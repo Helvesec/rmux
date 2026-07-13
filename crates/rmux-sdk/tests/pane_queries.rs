@@ -15,8 +15,9 @@ use rmux_proto::{
     ResizeWindowRequest, Response, SendKeysRequest, WindowTarget,
 };
 use rmux_sdk::{
-    EnsureSession, PaneProcessState, PaneRef, PaneSnapshot, PaneStateEvent, PaneStateEventsOptions,
-    RmuxBuilder, RmuxError, SessionName,
+    EnsureSession, PaneCloseOutcome, PaneProcessState, PaneRef, PaneRespawnOptions, PaneSnapshot,
+    PaneStateEvent, PaneStateEventsOptions, ProcessSpec, RmuxBuilder, RmuxError, SessionName,
+    TerminalSizeSpec,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -273,6 +274,23 @@ async fn pane_id_resolves_to_same_identity_through_linked_window_views() -> Test
     assert_ne!(
         owner_info.panes[0].session_id, viewer_info.panes[0].session_id,
         "the two views are owned by distinct sessions"
+    );
+
+    let owner_by_id = owner_session.pane_by_id(owner_id).await?;
+    let viewer_by_id = rmux.pane_by_id(viewer.clone(), owner_id).await?;
+    assert_eq!(
+        owner_by_id.target().session_name,
+        owner,
+        "the original linked-window view must win by-id resolution"
+    );
+    assert_eq!(
+        viewer_by_id.target().session_name,
+        viewer,
+        "an explicitly preferred alias must win before deterministic fallback sessions"
+    );
+    assert_eq!(
+        owner_by_id.snapshot().await?,
+        viewer_by_id.snapshot().await?
     );
 
     harness.finish().await
@@ -890,11 +908,66 @@ async fn issue_94_slot_handles_resolve_visible_indexes_under_base_index_one() ->
         visible.exists().await?,
         "visible slot (1, 1) must resolve under base-index 1"
     );
+    let mutation = visible.set_option("remain-on-exit", "on").await?;
+    assert_eq!(mutation.pane_id, visible.id().await?.expect("pane id"));
+    assert_eq!(
+        visible.option("remain-on-exit").await?.as_deref(),
+        Some("on")
+    );
+    visible.unset_option("remain-on-exit").await?;
+
     let snap = visible.snapshot().await?;
     assert!(
         snap.revision >= 1,
         "visible slot snapshot must be live, got revision {}",
         snap.revision
+    );
+    let info = visible.info().await?;
+    assert_eq!(
+        info.panes.len(),
+        1,
+        "visible slot info must retain pane details"
+    );
+    assert_eq!(
+        info.panes[0].index, 1,
+        "pane info exposes the visible index"
+    );
+
+    visible.set_title("sdk-visible-slot").await?;
+    assert_eq!(visible.title().await?.as_deref(), Some("sdk-visible-slot"));
+    visible
+        .resize(TerminalSizeSpec::new(snap.cols, snap.rows))
+        .await?;
+
+    let capture = visible.capture_pane().await?;
+    assert!(
+        capture.buffer_name.is_none(),
+        "printing capture must not allocate a buffer"
+    );
+    let output = visible.output_stream().await?;
+    drop(output);
+
+    let marker = "SDK_VISIBLE_SLOT_WAIT";
+    let armed = visible.wait_for_next(marker.as_bytes()).await?;
+    visible.send_text(format!("printf '{marker}\\n'\n")).await?;
+    armed.await?;
+
+    let respawned = visible
+        .respawn(PaneRespawnOptions {
+            kill: true,
+            start_directory: None,
+            process: ProcessSpec {
+                command: Some(vec!["cat >/dev/null".to_owned()]),
+                process_command: None,
+                environment: None,
+            },
+            keep_alive_on_exit: Some(true),
+        })
+        .await?;
+    assert_eq!(
+        respawned,
+        visible.target().clone(),
+        "respawn must return public visible coordinates"
     );
     let foreground = visible.foreground_state_with_revision().await?;
     assert!(
@@ -936,6 +1009,17 @@ async fn issue_94_slot_handles_resolve_visible_indexes_under_base_index_one() ->
             }
         ),
         "an invisible raw slot must fail closed before subscribing: {raw_events_error}"
+    );
+
+    raw_new_window(harness.socket_path(), name, 2).await?;
+    let close_target = visible.target().clone();
+    assert_eq!(
+        visible.close().await?,
+        PaneCloseOutcome::Closed {
+            target: close_target,
+            window_destroyed: true,
+        },
+        "close must resolve the visible slot identity without killing another pane"
     );
 
     harness.finish().await

@@ -7,7 +7,8 @@ use rmux_proto::{
     HookLifecycle, HookName, KillSessionRequest, LinkWindowRequest, NewSessionExtRequest,
     NewWindowRequest, OptionName, OptionScopeSelector, PaneTarget, Request, Response,
     ScopeSelector, SessionName, SetHookMutationRequest, SetOptionByNameRequest, SetOptionMode,
-    SetOptionRequest, TerminalSize, WindowId, WindowTarget,
+    SetOptionRequest, SplitDirection, SplitWindowExtRequest, SplitWindowTarget, TerminalSize,
+    WindowId, WindowTarget,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration, Instant};
@@ -296,6 +297,377 @@ async fn drain_controls(receiver: &mut mpsc::UnboundedReceiver<AttachControl>) {
             Ok(None) | Err(_) => return,
         }
     }
+}
+
+#[tokio::test]
+async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
+    let handler = RequestHandler::new();
+    let hooked_session = create_quiet_session(&handler, "pane-alert-queued-hook").await;
+    let live_session = create_quiet_session(&handler, "pane-alert-live-after-hook").await;
+    let hooked_target = WindowTarget::with_window(hooked_session.clone(), 0);
+    let live_target = WindowTarget::with_window(live_session.clone(), 0);
+    set_option(
+        &handler,
+        ScopeSelector::Window(live_target.clone()),
+        OptionName::MonitorBell,
+        "on",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::PaneTitleChanged,
+        "set-buffer -b queued-title-hook fired".to_owned(),
+    )
+    .await;
+    let (hooked_pane_id, hooked_generation, _) = pane_identity(&handler, &hooked_target).await;
+    let (live_pane_id, live_generation, _) = pane_identity(&handler, &live_target).await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let _undrained_lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .expect("test owns the lifecycle dispatch receiver");
+
+    handler.pane_alert_callback()(PaneAlertEvent {
+        session_name: hooked_session,
+        pane_id: hooked_pane_id,
+        bell_count: 0,
+        title_changed: true,
+        title_change: None,
+        clipboard_set: false,
+        clipboard_writes: Vec::new(),
+        mouse_mode_changed: false,
+        queue_activity_alert: false,
+        generation: hooked_generation,
+    });
+    let event = timeout(Duration::from_secs(2), lifecycle.recv())
+        .await
+        .expect("pane hook is queued before the deadline")
+        .expect("lifecycle channel remains open");
+    assert_eq!(event.hook_name, HookName::PaneTitleChanged);
+
+    // Leave the hook dispatch receiver undrained. Normal pane-alert delivery
+    // queues lifecycle work but does not wait for the hook command to run, so
+    // a slow hook cannot retain the pane-alert serialization lock.
+    handler.pane_alert_callback()(PaneAlertEvent {
+        session_name: live_session.clone(),
+        pane_id: live_pane_id,
+        bell_count: 1,
+        title_changed: false,
+        title_change: None,
+        clipboard_set: false,
+        clipboard_writes: Vec::new(),
+        mouse_mode_changed: false,
+        queue_activity_alert: false,
+        generation: live_generation,
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let bell_applied = {
+            let state = handler.state.lock().await;
+            state
+                .sessions
+                .session(&live_session)
+                .is_some_and(|session| {
+                    session
+                        .winlink_alert_flags(live_target.window_index())
+                        .contains(WINLINK_BELL)
+                })
+        };
+        if bell_applied {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "unrelated pane bell remains blocked behind an unexecuted hook"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
+    let handler = RequestHandler::new();
+    let exiting_session = create_quiet_session(&handler, "pane-alert-exit-hook").await;
+    let live_session = create_quiet_session(&handler, "pane-alert-live-peer").await;
+    let exiting_target = WindowTarget::with_window(exiting_session.clone(), 0);
+    let live_target = WindowTarget::with_window(live_session.clone(), 0);
+    set_option(
+        &handler,
+        ScopeSelector::Window(live_target.clone()),
+        OptionName::MonitorBell,
+        "on",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::PaneTitleChanged,
+        "set-buffer -b exit-title-hook fired".to_owned(),
+    )
+    .await;
+    let (exiting_pane_id, exiting_generation, _) = pane_identity(&handler, &exiting_target).await;
+    let (live_pane_id, live_generation, _) = pane_identity(&handler, &live_target).await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .expect("test owns the lifecycle dispatch receiver");
+
+    handler.pane_alert_callback()(PaneAlertEvent {
+        session_name: exiting_session,
+        pane_id: exiting_pane_id,
+        bell_count: 0,
+        title_changed: true,
+        title_change: None,
+        clipboard_set: false,
+        clipboard_writes: Vec::new(),
+        mouse_mode_changed: false,
+        queue_activity_alert: false,
+        generation: exiting_generation,
+    });
+    let exit_handler = handler.clone();
+    let mut exit_flush = tokio::spawn(async move {
+        exit_handler
+            .flush_pending_pane_alert_for_exit(exiting_pane_id, exiting_generation)
+            .await;
+    });
+
+    let event = timeout(Duration::from_secs(2), lifecycle.recv())
+        .await
+        .expect("exiting pane hook is queued before the deadline")
+        .expect("lifecycle channel remains open");
+    assert_eq!(event.hook_name, HookName::PaneTitleChanged);
+    assert!(
+        !exit_flush.is_finished(),
+        "exit flush waits for its ordered lifecycle hook"
+    );
+
+    handler.pane_alert_callback()(PaneAlertEvent {
+        session_name: live_session.clone(),
+        pane_id: live_pane_id,
+        bell_count: 1,
+        title_changed: false,
+        title_change: None,
+        clipboard_set: false,
+        clipboard_writes: Vec::new(),
+        mouse_mode_changed: false,
+        queue_activity_alert: false,
+        generation: live_generation,
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let bell_applied = {
+            let state = handler.state.lock().await;
+            state
+                .sessions
+                .session(&live_session)
+                .is_some_and(|session| {
+                    session
+                        .winlink_alert_flags(live_target.window_index())
+                        .contains(WINLINK_BELL)
+                })
+        };
+        if bell_applied {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "unrelated pane bell remains globally blocked by the exiting hook"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !exit_flush.is_finished(),
+        "unrelated alert applies while the exiting pane still waits for its hook"
+    );
+
+    let (hook_shutdown, hook_shutdown_rx) = tokio::sync::oneshot::channel();
+    let hook_handler = handler.clone();
+    let hook_task = tokio::spawn(async move {
+        hook_handler
+            .consume_lifecycle_hooks(lifecycle_events, hook_shutdown_rx)
+            .await;
+    });
+    timeout(Duration::from_secs(2), &mut exit_flush)
+        .await
+        .expect("exit flush completes after its hook is dispatched")
+        .expect("exit flush task joins");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            buffer_text(&state, "exit-title-hook").as_deref(),
+            Some("fired"),
+            "ordered hook completes before the exit flush returns"
+        );
+    }
+    let _ = hook_shutdown.send(());
+    timeout(Duration::from_secs(2), hook_task)
+        .await
+        .expect("lifecycle hook consumer stops")
+        .expect("lifecycle hook consumer joins");
+}
+
+#[tokio::test]
+async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_activity() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-alert-exit-silence-order").await;
+    let window_target = WindowTarget::with_window(session.clone(), 0);
+    let split = handler
+        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
+            target: SplitWindowTarget::Session(session.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+            command: Some(quiet_command()),
+            process_command: None,
+            start_directory: None,
+            keep_alive_on_exit: None,
+            detached: true,
+            size: None,
+            preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
+        })))
+        .await;
+    let Response::SplitWindow(split) = split else {
+        panic!("expected split-window success, got {split:?}");
+    };
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&split.pane)
+        .await;
+    set_option(
+        &handler,
+        ScopeSelector::Window(window_target.clone()),
+        OptionName::MonitorSilence,
+        "60",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::PaneTitleChanged,
+        "set-buffer -b exit-silence-hook fired".to_owned(),
+    )
+    .await;
+
+    let (exiting_pane_id, exiting_generation, live_pane_id, live_generation) = {
+        let state = handler.state.lock().await;
+        let window = state
+            .sessions
+            .session(&session)
+            .and_then(|current| current.window_at(window_target.window_index()))
+            .expect("two-pane alert window exists");
+        let exiting_pane_id = window.pane(0).expect("exiting pane exists").id();
+        let live_pane_id = window.pane(1).expect("live pane exists").id();
+        (
+            exiting_pane_id,
+            Some(state.pane_output_generation(&session, exiting_pane_id)),
+            live_pane_id,
+            Some(state.pane_output_generation(&session, live_pane_id)),
+        )
+    };
+    let initial_timer = handler
+        .silence_timer_snapshot_for_test(&window_target)
+        .expect("monitor-silence timer starts armed");
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .expect("test owns the lifecycle dispatch receiver");
+
+    handler.pane_alert_callback()(PaneAlertEvent {
+        session_name: session.clone(),
+        pane_id: exiting_pane_id,
+        bell_count: 0,
+        title_changed: true,
+        title_change: None,
+        clipboard_set: false,
+        clipboard_writes: Vec::new(),
+        mouse_mode_changed: false,
+        queue_activity_alert: true,
+        generation: exiting_generation,
+    });
+    let exit_handler = handler.clone();
+    let mut exit_flush = tokio::spawn(async move {
+        exit_handler
+            .flush_pending_pane_alert_for_exit(exiting_pane_id, exiting_generation)
+            .await;
+    });
+
+    let event = timeout(Duration::from_secs(2), lifecycle.recv())
+        .await
+        .expect("exiting pane title hook is queued")
+        .expect("lifecycle channel remains open");
+    assert_eq!(event.hook_name, HookName::PaneTitleChanged);
+    assert!(!exit_flush.is_finished(), "exit flush waits for its hook");
+    let exit_timer = handler
+        .silence_timer_snapshot_for_test(&window_target)
+        .expect("exit activity keeps the silence timer armed");
+    assert_eq!(
+        exit_timer.0,
+        initial_timer.0.saturating_add(1),
+        "the exiting activity resets silence exactly once before its hook wait"
+    );
+
+    handler.pane_alert_callback()(PaneAlertEvent {
+        session_name: session,
+        pane_id: live_pane_id,
+        bell_count: 0,
+        title_changed: false,
+        title_change: None,
+        clipboard_set: false,
+        clipboard_writes: Vec::new(),
+        mouse_mode_changed: false,
+        queue_activity_alert: true,
+        generation: live_generation,
+    });
+    let newer_timer = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = handler
+                .silence_timer_snapshot_for_test(&window_target)
+                .expect("same-window activity keeps the timer armed");
+            if snapshot.0 > exit_timer.0 {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("newer same-window activity resets silence while the hook waits");
+    assert!(
+        newer_timer.1 > exit_timer.1,
+        "the newer activity owns a strictly later silence deadline"
+    );
+    assert!(
+        !exit_flush.is_finished(),
+        "newer activity applies before the exiting hook completes"
+    );
+
+    let (hook_shutdown, hook_shutdown_rx) = tokio::sync::oneshot::channel();
+    let hook_handler = handler.clone();
+    let hook_task = tokio::spawn(async move {
+        hook_handler
+            .consume_lifecycle_hooks(lifecycle_events, hook_shutdown_rx)
+            .await;
+    });
+    timeout(Duration::from_secs(2), &mut exit_flush)
+        .await
+        .expect("exit flush completes after its hook")
+        .expect("exit flush task joins");
+    assert_eq!(
+        handler.silence_timer_snapshot_for_test(&window_target),
+        Some(newer_timer),
+        "the older exiting batch must not rearm over newer same-window activity"
+    );
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            buffer_text(&state, "exit-silence-hook").as_deref(),
+            Some("fired"),
+            "the ordered title hook still executes"
+        );
+    }
+    let _ = hook_shutdown.send(());
+    timeout(Duration::from_secs(2), hook_task)
+        .await
+        .expect("lifecycle hook consumer stops")
+        .expect("lifecycle hook consumer joins");
 }
 
 #[tokio::test]

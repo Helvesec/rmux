@@ -63,17 +63,27 @@ fn decode_terminal_response_after_append(
     }
 
     let search_at = new_input_at.max(2).min(input.len());
-    let Some(final_offset) = input[search_at..]
-        .iter()
-        .position(|byte| is_csi_final(*byte))
-    else {
+    let mut final_index = None;
+    for (offset, byte) in input[search_at..].iter().copied().enumerate() {
+        if is_csi_final(byte) {
+            final_index = Some(search_at + offset);
+            break;
+        }
+        // A CSI body may contain only parameter/intermediate bytes before its
+        // final byte. Treat C0 controls, DEL, ESC, and non-ASCII bytes as raw
+        // pane input immediately instead of retaining a "terminal response"
+        // that the pending-escape scheduler correctly cannot classify.
+        if !(0x20..=0x3f).contains(&byte) {
+            return TerminalResponseDecode::NotResponse;
+        }
+    }
+    let Some(final_index) = final_index else {
         return if is_plausible_terminal_response_prefix(input) {
             TerminalResponseDecode::Partial
         } else {
             TerminalResponseDecode::NotResponse
         };
     };
-    let final_index = search_at + final_offset;
     match input[final_index] {
         b'n' => matched(final_index + 1, decode_theme_report(input, final_index)),
         b'c' | b't' => matched(final_index + 1, None),
@@ -233,6 +243,20 @@ mod tests {
             decode_terminal_response(b"\x1b[?62;52"),
             TerminalResponseDecode::Partial
         );
+    }
+
+    #[test]
+    fn invalid_csi_body_bytes_are_never_retained_as_terminal_responses() {
+        for leader in [b'?', b'>', b'1'] {
+            for invalid in [b'\0', b'\r', b'\x1b', b'\x7f', b'\x80', b'\xff'] {
+                let input = [b'\x1b', b'[', leader, invalid];
+                assert_eq!(
+                    decode_attached_terminal_control_after_append(&input, false, 3),
+                    TerminalResponseDecode::NotResponse,
+                    "leader={leader:#04x}, invalid={invalid:#04x}"
+                );
+            }
+        }
     }
 
     #[test]

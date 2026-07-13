@@ -70,6 +70,13 @@ pub(super) struct RemovedPaneOutputs {
 }
 
 impl RemovedPaneOutputs {
+    pub(in crate::pane_terminals) fn pane_output_sender(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<PaneOutputSender> {
+        self.pane_outputs.get(&pane_id).cloned()
+    }
+
     pub(in crate::pane_terminals) fn abort_output_readers(&mut self) {
         #[cfg(unix)]
         for (_, reader) in self.pane_output_readers.drain() {

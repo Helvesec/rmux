@@ -1,6 +1,8 @@
 use super::super::RequestHandler;
 use super::session_name;
-use crate::input_keys::{encode_key, encode_mouse_event, ExtendedKeyFormat, MouseForwardEvent};
+use crate::input_keys::{
+    encode_key, encode_mouse_event, ExtendedKeyFormat, MouseForwardEvent, MAX_SGR_MOUSE_FRAME_BYTES,
+};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use rmux_core::{input::mode, key_string_lookup_string};
 use rmux_proto::{
@@ -29,6 +31,10 @@ use super::super::input_capture::RawPaneInputProbe;
 
 #[path = "handler_send_keys_tests/live_attach.rs"]
 mod live_attach;
+
+#[cfg(windows)]
+#[path = "handler_send_keys_tests/windows_console_repeat.rs"]
+mod windows_console_repeat;
 
 #[path = "handler_send_keys_tests/bracketed_paste_live.rs"]
 mod bracketed_paste_live;

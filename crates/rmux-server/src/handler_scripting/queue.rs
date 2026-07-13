@@ -5,7 +5,10 @@ use rmux_core::{
     command_parser::ParsedCommands,
     command_queue::{CommandGroup, CommandQueue},
 };
-use rmux_proto::{CommandOutput, ErrorResponse, Request, Response, RmuxError, Target};
+use rmux_proto::{
+    CommandOutput, ErrorResponse, PaneTarget, Request, Response, RmuxError, SessionName, Target,
+    WindowTarget,
+};
 
 use crate::mouse::AttachedMouseEvent;
 
@@ -123,6 +126,61 @@ impl QueueExecutionContext {
             .then_some(self.current_target.as_ref())
             .flatten()
     }
+
+    pub(in crate::handler) fn rename_session_targets(
+        &mut self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+    ) {
+        if let Some(target) = self.current_target.as_mut() {
+            rename_target_session(target, old_name, new_name);
+        }
+        if let Some(target) = self.mouse_target.as_mut() {
+            rename_target_session(target, old_name, new_name);
+        }
+        if let Some(event) = self.mouse_event.as_mut() {
+            if let Some(target) = event.pane_target.as_mut() {
+                rename_pane_target_session(target, old_name, new_name);
+            }
+        }
+    }
+}
+
+pub(in crate::handler) fn rename_target_session(
+    target: &mut Target,
+    old_name: &SessionName,
+    new_name: &SessionName,
+) {
+    match target {
+        Target::Session(session_name) if session_name == old_name => {
+            *session_name = new_name.clone();
+        }
+        Target::Window(window) => rename_window_target_session(window, old_name, new_name),
+        Target::Pane(pane) => rename_pane_target_session(pane, old_name, new_name),
+        Target::Session(_) => {}
+    }
+}
+
+pub(in crate::handler) fn rename_window_target_session(
+    target: &mut WindowTarget,
+    old_name: &SessionName,
+    new_name: &SessionName,
+) {
+    if target.session_name() != old_name {
+        return;
+    }
+    *target = WindowTarget::with_window(new_name.clone(), target.window_index());
+}
+
+pub(in crate::handler) fn rename_pane_target_session(
+    target: &mut PaneTarget,
+    old_name: &SessionName,
+    new_name: &SessionName,
+) {
+    if target.session_name() != old_name {
+        return;
+    }
+    *target = PaneTarget::with_window(new_name.clone(), target.window_index(), target.pane_index());
 }
 
 #[derive(Debug, Clone)]

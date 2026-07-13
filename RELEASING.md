@@ -133,8 +133,9 @@ deeper parser/security pass.
 
 ## Release candidate
 
-Use a disposable signed RC tag before the final tag when release workflow changes,
-signing, package formats, or package-manager publication changed.
+Use a signed RC tag before the final tag when release workflow changes, signing,
+package formats, or package-manager publication changed. RC tags are immutable
+release provenance and remain protected after validation.
 
 1. Create the RC tag on the release branch:
 
@@ -157,7 +158,8 @@ signing, package formats, or package-manager publication changed.
 
 4. Smoke-test at least Linux locally and ask for macOS/Windows public-install
    checks when platform packaging changed.
-5. Delete the disposable RC tag and GitHub release after validation.
+5. Retain the protected RC tag. The GitHub prerelease may be removed after
+   validation, but its signed tag remains as immutable provenance.
 
 ## Final release
 

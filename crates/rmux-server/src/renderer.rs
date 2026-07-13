@@ -17,6 +17,9 @@ use crate::pane_visible_geometry::visible_pane_content_geometry;
 mod borders;
 #[path = "renderer/clock_mode.rs"]
 mod clock_mode;
+#[cfg(test)]
+#[path = "renderer/copy_mode_tests.rs"]
+mod copy_mode_tests;
 #[path = "renderer/display_panes.rs"]
 mod display_panes;
 #[path = "renderer/format_draw.rs"]
@@ -54,14 +57,16 @@ pub(crate) use overlay::{
 };
 pub(crate) use pane_delta::{PaneRenderDelta, PaneRenderDeltaFrame, PaneRenderSnapshot};
 pub(crate) use pane_screen::{
+    render_copy_mode_pane_screen, render_copy_mode_pane_screen_preserving_prompt_cursor,
     render_pane_screen, render_pane_screen_preserving_prompt_cursor, styled_pane_screen,
     truncate_rendered_pane_line,
 };
 #[cfg(test)]
 use status::status_bar_runs;
+pub(crate) use status::StatusGeometry;
 use status::{
     format_status_message_line, prompt_status_runs, render_status_bar, sanitize_status_text,
-    status_bar_lines, status_message_y, status_runs_width, StatusBarRenderRequest, StatusGeometry,
+    status_bar_lines, status_message_y, status_runs_width, StatusBarRenderRequest,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -12,7 +12,7 @@ struct ClientIdentityFixture {
     victim_pid: u32,
     victim_attach_id: u64,
     victim_item_id: String,
-    _host_rx: mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+    host_rx: mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
     _victim_rx: mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
 }
 
@@ -67,7 +67,7 @@ async fn client_identity_fixture(
         victim_pid,
         victim_attach_id,
         victim_item_id: client_item_id(victim_pid, victim_attach_id),
-        _host_rx: host_rx,
+        host_rx,
         _victim_rx: victim_rx,
     }
 }
@@ -145,6 +145,22 @@ async fn assert_reconnected_client_survives(
             "stale choose-client action sent Detach to the replacement"
         );
     }
+}
+
+async fn wait_for_mode_tree_overlay(
+    control_rx: &mut mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match control_rx.recv().await {
+                Some(crate::pane_io::AttachControl::Overlay(_)) => break,
+                Some(_) => {}
+                None => panic!("choose-client host control channel closed before overlay refresh"),
+            }
+        }
+    })
+    .await
+    .expect("deferred choose-client action refreshes the mode-tree overlay");
 }
 
 #[tokio::test]
@@ -261,6 +277,44 @@ async fn choose_client_stale_accept_does_not_detach_reconnected_pid() {
         .accept_mode_tree_selection(fixture.host_pid)
         .await
         .expect("stale accept is a no-op");
+    assert_reconnected_client_survives(
+        &handler,
+        &fixture,
+        replacement_attach_id,
+        &mut replacement_rx,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn choose_client_confirmation_uses_captured_attach_identity() {
+    let handler = RequestHandler::new();
+    let mut fixture =
+        client_identity_fixture(&handler, "choose-client-confirm-identity", 635).await;
+    select_stale_client(&handler, &fixture).await;
+
+    handler
+        .handle_attached_live_input_for_test(fixture.host_pid, b"x")
+        .await
+        .expect("live choose-client delete key opens confirmation");
+    assert_eq!(
+        handler
+            .attached_prompt_render(fixture.host_pid)
+            .await
+            .expect("choose-client confirmation is active")
+            .prompt,
+        "detach selected clients?"
+    );
+
+    let (replacement_attach_id, mut replacement_rx) = reconnect_victim(&handler, &fixture).await;
+    while fixture.host_rx.try_recv().is_ok() {}
+
+    handler
+        .handle_attached_live_input_for_test(fixture.host_pid, b"y")
+        .await
+        .expect("live confirmation input succeeds");
+    wait_for_mode_tree_overlay(&mut fixture.host_rx).await;
+
     assert_reconnected_client_survives(
         &handler,
         &fixture,

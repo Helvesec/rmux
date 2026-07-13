@@ -42,6 +42,69 @@ fn temp_dir(label: &str) -> PathBuf {
     path
 }
 
+#[test]
+#[cfg(unix)]
+fn changelog_checker_rejects_unversioned_tmux_claim_without_test_link() {
+    let root = temp_dir("changelog-tmux-claim");
+    let changelog = root.join("CHANGELOG.md");
+    let required_sections = "## 0.9.0\n\n- Matches tmux queued attach sequencing.\n\n## 0.8.0\n\n## 0.7.1\n\n## 0.7.0\n";
+    fs::write(&changelog, required_sections).expect("write changelog fixture");
+    let changelog_arg = changelog.to_string_lossy().into_owned();
+
+    let rejected = run("scripts/check-changelog-release.py", &[&changelog_arg]);
+    assert!(!rejected.status.success(), "{}", stdout(&rejected));
+    assert!(
+        stderr(&rejected).contains("tmux compatibility claim lacks a fixture/test link"),
+        "{}",
+        stderr(&rejected)
+    );
+
+    let linked = required_sections.replace(
+        "Matches tmux queued attach sequencing.",
+        "Matches tmux queued attach sequencing, backed by [tests](tests/cli_attach_flow.rs).",
+    );
+    fs::write(&changelog, linked).expect("write linked changelog fixture");
+    let accepted = run("scripts/check-changelog-release.py", &[&changelog_arg]);
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+
+    fs::remove_dir_all(root).expect("remove changelog fixture");
+}
+
+#[test]
+fn current_changelog_records_the_exact_detached_wire_version() {
+    let changelog = include_str!("../CHANGELOG.md");
+    let current_release = changelog
+        .split("\n## 0.8.0\n")
+        .next()
+        .expect("0.9.0 changelog section");
+    let expected = format!(
+        "detached RPC frame envelope from wire version 3 to {}",
+        rmux_proto::RMUX_WIRE_VERSION
+    );
+
+    assert!(
+        current_release.contains(&expected),
+        "0.9.0 changelog must record the current detached wire version: {expected}"
+    );
+    assert!(
+        current_release.contains("already-running older server must be\n  restarted"),
+        "0.9.0 changelog must tell operators that this hard wire cut requires a server restart"
+    );
+}
+
+#[test]
+fn release_runbook_retains_non_bypassable_rc_tag_provenance() {
+    let releasing = include_str!("../RELEASING.md");
+    let release_identity = include_str!("../scripts/release-identity.sh");
+    let protection = include_str!("../scripts/verify-release-tag-protection.sh");
+
+    assert!(releasing.contains("Retain the protected RC tag"));
+    assert!(!releasing.contains("Delete the disposable RC tag"));
+    assert!(release_identity.contains("immutable stable or RC tag"));
+    assert!(!release_identity.contains("disposable RC tag"));
+    assert!(protection.contains("bypass_actors"));
+}
+
 #[cfg(unix)]
 fn run_release_ref_fixture(
     fake_bin: &Path,
@@ -49,6 +112,7 @@ fn run_release_ref_fixture(
     ref_sha: &str,
     peeled_type: &str,
     peeled_sha: &str,
+    tag_verified: bool,
     release_target: Option<&str>,
 ) -> Output {
     let path = format!(
@@ -67,6 +131,7 @@ fn run_release_ref_fixture(
         .env("FAKE_REF_SHA", ref_sha)
         .env("FAKE_PEELED_TYPE", peeled_type)
         .env("FAKE_PEELED_SHA", peeled_sha)
+        .env("FAKE_TAG_VERIFIED", tag_verified.to_string())
         .env("FAKE_RELEASE_TARGET", release_target.unwrap_or_default())
         .current_dir(repo_root())
         .output()
@@ -93,7 +158,10 @@ case "$endpoint" in
     printf '{"object":{"type":"%s","sha":"%s"}}\n' "$FAKE_REF_TYPE" "$FAKE_REF_SHA"
     ;;
   */git/tags/*)
-    printf '{"object":{"type":"%s","sha":"%s"}}\n' "$FAKE_PEELED_TYPE" "$FAKE_PEELED_SHA"
+    reason=unsigned
+    if [[ "$FAKE_TAG_VERIFIED" == true ]]; then reason=valid; fi
+    printf '{"object":{"type":"%s","sha":"%s"},"verification":{"verified":%s,"reason":"%s"}}\n' \
+      "$FAKE_PEELED_TYPE" "$FAKE_PEELED_SHA" "$FAKE_TAG_VERIFIED" "$reason"
     ;;
   */releases/tags/*)
     if [[ -z ${FAKE_RELEASE_TARGET:-} ]]; then exit 1; fi
@@ -115,9 +183,11 @@ esac
 
     let expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let tag_object = "1111111111111111111111111111111111111111";
-    let lightweight =
-        run_release_ref_fixture(&fake_bin, "commit", expected, "commit", expected, None);
-    assert!(lightweight.status.success(), "{}", stderr(&lightweight));
+    let lightweight = run_release_ref_fixture(
+        &fake_bin, "commit", expected, "commit", expected, true, None,
+    );
+    assert!(!lightweight.status.success());
+    assert!(stderr(&lightweight).contains("verified signed annotated tag"));
 
     let annotated = run_release_ref_fixture(
         &fake_bin,
@@ -125,16 +195,24 @@ esac
         tag_object,
         "commit",
         expected,
+        true,
         Some(expected),
     );
     assert!(annotated.status.success(), "{}", stderr(&annotated));
 
+    let unsigned = run_release_ref_fixture(
+        &fake_bin, "tag", tag_object, "commit", expected, false, None,
+    );
+    assert!(!unsigned.status.success());
+    assert!(stderr(&unsigned).contains("no verified signature"));
+
     let moved = run_release_ref_fixture(
         &fake_bin,
+        "tag",
+        tag_object,
         "commit",
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "commit",
-        expected,
+        true,
         None,
     );
     assert!(
@@ -145,10 +223,11 @@ esac
 
     let wrong_release = run_release_ref_fixture(
         &fake_bin,
+        "tag",
+        tag_object,
         "commit",
         expected,
-        "commit",
-        expected,
+        true,
         Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
     );
     assert!(
@@ -326,6 +405,42 @@ fn workflows_install_the_workspace_toolchain_instead_of_floating_stable() {
 }
 
 #[test]
+fn every_ci_and_release_job_has_a_bounded_runtime() {
+    for (workflow_name, workflow) in [
+        ("ci", include_str!("../.github/workflows/ci.yml")),
+        ("release", include_str!("../.github/workflows/release.yml")),
+        (
+            "scorecard",
+            include_str!("../.github/workflows/scorecard.yml"),
+        ),
+    ] {
+        let jobs = workflow
+            .split_once("\njobs:\n")
+            .map(|(_, jobs)| jobs)
+            .expect("workflow jobs section");
+        let mut current_job: Option<&str> = None;
+        let mut current_has_timeout = false;
+
+        for line in jobs.lines().chain(std::iter::once("  end:")) {
+            let is_job_header =
+                line.starts_with("  ") && !line.starts_with("    ") && line.ends_with(':');
+            if is_job_header {
+                if let Some(job) = current_job {
+                    assert!(
+                        current_has_timeout,
+                        "{workflow_name} job {job} must set timeout-minutes"
+                    );
+                }
+                current_job = Some(line.trim_end_matches(':').trim());
+                current_has_timeout = false;
+            } else if line.trim_start().starts_with("timeout-minutes:") {
+                current_has_timeout = true;
+            }
+        }
+    }
+}
+
+#[test]
 fn windows_package_reuses_the_exact_ctrl_tested_release_binaries() {
     let release = include_str!("../.github/workflows/release.yml");
     let package = include_str!("../scripts/package-windows.ps1");
@@ -363,6 +478,7 @@ fn windows_package_reuses_the_exact_ctrl_tested_release_binaries() {
 #[test]
 fn perf_current_and_darwin_baseline_validation_fail_closed_on_identity_drift() {
     let bench = include_str!("../scripts/perf-bench.sh");
+    let baseline_generator = include_str!("../scripts/perf-baseline.sh");
     let comparator = include_str!("../scripts/perf-diff.py");
     let baseline_check = include_str!("../scripts/check-perf-baseline.py");
     let gate = include_str!("../scripts/release-review-gate.sh");
@@ -393,6 +509,27 @@ fn perf_current_and_darwin_baseline_validation_fail_closed_on_identity_drift() {
     assert!(baseline_check.contains("Darwin baseline is missing an explicit clean-worktree stamp"));
     assert!(baseline_check.contains("missing or invalid environment.host_fingerprint"));
     assert!(baseline_check.contains("does not match expected"));
+    assert!(baseline_check.contains("personal home path leaked"));
+    assert!(baseline_check.contains("must be repository-relative"));
+    assert!(baseline_generator.contains("write_portable_source"));
+    assert!(baseline_generator.contains("python3 scripts/check-perf-baseline.py"));
+    assert!(baseline_generator.contains("\"$json_path\""));
+    assert!(baseline_generator.contains("--expected-platform \"$platform\""));
+    for (name, baseline) in [
+        (
+            "Darwin",
+            include_str!("../benches/perf/baselines/release-0.9.0.json"),
+        ),
+        (
+            "Linux",
+            include_str!("../benches/perf/baselines/release-0.9.0-linux.json"),
+        ),
+    ] {
+        assert!(
+            !baseline.contains("/Users/") && !baseline.contains("/home/"),
+            "{name} perf baseline leaked a personal home path"
+        );
+    }
     assert!(gate.contains("missing required Darwin perf baseline"));
     assert!(gate.contains("run this mandatory comparison on the baseline owner host"));
     assert!(gate.contains("perf-gate=portable-budget enforcement=absolute-budgets"));

@@ -142,12 +142,11 @@ async fn live_attach_meta_underscore_dispatches_root_binding_after_escape_timeou
 
 #[tokio::test]
 async fn meta_underscore_then_typed_g_flushes_binding_and_unblocks_input() {
-    // Alt+_ followed by a typed 'G' within escape-time accumulates the kitty
-    // APC opener \x1b_G, whose payload scan only ends on ST; the flush
-    // deadline must stay armed and resolve it as keyboard input (M-_ through
-    // the key tables, body bytes rerouted) instead of swallowing every
-    // subsequent keystroke — the same class as the fixed consumed-OSC
-    // M-] 5 2 ; swallow.
+    // Alt+_ followed by a typed 'G' selects the kitty APC opener \x1b_G,
+    // whose payload scan only ends on ST. If its streaming idle budget later
+    // expires, the flush still resolves it as keyboard input (M-_ through the
+    // key tables, body bytes rerouted) instead of swallowing every subsequent
+    // keystroke — the same class as the fixed consumed-OSC M-] 5 2 ; swallow.
     let handler = RequestHandler::new();
     let alpha = session_name("meta-underscore-typed-g");
     let requester_pid = std::process::id();
@@ -200,7 +199,7 @@ async fn meta_underscore_then_typed_g_flushes_binding_and_unblocks_input() {
     let (_, contents) = state
         .buffers
         .show(Some("apc-flushed"))
-        .expect("M-_ binding fired from the escape-time flush");
+        .expect("M-_ binding fired from the idle-timeout flush");
     assert_eq!(contents, b"ok");
 }
 
@@ -436,10 +435,10 @@ async fn alt_right_bracket_binding_fires_after_escape_timeout_and_unblocks_input
         RawPaneInputProbe::start(&handler, &alpha, "live-alt-right-bracket-binding", 0).await;
 
     // Alt+] followed by typed body bytes accumulates a full consumed-OSC
-    // prefix with no terminator; the escape-time flush must resolve it as
-    // keyboard input: dispatch M-] through the key tables and reroute the
-    // body bytes, instead of opening an unterminated OSC in the pane and
-    // swallowing every subsequent keystroke.
+    // prefix with no terminator. If its streaming idle budget expires, the
+    // flush must resolve it as keyboard input: dispatch M-] through the key
+    // tables and reroute the body bytes, instead of opening an unterminated
+    // OSC in the pane and swallowing every subsequent keystroke.
     let mut pending_input = Vec::new();
     handler
         .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b]")
@@ -466,7 +465,7 @@ async fn alt_right_bracket_binding_fires_after_escape_timeout_and_unblocks_input
     let (_, contents) = state
         .buffers
         .show(Some("flushed"))
-        .expect("M-] binding fired from the escape-time flush");
+        .expect("M-] binding fired from the idle-timeout flush");
     assert_eq!(contents, b"ok");
 }
 

@@ -80,7 +80,7 @@ impl PaneSet {
     /// Stale panes use the ordinary [`Pane::close`] idempotent semantics and
     /// return [`PaneCloseOutcome::AlreadyClosed`] as a success.
     pub async fn close_all(self) -> PaneSetBatch<PaneCloseOutcome> {
-        run_all(self.panes, |pane| async move { pane.close().await }).await
+        close_all_in_order(self.panes).await
     }
 
     /// Starts an all-panes visible-text expectation builder.
@@ -112,6 +112,24 @@ impl PaneSet {
     pub fn wait_any(&self) -> PaneSetExpectation<'_> {
         self.expect_any()
     }
+}
+
+async fn close_all_in_order(panes: Vec<Pane>) -> PaneSetBatch<PaneCloseOutcome> {
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    for pane in panes {
+        let target = pane.target().clone();
+        let pane_id = pane.id().await.ok().flatten();
+        let pane = match pane_id {
+            Some(pane_id) => pane.pin_to_id(pane_id),
+            None => pane,
+        };
+        match pane.close().await {
+            Ok(value) => successes.push(PaneSetSuccess::new(target, pane_id, value)),
+            Err(error) => failures.push(PaneSetFailure::new(target, pane_id, error)),
+        }
+    }
+    PaneSetBatch::new(successes, failures)
 }
 
 impl From<Vec<Pane>> for PaneSet {

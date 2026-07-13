@@ -399,6 +399,246 @@ async fn detach_client_target_session_preserves_reregistered_attached_client() {
 }
 
 #[tokio::test]
+async fn managed_client_actions_fail_closed_when_a_pid_is_reregistered() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("managed-client-generation-alpha");
+    let beta = session_name("managed-client-generation-beta");
+    for session_name in [&alpha, &beta] {
+        let response = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: None,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    }
+
+    let control_pid = 91_348;
+    let (old_control_id, _old_control_rx) =
+        register_control_test_client(&handler, control_pid, &alpha).await;
+    let pause = super::super::client_support::install_managed_client_resolution_pause(control_pid);
+    let detach_handler = handler.clone();
+    let detach = tokio::spawn(async move {
+        detach_handler
+            .handle(Request::DetachClientExt(
+                rmux_proto::DetachClientExtRequest {
+                    target_client: Some(control_pid.to_string()),
+                    all_other_clients: false,
+                    target_session: None,
+                    kill_on_detach: false,
+                    exec_command: None,
+                },
+            ))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("detach resolves the original control identity");
+    let (replacement_control_id, mut replacement_control_rx) =
+        register_control_test_client(&handler, control_pid, &beta).await;
+    assert_ne!(replacement_control_id, old_control_id);
+    while replacement_control_rx.try_recv().is_ok() {}
+    pause.release.notify_one();
+    assert!(matches!(
+        detach.await.expect("detach task joins"),
+        Response::Error(_)
+    ));
+    assert!(matches!(
+        replacement_control_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let pause = super::super::client_support::install_managed_client_resolution_pause(control_pid);
+    let refresh_handler = handler.clone();
+    let refresh = tokio::spawn(async move {
+        refresh_handler
+            .handle(Request::RefreshClient(Box::new(refresh_client_request(
+                control_pid,
+            ))))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("refresh resolves the original control identity");
+    let (third_control_id, mut third_control_rx) =
+        register_control_test_client(&handler, control_pid, &alpha).await;
+    assert_ne!(third_control_id, replacement_control_id);
+    while third_control_rx.try_recv().is_ok() {}
+    pause.release.notify_one();
+    assert!(matches!(
+        refresh.await.expect("refresh task joins"),
+        Response::Error(_)
+    ));
+    assert!(matches!(
+        third_control_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let attach_pid = 91_349;
+    let (old_attach_tx, _old_attach_rx) = mpsc::unbounded_channel();
+    let old_attach_id = handler
+        .register_attach(attach_pid, alpha.clone(), old_attach_tx)
+        .await;
+    let pause = super::super::client_support::install_managed_client_resolution_pause(attach_pid);
+    let detach_handler = handler.clone();
+    let detach = tokio::spawn(async move {
+        detach_handler
+            .handle(Request::DetachClientExt(
+                rmux_proto::DetachClientExtRequest {
+                    target_client: Some(attach_pid.to_string()),
+                    all_other_clients: false,
+                    target_session: None,
+                    kill_on_detach: false,
+                    exec_command: None,
+                },
+            ))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("detach resolves the original attach identity");
+    let (replacement_attach_tx, mut replacement_attach_rx) = mpsc::unbounded_channel();
+    let replacement_attach_id = handler
+        .register_attach(attach_pid, beta.clone(), replacement_attach_tx)
+        .await;
+    assert_ne!(replacement_attach_id, old_attach_id);
+    while replacement_attach_rx.try_recv().is_ok() {}
+    pause.release.notify_one();
+    assert!(matches!(
+        detach.await.expect("detach task joins"),
+        Response::Error(_)
+    ));
+    assert!(matches!(
+        replacement_attach_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let pause = super::super::client_support::install_managed_client_resolution_pause(attach_pid);
+    let refresh_handler = handler.clone();
+    let refresh = tokio::spawn(async move {
+        refresh_handler
+            .handle(Request::RefreshClient(Box::new(refresh_client_request(
+                attach_pid,
+            ))))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("refresh resolves the original attach identity");
+    let (third_attach_tx, mut third_attach_rx) = mpsc::unbounded_channel();
+    let third_attach_id = handler
+        .register_attach(attach_pid, alpha.clone(), third_attach_tx)
+        .await;
+    assert_ne!(third_attach_id, replacement_attach_id);
+    while third_attach_rx.try_recv().is_ok() {}
+    pause.release.notify_one();
+    assert!(matches!(
+        refresh.await.expect("refresh task joins"),
+        Response::Error(_)
+    ));
+    assert!(matches!(
+        third_attach_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    let pause = super::super::client_support::install_managed_client_resolution_pause(attach_pid);
+    let show_handler = handler.clone();
+    let show = tokio::spawn(async move {
+        show_handler
+            .handle(Request::ShowMessages(rmux_proto::ShowMessagesRequest {
+                jobs: false,
+                terminals: true,
+                target_client: Some(attach_pid.to_string()),
+            }))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("show-messages resolves the original attach identity");
+    let (fourth_attach_tx, _fourth_attach_rx) = mpsc::unbounded_channel();
+    let fourth_attach_id = handler
+        .register_attach(attach_pid, beta.clone(), fourth_attach_tx)
+        .await;
+    assert_ne!(fourth_attach_id, third_attach_id);
+    pause.release.notify_one();
+    let Response::ShowMessages(response) = show.await.expect("show-messages task joins") else {
+        panic!("show-messages should fail closed with an empty listing");
+    };
+    assert!(
+        response.output.stdout().is_empty(),
+        "show-messages must not expose the replacement attached client"
+    );
+
+    let active_control = handler.active_control.lock().await;
+    assert_eq!(
+        active_control
+            .by_pid
+            .get(&control_pid)
+            .expect("latest control registration survives")
+            .id,
+        third_control_id
+    );
+    drop(active_control);
+    let active_attach = handler.active_attach.lock().await;
+    assert_eq!(
+        active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("latest attach registration survives")
+            .id,
+        fourth_attach_id
+    );
+}
+
+async fn register_control_test_client(
+    handler: &RequestHandler,
+    control_pid: u32,
+    session_name: &SessionName,
+) -> (u64, mpsc::Receiver<ControlServerEvent>) {
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            control_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(control_pid, Some(session_name.clone()))
+        .await
+        .expect("set control session");
+    while event_rx.try_recv().is_ok() {}
+    (control_id, event_rx)
+}
+
+fn refresh_client_request(target_pid: u32) -> rmux_proto::request::RefreshClientRequest {
+    rmux_proto::request::RefreshClientRequest {
+        target_client: Some(target_pid.to_string()),
+        adjustment: None,
+        clear_pan: false,
+        pan_left: false,
+        pan_right: false,
+        pan_up: false,
+        pan_down: false,
+        status_only: false,
+        clipboard_query: false,
+        flags: None,
+        flags_alias: None,
+        subscriptions: Vec::new(),
+        subscriptions_format: Vec::new(),
+        control_size: None,
+        colour_report: None,
+    }
+}
+
+#[tokio::test]
 async fn control_mode_attach_session_tracks_the_control_clients_session() {
     let handler = RequestHandler::new();
     let requester_pid = 301;

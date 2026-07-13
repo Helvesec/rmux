@@ -18,6 +18,10 @@ use tokio::time::{Duration, Instant};
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 #[cfg(any(unix, windows))]
 const ATTACH_INTERACTIVE_OUTPUT_WINDOW: Duration = Duration::from_millis(250);
+#[cfg(any(unix, windows))]
+// Bound each opportunistic socket drain so sustained attach input cannot keep
+// this task away from render, control, shutdown, or escape-flush futures.
+const MAX_IMMEDIATE_ATTACH_READS: usize = 8;
 #[cfg(windows)]
 const ATTACH_EXIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(any(unix, windows))]
@@ -64,7 +68,7 @@ use deferred_passthrough::{
 use exit_log::{record_attach_error, record_attach_exit, AttachExitReason};
 pub(crate) use live_render::LivePaneRender;
 #[cfg(any(unix, windows))]
-use pending_escape::{is_pending_escape, PendingEscapeFlush};
+use pending_escape::PendingEscapeFlush;
 #[cfg(any(unix, windows))]
 use persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
@@ -163,26 +167,27 @@ pub(crate) async fn forward_attach(
 
     let result = async {
         loop {
-            let overlay_barrier = persistent_overlay_epoch.load(Ordering::SeqCst);
-            let previous_overlay_state_id = persistent_overlay_state_id;
-            advance_persistent_overlay_state(
-                &mut persistent_overlay_state_id,
-                attach_controls.as_mut(),
-                &mut deferred_controls,
-                overlay_barrier,
-                &control_backlog,
-            );
-            redraw_after_persistent_overlay_state_advance(
+            // Socket reads and attach-control refreshes can both remain
+            // continuously ready. Service an expired input ambiguity before
+            // either queue so its deadline is a real upper bound rather than
+            // merely another selectable wakeup.
+            flush_due_pending_escape_input(
+                &mut pending_escape_flush,
+                &live_input,
+                &mut pending_input,
+                locked,
+            )
+            .await?;
+            synchronize_persistent_overlay_epoch(
+                &persistent_overlay_epoch,
                 &stream,
                 &current_target,
+                attach_controls.as_mut(),
+                &mut deferred_controls,
+                &control_backlog,
                 &mut persistent_overlay,
                 &mut persistent_overlay_visible,
-                previous_overlay_state_id,
-                persistent_overlay_state_id,
-                persistent_overlay_replacement_pending(
-                    &deferred_controls,
-                    persistent_overlay_state_id,
-                ),
+                &mut persistent_overlay_state_id,
             )
             .await?;
             match apply_pending_attach_controls(
@@ -275,7 +280,7 @@ pub(crate) async fn forward_attach(
             // A pending repaint must not stop input from reaching the pane.
             // The repaint is rendered from the current transcript when its
             // deadline fires, so fresh input can safely pull the deadline in.
-            loop {
+            for _ in 0..MAX_IMMEDIATE_ATTACH_READS {
                 match try_read_socket_bytes(&stream, &mut decoder)? {
                     TryAttachRead::Read => {}
                     TryAttachRead::Closed => {
@@ -399,7 +404,6 @@ pub(crate) async fn forward_attach(
             let pending_shutdown_requested = live_input.handler.request_shutdown_if_pending();
 
             tokio::select! {
-                biased;
                 result = shutdown.changed() => {
                     let _ = result;
                     if closing.load(Ordering::SeqCst) {
@@ -776,30 +780,31 @@ pub(crate) async fn forward_attach(
                         .await;
                 }
                 _ = wait_for_refresh_deadline(pending_escape_flush.deadline()) => {
-                    pending_escape_flush.clear();
-                    if locked {
-                        pending_input.clear();
-                        continue;
-                    }
-                    live_input
-                        .handler
-                        .flush_attached_pending_escape_input(
-                            live_input.attach_pid,
-                            &mut pending_input,
-                        )
-                        .await?;
-                    // Rerouting flushed remainder bytes can retain a fresh
-                    // ambiguous prefix (e.g. a second ESC ] inside the body);
-                    // re-arm its deadline now rather than waiting for the
-                    // next client read.
-                    sync_pending_escape_flush(
+                    flush_due_pending_escape_input(
                         &mut pending_escape_flush,
                         &live_input,
-                        &pending_input,
+                        &mut pending_input,
+                        locked,
                     )
-                    .await;
+                    .await?;
                 }
                 control = recv_attach_control(&mut deferred_controls, attach_controls.as_mut(), &control_backlog) => {
+                    // Dismissal publishes its persistent-overlay epoch before
+                    // the fresh base frame is ready. This select arm may have
+                    // already received a stale tree control while that epoch
+                    // advanced, so fence it again immediately before dispatch.
+                    synchronize_persistent_overlay_epoch(
+                        &persistent_overlay_epoch,
+                        &stream,
+                        &current_target,
+                        attach_controls.as_mut(),
+                        &mut deferred_controls,
+                        &control_backlog,
+                        &mut persistent_overlay,
+                        &mut persistent_overlay_visible,
+                        &mut persistent_overlay_state_id,
+                    )
+                    .await?;
                     match control {
                         Some(AttachControl::Detach) => {
                             log_attach_exit(
@@ -1354,6 +1359,40 @@ pub(crate) async fn forward_attach(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(unix, windows))]
+async fn synchronize_persistent_overlay_epoch(
+    persistent_overlay_epoch: &AtomicU64,
+    stream: &AttachTransport,
+    current_target: &types::OpenAttachTarget,
+    attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
+    deferred_controls: &mut VecDeque<AttachControl>,
+    control_backlog: &AtomicUsize,
+    persistent_overlay: &mut Option<Vec<u8>>,
+    persistent_overlay_visible: &mut bool,
+    persistent_overlay_state_id: &mut Option<u64>,
+) -> io::Result<()> {
+    let overlay_barrier = persistent_overlay_epoch.load(Ordering::SeqCst);
+    let previous_overlay_state_id = *persistent_overlay_state_id;
+    advance_persistent_overlay_state(
+        persistent_overlay_state_id,
+        attach_controls,
+        deferred_controls,
+        overlay_barrier,
+        control_backlog,
+    );
+    redraw_after_persistent_overlay_state_advance(
+        stream,
+        current_target,
+        persistent_overlay,
+        persistent_overlay_visible,
+        previous_overlay_state_id,
+        *persistent_overlay_state_id,
+        persistent_overlay_replacement_pending(deferred_controls, *persistent_overlay_state_id),
+    )
+    .await
+}
+
 #[cfg(any(unix, windows))]
 fn log_attach_exit(
     live_input: &LiveAttachInputContext,
@@ -1629,11 +1668,58 @@ async fn sync_pending_escape_flush(
     live_input: &LiveAttachInputContext,
     pending_input: &[u8],
 ) {
-    if !is_pending_escape(pending_input) {
+    if pending_input.is_empty() {
         pending_escape_flush.clear();
         return;
     }
     let escape_time = live_input.handler.attached_escape_time().await;
+    sync_pending_escape_flush_with_escape_time(pending_escape_flush, pending_input, escape_time);
+}
+
+#[cfg(any(unix, windows))]
+async fn flush_due_pending_escape_input(
+    pending_escape_flush: &mut PendingEscapeFlush,
+    live_input: &LiveAttachInputContext,
+    pending_input: &mut Vec<u8>,
+    locked: bool,
+) -> io::Result<()> {
+    if !pending_escape_deadline_due(pending_escape_flush) {
+        return Ok(());
+    }
+
+    pending_escape_flush.clear();
+    if locked {
+        pending_input.clear();
+        return Ok(());
+    }
+
+    live_input
+        .handler
+        .flush_attached_pending_escape_input(live_input.attach_pid, pending_input)
+        .await?;
+    // Rerouting flushed remainder bytes can retain a fresh ambiguous prefix
+    // (for example, a second ESC ] inside the body). Re-arm it immediately
+    // rather than waiting for another client read.
+    sync_pending_escape_flush(pending_escape_flush, live_input, pending_input).await;
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn pending_escape_deadline_due(pending_escape_flush: &PendingEscapeFlush) -> bool {
+    pending_escape_flush
+        .deadline()
+        .is_some_and(|deadline| deadline <= Instant::now())
+}
+
+#[cfg(any(unix, windows))]
+fn sync_pending_escape_flush_with_escape_time(
+    pending_escape_flush: &mut PendingEscapeFlush,
+    pending_input: &[u8],
+    escape_time: Duration,
+) {
+    // `PendingEscapeFlush` owns the retained-input grammar. Keeping the
+    // classifier out of this wrapper prevents the decoder/timer split-brain
+    // that previously dropped APC and numeric CSI deadlines here.
     pending_escape_flush.sync(pending_input, escape_time);
 }
 
@@ -1656,7 +1742,7 @@ async fn process_attach_socket_messages(
         stream,
         live_input,
         Some(current_target),
-        pending_input,
+        PendingAttachInputState::new(pending_input, pending_escape_flush),
         active_emit_cache,
         locked,
     )
@@ -1686,17 +1772,25 @@ async fn process_socket_messages(
     stream: &AttachTransport,
     live_input: &LiveAttachInputContext,
     mut current_target: Option<&mut types::OpenAttachTarget>,
-    pending_input: &mut Vec<u8>,
+    mut pending_input: PendingAttachInputState<'_>,
     active_emit_cache: &mut Option<(u64, rmux_proto::WindowTarget)>,
     locked: &mut bool,
 ) -> io::Result<bool> {
+    let (pending_input, pending_escape_flush) = pending_input.parts_mut();
     let mut forwarded_to_pane = false;
     let mut data_scratch = [0_u8; ATTACH_INPUT_STACK_PAYLOAD];
     loop {
-        while let Some(bytes) = decoder
-            .next_data_payload_into(&mut data_scratch)
-            .map_err(invalid_attach_message)?
-        {
+        loop {
+            if pending_escape_deadline_due(pending_escape_flush) {
+                return Ok(forwarded_to_pane);
+            }
+            let Some(bytes) = decoder
+                .next_data_payload_into(&mut data_scratch)
+                .map_err(invalid_attach_message)?
+            else {
+                break;
+            };
+            let retained_before = pending_input.len();
             forwarded_to_pane |= process_attach_data_payload(
                 live_input,
                 stream,
@@ -1707,13 +1801,22 @@ async fn process_socket_messages(
                 bytes,
             )
             .await?;
+            pending_escape_flush.observe_input_dispatch(
+                retained_before,
+                bytes.len(),
+                pending_input,
+            );
         }
 
+        if pending_escape_deadline_due(pending_escape_flush) {
+            return Ok(forwarded_to_pane);
+        }
         let Some(message) = decoder.next_message().map_err(invalid_attach_message)? else {
             break;
         };
         match message {
             AttachMessage::Data(bytes) => {
+                let retained_before = pending_input.len();
                 forwarded_to_pane |= process_attach_data_payload(
                     live_input,
                     stream,
@@ -1724,8 +1827,15 @@ async fn process_socket_messages(
                     &bytes,
                 )
                 .await?;
+                pending_escape_flush.observe_input_dispatch(
+                    retained_before,
+                    bytes.len(),
+                    pending_input,
+                );
             }
             AttachMessage::Keystroke(keystroke) => {
+                let retained_before = pending_input.len();
+                let appended = keystroke.bytes().len();
                 let keystroke_forwarded_to_pane = if *locked {
                     pending_input.clear();
                     false
@@ -1740,6 +1850,11 @@ async fn process_socket_messages(
                         )
                         .await?
                 };
+                pending_escape_flush.observe_input_dispatch(
+                    retained_before,
+                    appended,
+                    pending_input,
+                );
                 forwarded_to_pane |= keystroke_forwarded_to_pane;
                 let response = live_input
                     .handler

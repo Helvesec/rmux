@@ -8,6 +8,7 @@ use rmux_core::{
 };
 use rmux_proto::OptionName;
 
+use crate::copy_mode::{CopyModeOverlayRange, CopyModeRenderOverlays, CopyModeRenderSnapshot};
 use crate::format_runtime::RuntimeFormatContext;
 
 use super::{cursor_position_bytes, visible_pane_geometry, StatusGeometry};
@@ -24,6 +25,7 @@ pub(crate) fn render_pane_screen(
         pane,
         screen,
         PaneScreenCursorRestore::Pane,
+        None,
     )
 }
 
@@ -39,6 +41,39 @@ pub(crate) fn render_pane_screen_preserving_prompt_cursor(
         pane,
         screen,
         PaneScreenCursorRestore::Prompt,
+        None,
+    )
+}
+
+pub(crate) fn render_copy_mode_pane_screen(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+    snapshot: &CopyModeRenderSnapshot,
+) -> Vec<u8> {
+    render_pane_screen_with_cursor_restore(
+        session,
+        options,
+        pane,
+        &snapshot.screen,
+        PaneScreenCursorRestore::Pane,
+        Some(&snapshot.overlays),
+    )
+}
+
+pub(crate) fn render_copy_mode_pane_screen_preserving_prompt_cursor(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+    snapshot: &CopyModeRenderSnapshot,
+) -> Vec<u8> {
+    render_pane_screen_with_cursor_restore(
+        session,
+        options,
+        pane,
+        &snapshot.screen,
+        PaneScreenCursorRestore::Prompt,
+        Some(&snapshot.overlays),
     )
 }
 
@@ -54,6 +89,7 @@ fn render_pane_screen_with_cursor_restore(
     pane: &Pane,
     screen: &Screen,
     cursor_restore: PaneScreenCursorRestore,
+    copy_mode_overlays: Option<&CopyModeRenderOverlays>,
 ) -> Vec<u8> {
     let _render_span = crate::perf_instrument::span("render_compose")
         .with_str("site", "pane_screen")
@@ -70,8 +106,16 @@ fn render_pane_screen_with_cursor_restore(
 
     let sparse_full_width_clear = pane_geometry.x() == 0
         && pane_geometry.cols() == session.terminal_size().cols
-        && pane_default_style(session, options, pane).is_none();
-    let styled_screen = styled_pane_screen(session, options, pane, screen);
+        && pane_default_style(session, options, pane).is_none()
+        && copy_mode_overlays.is_none();
+    let styled_screen = copy_mode_overlays.map_or_else(
+        || styled_pane_screen(session, options, pane, screen),
+        |overlays| {
+            Cow::Owned(styled_copy_mode_pane_screen(
+                session, options, pane, screen, overlays,
+            ))
+        },
+    );
     let rendered = styled_screen.capture_transcript(
         ScreenCaptureRange::default(),
         GridRenderOptions {
@@ -154,11 +198,21 @@ pub(crate) fn pane_selection_overlay_style(
     options: &OptionStore,
     pane: &Pane,
 ) -> Option<String> {
+    pane_cell_overlay_style(session, options, pane, OptionName::CopyModeSelectionStyle)
+        .map(|style| rmux_core::style_tostring(&style))
+}
+
+fn pane_cell_overlay_style(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+    option: OptionName,
+) -> Option<Style> {
     let value = options.resolve_for_pane(
         session.name(),
         session.active_window_index(),
         pane.index(),
-        OptionName::CopyModeSelectionStyle,
+        option,
     )?;
     let context = FormatContext::from_session(session)
         .with_window(session.active_window_index(), session.window(), true, false)
@@ -170,7 +224,54 @@ pub(crate) fn pane_selection_overlay_style(
         .with_pane(pane);
     let style = super::apply_runtime_style_overlay(&Style::default(), Some(value), &runtime);
     let rendered = rmux_core::style_tostring(&style);
-    (!rendered.is_empty() && rendered != "default").then_some(rendered)
+    (!rendered.is_empty() && rendered != "default").then_some(style)
+}
+
+pub(crate) fn styled_copy_mode_pane_screen(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+    screen: &Screen,
+    overlays: &CopyModeRenderOverlays,
+) -> Screen {
+    let mut styled_screen = screen.clone();
+    if let Some(style) = pane_default_style(session, options, pane) {
+        styled_screen.overlay_default_style(&style);
+    }
+    if let (Some(range), Some(style)) = (
+        overlays.mark,
+        pane_cell_overlay_style(session, options, pane, OptionName::CopyModeMarkStyle),
+    ) {
+        overlay_copy_mode_range(&mut styled_screen, range, &style);
+    }
+    if let Some(style) =
+        pane_cell_overlay_style(session, options, pane, OptionName::CopyModeMatchStyle)
+    {
+        for range in &overlays.matches {
+            overlay_copy_mode_range(&mut styled_screen, *range, &style);
+        }
+    }
+    if let (Some(range), Some(style)) = (
+        overlays.current_match,
+        pane_cell_overlay_style(
+            session,
+            options,
+            pane,
+            OptionName::CopyModeCurrentMatchStyle,
+        ),
+    ) {
+        overlay_copy_mode_range(&mut styled_screen, range, &style);
+    }
+    if styled_screen.has_selected_cells() {
+        if let Some(style) = pane_selection_overlay_style(session, options, pane) {
+            styled_screen.overlay_style_on_selected(&style);
+        }
+    }
+    styled_screen
+}
+
+fn overlay_copy_mode_range(screen: &mut Screen, range: CopyModeOverlayRange, style: &Style) {
+    screen.overlay_style_on_row_range(range.row, range.start_x, range.end_x, style);
 }
 
 pub(crate) fn styled_pane_screen<'a>(

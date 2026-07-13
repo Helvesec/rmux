@@ -114,8 +114,9 @@ use target_resolution::{
 };
 use terminal_size::{build_terminal_size, current_terminal_size};
 use top_level::{
-    accept_compatibility_options, infer_client_utf8_from_env, top_level_parse_failure,
-    top_level_version_output, top_level_version_requested, validate_top_level_invocation,
+    accept_compatibility_options, infer_client_utf8_from_env, scan_claude_top_level_invocation,
+    top_level_parse_failure, top_level_version_output, top_level_version_requested,
+    validate_claude_top_level_invocation, validate_top_level_invocation,
 };
 
 const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
@@ -135,6 +136,8 @@ where
             top_level_version_output(invoked_as_tmux(&args)),
         ));
     }
+    let claude_invocation = scan_claude_top_level_invocation(args.get(1..).unwrap_or(&[]));
+    validate_claude_top_level_invocation(claude_invocation.as_ref())?;
     if let Some(invocation) = claude_launcher::parse_internal_runner(args.get(1..).unwrap_or(&[])) {
         return claude_launcher::run_internal_runner(invocation);
     }
@@ -144,11 +147,13 @@ where
     if let Some(invocation) = tmux_dropin::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return tmux_dropin::run(invocation, args.first());
     }
-    if let Some(invocation) = claude_skill::parse_invocation(args.get(1..).unwrap_or(&[]))? {
-        return claude_skill::run(invocation);
-    }
-    if let Some(invocation) = claude_launcher::parse_invocation(args.get(1..).unwrap_or(&[])) {
-        return claude_launcher::run(invocation);
+    if let Some(claude_invocation) = claude_invocation {
+        if let Some(invocation) = claude_skill::parse_invocation(claude_invocation.arguments())? {
+            return claude_skill::run(invocation);
+        }
+        return claude_launcher::run(claude_launcher::ClaudeInvocation::new(
+            claude_invocation.into_arguments(),
+        ));
     }
     if let Some(invocation) = capabilities::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return capabilities::run(invocation);
@@ -370,7 +375,7 @@ fn shell_command_token(token: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_has_start_server_flag, default_client_command, render_list_commands_line,
+        command_has_start_server_flag, default_client_command, render_list_commands_line, run,
         same_file_identity_for_paths, startup_config_from_cli, top_level_parse_failure,
         usable_shell_path, ServerStartupConfig,
     };
@@ -450,6 +455,63 @@ mod tests {
     fn top_level_preparse_does_not_parse_option_values_as_flags() {
         assert!(top_level_parse_failure(&args(&["-L", "-h", "list-sessions",])).is_none());
         assert!(top_level_parse_failure(&args(&["-Lhas-h", "list-sessions"])).is_none());
+    }
+
+    #[test]
+    fn claude_dispatch_rejects_top_level_modes_it_cannot_honor() {
+        for flag in ["-h", "-V"] {
+            let exit = run(args(&["rmux", flag, "claude"]))
+                .expect_err("top-level display option exits before extension dispatch");
+            assert_eq!(exit.exit_code(), 0, "{flag}");
+            assert!(
+                !exit.message().contains("not supported by the managed"),
+                "{flag} keeps top-level priority"
+            );
+        }
+
+        for values in [
+            &["rmux", "-D", "claude"][..],
+            &["rmux", "-c", "echo ignored", "claude", "install-skill"][..],
+            &["rmux", "-cecho ignored", "claude"][..],
+            &["rmux", "-u", "-D", "-N", "claude"][..],
+        ] {
+            let error = run(args(values)).expect_err("managed launcher mode must be rejected");
+            assert_eq!(error.exit_code(), 1, "{values:?}");
+            assert!(
+                error.message().contains("usage: rmux"),
+                "the scanner must reject the mode before external dispatch: {values:?}"
+            );
+        }
+
+        let no_start = run(args(&["rmux", "-N", "claude"]))
+            .expect_err("-N must not silently start a private server");
+        assert!(no_start.message().contains("-N is incompatible"));
+
+        let control = run(args(&["rmux", "-C", "claude"]))
+            .expect_err("-C must not silently launch an attached client");
+        assert!(control.message().contains("-C control mode"));
+
+        for (values, option) in [
+            (&["rmux", "-2", "claude"][..], "-2"),
+            (&["rmux", "-f", "config", "claude"][..], "-f"),
+            (&["rmux", "-f", "--unknown", "claude"][..], "-f"),
+            (&["rmux", "-l", "claude"][..], "-l"),
+            (&["rmux", "-Ldemo", "claude"][..], "-L"),
+            (&["rmux", "-S/path", "claude"][..], "-S"),
+            (&["rmux", "-TRGB", "claude"][..], "-T"),
+            (&["rmux", "-u", "claude"][..], "-u"),
+            (&["rmux", "-v", "claude"][..], "-v"),
+            (&["rmux", "-v", "-fconfig", "claude"][..], "-f"),
+            (&["rmux", "-u", "-v", "-fconfig", "claude"][..], "-f"),
+            (&["rmux", "-v", "-Ldemo", "claude"][..], "-L"),
+            (&["rmux", "-L", "-f", "claude"][..], "-L"),
+        ] {
+            let error = run(args(values)).expect_err("ignored option must be rejected");
+            assert!(
+                error.message().contains(option),
+                "diagnostic must name {option}: {error:?}"
+            );
+        }
     }
 
     #[test]

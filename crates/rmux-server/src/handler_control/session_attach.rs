@@ -75,6 +75,7 @@ impl RequestHandler {
                 session_name.clone(),
                 session_id,
                 None,
+                None,
             )
             .await
             .is_err()

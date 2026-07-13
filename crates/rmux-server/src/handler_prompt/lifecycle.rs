@@ -42,8 +42,8 @@ impl RequestHandler {
             }
             Err(error) => return Err(error),
         };
-        let attach_pid = match managed {
-            ManagedClient::Attach(attach_pid) => attach_pid,
+        let (attach_pid, attach_id) = match managed {
+            ManagedClient::Attach { pid, attach_id } => (pid, attach_id),
             ManagedClient::Control(_) => {
                 return Ok(PromptStartOutcome::Immediate);
             }
@@ -62,7 +62,7 @@ impl RequestHandler {
             )
         };
         let initial_dispatch = prompt.initial_incremental_dispatch();
-        let installed = self.install_prompt(attach_pid, prompt).await?;
+        let installed = self.install_prompt(attach_pid, attach_id, prompt).await?;
         if !installed {
             return Ok(PromptStartOutcome::Immediate);
         }
@@ -95,8 +95,8 @@ impl RequestHandler {
             }
             Err(error) => return Err(error),
         };
-        let attach_pid = match managed {
-            ManagedClient::Attach(attach_pid) => attach_pid,
+        let (attach_pid, attach_id) = match managed {
+            ManagedClient::Attach { pid, attach_id } => (pid, attach_id),
             ManagedClient::Control(_) => {
                 return Ok(PromptStartOutcome::Immediate);
             }
@@ -114,7 +114,7 @@ impl RequestHandler {
                 PromptStartOutcome::Waiting(rx),
             )
         };
-        if !self.install_prompt(attach_pid, prompt).await? {
+        if !self.install_prompt(attach_pid, attach_id, prompt).await? {
             return Ok(PromptStartOutcome::Immediate);
         }
         Ok(outcome)
@@ -123,6 +123,7 @@ impl RequestHandler {
     async fn install_prompt(
         &self,
         attach_pid: u32,
+        expected_attach_id: u64,
         prompt: ClientPromptState,
     ) -> Result<bool, RmuxError> {
         let (session_name, control_tx, render_generation, overlay_generation) = {
@@ -130,6 +131,10 @@ impl RequestHandler {
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| {
+                    active.id == expected_attach_id
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             if active.prompt.is_some() {
                 return Ok(false);
@@ -149,8 +154,13 @@ impl RequestHandler {
             render_generation,
             overlay_generation,
         )));
-        self.refresh_attached_client(attach_pid, &session_name)
-            .await;
+        self.refresh_attached_client_for_identity(
+            attach_pid,
+            expected_attach_id,
+            &session_name,
+            "command-prompt",
+        )
+        .await?;
         Ok(true)
     }
 

@@ -112,7 +112,10 @@ async fn pane_set_close_all_reports_per_pane_outcomes() -> TestResult {
         .await?;
     let root = session.pane(0, 0);
     let right = root.split(rmux_sdk::SplitDirection::Right).await?;
+    let right_id_before_reindex = right.id().await?.expect("right pane has an id");
     let down = root.split(rmux_sdk::SplitDirection::Down).await?;
+    let down_id = down.id().await?.expect("down pane has an id");
+    assert_ne!(right_id_before_reindex, down_id);
     let panes = PaneSet::new(vec![right, down]);
 
     let closed = panes.close_all().await;
@@ -127,7 +130,39 @@ async fn pane_set_close_all_reports_per_pane_outcomes() -> TestResult {
             }
         )
     }));
+    assert_eq!(
+        closed
+            .successes()
+            .iter()
+            .map(|success| success.pane_id())
+            .collect::<Vec<_>>(),
+        vec![Some(down_id), Some(right_id_before_reindex)],
+        "close_all must resolve destructive slot operations in caller order after recompression"
+    );
     assert!(root.exists().await?, "root pane should remain alive");
+
+    let neighbor = root.split(rmux_sdk::SplitDirection::Right).await?;
+    let neighbor_id = neighbor.id().await?.expect("neighbor pane has an id");
+    let neighbor_by_id = session.pane_by_id(neighbor_id).await?;
+    let duplicate = PaneSet::new(vec![neighbor_by_id.clone(), neighbor_by_id])
+        .close_all()
+        .await;
+    assert!(
+        duplicate.is_success(),
+        "duplicate stable close must stay idempotent: {duplicate:?}"
+    );
+    assert!(matches!(
+        duplicate.successes()[0].value(),
+        PaneCloseOutcome::Closed { .. }
+    ));
+    assert!(matches!(
+        duplicate.successes()[1].value(),
+        PaneCloseOutcome::AlreadyClosed { .. }
+    ));
+    assert!(
+        root.exists().await?,
+        "duplicate stable close must not retarget the surviving neighbor"
+    );
 
     harness.finish().await
 }

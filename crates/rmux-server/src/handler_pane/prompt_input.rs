@@ -1,5 +1,5 @@
 use super::super::prompt_support::{decode_prompt_key, PromptInputEvent};
-use crate::input_keys::{decode_extended_key, ExtendedKeyDecode};
+use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 
 pub(in crate::handler) fn decode_prompt_input_event(
     bytes: &[u8],
@@ -9,11 +9,13 @@ pub(in crate::handler) fn decode_prompt_input_event(
     }
 
     if bytes.starts_with(b"\x1b[<") {
-        let size = bytes
-            .iter()
-            .position(|byte| matches!(byte, b'M' | b'm'))
-            .map(|index| index + 1)?;
-        return Some((PromptInputEvent::KeyName("Mouse".to_owned()), size));
+        match decode_mouse(bytes, None) {
+            MouseDecode::Matched { size, .. } | MouseDecode::Discard { size } => {
+                return Some((PromptInputEvent::KeyName("Mouse".to_owned()), size));
+            }
+            MouseDecode::Partial | MouseDecode::Overlong => return None,
+            MouseDecode::Invalid => {}
+        }
     }
 
     if is_extended_key_prefix(bytes) {
@@ -205,6 +207,14 @@ mod tests {
     fn partial_mouse_sequence_returns_none() {
         let bytes = b"\x1b[<0;12;34";
         assert!(decode_prompt_input_event(bytes).is_none());
+    }
+
+    #[test]
+    fn invalid_mouse_prefix_does_not_poison_prompt_input() {
+        let bytes = b"\x1b[<a";
+        let (event, consumed) = decode_prompt_input_event(bytes).expect("invalid CSI resolves");
+        assert_eq!(consumed, bytes.len());
+        assert!(matches!(event, PromptInputEvent::Escape));
     }
 
     #[test]

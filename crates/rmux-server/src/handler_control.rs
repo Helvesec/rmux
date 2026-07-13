@@ -2,13 +2,17 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmux_core::LifecycleEvent;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::SessionId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-use super::{client_support::SwitchTargetSelection, QueuedLifecycleEvent, RequestHandler};
+use super::{
+    client_support::SwitchTargetSelection, update_environment_from_client, QueuedLifecycleEvent,
+    RequestHandler,
+};
 use crate::control::{ControlClientFlags, ControlModeUpgrade, ControlServerEvent};
 use crate::control_notifications::{collect_control_notifications, ControlClientSnapshot};
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
@@ -20,6 +24,23 @@ use crate::server_access::current_owner_uid;
 
 #[path = "handler_control/session_attach.rs"]
 mod session_attach;
+
+const CONTROL_QUEUE_DRAIN_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlRegistrationError {
+    QueueDrainTimedOut { requester_pid: u32 },
+}
+
+impl ControlRegistrationError {
+    pub(crate) fn into_rmux_error(self) -> rmux_proto::RmuxError {
+        match self {
+            Self::QueueDrainTimedOut { requester_pid } => rmux_proto::RmuxError::Server(format!(
+                "timed out waiting for the previous control queue for client {requester_pid} to drain"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct ActiveControlState {
@@ -41,6 +62,8 @@ pub(super) struct ActiveControl {
     pub(super) terminal_context: OuterTerminalContext,
     event_tx: mpsc::Sender<ControlServerEvent>,
     pub(super) closing: Arc<AtomicBool>,
+    queue_draining: bool,
+    queue_drain_finished: watch::Sender<bool>,
 }
 
 pub(crate) struct ControlRegistration {
@@ -52,9 +75,15 @@ pub(crate) struct ControlRegistration {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlQueueDrainLease {
+    Acquired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ManagedClient {
-    Attach(u32),
-    Control(u32),
+    Attach { pid: u32, attach_id: u64 },
+    Control(ControlClientIdentity),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +111,59 @@ impl ControlClientIdentity {
 
 tokio::task_local! {
     static CONTROL_QUEUE_IDENTITY: ControlClientIdentity;
+    static CONTROL_QUEUE_EOF_CANCELLATION: ControlQueueEofCancellation;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ControlQueueEofCancellation {
+    identity: ControlClientIdentity,
+    cancelled: watch::Sender<bool>,
+    wait_cancelled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) enum ControlQueueEofAction {
+    Continue,
+    StopFrame,
+}
+
+impl ControlQueueEofCancellation {
+    pub(crate) fn new(identity: ControlClientIdentity) -> Self {
+        let (cancelled, _receiver) = watch::channel(false);
+        Self {
+            identity,
+            cancelled,
+            wait_cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub(crate) fn cancel_for_eof(&self) {
+        self.cancelled.send_replace(true);
+    }
+
+    pub(in crate::handler) fn is_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
+    }
+
+    pub(in crate::handler) fn mark_wait_cancelled(&self) {
+        self.wait_cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn action(&self) -> ControlQueueEofAction {
+        if self.wait_cancelled.load(Ordering::SeqCst) {
+            ControlQueueEofAction::StopFrame
+        } else {
+            ControlQueueEofAction::Continue
+        }
+    }
+
+    pub(in crate::handler) async fn cancelled(&self) {
+        let mut receiver = self.cancelled.subscribe();
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
+    }
 }
 
 pub(crate) async fn with_control_queue_identity<T, F>(
@@ -94,6 +176,18 @@ where
     CONTROL_QUEUE_IDENTITY.scope(identity, future).await
 }
 
+pub(crate) async fn with_control_queue_eof_cancellation<T, F>(
+    cancellation: ControlQueueEofCancellation,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    CONTROL_QUEUE_EOF_CANCELLATION
+        .scope(cancellation, future)
+        .await
+}
+
 pub(in crate::handler) fn current_control_queue_identity(
     requester_pid: u32,
 ) -> Option<ControlClientIdentity> {
@@ -101,6 +195,33 @@ pub(in crate::handler) fn current_control_queue_identity(
         .try_with(|identity| (identity.requester_pid() == requester_pid).then_some(*identity))
         .ok()
         .flatten()
+}
+
+pub(in crate::handler) fn current_control_queue_eof_cancellation(
+) -> Option<ControlQueueEofCancellation> {
+    let identity = CONTROL_QUEUE_IDENTITY.try_with(|identity| *identity).ok()?;
+    CONTROL_QUEUE_EOF_CANCELLATION
+        .try_with(|cancellation| (cancellation.identity == identity).then(|| cancellation.clone()))
+        .ok()
+        .flatten()
+}
+
+pub(in crate::handler) fn control_queue_eof_action(
+    identity: Option<ControlClientIdentity>,
+) -> ControlQueueEofAction {
+    let identity = identity.or_else(|| CONTROL_QUEUE_IDENTITY.try_with(|identity| *identity).ok());
+    let Some(identity) = identity else {
+        return ControlQueueEofAction::Continue;
+    };
+    CONTROL_QUEUE_EOF_CANCELLATION
+        .try_with(|cancellation| {
+            if cancellation.identity == identity {
+                cancellation.action()
+            } else {
+                ControlQueueEofAction::Continue
+            }
+        })
+        .unwrap_or(ControlQueueEofAction::Continue)
 }
 
 impl RequestHandler {
@@ -124,6 +245,7 @@ impl RequestHandler {
             },
         )
         .await
+        .expect("test control registration must not outlive the bounded queue drain")
     }
 
     pub(crate) async fn register_control_with_access(
@@ -131,58 +253,153 @@ impl RequestHandler {
         requester_pid: u32,
         upgrade: ControlModeUpgrade,
         registration: ControlRegistration,
-    ) -> u64 {
-        let mut active_control = self.active_control.lock().await;
-        let control_id = active_control.next_id;
-        active_control.next_id += 1;
-        if let Some(previous) = active_control.by_pid.insert(
+    ) -> Result<u64, ControlRegistrationError> {
+        self.register_control_with_access_timeout(
             requester_pid,
-            ActiveControl {
-                id: control_id,
-                session_name: None,
-                session_id: None,
-                last_session: None,
-                last_session_id: None,
-                flags: ControlClientFlags::default(),
-                uid: registration.uid,
-                user: registration.user,
-                can_write: registration.can_write,
-                terminal_context: upgrade.terminal_context,
-                event_tx: registration.event_tx,
-                closing: registration.closing,
-            },
-        ) {
-            previous.closing.store(true, Ordering::SeqCst);
-            let _ = try_send_control_event(&previous, ControlServerEvent::Exit(None));
-        }
-        drop(active_control);
+            upgrade,
+            registration,
+            CONTROL_QUEUE_DRAIN_REGISTRATION_TIMEOUT,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn register_control_with_access_timeout_for_test(
+        &self,
+        requester_pid: u32,
+        upgrade: ControlModeUpgrade,
+        registration: ControlRegistration,
+        drain_timeout: Duration,
+    ) -> Result<u64, ControlRegistrationError> {
+        self.register_control_with_access_timeout(
+            requester_pid,
+            upgrade,
+            registration,
+            drain_timeout,
+        )
+        .await
+    }
+
+    async fn register_control_with_access_timeout(
+        &self,
+        requester_pid: u32,
+        upgrade: ControlModeUpgrade,
+        registration: ControlRegistration,
+        drain_timeout: Duration,
+    ) -> Result<u64, ControlRegistrationError> {
+        let drain_deadline = tokio::time::Instant::now() + drain_timeout;
+        let control_id = loop {
+            let mut active_control = self.active_control.lock().await;
+            let drain_finished = active_control
+                .by_pid
+                .get(&requester_pid)
+                .filter(|active| active.queue_draining)
+                .map(|active| active.queue_drain_finished.subscribe());
+            if let Some(mut drain_finished) = drain_finished {
+                drop(active_control);
+                if tokio::time::timeout_at(
+                    drain_deadline,
+                    drain_finished.wait_for(|finished| *finished),
+                )
+                .await
+                .is_err()
+                {
+                    return Err(ControlRegistrationError::QueueDrainTimedOut { requester_pid });
+                }
+                continue;
+            }
+
+            let control_id = active_control.next_id;
+            active_control.next_id += 1;
+            let (queue_drain_finished, _queue_drain_pending) = watch::channel(false);
+            if let Some(previous) = active_control.by_pid.insert(
+                requester_pid,
+                ActiveControl {
+                    id: control_id,
+                    session_name: None,
+                    session_id: None,
+                    last_session: None,
+                    last_session_id: None,
+                    flags: ControlClientFlags::default(),
+                    uid: registration.uid,
+                    user: registration.user,
+                    can_write: registration.can_write,
+                    terminal_context: upgrade.terminal_context,
+                    event_tx: registration.event_tx,
+                    closing: registration.closing,
+                    queue_draining: false,
+                    queue_drain_finished,
+                },
+            ) {
+                previous.closing.store(true, Ordering::SeqCst);
+                let _ = try_send_control_event(&previous, ControlServerEvent::Exit(None));
+            }
+            break control_id;
+        };
 
         for line in self.take_startup_config_error_notifications().await {
             self.send_control_notification_to(requester_pid, line).await;
         }
 
-        control_id
+        Ok(control_id)
+    }
+
+    pub(crate) async fn begin_control_queue_drain(
+        &self,
+        identity: ControlClientIdentity,
+    ) -> ControlQueueDrainLease {
+        let mut active_control = self.active_control.lock().await;
+        let Some(active) = active_control.by_pid.get_mut(&identity.requester_pid()) else {
+            return ControlQueueDrainLease::Unavailable;
+        };
+        if active.id != identity.control_id() {
+            return ControlQueueDrainLease::Unavailable;
+        }
+        // The active frame may itself have marked the control client closing
+        // immediately before EOF (for example by emitting Exit). Its exact
+        // registration still owns all already-accepted frames until the
+        // drain observes that Exit and stops.
+        active.queue_draining = true;
+        ControlQueueDrainLease::Acquired
+    }
+
+    pub(crate) async fn control_queue_identity_is_open(
+        &self,
+        identity: ControlClientIdentity,
+    ) -> bool {
+        let active_control = self.active_control.lock().await;
+        active_control
+            .by_pid
+            .get(&identity.requester_pid())
+            .is_some_and(|active| {
+                active.id == identity.control_id() && !active.closing.load(Ordering::SeqCst)
+            })
     }
 
     pub(crate) async fn finish_control(&self, requester_pid: u32, control_id: u64) {
-        let removed_session = {
+        let (removed, removed_session) = {
             let mut active_control = self.active_control.lock().await;
             if active_control
                 .by_pid
                 .get(&requester_pid)
                 .is_some_and(|active| active.id == control_id)
             {
-                active_control
+                let removed = active_control
                     .by_pid
                     .remove(&requester_pid)
-                    .and_then(|active| active.session_name.zip(active.session_id))
+                    .expect("validated control registration remains present");
+                removed.queue_drain_finished.send_replace(true);
+                (true, removed.session_name.zip(removed.session_id))
             } else {
-                None
+                (false, None)
             }
         };
         if let Some(session_identity) = removed_session {
             self.destroy_unattached_sessions(vec![session_identity])
                 .await;
+        }
+        if removed {
+            let _ = self.request_shutdown_if_pending();
         }
     }
 
@@ -207,23 +424,25 @@ impl RequestHandler {
         let attached_count = self.attached_count(session_name).await;
 
         match client {
-            ManagedClient::Attach(attach_pid) => {
+            ManagedClient::Attach {
+                pid: attach_pid,
+                attach_id,
+            } => {
                 let active_attach = self.active_attach.lock().await;
-                if active_attach
-                    .by_pid
-                    .get(&attach_pid)
-                    .is_some_and(|active| &active.session_name == session_name)
-                {
+                if active_attach.by_pid.get(&attach_pid).is_some_and(|active| {
+                    active.id == attach_id && &active.session_name == session_name
+                }) {
                     attached_count
                 } else {
                     attached_count.saturating_add(1)
                 }
             }
-            ManagedClient::Control(control_pid) => {
+            ManagedClient::Control(identity) => {
                 let active_control = self.active_control.lock().await;
                 if active_control
                     .by_pid
-                    .get(&control_pid)
+                    .get(&identity.requester_pid())
+                    .filter(|active| active.id == identity.control_id())
                     .and_then(|active| active.session_name.as_ref())
                     .is_some_and(|active| active == session_name)
                 {
@@ -385,29 +604,53 @@ impl RequestHandler {
                 requester_pid,
                 identity.control_id(),
             )?;
-            return Ok(ManagedClient::Control(requester_pid));
+            return Ok(ManagedClient::Control(identity));
         }
 
         {
             let active_attach = self.active_attach.lock().await;
-            if active_attach.by_pid.contains_key(&requester_pid) {
-                return Ok(ManagedClient::Attach(requester_pid));
+            if let Some(active) = active_attach
+                .by_pid
+                .get(&requester_pid)
+                .filter(|active| !active.closing.load(Ordering::SeqCst))
+            {
+                return Ok(ManagedClient::Attach {
+                    pid: requester_pid,
+                    attach_id: active.id,
+                });
             }
         }
         {
             let active_control = self.active_control.lock().await;
-            if active_control.by_pid.contains_key(&requester_pid) {
-                return Ok(ManagedClient::Control(requester_pid));
+            if let Some(active) = active_control
+                .by_pid
+                .get(&requester_pid)
+                .filter(|active| !active.closing.load(Ordering::SeqCst))
+            {
+                return Ok(ManagedClient::Control(ControlClientIdentity::new(
+                    requester_pid,
+                    active.id,
+                )));
             }
         }
 
         let attach_candidates = {
             let active_attach = self.active_attach.lock().await;
-            active_attach.by_pid.keys().copied().collect::<Vec<_>>()
+            active_attach
+                .by_pid
+                .iter()
+                .filter(|(_, active)| !active.closing.load(Ordering::SeqCst))
+                .map(|(&pid, active)| (pid, active.id))
+                .collect::<Vec<_>>()
         };
         let control_candidates = {
             let active_control = self.active_control.lock().await;
-            active_control.by_pid.keys().copied().collect::<Vec<_>>()
+            active_control
+                .by_pid
+                .iter()
+                .filter(|(_, active)| !active.closing.load(Ordering::SeqCst))
+                .map(|(&pid, active)| ControlClientIdentity::new(pid, active.id))
+                .collect::<Vec<_>>()
         };
 
         match attach_candidates.len() + control_candidates.len() {
@@ -416,8 +659,8 @@ impl RequestHandler {
             )),
             0 => Err(attached_client_required(command_name)),
             1 => {
-                if let Some(pid) = attach_candidates.first().copied() {
-                    Ok(ManagedClient::Attach(pid))
+                if let Some((pid, attach_id)) = attach_candidates.first().copied() {
+                    Ok(ManagedClient::Attach { pid, attach_id })
                 } else {
                     Ok(ManagedClient::Control(
                         control_candidates
@@ -496,6 +739,7 @@ impl RequestHandler {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -513,6 +757,7 @@ impl RequestHandler {
             Some(expected_session_id),
             None,
             None,
+            None,
         )
         .await
     }
@@ -524,6 +769,7 @@ impl RequestHandler {
         next_session_name: rmux_proto::SessionName,
         expected_session_id: SessionId,
         target_selection: Option<SwitchTargetSelection>,
+        client_environment: Option<&HashMap<String, String>>,
     ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
         self.set_control_session_with_expected_identity(
             requester_pid,
@@ -531,6 +777,7 @@ impl RequestHandler {
             Some(expected_session_id),
             Some(expected_control_id),
             target_selection,
+            client_environment,
         )
         .await
     }
@@ -542,6 +789,7 @@ impl RequestHandler {
         expected_session_id: Option<SessionId>,
         expected_control_id: Option<u64>,
         target_selection: Option<SwitchTargetSelection>,
+        client_environment: Option<&HashMap<String, String>>,
     ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
         let exact_client_identity = expected_control_id.is_some();
         let command_name = if exact_client_identity {
@@ -600,6 +848,11 @@ impl RequestHandler {
         if !delivered {
             active_control.by_pid.remove(&requester_pid);
             return Err(attached_client_required(command_name));
+        }
+        if let (Some(session_name), Some(client_environment)) =
+            (next_session_name.as_ref(), client_environment)
+        {
+            update_environment_from_client(&mut state, session_name, client_environment);
         }
         if let Some(selection) = target_selection.as_ref() {
             selection
@@ -682,6 +935,27 @@ impl RequestHandler {
             }
             try_send_control_event(active, ControlServerEvent::Refresh)
         });
+    }
+
+    pub(super) async fn refresh_control_client_for_identity(
+        &self,
+        identity: ControlClientIdentity,
+    ) -> Result<(), rmux_proto::RmuxError> {
+        let mut active_control = self.active_control.lock().await;
+        let Some(active) = active_control
+            .by_pid
+            .get_mut(&identity.requester_pid())
+            .filter(|active| {
+                active.id == identity.control_id() && !active.closing.load(Ordering::SeqCst)
+            })
+        else {
+            return Err(attached_client_required("refresh-client"));
+        };
+        if !try_send_control_event(active, ControlServerEvent::Refresh) {
+            active_control.by_pid.remove(&identity.requester_pid());
+            return Err(attached_client_required("refresh-client"));
+        }
+        Ok(())
     }
 
     pub(super) async fn exit_control_session_identity(

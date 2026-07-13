@@ -212,6 +212,62 @@ fi
 fixture_manifest="benches/perf/fixtures/MANIFEST.sha256"
 baseline_summary="$output_dir/baselines.md"
 
+repo_relative_path() {
+    local path="$1"
+    case "$path" in
+        "$repo_root")
+            printf '.'
+            ;;
+        "$repo_root"/*)
+            printf '%s' "${path#"$repo_root"/}"
+            ;;
+        *)
+            printf '%s' "$path"
+            ;;
+    esac
+}
+
+portable_binary="$(repo_relative_path "$binary")"
+portable_legacy_json="$(repo_relative_path "$legacy_json")"
+portable_legacy_summary="$(repo_relative_path "$legacy_summary")"
+portable_json_path="$(repo_relative_path "$json_path")"
+portable_baseline_summary="$(repo_relative_path "$baseline_summary")"
+portable_toolchain="$toolchain"
+case "$portable_toolchain" in
+    *"$repo_root"*)
+        portable_toolchain="${toolchain%% *} (workspace rust-toolchain.toml)"
+        ;;
+esac
+
+write_portable_source() {
+    python3 - "$legacy_json" "$repo_root" <<'PY'
+import json
+import sys
+
+source_path, repo_root = sys.argv[1:]
+with open(source_path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+repo_prefix = repo_root.rstrip("/") + "/"
+
+
+def scrub(value):
+    if isinstance(value, dict):
+        return {key: scrub(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    if isinstance(value, str):
+        if value == repo_root:
+            return "."
+        if value.startswith(repo_prefix):
+            return value[len(repo_prefix):]
+    return value
+
+
+json.dump(scrub(payload), sys.stdout, ensure_ascii=False, separators=(",", ":"))
+PY
+}
+
 target_json_line() {
     local name="$1"
     local status="$2"
@@ -235,16 +291,16 @@ target_json_line() {
     printf '  "environment": {"platform":%s,"kernel":%s,"machine":%s,"host_fingerprint":%s,"rustc":%s,"rustc_verbose":%s,"toolchain":%s,"allocator":%s,"cpu_governor":%s},\n' \
         "$(json_string "$platform")" "$(json_string "$kernel")" "$(json_string "$machine")" "$(json_string "$host_fingerprint")" \
         "$(json_string "$rustc_version")" "$(json_string "$rustc_verbose")" \
-        "$(json_string "$toolchain")" "$(json_string "$allocator")" "$(json_string "$cpu_governor")"
+        "$(json_string "$portable_toolchain")" "$(json_string "$allocator")" "$(json_string "$cpu_governor")"
     printf '  "versions": {"rmux":%s,"tmux":%s,"rustc":%s},\n' \
         "$(json_string "$rmux_version")" "$(json_string "$tmux_version")" "$(json_string "$rustc_version")"
-    printf '  "binary": {"path":%s,"size_bytes":%s},\n' "$(json_string "$binary")" "$binary_size_bytes"
+    printf '  "binary": {"path":%s,"size_bytes":%s},\n' "$(json_string "$portable_binary")" "$binary_size_bytes"
     printf '  "memory": {"rss_proxy_kib":%s,"status":%s,"note":%s},\n' \
         "$rss_proxy_kib" "$(json_string "$rss_proxy_status")" "$(json_string "$rss_proxy_note")"
     printf '  "parameters": {"iterations":%s,"line_count":%s},\n' "$iterations" "$line_count"
     printf '  "artifacts": {"schema1_json":%s,"schema1_summary":%s,"baseline_file":%s,"baseline_summary":%s,"fixture_manifest":%s},\n' \
-        "$(json_string "$legacy_json")" "$(json_string "$legacy_summary")" \
-        "$(json_string "$json_path")" "$(json_string "$baseline_summary")" "$(json_string "$fixture_manifest")"
+        "$(json_string "$portable_legacy_json")" "$(json_string "$portable_legacy_summary")" \
+        "$(json_string "$portable_json_path")" "$(json_string "$portable_baseline_summary")" "$(json_string "$fixture_manifest")"
     printf '  "required_targets": [\n'
     target_json_line "attach_render" "collected" "attach_render_${line_count}_line_scrollback" "PTY attach render until the final scrollback marker is visible"
     printf ',\n'
@@ -263,10 +319,16 @@ target_json_line() {
     printf '    %s\n' "$(json_string "Benchmarks must use a release artifact; debug binaries are rejected by perf-bench.sh and perf-baseline.sh.")"
     printf '  ],\n'
     printf '  "source": '
-    cat "$legacy_json"
+    write_portable_source
     printf '\n'
     printf '}\n'
 } >"$json_path"
+
+# A generated release baseline is not successful until the same fail-closed
+# validator used by release gates accepts its portable paths and identity.
+python3 scripts/check-perf-baseline.py \
+    "$json_path" \
+    --expected-platform "$platform" >&2
 
 {
     printf '# RMUX Perf Baseline\n\n'

@@ -13,7 +13,8 @@ use super::mode_tree_model::{
     ClientSnapshot, ModeTreeAction, ModeTreeBuild, ModeTreeClientState, ModeTreeItem, TreeDepth,
 };
 use super::mode_tree_order::{
-    client_item_id, finalize_mode_tree, pane_item_id, session_item_id, window_item_id,
+    buffer_item_id, client_item_id, finalize_mode_tree, pane_item_id, session_item_id,
+    window_item_id,
 };
 use super::mode_tree_render::mode_tree_list_rows;
 use super::mode_tree_selection::{clamp_scroll, ensure_selected_visible, normalize_selection};
@@ -126,12 +127,10 @@ impl RequestHandler {
         }
         if let Some(session) = state.sessions.session(&mode.session_name) {
             let rows = session.window().size().rows;
-            let status_on = state
+            let status = state
                 .options
-                .resolve(Some(session.name()), OptionName::Status)
-                .map(|value| value != "off")
-                .unwrap_or(true);
-            let usable = rows.saturating_sub(u16::from(status_on));
+                .resolve(Some(session.name()), OptionName::Status);
+            let usable = crate::status_lines::content_rows_for_status(status, rows);
             mode.last_list_rows = usize::from(mode_tree_list_rows(
                 usable,
                 build.visible.len(),
@@ -227,7 +226,7 @@ pub(super) fn build_buffer_items(
         if !matches_mode_tree_filter(mode, &line.1, line.2.as_deref()) {
             continue;
         }
-        let id = format!("buffer:{}", entry.name());
+        let id = buffer_item_id(entry.name(), entry.order());
         roots.push(id.clone());
         items.insert(
             id.clone(),
@@ -242,6 +241,7 @@ pub(super) fn build_buffer_items(
                 no_tag: false,
                 action: ModeTreeAction::Buffer {
                     name: entry.name().to_owned(),
+                    order: entry.order(),
                 },
             },
         );

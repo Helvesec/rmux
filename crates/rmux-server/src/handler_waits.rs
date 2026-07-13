@@ -142,7 +142,9 @@ impl ArmedSdkWait {
                     })
                 }
             }
-            SdkWaitOutcome::Cancelled => {
+            _ => {
+                // Unknown future terminal outcomes fail closed for an older
+                // server; only an explicit Matched result may report success.
                 guard.disarm();
                 Response::SdkWaitForOutput(SdkWaitForOutputResponse {
                     wait_id: self.wait_id,

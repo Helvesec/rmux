@@ -3,7 +3,9 @@ use std::io;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{RmuxError, TerminalGeometry, TerminalSize};
 
-use super::pane_support::retain_partial_attached_control_input;
+use super::pane_support::{
+    retain_partial_attached_escape_input, strip_bracketed_paste_markers_after_append,
+};
 use super::prompt_support::{decode_prompt_key, PromptInputEvent};
 use super::scripting_support::{QueueCommandAction, QueueExecutionContext};
 use super::RequestHandler;
@@ -113,6 +115,7 @@ impl RequestHandler {
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
     ) -> io::Result<AttachedOverlayInput> {
+        let new_input_at = pending_input.len();
         pending_input.extend_from_slice(bytes);
 
         let Some(overlay_route) = self.attached_overlay_route(attach_pid).await else {
@@ -131,9 +134,7 @@ impl RequestHandler {
                     ..
                 }
         ) {
-            let scrubbed = super::pane_support::strip_bracketed_paste_markers(pending_input);
-            pending_input.clear();
-            pending_input.extend_from_slice(&scrubbed);
+            strip_bracketed_paste_markers_after_append(pending_input, new_input_at);
         }
 
         if matches!(overlay_route, AttachedOverlayRoute::Popup { .. }) {
@@ -149,9 +150,9 @@ impl RequestHandler {
                             offset += size;
                         }
                         MouseDecode::Discard { size } => offset += size,
-                        MouseDecode::Partial => {
+                        MouseDecode::Partial | MouseDecode::Overlong => {
                             pending_input.drain(..offset);
-                            retain_partial_attached_control_input(
+                            retain_partial_attached_escape_input(
                                 "popup overlay mouse",
                                 pending_input,
                             )?;
@@ -168,7 +169,7 @@ impl RequestHandler {
                     AttachedKeyDecode::Matched { size, .. } => size,
                     AttachedKeyDecode::Partial => {
                         pending_input.drain(..offset);
-                        retain_partial_attached_control_input(
+                        retain_partial_attached_escape_input(
                             "popup overlay key input",
                             pending_input,
                         )?;
@@ -207,8 +208,8 @@ impl RequestHandler {
                     MouseDecode::Discard { size } => {
                         pending_input.drain(..size);
                     }
-                    MouseDecode::Partial => {
-                        retain_partial_attached_control_input("menu overlay mouse", pending_input)?;
+                    MouseDecode::Partial | MouseDecode::Overlong => {
+                        retain_partial_attached_escape_input("menu overlay mouse", pending_input)?;
                         return Ok(AttachedOverlayInput::Consumed);
                     }
                     MouseDecode::Invalid => {
@@ -232,7 +233,7 @@ impl RequestHandler {
                     (event, size)
                 }
                 AttachedKeyDecode::Partial => {
-                    retain_partial_attached_control_input(
+                    retain_partial_attached_escape_input(
                         "menu overlay prompt input",
                         pending_input,
                     )?;
@@ -242,7 +243,7 @@ impl RequestHandler {
                     let Some(decoded) =
                         super::pane_support::decode_prompt_input_event(pending_input)
                     else {
-                        retain_partial_attached_control_input(
+                        retain_partial_attached_escape_input(
                             "menu overlay prompt input",
                             pending_input,
                         )?;
@@ -430,21 +431,48 @@ impl RequestHandler {
         &self,
         attach_pid: u32,
     ) -> Result<(), RmuxError> {
-        let (overlay, control_tx, render_generation, overlay_generation) = {
+        self.refresh_interactive_overlay_with_expected_identity(attach_pid, None)
+            .await
+    }
+
+    pub(super) async fn refresh_interactive_overlay_for_client_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        session_name: &rmux_proto::SessionName,
+    ) -> Result<(), RmuxError> {
+        self.refresh_interactive_overlay_with_expected_identity(
+            attach_pid,
+            Some((expected_attach_id, session_name)),
+        )
+        .await
+    }
+
+    async fn refresh_interactive_overlay_with_expected_identity(
+        &self,
+        attach_pid: u32,
+        expected_identity: Option<(u64, &rmux_proto::SessionName)>,
+    ) -> Result<(), RmuxError> {
+        let (overlay, captured_attach_id, captured_session_name) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
+            if expected_identity.is_some_and(|(expected_attach_id, expected_session_name)| {
+                active.id != expected_attach_id
+                    || &active.session_name != expected_session_name
+                    || active.suspended
+                    || active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            }) {
+                return Err(crate::handler_support::attached_client_required(
+                    "refresh-client",
+                ));
+            }
             let Some(overlay) = active.overlay.clone() else {
                 return Ok(());
             };
-            (
-                overlay,
-                active.control_tx.clone(),
-                active.render_generation,
-                active.overlay_generation,
-            )
+            (overlay, active.id, active.session_name.clone())
         };
 
         let frame = overlay.render();
@@ -453,6 +481,25 @@ impl RequestHandler {
             .by_pid
             .get_mut(&attach_pid)
             .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
+        if active.id != captured_attach_id
+            || active.session_name != captured_session_name
+            || active.closing.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return expected_identity.map_or(Ok(()), |_| {
+                Err(crate::handler_support::attached_client_required(
+                    "refresh-client",
+                ))
+            });
+        }
+        if expected_identity.is_some_and(|(expected_attach_id, expected_session_name)| {
+            active.id != expected_attach_id
+                || &active.session_name != expected_session_name
+                || active.suspended
+        }) {
+            return Err(crate::handler_support::attached_client_required(
+                "refresh-client",
+            ));
+        }
         if active
             .overlay
             .as_ref()
@@ -462,11 +509,18 @@ impl RequestHandler {
             return Ok(());
         }
         active.overlay_generation = active.overlay_generation.saturating_add(1);
-        let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::persistent(
-            frame,
-            render_generation,
-            active.overlay_generation.max(overlay_generation),
-        )));
+        let delivered = active
+            .control_tx
+            .send(AttachControl::Overlay(OverlayFrame::persistent(
+                frame,
+                active.render_generation,
+                active.overlay_generation,
+            )));
+        if delivered.is_err() && expected_identity.is_some() {
+            return Err(crate::handler_support::attached_client_required(
+                "refresh-client",
+            ));
+        }
         Ok(())
     }
 

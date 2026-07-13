@@ -228,6 +228,147 @@ async fn windows_console_key_metadata_is_sent_with_single_chunk_input(
 }
 
 #[tokio::test]
+async fn repeated_windows_console_keys_are_sent_as_separate_structured_frames(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let mut server = scenario.take_server();
+    let input_tx = scenario.input_tx();
+    let repeated_key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 3);
+    let logical_key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 1);
+
+    input_tx
+        .send(super::super::input::AttachInput::with_windows_console_key(
+            b";".to_vec(),
+            repeated_key,
+        ))
+        .await
+        .expect("send repeated Ctrl+; input");
+
+    assert_eq!(
+        read_client_messages(&mut server, 3).await?,
+        vec![
+            AttachMessage::Keystroke(
+                AttachedKeystroke::new(b";".to_vec()).with_windows_console_key(logical_key)
+            );
+            3
+        ]
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+    Ok(())
+}
+
+#[test]
+fn repeated_input_counter_preserves_maximum_u16_without_expansion() {
+    let key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, u16::MAX);
+    let input = super::super::input::AttachInput::with_windows_console_key(b";".to_vec(), key);
+    let mut pending = PendingRepeatedAttachInput::new(input);
+
+    assert_eq!(pending.remaining, u16::MAX);
+    assert_eq!(pending.input.payload(), b";");
+    for _ in 1..u16::MAX {
+        assert!(!pending.consume_one());
+    }
+    assert!(pending.consume_one());
+}
+
+#[tokio::test]
+async fn maximum_console_key_repeat_does_not_starve_server_detach(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let actions = scenario.actions.clone();
+    let server = scenario.take_server();
+    let input_tx = scenario.input_tx();
+    let repeated_key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, u16::MAX);
+    let (mut server_reader, mut server_writer) = tokio::io::split(server);
+    let (first_repeat_tx, first_repeat_rx) = tokio::sync::oneshot::channel();
+
+    let drain = tokio::spawn(async move {
+        let mut decoder = AttachFrameDecoder::new();
+        let mut buffer = [0_u8; 4096];
+        let mut emitted_repeats = 0_u32;
+        let mut first_repeat_tx = Some(first_repeat_tx);
+
+        loop {
+            let bytes_read = server_reader
+                .read(&mut buffer)
+                .await
+                .expect("read repeated attach frames");
+            if bytes_read == 0 {
+                break;
+            }
+            decoder.push_bytes(&buffer[..bytes_read]);
+            while let Some(message) = decoder
+                .next_message()
+                .expect("decode repeated attach frame")
+            {
+                if matches!(message, AttachMessage::Keystroke(_)) {
+                    emitted_repeats += 1;
+                    if let Some(first_repeat_tx) = first_repeat_tx.take() {
+                        let _ = first_repeat_tx.send(());
+                    }
+                }
+            }
+        }
+
+        emitted_repeats
+    });
+
+    input_tx
+        .send(super::super::input::AttachInput::with_windows_console_key(
+            b";".to_vec(),
+            repeated_key,
+        ))
+        .await
+        .expect("send maximum repeated Ctrl+; input");
+    timeout(first_repeat_rx)
+        .await?
+        .map_err(|_| "attach stream ended before the first repeated key")?;
+
+    let detach = encode_attach_message(&AttachMessage::DetachKill)?;
+    timeout(server_writer.write_all(&detach)).await??;
+    actions
+        .wait_for_call("detach-kill", Duration::from_secs(1))
+        .await?;
+
+    scenario.join().await?;
+    let emitted_repeats = timeout(drain).await??;
+    assert!(emitted_repeats > 0, "repeat stream should have started");
+    assert!(
+        emitted_repeats < u32::from(u16::MAX),
+        "server detach must interrupt the repeat stream before all repeats are emitted"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_windows_console_keys_preserve_count_without_capability(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::with_windows_console_key(RecordingActions::default(), false);
+    let mut server = scenario.take_server();
+    let input_tx = scenario.input_tx();
+    let repeated_key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 3);
+
+    input_tx
+        .send(super::super::input::AttachInput::with_windows_console_key(
+            b";".to_vec(),
+            repeated_key,
+        ))
+        .await
+        .expect("send repeated Ctrl+; input");
+
+    assert_eq!(
+        read_client_messages(&mut server, 3).await?,
+        vec![AttachMessage::Keystroke(AttachedKeystroke::new(b";".to_vec())); 3]
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn windows_console_key_metadata_is_not_sent_when_capability_is_disabled(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut scenario = AttachScenario::with_windows_console_key(RecordingActions::default(), false);
@@ -1341,6 +1482,32 @@ async fn read_client_message(
             return Ok(message);
         }
     }
+}
+
+async fn read_client_messages(
+    stream: &mut tokio::io::DuplexStream,
+    expected_count: usize,
+) -> Result<Vec<AttachMessage>, Box<dyn std::error::Error>> {
+    let mut decoder = AttachFrameDecoder::new();
+    let mut messages = Vec::with_capacity(expected_count);
+    let mut buffer = [0_u8; 128];
+    while messages.len() < expected_count {
+        let bytes_read = timeout(stream.read(&mut buffer)).await??;
+        if bytes_read == 0 {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client stream closed before all responses",
+            )));
+        }
+        decoder.push_bytes(&buffer[..bytes_read]);
+        while messages.len() < expected_count {
+            let Some(message) = decoder.next_message()? else {
+                break;
+            };
+            messages.push(message);
+        }
+    }
+    Ok(messages)
 }
 
 async fn wait_for_blocking_output_start(

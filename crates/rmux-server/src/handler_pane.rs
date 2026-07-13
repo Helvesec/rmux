@@ -47,8 +47,10 @@ mod pane_transfer;
 #[path = "handler_pane/windows_console_sequence.rs"]
 mod pane_windows_console_sequence;
 
-pub(in crate::handler) use pane_attached_input::bracketed_paste::strip_bracketed_paste_markers;
-pub(super) use pane_attached_input::retain_partial_attached_control_input;
+pub(in crate::handler) use pane_attached_input::bracketed_paste::{
+    strip_bracketed_paste_markers, strip_bracketed_paste_markers_after_append,
+};
+pub(super) use pane_attached_input::retain_partial_attached_escape_input;
 pub(super) use pane_by_id::resolve_pane_target_ref;
 #[cfg(windows)]
 pub(in crate::handler) use pane_deferred_wait::format_references_pane_pid;

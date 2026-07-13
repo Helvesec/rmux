@@ -253,6 +253,10 @@ impl RequestHandler {
             )?;
             (current_target.clone(), target, snapshot)
         };
+        // Bridge registration through the in-process forwarder's final wire
+        // drain. Closing the last session removes the active-attach entry
+        // before the browser has received its terminal exit frame.
+        let attach_forwarder_guard = self.begin_attach_forwarder();
         let attach_id = self
             .register_attach_with_access(
                 attach_pid,
@@ -295,6 +299,8 @@ impl RequestHandler {
             )
             .await;
             task_handler.finish_attach(attach_pid, attach_id).await;
+            drop(attach_forwarder_guard);
+            let _ = task_handler.request_shutdown_if_pending();
             if let Err(error) = result {
                 tracing::debug!(attach_pid, "web session attach ended: {error}");
             }

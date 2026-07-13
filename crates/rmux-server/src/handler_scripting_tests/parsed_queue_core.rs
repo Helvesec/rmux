@@ -354,7 +354,8 @@ async fn register_control_client(
                 can_write,
             },
         )
-        .await;
+        .await
+        .expect("control registration succeeds");
     event_rx
 }
 

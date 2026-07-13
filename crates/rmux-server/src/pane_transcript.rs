@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::clock_mode::{ClockModeState, CLOCK_MODE_NAME};
-use crate::copy_mode::{CopyModeState, CopyModeSummary};
+use crate::copy_mode::{CopyModeRenderSnapshot, CopyModeState, CopyModeSummary};
 use rmux_core::{
     style::Style, GridRenderOptions, Screen, ScreenCaptureRange, TerminalPassthrough,
     TerminalScreen, Utf8Config,
@@ -414,6 +414,10 @@ impl PaneTranscript {
 
     pub(crate) fn copy_mode_render_screen(&self) -> Option<Screen> {
         self.copy_mode_state().map(CopyModeState::render_screen)
+    }
+
+    pub(crate) fn copy_mode_render_snapshot(&self) -> Option<CopyModeRenderSnapshot> {
+        self.copy_mode_state().map(CopyModeState::render_snapshot)
     }
 
     pub(crate) fn clear_copy_mode(&mut self) -> bool {

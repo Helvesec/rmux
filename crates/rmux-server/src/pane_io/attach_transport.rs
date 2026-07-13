@@ -71,11 +71,20 @@ impl AttachTransport {
     }
 
     pub(super) async fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all_with_timeout(bytes, ATTACH_WRITE_TIMEOUT)
+            .await
+    }
+
+    async fn write_all_with_timeout(
+        &self,
+        bytes: &[u8],
+        write_timeout: std::time::Duration,
+    ) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         let mut writer = self.writer.lock().await;
-        match timeout(ATTACH_WRITE_TIMEOUT, writer.write_all(bytes)).await {
+        match timeout(write_timeout, writer.write_all(bytes)).await {
             Err(_) => Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "attach client did not drain server output",
@@ -100,6 +109,32 @@ impl AttachTransport {
 impl From<LocalStream> for AttachTransport {
     fn from(stream: LocalStream) -> Self {
         Self::from_io(stream)
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    use super::AttachTransport;
+
+    #[tokio::test]
+    async fn saturated_non_reader_is_bounded_by_the_write_timeout() {
+        let (server, _non_reader) = tokio::io::duplex(1);
+        let transport = AttachTransport::from_io(server);
+        let started = Instant::now();
+
+        let error = transport
+            .write_all_with_timeout(&vec![b'x'; 4096], Duration::from_millis(25))
+            .await
+            .expect_err("a saturated attach peer must time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a non-reading attach peer must not hold shutdown indefinitely"
+        );
     }
 }
 

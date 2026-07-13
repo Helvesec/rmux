@@ -134,6 +134,45 @@ async fn batched_prompt_text_preserves_split_utf8_at_the_input_boundary() {
 }
 
 #[tokio::test]
+async fn timed_out_partial_prompt_mouse_resolves_as_escape() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let mut control_rx =
+        create_attached_session(&handler, requester_pid, "prompt-partial-mouse").await;
+    let parsed = parse_command("command-prompt -b -pname");
+    handler
+        .execute_parsed_commands_for_test(requester_pid, parsed)
+        .await
+        .expect("background command prompt starts");
+    let _ = recv_switch_frame_containing(&mut control_rx, "name ").await;
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b[<")
+        .await
+        .expect("partial prompt mouse input");
+    assert_eq!(pending_input, b"\x1b[<");
+    assert!(handler
+        .attached_prompt_render(requester_pid)
+        .await
+        .is_some());
+
+    handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("prompt escape timeout");
+
+    assert!(pending_input.is_empty());
+    assert!(
+        handler
+            .attached_prompt_render(requester_pid)
+            .await
+            .is_none(),
+        "the timeout must cancel the prompt rather than retain input forever"
+    );
+}
+
+#[tokio::test]
 async fn command_prompt_renders_prompt_and_executes_substituted_command() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
@@ -159,6 +198,49 @@ async fn command_prompt_renders_prompt_and_executes_substituted_command() {
         .expect("prompt task join")
         .expect("prompt command output");
     assert_eq!(output.stdout(), b"value=delta\n");
+}
+
+#[tokio::test]
+async fn rename_session_rekeys_the_active_prompt_execution_context() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("prompt-rename-alpha");
+    let beta = session_name("prompt-rename-beta");
+    let mut control_rx = create_attached_session(&handler, requester_pid, alpha.as_str()).await;
+    let parsed = parse_command("command-prompt -pgo { display-message -p '#{session_name}' }");
+    let context = super::scripting_support::QueueExecutionContext::without_caller_cwd()
+        .with_implicit_current_target(Some(rmux_proto::Target::Pane(rmux_proto::PaneTarget::new(
+            alpha.clone(),
+            0,
+        ))));
+    let handler_task = handler.clone();
+    let join = tokio::spawn(async move {
+        handler_task
+            .execute_parsed_commands(requester_pid, parsed, context)
+            .await
+    });
+    let _ = recv_switch_frame_containing(&mut control_rx, "go ").await;
+
+    let response = handler
+        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+            target: alpha,
+            new_name: beta.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RenameSession(_)),
+        "{response:?}"
+    );
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\r")
+        .await
+        .expect("renamed prompt accepts input");
+
+    let output = join
+        .await
+        .expect("prompt task join")
+        .expect("prompt context resolves after rename");
+    assert_eq!(output.stdout(), format!("{beta}\n").as_bytes());
 }
 
 #[tokio::test]

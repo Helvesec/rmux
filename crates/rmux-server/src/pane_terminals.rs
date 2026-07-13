@@ -57,7 +57,7 @@ mod pipes;
 mod rollback;
 #[path = "pane_terminals/session_mutation.rs"]
 mod session_mutation;
-pub(in crate::pane_terminals) use session_mutation::SessionTransferSnapshot;
+pub(crate) use session_mutation::SessionTransferSnapshot;
 #[path = "pane_terminals/session_runtime.rs"]
 mod session_runtime;
 #[path = "pane_terminals/window_indices.rs"]
@@ -215,6 +215,8 @@ pub(crate) struct HandlerState {
     input_disabled_panes: HashSet<PaneId>,
     #[cfg(test)]
     pane_input_captures: StdMutex<HashMap<String, Vec<u8>>>,
+    #[cfg(test)]
+    window_runtime_resize_count: u64,
     dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
     marked_pane: Option<MarkedPane>,
     pipes: PanePipeStore,
@@ -361,6 +363,11 @@ impl HandlerState {
         session_name: &SessionName,
     ) -> Option<TerminalPixels> {
         self.attached_terminal_pixels.get(session_name).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn window_runtime_resize_count_for_test(&self) -> u64 {
+        self.window_runtime_resize_count
     }
 
     pub(crate) fn add_message(&mut self, message: impl Into<String>) {

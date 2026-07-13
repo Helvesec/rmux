@@ -161,40 +161,80 @@ impl RequestHandler {
         pane_id: PaneId,
         generation: Option<u64>,
     ) {
-        let _dispatch = self.pane_alert_dispatch.lock().await;
-        let prepared = {
+        let (prepared, silence_resets) = {
+            // EOF publication has already drained every reader event for this
+            // pane. Serialize only the coalescer take and state-backed
+            // preparation. Reset silence while the observation order is still
+            // serialized, then release the dispatch lock before lifecycle
+            // hooks that may wait on arbitrary commands.
+            let _dispatch = self.pane_alert_dispatch.lock().await;
             let mut state = self.state.lock().await;
             let pending = self
                 .pane_alert_coalescer
                 .lock()
                 .expect("pane alert coalescer mutex must not be poisoned")
                 .take_for_pane_generation(pane_id, generation);
-            pending.and_then(|event| self.prepare_pane_alert_event_locked(&mut state, event))
+            let prepared = pending
+                .and_then(|event| self.prepare_pane_alert_event_locked(&mut state, event))
+                .into_iter()
+                .collect::<Vec<_>>();
+            let silence_resets =
+                self.reset_prepared_pane_alert_silence_locked(&mut state, &prepared);
+            (prepared, silence_resets)
         };
-        let Some(prepared) = prepared else {
+        if prepared.is_empty() {
             return;
-        };
+        }
         let refreshes = self
-            .apply_prepared_pane_alert_events_before_exit(vec![prepared])
+            .apply_prepared_pane_alert_events_before_exit(prepared, silence_resets)
             .await;
         for session_name in refreshes {
             self.refresh_attached_session(&session_name).await;
         }
     }
 
+    fn reset_prepared_pane_alert_silence_locked(
+        &self,
+        state: &mut crate::pane_terminals::HandlerState,
+        prepared_events: &[PreparedPaneAlertEvent],
+    ) -> HashSet<WindowId> {
+        let mut reset_windows = HashSet::new();
+        for prepared in prepared_events {
+            let has_activity = prepared
+                .alert_flags
+                .as_ref()
+                .is_some_and(|flags| flags.intersects(WINDOW_ACTIVITY.union(WINDOW_BELL)));
+            if !has_activity || reset_windows.contains(&prepared.identity.window_id) {
+                continue;
+            }
+            let Some(pane_target) = prepared.identity.resolve(state) else {
+                continue;
+            };
+            let target = WindowTarget::with_window(
+                pane_target.session_name().clone(),
+                pane_target.window_index(),
+            );
+            if self.reset_window_family_silence_locked(state, &target) {
+                reset_windows.insert(prepared.identity.window_id);
+            }
+        }
+        reset_windows
+    }
+
     pub(in crate::handler) async fn apply_prepared_pane_alert_events(
         &self,
         prepared_events: Vec<PreparedPaneAlertEvent>,
     ) -> HashSet<SessionName> {
-        self.apply_prepared_pane_alert_events_with_dispatch(prepared_events, false)
+        self.apply_prepared_pane_alert_events_with_dispatch(prepared_events, false, HashSet::new())
             .await
     }
 
     async fn apply_prepared_pane_alert_events_before_exit(
         &self,
         prepared_events: Vec<PreparedPaneAlertEvent>,
+        silence_resets: HashSet<WindowId>,
     ) -> HashSet<SessionName> {
-        self.apply_prepared_pane_alert_events_with_dispatch(prepared_events, true)
+        self.apply_prepared_pane_alert_events_with_dispatch(prepared_events, true, silence_resets)
             .await
     }
 
@@ -202,6 +242,7 @@ impl RequestHandler {
         &self,
         prepared_events: Vec<PreparedPaneAlertEvent>,
         wait_for_lifecycle_hooks: bool,
+        silence_resets: HashSet<WindowId>,
     ) -> HashSet<SessionName> {
         let mut inactive_refresh_session_ids = HashSet::new();
         let mut window_alerts = HashMap::<WindowId, PendingStableWindowAlert>::new();
@@ -236,6 +277,7 @@ impl RequestHandler {
             let mut plans = Vec::new();
             let mut automatic_name_refreshes = HashSet::new();
             for (window_id, pending) in window_alerts {
+                let silence_was_reset = silence_resets.contains(&window_id);
                 let mut flags = AlertFlags::empty();
                 let mut representative_identity = None;
                 for (pane_identity, event_flags) in pending.events {
@@ -289,7 +331,7 @@ impl RequestHandler {
                         .get(family_target.session_name())
                         .copied()
                         .unwrap_or(0);
-                    let family_plans = if position == 0 {
+                    let family_plans = if position == 0 && !silence_was_reset {
                         self.alerts_queue_window_locked(
                             &mut state,
                             family_target,

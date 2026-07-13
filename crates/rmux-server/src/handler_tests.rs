@@ -47,6 +47,9 @@ mod split_before;
 #[path = "handler_tests/rename_session.rs"]
 mod rename_session;
 
+#[path = "handler_tests/rename_session_retained_output.rs"]
+mod rename_session_retained_output;
+
 #[path = "handler_tests/lists_and_hooks.rs"]
 mod lists_and_hooks;
 

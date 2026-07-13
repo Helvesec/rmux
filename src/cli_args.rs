@@ -198,6 +198,52 @@ where
     Cli::from_raw(raw, parsed_commands)
 }
 
+/// Result of parsing only the clap-owned top-level prefix and opaque command
+/// tail. Extensions use this before command-queue parsing so they share the
+/// exact same short-option cluster and value-boundary rules as the main CLI.
+#[derive(Debug)]
+pub(crate) struct TopLevelCommandScan {
+    pub(crate) assume_256_colors: bool,
+    pub(crate) control_mode: u8,
+    pub(crate) no_fork: bool,
+    pub(crate) shell_command: Option<String>,
+    pub(crate) config_files: Vec<PathBuf>,
+    pub(crate) login_shell: bool,
+    pub(crate) socket_name: Option<OsString>,
+    pub(crate) no_start_server: bool,
+    pub(crate) socket_path: Option<OsString>,
+    pub(crate) terminal_features: Vec<String>,
+    pub(crate) utf8: bool,
+    pub(crate) verbose: u8,
+    pub(crate) command: Vec<OsString>,
+}
+
+pub(crate) fn scan_top_level_command(
+    arguments: &[OsString],
+) -> Result<TopLevelCommandScan, clap::Error> {
+    let args = std::iter::once(OsString::from("rmux"))
+        .chain(arguments.iter().cloned())
+        .collect::<Vec<_>>();
+    let args = normalize_top_level_attached_short_values(args);
+    let matches = RawCli::command().try_get_matches_from(args)?;
+    let raw = RawCli::from_arg_matches(&matches)?;
+    Ok(TopLevelCommandScan {
+        assume_256_colors: raw.assume_256_colors,
+        control_mode: raw.control_mode,
+        no_fork: raw.no_fork,
+        shell_command: raw.shell_command,
+        config_files: raw.config_files,
+        login_shell: raw.login_shell,
+        socket_name: raw.socket_name,
+        no_start_server: raw.no_start_server,
+        socket_path: raw.socket_path,
+        terminal_features: raw.terminal_features,
+        utf8: raw.utf8,
+        verbose: raw.verbose,
+        command: raw.command,
+    })
+}
+
 fn normalize_top_level_attached_short_values<I>(args: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = OsString>,

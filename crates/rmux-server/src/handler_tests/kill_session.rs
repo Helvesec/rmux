@@ -438,6 +438,136 @@ async fn exit_empty_shutdown_retries_after_state_lock_contention() {
 }
 
 #[tokio::test]
+async fn exit_empty_shutdown_waits_for_last_session_control_cleanup() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+    let alpha = session_name("exit-empty-control-alpha");
+    let requester_pid = 42_461;
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+    let session_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .expect("session exists")
+        .id();
+    let (event_tx, mut event_rx) = mpsc::channel(1);
+    let closing = Arc::new(AtomicBool::new(false));
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: rmux_proto::ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::clone(&closing),
+        )
+        .await;
+    handler
+        .set_control_session_identity(requester_pid, alpha.clone(), session_id)
+        .await
+        .expect("control attaches to the last session");
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(crate::control::ControlServerEvent::SessionChanged(Some(ref session_name)))
+            if session_name == &alpha
+    ));
+
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: alpha.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    assert!(
+        !handler.request_shutdown_if_pending(),
+        "bound control cleanup defers rather than cancels exit-empty"
+    );
+    tokio::time::timeout(Duration::from_millis(20), &mut shutdown_rx)
+        .await
+        .expect_err("shutdown waits for exact control cleanup");
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("last-session lifecycle closes the control"),
+        Some(crate::control::ControlServerEvent::Exit(_))
+    ));
+    assert!(closing.load(std::sync::atomic::Ordering::SeqCst));
+    handler.finish_control(requester_pid, control_id).await;
+
+    tokio::time::timeout(Duration::from_millis(200), shutdown_rx)
+        .await
+        .expect("finish-control re-evaluates pending exit-empty")
+        .expect("shutdown receiver completes cleanly");
+}
+
+#[tokio::test]
+async fn exit_empty_shutdown_is_cancelled_by_live_unattached_control() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+    let alpha = session_name("exit-empty-unattached-control-alpha");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+    let (event_tx, _event_rx) = mpsc::channel(1);
+    let control_id = handler
+        .register_control_with_closing(
+            42_462,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: rmux_proto::ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: alpha,
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    assert!(
+        !handler.request_shutdown_if_pending(),
+        "a live unattached control makes exit-empty stale"
+    );
+    handler.finish_control(42_462, control_id).await;
+    tokio::time::timeout(Duration::from_millis(100), &mut shutdown_rx)
+        .await
+        .expect_err("a cancelled exit-empty request must not revive on control cleanup");
+}
+
+#[tokio::test]
 async fn exit_empty_does_not_downgrade_pending_kill_server_shutdown() {
     let handler = RequestHandler::new();
     let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();

@@ -227,7 +227,6 @@ impl RequestHandler {
             affected_sessions,
             destroyed_sessions,
             removed_subscription_keys,
-            subscription_rekeys,
             removed_pane_ids,
             resize_targets,
             layout_window,
@@ -299,6 +298,16 @@ impl RequestHandler {
                             subscription_rekeys.push((previous_key, current_key));
                         }
                     }
+                    #[cfg(test)]
+                    super::super::pane_family_lifecycle_tests::pause_before_pane_kill_subscription_rekey(
+                        &session_name,
+                    )
+                    .await;
+                    // Keep the runtime-owner mutation and its registry rekey
+                    // in one state -> subscriptions transaction. Otherwise a
+                    // later B -> C owner transfer can commit before this
+                    // operation's delayed A -> B rekey and strand records on B.
+                    self.rekey_pane_output_subscriptions(&subscription_rekeys);
                     let resize_targets = result
                         .response
                         .window_destroyed
@@ -324,7 +333,6 @@ impl RequestHandler {
                         affected_sessions,
                         destroyed_sessions,
                         removed_subscription_keys,
-                        subscription_rekeys,
                         result.removed_pane_ids,
                         resize_targets,
                         layout_window,
@@ -339,7 +347,6 @@ impl RequestHandler {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    Vec::new(),
                     layout_window,
                     None,
                 ),
@@ -347,7 +354,6 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::KillPane(_)) {
-            self.rekey_pane_output_subscriptions(&subscription_rekeys);
             match after_hook_target {
                 Some(target) => self.queue_exact_pane_inline_hook(
                     HookName::AfterKillPane,

@@ -9,7 +9,8 @@ use rmux_proto::{
 use super::pane_support::format_references_pane_pid;
 use super::{
     attach_support::surviving_attached_resize_targets, client_environment_snapshot,
-    client_spawn_environment, scripting_support::render_start_directory_template, RequestHandler,
+    client_spawn_environment, scripting_support::render_start_directory_template,
+    PaneOutputSubscriptionKeySnapshot, RequestHandler,
 };
 use crate::hook_runtime::{hooks_disabled, PendingInlineHookFormat};
 use crate::pane_terminals::{
@@ -219,11 +220,22 @@ impl RequestHandler {
         request: rmux_proto::KillWindowRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
-        let (response, removed_windows, removed_pane_ids, lifecycle_events, resize_window_ids) = {
+        let (
+            response,
+            removed_windows,
+            removed_pane_ids,
+            lifecycle_events,
+            resize_window_ids,
+            subscriptions_removed,
+        ) = {
             let mut state = self.state.lock().await;
             if let Err(error) = super::require_expected_window_identity(&state, &request.target) {
                 return Response::Error(ErrorResponse { error });
             }
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
+                &state,
+                std::slice::from_ref(&session_name),
+            );
             let active_window_ids_before = active_window_ids_by_session(&state);
             let timer_sessions = state
                 .sessions
@@ -275,12 +287,16 @@ impl RequestHandler {
                         .extend(changed_active_window_ids(&active_window_ids_before, &state));
                     resize_window_ids.sort_by_key(|window_id| window_id.as_u32());
                     resize_window_ids.dedup();
+                    let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
+                        subscription_keys.reconcile_after(&state),
+                    );
                     (
                         Response::KillWindow(result.response),
                         result.removed_windows,
                         result.removed_pane_ids,
                         lifecycle_events,
                         resize_window_ids,
+                        subscriptions_removed,
                     )
                 }
                 Err(error) => (
@@ -289,9 +305,14 @@ impl RequestHandler {
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
+                    false,
                 ),
             }
         };
+
+        if subscriptions_removed {
+            let _ = self.request_shutdown_if_pending();
+        }
 
         if matches!(response, Response::KillWindow(_)) {
             self.pause_before_window_lifecycle_emit().await;
@@ -667,8 +688,16 @@ impl RequestHandler {
             mut refresh_sessions,
             resize_window_ids,
             linked_event,
+            subscriptions_removed,
         ) = {
             let mut state = self.state.lock().await;
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
+                &state,
+                &[
+                    request.source.session_name().clone(),
+                    request.target.session_name().clone(),
+                ],
+            );
             let active_window_ids_before = active_window_ids_by_session(&state);
             let mut resize_window_ids = [
                 state
@@ -735,12 +764,16 @@ impl RequestHandler {
                             target: Some(result.response.target.clone()),
                         },
                     );
+                    let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
+                        subscription_keys.reconcile_after(&state),
+                    );
                     (
                         Response::LinkWindow(result.response),
                         result.removed_pane_ids,
                         refresh_sessions,
                         resize_window_ids,
                         linked_event,
+                        subscriptions_removed,
                     )
                 }
                 Err(error) => (
@@ -749,9 +782,14 @@ impl RequestHandler {
                     Vec::new(),
                     Vec::new(),
                     None,
+                    false,
                 ),
             }
         };
+
+        if subscriptions_removed {
+            let _ = self.request_shutdown_if_pending();
+        }
 
         if matches!(response, Response::LinkWindow(_)) {
             self.forget_pane_snapshot_coalescers(&removed_destination_pane_ids);
@@ -790,8 +828,23 @@ impl RequestHandler {
         request: rmux_proto::MoveWindowRequest,
     ) -> Response {
         self.pause_before_window_lifecycle_mutation().await;
-        let (response, removed_destination_pane_ids, effects) = {
+        let (response, removed_destination_pane_ids, effects, subscriptions_removed) = {
             let mut state = self.state.lock().await;
+            let mut subscription_roots = request
+                .source
+                .as_ref()
+                .map(|source| vec![source.session_name().clone()])
+                .unwrap_or_default();
+            match &request.target {
+                rmux_proto::MoveWindowTarget::Session(session_name) => {
+                    subscription_roots.push(session_name.clone());
+                }
+                rmux_proto::MoveWindowTarget::Window(target) => {
+                    subscription_roots.push(target.session_name().clone());
+                }
+            }
+            let subscription_keys =
+                PaneOutputSubscriptionKeySnapshot::capture_related(&state, &subscription_roots);
             let effects = MoveWindowEffects::capture(&state, &request);
             let timer_overrides = move_window_timer_target_overrides(&state, &request);
             let mut timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
@@ -819,16 +872,29 @@ impl RequestHandler {
                         Vec::new(),
                         &[],
                     );
+                    let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
+                        subscription_keys.reconcile_after(&state),
+                    );
                     let effects = effects.prepare_success(&mut state, &result.response);
                     (
                         Response::MoveWindow(result.response),
                         result.removed_pane_ids,
                         Some(effects),
+                        subscriptions_removed,
                     )
                 }
-                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new(), None),
+                Err(error) => (
+                    Response::Error(ErrorResponse { error }),
+                    Vec::new(),
+                    None,
+                    false,
+                ),
             }
         };
+
+        if subscriptions_removed {
+            let _ = self.request_shutdown_if_pending();
+        }
 
         if let Some(effects) = effects {
             self.forget_pane_snapshot_coalescers(&removed_destination_pane_ids);
@@ -844,8 +910,19 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         self.pause_before_window_lifecycle_mutation().await;
-        let (response, removed_pane_ids, refresh_sessions, resize_targets, lifecycle_event) = {
+        let (
+            response,
+            removed_pane_ids,
+            refresh_sessions,
+            resize_targets,
+            lifecycle_event,
+            subscriptions_removed,
+        ) = {
             let mut state = self.state.lock().await;
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
+                &state,
+                std::slice::from_ref(&session_name),
+            );
             let mut refresh_sessions = state
                 .window_linked_session_family_list(&session_name, request.target.window_index());
             let linked_targets =
@@ -900,12 +977,16 @@ impl RequestHandler {
                             },
                         ))
                     };
+                    let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
+                        subscription_keys.reconcile_after(&state),
+                    );
                     (
                         Response::UnlinkWindow(result.response),
                         result.removed_pane_ids,
                         refresh_sessions,
                         resize_targets,
                         lifecycle_event,
+                        subscriptions_removed,
                     )
                 }
                 Err(error) => (
@@ -914,9 +995,14 @@ impl RequestHandler {
                     Vec::new(),
                     Vec::new(),
                     None,
+                    false,
                 ),
             }
         };
+
+        if subscriptions_removed {
+            let _ = self.request_shutdown_if_pending();
+        }
 
         if matches!(response, Response::UnlinkWindow(_)) {
             self.pause_before_window_lifecycle_emit().await;
@@ -946,6 +1032,13 @@ impl RequestHandler {
     ) -> Response {
         let (response, mut refresh_sessions, resize_window_ids) = {
             let mut state = self.state.lock().await;
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
+                &state,
+                &[
+                    request.source.session_name().clone(),
+                    request.target.session_name().clone(),
+                ],
+            );
             let active_window_ids_before = active_window_ids_by_session(&state);
             let mut resize_window_ids = [&request.source, &request.target]
                 .into_iter()
@@ -1001,6 +1094,7 @@ impl RequestHandler {
                         .extend(changed_active_window_ids(&active_window_ids_before, &state));
                     resize_window_ids.sort_by_key(|window_id| window_id.as_u32());
                     resize_window_ids.dedup();
+                    self.rekey_pane_output_subscriptions(&subscription_keys.rekeys_after(&state));
                     (
                         Response::SwapWindow(response),
                         refresh_sessions,
@@ -1132,8 +1226,12 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let attached_count = self.attached_count(&session_name).await;
-        let (response, removed_pane_ids) = {
+        let (response, removed_pane_ids, subscriptions_removed, refresh_sessions) = {
             let mut state = self.state.lock().await;
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
+                &state,
+                std::slice::from_ref(&session_name),
+            );
             request.start_directory = match render_start_directory_template(
                 &state,
                 &Target::Window(target),
@@ -1161,20 +1259,36 @@ impl RequestHandler {
                 Ok(result) => {
                     self.record_panes_closed_as_killed(&result.removed_pane_ids);
                     self.record_pane_respawn_boundary(result.retained_pane_id);
+                    let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
+                        subscription_keys.reconcile_after(&state),
+                    );
                     (
                         Response::RespawnWindow(result.response),
                         result.removed_pane_ids,
+                        subscriptions_removed,
+                        result.refresh_sessions,
                     )
                 }
-                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
+                Err(error) => (
+                    Response::Error(ErrorResponse { error }),
+                    Vec::new(),
+                    false,
+                    Vec::new(),
+                ),
             }
         };
+
+        if subscriptions_removed {
+            let _ = self.request_shutdown_if_pending();
+        }
 
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
         }
         if matches!(&response, Response::RespawnWindow(_)) {
-            self.refresh_attached_session(&session_name).await;
+            for refresh_session in refresh_sessions {
+                self.refresh_attached_session(&refresh_session).await;
+            }
         }
 
         response

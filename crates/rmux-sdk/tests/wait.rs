@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use rmux_proto::{
     encode_frame, CancelSdkWaitResponse, CommandOutput, FrameDecoder, HandshakeResponse,
-    HasSessionRequest, ListPanesResponse, PaneOutputSubscriptionStart, PaneSnapshotCell,
-    PaneSnapshotCursor, PaneSnapshotResponse, Request, Response, SdkWaitForOutputRequest,
-    SdkWaitForOutputResponse, SdkWaitOutcome, CAPABILITY_SDK_WAITS_ARMED,
+    HasSessionRequest, ListPanesResponse, PaneId, PaneOutputSubscriptionStart, PaneSnapshotCell,
+    PaneSnapshotCursor, PaneSnapshotResponse, PaneTargetRef, Request, Response,
+    SdkWaitForOutputRefRequest, SdkWaitForOutputResponse, SdkWaitOutcome,
+    CAPABILITY_SDK_WAITS_ARMED,
 };
 use rmux_sdk::{EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -588,33 +589,49 @@ async fn accept_peer(listener: &UnixListener) -> TestResult<Peer> {
 async fn accept_sdk_wait(
     listener: &UnixListener,
     expected_bytes: &[u8],
-) -> TestResult<(Peer, Vec<Peer>, SdkWaitForOutputRequest)> {
+) -> TestResult<(Peer, Vec<Peer>, SdkWaitForOutputRefRequest)> {
     let mut peers = Vec::new();
-    let (mut main_index, mut request) =
-        expect_request_from_existing_or_new(listener, &mut peers, Duration::from_secs(1)).await?;
-    if let Request::Handshake(handshake) = &request {
-        assert!(
-            handshake
-                .required_capabilities
-                .iter()
-                .any(|capability| capability == CAPABILITY_SDK_WAITS_ARMED),
-            "armed SDK wait handshake did not require {CAPABILITY_SDK_WAITS_ARMED}: {handshake:?}"
-        );
-        peers[main_index]
-            .write_response(Response::Handshake(HandshakeResponse::current()))
-            .await?;
-        (main_index, request) =
+    let mut saw_armed_handshake = false;
+    loop {
+        let (peer_index, request) =
             expect_request_from_existing_or_new(listener, &mut peers, Duration::from_secs(1))
                 .await?;
+        match request {
+            Request::Handshake(handshake) => {
+                saw_armed_handshake |= handshake
+                    .required_capabilities
+                    .iter()
+                    .any(|capability| capability == CAPABILITY_SDK_WAITS_ARMED);
+                peers[peer_index]
+                    .write_response(Response::Handshake(HandshakeResponse::current()))
+                    .await?;
+            }
+            Request::ListPanes(request) => {
+                assert_eq!(request.target, session_name());
+                assert_eq!(request.target_window_index, Some(0));
+                peers[peer_index]
+                    .write_response(Response::ListPanes(ListPanesResponse {
+                        output: CommandOutput::from_stdout("0:0:%1\n"),
+                    }))
+                    .await?;
+            }
+            Request::SdkWaitForOutputRef(request) => {
+                assert!(
+                    saw_armed_handshake,
+                    "SDK wait transport did not require {CAPABILITY_SDK_WAITS_ARMED}"
+                );
+                assert_eq!(
+                    request.target,
+                    PaneTargetRef::by_id(session_name(), PaneId::new(1))
+                );
+                assert_eq!(request.bytes, expected_bytes);
+                assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
+                let main = peers.swap_remove(peer_index);
+                return Ok((main, peers, request));
+            }
+            request => panic!("wait_for must use server-side SDK byte wait, got {request:?}"),
+        }
     }
-    let main = peers.swap_remove(main_index);
-    let Request::SdkWaitForOutput(request) = request else {
-        panic!("wait_for must use server-side SDK byte wait, got {request:?}");
-    };
-    assert_eq!(request.target, target().to_proto());
-    assert_eq!(request.bytes, expected_bytes);
-    assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
-    Ok((main, peers, request))
 }
 
 async fn expect_sdk_cancel_request(

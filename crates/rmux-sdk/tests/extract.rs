@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_frame, CommandOutput, DisplayMessageResponse, ErrorResponse, FrameDecoder, LayoutName,
-    ListPanesResponse, ListSessionsRequest, ListSessionsResponse, ListWindowsResponse,
+    encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse, LayoutName,
+    ListPanesResponse, ListSessionsRequest, ListSessionsResponse, ListWindowsResponse, PaneId,
     PaneOutputCursor, PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice,
     PaneOutputLagResponse, PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneRecentOutput,
-    PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse, Request, Response,
+    PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse, PaneTargetRef, Request, Response,
     RmuxError as ProtoError, SubscribePaneOutputResponse, TerminalSize, WindowListEntry,
     WindowTarget,
 };
@@ -168,12 +168,7 @@ async fn collect_output_until_exit_caps_raw_bytes_and_records_lag() -> TestResul
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
 
-        let request = peer.expect_request().await?;
-        let Request::SubscribePaneOutput(request) = request else {
-            panic!("collection must subscribe to raw pane output, got {request:?}");
-        };
-        assert_eq!(request.target, target().to_proto());
-        assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
+        expect_output_subscription(&mut peer, PaneOutputSubscriptionStart::Now).await?;
         let subscription_id = PaneOutputSubscriptionId::new(11);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
@@ -263,11 +258,7 @@ async fn collect_output_until_exit_observes_exit_with_empty_live_subscription() 
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
 
-        let request = peer.expect_request().await?;
-        let Request::SubscribePaneOutput(request) = request else {
-            panic!("collection must subscribe to raw pane output, got {request:?}");
-        };
-        assert_eq!(request.target, target().to_proto());
+        expect_output_subscription(&mut peer, PaneOutputSubscriptionStart::Now).await?;
         let subscription_id = PaneOutputSubscriptionId::new(13);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
@@ -319,11 +310,7 @@ async fn collect_output_until_exit_returns_after_post_subscribe_exit_observation
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
 
-        let request = peer.expect_request().await?;
-        let Request::SubscribePaneOutput(request) = request else {
-            panic!("collection must subscribe to raw pane output, got {request:?}");
-        };
-        assert_eq!(request.target, target().to_proto());
+        expect_output_subscription(&mut peer, PaneOutputSubscriptionStart::Now).await?;
         let subscription_id = PaneOutputSubscriptionId::new(12);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
@@ -370,11 +357,7 @@ async fn collect_output_until_exit_drains_final_output_after_exit_observation() 
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
 
-        let request = peer.expect_request().await?;
-        let Request::SubscribePaneOutput(request) = request else {
-            panic!("collection must subscribe to raw pane output, got {request:?}");
-        };
-        assert_eq!(request.target, target().to_proto());
+        expect_output_subscription(&mut peer, PaneOutputSubscriptionStart::Now).await?;
         let subscription_id = PaneOutputSubscriptionId::new(14);
         peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
@@ -442,11 +425,7 @@ async fn collect_output_until_exit_starting_at_oldest_uses_requested_cursor() ->
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
-        let request = peer.expect_request().await?;
-        let Request::SubscribePaneOutput(request) = request else {
-            panic!("collection must subscribe to raw pane output, got {request:?}");
-        };
-        assert_eq!(request.start, PaneOutputSubscriptionStart::Oldest);
+        expect_output_subscription(&mut peer, PaneOutputSubscriptionStart::Oldest).await?;
         peer.write_response(Response::Error(ErrorResponse {
             error: ProtoError::InvalidTarget {
                 value: target().to_proto().to_string(),
@@ -475,11 +454,7 @@ async fn collect_output_until_exit_propagates_foreign_invalid_target() -> TestRe
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
-        let request = peer.expect_request().await?;
-        let Request::SubscribePaneOutput(request) = request else {
-            panic!("collection must subscribe to raw pane output, got {request:?}");
-        };
-        assert_eq!(request.target, target().to_proto());
+        expect_output_subscription(&mut peer, PaneOutputSubscriptionStart::Now).await?;
         peer.write_response(Response::Error(ErrorResponse {
             error: ProtoError::InvalidTarget {
                 value: "other:0.0".to_owned(),
@@ -543,6 +518,31 @@ async fn expect_cursor(peer: &mut Peer, expected: PaneOutputSubscriptionId) -> T
     Ok(())
 }
 
+async fn expect_output_subscription(
+    peer: &mut Peer,
+    expected_start: PaneOutputSubscriptionStart,
+) -> TestResult {
+    expect_list_panes(peer).await?;
+
+    let request = peer.expect_request().await?;
+    let Request::Handshake(_) = request else {
+        panic!("pane-output subscription must probe by-id capability, got {request:?}");
+    };
+    peer.write_response(Response::Handshake(HandshakeResponse::current()))
+        .await?;
+
+    let request = peer.expect_request().await?;
+    let Request::SubscribePaneOutputRef(request) = request else {
+        panic!("collection must subscribe to raw pane output by id, got {request:?}");
+    };
+    assert_eq!(
+        request.target,
+        PaneTargetRef::by_id(session_name(), PaneId::new(1))
+    );
+    assert_eq!(request.start, expected_start);
+    Ok(())
+}
+
 async fn expect_list_panes(peer: &mut Peer) -> TestResult {
     let request = peer.expect_request().await?;
     let Request::ListPanes(request) = request else {
@@ -562,16 +562,24 @@ async fn expect_info_probe(peer: &mut Peer, details_line: String) -> TestResult 
     expect_list_panes(peer).await?;
 
     let request = peer.expect_request().await?;
-    let Request::DisplayMessage(request) = request else {
-        panic!("exit probe must read pane details with display-message, got {request:?}");
+    let Request::ListPanes(request) = request else {
+        panic!("exit probe must read pane details with list-panes, got {request:?}");
     };
+    assert_eq!(request.target, session_name());
+    assert_eq!(request.target_window_index, None);
     assert_eq!(
-        request.target,
-        Some(rmux_proto::Target::Pane(target().to_proto()))
+        request.format.as_deref(),
+        Some(
+            "#{pane_id}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\
+             \t#{pane_width}\t#{pane_height}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\
+             \t#{cursor_shape}\t#{history_bytes}\t#{history_size}\t#{pane_start_command}\
+             \t#{pane_lifecycle_generation}\t#{pane_lifecycle_revision}\t#{pane_output_sequence}\
+             \t#{pane_start_path}"
+        )
     );
-    peer.write_response(Response::DisplayMessage(
-        DisplayMessageResponse::from_output(CommandOutput::from_stdout(details_line)),
-    ))
+    peer.write_response(Response::ListPanes(ListPanesResponse {
+        output: CommandOutput::from_stdout(details_line),
+    }))
     .await
 }
 

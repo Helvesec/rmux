@@ -10,8 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, RmuxError,
-    TerminalSize,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke,
+    AttachedWindowsConsoleKey, RmuxError, TerminalSize,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -44,6 +44,24 @@ const ATTACH_OUTPUT_BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
 const ATTACH_OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const ATTACH_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_RENDER_MAX_PENDING: Duration = Duration::from_millis(8);
+
+struct PendingRepeatedAttachInput {
+    input: super::input::AttachInput,
+    remaining: u16,
+}
+
+impl PendingRepeatedAttachInput {
+    fn new(input: super::input::AttachInput) -> Self {
+        let remaining = input.repeat_count();
+        debug_assert!(remaining > 1);
+        Self { input, remaining }
+    }
+
+    fn consume_one(&mut self) -> bool {
+        self.remaining -= 1;
+        self.remaining == 0
+    }
+}
 
 pub(super) async fn drive_async_attach<Reader, Writer, Output>(
     reader: Reader,
@@ -103,6 +121,7 @@ where
     let mut pending_actions = 0_usize;
     let mut input_open = true;
     let mut resize_open = true;
+    let mut pending_repeated_input: Option<PendingRepeatedAttachInput> = None;
     let mut output = AttachOutputQueue::spawn(output);
     let mut output_failure_rx = output.take_failure_notifications();
 
@@ -135,7 +154,25 @@ where
                 }
                 output.check_failure()?;
             }
-            input = input_rx.recv(), if input_open => {
+            _ = std::future::ready(()), if pending_repeated_input.is_some() => {
+                if locked.is_locked() {
+                    pending_repeated_input = None;
+                    continue;
+                }
+                let pending = pending_repeated_input
+                    .as_mut()
+                    .expect("guarded repeated attach input remains present");
+                write_attach_input_once(
+                    &mut writer,
+                    &pending.input,
+                    windows_console_key_enabled,
+                )
+                .await?;
+                if pending.consume_one() {
+                    pending_repeated_input = None;
+                }
+            }
+            input = input_rx.recv(), if input_open && pending_repeated_input.is_none() => {
                 let Some(input) = input else {
                     input_open = false;
                     continue;
@@ -143,23 +180,15 @@ where
                 if locked.is_locked() {
                     continue;
                 }
-                let input_bytes = input.payload();
-                let windows_console_key = if windows_console_key_enabled {
-                    input.windows_console_key()
+                if input.repeat_count() > 1 {
+                    pending_repeated_input = Some(PendingRepeatedAttachInput::new(input));
                 } else {
-                    None
-                };
-                for chunk in super::input::attach_input_chunks(input_bytes) {
-                    let mut keystroke = AttachedKeystroke::new(chunk.to_vec());
-                    if chunk.len() == input_bytes.len() {
-                        if let Some(key) = windows_console_key {
-                            keystroke = keystroke.with_windows_console_key(key);
-                        }
-                    }
-                    write_async_attach_message(
+                    write_attach_input_once(
                         &mut writer,
-                        AttachMessage::Keystroke(keystroke),
-                    ).await?;
+                        &input,
+                        windows_console_key_enabled,
+                    )
+                    .await?;
                 }
             }
             size = resize_rx.recv(), if resize_open => {
@@ -234,6 +263,44 @@ where
         (_, Err(error)) => Err(error),
         (result, Ok(())) => result,
     }
+}
+
+async fn write_attach_input_once<Writer>(
+    writer: &mut Writer,
+    input: &super::input::AttachInput,
+    windows_console_key_enabled: bool,
+) -> std::result::Result<(), ClientError>
+where
+    Writer: tokio::io::AsyncWrite + Unpin,
+{
+    let input_bytes = input.payload();
+    let windows_console_key = if windows_console_key_enabled {
+        input
+            .windows_console_key()
+            .map(single_repeat_windows_console_key)
+    } else {
+        None
+    };
+    for chunk in super::input::attach_input_chunks(input_bytes) {
+        let mut keystroke = AttachedKeystroke::new(chunk.to_vec());
+        if chunk.len() == input_bytes.len() {
+            if let Some(key) = windows_console_key {
+                keystroke = keystroke.with_windows_console_key(key);
+            }
+        }
+        write_async_attach_message(&mut *writer, AttachMessage::Keystroke(keystroke)).await?;
+    }
+    Ok(())
+}
+
+fn single_repeat_windows_console_key(key: AttachedWindowsConsoleKey) -> AttachedWindowsConsoleKey {
+    AttachedWindowsConsoleKey::new(
+        key.virtual_key_code(),
+        key.virtual_scan_code(),
+        key.unicode_char(),
+        key.control_key_state(),
+        1,
+    )
 }
 
 async fn finish_attach_output(

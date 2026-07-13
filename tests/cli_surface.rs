@@ -1482,7 +1482,12 @@ fn control_stdin_queue_routes_named_inventory_start_server_and_new_window_flags(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    child.stdin.take().expect("control stdin").write_all(
+    let mut stdin = child.stdin.take().expect("control stdin");
+    let stdout = child.stdout.take().expect("control stdout");
+    let stderr = child.stderr.take().expect("control stderr");
+    let (stdout_buffer, stdout_thread) = spawn_pipe_collector(stdout);
+    let (_stderr_buffer, stderr_thread) = spawn_pipe_collector(stderr);
+    stdin.write_all(
         concat!(
             "start-server\n",
             "list-commands -F '#{command_list_name}|#{command_list_usage}' send-keys\n",
@@ -1501,11 +1506,20 @@ fn control_stdin_queue_routes_named_inventory_start_server_and_new_window_flags(
         )
         .as_bytes(),
     )?;
-    let output = child.wait_with_output()?;
+    stdin.flush()?;
+    wait_for_output_condition(
+        &stdout_buffer,
+        ATTACH_TIMEOUT,
+        "control queue explicit exit",
+        |rendered| rendered.contains("%exit\n"),
+    )?;
+    drop(stdin);
+    let status = wait_for_child_status(&mut child, ATTACH_TIMEOUT)?;
+    let rendered = String::from_utf8(read_pipe_output(stdout_thread, "stdout")?)?;
+    let stderr = String::from_utf8(read_pipe_output(stderr_thread, "stderr")?)?;
 
-    assert_eq!(output.status.code(), Some(0));
-    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
-    let rendered = stdout(&output);
+    assert_eq!(status.code(), Some(0));
+    assert!(stderr.is_empty(), "stderr={stderr:?}");
     for expected in [
         "send-keys|[-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]",
         "set-buffer|[-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]",
@@ -1928,7 +1942,7 @@ fn nested_cli_commands_inherit_calling_pane_target() -> Result<(), Box<dyn Error
     let binary = shell_quote_str(env!("CARGO_BIN_EXE_rmux"));
     let command = format!(
         "sleep 1; {binary} display-message -p '#{{session_name}}:#{{pane_id}}' > {} 2>/dev/null; \
-         {binary} split-window -d \"sh -c 'printf nested > {}; sleep 2'\"; sleep 2",
+         {binary} split-window -d \"sh -c 'printf nested > {}; sleep 30'\"; sleep 30",
         shell_quote(&display_path),
         shell_quote(&split_marker)
     );

@@ -24,7 +24,14 @@ struct TreeKillSortKey {
     pane_id: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleTreeKillPolicy {
+    Error,
+    Skip,
+}
+
 impl RequestHandler {
+    #[cfg(test)]
     pub(super) async fn perform_tree_kill_current(&self, attach_pid: u32) -> Result<(), RmuxError> {
         let mut mode = {
             let active_attach = self.active_attach.lock().await;
@@ -49,6 +56,7 @@ impl RequestHandler {
             .await
     }
 
+    #[cfg(test)]
     pub(super) async fn perform_tree_kill_tagged(&self, attach_pid: u32) -> Result<(), RmuxError> {
         let mut mode = {
             let active_attach = self.active_attach.lock().await;
@@ -68,13 +76,41 @@ impl RequestHandler {
             .filter(|item| mode.tagged.contains(&item.id))
             .map(|item| item.action.clone())
             .collect::<Vec<_>>();
-        self.perform_tree_kill_actions(attach_pid, actions).await
+        self.perform_tree_kill_tagged_actions(attach_pid, actions)
+            .await
     }
 
     pub(super) async fn perform_tree_kill_actions(
         &self,
         attach_pid: u32,
+        actions: Vec<ModeTreeAction>,
+    ) -> Result<(), RmuxError> {
+        self.perform_tree_kill_actions_with_stale_policy(
+            attach_pid,
+            actions,
+            StaleTreeKillPolicy::Error,
+        )
+        .await
+    }
+
+    pub(super) async fn perform_tree_kill_tagged_actions(
+        &self,
+        attach_pid: u32,
+        actions: Vec<ModeTreeAction>,
+    ) -> Result<(), RmuxError> {
+        self.perform_tree_kill_actions_with_stale_policy(
+            attach_pid,
+            actions,
+            StaleTreeKillPolicy::Skip,
+        )
+        .await
+    }
+
+    async fn perform_tree_kill_actions_with_stale_policy(
+        &self,
+        attach_pid: u32,
         mut actions: Vec<ModeTreeAction>,
+        stale_policy: StaleTreeKillPolicy,
     ) -> Result<(), RmuxError> {
         actions.sort_by_key(tree_kill_sort_key);
         let mut stable_targets = BTreeSet::new();
@@ -82,7 +118,12 @@ impl RequestHandler {
             tree_kill_stable_identity(action).is_none_or(|identity| stable_targets.insert(identity))
         });
         for action in actions {
-            let response = match action {
+            if stale_policy == StaleTreeKillPolicy::Skip
+                && !self.tree_kill_action_identity_is_current(&action).await
+            {
+                continue;
+            }
+            let response = match &action {
                 ModeTreeAction::TreeTarget {
                     session_name,
                     session_id,
@@ -97,8 +138,8 @@ impl RequestHandler {
                     });
                     self.dispatch_mode_tree_session_request(
                         attach_pid,
-                        session_name,
-                        session_id,
+                        session_name.clone(),
+                        *session_id,
                         request,
                     )
                     .await
@@ -113,17 +154,17 @@ impl RequestHandler {
                     ..
                 } => {
                     let request = Request::KillWindow(KillWindowRequest {
-                        target: WindowTarget::with_window(session_name.clone(), window_index),
+                        target: WindowTarget::with_window(session_name.clone(), *window_index),
                         kill_all_others: false,
                     });
                     self.dispatch_mode_tree_window_request(
                         attach_pid,
                         ExpectedWindowOccurrenceIdentity::new(
-                            session_name,
-                            session_id,
-                            window_index,
-                            window_id,
-                            window_occurrence_id,
+                            session_name.clone(),
+                            *session_id,
+                            *window_index,
+                            *window_id,
+                            *window_occurrence_id,
                         ),
                         request,
                     )
@@ -139,17 +180,17 @@ impl RequestHandler {
                     pane_id: Some(pane_id),
                 } => {
                     let request = Request::PaneKill(PaneKillRequest {
-                        target: PaneTargetRef::by_id(session_name.clone(), pane_id),
+                        target: PaneTargetRef::by_id(session_name.clone(), *pane_id),
                         kill_all_except: false,
                     });
                     self.dispatch_mode_tree_window_request(
                         attach_pid,
                         ExpectedWindowOccurrenceIdentity::new(
-                            session_name,
-                            session_id,
-                            window_index,
-                            window_id,
-                            window_occurrence_id,
+                            session_name.clone(),
+                            *session_id,
+                            *window_index,
+                            *window_id,
+                            *window_occurrence_id,
                         ),
                         request,
                     )
@@ -167,6 +208,12 @@ impl RequestHandler {
                 | ModeTreeAction::CustomizeKey { .. } => continue,
             };
             if let Response::Error(error) = response {
+                if stale_policy == StaleTreeKillPolicy::Skip
+                    && tree_kill_error_can_mean_stale_identity(&action, &error.error)
+                    && !self.tree_kill_action_identity_is_current(&action).await
+                {
+                    continue;
+                }
                 return Err(error.error);
             }
         }
@@ -175,6 +222,48 @@ impl RequestHandler {
             self.refresh_mode_tree_overlay_if_active(attach_pid).await?;
         }
         Ok(())
+    }
+
+    async fn tree_kill_action_identity_is_current(&self, action: &ModeTreeAction) -> bool {
+        let ModeTreeAction::TreeTarget {
+            session_name,
+            session_id,
+            window_index,
+            window_id,
+            window_occurrence_id,
+            pane_id,
+            ..
+        } = action
+        else {
+            return true;
+        };
+        let state = self.state.lock().await;
+        let Some(session) = state
+            .sessions
+            .session(session_name)
+            .filter(|session| session.id() == *session_id)
+        else {
+            return false;
+        };
+        let Some(window_index) = window_index else {
+            return true;
+        };
+        let (Some(window_id), Some(window_occurrence_id)) = (window_id, window_occurrence_id)
+        else {
+            return false;
+        };
+        let Some(window) = session
+            .window_at(*window_index)
+            .filter(|window| window.id() == *window_id)
+        else {
+            return false;
+        };
+        if state.window_link_occurrence_id(session_name, *window_index)
+            != Some(*window_occurrence_id)
+        {
+            return false;
+        }
+        pane_id.is_none_or(|pane_id| window.panes().iter().any(|pane| pane.id() == pane_id))
     }
 
     async fn dispatch_mode_tree_session_request(
@@ -195,6 +284,37 @@ impl RequestHandler {
         request: Request,
     ) -> Response {
         dispatch_with_expected_window_occurrence_identity(self, attach_pid, identity, request).await
+    }
+}
+
+fn tree_kill_error_can_mean_stale_identity(action: &ModeTreeAction, error: &RmuxError) -> bool {
+    match action {
+        ModeTreeAction::TreeTarget {
+            window_index: None, ..
+        } => matches!(error, RmuxError::SessionNotFound(_)),
+        ModeTreeAction::TreeTarget {
+            window_index: Some(_),
+            pane_id: None,
+            ..
+        } => matches!(
+            error,
+            RmuxError::SessionNotFound(_) | RmuxError::InvalidTarget { .. }
+        ),
+        ModeTreeAction::TreeTarget {
+            window_index: Some(_),
+            pane_id: Some(_),
+            ..
+        } => matches!(
+            error,
+            RmuxError::SessionNotFound(_)
+                | RmuxError::InvalidTarget { .. }
+                | RmuxError::PaneNotFound { .. }
+        ),
+        ModeTreeAction::None
+        | ModeTreeAction::Buffer { .. }
+        | ModeTreeAction::Client { .. }
+        | ModeTreeAction::CustomizeOption { .. }
+        | ModeTreeAction::CustomizeKey { .. } => false,
     }
 }
 
@@ -278,5 +398,57 @@ fn tree_kill_sort_key(action: &ModeTreeAction) -> TreeKillSortKey {
             window_occurrence_id: u64::MAX,
             pane_id: u32::MAX,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_proto::PaneId;
+
+    fn session_name() -> SessionName {
+        SessionName::new("tree-kill-error-classification").expect("valid session name")
+    }
+
+    #[test]
+    fn tagged_tree_kill_only_classifies_target_identity_errors_as_stale_candidates() {
+        let session = ModeTreeAction::session_tree_target(session_name(), SessionId::new(1));
+        let window = ModeTreeAction::window_tree_target(
+            session_name(),
+            SessionId::new(1),
+            0,
+            WindowId::new(2),
+            WindowLinkOccurrenceId::new_for_test(3),
+        );
+        let pane = ModeTreeAction::pane_tree_target(
+            session_name(),
+            SessionId::new(1),
+            0,
+            WindowId::new(2),
+            WindowLinkOccurrenceId::new_for_test(3),
+            0,
+            PaneId::new(4),
+        );
+
+        assert!(tree_kill_error_can_mean_stale_identity(
+            &session,
+            &RmuxError::SessionNotFound(session_name().to_string())
+        ));
+        assert!(tree_kill_error_can_mean_stale_identity(
+            &window,
+            &RmuxError::invalid_target("target", "window identity changed before mutation")
+        ));
+        assert!(tree_kill_error_can_mean_stale_identity(
+            &pane,
+            &RmuxError::pane_not_found(session_name(), PaneId::new(4))
+        ));
+
+        let real_error = RmuxError::Server("client is read-only".to_owned());
+        for action in [&session, &window, &pane] {
+            assert!(!tree_kill_error_can_mean_stale_identity(
+                action,
+                &real_error
+            ));
+        }
     }
 }

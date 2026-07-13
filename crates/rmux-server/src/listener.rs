@@ -216,7 +216,7 @@ async fn serve_connection(
                 }
                 let cancel_on_peer_disconnect = request_cancels_on_peer_disconnect(&request);
                 debug!("dispatching {}", request.command_name());
-                let outcome = match request {
+                let mut outcome = match request {
                     Request::SdkWaitForOutput(request) => {
                         let prepared = handler
                             .prepare_sdk_wait_for_output(connection_id, request)
@@ -272,7 +272,59 @@ async fn serve_connection(
                         }
                     }
                 };
+                // An attach registration is removed as soon as its last
+                // session closes, but its forwarder still has to deliver the
+                // terminal exit frame. Bridge that transition before any
+                // further await can let exit-empty shut the daemon down.
+                let attach_forwarder_guard = outcome
+                    .attach
+                    .is_some()
+                    .then(|| handler.begin_attach_forwarder());
+                let pending_control = if let Some(control_upgrade) = outcome.control.take() {
+                    let initial_command_count = control_upgrade.initial_command_count as usize;
+                    let (server_event_tx, server_event_rx) =
+                        tokio::sync::mpsc::channel::<ControlServerEvent>(
+                            control::CONTROL_SERVER_EVENT_CAPACITY,
+                        );
+                    let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let control_id = match handler
+                        .register_control_with_access(
+                            requester.pid,
+                            control_upgrade,
+                            ControlRegistration {
+                                event_tx: server_event_tx,
+                                closing: closing.clone(),
+                                uid: requester.uid,
+                                user: requester.user.clone(),
+                                can_write,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(control_id) => control_id,
+                        Err(error) => {
+                            conn.write_response(&Response::Error(ErrorResponse {
+                                error: error.into_rmux_error(),
+                            }))
+                            .await?;
+                            drop(detached_request_guard.take());
+                            continue;
+                        }
+                    };
+                    Some((
+                        initial_command_count,
+                        server_event_rx,
+                        closing,
+                        control_id,
+                    ))
+                } else {
+                    None
+                };
+
                 if let Err(error) = conn.write_response(&outcome.response).await {
+                    if let Some((_, _, _, control_id)) = pending_control.as_ref() {
+                        handler.finish_control(requester.pid, *control_id).await;
+                    }
                     drop(detached_request_guard.take());
                     #[cfg(windows)]
                     let _ = handler
@@ -281,6 +333,8 @@ async fn serve_connection(
                 }
 
                 if let Some(attach) = outcome.attach {
+                    let attach_forwarder_guard = attach_forwarder_guard
+                        .expect("attach outcome must hold an attach forwarder guard");
                     let Response::AttachSession(response) = &outcome.response else {
                         return Err(io::Error::other(
                             "attach upgrade requires an attach-session response",
@@ -344,28 +398,17 @@ async fn serve_connection(
                     )
                     .await;
                     handler.finish_attach(requester.pid, attach_id).await;
+                    drop(attach_forwarder_guard);
+                    let _ = handler.request_shutdown_if_pending();
                     return result;
                 }
-                if let Some(control_upgrade) = outcome.control {
-                    let initial_command_count = control_upgrade.initial_command_count as usize;
-                    let (server_event_tx, server_event_rx) =
-                        tokio::sync::mpsc::channel::<ControlServerEvent>(
-                            control::CONTROL_SERVER_EVENT_CAPACITY,
-                        );
-                    let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let control_id = handler
-                        .register_control_with_access(
-                            requester.pid,
-                            control_upgrade,
-                            ControlRegistration {
-                                event_tx: server_event_tx,
-                                closing: closing.clone(),
-                                uid: requester.uid,
-                                user: requester.user.clone(),
-                                can_write,
-                            },
-                        )
-                        .await;
+                if let Some((
+                    initial_command_count,
+                    server_event_rx,
+                    closing,
+                    control_id,
+                )) = pending_control
+                {
                     drop(detached_connection_guard);
                     drop(detached_request_guard.take());
                     let (stream, buffered_bytes) = conn.into_raw_parts();

@@ -355,6 +355,75 @@ async fn clock_mode_overlay_uses_window_options_for_fallback_rendering() {
 }
 
 #[tokio::test]
+async fn refresh_client_replays_active_clock_after_base_switch() {
+    let handler = RequestHandler::new();
+    let target = create_session(
+        &handler,
+        "refresh-client-clock",
+        TerminalSize { cols: 20, rows: 8 },
+    )
+    .await;
+    let requester_pid = std::process::id();
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, target.session_name().clone(), control_tx)
+        .await;
+    assert!(matches!(
+        handler
+            .handle(Request::ClockMode(ClockModeRequest {
+                target: Some(target),
+            }))
+            .await,
+        Response::ClockMode(_)
+    ));
+    let _ = next_overlay(&mut control_rx).await;
+    while control_rx.try_recv().is_ok() {}
+
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            rmux_proto::request::RefreshClientRequest {
+                target_client: None,
+                adjustment: None,
+                clear_pan: false,
+                pan_left: false,
+                pan_right: false,
+                pan_up: false,
+                pan_down: false,
+                status_only: false,
+                clipboard_query: false,
+                flags: None,
+                flags_alias: None,
+                subscriptions: Vec::new(),
+                subscriptions_format: Vec::new(),
+                control_size: None,
+                colour_report: None,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+
+    let mut saw_switch = false;
+    let mut replayed_clock = None;
+    while let Ok(control) = control_rx.try_recv() {
+        match control {
+            AttachControl::Switch(_) => saw_switch = true,
+            AttachControl::Overlay(frame) if saw_switch && frame.persistent => {
+                replayed_clock = Some(frame);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_switch, "refresh-client must queue the base Switch");
+    let frame = replayed_clock.expect("clock overlay must be queued after the base Switch");
+    let rendered = String::from_utf8(frame.frame).expect("clock frame is utf-8");
+    assert!(rendered.contains("\u{1b}[?25l"));
+}
+
+#[tokio::test]
 async fn clock_mode_updates_pane_formats_and_exits_on_any_keypress() {
     let handler = RequestHandler::new();
     let target = create_session(&handler, "alpha", TerminalSize { cols: 32, rows: 8 }).await;

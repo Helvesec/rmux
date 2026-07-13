@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use super::super::mode_tree_support::ModeTreeClientState;
 use super::super::overlay_support::ClientOverlayState;
 use super::super::prompt_support::ClientPromptState;
+use super::super::scripting_support::{rename_pane_target_session, rename_window_target_session};
 use crate::client_flags::ClientFlags;
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
 use crate::mouse::ClientMouseState;
@@ -136,6 +137,28 @@ pub(crate) struct AttachRegistration {
     pub(crate) client_size: Option<TerminalSize>,
 }
 
+fn rename_display_panes_state(
+    state: &mut DisplayPanesClientState,
+    old_name: &rmux_proto::SessionName,
+    new_name: &rmux_proto::SessionName,
+) -> bool {
+    let mut renamed = state.clone();
+    rename_window_target_session(&mut renamed.window, old_name, new_name);
+    let old_prefix = format!("={old_name}:");
+    for label in &mut renamed.labels {
+        if label.target.session_name() != old_name {
+            continue;
+        }
+        let Some(suffix) = label.target_string.strip_prefix(&old_prefix) else {
+            return false;
+        };
+        rename_pane_target_session(&mut label.target, old_name, new_name);
+        label.target_string = format!("={new_name}:{suffix}");
+    }
+    *state = renamed;
+    true
+}
+
 impl ActiveAttachState {
     pub(in crate::handler) fn attached_count(
         &self,
@@ -156,11 +179,29 @@ impl ActiveAttachState {
         for active in self.by_pid.values_mut() {
             if &active.session_name == session_name && active.session_id == session_id {
                 active.session_name = new_name.clone();
+                if let Some(mode_tree) = active.mode_tree.as_mut() {
+                    mode_tree.rename_session(session_name, new_name);
+                }
+                if active.display_panes.as_mut().is_some_and(|display_panes| {
+                    !rename_display_panes_state(display_panes, session_name, new_name)
+                }) {
+                    active.display_panes = None;
+                    active.display_panes_state_id = active.display_panes_state_id.saturating_add(1);
+                }
             }
             if active.last_session.as_ref() == Some(session_name)
                 && active.last_session_id == Some(session_id)
             {
                 active.last_session = Some(new_name.clone());
+            }
+            active
+                .mouse
+                .rename_session_targets(session_name, session_id, new_name);
+            if let Some(prompt) = active.prompt.as_mut() {
+                prompt.rename_session_targets(session_name, new_name);
+            }
+            if let Some(overlay) = active.overlay.as_mut() {
+                overlay.rename_session_targets(session_name, new_name);
             }
         }
         if let Some(renamed_windows) = self.active_client_by_window.remove(session_name) {
@@ -273,17 +314,6 @@ impl ActiveAttachState {
             .get(&attach_pid)
             .map(|active| active.last_session.clone().zip(active.last_session_id))
             .ok_or_else(|| rmux_proto::RmuxError::Server("attached client disappeared".to_owned()))
-    }
-
-    pub(in crate::handler) fn attached_client_pids_except(&self, except_pid: u32) -> Vec<u32> {
-        let mut pids = self
-            .by_pid
-            .keys()
-            .copied()
-            .filter(|pid| *pid != except_pid)
-            .collect::<Vec<_>>();
-        pids.sort_unstable();
-        pids
     }
 
     pub(in crate::handler) fn session_for_attached_client(

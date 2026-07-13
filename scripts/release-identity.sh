@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/release-identity.sh <release-tag>
 
-Validate a stable or disposable RC tag against Cargo.toml and print the
+Validate an immutable stable or RC tag against Cargo.toml and print the
 separate tag, release, and package identities as KEY=value lines.
 USAGE
 }

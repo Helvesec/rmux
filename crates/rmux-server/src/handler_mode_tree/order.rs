@@ -14,6 +14,10 @@ pub(super) fn client_item_id(pid: u32, attach_id: u64) -> String {
     format!("client:{pid}:{attach_id}")
 }
 
+pub(super) fn buffer_item_id(name: &str, order: u64) -> String {
+    format!("buffer:{order}:{name}")
+}
+
 pub(super) fn window_item_id(
     session_id: SessionId,
     window_index: u32,

@@ -31,6 +31,9 @@ const LOW_SURROGATE_END: u16 = 0xdfff;
 pub(super) struct AttachInput {
     bytes: Vec<u8>,
     windows_console_key: Option<AttachedWindowsConsoleKey>,
+    /// Number of times this logical payload must be emitted by the attach stream.
+    /// Kept compact here so a single Win32 record never allocates per repetition.
+    repeat_count: u16,
 }
 
 impl AttachInput {
@@ -38,6 +41,7 @@ impl AttachInput {
         Self {
             bytes,
             windows_console_key: None,
+            repeat_count: 1,
         }
     }
 
@@ -45,6 +49,15 @@ impl AttachInput {
         Self {
             bytes,
             windows_console_key: Some(key),
+            repeat_count: key.repeat_count().max(1),
+        }
+    }
+
+    fn repeated_bytes(bytes: Vec<u8>, repeat_count: u16) -> Self {
+        Self {
+            bytes,
+            windows_console_key: None,
+            repeat_count: repeat_count.max(1),
         }
     }
 
@@ -54,6 +67,10 @@ impl AttachInput {
 
     pub(super) fn windows_console_key(&self) -> Option<AttachedWindowsConsoleKey> {
         self.windows_console_key
+    }
+
+    pub(super) const fn repeat_count(&self) -> u16 {
+        self.repeat_count
     }
 }
 
@@ -290,9 +307,6 @@ fn encode_input_batch(
     pending_high_surrogate: &mut Option<u16>,
     last_mouse_button_state: &mut u32,
 ) -> Vec<AttachInput> {
-    let has_mouse = events
-        .iter()
-        .any(|event| matches!(event, BatchEvent::Mouse(_)));
     let mut text_downs = 0usize;
     let mut has_other_key = false;
     for event in events {
@@ -318,8 +332,13 @@ fn encode_input_batch(
     // A fresh burst needs at least two pasted characters — a lone character is
     // indistinguishable from a keystroke — while a run already open continues on
     // any further pasted text until the input buffer drains.
-    let paste_text_only = !has_mouse && !has_other_key;
-    let is_paste = paste_text_only && (text_downs >= 2 || (*paste_open && text_downs >= 1));
+    // Native MOUSE_EVENT records can be coalesced into the same console read as
+    // a clipboard burst. They are not evidence that the key records are live:
+    // when the keys form a paste, prefer the paste and suppress those mouse
+    // records rather than turning clipboard bytes into interactive input.
+    let paste_text_only = !has_other_key;
+    let is_paste = paste_text_only
+        && (text_downs >= 2 || (*paste_open && text_downs >= 1) || (!drained && text_downs >= 1));
 
     let mut inputs = Vec::new();
     if is_paste {
@@ -338,6 +357,15 @@ fn encode_input_batch(
         for event in events {
             if let BatchEvent::Key(key) = event {
                 text.extend_from_slice(&encode_key_event(*key, pending_high_surrogate));
+            }
+        }
+        // Mouse records coalesced with clipboard text are suppressed so they
+        // cannot make the text live or enter its paste envelope. Still feed
+        // them through the state tracker: dropping a coalesced release without
+        // advancing state would turn the next move into a phantom drag.
+        for event in events {
+            if let BatchEvent::Mouse(mouse) = event {
+                let _suppressed = encode_mouse_event(*mouse, last_mouse_button_state);
             }
         }
         strip_embedded_paste_markers(&mut text);
@@ -372,15 +400,33 @@ fn encode_input_batch(
         inputs.push(AttachInput::bytes(tail));
         *paste_open = false;
     }
+    inputs.extend(encode_live_input_batch(
+        events,
+        pending_high_surrogate,
+        last_mouse_button_state,
+    ));
+    inputs
+}
+
+fn encode_live_input_batch(
+    events: &[BatchEvent],
+    pending_high_surrogate: &mut Option<u16>,
+    last_mouse_button_state: &mut u32,
+) -> Vec<AttachInput> {
+    let mut inputs = Vec::new();
     for event in events {
         match event {
             BatchEvent::Key(key) => {
-                let bytes = encode_key_event(*key, pending_high_surrogate);
+                let logical_key = ConsoleKeyEvent {
+                    repeat_count: 1,
+                    ..*key
+                };
+                let bytes = encode_key_event(logical_key, pending_high_surrogate);
                 if bytes.is_empty() {
                     continue;
                 }
                 let input = windows_console_key_for_event(*key, &bytes).map_or_else(
-                    || AttachInput::bytes(bytes.clone()),
+                    || AttachInput::repeated_bytes(bytes.clone(), key.repeat_count),
                     |console_key| {
                         trace_windows_console_key(console_key, &bytes);
                         AttachInput::with_windows_console_key(bytes.clone(), console_key)
@@ -999,6 +1045,422 @@ mod tests {
             .collect()
     }
 
+    fn key_event_batch(bytes: &[u8]) -> Vec<BatchEvent> {
+        bytes
+            .iter()
+            .map(|byte| {
+                let virtual_key = if *byte == b'\x1b' {
+                    VK_ESCAPE
+                } else {
+                    u16::from(*byte)
+                };
+                BatchEvent::Key(key_event(virtual_key, u16::from(*byte), 0))
+            })
+            .collect()
+    }
+
+    fn bracketed_text(bytes: &[u8]) -> Vec<u8> {
+        let mut framed = BRACKETED_PASTE_START.to_vec();
+        framed.extend_from_slice(bytes);
+        framed.extend_from_slice(BRACKETED_PASTE_END);
+        framed
+    }
+
+    #[test]
+    fn sgr_mouse_syntax_from_key_events_is_fail_closed_as_paste() {
+        let sequence = b"\x1b[<0;10;5M";
+        let inputs = encode_input_batch(
+            &key_event_batch(sequence),
+            true,
+            &mut false,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+
+        assert_eq!(batch_bytes(&inputs), bracketed_text(sequence));
+    }
+
+    #[test]
+    fn coalesced_sgr_key_event_frames_are_also_fail_closed_as_paste() {
+        let sequence = b"\x1b[<0;10;5M\x1b[<32;11;5M\x1b[<0;11;5m";
+        let inputs = encode_input_batch(
+            &key_event_batch(sequence),
+            true,
+            &mut false,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+
+        assert_eq!(batch_bytes(&inputs), bracketed_text(sequence));
+    }
+
+    #[test]
+    fn mixed_sgr_mouse_and_text_bursts_remain_one_faithful_paste() {
+        let click = b"\x1b[<0;10;5M";
+        let drag = b"\x1b[<32;11;5M";
+        let mut cases = Vec::new();
+
+        let mut text_then_sgr = b"ab".to_vec();
+        text_then_sgr.extend_from_slice(click);
+        cases.push((
+            "text + SGR",
+            text_then_sgr.clone(),
+            bracketed_text(&text_then_sgr),
+        ));
+
+        let mut sgr_then_one = click.to_vec();
+        sgr_then_one.push(b'x');
+        cases.push((
+            "SGR + one character",
+            sgr_then_one.clone(),
+            bracketed_text(&sgr_then_one),
+        ));
+
+        let mut sgr_then_paste = click.to_vec();
+        sgr_then_paste.extend_from_slice(b"xy");
+        cases.push((
+            "SGR + multi-character paste",
+            sgr_then_paste.clone(),
+            bracketed_text(&sgr_then_paste),
+        ));
+
+        let mut adjacent_sgr_then_paste = click.to_vec();
+        adjacent_sgr_then_paste.extend_from_slice(drag);
+        adjacent_sgr_then_paste.extend_from_slice(b"yz");
+        cases.push((
+            "SGR + SGR + text",
+            adjacent_sgr_then_paste.clone(),
+            bracketed_text(&adjacent_sgr_then_paste),
+        ));
+
+        for (label, bytes, expected) in cases {
+            let mut paste_open = false;
+            let inputs = encode_input_batch(
+                &key_event_batch(&bytes),
+                true,
+                &mut paste_open,
+                &mut Vec::new(),
+                &mut None,
+                &mut 0,
+            );
+
+            assert_eq!(batch_bytes(&inputs), expected, "{label}");
+            assert!(!paste_open, "{label} must leave no paste envelope open");
+        }
+    }
+
+    #[test]
+    fn native_mouse_record_inside_paste_does_not_make_text_live_or_stale_button_state() {
+        let mut paste_open = false;
+        let mut carryover = Vec::new();
+        let mut surrogate = None;
+        let mut last_mouse = FROM_LEFT_1ST_BUTTON_PRESSED;
+
+        let first = encode_input_batch(
+            &key_event_batch(b"ab"),
+            false,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        assert!(paste_open);
+
+        let mixed = [
+            BatchEvent::Mouse(mouse_event(0, 0, 0, 3, 4)),
+            BatchEvent::Key(key_event(b'c' as u16, b'c' as u16, 0)),
+        ];
+        let middle = encode_input_batch(
+            &mixed,
+            false,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        assert!(
+            paste_open,
+            "a coalesced mouse release must not close the active paste"
+        );
+        assert_eq!(last_mouse, 0, "the suppressed release still updates state");
+
+        let final_part = encode_input_batch(
+            &key_event_batch(b"d"),
+            true,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        let combined = first
+            .iter()
+            .chain(&middle)
+            .chain(&final_part)
+            .flat_map(|input| input.payload().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(combined, bracketed_text(b"abcd"));
+        assert!(!paste_open);
+
+        let hover = encode_input_batch(
+            &[BatchEvent::Mouse(mouse_event(0, MOUSE_MOVED, 0, 4, 5))],
+            true,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        assert_eq!(batch_bytes(&hover), b"\x1b[<35;5;6M");
+    }
+
+    #[test]
+    fn sgr_key_event_paste_stays_fail_closed_across_every_console_batch_boundary() {
+        let sequence = b"\x1b[<32;123;45M";
+        for split in 1..sequence.len() {
+            let mut paste_open = false;
+            let mut carryover = Vec::new();
+            let mut surrogate = None;
+            let mut last_mouse = 0;
+
+            let first = encode_input_batch(
+                &key_event_batch(&sequence[..split]),
+                false,
+                &mut paste_open,
+                &mut carryover,
+                &mut surrogate,
+                &mut last_mouse,
+            );
+            let second = encode_input_batch(
+                &key_event_batch(&sequence[split..]),
+                true,
+                &mut paste_open,
+                &mut carryover,
+                &mut surrogate,
+                &mut last_mouse,
+            );
+
+            assert_eq!(
+                first
+                    .iter()
+                    .chain(&second)
+                    .flat_map(|input| input.payload().to_vec())
+                    .collect::<Vec<_>>(),
+                bracketed_text(sequence),
+                "split at byte {split}"
+            );
+            assert!(!paste_open, "the drained paste must close its envelope");
+        }
+    }
+
+    #[test]
+    fn drained_partial_sgr_prefix_and_later_text_never_become_a_live_click() {
+        let prefix = b"\x1b[<0;";
+        let continuation = b"10;5M";
+        let mut paste_open = false;
+        let mut carryover = Vec::new();
+        let mut surrogate = None;
+        let mut last_mouse = 0;
+
+        let first = encode_input_batch(
+            &key_event_batch(prefix),
+            true,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        let second = encode_input_batch(
+            &key_event_batch(continuation),
+            true,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+
+        assert_eq!(batch_bytes(&first), bracketed_text(prefix));
+        assert_eq!(batch_bytes(&second), bracketed_text(continuation));
+        assert!(!paste_open);
+    }
+
+    #[test]
+    fn text_before_a_split_sgr_prefix_keeps_the_whole_burst_in_paste() {
+        let first_bytes = b"ab\x1b[<0;";
+        let second_bytes = b"10;5M";
+        let mut paste_open = false;
+        let mut carryover = Vec::new();
+        let mut surrogate = None;
+        let mut last_mouse = 0;
+
+        let first = encode_input_batch(
+            &key_event_batch(first_bytes),
+            false,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        let second = encode_input_batch(
+            &key_event_batch(second_bytes),
+            true,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        let expected = bracketed_text(b"ab\x1b[<0;10;5M");
+
+        assert_eq!(batch_bytes(&first), b"\x1b[200~ab\x1b[<0;");
+        assert_eq!(
+            first
+                .iter()
+                .chain(&second)
+                .flat_map(|input| input.payload().to_vec())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(!paste_open);
+    }
+
+    #[test]
+    fn undrained_pure_sgr_key_events_remain_one_paste() {
+        let first_bytes = b"\x1b[<0;10;5M";
+        let second_bytes = b"\x1b[<32;11;5M\x1b[<0;11;5m";
+        let mut paste_open = false;
+        let mut carryover = Vec::new();
+        let mut surrogate = None;
+        let mut last_mouse = 0;
+
+        let first = encode_input_batch(
+            &key_event_batch(first_bytes),
+            false,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        assert!(paste_open, "the undrained key burst opens paste state");
+
+        let second = encode_input_batch(
+            &key_event_batch(second_bytes),
+            true,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        let source = [first_bytes.as_slice(), second_bytes.as_slice()].concat();
+
+        assert_eq!(
+            first
+                .iter()
+                .chain(&second)
+                .flat_map(|input| input.payload().to_vec())
+                .collect::<Vec<_>>(),
+            bracketed_text(&source)
+        );
+        assert!(!paste_open);
+    }
+
+    #[test]
+    fn undrained_sgr_followed_by_text_falls_back_to_one_paste() {
+        let first_bytes = b"\x1b[<0;10;5M";
+        let second_bytes = b"ordinary text";
+        let mut paste_open = false;
+        let mut carryover = Vec::new();
+        let mut surrogate = None;
+        let mut last_mouse = 0;
+
+        let first = encode_input_batch(
+            &key_event_batch(first_bytes),
+            false,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        assert!(paste_open, "the undrained key burst opens paste state");
+        let second = encode_input_batch(
+            &key_event_batch(second_bytes),
+            true,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        let source = [first_bytes.as_slice(), second_bytes.as_slice()].concat();
+
+        assert_eq!(
+            first
+                .iter()
+                .chain(&second)
+                .flat_map(|input| input.payload().to_vec())
+                .collect::<Vec<_>>(),
+            bracketed_text(&source)
+        );
+        assert!(!paste_open);
+    }
+
+    #[test]
+    fn invalid_sgr_lookalike_remains_a_detected_paste() {
+        let text = b"\x1b[<not-a-mouse-frame";
+        let inputs = encode_input_batch(
+            &key_event_batch(text),
+            true,
+            &mut false,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+        let mut expected = BRACKETED_PASTE_START.to_vec();
+        expected.extend_from_slice(text);
+        expected.extend_from_slice(BRACKETED_PASTE_END);
+
+        assert_eq!(batch_bytes(&inputs), expected);
+    }
+
+    #[test]
+    fn split_invalid_sgr_lookalike_falls_back_to_one_paste_envelope() {
+        let first_text = b"\x1b[<12;";
+        let second_text = b"x;9M ordinary text";
+        let mut paste_open = false;
+        let mut carryover = Vec::new();
+        let mut surrogate = None;
+        let mut last_mouse = 0;
+
+        let first = encode_input_batch(
+            &key_event_batch(first_text),
+            false,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        let second = encode_input_batch(
+            &key_event_batch(second_text),
+            true,
+            &mut paste_open,
+            &mut carryover,
+            &mut surrogate,
+            &mut last_mouse,
+        );
+        let mut expected = BRACKETED_PASTE_START.to_vec();
+        expected.extend_from_slice(first_text);
+        expected.extend_from_slice(second_text);
+        expected.extend_from_slice(BRACKETED_PASTE_END);
+
+        assert_eq!(
+            first
+                .iter()
+                .chain(&second)
+                .flat_map(|input| input.payload().to_vec())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(!paste_open);
+    }
+
     #[test]
     fn multi_character_paste_burst_is_wrapped_in_bracketed_markers() {
         // The record pattern conhost delivers for pasting "ab\r\ncd" (probed
@@ -1410,6 +1872,70 @@ mod tests {
         event.repeat_count = 3;
 
         assert_eq!(encode(&event), b"xxx");
+    }
+
+    #[test]
+    fn console_key_event_preserves_maximum_u16_repeat_count() {
+        let mut event = key_event('x' as u16, 'x' as u16, 0);
+        event.repeat_count = u16::MAX;
+
+        assert_eq!(encode(&event).len(), usize::from(u16::MAX));
+    }
+
+    #[test]
+    fn repeated_control_chord_is_retained_as_one_counted_logical_input() {
+        let mut event = key_event(0xba, b';' as u16, LEFT_CTRL_PRESSED);
+        event.repeat_count = 3;
+        let events = [BatchEvent::Key(event)];
+        let mut paste_open = false;
+
+        let inputs = encode_input_batch(
+            &events,
+            true,
+            &mut paste_open,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+
+        assert_eq!(inputs.len(), 1);
+        let input = &inputs[0];
+        assert_eq!(input.payload(), b";");
+        assert_eq!(input.repeat_count(), 3);
+        let key = input
+            .windows_console_key()
+            .expect("Ctrl+; must retain Windows identity");
+        assert_eq!(key.virtual_key_code(), 0xba);
+        assert_eq!(key.unicode_char(), b';' as u16);
+        assert_eq!(key.control_key_state(), LEFT_CTRL_PRESSED);
+        assert_eq!(key.repeat_count(), 3);
+    }
+
+    #[test]
+    fn maximum_control_repeat_is_represented_without_per_repeat_inputs() {
+        let mut event = key_event(0xba, b';' as u16, LEFT_CTRL_PRESSED);
+        event.repeat_count = u16::MAX;
+        let events = [BatchEvent::Key(event)];
+
+        let inputs = encode_input_batch(
+            &events,
+            true,
+            &mut false,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].payload(), b";");
+        assert_eq!(inputs[0].repeat_count(), u16::MAX);
+        assert_eq!(
+            inputs[0]
+                .windows_console_key()
+                .expect("Ctrl+; metadata remains present")
+                .repeat_count(),
+            u16::MAX
+        );
     }
 
     #[test]

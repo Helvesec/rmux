@@ -1,4 +1,5 @@
 use super::*;
+use crate::daemon::ShutdownHandle;
 use rmux_core::events::SubscriptionLimits;
 use rmux_proto::WebShareCreatedResponse;
 use rmux_proto::{encode_attach_message, AttachMessage};
@@ -250,6 +251,91 @@ async fn web_session_share_drains_initial_attach_output() {
     assert!(matches!(event, WebSessionAttachEvent::Data(_)));
     assert_eq!(session_stream.snapshot.size.cols, 80);
     assert_eq!(session_stream.snapshot.size.rows, 24);
+}
+
+#[tokio::test]
+async fn web_session_last_exit_drains_before_daemon_shutdown() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+    let session_name = new_session(&handler, "websession-exit-drain").await;
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name.clone())),
+    )
+    .await;
+    let stream = handler
+        .open_web_share(
+            &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
+            None,
+        )
+        .await
+        .expect("session web share opens");
+    let WebShareStream::Session(mut session_stream) = stream else {
+        panic!("expected session web share stream");
+    };
+    let attach_pid = session_stream.attach_pid();
+    let control_tx = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .expect("web session attach is registered")
+        .control_tx
+        .clone();
+    let mut reader = session_stream.take_attach_reader();
+    let _ = timeout(Duration::from_secs(2), reader.read_event())
+        .await
+        .expect("attach stream should produce initial output")
+        .expect("attach read succeeds");
+    control_tx
+        .send(AttachControl::Write(vec![b'x'; 128 * 1024]))
+        .expect("fill the bounded in-process attach transport");
+    tokio::task::yield_now().await;
+
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: session_name,
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    assert!(
+        !handler.request_shutdown_if_pending(),
+        "web attach wire drain must defer exit-empty shutdown"
+    );
+    assert!(
+        timeout(Duration::from_millis(25), &mut shutdown_rx)
+            .await
+            .is_err(),
+        "daemon shutdown must stay pending until the browser receives its exit frame"
+    );
+
+    let exited = timeout(Duration::from_secs(2), async {
+        loop {
+            match reader.read_event().await.expect("attach read succeeds") {
+                Some(WebSessionAttachEvent::Data(bytes))
+                    if bytes
+                        .windows(b"[exited]\r\n".len())
+                        .any(|window| window == b"[exited]\r\n") =>
+                {
+                    break;
+                }
+                Some(_) => continue,
+                None => panic!("web attach closed before its exit frame"),
+            }
+        }
+    })
+    .await;
+    assert!(exited.is_ok(), "web attach exit frame should drain");
+
+    timeout(Duration::from_millis(500), shutdown_rx)
+        .await
+        .expect("daemon should shut down after the web attach drains")
+        .expect("shutdown receiver should complete cleanly");
 }
 
 #[tokio::test]

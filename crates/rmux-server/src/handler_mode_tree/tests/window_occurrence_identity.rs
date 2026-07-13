@@ -4,7 +4,7 @@ use rmux_proto::{LinkWindowRequest, WindowTarget};
 
 use crate::pane_terminals::WindowLinkOccurrenceId;
 
-use super::super::mode_tree_model::ChooseTreeTarget;
+use super::super::mode_tree_model::{ChooseTreeTarget, ModeTreeActionIdentity};
 use super::super::mode_tree_order::{pane_item_id, window_item_id};
 
 struct LinkedOccurrenceFixture {
@@ -351,9 +351,18 @@ async fn choose_tree_default_accept_revalidates_occurrence_at_selection_lock() {
         pane_id: None,
     };
     let replacement_occurrence_id = replace_linked_occurrence(&handler, &fixture).await;
+    let action_identity = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&fixture.attach_pid)
+            .expect("choose-tree host remains attached");
+        assert_eq!(active.id, fixture.attach_id);
+        ModeTreeActionIdentity::new(fixture.attach_pid, active.id, active.mode_tree_state_id)
+    };
 
     let error = handler
-        .apply_choose_tree_default_target(fixture.attach_pid, fixture.attach_id, stale_target)
+        .apply_choose_tree_default_target(action_identity, stale_target)
         .await
         .expect_err("default accept must reject a replaced occurrence at the state lock");
     assert!(

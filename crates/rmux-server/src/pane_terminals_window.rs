@@ -33,6 +33,7 @@ pub(crate) struct RespawnWindowResult {
     pub(crate) response: rmux_proto::RespawnWindowResponse,
     pub(crate) retained_pane_id: PaneId,
     pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) refresh_sessions: Vec<SessionName>,
 }
 
 impl HandlerState {
@@ -468,7 +469,20 @@ impl HandlerState {
             self.pane_output_generation(&runtime_session_name, pane_id);
         let base_environment =
             self.session_base_environment_for_window(&session_name, window_index);
-        let before_pane_options = self.pane_option_slots_for_session(&session_name)?;
+        let mut pane_option_sessions =
+            self.window_linked_session_family_list(&session_name, window_index);
+        if pane_option_sessions.is_empty() {
+            pane_option_sessions.push(session_name.clone());
+        }
+        pane_option_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        pane_option_sessions.dedup();
+        let before_pane_options = pane_option_sessions
+            .into_iter()
+            .map(|affected_session| {
+                self.pane_option_slots_for_session(&affected_session)
+                    .map(|snapshot| (affected_session, snapshot))
+            })
+            .collect::<Result<Vec<_>, RmuxError>>()?;
 
         // Prepare the replacement process against a preview of the new layout.
         // No old runtime state is touched until every fallible spawn step has
@@ -499,6 +513,12 @@ impl HandlerState {
             })
             .collect::<std::collections::HashMap<_, _>>();
         let mut removed_outputs = self.remove_pane_outputs(&runtime_session_name, &pane_ids);
+        // Keep the output channel for the stable pane identity. Existing SDK
+        // subscribers own receivers for this sender; replacing the channel
+        // would leave a registry record that can never observe the respawned
+        // process. Generation advancement below rejects any late output from
+        // the old reader while preserving the receiver identity.
+        let retained_output_sender = removed_outputs.pane_output_sender(pane_id);
         self.seed_pane_output_generation(
             &runtime_session_name,
             pane_id,
@@ -506,9 +526,12 @@ impl HandlerState {
         );
         self.replace_session(&session_name, respawned_session)?;
 
-        if let Err(error) =
-            self.install_prepared_window_terminal(&runtime_session_name, window_index, prepared)
-        {
+        if let Err(error) = self.install_prepared_window_terminal(
+            &runtime_session_name,
+            window_index,
+            prepared,
+            retained_output_sender,
+        ) {
             self.replace_session(&session_name, previous_session)?;
             self.terminals
                 .insert_existing_panes(&runtime_session_name, removed_terminals)?;
@@ -528,18 +551,30 @@ impl HandlerState {
         if automatic_name_applied {
             self.mark_auto_named_window(&session_name, window_index);
         }
-        self.rekey_pane_options_after_session_change(&before_pane_options, &session_name)?;
         removed_outputs.abort_output_readers();
         super::terminate_removed_terminals(&mut removed_terminals);
 
-        self.synchronize_session_group_from(&session_name)?;
-        self.sync_pane_lifecycle_dimensions_for_session(&session_name);
+        // The window model is shared through explicit link aliases as well as
+        // session groups. Synchronize every alias before deciding which pane
+        // identities disappeared; otherwise a linked slot can keep destroyed
+        // sibling panes artificially reachable after the runtime was replaced.
+        let mut synchronized_sessions =
+            self.synchronize_linked_window_family_from_slot(&session_name, window_index)?;
+        synchronized_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        synchronized_sessions.dedup();
+        for synchronized_session in &synchronized_sessions {
+            self.sync_pane_lifecycle_dimensions_for_session(synchronized_session);
+        }
+        for (affected_session, before) in before_pane_options {
+            self.rekey_pane_options_after_session_change(&before, &affected_session)?;
+        }
         let removed_pane_ids = self.pane_ids_no_longer_referenced(removed_pane_ids);
 
         Ok(RespawnWindowResult {
             response: rmux_proto::RespawnWindowResponse { target },
             retained_pane_id: pane_id,
             removed_pane_ids,
+            refresh_sessions: synchronized_sessions,
         })
     }
 

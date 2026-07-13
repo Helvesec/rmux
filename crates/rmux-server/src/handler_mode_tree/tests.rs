@@ -19,7 +19,10 @@ use super::mode_tree_sort::stable_order;
 use super::*;
 use crate::pane_terminals::HandlerState;
 use rmux_core::{command_parser::CommandParser, input::InputParser, Screen, Style, Utf8Config};
-use rmux_proto::{NewSessionRequest, Request, Response, SessionName, TerminalSize};
+use rmux_proto::{
+    NewSessionRequest, OptionName, Request, Response, ScopeSelector, SessionName, SetOptionMode,
+    SetOptionRequest, TerminalSize,
+};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::mpsc;
@@ -106,3 +109,6 @@ mod window_occurrence_identity;
 
 #[path = "tests/client_identity.rs"]
 mod client_identity;
+
+#[path = "tests/deferred_confirmation.rs"]
+mod deferred_confirmation;

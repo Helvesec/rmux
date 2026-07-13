@@ -224,6 +224,254 @@ async fn display_panes_target_client_does_not_fan_out_within_the_session() {
 }
 
 #[tokio::test]
+async fn rename_session_rekeys_display_panes_typed_and_template_targets() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("display-panes-rename-alpha");
+    let beta = session_name("display-panes-rename-beta");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    drain_attach_controls(&mut control_rx);
+
+    let response = handler
+        .handle(Request::DisplayPanes(Box::new(
+            rmux_proto::DisplayPanesRequest {
+                target: alpha.clone(),
+                duration_ms: Some(60_000),
+                non_blocking: true,
+                no_command: false,
+                template: Some("set-buffer -b display-panes-rename '%%'".to_owned()),
+                target_client: None,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::DisplayPanes(_)),
+        "{response:?}"
+    );
+    let _ = recv_overlay_frame(&mut control_rx, "display-panes before rename").await;
+
+    let response = handler
+        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+            target: alpha,
+            new_name: beta.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RenameSession(_)),
+        "{response:?}"
+    );
+
+    let label = {
+        let active_attach = handler.active_attach.lock().await;
+        let display_panes = active_attach.by_pid[&requester_pid]
+            .display_panes
+            .as_ref()
+            .expect("display-panes survives a well-formed target rekey");
+        assert_eq!(display_panes.window.session_name(), &beta);
+        for label in &display_panes.labels {
+            assert_eq!(label.target.session_name(), &beta);
+            assert!(
+                label.target_string.starts_with(&format!("={beta}:")),
+                "template target must follow the typed target: {:?}",
+                label.target_string
+            );
+        }
+        display_panes.labels[0].label.clone()
+    };
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, label.as_bytes())
+        .await
+        .expect("renamed display-panes label executes");
+    let state = handler.state.lock().await;
+    let (_, buffer) = state
+        .buffers
+        .show(Some("display-panes-rename"))
+        .expect("renamed display-panes template writes the probe buffer");
+    assert!(
+        String::from_utf8_lossy(buffer).starts_with(&format!("={beta}:")),
+        "executed template must receive the renamed exact target"
+    );
+}
+
+#[tokio::test]
+async fn refresh_client_replays_active_display_panes_after_base_switch() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let session = session_name("refresh-client-display-panes");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &session).await;
+    drain_attach_controls(&mut control_rx);
+    let response = handler
+        .handle(Request::DisplayPanes(Box::new(
+            rmux_proto::DisplayPanesRequest {
+                target: session,
+                duration_ms: Some(60_000),
+                non_blocking: true,
+                no_command: true,
+                template: None,
+                target_client: None,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::DisplayPanes(_)),
+        "{response:?}"
+    );
+    let _ = recv_overlay_frame(&mut control_rx, "display-panes before refresh-client").await;
+    drain_attach_controls(&mut control_rx);
+
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            rmux_proto::request::RefreshClientRequest {
+                target_client: None,
+                adjustment: None,
+                clear_pan: false,
+                pan_left: false,
+                pan_right: false,
+                pan_up: false,
+                pan_down: false,
+                status_only: false,
+                clipboard_query: false,
+                flags: None,
+                flags_alias: None,
+                subscriptions: Vec::new(),
+                subscriptions_format: Vec::new(),
+                control_size: None,
+                colour_report: None,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+
+    let mut saw_switch = false;
+    let mut replayed_display_panes = None;
+    while let Ok(control) = control_rx.try_recv() {
+        match control {
+            AttachControl::Switch(_) => saw_switch = true,
+            AttachControl::Overlay(frame) if saw_switch && !frame.persistent => {
+                replayed_display_panes = Some(frame);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_switch, "refresh-client must queue the base Switch");
+    let frame = replayed_display_panes.expect("display-panes overlay must follow the base Switch");
+    assert!(!frame.frame.is_empty());
+    assert!(
+        handler.active_attach.lock().await.by_pid[&requester_pid]
+            .display_panes
+            .is_some(),
+        "replayed display-panes state remains active"
+    );
+}
+
+#[tokio::test]
+async fn refresh_client_replay_order_matches_overlay_input_priority() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let session = session_name("refresh-client-overlay-priority");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &session).await;
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: session.clone(),
+                name: Some("w1".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: None,
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    let commands = handler
+        .parse_control_commands("choose-tree -Zw")
+        .await
+        .expect("choose-tree parses");
+    handler
+        .execute_parsed_commands_for_test(requester_pid, commands)
+        .await
+        .expect("choose-tree activates");
+    assert!(handler.mode_tree_active(requester_pid).await);
+    assert!(matches!(
+        handler
+            .handle(Request::DisplayPanes(Box::new(
+                rmux_proto::DisplayPanesRequest {
+                    target: session,
+                    duration_ms: Some(60_000),
+                    non_blocking: true,
+                    no_command: true,
+                    template: None,
+                    target_client: None,
+                },
+            )))
+            .await,
+        Response::DisplayPanes(_)
+    ));
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = &active_attach.by_pid[&requester_pid];
+        assert!(active.mode_tree.is_some());
+        assert!(active.display_panes.is_some());
+    }
+    drain_attach_controls(&mut control_rx);
+
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            rmux_proto::request::RefreshClientRequest {
+                target_client: None,
+                adjustment: None,
+                clear_pan: false,
+                pan_left: false,
+                pan_right: false,
+                pan_up: false,
+                pan_down: false,
+                status_only: false,
+                clipboard_query: false,
+                flags: None,
+                flags_alias: None,
+                subscriptions: Vec::new(),
+                subscriptions_format: Vec::new(),
+                control_size: None,
+                colour_report: None,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+
+    let mut saw_switch = false;
+    let mut replay_order = Vec::new();
+    while let Ok(control) = control_rx.try_recv() {
+        match control {
+            AttachControl::Switch(_) => saw_switch = true,
+            AttachControl::Overlay(frame) if saw_switch && !frame.persistent => {
+                replay_order.push("display-panes");
+            }
+            AttachControl::Overlay(frame) if saw_switch && frame.persistent_state_id.is_some() => {
+                replay_order.push("mode-tree");
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_switch, "refresh-client must queue the base Switch");
+    assert_eq!(
+        replay_order,
+        ["display-panes", "mode-tree"],
+        "visual replay must run in reverse input-routing priority so mode-tree remains visible"
+    );
+}
+
+#[tokio::test]
 async fn display_panes_input_uses_visible_pane_base_index_labels() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
@@ -322,14 +570,18 @@ async fn display_panes_bounds_unterminated_sgr_mouse_without_pane_leak() {
         "prefix q should enter display-panes, got {overlay:?}"
     );
 
-    let partial = oversized_unterminated_sgr_mouse_input();
-    let result = handler
+    let partial = bounded_unterminated_sgr_mouse_input();
+    let forwarded = handler
         .handle_attached_live_input_inner(requester_pid, &mut pending_input, &partial)
-        .await;
-    assert_partial_control_bound(result, "display-panes prompt input");
+        .await
+        .expect("bounded invalid display-panes mouse input is consumed");
+    assert!(
+        !forwarded,
+        "invalid display-panes mouse input must not reach pane IO"
+    );
     assert!(
         pending_input.is_empty(),
-        "overflowing display-panes partial input should be cleared after rejection"
+        "overflowing display-panes input should be consumed at the syntax bound"
     );
     assert_eq!(
         capture_pane_print(&handler, target.clone()).await,
@@ -340,7 +592,7 @@ async fn display_panes_bounds_unterminated_sgr_mouse_without_pane_leak() {
     let recovered = handler
         .handle_attached_live_input_inner(requester_pid, &mut pending_input, b"\x1b")
         .await
-        .expect("escape should still close display-panes after partial-input rejection");
+        .expect("escape should still close display-panes after the bounded discard");
     assert!(
         !recovered,
         "display-panes escape must not be forwarded to pane IO"

@@ -27,6 +27,7 @@ use super::terminal_response::{
 };
 use super::{
     is_enter_key, is_mouse_prefix, resolve_input_target, retain_partial_attached_control_input,
+    retain_partial_attached_escape_input,
 };
 use crate::client_flags::ClientFlags;
 use crate::handler::overlay_support::AttachedOverlayInput;
@@ -495,8 +496,8 @@ impl RequestHandler {
                 let last_mouse = self.attached_last_mouse_event(attach_pid).await;
                 let consumed = match decode_mouse(pending_input, last_mouse) {
                     MouseDecode::Matched { size, .. } | MouseDecode::Discard { size } => size,
-                    MouseDecode::Partial => {
-                        retain_partial_attached_control_input(
+                    MouseDecode::Partial | MouseDecode::Overlong => {
+                        retain_partial_attached_escape_input(
                             "clock mode mouse input",
                             pending_input,
                         )?;
@@ -516,12 +517,12 @@ impl RequestHandler {
             let consumed = match decode_attached_key(pending_input, backspace) {
                 AttachedKeyDecode::Matched { size, .. } => size,
                 AttachedKeyDecode::Partial => {
-                    retain_partial_attached_control_input("clock mode input", pending_input)?;
+                    retain_partial_attached_escape_input("clock mode input", pending_input)?;
                     return Ok(AttachedLiveInputStep::Complete(false));
                 }
                 AttachedKeyDecode::Invalid => {
                     let Some((_, consumed)) = decode_prompt_input_event(pending_input) else {
-                        retain_partial_attached_control_input("clock mode input", pending_input)?;
+                        retain_partial_attached_escape_input("clock mode input", pending_input)?;
                         return Ok(AttachedLiveInputStep::Complete(false));
                     };
                     consumed
@@ -772,9 +773,9 @@ impl RequestHandler {
                         offset += size;
                         raw_start = offset;
                     }
-                    MouseDecode::Partial => {
+                    MouseDecode::Partial | MouseDecode::Overlong => {
                         pending_input.drain(..offset);
-                        retain_partial_attached_control_input("live mouse", pending_input)?;
+                        retain_partial_attached_escape_input("live mouse", pending_input)?;
                         return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                     }
                     MouseDecode::Invalid => {
@@ -846,7 +847,7 @@ impl RequestHandler {
                     }
                     ExtendedKeyDecode::Partial => {
                         pending_input.drain(..offset);
-                        retain_partial_attached_control_input("live extended key", pending_input)?;
+                        retain_partial_attached_escape_input("live extended key", pending_input)?;
                         return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                     }
                     ExtendedKeyDecode::Invalid => {
@@ -890,8 +891,16 @@ impl RequestHandler {
                         }
                     } else {
                         if is_utf8_lead_byte(first) && slice.len() < utf8_expected_len(first) {
-                            pending_input.drain(..raw_start);
-                            retain_partial_attached_control_input("live utf-8", pending_input)?;
+                            if raw_start < offset {
+                                self.write_attached_bytes(
+                                    attach_pid,
+                                    &pending_input[raw_start..offset],
+                                )
+                                .await?;
+                                forwarded_to_pane = true;
+                            }
+                            pending_input.drain(..offset);
+                            retain_partial_attached_escape_input("live utf-8", pending_input)?;
                             return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                         }
                         offset += 1;
@@ -959,8 +968,13 @@ impl RequestHandler {
                     continue;
                 }
                 AttachedKeyDecode::Partial => {
-                    pending_input.drain(..raw_start);
-                    retain_partial_attached_control_input("live attached key", pending_input)?;
+                    if raw_start < offset {
+                        self.write_attached_bytes(attach_pid, &pending_input[raw_start..offset])
+                            .await?;
+                        forwarded_to_pane = true;
+                    }
+                    pending_input.drain(..offset);
+                    retain_partial_attached_escape_input("live attached key", pending_input)?;
                     return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                 }
                 AttachedKeyDecode::Invalid => {}
@@ -1423,13 +1437,31 @@ mod live_key_decode_tests {
 
     #[test]
     fn meta_unicode_waits_for_every_utf8_byte() {
-        assert_eq!(
-            decode_live_attached_key(b"\x1b\xc3", None),
-            AttachedKeyDecode::Partial
-        );
+        for partial in [
+            b"\x1b\xc3".as_slice(),
+            b"\x1b\xe6".as_slice(),
+            b"\x1b\xe6\x97".as_slice(),
+            b"\x1b\xf0".as_slice(),
+            b"\x1b\xf0\x9f".as_slice(),
+            b"\x1b\xf0\x9f\x92".as_slice(),
+        ] {
+            assert_eq!(
+                decode_live_attached_key(partial, None),
+                AttachedKeyDecode::Partial,
+                "{partial:?} must stay pending until its declared UTF-8 length"
+            );
+        }
         assert!(matches!(
             decode_live_attached_key(b"\x1b\xc3\xa9", None),
             AttachedKeyDecode::Matched { size: 3, .. }
+        ));
+        assert!(matches!(
+            decode_live_attached_key(b"\x1b\xe6\x97\xa5", None),
+            AttachedKeyDecode::Matched { size: 4, .. }
+        ));
+        assert!(matches!(
+            decode_live_attached_key(b"\x1b\xf0\x9f\x92\xa1", None),
+            AttachedKeyDecode::Matched { size: 5, .. }
         ));
     }
 }

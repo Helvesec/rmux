@@ -20,16 +20,14 @@ fn timer_snapshot(handler: &RequestHandler, target: &WindowTarget) -> (u64, toki
         .expect("silence timer is armed")
 }
 
-async fn replace_deadline(
+async fn settled_timer_snapshot(
     handler: &RequestHandler,
     target: &WindowTarget,
-    offset_seconds: u64,
 ) -> (u64, tokio::time::Instant) {
-    // Let any in-flight ConPTY startup-activity re-arm land before pinning a
-    // deterministic deadline: the fixture panes are quiet, so once the timer
-    // is stable nothing re-arms it again and the later exact-equality
-    // assertions cannot race the asynchronous alert queue (the class fixed
-    // for link_window_after_moves_silence_expiry_to_new_target_without_delay).
+    // Observe the production timer until any in-flight ConPTY startup activity
+    // has finished re-arming it. Do not replace the deadline here: doing so
+    // would manufacture the baseline that these fanout tests are meant to
+    // preserve.
     let settle_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut previous = timer_snapshot(handler, target);
     let mut stable_since = tokio::time::Instant::now();
@@ -38,23 +36,19 @@ async fn replace_deadline(
         let current = timer_snapshot(handler, target);
         let now = tokio::time::Instant::now();
         if current == previous {
-            if now.duration_since(stable_since) >= Duration::from_millis(250) {
-                break;
+            if now.duration_since(stable_since) >= Duration::from_millis(500) {
+                return current;
             }
         } else {
             previous = current;
             stable_since = now;
         }
         if now >= settle_deadline {
-            break;
+            panic!(
+                "silence timer did not settle naturally for {target}; last snapshot: {previous:?}"
+            );
         }
     }
-
-    handler.replace_silence_timer_deadline_for_test(
-        target,
-        tokio::time::Instant::now() + Duration::from_secs(offset_seconds),
-    );
-    timer_snapshot(handler, target)
 }
 
 async fn create_destination_group(
@@ -192,12 +186,22 @@ async fn link_window_fans_out_source_silence_deadline_only_to_new_group_aliases(
     handler.wait_for_initial_panes_for_test().await;
     enable_global_monitor_silence(&handler).await;
 
-    let source_before = replace_deadline(&handler, &source, 121).await;
-    let external_before = replace_deadline(&handler, &external, 137).await;
+    let source_before = settled_timer_snapshot(&handler, &source).await;
+    let external_before = settled_timer_snapshot(&handler, &external).await;
     let owner_unrelated = WindowTarget::with_window(owner.clone(), 0);
     let peer_unrelated = WindowTarget::with_window(peer.clone(), 0);
-    let owner_unrelated_before = replace_deadline(&handler, &owner_unrelated, 149).await;
-    let peer_unrelated_before = replace_deadline(&handler, &peer_unrelated, 163).await;
+    let owner_unrelated_before = settled_timer_snapshot(&handler, &owner_unrelated).await;
+    let peer_unrelated_before = settled_timer_snapshot(&handler, &peer_unrelated).await;
+    for (label, snapshot) in [
+        ("external alias", external_before),
+        ("owner unrelated", owner_unrelated_before),
+        ("peer unrelated", peer_unrelated_before),
+    ] {
+        assert_ne!(
+            snapshot.1, source_before.1,
+            "{label} needs a distinct natural deadline for this preservation assertion to be meaningful"
+        );
+    }
 
     let owner_destination = WindowTarget::with_window(owner, 1);
     let peer_destination = WindowTarget::with_window(peer, 1);
@@ -232,7 +236,7 @@ async fn link_window_kill_clears_replaced_group_alerts_before_deadline_fanout() 
         create_destination_group(&handler, "link-kill-alert-owner", "link-kill-alert-peer").await;
     handler.wait_for_initial_panes_for_test().await;
     enable_global_monitor_silence(&handler).await;
-    let source_before = replace_deadline(&handler, &source, 127).await;
+    let source_before = settled_timer_snapshot(&handler, &source).await;
     let stale_flags = rmux_core::WINLINK_ALERTFLAGS;
     {
         let mut state = handler.state.lock().await;
@@ -342,12 +346,22 @@ async fn move_window_fans_out_source_silence_deadline_without_touching_external_
     handler.wait_for_initial_panes_for_test().await;
     enable_global_monitor_silence(&handler).await;
 
-    let source_before = replace_deadline(&handler, &source, 121).await;
-    let external_before = replace_deadline(&handler, &external, 137).await;
+    let source_before = settled_timer_snapshot(&handler, &source).await;
+    let external_before = settled_timer_snapshot(&handler, &external).await;
     let owner_unrelated = WindowTarget::with_window(owner.clone(), 0);
     let peer_unrelated = WindowTarget::with_window(peer.clone(), 0);
-    let owner_unrelated_before = replace_deadline(&handler, &owner_unrelated, 149).await;
-    let peer_unrelated_before = replace_deadline(&handler, &peer_unrelated, 163).await;
+    let owner_unrelated_before = settled_timer_snapshot(&handler, &owner_unrelated).await;
+    let peer_unrelated_before = settled_timer_snapshot(&handler, &peer_unrelated).await;
+    for (label, snapshot) in [
+        ("external alias", external_before),
+        ("owner unrelated", owner_unrelated_before),
+        ("peer unrelated", peer_unrelated_before),
+    ] {
+        assert_ne!(
+            snapshot.1, source_before.1,
+            "{label} needs a distinct natural deadline for this preservation assertion to be meaningful"
+        );
+    }
     let owner_destination = WindowTarget::with_window(owner.clone(), 1);
     let peer_destination = WindowTarget::with_window(peer, 1);
 
@@ -398,10 +412,14 @@ async fn move_window_fanout_never_overwrites_a_represented_group_peer_deadline()
     let peer_source = WindowTarget::with_window(peer.clone(), 0);
     let owner_unrelated = WindowTarget::with_window(owner.clone(), 1);
     let peer_unrelated = WindowTarget::with_window(peer.clone(), 1);
-    let owner_source_before = replace_deadline(&handler, &owner_source, 121).await;
-    let peer_source_before = replace_deadline(&handler, &peer_source, 137).await;
-    let owner_unrelated_before = replace_deadline(&handler, &owner_unrelated, 149).await;
-    let peer_unrelated_before = replace_deadline(&handler, &peer_unrelated, 163).await;
+    let owner_source_before = settled_timer_snapshot(&handler, &owner_source).await;
+    let peer_source_before = settled_timer_snapshot(&handler, &peer_source).await;
+    let owner_unrelated_before = settled_timer_snapshot(&handler, &owner_unrelated).await;
+    let peer_unrelated_before = settled_timer_snapshot(&handler, &peer_unrelated).await;
+    assert_ne!(
+        owner_source_before.1, peer_source_before.1,
+        "represented aliases need distinct natural deadlines to prove the peer wins"
+    );
 
     let response = handler
         .handle(Request::MoveWindow(MoveWindowRequest {
@@ -459,12 +477,29 @@ async fn swap_window_fans_out_each_addressed_deadline_without_touching_external_
     handler.wait_for_initial_panes_for_test().await;
     enable_global_monitor_silence(&handler).await;
 
-    let source_before = replace_deadline(&handler, &source, 121).await;
-    let source_external_before = replace_deadline(&handler, &source_external, 137).await;
-    let owner_before = replace_deadline(&handler, &owner_target, 149).await;
+    let source_before = settled_timer_snapshot(&handler, &source).await;
+    let source_external_before = settled_timer_snapshot(&handler, &source_external).await;
+    let owner_before = settled_timer_snapshot(&handler, &owner_target).await;
     let peer_target = WindowTarget::with_window(peer, 0);
-    let _peer_before = replace_deadline(&handler, &peer_target, 163).await;
-    let target_external_before = replace_deadline(&handler, &target_external, 179).await;
+    let _peer_before = settled_timer_snapshot(&handler, &peer_target).await;
+    let target_external_before = settled_timer_snapshot(&handler, &target_external).await;
+    assert_ne!(
+        source_before.1, owner_before.1,
+        "addressed windows need distinct natural deadlines to prove the swap"
+    );
+    for (label, snapshot) in [
+        ("source external alias", source_external_before),
+        ("target external alias", target_external_before),
+    ] {
+        assert_ne!(
+            snapshot.1, source_before.1,
+            "{label} needs a distinct deadline from the source to prove it was untouched"
+        );
+        assert_ne!(
+            snapshot.1, owner_before.1,
+            "{label} needs a distinct deadline from the target to prove it was untouched"
+        );
+    }
 
     let response = handler
         .handle(Request::SwapWindow(SwapWindowRequest {

@@ -64,7 +64,8 @@ async fn control_queue_allows_read_only_start_server_and_list_commands() {
                 can_write: false,
             },
         )
-        .await;
+        .await
+        .expect("control registration succeeds");
     let parsed = CommandParser::new()
         .parse("start-server ; list-commands new-window")
         .expect("control commands parse");

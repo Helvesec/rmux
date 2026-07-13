@@ -34,16 +34,27 @@ impl RequestHandler {
                 mode.selected_id = Some(selected_id);
             }
         }
-        let items = selected_items(&mode, &build);
+        let actions = selected_items(&mode, &build)
+            .into_iter()
+            .map(|item| item.action.clone())
+            .collect();
+        self.perform_client_detach_actions(attach_pid, actions)
+            .await
+    }
 
+    pub(super) async fn perform_client_detach_actions(
+        &self,
+        attach_pid: u32,
+        actions: Vec<ModeTreeAction>,
+    ) -> Result<(), RmuxError> {
         // Detach self last so other detaches complete while we still have state.
         let mut self_detach = None;
-        for item in &items {
+        for action in actions {
             let ModeTreeAction::Client {
                 pid,
                 attach_id,
                 control,
-            } = item.action
+            } = action
             else {
                 continue;
             };

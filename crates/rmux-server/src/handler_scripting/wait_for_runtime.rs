@@ -2,6 +2,9 @@ use rmux_proto::{
     ErrorResponse, Response, RmuxError, WaitForMode, WaitForRequest, WaitForResponse,
 };
 
+use super::super::control_support::{
+    current_control_queue_eof_cancellation, ControlQueueEofCancellation,
+};
 use super::super::RequestHandler;
 use crate::wait_for::{WaitForCleanupGuard, WaitForRegistration, WaitForWaiterKind, WaitForWake};
 
@@ -30,6 +33,16 @@ impl RequestHandler {
             }
         }
 
+        let eof_cancellation = matches!(request.mode, WaitForMode::Wait | WaitForMode::Lock)
+            .then(current_control_queue_eof_cancellation)
+            .flatten();
+        // Snapshot EOF before registration without short-circuiting it. The
+        // store decides first whether this operation is already Ready; only a
+        // newly-created Waiting registration is eligible for cancellation.
+        let cancelled_before_registration = eof_cancellation
+            .as_ref()
+            .is_some_and(ControlQueueEofCancellation::is_cancelled);
+
         let result = match request.mode {
             WaitForMode::Wait => {
                 let registration = match self.wait_for.lock() {
@@ -40,8 +53,13 @@ impl RequestHandler {
                         });
                     }
                 };
-                self.wait_for_registration(registration, WaitForWaiterKind::Signal)
-                    .await
+                self.wait_for_registration(
+                    registration,
+                    WaitForWaiterKind::Signal,
+                    eof_cancellation.as_ref(),
+                    cancelled_before_registration,
+                )
+                .await
             }
             WaitForMode::Signal => match self.wait_for.lock() {
                 Ok(mut store) => store.signal(&request.channel),
@@ -56,8 +74,13 @@ impl RequestHandler {
                         });
                     }
                 };
-                self.wait_for_registration(registration, WaitForWaiterKind::Lock)
-                    .await
+                self.wait_for_registration(
+                    registration,
+                    WaitForWaiterKind::Lock,
+                    eof_cancellation.as_ref(),
+                    cancelled_before_registration,
+                )
+                .await
             }
             WaitForMode::Unlock => match self.wait_for.lock() {
                 Ok(mut store) => store.unlock(&request.channel),
@@ -75,8 +98,13 @@ impl RequestHandler {
         &self,
         registration: WaitForRegistration,
         kind: WaitForWaiterKind,
+        eof_cancellation: Option<&ControlQueueEofCancellation>,
+        cancelled_before_registration: bool,
     ) -> Result<(), RmuxError> {
         match registration {
+            // Registration is the linearization point. A pre-signalled wait
+            // or free lock has already completed before EOF cancellation is
+            // consulted, so Ready must remain a normal successful command.
             WaitForRegistration::Ready => Ok(()),
             WaitForRegistration::Shutdown => Err(wait_for_shutdown_error()),
             WaitForRegistration::Waiting {
@@ -86,7 +114,30 @@ impl RequestHandler {
             } => {
                 let mut cleanup =
                     WaitForCleanupGuard::new(&self.wait_for, channel.clone(), waiter_id, kind);
-                match receiver.await {
+                if cancelled_before_registration {
+                    if let Some(cancellation) = eof_cancellation {
+                        cancellation.mark_wait_cancelled();
+                    }
+                    return Ok(());
+                }
+                let wake = match eof_cancellation {
+                    Some(cancellation) => {
+                        tokio::select! {
+                            biased;
+
+                            // Preserve a signal or lock grant that was ready
+                            // in this scheduler turn. EOF wins only while the
+                            // registration is still genuinely waiting.
+                            wake = receiver => wake,
+                            _ = cancellation.cancelled() => {
+                                cancellation.mark_wait_cancelled();
+                                return Ok(());
+                            }
+                        }
+                    }
+                    None => receiver.await,
+                };
+                match wake {
                     Ok(WaitForWake::Ready) => {
                         if kind == WaitForWaiterKind::Lock {
                             let mut store = self.wait_for.lock().map_err(|_| {

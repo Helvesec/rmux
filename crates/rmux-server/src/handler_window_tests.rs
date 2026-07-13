@@ -216,3 +216,6 @@ mod active_selection;
 
 #[path = "handler_window_tests/resize_respawn.rs"]
 mod resize_respawn;
+
+#[path = "handler_window_tests/respawn_linked_refresh.rs"]
+mod respawn_linked_refresh;

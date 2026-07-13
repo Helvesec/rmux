@@ -393,6 +393,16 @@ async fn set_hook_updates_the_store_and_one_shot_hooks_are_consumed_on_attach() 
 async fn session_closed_hooks_fire_before_session_scope_is_removed() {
     let handler = RequestHandler::new();
     create_session(&handler, "alpha").await;
+    let lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .expect("test owns the lifecycle dispatch receiver");
+    let (hook_shutdown, hook_shutdown_rx) = tokio::sync::oneshot::channel();
+    let hook_handler = handler.clone();
+    let hook_task = tokio::spawn(async move {
+        hook_handler
+            .consume_lifecycle_hooks(lifecycle_events, hook_shutdown_rx)
+            .await;
+    });
 
     assert!(matches!(
         handler
@@ -418,12 +428,9 @@ async fn session_closed_hooks_fire_before_session_scope_is_removed() {
         Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
     );
 
-    let state = handler.state.lock().await;
-    let (_, content) = state
-        .buffers
-        .show(Some("closed"))
-        .expect("closed buffer exists");
-    assert_eq!(String::from_utf8_lossy(content), "ok");
+    wait_for_buffer(&handler, "closed", "ok").await;
+    let _ = hook_shutdown.send(());
+    hook_task.await.expect("lifecycle hook task joins");
 }
 
 #[tokio::test]

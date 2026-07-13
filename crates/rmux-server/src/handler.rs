@@ -50,6 +50,8 @@ mod mode_tree_support;
 mod option_support;
 #[path = "handler_overlay.rs"]
 mod overlay_support;
+#[path = "handler/pane_output_subscription_rekeys.rs"]
+mod pane_output_subscription_rekeys;
 #[path = "handler_pane_state.rs"]
 mod pane_state_support;
 #[path = "handler_pane.rs"]
@@ -127,8 +129,11 @@ pub(in crate::handler) use client_runtime_support::{
     format_attached_client_flags, format_control_client_flags,
 };
 use control_support::ActiveControlState;
+#[cfg(all(test, unix))]
+pub(crate) use control_support::ControlRegistrationError;
 pub(crate) use control_support::{
-    with_control_queue_identity, ControlClientIdentity, ControlRegistration,
+    with_control_queue_eof_cancellation, with_control_queue_identity, ControlClientIdentity,
+    ControlQueueDrainLease, ControlQueueEofCancellation, ControlRegistration,
 };
 use exited_output_support::RetainedExitedPaneOutputs;
 pub(in crate::handler) use hook_identity_support::{
@@ -146,6 +151,9 @@ pub(crate) use lifecycle_support::{
     DeferredLifecycleEvent, LifecycleDispatchItem, QueuedLifecycleEvent,
 };
 use option_support::option_value_u32;
+pub(in crate::handler) use pane_output_subscription_rekeys::{
+    PaneOutputSubscriptionKeySnapshot, PaneOutputSubscriptionReconciliation,
+};
 use pane_support::PaneSnapshotRevisionRegistry;
 use session_lease_support::SessionLeaseStore;
 use subscription_support::OutputSubscriptionState;
@@ -199,6 +207,7 @@ pub(crate) struct RequestHandler {
     state: Arc<Mutex<HandlerState>>,
     active_attach: Arc<Mutex<ActiveAttachState>>,
     active_attach_epoch: Arc<AtomicU64>,
+    active_attach_forwarders: Arc<AtomicUsize>,
     active_control: Arc<Mutex<ActiveControlState>>,
     silence_timers: Arc<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Arc<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -281,6 +290,7 @@ impl Clone for RequestHandler {
             state: self.state.clone(),
             active_attach: self.active_attach.clone(),
             active_attach_epoch: self.active_attach_epoch.clone(),
+            active_attach_forwarders: self.active_attach_forwarders.clone(),
             active_control: self.active_control.clone(),
             silence_timers: self.silence_timers.clone(),
             pane_alert_coalescer: self.pane_alert_coalescer.clone(),
@@ -352,6 +362,7 @@ pub(crate) struct WeakRequestHandler {
     state: Weak<Mutex<HandlerState>>,
     active_attach: Weak<Mutex<ActiveAttachState>>,
     active_attach_epoch: Weak<AtomicU64>,
+    active_attach_forwarders: Weak<AtomicUsize>,
     active_control: Weak<Mutex<ActiveControlState>>,
     silence_timers: Weak<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Weak<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -399,6 +410,7 @@ impl WeakRequestHandler {
             state: self.state.upgrade()?,
             active_attach: self.active_attach.upgrade()?,
             active_attach_epoch: self.active_attach_epoch.upgrade()?,
+            active_attach_forwarders: self.active_attach_forwarders.upgrade()?,
             active_control: self.active_control.upgrade()?,
             silence_timers: self.silence_timers.upgrade()?,
             pane_alert_coalescer: self.pane_alert_coalescer.upgrade()?,
@@ -664,6 +676,7 @@ impl RequestHandler {
             state: Arc::new(Mutex::new(state)),
             active_attach: Arc::new(Mutex::new(ActiveAttachState::default())),
             active_attach_epoch: Arc::new(AtomicU64::new(0)),
+            active_attach_forwarders: Arc::new(AtomicUsize::new(0)),
             active_control: Arc::new(Mutex::new(ActiveControlState::default())),
             silence_timers: Arc::new(StdMutex::new(HashMap::new())),
             pane_alert_coalescer: Arc::new(StdMutex::new(
@@ -745,6 +758,7 @@ impl RequestHandler {
             state: Arc::downgrade(&self.state),
             active_attach: Arc::downgrade(&self.active_attach),
             active_attach_epoch: Arc::downgrade(&self.active_attach_epoch),
+            active_attach_forwarders: Arc::downgrade(&self.active_attach_forwarders),
             active_control: Arc::downgrade(&self.active_control),
             silence_timers: Arc::downgrade(&self.silence_timers),
             pane_alert_coalescer: Arc::downgrade(&self.pane_alert_coalescer),

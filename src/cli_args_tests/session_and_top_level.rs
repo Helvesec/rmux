@@ -1,4 +1,54 @@
 use super::*;
+use clap::Parser as _;
+use std::ffi::OsString;
+
+#[test]
+fn top_level_scanner_matches_raw_and_public_config_value_boundaries() {
+    let raw = super::super::RawCli::try_parse_from(["rmux", "-f", "-Ldemo", "claude"])
+        .expect("raw clap consumes the hyphenated token as -f's value");
+    assert_eq!(raw.config_files, vec![std::path::PathBuf::from("-Ldemo")]);
+    assert_eq!(raw.command, vec![OsString::from("claude")]);
+
+    let raw = super::super::RawCli::try_parse_from(["rmux", "-Lfixed", "-f", "-Ldemo", "claude"])
+        .expect("raw clap preserves the first compact token as the command tail");
+    assert!(raw.config_files.is_empty());
+    assert!(raw.socket_name.is_none());
+    assert_eq!(
+        raw.command,
+        ["-Lfixed", "-f", "-Ldemo", "claude"]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+    );
+
+    let raw_help_kind = super::super::RawCli::try_parse_from(["rmux", "-f", "--help", "claude"])
+        .expect_err("raw clap rejects --help as a missing -f value")
+        .kind();
+    assert_eq!(raw_help_kind, clap::error::ErrorKind::InvalidValue);
+
+    for arguments in [
+        &["-f", "-Ldemo", "claude"][..],
+        &["-Lfixed", "-f", "-Ldemo", "claude"][..],
+        &["-f", "--help", "claude"][..],
+    ] {
+        let mut full_arguments = vec![OsString::from("rmux")];
+        full_arguments.extend(arguments.iter().map(OsString::from));
+        let public_kind = super::super::parse(full_arguments)
+            .expect_err("the public parser must reject the same boundary")
+            .kind();
+        let scan_arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
+        let scan_kind = super::super::scan_top_level_command(&scan_arguments)
+            .expect_err("the extension scanner must reject the same boundary")
+            .kind();
+
+        assert_eq!(
+            public_kind,
+            clap::error::ErrorKind::InvalidValue,
+            "public parse: {arguments:?}"
+        );
+        assert_eq!(scan_kind, public_kind, "extension scan: {arguments:?}");
+    }
+}
 
 #[test]
 fn new_session_accepts_omitted_session_name() {

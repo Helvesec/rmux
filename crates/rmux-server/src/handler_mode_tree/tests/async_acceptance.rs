@@ -1,6 +1,766 @@
 use super::*;
 
-use super::super::mode_tree_model::ChooseTreeTarget;
+use super::super::mode_tree_model::{ChooseTreeTarget, ModeTreeActionIdentity};
+use crate::handler::prompt_support::PromptInputEvent;
+
+async fn choose_buffer_action_fixture(
+    label: &str,
+    attach_pid_offset: u32,
+) -> (
+    RequestHandler,
+    u32,
+    mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+) {
+    let handler = RequestHandler::new();
+    let session_name = SessionName::new(label).expect("valid session");
+    create_mode_tree_test_session(&handler, &session_name).await;
+    for (name, content) in [
+        ("stale", b"old".to_vec()),
+        ("delete-me", b"delete".to_vec()),
+        ("keep", b"safe".to_vec()),
+    ] {
+        let response = handler
+            .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
+                name: Some(name.to_owned()),
+                content,
+                append: false,
+                new_name: None,
+                set_clipboard: false,
+                target_client: None,
+            })))
+            .await;
+        assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
+    }
+
+    let attach_pid = std::process::id().saturating_add(attach_pid_offset);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name, control_tx)
+        .await;
+    open_choose_buffer(&handler, attach_pid).await;
+    (handler, attach_pid, control_rx)
+}
+
+async fn open_choose_buffer(handler: &RequestHandler, attach_pid: u32) {
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-buffer"])
+        .expect("choose-buffer parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            attach_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("choose-buffer opens");
+}
+
+async fn set_global_option(handler: &RequestHandler, option: OptionName, value: &str) {
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option,
+                value: value.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+}
+
+fn frame_visits_row(frame: &[u8], row: u16) -> bool {
+    let cursor = format!("\x1b[{row};1H");
+    frame
+        .windows(cursor.len())
+        .any(|window| window == cursor.as_bytes())
+}
+
+fn mouse_event_at_row(y: u16) -> crate::input_keys::MouseForwardEvent {
+    crate::input_keys::MouseForwardEvent {
+        b: 0,
+        lb: 0,
+        x: 0,
+        y,
+        lx: 0,
+        ly: y,
+        sgr_b: 0,
+        sgr_type: 'M',
+        ignore: false,
+    }
+}
+
+#[tokio::test]
+async fn mode_tree_reserves_numeric_status_at_top_and_bottom() {
+    let label = "choose-buffer-multi-line-status";
+    let session_name = SessionName::new(label).expect("valid session");
+    let (handler, attach_pid, _control_rx) = choose_buffer_action_fixture(label, 79).await;
+    set_global_option(&handler, OptionName::Status, "3").await;
+
+    let mut mode = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .and_then(|active| active.mode_tree.clone())
+        .expect("choose-buffer remains active");
+    mode.preview_mode = PreviewMode::Off;
+    let build = handler
+        .build_mode_tree(&mut mode, attach_pid)
+        .await
+        .expect("choose-buffer rebuild succeeds");
+
+    assert_eq!(mode.last_list_rows, 21);
+    assert_eq!(
+        handler
+            .mode_tree_content_rows(&mode)
+            .await
+            .expect("mode-tree geometry resolves"),
+        21
+    );
+    let overlay = {
+        let state = handler.state.lock().await;
+        render_mode_tree_overlay(&state, &mode, &build)
+    };
+    assert!(frame_visits_row(&overlay, 21));
+    assert!(!frame_visits_row(&overlay, 22));
+
+    let clear = handler
+        .mode_tree_overlay_clear_frame_for_test(&session_name)
+        .await
+        .expect("mode-tree clear frame resolves");
+    assert!(frame_visits_row(&clear, 21));
+    assert!(!frame_visits_row(&clear, 22));
+
+    set_global_option(&handler, OptionName::StatusPosition, "top").await;
+    let overlay = {
+        let state = handler.state.lock().await;
+        render_mode_tree_overlay(&state, &mode, &build)
+    };
+    for status_row in 1..=3 {
+        assert!(!frame_visits_row(&overlay, status_row));
+    }
+    assert!(frame_visits_row(&overlay, 4));
+    assert!(frame_visits_row(&overlay, 24));
+
+    let clear = handler
+        .mode_tree_overlay_clear_frame_for_test(&session_name)
+        .await
+        .expect("mode-tree clear frame resolves");
+    for status_row in 1..=3 {
+        assert!(!frame_visits_row(&clear, status_row));
+    }
+    assert!(frame_visits_row(&clear, 4));
+    assert!(frame_visits_row(&clear, 24));
+}
+
+#[tokio::test]
+async fn mode_tree_mouse_uses_content_rows_below_top_status() {
+    let label = "choose-buffer-top-status-mouse";
+    let (handler, attach_pid, _control_rx) = choose_buffer_action_fixture(label, 80).await;
+    set_global_option(&handler, OptionName::Status, "3").await;
+    set_global_option(&handler, OptionName::StatusPosition, "top").await;
+
+    for index in 0..24 {
+        let response = handler
+            .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
+                name: Some(format!("mouse-row-{index:02}")),
+                content: vec![u8::try_from(index).expect("test index fits in u8")],
+                append: false,
+                new_name: None,
+                set_clipboard: false,
+                target_client: None,
+            })))
+            .await;
+        assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
+    }
+
+    let mut mode = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .and_then(|active| active.mode_tree.clone())
+        .expect("choose-buffer remains active");
+    mode.preview_mode = PreviewMode::Off;
+    mode.scroll = 0;
+    mode.selected_id = None;
+    let build = handler
+        .build_mode_tree(&mut mode, attach_pid)
+        .await
+        .expect("choose-buffer rebuild succeeds");
+    let expected_first = build.visible.first().cloned().expect("first content row");
+    let expected_last = build.visible.get(20).cloned().expect("last content row");
+    mode.selected_id = Some(expected_first.clone());
+    handler
+        .store_mode_tree_state(attach_pid, mode)
+        .await
+        .expect("mode-tree state stores");
+
+    assert!(!handler
+        .handle_mode_tree_mouse_event(attach_pid, mouse_event_at_row(2))
+        .await
+        .expect("status-row click is ignored"));
+    assert!(handler
+        .handle_mode_tree_mouse_event(attach_pid, mouse_event_at_row(3))
+        .await
+        .expect("first content-row click succeeds"));
+    assert_eq!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .and_then(|active| active.mode_tree.as_ref())
+            .and_then(|mode| mode.selected_id.clone()),
+        Some(expected_first)
+    );
+
+    assert!(handler
+        .handle_mode_tree_mouse_event(attach_pid, mouse_event_at_row(23))
+        .await
+        .expect("last content-row click succeeds"));
+    assert_eq!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .and_then(|active| active.mode_tree.as_ref())
+            .and_then(|mode| mode.selected_id.clone()),
+        Some(expected_last)
+    );
+}
+
+async fn delete_stale_buffer(handler: &RequestHandler) {
+    let response = handler
+        .handle(Request::DeleteBuffer(rmux_proto::DeleteBufferRequest {
+            name: Some("stale".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::DeleteBuffer(_)),
+        "{response:?}"
+    );
+}
+
+async fn replace_stale_buffer(handler: &RequestHandler) {
+    delete_stale_buffer(handler).await;
+    let response = handler
+        .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
+            name: Some("stale".to_owned()),
+            content: b"replacement".to_vec(),
+            append: false,
+            new_name: None,
+            set_clipboard: false,
+            target_client: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
+}
+
+async fn choose_buffer_item_id(
+    handler: &RequestHandler,
+    attach_pid: u32,
+    buffer_name: &str,
+) -> String {
+    let mut mode = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .and_then(|active| active.mode_tree.clone())
+        .expect("choose-buffer remains active");
+    handler
+        .build_mode_tree(&mut mode, attach_pid)
+        .await
+        .expect("choose-buffer rebuild succeeds")
+        .items
+        .values()
+        .find(|item| {
+            matches!(
+                &item.action,
+                ModeTreeAction::Buffer { name, .. } if name == buffer_name
+            )
+        })
+        .map(|item| item.id.clone())
+        .expect("buffer item exists")
+}
+
+#[tokio::test]
+async fn choose_buffer_accept_rejects_a_reconnected_host_before_paste() {
+    let label = "choose-buffer-host-generation-write";
+    let session_name = SessionName::new(label).expect("valid session");
+    let target = rmux_proto::PaneTarget::with_window(session_name.clone(), 0, 0);
+    let (handler, attach_pid, _old_rx) = choose_buffer_action_fixture(label, 70).await;
+    handler.start_attached_input_capture_for_test(&target).await;
+    let keep_id = choose_buffer_item_id(&handler, attach_pid, "keep").await;
+    let old_identity = {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&attach_pid)
+            .expect("original host remains attached");
+        active
+            .mode_tree
+            .as_mut()
+            .expect("original choose-buffer remains active")
+            .selected_id = Some(keep_id);
+        super::super::mode_tree_model::ModeTreeActionIdentity::new(
+            attach_pid,
+            active.id,
+            active.mode_tree_state_id,
+        )
+    };
+
+    let pause =
+        super::super::mode_tree_buffer_actions::install_mode_tree_buffer_paste_pause(attach_pid);
+    let accepting_handler = handler.clone();
+    let accept = tokio::spawn(async move {
+        accepting_handler
+            .accept_mode_tree_selection(attach_pid)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("accept reaches the pre-write identity pause");
+
+    let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
+    let replacement_attach_id = handler
+        .register_attach(attach_pid, session_name, replacement_tx)
+        .await;
+    assert_ne!(replacement_attach_id, old_identity.attach_id());
+    open_choose_buffer(&handler, attach_pid).await;
+    let replacement_state_id = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .expect("replacement host is attached")
+        .mode_tree_state_id;
+    while replacement_rx.try_recv().is_ok() {}
+
+    pause.release.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), accept)
+        .await
+        .expect("stale accept completes")
+        .expect("stale accept task joins");
+    assert!(result.is_err(), "stale host generation must fail closed");
+    assert_eq!(
+        handler.attached_input_capture_for_test(&target).await,
+        Some(Vec::new()),
+        "the stale host must not paste into the pane"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = active_attach
+        .by_pid
+        .get(&attach_pid)
+        .expect("replacement host survives");
+    assert_eq!(replacement.id, replacement_attach_id);
+    assert_eq!(replacement.mode_tree_state_id, replacement_state_id);
+    assert!(
+        replacement.mode_tree.is_some(),
+        "the stale accept must not dismiss the replacement tree"
+    );
+    drop(active_attach);
+    while let Ok(control) = replacement_rx.try_recv() {
+        assert!(
+            !matches!(
+                control,
+                crate::pane_io::AttachControl::AdvancePersistentOverlayState(_)
+            ),
+            "the stale accept advanced the replacement overlay state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn choose_buffer_p_key_rejects_a_same_pid_reconnect_before_paste() {
+    let label = "choose-buffer-p-key-host-generation";
+    let session_name = SessionName::new(label).expect("valid session");
+    let target = rmux_proto::PaneTarget::with_window(session_name.clone(), 0, 0);
+    let (handler, attach_pid, _old_rx) = choose_buffer_action_fixture(label, 76).await;
+    handler.start_attached_input_capture_for_test(&target).await;
+    let keep_id = choose_buffer_item_id(&handler, attach_pid, "keep").await;
+    let old_attach_id = {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&attach_pid)
+            .expect("original host remains attached");
+        active
+            .mode_tree
+            .as_mut()
+            .expect("original choose-buffer remains active")
+            .selected_id = Some(keep_id);
+        active.id
+    };
+
+    let pause =
+        super::super::mode_tree_buffer_actions::install_mode_tree_buffer_paste_pause(attach_pid);
+    let key_handler = handler.clone();
+    let key = tokio::spawn(async move {
+        key_handler
+            .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Char('p'))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("p reaches the pre-write identity pause");
+
+    let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
+    let replacement_attach_id = handler
+        .register_attach(attach_pid, session_name, replacement_tx)
+        .await;
+    assert_ne!(replacement_attach_id, old_attach_id);
+    open_choose_buffer(&handler, attach_pid).await;
+    let replacement_state_id = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .expect("replacement host is attached")
+        .mode_tree_state_id;
+    while replacement_rx.try_recv().is_ok() {}
+
+    pause.release.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), key)
+        .await
+        .expect("stale p key completes")
+        .expect("stale p key task joins");
+    assert!(result.is_err(), "the stale p key must fail closed");
+    assert_eq!(
+        handler.attached_input_capture_for_test(&target).await,
+        Some(Vec::new()),
+        "the stale p key must not paste into the pane"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = active_attach
+        .by_pid
+        .get(&attach_pid)
+        .expect("replacement host survives");
+    assert_eq!(replacement.id, replacement_attach_id);
+    assert_eq!(replacement.mode_tree_state_id, replacement_state_id);
+    assert!(
+        replacement.mode_tree.is_some(),
+        "the stale p key must not dismiss the replacement tree"
+    );
+    drop(active_attach);
+    while let Ok(control) = replacement_rx.try_recv() {
+        assert!(
+            !matches!(
+                control,
+                crate::pane_io::AttachControl::AdvancePersistentOverlayState(_)
+            ),
+            "the stale p key advanced the replacement overlay state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn choose_buffer_d_key_rejects_a_same_pid_reconnect_before_delete() {
+    let label = "choose-buffer-d-key-host-generation";
+    let session_name = SessionName::new(label).expect("valid session");
+    let (handler, attach_pid, _old_rx) = choose_buffer_action_fixture(label, 77).await;
+    let keep_id = choose_buffer_item_id(&handler, attach_pid, "keep").await;
+    let old_attach_id = {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&attach_pid)
+            .expect("original host remains attached");
+        active
+            .mode_tree
+            .as_mut()
+            .expect("original choose-buffer remains active")
+            .selected_id = Some(keep_id);
+        active.id
+    };
+
+    let pause =
+        super::super::mode_tree_buffer_actions::install_mode_tree_buffer_delete_pause(attach_pid);
+    let key_handler = handler.clone();
+    let key = tokio::spawn(async move {
+        key_handler
+            .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Char('d'))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("d reaches the pre-delete identity pause");
+
+    let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
+    let replacement_attach_id = handler
+        .register_attach(attach_pid, session_name, replacement_tx)
+        .await;
+    assert_ne!(replacement_attach_id, old_attach_id);
+    open_choose_buffer(&handler, attach_pid).await;
+    let replacement_state_id = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .expect("replacement host is attached")
+        .mode_tree_state_id;
+    while replacement_rx.try_recv().is_ok() {}
+
+    pause.release.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), key)
+        .await
+        .expect("stale d key completes")
+        .expect("stale d key task joins");
+    assert!(result.is_err(), "the stale d key must fail closed");
+    assert_eq!(
+        handler.state.lock().await.buffers.get("keep"),
+        Some(&b"safe"[..]),
+        "the stale d key must not delete the selected buffer"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = active_attach
+        .by_pid
+        .get(&attach_pid)
+        .expect("replacement host survives");
+    assert_eq!(replacement.id, replacement_attach_id);
+    assert_eq!(replacement.mode_tree_state_id, replacement_state_id);
+    assert!(
+        replacement.mode_tree.is_some(),
+        "the stale d key must not dismiss the replacement tree"
+    );
+    drop(active_attach);
+    while let Ok(control) = replacement_rx.try_recv() {
+        assert!(
+            !matches!(
+                control,
+                crate::pane_io::AttachControl::AdvancePersistentOverlayState(_)
+            ),
+            "the stale d key advanced the replacement overlay state"
+        );
+    }
+}
+
+#[tokio::test]
+async fn choose_buffer_stale_host_identity_cannot_dismiss_a_replacement_tree() {
+    let label = "choose-buffer-host-generation-dismiss";
+    let session_name = SessionName::new(label).expect("valid session");
+    let (handler, attach_pid, _old_rx) = choose_buffer_action_fixture(label, 71).await;
+    let old_identity = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("original host remains attached");
+        super::super::mode_tree_model::ModeTreeActionIdentity::new(
+            attach_pid,
+            active.id,
+            active.mode_tree_state_id,
+        )
+    };
+
+    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+    let replacement_attach_id = handler
+        .register_attach(attach_pid, session_name, replacement_tx)
+        .await;
+    open_choose_buffer(&handler, attach_pid).await;
+
+    assert!(handler
+        .dismiss_mode_tree_with_refresh_for_action_identity(old_identity)
+        .await
+        .is_err());
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = active_attach
+        .by_pid
+        .get(&attach_pid)
+        .expect("replacement host survives");
+    assert_eq!(replacement.id, replacement_attach_id);
+    assert!(replacement.mode_tree.is_some());
+}
+
+#[tokio::test]
+async fn closing_host_identity_cannot_dismiss_the_shared_mode_tree() {
+    let (handler, attach_pid, mut control_rx) =
+        choose_buffer_action_fixture("choose-buffer-closing-host-dismiss", 75).await;
+    let (attach_id, mode_tree_state_id) = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("choose-buffer host remains registered");
+        active
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        (active.id, active.mode_tree_state_id)
+    };
+    while control_rx.try_recv().is_ok() {}
+
+    assert!(handler
+        .dismiss_mode_tree_for_client_identity(attach_pid, attach_id)
+        .await
+        .is_err());
+
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&attach_pid)
+        .expect("closing host remains registered for teardown");
+    assert_eq!(active.mode_tree_state_id, mode_tree_state_id);
+    assert!(
+        active.mode_tree.is_some(),
+        "a stale closing action must not dismiss the shared tree"
+    );
+    drop(active_attach);
+    while let Ok(control) = control_rx.try_recv() {
+        assert!(
+            !matches!(
+                control,
+                crate::pane_io::AttachControl::AdvancePersistentOverlayState(_)
+            ),
+            "a closing action advanced the shared mode-tree generation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn choose_buffer_delete_does_not_fall_back_after_all_tags_go_stale() {
+    let (handler, attach_pid, _control_rx) =
+        choose_buffer_action_fixture("choose-buffer-stale-tag", 72).await;
+    let stale_id = choose_buffer_item_id(&handler, attach_pid, "stale").await;
+    let keep_id = choose_buffer_item_id(&handler, attach_pid, "keep").await;
+    {
+        let mut active_attach = handler.active_attach.lock().await;
+        let mode = active_attach
+            .by_pid
+            .get_mut(&attach_pid)
+            .and_then(|active| active.mode_tree.as_mut())
+            .expect("choose-buffer remains active");
+        mode.selected_id = Some(keep_id);
+        mode.tagged.insert(stale_id);
+    }
+    replace_stale_buffer(&handler).await;
+
+    handler
+        .perform_buffer_delete(attach_pid)
+        .await
+        .expect("stale tagged delete is a no-op");
+
+    let state = handler.state.lock().await;
+    assert_eq!(state.buffers.get("stale"), Some(&b"replacement"[..]));
+    assert_eq!(state.buffers.get("keep"), Some(&b"safe"[..]));
+    drop(state);
+    assert!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .is_some_and(|active| active.mode_tree.is_some()),
+        "stale identity keeps choose-buffer open for explicit review"
+    );
+}
+
+#[tokio::test]
+async fn choose_buffer_paste_delete_does_not_fall_back_after_selection_goes_stale() {
+    let (handler, attach_pid, _control_rx) =
+        choose_buffer_action_fixture("choose-buffer-stale-selection", 73).await;
+    let stale_id = choose_buffer_item_id(&handler, attach_pid, "stale").await;
+    handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get_mut(&attach_pid)
+        .and_then(|active| active.mode_tree.as_mut())
+        .expect("choose-buffer remains active")
+        .selected_id = Some(stale_id);
+    replace_stale_buffer(&handler).await;
+
+    handler
+        .perform_buffer_paste(attach_pid, true)
+        .await
+        .expect("stale selected paste-delete is a no-op");
+
+    let state = handler.state.lock().await;
+    assert_eq!(state.buffers.get("stale"), Some(&b"replacement"[..]));
+    assert_eq!(state.buffers.get("keep"), Some(&b"safe"[..]));
+    drop(state);
+    assert!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .is_some_and(|active| active.mode_tree.is_some()),
+        "stale ordered paste keeps choose-buffer open for explicit review"
+    );
+}
+
+#[tokio::test]
+async fn choose_buffer_confirmation_uses_captured_buffer_instances() {
+    let (handler, attach_pid, mut control_rx) =
+        choose_buffer_action_fixture("choose-buffer-confirm-snapshot", 74).await;
+    let stale_id = choose_buffer_item_id(&handler, attach_pid, "stale").await;
+    let delete_id = choose_buffer_item_id(&handler, attach_pid, "delete-me").await;
+    let keep_id = choose_buffer_item_id(&handler, attach_pid, "keep").await;
+    {
+        let mut active_attach = handler.active_attach.lock().await;
+        let mode = active_attach
+            .by_pid
+            .get_mut(&attach_pid)
+            .and_then(|active| active.mode_tree.as_mut())
+            .expect("choose-buffer remains active");
+        mode.selected_id = Some(keep_id);
+        mode.tagged.insert(stale_id);
+        mode.tagged.insert(delete_id);
+    }
+    handler
+        .handle_attached_live_input_for_test(attach_pid, b"x")
+        .await
+        .expect("delete confirmation opens");
+    assert_eq!(
+        handler
+            .attached_prompt_render(attach_pid)
+            .await
+            .expect("delete confirmation is active")
+            .prompt,
+        "delete selected buffers?"
+    );
+
+    replace_stale_buffer(&handler).await;
+
+    while control_rx.try_recv().is_ok() {}
+    handler
+        .handle_attached_live_input_for_test(attach_pid, b"y")
+        .await
+        .expect("confirmation input succeeds");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match control_rx.recv().await {
+                Some(crate::pane_io::AttachControl::Overlay(_)) => break,
+                Some(_) => {}
+                None => panic!("attach control channel closed before action refresh"),
+            }
+        }
+    })
+    .await
+    .expect("captured buffer actions finish");
+
+    let state = handler.state.lock().await;
+    assert!(state.buffers.get("delete-me").is_none());
+    assert_eq!(state.buffers.get("stale"), Some(&b"replacement"[..]));
+    assert_eq!(state.buffers.get("keep"), Some(&b"safe"[..]));
+}
 
 #[tokio::test]
 async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
@@ -297,6 +1057,73 @@ async fn choose_tree_stale_session_action_fails_closed_after_name_reuse() {
 }
 
 #[tokio::test]
+async fn choose_tree_tagged_kill_skips_stale_identity_and_finishes_live_batch() {
+    let handler = RequestHandler::new();
+    let stale_name = SessionName::new("a-choose-tree-stale-batch").expect("valid session");
+    let live_name = SessionName::new("z-choose-tree-live-batch").expect("valid session");
+    create_mode_tree_test_session(&handler, &stale_name).await;
+    create_mode_tree_test_session(&handler, &live_name).await;
+    let (stale_id, live_id) = {
+        let state = handler.state.lock().await;
+        (
+            state
+                .sessions
+                .session(&stale_name)
+                .expect("stale target exists")
+                .id(),
+            state
+                .sessions
+                .session(&live_name)
+                .expect("live target exists")
+                .id(),
+        )
+    };
+    let stale_action = ModeTreeAction::session_tree_target(stale_name.clone(), stale_id);
+    let live_action = ModeTreeAction::session_tree_target(live_name.clone(), live_id);
+
+    assert!(matches!(
+        handler
+            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
+                target: stale_name.clone(),
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await,
+        Response::KillSession(_)
+    ));
+    create_mode_tree_test_session(&handler, &stale_name).await;
+    let replacement_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&stale_name)
+        .expect("replacement session exists")
+        .id();
+    assert_ne!(replacement_id, stale_id);
+
+    handler
+        .perform_tree_kill_tagged_actions(std::process::id(), vec![stale_action, live_action])
+        .await
+        .expect("stale tagged target is skipped without aborting the live batch");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&stale_name)
+            .map(rmux_core::Session::id),
+        Some(replacement_id),
+        "the replacement behind the stale identity must survive"
+    );
+    assert!(
+        state.sessions.session(&live_name).is_none(),
+        "the later live tagged target must still be processed"
+    );
+}
+
+#[tokio::test]
 async fn choose_tree_kill_current_does_not_fall_back_after_session_aba() {
     use super::super::mode_tree_order::session_item_id;
 
@@ -485,6 +1312,370 @@ async fn create_mode_tree_test_window(
 }
 
 #[tokio::test]
+async fn rename_session_rekeys_active_choose_tree_host_before_refresh() {
+    let handler = RequestHandler::new();
+    let original = SessionName::new("choose-tree-rename-original").expect("valid session");
+    let renamed = SessionName::new("choose-tree-rename-renamed").expect("valid session");
+    create_mode_tree_test_session(&handler, &original).await;
+
+    let attach_pid = std::process::id().saturating_add(652);
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, original.clone(), control_tx)
+        .await;
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree", "-s"])
+        .expect("choose-tree parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            attach_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("choose-tree opens");
+    let stable_selected_id = {
+        let mut active_attach = handler.active_attach.lock().await;
+        let mode = active_attach
+            .by_pid
+            .get_mut(&attach_pid)
+            .expect("attached choose-tree client")
+            .mode_tree
+            .as_mut()
+            .expect("choose-tree is active");
+        let selected_id = mode
+            .selected_id
+            .clone()
+            .expect("choose-tree selects a stable identity row");
+        mode.tagged.insert(selected_id.clone());
+        selected_id
+    };
+
+    let response = handler
+        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+            target: original,
+            new_name: renamed.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RenameSession(_)),
+        "{response:?}"
+    );
+
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("attached choose-tree client survives rename");
+        assert_eq!(active.session_name, renamed);
+        assert_eq!(
+            active
+                .mode_tree
+                .as_ref()
+                .expect("choose-tree remains active")
+                .session_name,
+            renamed,
+            "the persistent choose-tree host must follow the session identity"
+        );
+        assert_eq!(
+            active
+                .mode_tree
+                .as_ref()
+                .expect("choose-tree remains active")
+                .selected_id
+                .as_ref(),
+            Some(&stable_selected_id),
+            "SessionId-based selection must remain stable across a name-only rename"
+        );
+        assert!(
+            active
+                .mode_tree
+                .as_ref()
+                .expect("choose-tree remains active")
+                .tagged
+                .contains(&stable_selected_id),
+            "SessionId-based tags must survive the rebuild without stale name keys"
+        );
+    }
+
+    assert!(handler
+        .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Char('q'))
+        .await
+        .expect("q dismisses choose-tree after rename"));
+    assert!(
+        handler.active_attach.lock().await.by_pid[&attach_pid]
+            .mode_tree
+            .is_none(),
+        "q must not leave an invisible input-capturing tree after rename"
+    );
+}
+
+#[tokio::test]
+async fn refresh_client_replays_active_mode_tree_after_base_switch() {
+    let handler = RequestHandler::new();
+    let session = SessionName::new("refresh-client-mode-tree").expect("valid session");
+    create_mode_tree_test_session(&handler, &session).await;
+    let attach_pid = std::process::id();
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session, control_tx)
+        .await;
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree", "-s"])
+        .expect("choose-tree parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            attach_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("choose-tree opens");
+    while control_rx.try_recv().is_ok() {}
+
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            rmux_proto::request::RefreshClientRequest {
+                target_client: None,
+                adjustment: None,
+                clear_pan: false,
+                pan_left: false,
+                pan_right: false,
+                pan_up: false,
+                pan_down: false,
+                status_only: false,
+                clipboard_query: false,
+                flags: None,
+                flags_alias: None,
+                subscriptions: Vec::new(),
+                subscriptions_format: Vec::new(),
+                control_size: None,
+                colour_report: None,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+
+    let mut saw_switch = false;
+    let mut replayed_tree = None;
+    while let Ok(control) = control_rx.try_recv() {
+        match control {
+            crate::pane_io::AttachControl::Switch(_) => saw_switch = true,
+            crate::pane_io::AttachControl::Overlay(frame)
+                if saw_switch && frame.persistent_state_id.is_some() =>
+            {
+                replayed_tree = Some(frame);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_switch, "refresh-client must queue the base Switch");
+    let frame = replayed_tree.expect("mode-tree overlay must follow the base Switch");
+    assert!(frame.persistent);
+    assert!(!frame.frame.is_empty());
+    assert!(handler
+        .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Char('q'))
+        .await
+        .expect("replayed choose-tree accepts q"));
+}
+
+async fn choose_tree_identity_guard_fixture(
+    label: &str,
+    attach_pid_offset: u32,
+) -> (
+    RequestHandler,
+    u32,
+    ModeTreeActionIdentity,
+    ChooseTreeTarget,
+    mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+) {
+    let handler = RequestHandler::new();
+    let session_name = SessionName::new(label).expect("valid session");
+    create_mode_tree_test_session(&handler, &session_name).await;
+    create_mode_tree_test_window(&handler, &session_name, 1).await;
+    let (session_id, window_id, window_occurrence_id) = {
+        let mut state = handler.state.lock().await;
+        state.ensure_live_window_link_occurrences();
+        let session = state
+            .sessions
+            .session(&session_name)
+            .expect("choose-tree session exists");
+        (
+            session.id(),
+            session.window_at(1).expect("target window exists").id(),
+            state
+                .window_link_occurrence_id(&session_name, 1)
+                .expect("target window occurrence exists"),
+        )
+    };
+    let attach_pid = std::process::id().saturating_add(attach_pid_offset);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let attach_id = handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree", "-w"])
+        .expect("choose-tree parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            attach_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("choose-tree opens");
+    let action_identity = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("choose-tree host remains attached");
+        assert_eq!(active.id, attach_id);
+        ModeTreeActionIdentity::new(attach_pid, active.id, active.mode_tree_state_id)
+    };
+    (
+        handler,
+        attach_pid,
+        action_identity,
+        ChooseTreeTarget {
+            session_name,
+            session_id,
+            window_index: Some(1),
+            window_id: Some(window_id),
+            window_occurrence_id: Some(window_occurrence_id),
+            pane_index: None,
+            pane_id: None,
+        },
+        control_rx,
+    )
+}
+
+#[tokio::test]
+async fn choose_tree_stale_mode_tree_generation_cannot_select_or_dismiss() {
+    let (handler, attach_pid, stale_identity, target, mut control_rx) =
+        choose_tree_identity_guard_fixture("choose-tree-stale-host-state", 652).await;
+    let replacement_mode = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .and_then(|active| active.mode_tree.clone())
+        .expect("choose-tree remains active");
+    handler
+        .store_mode_tree_state(attach_pid, replacement_mode)
+        .await
+        .expect("replacement mode-tree generation stores");
+    let replacement_state_id = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .expect("choose-tree host remains attached")
+        .mode_tree_state_id;
+    assert_ne!(replacement_state_id, stale_identity.state_id());
+    while control_rx.try_recv().is_ok() {}
+
+    assert!(handler
+        .apply_choose_tree_default_target(stale_identity, target)
+        .await
+        .is_err());
+
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&SessionName::new("choose-tree-stale-host-state").expect("valid session"))
+            .expect("session survives")
+            .active_window_index(),
+        0,
+        "stale generation must not select the target window"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&attach_pid)
+        .expect("host survives");
+    assert_eq!(active.mode_tree_state_id, replacement_state_id);
+    assert!(
+        active.mode_tree.is_some(),
+        "replacement tree must remain open"
+    );
+    drop(active_attach);
+    while let Ok(control) = control_rx.try_recv() {
+        assert!(!matches!(
+            control,
+            crate::pane_io::AttachControl::AdvancePersistentOverlayState(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn choose_tree_closing_host_cannot_select_or_dismiss() {
+    let (handler, attach_pid, identity, target, mut control_rx) =
+        choose_tree_identity_guard_fixture("choose-tree-closing-host", 653).await;
+    {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("choose-tree host remains attached")
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    while control_rx.try_recv().is_ok() {}
+
+    assert!(handler
+        .apply_choose_tree_default_target(identity, target)
+        .await
+        .is_err());
+
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&SessionName::new("choose-tree-closing-host").expect("valid session"))
+            .expect("session survives")
+            .active_window_index(),
+        0,
+        "closing host must not select the target window"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&attach_pid)
+        .expect("closing host remains registered for teardown");
+    assert_eq!(active.mode_tree_state_id, identity.state_id());
+    assert!(active.mode_tree.is_some(), "shared tree must remain open");
+    drop(active_attach);
+    while let Ok(control) = control_rx.try_recv() {
+        assert!(!matches!(
+            control,
+            crate::pane_io::AttachControl::AdvancePersistentOverlayState(_)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn choose_tree_default_switch_rejects_a_reconnected_host_at_the_send_lock() {
     let handler = RequestHandler::new();
     let host = SessionName::new("choose-tree-host-generation-alpha").expect("valid session");
@@ -519,6 +1710,15 @@ async fn choose_tree_default_switch_rejects_a_reconnected_host_at_the_send_lock(
         )
         .await
         .expect("choose-tree opens");
+    let old_action_identity = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("choose-tree host remains attached");
+        assert_eq!(active.id, old_attach_id);
+        ModeTreeActionIdentity::new(attach_pid, active.id, active.mode_tree_state_id)
+    };
 
     let pause =
         super::super::super::attach_support::install_attach_control_identity_pause(attach_pid);
@@ -527,8 +1727,7 @@ async fn choose_tree_default_switch_rejects_a_reconnected_host_at_the_send_lock(
     let switch = tokio::spawn(async move {
         switch_handler
             .apply_choose_tree_default_target(
-                attach_pid,
-                old_attach_id,
+                old_action_identity,
                 ChooseTreeTarget {
                     session_name: switch_target,
                     session_id: target_session_id,

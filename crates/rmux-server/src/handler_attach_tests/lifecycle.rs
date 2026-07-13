@@ -67,14 +67,25 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
         .expect("attached exit input");
     wait_for_dead_pane(&handler, &alpha, 0, 0).await;
 
+    let mouse_tracking_enables = [
+        b"\x1b[?1000h".as_slice(),
+        b"\x1b[?1002h".as_slice(),
+        b"\x1b[?1003h".as_slice(),
+    ];
     let dead_target = take_switch_target(
         recv_matching_attach_control(&mut control_rx, "kept-dead pane refresh", |control| {
-            matches!(control, AttachControl::Switch(_))
+            let AttachControl::Switch(target) = control else {
+                return false;
+            };
+            let start = target.outer_terminal.attach_start_sequence();
+            mouse_tracking_enables
+                .iter()
+                .all(|enable| !start.windows(enable.len()).any(|window| window == *enable))
         })
         .await,
     );
     let dead_start = dead_target.outer_terminal.attach_start_sequence();
-    for enable in [b"\x1b[?1000h".as_slice(), b"\x1b[?1002h", b"\x1b[?1003h"] {
+    for enable in mouse_tracking_enables {
         assert!(
             !dead_start
                 .windows(enable.len())

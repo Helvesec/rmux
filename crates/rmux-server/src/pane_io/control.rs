@@ -55,6 +55,10 @@ impl<'a> PendingAttachInputState<'a> {
         self.clear();
     }
 
+    pub(super) fn parts_mut(&mut self) -> (&mut Vec<u8>, &mut PendingEscapeFlush) {
+        (self.bytes, self.escape_flush)
+    }
+
     pub(super) fn clear(&mut self) {
         self.bytes.clear();
         self.escape_flush.clear();

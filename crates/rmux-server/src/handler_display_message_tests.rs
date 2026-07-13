@@ -130,21 +130,38 @@ async fn client_less_display_message_prefers_requester_tmux_pane_over_attached_c
         .register_attach(std::process::id(), attached.clone(), control_tx)
         .await;
 
+    let expected_rmux = format!("{},1,0", socket_path.display());
+    let expected_tmux_pane = format!("%{pane_id}");
     let requester = spawn_requester_with_environment(&[
-        ("RMUX", format!("{},1,0", socket_path.display())),
-        ("TMUX_PANE", format!("%{pane_id}")),
+        ("RMUX", expected_rmux.clone()),
+        ("TMUX_PANE", expected_tmux_pane.clone()),
     ]);
     let requester_pid = requester.0.id();
-    let requester_environment = rmux_os::process::environment(requester_pid)
-        .expect("requester process environment is readable");
+    // Linux may expose the posix_spawn child in /proc before exec has
+    // installed the requested environment. Wait for the exact fixture values
+    // rather than accepting an empty or inherited pre-exec snapshot.
+    let requester_environment = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(environment) = rmux_os::process::environment(requester_pid) {
+                let ready = environment.get("TMUX_PANE") == Some(&expected_tmux_pane)
+                    && environment.get("RMUX") == Some(&expected_rmux);
+                if ready {
+                    break environment;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("requester process installs its expected environment");
     assert_eq!(
         requester_environment.get("TMUX_PANE"),
-        Some(&format!("%{pane_id}")),
+        Some(&expected_tmux_pane),
         "requester fixture carries the detached pane identity"
     );
     assert_eq!(
         requester_environment.get("RMUX"),
-        Some(&format!("{},1,0", socket_path.display())),
+        Some(&expected_rmux),
         "requester fixture carries the matching server socket"
     );
 

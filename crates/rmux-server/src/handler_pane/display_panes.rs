@@ -13,7 +13,11 @@ use super::super::{
     scripting_support::QueueExecutionContext,
     RequestHandler,
 };
-use super::{decode_prompt_input_event, io_other, retain_partial_attached_control_input};
+use super::{
+    decode_prompt_input_event, io_other, retain_partial_attached_escape_input,
+    strip_bracketed_paste_markers_after_append,
+};
+use crate::handler_support::attached_client_required;
 use crate::key_table::{
     decode_attached_key, matches_prefix_key, session_option_key, AttachedKeyDecode,
 };
@@ -250,6 +254,78 @@ impl RequestHandler {
         delivered
     }
 
+    pub(in crate::handler) async fn refresh_display_panes_overlay_for_client_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        session_name: &rmux_proto::SessionName,
+    ) -> Result<(), RmuxError> {
+        let expected_state_id = {
+            let active_attach = self.active_attach.lock().await;
+            let active = active_attach
+                .by_pid
+                .get(&attach_pid)
+                .filter(|active| {
+                    active.id == expected_attach_id
+                        && &active.session_name == session_name
+                        && !active.suspended
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .ok_or_else(|| attached_client_required("refresh-client"))?;
+            let Some(display_panes) = active.display_panes.as_ref() else {
+                return Ok(());
+            };
+            display_panes.id
+        };
+        let (overlay_frame, clear_frame) = {
+            let state = self.state.lock().await;
+            let session = state
+                .sessions
+                .session(session_name)
+                .ok_or_else(|| session_not_found(session_name))?;
+            (
+                renderer::render_display_panes_overlay(session, &state.options),
+                renderer::render_display_panes_clear(session, &state.options),
+            )
+        };
+
+        let mut active_attach = self.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&attach_pid)
+            .filter(|active| {
+                active.id == expected_attach_id
+                    && &active.session_name == session_name
+                    && !active.suspended
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .ok_or_else(|| attached_client_required("refresh-client"))?;
+        if active
+            .display_panes
+            .as_ref()
+            .is_none_or(|display_panes| display_panes.id != expected_state_id)
+        {
+            return Ok(());
+        }
+
+        active.overlay_generation = active.overlay_generation.saturating_add(1);
+        let mut frame =
+            if active.mode_tree.is_some() || active.overlay.is_some() || active.render_stream {
+                Vec::new()
+            } else {
+                clear_frame
+            };
+        frame.extend_from_slice(&overlay_frame);
+        active
+            .control_tx
+            .send(AttachControl::Overlay(OverlayFrame::new(
+                frame,
+                active.render_generation,
+                active.overlay_generation,
+            )))
+            .map_err(|_| attached_client_required("refresh-client"))
+    }
+
     fn schedule_display_panes_timeout(&self, attach_pid: u32, state_id: u64, duration: Duration) {
         let handler = self.clone();
         tokio::spawn(async move {
@@ -426,11 +502,9 @@ impl RequestHandler {
         // prefix passthrough path still triggers. Strip the CONCATENATED
         // buffer so a marker that straddles the pending_input / bytes seam
         // still collapses.
-        use super::strip_bracketed_paste_markers;
+        let new_input_at = pending_input.len();
         pending_input.extend_from_slice(bytes);
-        let scrubbed = strip_bracketed_paste_markers(pending_input);
-        pending_input.clear();
-        pending_input.extend_from_slice(&scrubbed);
+        strip_bracketed_paste_markers_after_append(pending_input, new_input_at);
         match self
             .display_panes_prefix_input(attach_pid, pending_input)
             .await
@@ -443,7 +517,7 @@ impl RequestHandler {
                 return Ok(Some(std::mem::take(pending_input)));
             }
             DisplayPanesPrefixInput::Partial => {
-                retain_partial_attached_control_input("display-panes prefix", pending_input)?;
+                retain_partial_attached_escape_input("display-panes prefix", pending_input)?;
                 return Ok(None);
             }
             DisplayPanesPrefixInput::Other => {}
@@ -451,7 +525,7 @@ impl RequestHandler {
 
         loop {
             let Some((event, consumed)) = decode_prompt_input_event(pending_input) else {
-                retain_partial_attached_control_input("display-panes prompt input", pending_input)?;
+                retain_partial_attached_escape_input("display-panes prompt input", pending_input)?;
                 return Ok(None);
             };
             pending_input.drain(..consumed);

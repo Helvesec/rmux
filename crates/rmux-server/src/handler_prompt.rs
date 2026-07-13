@@ -73,6 +73,14 @@ pub(super) struct ClientPromptState {
 }
 
 impl ClientPromptState {
+    pub(in crate::handler) fn rename_session_targets(
+        &mut self,
+        old_name: &rmux_proto::SessionName,
+        new_name: &rmux_proto::SessionName,
+    ) {
+        self.context.rename_session_targets(old_name, new_name);
+    }
+
     fn new_command(plan: CommandPromptPlan, completion: PromptCompletion) -> Self {
         let first = plan.fields.first().cloned().unwrap_or(PromptField {
             prompt: ":".to_owned(),

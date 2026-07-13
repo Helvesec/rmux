@@ -73,18 +73,20 @@
   [selection overlay tests](crates/rmux-core/src/screen/tests.rs),
   [renderer expansion tests](crates/rmux-server/src/renderer/tests.rs), and
   [attached copy-mode render tests](crates/rmux-server/src/handler_attach_tests/copy_mode_render.rs).
-- Answers OSC 10/11/12 colour queries from the emulator so theme-detecting
-  TUIs render deterministically in detached sessions, recorded as RMUX
-  extension behavior in
+- Tracks application-set OSC 10/11/12 colours per pane and round-trips only
+  those known values. Queries for an unknown outer-terminal palette remain
+  unanswered instead of returning an invented dark theme, recorded in
   [ledger entry C-D50](docs/compat/tmux-3.7-divergences.md) and backed by
   [emulator reply tests](crates/rmux-core/src/input/tests/osc_dcs_misc.rs)
   (contributed by @nymph-ai).
-- Enables mouse reporting and bracketed paste on any VT outer terminal for a
-  Windows attach client, not only Windows Terminal: a session reached over a
-  non-`WT_SESSION` VT outer (OpenSSH-into-Windows, WezTerm, Alacritty, the VS
-  Code terminal) now drives the outer's mouse and bracketed-paste modes the
-  way tmux does on an xterm-like terminal, with no host-brand gating
-  (issue #93), backed by
+- Emits mouse-reporting and bracketed-paste enables for any VT outer terminal
+  used by a Windows attach client, not only Windows Terminal: non-`WT_SESSION`
+  VT outers (including OpenSSH-into-Windows, WezTerm, Alacritty, and the VS
+  Code terminal) now take the same RMUX capability path, with no host-brand
+  gating. Interactive SSH hosted through ConPTY remains host-dependent:
+  ConPTY can consume these DECSET enables before they reach the remote outer
+  terminal, so this release fixes and pins RMUX's emission half of issue #93
+  without claiming that host limitation is solved, backed by
   [client capability tests](src/client_terminal.rs),
   [daemon capability tests](crates/rmux-server/src/handler_client_runtime.rs),
   and
@@ -126,17 +128,20 @@
   (issue #91).
 - Delivers bracketed paste to Windows attach panes: a paste into a pane that
   enabled bracketed-paste mode now arrives wrapped in `ESC[200~`/`ESC[201~`
-  (and is stripped for a pane that did not), matching tmux, by detecting the
-  console-input burst a paste produces. Paste-marker stripping runs to a fixed
-  point and carries a small tail across `ReadConsoleInputW` batches so a
-  hostile clipboard cannot slip a live `ESC[201~` out of the paste envelope
-  either by reassembly or by straddling a batch boundary. AltGr characters
-  and the pure modifier key-downs classic conhost interleaves around shifted
-  content no longer defeat burst detection. The scrub is also applied on
-  every platform whenever a real terminal paste arrives while the command
-  prompt, mode-tree, no-job popup, menu, or display-panes overlay is open —
-  the leading `ESC` of `ESC[200~` used to close the overlay and leak the body
-  to the pane's shell on Unix and inside the Windows attach client alike.
+  (and is stripped for a pane that did not) after detecting the console-input
+  burst a paste produces. Native mouse records coalesced with a detected paste
+  are suppressed without making its text live, while their button state still
+  advances; SGR-looking bytes delivered as key records remain pasted text
+  rather than being trusted as mouse provenance. Paste-marker stripping runs
+  to a fixed point and carries a small tail across `ReadConsoleInputW` batches
+  so a hostile clipboard cannot slip a live `ESC[201~` out of the paste
+  envelope either by reassembly or by straddling a batch boundary. AltGr
+  characters and the pure modifier key-downs classic conhost interleaves
+  around shifted content no longer defeat burst detection. The scrub is also
+  applied on every platform whenever a real terminal paste arrives while the
+  command prompt, mode-tree, no-job popup, menu, or display-panes overlay is
+  open — the leading `ESC` of `ESC[200~` used to close the overlay and leak the
+  body to the pane's shell on Unix and inside the Windows attach client alike.
   The Windows-specific detection heuristic is recorded in
   [tmux divergence ledger entry C-D51](docs/compat/tmux-3.7-divergences.md) and
   backed by
@@ -170,11 +175,31 @@
 - Resolves `show-options -gp` and `set-option -gp` against the real global
   pane scope instead of treating the combination as a silent no-op, backed by
   [CLI scope matrix tests](tests/cli_surface.rs).
-- Matches tmux queued attach sequencing: `attach-session ; detach-client` and
+- Handles queued attach sequencing: `attach-session ; detach-client` and
   `attach-session ; <command> ; detach-client` use a real queued attached
   client when a terminal is present, `attach-session ; kill-server` exits with
   the server gone, and an `attach-session` that is final or has no terminal
-  tail still performs the normal terminal attach instead of being dropped.
+  tail still performs the normal terminal attach instead of being dropped,
+  backed by [queued attach flow tests](tests/cli_attach_flow.rs).
+- Closes control-mode output immediately with `%exit` on input EOF while
+  retaining the requester's identity and permissions long enough to finish
+  already accepted finite automation. Frames that would wait indefinitely are
+  cancelled, shutdown still wins, and a replacement client with the same PID
+  cannot overtake the detached drain. tmux 3.7b instead drops later queued
+  frames after EOF, so the intentional automation-preserving behavior is
+  recorded in
+  [ledger entry C-D54](docs/compat/tmux-3.7-divergences.md) and backed by
+  [control EOF tests](crates/rmux-server/src/control/tests.rs).
+- Bounds every retained attached-input family: ambiguous keyboard prefixes use
+  `escape-time`, recognized streaming paste/OSC/APC bodies use an eight-second
+  idle budget, malformed or oversized SGR mouse frames are consumed within a
+  fixed syntax bound, and a timed-out paste cannot release a partial delimiter
+  as live input. These safer-than-tmux choices are recorded in
+  [ledger entries C-D53 and C-D55](docs/compat/tmux-3.7-divergences.md) and
+  backed by
+  [pending-input tests](crates/rmux-server/src/pane_io/tests.rs),
+  [mouse decoder tests](crates/rmux-server/src/input_keys/tests.rs), and
+  [paste timeout tests](crates/rmux-server/src/handler_pane/attached_input/bracketed_paste.rs).
 - Updated the command inventory so `list-commands`, help text, parser
   acceptance, source-file handling, and runtime support stay coherent for the
   tmux-compatible 0.9.0 surface.
@@ -199,8 +224,12 @@
   backpressure.
 - Documented the detached RPC 0.9.0 wire policy as exact-versioned and added
   fuzz coverage for the detached frame decoder.
-- Bumped the detached RPC frame envelope from wire version 3 to 4 for the
-  0.9.0 SDK pane-state and pane-option extension boundary.
+- Bumped the detached RPC frame envelope from wire version 3 to 5 across the
+  0.9.0 SDK pane-state/pane-option boundary (wire 4) and explicit initial
+  control-command framing boundary (wire 5), while retaining the wire-4
+  compatibility fixture ledger. This is a hard cut: clients and SDKs must use
+  the matching 0.9.0 daemon, and an already-running older server must be
+  restarted during upgrade.
 - Locked SDK armed waits behind capabilities, including the Windows 250ms
   post-ACK settle and the documented best-effort cancellation transport.
 

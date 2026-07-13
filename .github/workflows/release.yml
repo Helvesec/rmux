@@ -27,6 +27,7 @@ jobs:
   source-gates:
     name: Release source gates
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     outputs:
       package_version: ${{ steps.release_identity.outputs.package_version }}
       release_version: ${{ steps.release_identity.outputs.release_version }}
@@ -139,6 +140,7 @@ jobs:
     needs:
       - source-gates
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -519,6 +521,7 @@ jobs:
   publish:
     name: Publish GitHub release assets
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     environment: release
     permissions:
       contents: write
@@ -903,6 +906,7 @@ jobs:
     name: Publish Snap ${{ matrix.snap-arch }} candidate
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs:
       - publish
       - snap
@@ -964,6 +968,7 @@ jobs:
   validate-winget:
     name: Validate WinGet manifest
     runs-on: windows-latest
+    timeout-minutes: 60
     needs:
       - publish
       - source-gates
@@ -1038,6 +1043,7 @@ jobs:
     name: Publish Chocolatey package
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
     runs-on: windows-latest
+    timeout-minutes: 60
     needs:
       - publish
       - source-gates

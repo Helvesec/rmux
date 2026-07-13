@@ -1,6 +1,6 @@
 use super::attach_support::AttachRegistration;
 use super::RequestHandler;
-use crate::input_keys::MouseForwardEvent;
+use crate::input_keys::{MouseForwardEvent, MAX_SGR_MOUSE_FRAME_BYTES};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
@@ -18,7 +18,7 @@ use rmux_proto::{
     Response, RmuxError, ScopeSelector, SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest,
     SelectWindowRequest, SendKeysRequest, SessionName, SetOptionMode, SetOptionRequest,
     SplitWindowRequest, SplitWindowTarget, SwitchClientRequest, TerminalSize, WindowTarget,
-    CAPABILITY_ATTACH_RENDER, DEFAULT_MAX_FRAME_LENGTH,
+    CAPABILITY_ATTACH_RENDER,
 };
 #[cfg(unix)]
 use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
@@ -606,27 +606,10 @@ fn drain_attach_controls(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>
     while control_rx.try_recv().is_ok() {}
 }
 
-fn oversized_unterminated_sgr_mouse_input() -> Vec<u8> {
+fn bounded_unterminated_sgr_mouse_input() -> Vec<u8> {
     let mut bytes = b"\x1b[<".to_vec();
-    bytes.resize(DEFAULT_MAX_FRAME_LENGTH + 1, b'1');
+    bytes.resize(MAX_SGR_MOUSE_FRAME_BYTES, b'1');
     bytes
-}
-
-fn assert_partial_control_bound<T>(result: std::io::Result<T>, context: &str) {
-    let error = match result {
-        Ok(_) => panic!("partial control input should be rejected after the bound"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    let message = error.to_string();
-    assert!(
-        message.contains(context),
-        "error should name {context:?}, got {message:?}"
-    );
-    assert!(
-        message.contains("maximum"),
-        "error should include the retained byte limit, got {message:?}"
-    );
 }
 
 async fn recv_overlay_frame(

@@ -7,8 +7,8 @@ use rmux_core::events::OutputCursorItem;
 use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
-    AttachedKeystroke, KeyDispatched, NewSessionRequest, PaneTarget, Request, Response,
-    SessionName, TerminalSize,
+    AttachedKeystroke, KeyDispatched, KillSessionRequest, NewSessionRequest, PaneTarget, Request,
+    Response, SessionName, TerminalSize,
 };
 use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,14 +27,761 @@ use super::{
     clear_close_pane_output_after_refresh_if_target_changed, consume_predicted_echo,
     forward_attach, is_predictable_local_echo, pane_output_channel,
     pane_output_channel_with_limits, predictable_local_echo_prefix_len,
-    process_attach_data_payload, process_socket_messages, should_emit_overlay, AttachControl,
-    AttachTarget, LiveAttachInputContext, OverlayFrame, PredictedEcho,
+    process_attach_data_payload, process_socket_messages, should_emit_overlay,
+    sync_pending_escape_flush_with_escape_time, AttachControl, AttachTarget,
+    LiveAttachInputContext, OverlayFrame, PredictedEcho,
 };
+use crate::daemon::ShutdownHandle;
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
 use crate::renderer::PaneRenderDeltaFrame;
 
 mod persistent_overlay;
+
+#[test]
+fn pending_escape_wrapper_covers_apc_csi_paste_and_excludes_utf8() {
+    let mut flush = PendingEscapeFlush::default();
+    let escape_time = Duration::from_millis(5);
+    let before_apc = Instant::now();
+
+    sync_pending_escape_flush_with_escape_time(&mut flush, b"\x1b_Gi=7;payload", escape_time);
+    assert!(
+        flush
+            .deadline()
+            .is_some_and(|deadline| deadline > before_apc + Duration::from_secs(1)),
+        "the production wrapper must give Kitty APC a stream idle budget, not escape-time"
+    );
+
+    flush.clear();
+    sync_pending_escape_flush_with_escape_time(&mut flush, b"\x1b[12", escape_time);
+    assert!(
+        flush.deadline().is_some(),
+        "numeric CSI retention must stay timed"
+    );
+
+    flush.clear();
+    let before_paste = Instant::now();
+    sync_pending_escape_flush_with_escape_time(&mut flush, b"\x1b[200~body", escape_time);
+    assert!(
+        flush
+            .deadline()
+            .is_some_and(|deadline| deadline > before_paste + Duration::from_secs(1)),
+        "streaming bracketed paste must use the long stream idle budget"
+    );
+
+    sync_pending_escape_flush_with_escape_time(&mut flush, b"\xe6\x97", escape_time);
+    assert!(
+        flush.deadline().is_none(),
+        "partial UTF-8 must never inherit the escape deadline"
+    );
+}
+
+#[test]
+fn pending_escape_wrapper_resets_stream_deadline_for_new_keyboard_suffix() {
+    let mut flush = PendingEscapeFlush::default();
+    let escape_time = Duration::from_millis(5);
+
+    sync_pending_escape_flush_with_escape_time(&mut flush, b"\x1b_Gpayload", escape_time);
+    let stream_deadline = flush.deadline().expect("APC stream arms");
+    let before_escape = Instant::now();
+    sync_pending_escape_flush_with_escape_time(&mut flush, b"\x1b", escape_time);
+    let escape_deadline = flush.deadline().expect("post-stream Escape arms");
+
+    assert!(escape_deadline >= before_escape + escape_time);
+    assert!(
+        escape_deadline < stream_deadline,
+        "a consumed stream followed by Escape must not inherit its long idle deadline"
+    );
+    sync_pending_escape_flush_with_escape_time(&mut flush, b"\x1b[12", Duration::from_secs(1));
+    assert_eq!(
+        flush.deadline(),
+        Some(escape_deadline),
+        "numeric CSI growth keeps the first keyboard ambiguity deadline"
+    );
+}
+
+#[test]
+fn pending_escape_wrapper_times_only_unterminated_overlong_mouse_input() {
+    let mut flush = PendingEscapeFlush::default();
+    let escape_time = Duration::from_millis(5);
+
+    sync_pending_escape_flush_with_escape_time(&mut flush, b"\x1b[<700000", escape_time);
+    assert!(
+        flush.deadline().is_some(),
+        "an unterminated overflowing decimal remains bounded by escape-time"
+    );
+
+    sync_pending_escape_flush_with_escape_time(&mut flush, b"\x1b[<700000;1;1M", escape_time);
+    assert!(
+        flush.deadline().is_none(),
+        "a lexically complete invalid mouse frame must leave the retained-input grammar"
+    );
+}
+
+async fn pending_escape_socket_fixture(
+    session: &str,
+) -> (
+    LiveAttachInputContext,
+    AttachTransport,
+    tokio::net::UnixStream,
+    mpsc::UnboundedReceiver<AttachControl>,
+) {
+    let handler = Arc::new(RequestHandler::new());
+    let attach_pid = std::process::id();
+    let session_name = SessionName::new(session).expect("valid session name");
+    let target = PaneTarget::with_window(session_name.clone(), 0, 0);
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name, control_tx)
+        .await;
+    handler.start_attached_input_capture_for_test(&target).await;
+    let (stream, peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+
+    (
+        LiveAttachInputContext {
+            handler,
+            attach_pid,
+        },
+        AttachTransport::from(stream),
+        peer,
+        control_rx,
+    )
+}
+
+struct PendingEscapeSchedulerFixture {
+    handler: Arc<RequestHandler>,
+    target: PaneTarget,
+    peer: tokio::net::UnixStream,
+    shutdown: watch::Sender<()>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+async fn current_attach_target(
+    handler: &RequestHandler,
+    attach_pid: u32,
+    session_name: &SessionName,
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+) -> AttachTarget {
+    handler
+        .refresh_attached_client(attach_pid, session_name)
+        .await;
+    let target = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match control_rx.recv().await {
+                Some(AttachControl::Switch(target)) => break *target,
+                Some(_) => continue,
+                None => panic!("attach control channel closed before initial target"),
+            }
+        }
+    })
+    .await
+    .expect("timed out building the initial attach target");
+    handler
+        .clear_attached_render_refresh_pending(attach_pid)
+        .await;
+    target
+}
+
+impl PendingEscapeSchedulerFixture {
+    async fn start(session: &str) -> Self {
+        let handler = Arc::new(RequestHandler::new());
+        let attach_pid = std::process::id();
+        let session_name = SessionName::new(session).expect("valid session name");
+        let target = PaneTarget::with_window(session_name.clone(), 0, 0);
+        let created = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+        let escape_time = handler
+            .handle(Request::SetOption(rmux_proto::SetOptionRequest {
+                scope: rmux_proto::ScopeSelector::Global,
+                option: rmux_proto::OptionName::EscapeTime,
+                value: "500".to_owned(),
+                mode: rmux_proto::SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(
+            matches!(escape_time, Response::SetOption(_)),
+            "{escape_time:?}"
+        );
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        handler
+            .register_attach(attach_pid, session_name.clone(), control_tx)
+            .await;
+        handler.start_attached_input_capture_for_test(&target).await;
+        let initial_target =
+            current_attach_target(&handler, attach_pid, &session_name, &mut control_rx).await;
+        let (shutdown, shutdown_rx) = watch::channel(());
+        let (stream, peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+        let task = tokio::spawn(forward_attach(
+            stream,
+            initial_target,
+            Vec::new(),
+            shutdown_rx,
+            control_rx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            LiveAttachInputContext {
+                handler: Arc::clone(&handler),
+                attach_pid,
+            },
+            false,
+        ));
+
+        Self {
+            handler,
+            target,
+            peer,
+            shutdown,
+            task,
+        }
+    }
+
+    async fn send(&mut self, message: AttachMessage) {
+        self.send_batch(&[message]).await;
+    }
+
+    async fn send_batch(&mut self, messages: &[AttachMessage]) {
+        let mut encoded = Vec::new();
+        for message in messages {
+            encoded
+                .extend_from_slice(&encode_attach_message(message).expect("encode attach input"));
+        }
+        self.peer
+            .write_all(&encoded)
+            .await
+            .expect("write attach input");
+    }
+
+    async fn wait_for_capture(&self, matches: impl Fn(&[u8]) -> bool, label: &str) -> Vec<u8> {
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let captured = self
+                    .handler
+                    .attached_input_capture_for_test(&self.target)
+                    .await
+                    .expect("input capture remains installed");
+                if matches(&captured) {
+                    break captured;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        match result {
+            Ok(captured) => captured,
+            Err(_) => {
+                let captured = self
+                    .handler
+                    .attached_input_capture_for_test(&self.target)
+                    .await;
+                panic!(
+                    "timed out waiting for {label}; capture={captured:?}, attach_finished={}",
+                    self.task.is_finished()
+                );
+            }
+        }
+    }
+
+    async fn finish(self) {
+        self.shutdown.send(()).expect("request attach shutdown");
+        assert!(self.task.await.expect("attach task join").is_ok());
+    }
+}
+
+async fn assert_fragmented_meta_control_promotes_to_streaming_deadline(
+    session: &str,
+    prefix: AttachMessage,
+    recognized_opener: AttachMessage,
+    completion: AttachMessage,
+    expected: &[u8],
+) {
+    let mut fixture = PendingEscapeSchedulerFixture::start(session).await;
+    fixture.send(prefix).await;
+    fixture
+        .wait_for_capture(|captured| captured == b"A", "prefix dispatch")
+        .await;
+    fixture.send(recognized_opener).await;
+
+    // The configured escape-time is 500 ms. Once the second fragment selects
+    // a recognized OSC/APC family, it must survive beyond that keyboard budget.
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    assert_eq!(
+        fixture
+            .handler
+            .attached_input_capture_for_test(&fixture.target)
+            .await,
+        Some(b"A".to_vec()),
+        "a transport split after ESC must not flush a recognized control body"
+    );
+
+    fixture.send(completion).await;
+    fixture
+        .wait_for_capture(
+            |captured| captured == expected,
+            "fragmented Meta control completion",
+        )
+        .await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn unix_data_osc_split_after_escape_promotes_to_streaming_deadline() {
+    assert_fragmented_meta_control_promotes_to_streaming_deadline(
+        "unix-data-split-osc-streaming-deadline",
+        AttachMessage::Data(b"A\x1b".to_vec()),
+        AttachMessage::Data(b"]52;c;UNIX_OSC".to_vec()),
+        AttachMessage::Data(b"\x07Z".to_vec()),
+        b"AZ",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn windows_keystroke_apc_split_after_escape_promotes_to_streaming_deadline() {
+    assert_fragmented_meta_control_promotes_to_streaming_deadline(
+        "windows-keystroke-split-apc-streaming-deadline",
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"A\x1b".to_vec())),
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"_Gi=7;WINDOWS_APC".to_vec())),
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"_BODY\x1b\\Z".to_vec())),
+        b"A\x1b_Gi=7;WINDOWS_APC_BODY\x1b\\Z",
+    )
+    .await;
+}
+
+async fn assert_invalid_meta_byte_flushes_on_keyboard_deadline(
+    session: &str,
+    input: AttachMessage,
+) {
+    let mut fixture = PendingEscapeSchedulerFixture::start(session).await;
+    let started = Instant::now();
+    fixture.send(input).await;
+    let captured = fixture
+        .wait_for_capture(
+            |captured| captured == b"A\x1b\xff",
+            "invalid Meta byte keyboard-deadline flush",
+        )
+        .await;
+    assert_eq!(captured, b"A\x1b\xff");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "invalid Meta input must use escape-time, not the 8-second stream budget"
+    );
+
+    fixture.send(AttachMessage::Data(b"Z".to_vec())).await;
+    fixture
+        .wait_for_capture(
+            |captured| captured == b"A\x1b\xffZ",
+            "ordinary input after invalid Meta flush",
+        )
+        .await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_meta_byte_deadline_covers_data_and_windows_keystroke_frames() {
+    assert_invalid_meta_byte_flushes_on_keyboard_deadline(
+        "invalid-meta-data-deadline",
+        AttachMessage::Data(b"A\x1b\xff".to_vec()),
+    )
+    .await;
+    assert_invalid_meta_byte_flushes_on_keyboard_deadline(
+        "invalid-meta-keystroke-deadline",
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"A\x1b\xff".to_vec())),
+    )
+    .await;
+}
+
+async fn assert_invalid_csi_body_is_forwarded_without_retention(
+    session: &str,
+    input: AttachMessage,
+) {
+    let mut fixture = PendingEscapeSchedulerFixture::start(session).await;
+    fixture.send(input).await;
+    let captured = fixture
+        .wait_for_capture(
+            |captured| captured == b"A\x1b[1\r",
+            "invalid CSI body forwarding",
+        )
+        .await;
+    assert_eq!(captured, b"A\x1b[1\r");
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn invalid_csi_body_cannot_be_retained_without_a_deadline() {
+    assert_invalid_csi_body_is_forwarded_without_retention(
+        "invalid-csi-body-data",
+        AttachMessage::Data(b"A\x1b[1\r".to_vec()),
+    )
+    .await;
+    assert_invalid_csi_body_is_forwarded_without_retention(
+        "invalid-csi-body-keystroke",
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"A\x1b[1\r".to_vec())),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn sustained_ready_socket_serves_the_initial_ambiguous_csi_deadline() {
+    let mut fixture = PendingEscapeSchedulerFixture::start("sustained-ready-csi-deadline").await;
+    fixture
+        .send(AttachMessage::Data(b"A\x1b[12;".to_vec()))
+        .await;
+    fixture
+        .wait_for_capture(|captured| captured == b"A", "ambiguous CSI retention")
+        .await;
+
+    // Keep producing immediately readable frames for longer than escape-time.
+    // The attach loop must still service the original ambiguity deadline.
+    let empty = AttachMessage::Data(Vec::new());
+    let started = Instant::now();
+    let captured = tokio::time::timeout(Duration::from_millis(900), async {
+        loop {
+            fixture
+                .send_batch(&[
+                    empty.clone(),
+                    empty.clone(),
+                    empty.clone(),
+                    empty.clone(),
+                    empty.clone(),
+                    empty.clone(),
+                    empty.clone(),
+                    empty.clone(),
+                ])
+                .await;
+            tokio::task::yield_now().await;
+            let captured = fixture
+                .handler
+                .attached_input_capture_for_test(&fixture.target)
+                .await
+                .expect("input capture remains installed");
+            if captured == b"A\x1b[12;" {
+                break captured;
+            }
+        }
+    })
+    .await
+    .expect("continuously ready socket must not starve the CSI deadline");
+    assert_eq!(captured, b"A\x1b[12;");
+    assert!(started.elapsed() < Duration::from_millis(900));
+    fixture.finish().await;
+}
+
+async fn assert_streaming_control_survives_keyboard_escape_time(
+    session: &str,
+    prefix: &[u8],
+    completion: &[u8],
+) -> Vec<u8> {
+    let mut fixture = PendingEscapeSchedulerFixture::start(session).await;
+    fixture.send(AttachMessage::Data(prefix.to_vec())).await;
+    fixture
+        .wait_for_capture(|captured| captured == b"A", "stream prefix dispatch")
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    let before_completion = fixture
+        .handler
+        .attached_input_capture_for_test(&fixture.target)
+        .await;
+    assert_eq!(
+        before_completion,
+        Some(b"A".to_vec()),
+        "an unambiguous streaming control must outlive keyboard escape-time"
+    );
+
+    fixture.send(AttachMessage::Data(completion.to_vec())).await;
+    let captured = fixture
+        .wait_for_capture(|captured| captured.ends_with(b"Z"), "stream completion")
+        .await;
+    fixture.finish().await;
+    captured
+}
+
+#[tokio::test]
+async fn fragmented_osc_control_keeps_the_streaming_idle_deadline() {
+    let captured = assert_streaming_control_survives_keyboard_escape_time(
+        "fragmented-osc-stream-deadline",
+        b"A\x1b]52;c;AA",
+        b"AA\x07Z",
+    )
+    .await;
+    assert_eq!(captured, b"AZ");
+}
+
+#[tokio::test]
+async fn fragmented_apc_control_keeps_the_streaming_idle_deadline() {
+    let captured = assert_streaming_control_survives_keyboard_escape_time(
+        "fragmented-apc-stream-deadline",
+        b"A\x1b_Gi=7;PAY",
+        b"LOAD\x1b\\Z",
+    )
+    .await;
+    assert_eq!(captured, b"A\x1b_Gi=7;PAYLOAD\x1b\\Z");
+}
+
+#[tokio::test]
+async fn socket_dispatch_rearms_replaced_same_kind_ambiguous_suffix() {
+    let (live_input, stream, _peer, _control_rx) =
+        pending_escape_socket_fixture("escape-epoch-ambiguous").await;
+    let mut decoder = AttachFrameDecoder::new();
+    let mut pending_input = Vec::new();
+    let mut pending_escape_flush = PendingEscapeFlush::default();
+    let mut active_emit_cache = None;
+    let mut locked = false;
+
+    decoder.push_bytes(
+        &encode_attach_message(&AttachMessage::Data(b"\x1b".to_vec()))
+            .expect("encode initial Escape"),
+    );
+    process_socket_messages(
+        &mut decoder,
+        &stream,
+        &live_input,
+        None,
+        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
+        &mut active_emit_cache,
+        &mut locked,
+    )
+    .await
+    .expect("retain initial Escape");
+    assert_eq!(pending_input, b"\x1b");
+    sync_pending_escape_flush_with_escape_time(
+        &mut pending_escape_flush,
+        &pending_input,
+        Duration::from_secs(1),
+    );
+    let first_deadline = pending_escape_flush
+        .deadline()
+        .expect("initial Escape arms a deadline");
+
+    decoder.push_bytes(
+        &encode_attach_message(&AttachMessage::Data(b"x\x1b".to_vec()))
+            .expect("encode replacement Escape"),
+    );
+    process_socket_messages(
+        &mut decoder,
+        &stream,
+        &live_input,
+        None,
+        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
+        &mut active_emit_cache,
+        &mut locked,
+    )
+    .await
+    .expect("consume Meta-x and retain replacement Escape");
+    assert_eq!(pending_input, b"\x1b");
+    sync_pending_escape_flush_with_escape_time(
+        &mut pending_escape_flush,
+        &pending_input,
+        Duration::from_secs(3),
+    );
+    let replacement_deadline = pending_escape_flush
+        .deadline()
+        .expect("replacement Escape arms a fresh deadline");
+
+    assert!(
+        replacement_deadline > first_deadline + Duration::from_secs(1),
+        "a same-kind suffix must not inherit the consumed prefix's deadline"
+    );
+}
+
+#[tokio::test]
+async fn socket_dispatch_promotes_coalesced_split_osc_to_streaming() {
+    let (live_input, stream, _peer, _control_rx) =
+        pending_escape_socket_fixture("escape-meta-osc-provenance").await;
+    let mut decoder = AttachFrameDecoder::new();
+    let mut pending_input = Vec::new();
+    let mut pending_escape_flush = PendingEscapeFlush::default();
+    let mut active_emit_cache = None;
+    let mut locked = false;
+    let mut encoded = encode_attach_message(&AttachMessage::Data(b"A\x1b".to_vec()))
+        .expect("encode initial Meta escape");
+    encoded.extend_from_slice(
+        &encode_attach_message(&AttachMessage::Data(b"]52;c;COALESCED".to_vec()))
+            .expect("encode OSC-like continuation"),
+    );
+    decoder.push_bytes(&encoded);
+
+    process_socket_messages(
+        &mut decoder,
+        &stream,
+        &live_input,
+        None,
+        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
+        &mut active_emit_cache,
+        &mut locked,
+    )
+    .await
+    .expect("retain coalesced OSC-like Meta input");
+    assert_eq!(pending_input, b"\x1b]52;c;COALESCED");
+
+    let before = Instant::now();
+    sync_pending_escape_flush_with_escape_time(
+        &mut pending_escape_flush,
+        &pending_input,
+        Duration::from_millis(500),
+    );
+    let deadline = pending_escape_flush
+        .deadline()
+        .expect("coalesced split OSC input must arm");
+    assert!(
+        deadline >= before + Duration::from_secs(8),
+        "a recognized OSC opener must promote beyond the initial Meta ambiguity"
+    );
+}
+
+#[tokio::test]
+async fn socket_dispatch_preserves_deadline_for_true_csi_continuation() {
+    let (live_input, stream, _peer, _control_rx) =
+        pending_escape_socket_fixture("escape-epoch-continuation").await;
+    let mut decoder = AttachFrameDecoder::new();
+    let mut pending_input = Vec::new();
+    let mut pending_escape_flush = PendingEscapeFlush::default();
+    let mut active_emit_cache = None;
+    let mut locked = false;
+
+    decoder.push_bytes(
+        &encode_attach_message(&AttachMessage::Data(b"\x1b[".to_vec()))
+            .expect("encode initial CSI opener"),
+    );
+    process_socket_messages(
+        &mut decoder,
+        &stream,
+        &live_input,
+        None,
+        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
+        &mut active_emit_cache,
+        &mut locked,
+    )
+    .await
+    .expect("retain initial CSI opener");
+    assert_eq!(pending_input, b"\x1b[");
+    sync_pending_escape_flush_with_escape_time(
+        &mut pending_escape_flush,
+        &pending_input,
+        Duration::from_secs(1),
+    );
+    let original_deadline = pending_escape_flush
+        .deadline()
+        .expect("initial CSI opener arms a deadline");
+
+    decoder.push_bytes(
+        &encode_attach_message(&AttachMessage::Data(b"12".to_vec()))
+            .expect("encode continued CSI parameters"),
+    );
+    process_socket_messages(
+        &mut decoder,
+        &stream,
+        &live_input,
+        None,
+        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
+        &mut active_emit_cache,
+        &mut locked,
+    )
+    .await
+    .expect("retain continued CSI parameters");
+    assert_eq!(pending_input, b"\x1b[12");
+    sync_pending_escape_flush_with_escape_time(
+        &mut pending_escape_flush,
+        &pending_input,
+        Duration::from_secs(30),
+    );
+
+    assert_eq!(
+        pending_escape_flush.deadline(),
+        Some(original_deadline),
+        "a true continuation must not turn keyboard escape-time into a sliding deadline"
+    );
+}
+
+#[tokio::test]
+async fn socket_dispatch_rearms_replaced_same_length_streaming_suffix() {
+    let (live_input, stream, _peer, _control_rx) =
+        pending_escape_socket_fixture("escape-epoch-streaming").await;
+    let mut decoder = AttachFrameDecoder::new();
+    let mut pending_input = Vec::new();
+    let mut pending_escape_flush = PendingEscapeFlush::default();
+    let mut active_emit_cache = None;
+    let mut locked = false;
+    let incomplete_paste = b"\x1b[200~body";
+
+    decoder.push_bytes(
+        &encode_attach_message(&AttachMessage::Data(incomplete_paste.to_vec()))
+            .expect("encode initial incomplete paste"),
+    );
+    process_socket_messages(
+        &mut decoder,
+        &stream,
+        &live_input,
+        None,
+        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
+        &mut active_emit_cache,
+        &mut locked,
+    )
+    .await
+    .expect("retain initial incomplete paste");
+    assert_eq!(pending_input, incomplete_paste);
+    sync_pending_escape_flush_with_escape_time(
+        &mut pending_escape_flush,
+        &pending_input,
+        Duration::from_secs(8),
+    );
+    let first_deadline = pending_escape_flush
+        .deadline()
+        .expect("initial paste stream arms a deadline");
+
+    let mut replacement = b"\x1b[201~".to_vec();
+    replacement.extend_from_slice(incomplete_paste);
+    decoder.push_bytes(
+        &encode_attach_message(&AttachMessage::Data(replacement))
+            .expect("encode completed and replacement paste streams"),
+    );
+    process_socket_messages(
+        &mut decoder,
+        &stream,
+        &live_input,
+        None,
+        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
+        &mut active_emit_cache,
+        &mut locked,
+    )
+    .await
+    .expect("complete first paste and retain replacement stream");
+    assert_eq!(
+        pending_input, incomplete_paste,
+        "the replacement intentionally matches the old kind, length, and contents"
+    );
+    sync_pending_escape_flush_with_escape_time(
+        &mut pending_escape_flush,
+        &pending_input,
+        Duration::from_secs(30),
+    );
+    let replacement_deadline = pending_escape_flush
+        .deadline()
+        .expect("replacement paste stream arms a fresh deadline");
+
+    assert!(
+        replacement_deadline > first_deadline + Duration::from_secs(20),
+        "a same-length streaming suffix must not inherit the completed stream's deadline"
+    );
+}
 
 #[test]
 fn overlay_generation_rejects_stale_clears_after_switches_or_newer_overlays() {
@@ -282,6 +1029,7 @@ async fn typed_keystroke_wire_reaches_stub_and_acknowledges() {
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&encoded);
     let mut pending_input = Vec::new();
+    let mut pending_escape_flush = PendingEscapeFlush::default();
     let mut active_emit_cache = None;
     let mut locked = true;
     let live_input = LiveAttachInputContext {
@@ -294,7 +1042,7 @@ async fn typed_keystroke_wire_reaches_stub_and_acknowledges() {
         &stream,
         &live_input,
         None,
-        &mut pending_input,
+        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
         &mut active_emit_cache,
         &mut locked,
     )
@@ -345,6 +1093,7 @@ async fn mouse_keystroke_wire_does_not_error_or_drop_the_attach() {
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&encoded);
     let mut pending_input = Vec::new();
+    let mut pending_escape_flush = PendingEscapeFlush::default();
     let mut active_emit_cache = None;
     let mut locked = false;
     let live_input = LiveAttachInputContext {
@@ -357,7 +1106,7 @@ async fn mouse_keystroke_wire_does_not_error_or_drop_the_attach() {
         &stream,
         &live_input,
         None,
-        &mut pending_input,
+        PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
         &mut active_emit_cache,
         &mut locked,
     )
@@ -1294,6 +2043,94 @@ async fn forward_attach_exited_control_wins_over_closing_shutdown() {
         result.is_ok(),
         "forward_attach should exit cleanly: {result:?}"
     );
+}
+
+#[tokio::test]
+async fn last_session_exit_waits_for_attach_wire_drain_before_daemon_shutdown() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = SessionName::new("attach-drain").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let (daemon_shutdown, mut daemon_shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(daemon_shutdown);
+    let forwarder_guard = handler.begin_attach_forwarder();
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let attach_pid = std::process::id();
+    let attach_id = handler
+        .register_attach_with_closing(
+            attach_pid,
+            session_name.clone(),
+            control_tx,
+            Arc::clone(&closing),
+            OuterTerminalContext::default(),
+            crate::client_flags::ClientFlags::default(),
+        )
+        .await;
+    let live_input = LiveAttachInputContext {
+        handler: Arc::clone(&handler),
+        attach_pid,
+    };
+
+    let attach_task = tokio::spawn(forward_attach(
+        stream,
+        test_attach_target(&session_name, b"BASE-0", None),
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::new(AtomicUsize::new(0)),
+        closing,
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+        false,
+    ));
+    let _ = read_attach_data_until(&mut peer, b"BASE-0").await;
+
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: session_name,
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    assert!(
+        !handler.request_shutdown_if_pending(),
+        "exit-empty must wait for the attached exit frame to drain"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut daemon_shutdown_rx)
+            .await
+            .is_err(),
+        "daemon shutdown must stay pending while the attach forwarder owns the wire"
+    );
+
+    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
+    assert!(
+        exited
+            .windows(b"[exited]\r\n".len())
+            .any(|window| window == b"[exited]\r\n"),
+        "the terminal exit frame must arrive before daemon shutdown"
+    );
+    let result = attach_task.await.expect("attach task join");
+    assert!(result.is_ok(), "forward_attach should drain: {result:?}");
+    handler.finish_attach(attach_pid, attach_id).await;
+    drop(forwarder_guard);
+    let _ = handler.request_shutdown_if_pending();
+    tokio::time::timeout(Duration::from_millis(500), daemon_shutdown_rx)
+        .await
+        .expect("daemon should shut down after the attach exit frame drains")
+        .expect("shutdown receiver should complete cleanly");
 }
 
 #[tokio::test]

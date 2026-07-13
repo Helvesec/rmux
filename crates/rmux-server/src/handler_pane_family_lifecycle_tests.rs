@@ -3,10 +3,10 @@ use super::RequestHandler;
 use crate::pane_io::{AttachControl, PaneExitEvent};
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    BreakPaneRequest, HookLifecycle, HookName, KillPaneRequest, LinkWindowRequest,
-    NewWindowRequest, PaneKillRequest, PaneOutputCursorRequest, PaneOutputSubscriptionStart,
-    PaneTarget, PaneTargetRef, Request, Response, ScopeSelector, SessionName, SetHookRequest,
-    SubscribePaneOutputRefRequest, WindowTarget,
+    BreakPaneRequest, HookLifecycle, HookName, KillPaneRequest, KillSessionRequest,
+    LinkWindowRequest, NewWindowRequest, PaneKillRequest, PaneOutputCursorRequest,
+    PaneOutputSubscriptionStart, PaneTarget, PaneTargetRef, Request, Response, ScopeSelector,
+    SessionName, SetHookRequest, SubscribePaneOutputRefRequest, WindowTarget,
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -19,6 +19,49 @@ mod resize_mutation_reconciliation;
 mod resize_policy;
 
 type LifecycleKey = (HookName, SessionName);
+
+#[derive(Debug, Default)]
+struct PaneKillSubscriptionRekeyPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+static PANE_KILL_SUBSCRIPTION_REKEY_PAUSE: std::sync::Mutex<
+    Option<(SessionName, std::sync::Arc<PaneKillSubscriptionRekeyPause>)>,
+> = std::sync::Mutex::new(None);
+
+fn install_pane_kill_subscription_rekey_pause(
+    session_name: SessionName,
+) -> std::sync::Arc<PaneKillSubscriptionRekeyPause> {
+    let pause = std::sync::Arc::new(PaneKillSubscriptionRekeyPause::default());
+    *PANE_KILL_SUBSCRIPTION_REKEY_PAUSE
+        .lock()
+        .expect("pane-kill subscription rekey pause lock") = Some((session_name, pause.clone()));
+    pause
+}
+
+pub(super) async fn pause_before_pane_kill_subscription_rekey(session_name: &SessionName) {
+    let pause = PANE_KILL_SUBSCRIPTION_REKEY_PAUSE
+        .lock()
+        .expect("pane-kill subscription rekey pause lock")
+        .as_ref()
+        .filter(|(paused_session, _)| paused_session == session_name)
+        .map(|(_, pause)| pause.clone());
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+    let mut installed = PANE_KILL_SUBSCRIPTION_REKEY_PAUSE
+        .lock()
+        .expect("pane-kill subscription rekey pause lock");
+    if installed
+        .as_ref()
+        .is_some_and(|(_, current)| std::sync::Arc::ptr_eq(current, &pause))
+    {
+        installed.take();
+    }
+}
 
 async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &'static str) {
     let response = handler
@@ -397,6 +440,86 @@ async fn pane_id_runtime_owner_alias_removal_rekeys_live_output_subscription() {
     assert!(
         matches!(closed_cursor, Response::Error(_)),
         "{closed_cursor:?}"
+    );
+}
+
+#[tokio::test]
+async fn pane_id_owner_rekey_commits_before_following_owner_transfer() {
+    let handler = RequestHandler::new();
+    let (_keeper, owner, peer, family_pane_id) =
+        create_grouped_last_pane_family(&handler, "pane-id-rekey-order").await;
+    let survivor = create_grouped_session(&handler, "pane-id-rekey-order-survivor", &owner).await;
+    let subscribed = handler
+        .handle_subscribe_pane_output_ref(
+            4245,
+            SubscribePaneOutputRefRequest {
+                target: PaneTargetRef::by_id(owner.clone(), family_pane_id),
+                start: PaneOutputSubscriptionStart::Now,
+            },
+        )
+        .await;
+    let Response::SubscribePaneOutput(subscribed) = subscribed else {
+        panic!("live grouped pane should accept subscription: {subscribed:?}");
+    };
+
+    let pause = install_pane_kill_subscription_rekey_pause(owner.clone());
+    let pane_kill_handler = handler.clone();
+    let pane_kill_owner = owner.clone();
+    let pane_kill = tokio::spawn(async move {
+        pane_kill_handler
+            .handle(Request::PaneKill(PaneKillRequest {
+                target: PaneTargetRef::by_id(pane_kill_owner, family_pane_id),
+                kill_all_except: false,
+            }))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("pane-kill reaches its state-locked subscription rekey");
+
+    let next_transfer_handler = handler.clone();
+    let next_transfer_peer = peer.clone();
+    let next_transfer = tokio::spawn(async move {
+        next_transfer_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: next_transfer_peer,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !next_transfer.is_finished(),
+        "the B -> C transfer must wait until pane-kill commits A -> B"
+    );
+
+    pause.release.notify_one();
+    let pane_kill_response = tokio::time::timeout(Duration::from_secs(2), pane_kill)
+        .await
+        .expect("pane-kill rekey completes before timeout")
+        .expect("pane-kill task joins");
+    let next_transfer_response = tokio::time::timeout(Duration::from_secs(2), next_transfer)
+        .await
+        .expect("following owner transfer completes before timeout")
+        .expect("following owner-transfer task joins");
+    assert!(
+        matches!(pane_kill_response, Response::KillPane(_)),
+        "{pane_kill_response:?}"
+    );
+    assert!(
+        matches!(next_transfer_response, Response::KillSession(_)),
+        "{next_transfer_response:?}"
+    );
+
+    let subscription_key = handler
+        .pane_output_subscription_key_for_test(subscribed.subscription_id)
+        .expect("live subscription remains registered");
+    assert_eq!(
+        subscription_key.runtime_session_name(),
+        &survivor,
+        "the subscription must follow both A -> B and B -> C owner transfers"
     );
 }
 

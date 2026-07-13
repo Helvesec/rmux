@@ -139,6 +139,7 @@ impl HandlerState {
         runtime_session_name: &SessionName,
         window_index: u32,
         prepared: PreparedWindowTerminal,
+        retained_output_sender: Option<crate::pane_io::PaneOutputSender>,
     ) -> Result<PaneId, RmuxError> {
         let PreparedWindowTerminal {
             terminal,
@@ -155,7 +156,12 @@ impl HandlerState {
             pane_index,
             terminal,
         )?;
-        if let Err(error) = self.reset_pane_output(runtime_session_name, pane_id, output) {
+        if let Err(error) = self.reset_pane_output_with_sender(
+            runtime_session_name,
+            pane_id,
+            output,
+            retained_output_sender,
+        ) {
             if let Some(terminal) = self.terminals.remove_pane(runtime_session_name, pane_id) {
                 terminal.terminate_in_background();
             }
@@ -267,6 +273,10 @@ impl HandlerState {
         session_name: &SessionName,
         window_index: u32,
     ) -> Result<(), RmuxError> {
+        #[cfg(test)]
+        {
+            self.window_runtime_resize_count = self.window_runtime_resize_count.saturating_add(1);
+        }
         let (runtime_session_name, window_size, pane_geometries) = {
             let session = self
                 .sessions

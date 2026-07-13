@@ -9,6 +9,7 @@ use rmux_proto::{
     SaveBufferResponse, SetBufferResponse, ShowBufferResponse,
 };
 
+use super::mode_tree_support::ModeTreeActionIdentity;
 use super::pane_support::{prepare_pane_input_write, write_bytes_to_target_io, PaneInputLiveness};
 use super::RequestHandler;
 use crate::outer_terminal::OuterTerminal;
@@ -17,13 +18,31 @@ use crate::pane_terminals::{session_not_found, PaneCaptureRequest};
 
 #[path = "handler_buffer/capture_format.rs"]
 mod capture_format;
+#[cfg(test)]
+#[path = "handler_buffer/identity_test_pause.rs"]
+mod identity_test_pause;
 #[path = "handler_buffer/list.rs"]
 mod list;
 
 use capture_format::{apply_capture_format_flags, capture_render_options, parse_buffer_limit};
+#[cfg(test)]
+pub(super) use identity_test_pause::{
+    install_paste_buffer_identity_pause, pause_after_paste_buffer_identity_capture,
+};
 use list::{
     command_output_from_lines, render_list_buffer_line, sort_buffer_entries, BufferSortOrder,
 };
+
+#[derive(Debug)]
+pub(super) enum OrderedPasteBufferResult {
+    /// The selected name now identifies a different buffer instance.
+    StaleIdentity,
+    /// The mode-tree action no longer belongs to the attached client and
+    /// tree generation that selected it.
+    StaleRequesterIdentity,
+    /// A normal public response, including the legitimate empty-store no-op.
+    Completed(Response),
+}
 
 impl RequestHandler {
     pub(super) async fn handle_set_buffer(
@@ -93,30 +112,85 @@ impl RequestHandler {
         &self,
         request: rmux_proto::PasteBufferRequest,
     ) -> Response {
+        match self.handle_paste_buffer_inner(request, None, None).await {
+            OrderedPasteBufferResult::Completed(response) => response,
+            OrderedPasteBufferResult::StaleIdentity => Response::Error(ErrorResponse {
+                error: RmuxError::Server(
+                    "unordered paste unexpectedly produced a stale buffer identity".to_owned(),
+                ),
+            }),
+            OrderedPasteBufferResult::StaleRequesterIdentity => Response::Error(ErrorResponse {
+                error: RmuxError::Server(
+                    "unordered paste unexpectedly carried a mode-tree requester identity"
+                        .to_owned(),
+                ),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn handle_paste_buffer_for_order(
+        &self,
+        request: rmux_proto::PasteBufferRequest,
+        expected_order: u64,
+    ) -> OrderedPasteBufferResult {
+        self.handle_paste_buffer_inner(request, Some(expected_order), None)
+            .await
+    }
+
+    pub(super) async fn handle_paste_buffer_for_order_and_requester(
+        &self,
+        request: rmux_proto::PasteBufferRequest,
+        expected_order: u64,
+        expected_requester: ModeTreeActionIdentity,
+    ) -> OrderedPasteBufferResult {
+        self.handle_paste_buffer_inner(request, Some(expected_order), Some(expected_requester))
+            .await
+    }
+
+    async fn handle_paste_buffer_inner(
+        &self,
+        request: rmux_proto::PasteBufferRequest,
+        expected_order: Option<u64>,
+        expected_requester: Option<ModeTreeActionIdentity>,
+    ) -> OrderedPasteBufferResult {
         let session_name = request.target.session_name().clone();
         let window_index = request.target.window_index();
         let pane_index = request.target.pane_index();
 
-        let (buffer_name, content, buffer_order, bracketed_mode) = {
+        // This lock is the ordered paste linearization point: validate the
+        // monotonic order and snapshot the matching bytes atomically. A later
+        // replacement cannot retarget the write, and delete_if_order_matches
+        // below prevents deleting that replacement after the async write.
+        let (buffer_name, content, buffer_order, pane_id, bracketed_mode) = {
             let state = self.state.lock().await;
 
             if !state.sessions.contains_session(&session_name) {
-                return Response::Error(ErrorResponse {
+                return OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
                     error: session_not_found(&session_name),
-                });
+                }));
             }
 
             if request.name.is_none() && state.buffers.is_empty() {
-                return Response::PasteBuffer(PasteBufferResponse {
-                    buffer_name: String::new(),
-                });
+                return OrderedPasteBufferResult::Completed(Response::PasteBuffer(
+                    PasteBufferResponse {
+                        buffer_name: String::new(),
+                    },
+                ));
             }
 
             let (name, content, order) =
                 match state.buffers.show_with_order(request.name.as_deref()) {
                     Ok((name, content, order)) => (name.to_owned(), content.to_vec(), order),
-                    Err(error) => return Response::Error(ErrorResponse { error }),
+                    Err(error) => {
+                        return OrderedPasteBufferResult::Completed(Response::Error(
+                            ErrorResponse { error },
+                        ))
+                    }
                 };
+            if expected_order.is_some_and(|expected_order| expected_order != order) {
+                return OrderedPasteBufferResult::StaleIdentity;
+            }
 
             let pane = match state
                 .sessions
@@ -126,12 +200,12 @@ impl RequestHandler {
             {
                 Some(pane) => pane,
                 None => {
-                    return Response::Error(ErrorResponse {
+                    return OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
                         error: RmuxError::invalid_target(
                             format!("{session_name}:{window_index}.{pane_index}"),
                             "pane index does not exist in session",
                         ),
-                    })
+                    }))
                 }
             };
             let bracketed_mode = request.bracketed
@@ -141,13 +215,56 @@ impl RequestHandler {
                         state.mode & rmux_core::input::mode::MODE_BRACKETPASTE != 0
                     });
 
-            (name, content, order, bracketed_mode)
+            (name, content, order, pane.id(), bracketed_mode)
         };
+
+        #[cfg(test)]
+        pause_after_paste_buffer_identity_capture(&session_name).await;
 
         let payload = render_paste_payload(&content, &request);
         let payload = bracketed_paste_payload(payload, bracketed_mode);
         let write = {
             let mut state = self.state.lock().await;
+            // The state lock is acquired before the attach lock, matching
+            // attach registration. Keeping both through sink preparation
+            // makes this requester check the logical commit point for this
+            // individual mode-tree paste.
+            let _active_attach = match expected_requester {
+                Some(expected) => {
+                    let active_attach = self.active_attach.lock().await;
+                    let requester_is_current = active_attach
+                        .by_pid
+                        .get(&expected.attach_pid())
+                        .is_some_and(|active| {
+                            active.id == expected.attach_id()
+                                && active.mode_tree_state_id == expected.state_id()
+                                && active.mode_tree.is_some()
+                                && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        });
+                    if !requester_is_current {
+                        return OrderedPasteBufferResult::StaleRequesterIdentity;
+                    }
+                    Some(active_attach)
+                }
+                None => None,
+            };
+            // The wrapper decision belongs to the captured stable pane. Keep
+            // identity validation and sink preparation under this same lock so
+            // a concurrent slot replacement cannot inherit that decision.
+            let pane_identity_matches = state
+                .sessions
+                .session(&session_name)
+                .and_then(|session| session.window_at(window_index))
+                .and_then(|window| window.pane(pane_index))
+                .is_some_and(|pane| pane.id() == pane_id);
+            if !pane_identity_matches {
+                return OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
+                    error: RmuxError::invalid_target(
+                        request.target.to_string(),
+                        "pane identity changed before paste-buffer write",
+                    ),
+                }));
+            }
             match prepare_pane_input_write(
                 &mut state,
                 &request.target,
@@ -155,25 +272,49 @@ impl RequestHandler {
                 PaneInputLiveness::RejectDead,
             ) {
                 Ok(write) => write,
-                Err(error) => return Response::Error(ErrorResponse { error }),
+                Err(error) => {
+                    return OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
+                        error,
+                    }))
+                }
             }
         };
         if let Err(error) = write_bytes_to_target_io(write, payload).await {
-            return Response::Error(ErrorResponse {
+            return OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
                 error: RmuxError::Server(format!(
                     "failed to write buffer to pane {}:{}.{}: {}",
                     session_name, window_index, pane_index, error
                 )),
-            });
+            }));
         }
 
         if request.delete_after {
             self.pause_before_paste_buffer_delete().await;
             let mut state = self.state.lock().await;
+            let _active_attach = match expected_requester {
+                Some(expected) => {
+                    let active_attach = self.active_attach.lock().await;
+                    let requester_is_current = active_attach
+                        .by_pid
+                        .get(&expected.attach_pid())
+                        .is_some_and(|active| {
+                            active.id == expected.attach_id()
+                                && active.mode_tree_state_id == expected.state_id()
+                                && active.mode_tree.is_some()
+                                && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                        });
+                    if !requester_is_current {
+                        return OrderedPasteBufferResult::StaleRequesterIdentity;
+                    }
+                    Some(active_attach)
+                }
+                None => None,
+            };
             let deleted = state
                 .buffers
                 .delete_if_order_matches(&buffer_name, buffer_order);
             drop(state);
+            drop(_active_attach);
             if deleted {
                 self.emit(LifecycleEvent::PasteBufferDeleted {
                     buffer_name: buffer_name.clone(),
@@ -182,7 +323,9 @@ impl RequestHandler {
             }
         }
 
-        Response::PasteBuffer(PasteBufferResponse { buffer_name })
+        OrderedPasteBufferResult::Completed(Response::PasteBuffer(PasteBufferResponse {
+            buffer_name,
+        }))
     }
 
     pub(super) async fn handle_list_buffers(

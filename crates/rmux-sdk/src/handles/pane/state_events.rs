@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use crate::handles::connect_transport_to_endpoint;
 use crate::handles::session::unexpected_response;
 use crate::transport::TransportClient;
-use crate::{Pane, PaneId, Result};
+use crate::{Pane, PaneId, Result, RmuxError};
 use rmux_proto::{
     PaneOptionEntry as ProtoPaneOptionEntry, PaneStateCursorRequest, PaneStateEventDto,
     PaneStateSnapshot, PaneStateSubscriptionId, Request, Response, SubscribePaneStateRequest,
@@ -11,7 +11,7 @@ use rmux_proto::{
 };
 
 use super::foreground::ForegroundState;
-use super::target::stale_slot_error;
+use super::target::{is_stale_pane_id_target_error, stale_slot_error};
 
 pub use rmux_proto::PaneStateClosedReason;
 
@@ -185,14 +185,20 @@ impl PaneStateEventStream {
         )
         .await?;
 
-        let response = cursor_transport
-            .request(Request::SubscribePaneState(SubscribePaneStateRequest {
-                target,
-                include_title: options.include_title,
-                include_options: options.include_options,
-                include_foreground: options.include_foreground,
-            }))
-            .await?;
+        let response = match subscribe_pane_state(&cursor_transport, target.clone(), options).await
+        {
+            Ok(response) => response,
+            Err(error) if pane.is_stable_id() && is_stale_pane_id_target_error(&error, &target) => {
+                let pane_id = pane
+                    .stable_id
+                    .expect("stable-id state stream retry requires a stable pane id");
+                let retry_target = pane.resolved_proto_target_ref().await?.ok_or_else(|| {
+                    RmuxError::pane_not_found(pane.target().session_name.clone(), pane_id)
+                })?;
+                subscribe_pane_state(&cursor_transport, retry_target, options).await?
+            }
+            Err(error) => return Err(error),
+        };
 
         let response = match response {
             Response::SubscribePaneState(response) => *response,
@@ -288,6 +294,21 @@ impl PaneStateEventStream {
             self.pending.clear();
         }
     }
+}
+
+async fn subscribe_pane_state(
+    transport: &TransportClient,
+    target: rmux_proto::PaneTargetRef,
+    options: PaneStateEventsOptions,
+) -> Result<Response> {
+    transport
+        .request(Request::SubscribePaneState(SubscribePaneStateRequest {
+            target,
+            include_title: options.include_title,
+            include_options: options.include_options,
+            include_foreground: options.include_foreground,
+        }))
+        .await
 }
 
 impl Drop for PaneStateEventStream {

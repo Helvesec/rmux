@@ -22,9 +22,16 @@ impl RequestHandler {
                 .reconcile_attached_session_size_and_emit(session_name)
                 .await;
         }
-        let (refresh_contexts, mode_tree_pids, overlay_pids, stale_clients) = {
+        let (
+            refresh_contexts,
+            display_panes_identities,
+            mode_tree_pids,
+            overlay_pids,
+            stale_clients,
+        ) = {
             let mut active_attach = self.active_attach.lock().await;
             let mut refresh_contexts = Vec::new();
+            let mut display_panes_identities = Vec::new();
             let mut mode_tree_pids = Vec::new();
             let mut overlay_pids = Vec::new();
             let mut stale_clients = Vec::new();
@@ -34,6 +41,9 @@ impl RequestHandler {
                 }
                 if active.mode_tree.is_some() {
                     mode_tree_pids.push(*pid);
+                }
+                if active.display_panes.is_some() {
+                    display_panes_identities.push((*pid, active.id));
                 }
                 if active.overlay.is_some() {
                     overlay_pids.push(*pid);
@@ -68,6 +78,7 @@ impl RequestHandler {
             }
             (
                 refresh_contexts,
+                display_panes_identities,
                 mode_tree_pids,
                 overlay_pids,
                 stale_clients,
@@ -145,11 +156,20 @@ impl RequestHandler {
                 .await;
         }
         self.refresh_clock_overlays_for_session(session_name).await;
-        for attach_pid in mode_tree_pids {
-            let _ = self.refresh_mode_tree_overlay_if_active(attach_pid).await;
+        for (attach_pid, attach_id) in display_panes_identities {
+            let _ = self
+                .refresh_display_panes_overlay_for_client_identity(
+                    attach_pid,
+                    attach_id,
+                    session_name,
+                )
+                .await;
         }
         for attach_pid in overlay_pids {
             let _ = self.refresh_interactive_overlay_if_active(attach_pid).await;
+        }
+        for attach_pid in mode_tree_pids {
+            let _ = self.refresh_mode_tree_overlay_if_active(attach_pid).await;
         }
         self.refresh_control_session(session_name).await;
     }
@@ -193,6 +213,40 @@ impl RequestHandler {
         attach_pid: u32,
         session_name: &rmux_proto::SessionName,
     ) {
+        let _ = self
+            .refresh_attached_client_with_expected_identity(attach_pid, None, session_name)
+            .await;
+    }
+
+    pub(crate) async fn refresh_attached_client_for_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        session_name: &rmux_proto::SessionName,
+        command_name: &str,
+    ) -> Result<(), rmux_proto::RmuxError> {
+        if self
+            .refresh_attached_client_with_expected_identity(
+                attach_pid,
+                Some(expected_attach_id),
+                session_name,
+            )
+            .await
+        {
+            Ok(())
+        } else {
+            Err(crate::handler_support::attached_client_required(
+                command_name,
+            ))
+        }
+    }
+
+    async fn refresh_attached_client_with_expected_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: Option<u64>,
+        session_name: &rmux_proto::SessionName,
+    ) -> bool {
         let _refresh_span = crate::perf_instrument::span("attach_refresh")
             .with_str("scope", "client")
             .with_u64("attach_pid", u64::from(attach_pid))
@@ -206,7 +260,12 @@ impl RequestHandler {
             active_attach
                 .by_pid
                 .get(&attach_pid)
-                .filter(|active| &active.session_name == session_name && !active.suspended)
+                .filter(|active| {
+                    expected_attach_id.is_none_or(|expected| {
+                        active.id == expected && !active.closing.load(Ordering::SeqCst)
+                    }) && &active.session_name == session_name
+                        && !active.suspended
+                })
                 .map(|active| {
                     (
                         active
@@ -230,7 +289,7 @@ impl RequestHandler {
             key_table,
         )) = prompt
         else {
-            return;
+            return false;
         };
         let target = {
             let state = self.state.lock().await;
@@ -251,20 +310,26 @@ impl RequestHandler {
             .ok()
         };
         let Some(mut target) = target else {
-            return;
+            return false;
         };
         if mode_tree_active {
             target.persistent_overlay_state_id = Some(mode_tree_state_id);
         }
 
         let mut active_attach = self.active_attach.lock().await;
-        let stale_client = match active_attach.by_pid.get_mut(&attach_pid) {
-            Some(active) if &active.session_name == session_name && !active.suspended => {
+        let (delivered, stale_client) = match active_attach.by_pid.get_mut(&attach_pid) {
+            Some(active)
+                if expected_attach_id.is_none_or(|expected| {
+                    active.id == expected && !active.closing.load(Ordering::SeqCst)
+                }) && &active.session_name == session_name
+                    && !active.suspended =>
+            {
                 active.render_generation = active.render_generation.saturating_add(1);
-                (!enqueue_tracked_render_control(active, AttachControl::switch(target)))
-                    .then(|| active.identity(attach_pid))
+                let delivered =
+                    enqueue_tracked_render_control(active, AttachControl::switch(target));
+                (delivered, (!delivered).then(|| active.identity(attach_pid)))
             }
-            _ => None,
+            _ => (false, None),
         };
         drop(active_attach);
         if let Some(stale_client) = stale_client {
@@ -277,9 +342,73 @@ impl RequestHandler {
                     .await;
             }
         }
+        if let Some(expected_attach_id) = expected_attach_id {
+            if !delivered {
+                return false;
+            }
+            if self
+                .refresh_clock_overlay_for_client_identity(
+                    attach_pid,
+                    expected_attach_id,
+                    session_name,
+                )
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            if self
+                .refresh_display_panes_overlay_for_client_identity(
+                    attach_pid,
+                    expected_attach_id,
+                    session_name,
+                )
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            if self
+                .refresh_interactive_overlay_for_client_identity(
+                    attach_pid,
+                    expected_attach_id,
+                    session_name,
+                )
+                .await
+                .is_err()
+            {
+                return false;
+            }
+            return self
+                .refresh_mode_tree_overlay_for_client_identity(
+                    attach_pid,
+                    expected_attach_id,
+                    session_name,
+                )
+                .await
+                .is_ok();
+        }
         self.refresh_clock_overlays_for_session(session_name).await;
-        let _ = self.refresh_mode_tree_overlay_if_active(attach_pid).await;
+        let current_attach_id = {
+            let active_attach = self.active_attach.lock().await;
+            active_attach
+                .by_pid
+                .get(&attach_pid)
+                .filter(|active| &active.session_name == session_name && !active.suspended)
+                .map(|active| active.id)
+        };
+        if let Some(current_attach_id) = current_attach_id {
+            let _ = self
+                .refresh_display_panes_overlay_for_client_identity(
+                    attach_pid,
+                    current_attach_id,
+                    session_name,
+                )
+                .await;
+        }
         let _ = self.refresh_interactive_overlay_if_active(attach_pid).await;
+        let _ = self.refresh_mode_tree_overlay_if_active(attach_pid).await;
+        delivered
     }
 
     pub(crate) async fn refresh_attached_client_base_only(

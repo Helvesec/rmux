@@ -10,6 +10,9 @@ use rmux_proto::{
 };
 use tokio::sync::mpsc;
 
+use super::super::control_support::{
+    with_control_queue_eof_cancellation, ControlQueueEofCancellation,
+};
 use super::*;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::outer_terminal::OuterTerminalContext;
@@ -165,6 +168,161 @@ async fn stale_control_queue_cannot_apply_parse_time_assignments_to_reused_pid()
     assert!(result.error.is_some(), "stale assignment must fail closed");
     let state = handler.state.lock().await;
     assert_eq!(state.environment.global_value("CONTROL_QUEUE_PARSE"), None);
+}
+
+#[tokio::test]
+async fn stopped_control_frame_does_not_enter_a_nested_command_queue() {
+    let handler = RequestHandler::new();
+    let requester_pid = 93_780;
+    let (control_id, _control_events) = register_control(&handler, requester_pid).await;
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let cancellation = ControlQueueEofCancellation::new(identity);
+    cancellation.cancel_for_eof();
+    cancellation.mark_wait_cancelled();
+    let nested_commands = CommandParser::new()
+        .parse(
+            "CONTROL_EOF_NESTED_PARSE=mutated set-environment -g CONTROL_EOF_NESTED_FIRST must-not-run",
+        )
+        .expect("nested command parses");
+
+    // `run-shell -C`, command-form `if-shell`, source-file, and hooks enter
+    // this detached parsed-command path while retaining the outer control
+    // identity. A monotone StopFrame must be observed before its first item.
+    let result = with_control_queue_eof_cancellation(
+        cancellation,
+        with_control_queue_identity(
+            identity,
+            handler.execute_parsed_commands_for_test(requester_pid, nested_commands),
+        ),
+    )
+    .await;
+    assert!(result.is_ok(), "EOF frame stop stays internal: {result:?}");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.environment.global_value("CONTROL_EOF_NESTED_FIRST"),
+        None,
+        "a nested queue entered after StopFrame must not execute its first mutation"
+    );
+    assert_eq!(
+        state.environment.global_value("CONTROL_EOF_NESTED_PARSE"),
+        None,
+        "StopFrame must be checked before nested parse-time assignments"
+    );
+    drop(state);
+    handler.finish_control(requester_pid, control_id).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn control_eof_ready_signal_wins_same_turn_cancellation() {
+    let handler = RequestHandler::new();
+    let requester_pid = 93_781;
+    let channel = "control-eof-ready-signal-race";
+    let (control_id, _control_events) = register_control(&handler, requester_pid).await;
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let cancellation = ControlQueueEofCancellation::new(identity);
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "wait-for {channel} ; set-environment -g CONTROL_EOF_READY_SIGNAL won"
+        ))
+        .expect("control commands parse");
+    let queued_handler = handler.clone();
+    let queued_cancellation = cancellation.clone();
+    let queued = tokio::spawn(async move {
+        with_control_queue_eof_cancellation(
+            queued_cancellation,
+            queued_handler.execute_control_commands_identity(requester_pid, control_id, commands),
+        )
+        .await
+    });
+    wait_for_waiter(&handler, channel).await;
+
+    // Current-thread runtime plus no await between these operations makes
+    // both receiver and EOF ready before the waiter task can be repolled.
+    handler
+        .wait_for
+        .lock()
+        .expect("wait-for store")
+        .signal(channel)
+        .expect("signal waiter");
+    cancellation.cancel_for_eof();
+
+    let result = queued.await.expect("control queue joins");
+    assert!(result.error.is_none(), "Ready signal stays successful");
+    assert_eq!(handler.wait_for_counts(channel), (0, 0, false));
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.environment.global_value("CONTROL_EOF_READY_SIGNAL"),
+        Some("won"),
+        "receiver-first bias must let the frame continue"
+    );
+    drop(state);
+    handler.finish_control(requester_pid, control_id).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn control_eof_ready_lock_grant_wins_same_turn_cancellation() {
+    let handler = RequestHandler::new();
+    let requester_pid = 93_782;
+    let channel = "control-eof-ready-lock-race";
+    let response = handler
+        .handle(Request::WaitFor(WaitForRequest {
+            channel: channel.to_owned(),
+            mode: WaitForMode::Lock,
+        }))
+        .await;
+    assert!(matches!(response, Response::WaitFor(_)), "{response:?}");
+    let (control_id, _control_events) = register_control(&handler, requester_pid).await;
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let cancellation = ControlQueueEofCancellation::new(identity);
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "wait-for -L {channel} ; set-environment -g CONTROL_EOF_READY_LOCK won"
+        ))
+        .expect("control commands parse");
+    let queued_handler = handler.clone();
+    let queued_cancellation = cancellation.clone();
+    let queued = tokio::spawn(async move {
+        with_control_queue_eof_cancellation(
+            queued_cancellation,
+            queued_handler.execute_control_commands_identity(requester_pid, control_id, commands),
+        )
+        .await
+    });
+    wait_for_lock_waiter(&handler, channel).await;
+
+    handler
+        .wait_for
+        .lock()
+        .expect("wait-for store")
+        .unlock(channel)
+        .expect("grant lock waiter");
+    cancellation.cancel_for_eof();
+
+    let result = queued.await.expect("control queue joins");
+    assert!(result.error.is_none(), "Ready lock grant stays successful");
+    assert_eq!(
+        handler.wait_for_counts(channel),
+        (0, 0, true),
+        "the receiver-first branch must accept and retain the lock grant"
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.environment.global_value("CONTROL_EOF_READY_LOCK"),
+        Some("won"),
+        "accepted lock grant must let the frame continue"
+    );
+    drop(state);
+
+    let response = handler
+        .handle(Request::WaitFor(WaitForRequest {
+            channel: channel.to_owned(),
+            mode: WaitForMode::Unlock,
+        }))
+        .await;
+    assert!(matches!(response, Response::WaitFor(_)), "{response:?}");
+    assert_eq!(handler.wait_for_counts(channel), (0, 0, false));
+    handler.finish_control(requester_pid, control_id).await;
 }
 
 #[tokio::test]
@@ -646,6 +804,16 @@ async fn wait_for_waiter(handler: &RequestHandler, channel: &str) {
         tokio::task::yield_now().await;
     }
     assert_eq!(handler.wait_for_counts(channel).0, 1);
+}
+
+async fn wait_for_lock_waiter(handler: &RequestHandler, channel: &str) {
+    for _ in 0..200 {
+        if handler.wait_for_counts(channel).1 == 1 {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(handler.wait_for_counts(channel).1, 1);
 }
 
 async fn signal_waiter(handler: &RequestHandler, channel: &str) {

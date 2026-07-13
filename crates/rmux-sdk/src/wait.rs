@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use rmux_proto::{
     CancelSdkWaitRequest, PaneOutputSubscriptionStart, Request, Response, RmuxError as ProtoError,
-    SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitId, SdkWaitOutcome,
-    CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_WAITS_ARMED,
+    SdkWaitForOutputRefRequest, SdkWaitId, SdkWaitOutcome, CAPABILITY_SDK_PANE_BY_ID,
+    CAPABILITY_SDK_WAITS_ARMED,
 };
 
 use crate::handles::{connect_transport_to_endpoint, Pane};
@@ -243,21 +243,11 @@ async fn sdk_wait_request_for_pane(
     wait_id: SdkWaitId,
     bytes: Vec<u8>,
 ) -> Result<Request> {
-    if pane.is_stable_id() {
-        crate::capabilities::require(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await?;
-        return Ok(Request::SdkWaitForOutputRef(SdkWaitForOutputRefRequest {
-            owner_id,
-            wait_id,
-            target: pane.proto_target_ref(),
-            bytes,
-            start: PaneOutputSubscriptionStart::Now,
-        }));
-    }
-
-    Ok(Request::SdkWaitForOutput(SdkWaitForOutputRequest {
+    crate::capabilities::require(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await?;
+    Ok(Request::SdkWaitForOutputRef(SdkWaitForOutputRefRequest {
         owner_id,
         wait_id,
-        target: pane.target().into(),
+        target: pane.required_resolved_proto_target_ref().await?,
         bytes,
         start: PaneOutputSubscriptionStart::Now,
     }))

@@ -124,7 +124,7 @@ use super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::{
     command_output_from_lines, initial_session_spawn_environment, parse_session_sort_order,
     prepare_lifecycle_event, resolve_existing_session_target, update_environment_from_client,
-    PendingShutdownReason, RequestHandler, SessionSortOrder,
+    PaneOutputSubscriptionKeySnapshot, PendingShutdownReason, RequestHandler, SessionSortOrder,
 };
 
 impl RequestHandler {
@@ -1161,6 +1161,7 @@ impl RequestHandler {
             removed_pane_ids,
             removed_sessions,
             resize_window_ids,
+            subscriptions_removed,
         ) = {
             let mut state = self.state.lock().await;
             let session_name = if expected_session_id.is_some() {
@@ -1206,36 +1207,10 @@ impl RequestHandler {
             } else {
                 vec![(session_name.clone(), selected_session_id)]
             };
-            // Killing a grouped runtime-owner alias transfers the surviving
-            // pane runtimes to the next owner (remove_session_terminals
-            // renames terminals and pane outputs), which changes the
-            // (runtime owner, pane id) subscription keys. Capture every
-            // current key so the survivors can be rekeyed after the removal,
-            // like the pane-kill path does; a stale key would strand live
-            // pane-output subscriptions on a name that no longer streams.
-            let previous_subscription_keys = {
-                let mut keys = Vec::new();
-                let mut seen = std::collections::HashSet::new();
-                let pane_ids = state
-                    .sessions
-                    .iter()
-                    .flat_map(|(_, session)| {
-                        session
-                            .windows()
-                            .values()
-                            .flat_map(|window| window.panes().iter().map(rmux_core::Pane::id))
-                    })
-                    .collect::<Vec<_>>();
-                for pane_id in pane_ids {
-                    if !seen.insert(pane_id) {
-                        continue;
-                    }
-                    if let Some(key) = state.pane_output_subscription_key_for_pane_id(pane_id) {
-                        keys.push(key);
-                    }
-                }
-                keys
-            };
+            // kill-session -a may remove unrelated session families, while a
+            // grouped owner removal may transfer surviving runtimes. Capture
+            // all stable pane identities so both cases reconcile atomically.
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_all(&state);
             let mut queued_events = Vec::new();
             let mut removed_pane_ids = Vec::new();
             let mut removed_sessions: Vec<(SessionName, SessionId)> = Vec::new();
@@ -1331,35 +1306,28 @@ impl RequestHandler {
             );
             let removed_pane_ids = state.pane_ids_no_longer_referenced(removed_pane_ids);
             self.record_panes_closed_as_killed(&removed_pane_ids);
-            let mut subscription_rekeys = Vec::new();
-            for previous_key in previous_subscription_keys {
-                if removed_pane_ids.contains(&previous_key.pane_id()) {
-                    continue;
-                }
-                if let Some(current_key) = state
-                    .pane_output_subscription_key_for_pane_id(previous_key.pane_id())
-                    .filter(|current_key| current_key != &previous_key)
-                {
-                    subscription_rekeys.push((previous_key, current_key));
-                }
-            }
             #[cfg(test)]
             self.pause_before_kill_session_subscription_rekey(&session_name)
                 .await;
-            // Keep the state transition and subscription-key transition in
-            // one critical section. Otherwise concurrent owner transfers can
-            // apply A -> B after B -> C and strand records on B. Apply the
-            // committed rekeys even when a later multi-session removal makes
-            // the aggregate response an error.
-            self.rekey_pane_output_subscriptions(&subscription_rekeys);
+            // Keep removals and owner rekeys in the same state -> registry
+            // transaction. Apply the committed delta even when a later
+            // multi-session removal made the aggregate response an error.
+            let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
+                subscription_keys.reconcile_after(&state),
+            );
             (
                 response,
                 queued_events,
                 removed_pane_ids,
                 removed_sessions,
                 removed_window_ids,
+                subscriptions_removed,
             )
         };
+
+        if subscriptions_removed {
+            let _ = self.request_shutdown_if_pending();
+        }
 
         for (removed_session_name, removed_session_id) in &removed_sessions {
             self.exit_attached_session_identity(removed_session_name, *removed_session_id)
@@ -1466,9 +1434,36 @@ impl RequestHandler {
                     error: RmuxError::DuplicateSession(new_name.to_string()),
                 });
             }
+            let previous_subscription_keys = {
+                let mut seen = std::collections::HashSet::new();
+                session_pane_ids(
+                    state
+                        .sessions
+                        .session(&session_name)
+                        .expect("validated rename source must exist"),
+                )
+                .into_iter()
+                .filter(|pane_id| seen.insert(*pane_id))
+                .filter_map(|pane_id| state.pane_output_subscription_key_for_pane_id(pane_id))
+                .collect::<Vec<_>>()
+            };
 
             match state.rename_session(&session_name, &new_name) {
                 Ok(()) => {
+                    let subscription_rekeys = previous_subscription_keys
+                        .into_iter()
+                        .filter_map(|previous| {
+                            state
+                                .pane_output_subscription_key_for_pane_id(previous.pane_id())
+                                .filter(|current| current != &previous)
+                                .map(|current| (previous, current))
+                        })
+                        .collect::<Vec<_>>();
+                    // The live subscribe path takes the same state ->
+                    // subscriptions lock order, so no late old-name record
+                    // can land after this rename commits its rekeys.
+                    self.rekey_pane_output_subscriptions(&subscription_rekeys);
+                    self.rekey_retained_exited_pane_outputs(&session_name, &new_name, session_id);
                     self.rekey_session_silence_timers_locked(
                         &state,
                         &session_name,

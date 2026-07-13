@@ -1,19 +1,20 @@
 use std::collections::{HashMap, HashSet};
 
 use rmux_core::{EnvironmentStore, HookStore, OptionStore, PaneId, Session, SessionStore};
-use rmux_proto::{RmuxError, SessionName};
+use rmux_proto::{RmuxError, SessionName, TerminalPixels};
 
 use super::{
     session_not_found, HandlerState, PaneExitMetadata, PaneLifecycleState, WindowLinkGroup,
     WindowLinkSlot,
 };
 
-pub(in crate::pane_terminals) struct SessionTransferSnapshot {
+pub(crate) struct SessionTransferSnapshot {
     sessions: SessionStore,
     options: OptionStore,
     environment: EnvironmentStore,
     hooks: HookStore,
     pane_lifecycle: HashMap<PaneId, PaneLifecycleState>,
+    attached_terminal_pixels: HashMap<SessionName, TerminalPixels>,
     dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
     auto_named_windows: HashSet<(SessionName, u32)>,
     window_link_groups: HashMap<u64, WindowLinkGroup>,
@@ -24,13 +25,14 @@ pub(in crate::pane_terminals) struct SessionTransferSnapshot {
 }
 
 impl SessionTransferSnapshot {
-    pub(in crate::pane_terminals) fn capture(state: &HandlerState) -> Self {
+    pub(crate) fn capture(state: &HandlerState) -> Self {
         Self {
             sessions: state.sessions.clone(),
             options: state.options.clone(),
             environment: state.environment.clone(),
             hooks: state.hooks.clone(),
             pane_lifecycle: state.pane_lifecycle.clone(),
+            attached_terminal_pixels: state.attached_terminal_pixels.clone(),
             dead_panes: state.dead_panes.clone(),
             auto_named_windows: state.auto_named_windows.clone(),
             window_link_groups: state.window_link_groups.clone(),
@@ -41,12 +43,13 @@ impl SessionTransferSnapshot {
         }
     }
 
-    pub(in crate::pane_terminals) fn restore(self, state: &mut HandlerState) {
+    pub(crate) fn restore(self, state: &mut HandlerState) {
         state.sessions = self.sessions;
         state.options = self.options;
         state.environment = self.environment;
         state.hooks = self.hooks;
         state.pane_lifecycle = self.pane_lifecycle;
+        state.attached_terminal_pixels = self.attached_terminal_pixels;
         state.dead_panes = self.dead_panes;
         state.auto_named_windows = self.auto_named_windows;
         state.window_link_groups = self.window_link_groups;

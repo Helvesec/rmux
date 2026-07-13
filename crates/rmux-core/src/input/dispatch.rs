@@ -567,11 +567,11 @@ pub(crate) fn dispatch_dcs<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
     }
 }
 
-/// Answers an OSC 10/11/12 colour QUERY (`?` payload) from the emulator, the
-/// way an attached terminal would (`OSC <n>;rgb:RRRR/GGGG/BBBB`, terminated
-/// like the query). Detached sessions have no terminal to forward the query
-/// to, and theme-detecting TUIs otherwise mis-render. Returns false for
-/// set-colour payloads, which callers handle as before.
+/// Answers an OSC 10/11/12 colour query only when the application previously
+/// set that exact per-pane slot. RMUX cannot observe the attached terminal's
+/// palette, so an unknown value must remain unanswered rather than
+/// impersonating a confidently wrong theme. Returns false for set-colour
+/// payloads, which callers handle as before.
 fn answer_osc_colour_query(
     parser: &mut InputParser,
     slot: OscColourSlot,
@@ -582,15 +582,17 @@ fn answer_osc_colour_query(
         return false;
     }
 
-    let reply = format!(
-        "\x1b]{};{}{}",
-        slot.osc_number(),
-        parser.osc_colour(slot),
-        match end {
-            InputEndType::Bel => "\x07",
-            InputEndType::St => "\x1b\\",
-        }
-    );
-    parser.reply(&reply);
+    if let Some(colour) = parser.osc_colour(slot) {
+        let reply = format!(
+            "\x1b]{};{}{}",
+            slot.osc_number(),
+            colour,
+            match end {
+                InputEndType::Bel => "\x07",
+                InputEndType::St => "\x1b\\",
+            }
+        );
+        parser.reply(&reply);
+    }
     true
 }

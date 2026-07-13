@@ -8,7 +8,8 @@ use crate::handler_support::attached_client_required;
 use crate::pane_io::AttachControl;
 
 use super::super::{
-    client_runtime_support::clipboard_query_sequence, control_support::ManagedClient,
+    client_runtime_support::clipboard_query_sequence,
+    control_support::{ControlClientIdentity, ManagedClient},
     RequestHandler,
 };
 
@@ -38,13 +39,15 @@ impl RequestHandler {
         };
 
         match client {
-            ManagedClient::Attach(attach_pid) => {
-                self.handle_refresh_attached_client(attach_pid, request)
+            ManagedClient::Attach {
+                pid: attach_pid,
+                attach_id,
+            } => {
+                self.handle_refresh_attached_client(attach_pid, attach_id, request)
                     .await
             }
-            ManagedClient::Control(control_pid) => {
-                self.handle_refresh_control_client(control_pid, request)
-                    .await
+            ManagedClient::Control(identity) => {
+                self.handle_refresh_control_client(identity, request).await
             }
         }
     }
@@ -52,13 +55,17 @@ impl RequestHandler {
     async fn handle_refresh_attached_client(
         &self,
         attach_pid: u32,
+        expected_attach_id: u64,
         request: RefreshClientRequest,
     ) -> Response {
         let mut needs_full_refresh = !request.status_only;
         let clipboard_query = request.clipboard_query;
         let session_name = {
             let mut active_attach = self.active_attach.lock().await;
-            let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
+            let Some(active) = active_attach.by_pid.get_mut(&attach_pid).filter(|active| {
+                active.id == expected_attach_id
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            }) else {
                 return Response::Error(ErrorResponse {
                     error: attached_client_required("refresh-client"),
                 });
@@ -103,7 +110,11 @@ impl RequestHandler {
 
         if request.status_only {
             if let Err(error) = self
-                .refresh_attached_client_status(attach_pid, &session_name)
+                .refresh_attached_client_status_for_identity(
+                    attach_pid,
+                    expected_attach_id,
+                    &session_name,
+                )
                 .await
             {
                 return Response::Error(ErrorResponse { error });
@@ -111,17 +122,30 @@ impl RequestHandler {
             needs_full_refresh = false;
         }
         if clipboard_query {
-            let _ = self
-                .send_attach_control(
+            if let Err(error) = self
+                .send_attach_control_for_client_identity(
                     attach_pid,
+                    expected_attach_id,
                     AttachControl::Write(clipboard_query_sequence()),
                     "refresh-client",
                 )
-                .await;
+                .await
+            {
+                return Response::Error(ErrorResponse { error });
+            }
         }
         if needs_full_refresh {
-            self.refresh_attached_client(attach_pid, &session_name)
-                .await;
+            if let Err(error) = self
+                .refresh_attached_client_for_identity(
+                    attach_pid,
+                    expected_attach_id,
+                    &session_name,
+                    "refresh-client",
+                )
+                .await
+            {
+                return Response::Error(ErrorResponse { error });
+            }
         }
 
         Response::RefreshClient(RefreshClientResponse {
@@ -131,9 +155,10 @@ impl RequestHandler {
 
     async fn handle_refresh_control_client(
         &self,
-        control_pid: u32,
+        identity: ControlClientIdentity,
         request: RefreshClientRequest,
     ) -> Response {
+        let control_pid = identity.requester_pid();
         if request.has_attach_only_effects() {
             return Response::Error(ErrorResponse {
                 error: attached_client_required("refresh-client"),
@@ -152,21 +177,41 @@ impl RequestHandler {
             None => None,
         };
 
-        let session_name = {
+        let (session_name, session_id) = {
             let active_control = self.active_control.lock().await;
-            let Some(active) = active_control.by_pid.get(&control_pid) else {
+            let Some(active) = active_control.by_pid.get(&control_pid).filter(|active| {
+                active.id == identity.control_id()
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            }) else {
                 return Response::Error(ErrorResponse {
                     error: attached_client_required("refresh-client"),
                 });
             };
-            active.session_name.clone()
+            (active.session_name.clone(), active.session_id)
         };
 
-        if let (Some(session_name), Some(size)) = (session_name.as_ref(), control_size) {
+        if let (Some(session_name), Some(session_id), Some(size)) =
+            (session_name.as_ref(), session_id, control_size)
+        {
             #[cfg(windows)]
             self.wait_for_windows_deferred_all_pane_pids().await;
             let target = {
                 let mut state = self.state.lock().await;
+                let active_control = self.active_control.lock().await;
+                let exact_client_still_attached = active_control
+                    .by_pid
+                    .get(&control_pid)
+                    .is_some_and(|active| {
+                        active.id == identity.control_id()
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                            && active.session_name.as_ref() == Some(session_name)
+                            && active.session_id == Some(session_id)
+                    });
+                if !exact_client_still_attached {
+                    return Response::Error(ErrorResponse {
+                        error: attached_client_required("refresh-client"),
+                    });
+                }
                 match state.mutate_session_and_resize_active_window_terminal(
                     session_name,
                     |session| {
@@ -184,8 +229,10 @@ impl RequestHandler {
             };
             self.emit(LifecycleEvent::WindowLayoutChanged { target })
                 .await;
-        } else if let Some(session_name) = session_name.as_ref() {
-            self.refresh_control_session(session_name).await;
+        } else if control_size.is_none() {
+            if let Err(error) = self.refresh_control_client_for_identity(identity).await {
+                return Response::Error(ErrorResponse { error });
+            }
         }
 
         Response::RefreshClient(RefreshClientResponse {

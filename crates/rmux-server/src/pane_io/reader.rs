@@ -1072,6 +1072,42 @@ mod tests {
 
         assert!(callback_observed.load(Ordering::Acquire));
     }
+
+    #[test]
+    fn mouse_mode_alert_is_stamped_by_production_pane_publication() {
+        let transcript = PaneTranscript::shared(2_000, TerminalSize { cols: 80, rows: 24 });
+        let callback_transcript = Arc::clone(&transcript);
+        let callback_observed = Arc::new(AtomicBool::new(false));
+        let callback_observed_clone = Arc::clone(&callback_observed);
+        let callback: PaneAlertCallback = Arc::new(move |event| {
+            assert!(
+                event.mouse_mode_changed,
+                "the reader publication path must stamp a real mouse-mode transition"
+            );
+            assert!(
+                callback_transcript.try_lock().is_err(),
+                "mouse-mode comparison and callback must share the transcript boundary"
+            );
+            callback_observed_clone.store(true, Ordering::Release);
+        });
+        let output = pane_output_channel();
+        let session_name = SessionName::new("mouse-mode-stamping").expect("valid session name");
+
+        let _ = publish_pane_bytes(
+            PanePublishContext {
+                session_name: &session_name,
+                pane_id: PaneId::new(1),
+                transcript: &transcript,
+                pane_output: &output,
+                generation: None,
+                pane_alert_callback: Some(&callback),
+                emit_no_bell_alert: false,
+            },
+            b"\x1b[?1003h".to_vec(),
+        );
+
+        assert!(callback_observed.load(Ordering::Acquire));
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1211,7 +1247,7 @@ finally:
     #[tokio::test]
     async fn async_output_reader_uses_server_runtime_when_spawned_from_temporary_runtime(
     ) -> Result<(), Box<dyn Error>> {
-        let mut spawned = ChildCommand::new("sh")
+        let spawned = ChildCommand::new("sh")
             .size(PtyTerminalSize::new(80, 24))
             .spawn()?;
         let output_reader = spawned.master().try_clone()?;
@@ -1254,8 +1290,25 @@ finally:
         .await;
 
         spawned.child().terminate_forcefully()?;
-        let _ = spawned.child_mut().wait();
         output_reader_task.abort();
+        drop(writer);
+        let (master, mut child) = spawned.into_parts();
+        drop(master);
+
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if Instant::now() >= reap_deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "temporary-runtime PTY child did not exit after forceful termination",
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         assert!(
             captured.contains("RMUX_SERVER_RUNTIME_OK"),

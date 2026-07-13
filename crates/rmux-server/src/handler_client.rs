@@ -28,10 +28,66 @@ mod attach;
 mod detach;
 #[path = "handler_client/refresh.rs"]
 mod refresh;
+#[cfg(test)]
+#[path = "handler_client/switch_atomicity_tests.rs"]
+mod switch_atomicity_tests;
 #[path = "handler_client/switching.rs"]
 mod switching;
 
 pub(in crate::handler) use switching::SwitchTargetSelection;
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct ManagedClientResolutionPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static MANAGED_CLIENT_RESOLUTION_PAUSE: std::sync::Mutex<
+    Option<(u32, std::sync::Arc<ManagedClientResolutionPause>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(in crate::handler) fn install_managed_client_resolution_pause(
+    pid: u32,
+) -> std::sync::Arc<ManagedClientResolutionPause> {
+    let pause = std::sync::Arc::new(ManagedClientResolutionPause::default());
+    *MANAGED_CLIENT_RESOLUTION_PAUSE
+        .lock()
+        .expect("managed client resolution pause lock") = Some((pid, pause.clone()));
+    pause
+}
+
+#[cfg(test)]
+async fn pause_after_managed_client_resolution(client: ManagedClient) {
+    let pid = match client {
+        ManagedClient::Attach { pid, .. } => pid,
+        ManagedClient::Control(identity) => identity.requester_pid(),
+    };
+    let pause = {
+        let mut installed = MANAGED_CLIENT_RESOLUTION_PAUSE
+            .lock()
+            .expect("managed client resolution pause lock");
+        let matches_pid = installed
+            .as_ref()
+            .is_some_and(|(paused_pid, _)| *paused_pid == pid);
+        matches_pid.then(|| {
+            installed
+                .take()
+                .expect("matching managed client resolution pause remains installed")
+                .1
+        })
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
+
+#[cfg(not(test))]
+async fn pause_after_managed_client_resolution(_client: ManagedClient) {}
 
 impl RequestHandler {
     async fn managed_client_for_pid(
@@ -102,36 +158,65 @@ impl RequestHandler {
         }
 
         let Some(target_client) = target_client.map(normalize_target_client) else {
-            return self
+            let client = self
                 .resolve_managed_client(requester_pid, command_name)
-                .await;
+                .await?;
+            pause_after_managed_client_resolution(client).await;
+            return Ok(client);
         };
         if target_client == "=" {
-            return self
+            let client = self
                 .resolve_managed_client(requester_pid, command_name)
-                .await;
+                .await?;
+            pause_after_managed_client_resolution(client).await;
+            return Ok(client);
         }
 
-        {
+        let attach_client = {
             let active_attach = self.active_attach.lock().await;
             if let Ok(pid) = target_client.parse::<u32>() {
-                if active_attach.by_pid.contains_key(&pid) {
-                    return Ok(ManagedClient::Attach(pid));
-                }
-            } else if let Some((&pid, _)) = active_attach
-                .by_pid
-                .iter()
-                .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
-            {
-                return Ok(ManagedClient::Attach(pid));
+                active_attach
+                    .by_pid
+                    .get(&pid)
+                    .filter(|active| !active.closing.load(Ordering::SeqCst))
+                    .map(|active| ManagedClient::Attach {
+                        pid,
+                        attach_id: active.id,
+                    })
+            } else {
+                active_attach
+                    .by_pid
+                    .iter()
+                    .filter(|(_, active)| !active.closing.load(Ordering::SeqCst))
+                    .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
+                    .map(|(&pid, active)| ManagedClient::Attach {
+                        pid,
+                        attach_id: active.id,
+                    })
             }
+        };
+        if let Some(client) = attach_client {
+            pause_after_managed_client_resolution(client).await;
+            return Ok(client);
         }
 
-        let active_control = self.active_control.lock().await;
-        if let Ok(pid) = target_client.parse::<u32>() {
-            if active_control.by_pid.contains_key(&pid) {
-                return Ok(ManagedClient::Control(pid));
-            }
+        let control_client = if let Ok(pid) = target_client.parse::<u32>() {
+            let active_control = self.active_control.lock().await;
+            active_control
+                .by_pid
+                .get(&pid)
+                .filter(|active| !active.closing.load(Ordering::SeqCst))
+                .map(|active| {
+                    ManagedClient::Control(super::control_support::ControlClientIdentity::new(
+                        pid, active.id,
+                    ))
+                })
+        } else {
+            None
+        };
+        if let Some(client) = control_client {
+            pause_after_managed_client_resolution(client).await;
+            return Ok(client);
         }
 
         Err(RmuxError::Server(format!(
@@ -190,7 +275,9 @@ impl RequestHandler {
             .resolve_target_managed_client(requester_pid, target_client, command_name)
             .await?
         {
-            ManagedClient::Attach(attach_pid) => Ok(attach_pid),
+            ManagedClient::Attach {
+                pid: attach_pid, ..
+            } => Ok(attach_pid),
             ManagedClient::Control(_) => Err(RmuxError::Server(format!(
                 "{command_name} requires an attached client"
             ))),
@@ -321,6 +408,7 @@ impl RequestHandler {
             client_flags,
             None,
             None,
+            None,
         )
         .await
     }
@@ -332,6 +420,7 @@ impl RequestHandler {
         client_flags: ClientFlags,
         expected_session_id: Option<rmux_proto::SessionId>,
         expected_attach_identity: Option<(u32, u64)>,
+        expected_switch_target: Option<&SwitchTargetSelection>,
     ) -> Result<(), RmuxError> {
         if let Some((attach_pid, attach_id)) = expected_attach_identity {
             let active_attach = self.active_attach.lock().await;
@@ -352,6 +441,7 @@ impl RequestHandler {
 
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
+        let switch_window_target = expected_switch_target.map(SwitchTargetSelection::window_target);
         for _ in 0..4 {
             if let Some((attach_pid, attach_id)) = expected_attach_identity {
                 let active_attach = self.active_attach.lock().await;
@@ -363,13 +453,23 @@ impl RequestHandler {
                     return Err(attached_client_required("switch-client"));
                 }
             }
-            let selection = self
-                .selected_attached_session_size_for_new_client(
-                    session_name,
-                    client_size,
-                    client_flags,
-                )
-                .await?;
+            let selection = match switch_window_target.as_ref() {
+                Some(target) => {
+                    let incoming_client_size =
+                        (!client_flags.contains(ClientFlags::IGNORESIZE)).then_some(client_size);
+                    self.selected_attached_window_size(target, incoming_client_size)
+                        .await?
+                }
+                None => {
+                    self.selected_attached_session_size_for_new_client(
+                        session_name,
+                        client_size,
+                        client_flags,
+                    )
+                    .await?
+                }
+            };
+            self.pause_after_attached_size_selection().await;
             if expected_session_id.is_some_and(|expected| selection.session_id != expected) {
                 return Err(crate::pane_terminals::session_not_found(session_name));
             }
@@ -392,21 +492,45 @@ impl RequestHandler {
                 &active_attach,
                 session_name,
                 &selection,
-                true,
+                switch_window_target.is_none(),
             ) {
                 continue;
+            }
+            if let Some(selection) = expected_switch_target {
+                let expected_session_id = expected_session_id
+                    .expect("a switch target selection carries a stable session identity");
+                selection.validate_for_session_identity(
+                    &state,
+                    session_name,
+                    expected_session_id,
+                )?;
             }
             if !client_flags.contains(ClientFlags::IGNORESIZE) {
                 state.set_attached_terminal_pixels(session_name, client_geometry.pixels);
             }
-            let result =
-                state.mutate_session_and_resize_active_window_terminal(session_name, |session| {
-                    session.touch_attached();
-                    if let Some(selected_size) = selection.selected_size {
-                        session.resize_active_window_terminal(selected_size);
-                    }
-                    Ok(())
-                });
+            let result = match switch_window_target.as_ref() {
+                Some(target) => state.mutate_session_and_resize_window_terminal(
+                    session_name,
+                    target.window_index(),
+                    |session| {
+                        session.touch_attached();
+                        if let Some(selected_size) = selection.selected_size {
+                            session.resize_window(target.window_index(), selected_size)?;
+                        }
+                        Ok(())
+                    },
+                ),
+                None => state.mutate_session_and_resize_active_window_terminal(
+                    session_name,
+                    |session| {
+                        session.touch_attached();
+                        if let Some(selected_size) = selection.selected_size {
+                            session.resize_active_window_terminal(selected_size);
+                        }
+                        Ok(())
+                    },
+                ),
+            };
             drop(active_attach);
             return result;
         }

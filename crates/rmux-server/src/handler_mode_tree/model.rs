@@ -4,7 +4,37 @@ use rmux_core::KeyCode;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{PaneId, PaneTarget, SessionId, SessionName, Target, WindowId, WindowTarget};
 
+use super::super::scripting_support::rename_pane_target_session;
 use crate::pane_terminals::WindowLinkOccurrenceId;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) struct ModeTreeActionIdentity {
+    attach_pid: u32,
+    attach_id: u64,
+    state_id: u64,
+}
+
+impl ModeTreeActionIdentity {
+    pub(in crate::handler) const fn new(attach_pid: u32, attach_id: u64, state_id: u64) -> Self {
+        Self {
+            attach_pid,
+            attach_id,
+            state_id,
+        }
+    }
+
+    pub(in crate::handler) const fn attach_pid(self) -> u32 {
+        self.attach_pid
+    }
+
+    pub(in crate::handler) const fn attach_id(self) -> u64 {
+        self.attach_id
+    }
+
+    pub(in crate::handler) const fn state_id(self) -> u64 {
+        self.state_id
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ModeTreeKind {
@@ -86,6 +116,24 @@ pub(in crate::handler) struct ModeTreeClientState {
     pub(super) last_list_rows: usize,
 }
 
+impl ModeTreeClientState {
+    pub(in crate::handler) fn rename_session(
+        &mut self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+    ) {
+        if &self.session_name == old_name {
+            self.session_name = new_name.clone();
+        }
+        if let Some(target) = self.host_pane.as_mut() {
+            rename_pane_target_session(target, old_name, new_name);
+        }
+        if let Some(target) = self.zoom_restore.as_mut() {
+            rename_pane_target_session(target, old_name, new_name);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct ParsedModeTreeCommand {
     pub(super) kind: ModeTreeKind,
@@ -139,6 +187,7 @@ pub(super) enum ModeTreeAction {
     },
     Buffer {
         name: String,
+        order: u64,
     },
     Client {
         pid: u32,
@@ -253,7 +302,7 @@ impl ModeTreeAction {
                     .map(PaneId::as_u32)
                     .map(|pane_id| format!("={session_name}:{window_index}.%{pane_id}")),
             },
-            Self::Buffer { name } => Some(name.clone()),
+            Self::Buffer { name, .. } => Some(name.clone()),
             Self::Client { pid, .. } => Some(pid.to_string()),
             Self::CustomizeOption { name, .. } => Some(name.clone()),
             Self::CustomizeKey {
@@ -314,8 +363,8 @@ pub(super) enum ModeTreePromptCallback {
 
 #[derive(Debug, Clone)]
 pub(super) enum ModeTreeDeferredAction {
-    DeleteBuffers,
-    DetachClients,
-    KillCurrentTreeSelection,
-    KillTaggedTreeSelections,
+    DeleteBuffers { targets: Vec<ModeTreeAction> },
+    DetachClients { targets: Vec<ModeTreeAction> },
+    KillCurrentTreeSelection { targets: Vec<ModeTreeAction> },
+    KillTaggedTreeSelections { targets: Vec<ModeTreeAction> },
 }

@@ -10,40 +10,61 @@ use rmux_proto::{
 use super::target::{is_already_closed_error, is_already_closed_pane_id_error, parse_error};
 
 pub(super) async fn pane_snapshot(pane: &Pane) -> Result<PaneSnapshot> {
-    let Some(resolved_id) = pane.id().await? else {
+    let Some(mut resolved_target) = pane.resolved_proto_target_ref().await? else {
         return Ok(PaneSnapshot::default());
     };
 
     // The pane was listed at the start of this call, but the daemon can still
-    // close it between the existence check and the snapshot endpoint round
-    // trip. Treat the already-closed protocol errors emitted in that window as
-    // a "vanished mid-snapshot" signal and degrade to a default snapshot,
-    // while genuine transport or protocol errors still propagate.
-    match request_pane_snapshot(pane, resolved_id).await {
-        Ok(response) => snapshot_from_response(response),
-        Err(error)
-            if is_already_closed_error(&error, pane.target())
-                || is_already_closed_pane_id_error(
-                    &error,
-                    &pane.target().session_name,
-                    resolved_id,
-                ) =>
-        {
-            Ok(PaneSnapshot::default())
+    // close or move it between the resolution and snapshot round trips. A
+    // stable-id handle gets one fresh global resolution after such an error;
+    // slot handles never follow a pane away from their addressed slot.
+    for attempt in 0..2 {
+        let resolved_id = resolved_target
+            .pane_id()
+            .expect("resolved SDK pane snapshot targets are id-based");
+        let resolved_session_name = resolved_target.session_name().clone();
+        match request_pane_snapshot(pane, resolved_target.clone()).await {
+            Ok(response) => return snapshot_from_response(response),
+            Err(error)
+                if is_already_closed_error(&error, pane.target())
+                    || matches!(
+                        &error,
+                        crate::RmuxError::Protocol {
+                            source: rmux_proto::RmuxError::SessionNotFound(session),
+                        } if session == resolved_session_name.as_str()
+                    )
+                    || is_already_closed_pane_id_error(
+                        &error,
+                        &resolved_session_name,
+                        resolved_id,
+                    ) =>
+            {
+                if attempt == 0 && pane.is_stable_id() {
+                    let Some(retry_target) = pane.resolved_proto_target_ref().await? else {
+                        return Ok(PaneSnapshot::default());
+                    };
+                    if retry_target != resolved_target {
+                        resolved_target = retry_target;
+                        continue;
+                    }
+                }
+                return Ok(PaneSnapshot::default());
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
     }
+    unreachable!("pane snapshot retry loop always returns")
 }
 
 async fn request_pane_snapshot(
     pane: &Pane,
-    resolved_id: rmux_proto::PaneId,
+    resolved_target: rmux_proto::PaneTargetRef,
 ) -> Result<PaneSnapshotResponse> {
     let response = if pane.stable_id.is_some() {
         crate::capabilities::require(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await?;
         pane.transport()
             .request(Request::PaneSnapshotRef(PaneSnapshotRefRequest {
-                target: pane.proto_target_ref(),
+                target: resolved_target,
             }))
             .await?
     } else if crate::capabilities::supports(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await? {
@@ -56,10 +77,7 @@ async fn request_pane_snapshot(
         // resolved whenever the daemon supports it.
         pane.transport()
             .request(Request::PaneSnapshotRef(PaneSnapshotRefRequest {
-                target: rmux_proto::PaneTargetRef::by_id(
-                    pane.target().session_name.clone(),
-                    resolved_id,
-                ),
+                target: resolved_target,
             }))
             .await?
     } else {

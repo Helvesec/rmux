@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use rmux_core::{BoxLines, Style};
 use rmux_proto::{Target, TerminalSize};
 
+use super::super::scripting_support::rename_target_session;
 use crate::renderer::{render_popup_overlay, OverlayRect, PopupRenderSpec};
 
 use super::menu::MenuOverlayState;
@@ -26,6 +27,24 @@ impl ClientOverlayState {
         match self {
             Self::Menu(menu) => menu.render(),
             Self::Popup(popup) => popup.render(),
+        }
+    }
+
+    pub(in crate::handler) fn rename_session_targets(
+        &mut self,
+        old_name: &rmux_proto::SessionName,
+        new_name: &rmux_proto::SessionName,
+    ) {
+        match self {
+            Self::Menu(menu) => {
+                rename_target_session(&mut menu.current_target, old_name, new_name);
+            }
+            Self::Popup(popup) => {
+                rename_target_session(&mut popup.current_target, old_name, new_name);
+                if let Some(menu) = popup.nested_menu.as_mut() {
+                    rename_target_session(&mut menu.current_target, old_name, new_name);
+                }
+            }
         }
     }
 }

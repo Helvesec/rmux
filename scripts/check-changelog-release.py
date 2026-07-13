@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-TMUX_CLAIM = re.compile(r"matches\s+tmux\s+3\.7", re.IGNORECASE)
+TMUX_CLAIM = re.compile(r"\bmatches\s+tmux\b", re.IGNORECASE)
 FIXTURE_LINK = re.compile(r"\[[^\]]+\]\(((?:tests/|crates/|scripts/|docs/)[^)]+)\)")
 
 
@@ -50,7 +50,7 @@ def main(argv: list[str]) -> int:
     for line_number, bullet in changelog_bullets(text):
         if TMUX_CLAIM.search(bullet) and FIXTURE_LINK.search(bullet) is None:
             return fail(
-                f"{path}:{line_number}: tmux 3.7 compatibility claim lacks a fixture/test link"
+                f"{path}:{line_number}: tmux compatibility claim lacks a fixture/test link"
             )
 
     for line_number, line in enumerate(text.splitlines(), start=1):

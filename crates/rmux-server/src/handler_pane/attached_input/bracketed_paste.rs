@@ -74,29 +74,94 @@ pub(super) fn decode_bracketed_paste_after_append(
 /// `ESC[200~` if the middle marker is removed in isolation) are also
 /// eliminated.
 pub(in crate::handler) fn strip_bracketed_paste_markers(input: &[u8]) -> Vec<u8> {
-    let mut current = input.to_vec();
-    loop {
-        let mut out = Vec::with_capacity(current.len());
-        let mut index = 0;
-        let mut removed = false;
-        while index < current.len() {
-            let rest = &current[index..];
-            if rest.starts_with(BRACKETED_PASTE_START) {
-                index += BRACKETED_PASTE_START.len();
-                removed = true;
-            } else if rest.starts_with(BRACKETED_PASTE_END) {
-                index += BRACKETED_PASTE_END.len();
-                removed = true;
+    let mut out = Vec::with_capacity(input.len());
+    for &byte in input {
+        out.push(byte);
+        loop {
+            let marker_len = if out.ends_with(BRACKETED_PASTE_START) {
+                Some(BRACKETED_PASTE_START.len())
+            } else if out.ends_with(BRACKETED_PASTE_END) {
+                Some(BRACKETED_PASTE_END.len())
             } else {
-                out.push(current[index]);
-                index += 1;
+                None
+            };
+            let Some(marker_len) = marker_len else {
+                break;
+            };
+            out.truncate(out.len() - marker_len);
+        }
+    }
+    out
+}
+
+/// Removes markers introduced by the latest append without rescanning the
+/// already-scrubbed prefix. The retained prefix remains the reduction stack,
+/// so markers split across the append boundary and arbitrarily deep deletion
+/// cascades are handled while visiting each newly appended byte once.
+pub(in crate::handler) fn strip_bracketed_paste_markers_after_append(
+    input: &mut Vec<u8>,
+    new_input_at: usize,
+) {
+    let _ = strip_bracketed_paste_markers_after_append_inner(input, new_input_at);
+}
+
+/// Continues the same stack reduction used by
+/// [`strip_bracketed_paste_markers`] from an already-scrubbed prefix. Keeping
+/// that prefix as the reduction stack is important: a deletion in the newly
+/// appended bytes can expose another marker across the append boundary, but
+/// replaying the prefix after every such deletion makes a nested cascade
+/// quadratic. Each appended byte is instead visited exactly once here.
+fn strip_bracketed_paste_markers_after_append_inner(
+    input: &mut Vec<u8>,
+    new_input_at: usize,
+) -> usize {
+    let appended = input.split_off(new_input_at.min(input.len()));
+    let scanned = appended.len();
+    for byte in appended {
+        input.push(byte);
+        if let Some(marker_len) = trailing_bracketed_paste_marker_len(input) {
+            input.truncate(input.len() - marker_len);
+        }
+    }
+    scanned
+}
+
+fn trailing_bracketed_paste_marker_len(input: &[u8]) -> Option<usize> {
+    if input.ends_with(BRACKETED_PASTE_START) {
+        Some(BRACKETED_PASTE_START.len())
+    } else if input.ends_with(BRACKETED_PASTE_END) {
+        Some(BRACKETED_PASTE_END.len())
+    } else {
+        None
+    }
+}
+
+pub(super) fn neutralize_timed_out_bracketed_paste(input: &[u8]) -> Option<Vec<u8>> {
+    input.starts_with(BRACKETED_PASTE_START).then(|| {
+        let mut body = strip_bracketed_paste_markers(input);
+        // The timeout proves this was already inside a bracketed paste, so a
+        // trailing proper prefix of either protocol marker is not user text:
+        // it is a delimiter fragment cut by the idle deadline. Remove the
+        // longest suffix repeatedly. Keeping even a lone trailing ESC would
+        // move an incomplete CSI/APC into a non-bracketed child parser when
+        // the sanitized body is forwarded.
+        while let Some(suffix_len) = longest_partial_marker_suffix(&body) {
+            body.truncate(body.len() - suffix_len);
+        }
+        body
+    })
+}
+
+fn longest_partial_marker_suffix(input: &[u8]) -> Option<usize> {
+    let mut longest = None;
+    for marker in [BRACKETED_PASTE_START, BRACKETED_PASTE_END] {
+        for prefix_len in 1..marker.len() {
+            if input.ends_with(&marker[..prefix_len]) {
+                longest = Some(longest.map_or(prefix_len, |found: usize| found.max(prefix_len)));
             }
         }
-        if !removed {
-            return out;
-        }
-        current = out;
     }
+    longest
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -109,7 +174,10 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::{
         decode_bracketed_paste, decode_bracketed_paste_after_append,
-        encode_bracketed_paste_for_mode, strip_bracketed_paste_markers, BracketedPasteDecode,
+        encode_bracketed_paste_for_mode, neutralize_timed_out_bracketed_paste,
+        strip_bracketed_paste_markers, strip_bracketed_paste_markers_after_append,
+        strip_bracketed_paste_markers_after_append_inner, BracketedPasteDecode,
+        BRACKETED_PASTE_START,
     };
 
     #[test]
@@ -245,6 +313,82 @@ mod tests {
         assert_eq!(
             strip_bracketed_paste_markers(b"\x1b[200~a\x03b\x1b[201~"),
             b"a\x03b".to_vec()
+        );
+    }
+
+    #[test]
+    fn incremental_strip_handles_markers_split_across_every_append_boundary() {
+        let source = b"prefix\x1b[200~body\x1b[201~suffix";
+        let expected = strip_bracketed_paste_markers(source);
+
+        for chunk_size in 1..=source.len() {
+            let mut pending = Vec::new();
+            for chunk in source.chunks(chunk_size) {
+                let new_input_at = pending.len();
+                pending.extend_from_slice(chunk);
+                strip_bracketed_paste_markers_after_append(&mut pending, new_input_at);
+            }
+            assert_eq!(pending, expected, "chunk size {chunk_size}");
+        }
+    }
+
+    #[test]
+    fn incremental_strip_expands_left_for_fixed_point_cascades() {
+        let source = b"prefix\x1b[20\x1b[201~1~body";
+        let expected = strip_bracketed_paste_markers(source);
+        let mut pending = b"prefix\x1b[20".to_vec();
+        let new_input_at = pending.len();
+        pending.extend_from_slice(b"\x1b[201~1~body");
+
+        strip_bracketed_paste_markers_after_append(&mut pending, new_input_at);
+
+        assert_eq!(pending, expected);
+    }
+
+    #[test]
+    fn incremental_strip_visits_each_appended_byte_once_under_deep_cascades() {
+        // `ESC[200` is a proper five-byte prefix of the six-byte start marker.
+        // Every appended `~` removes one prefix, exposing the previous prefix
+        // for the next byte. A rescan-and-back-up implementation performs one
+        // increasingly deep pass per deletion (quadratic work); the retained
+        // prefix as a reduction stack handles the same cascade in one pass.
+        const CASCADE_DEPTH: usize = 16 * 1024;
+        let marker_prefix = &BRACKETED_PASTE_START[..BRACKETED_PASTE_START.len() - 1];
+        let mut pending = marker_prefix.repeat(CASCADE_DEPTH);
+        let new_input_at = pending.len();
+        pending.extend(std::iter::repeat_n(b'~', CASCADE_DEPTH));
+
+        let scanned = strip_bracketed_paste_markers_after_append_inner(&mut pending, new_input_at);
+
+        assert_eq!(scanned, CASCADE_DEPTH);
+        assert!(pending.is_empty(), "the entire marker cascade must reduce");
+    }
+
+    #[test]
+    fn timed_out_paste_drops_every_partial_marker_suffix() {
+        for suffix in [
+            b"\x1b".as_slice(),
+            b"\x1b[".as_slice(),
+            b"\x1b[2".as_slice(),
+            b"\x1b[20".as_slice(),
+            b"\x1b[200".as_slice(),
+            b"\x1b[201".as_slice(),
+        ] {
+            let mut retained = b"\x1b[200~body".to_vec();
+            retained.extend_from_slice(suffix);
+            assert_eq!(
+                neutralize_timed_out_bracketed_paste(&retained),
+                Some(b"body".to_vec()),
+                "cut marker suffix {suffix:?} must not escape into the pane"
+            );
+        }
+    }
+
+    #[test]
+    fn timed_out_paste_stabilizes_repeated_partial_suffixes() {
+        assert_eq!(
+            neutralize_timed_out_bracketed_paste(b"\x1b[200~body\x1b[20\x1b["),
+            Some(b"body".to_vec())
         );
     }
 }

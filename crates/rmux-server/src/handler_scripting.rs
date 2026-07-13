@@ -11,7 +11,8 @@ use rmux_proto::{
 use std::collections::VecDeque;
 
 use super::control_support::{
-    current_control_queue_identity, with_control_queue_identity, ControlClientIdentity,
+    control_queue_eof_action, current_control_queue_identity, with_control_queue_identity,
+    ControlClientIdentity, ControlQueueEofAction,
 };
 use super::RequestHandler;
 use crate::control::ControlCommandResult;
@@ -93,6 +94,9 @@ pub(super) use self::format_context::{
 pub(in crate::handler) use self::parser_context::command_parser_from_state;
 pub(super) use self::prompt_parse::{ParsedPromptHistoryCommand, PromptHistoryAction};
 use self::queue::{queue_action_from_response, remove_group_contexts, QueueInvocation, QueueMode};
+pub(in crate::handler) use self::queue::{
+    rename_pane_target_session, rename_target_session, rename_window_target_session,
+};
 pub(super) use self::queue::{QueueCommandAction, QueueExecutionContext};
 use self::request_parse::parse_queue_invocation;
 #[cfg(test)]
@@ -191,6 +195,7 @@ impl RequestHandler {
                     source_file_error: None,
                     execution_error: Some(error),
                     exit_status: Some(1),
+                    server_shutdown_started: false,
                 };
             }
         };
@@ -268,6 +273,18 @@ impl RequestHandler {
         mode: QueueMode,
         expected_control_id: Option<u64>,
     ) -> ControlCommandResult {
+        let control_identity = expected_control_id
+            .map(|control_id| ControlClientIdentity::new(requester_pid, control_id));
+        if control_queue_eof_action(control_identity) == ControlQueueEofAction::StopFrame {
+            return ControlCommandResult {
+                stdout: Vec::new(),
+                error: None,
+                source_file_error: None,
+                execution_error: None,
+                exit_status: None,
+                server_shutdown_started: false,
+            };
+        }
         if let Err(error) = self
             .apply_parse_time_assignments(requester_pid, &commands, expected_control_id)
             .await
@@ -278,6 +295,7 @@ impl RequestHandler {
                 source_file_error: None,
                 execution_error: Some(error),
                 exit_status: Some(1),
+                server_shutdown_started: false,
             };
         }
         let mut queue = CommandQueue::from_parsed(commands);
@@ -288,8 +306,15 @@ impl RequestHandler {
         let mut execution_errors = Vec::new();
         let mut exit_status = None;
         let mut inserted_command_count = 0_usize;
+        let mut server_shutdown_started = false;
 
-        'command_queue: while let Some(item) = queue.pop_front() {
+        'command_queue: loop {
+            if control_queue_eof_action(control_identity) == ControlQueueEofAction::StopFrame {
+                break 'command_queue;
+            }
+            let Some(item) = queue.pop_front() else {
+                break 'command_queue;
+            };
             let item_context = contexts
                 .pop_front()
                 .expect("queue item context must stay aligned");
@@ -300,16 +325,24 @@ impl RequestHandler {
                 mode,
                 expected_control_id,
             );
-            let command_action = match expected_control_id {
-                Some(control_id) => {
+            let execute_and_check_eof = async {
+                let command_action = command_execution.await;
+                let eof_action = control_queue_eof_action(control_identity);
+                (command_action, eof_action)
+            };
+            let (command_action, eof_action) = match expected_control_id {
+                Some(_) => {
                     with_control_queue_identity(
-                        ControlClientIdentity::new(requester_pid, control_id),
-                        command_execution,
+                        control_identity.expect("control queues capture a client identity"),
+                        execute_and_check_eof,
                     )
                     .await
                 }
-                None => command_execution.await,
+                None => execute_and_check_eof.await,
             };
+            if eof_action == ControlQueueEofAction::StopFrame {
+                break 'command_queue;
+            }
             match command_action {
                 Ok(QueueCommandAction::Normal {
                     output: Some(output),
@@ -442,7 +475,10 @@ impl RequestHandler {
                     }
                 }
             }
-            let _ = self.request_shutdown_if_pending();
+            if self.request_shutdown_if_pending() {
+                server_shutdown_started = true;
+                break 'command_queue;
+            }
         }
 
         ControlCommandResult {
@@ -451,6 +487,7 @@ impl RequestHandler {
             source_file_error: aggregate_rmux_errors(source_file_errors),
             execution_error: aggregate_rmux_errors(execution_errors),
             exit_status,
+            server_shutdown_started,
         }
     }
 

@@ -7,21 +7,23 @@ use crate::{
     InfoSnapshot, PaneExitState, PaneId, PaneInfo, PaneProcessState, PaneRef, Result, RmuxError,
     SessionId, SessionInfo, TerminalSizeSpec, WindowId, WindowInfo,
 };
-use rmux_proto::{
-    DisplayMessageRequest, ListPanesRequest, ListSessionsRequest, ListWindowsRequest, Request,
-    Response, Target,
-};
+use rmux_proto::{ListPanesRequest, ListSessionsRequest, ListWindowsRequest, Request, Response};
 
 use super::target::{is_already_closed_error, parse_error};
 
 const SESSION_INFO_FORMAT: &str = "#{session_name}\t#{session_id}";
 const PANE_LIST_FORMAT: &str = "#{window_index}:#{pane_index}:#{pane_id}";
+// A stable pane can move from a session already scanned to one not yet scanned.
+// A second, reverse-order sweep closes that overlap without allowing an
+// unbounded lookup loop when the pane is genuinely gone or keeps moving.
+const PANE_ID_RESOLUTION_SWEEPS: usize = 2;
 const PANE_INFO_FORMAT: &str =
     "#{pane_id}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\
      \t#{pane_width}\t#{pane_height}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\
      \t#{cursor_shape}\t#{history_bytes}\t#{history_size}\t#{pane_start_command}\
      \t#{pane_lifecycle_generation}\t#{pane_lifecycle_revision}\t#{pane_output_sequence}\
      \t#{pane_start_path}";
+const PANE_TITLE_FORMAT: &str = "#{pane_id}\t#{pane_title}";
 
 #[derive(Debug, Clone)]
 pub(super) struct ListedPane {
@@ -102,7 +104,11 @@ pub(super) async fn pane_info_snapshot(
         ));
     };
 
-    let details = fetch_live_details_or_default(client, target).await?;
+    let details = match fetch_live_details_by_id(client, &target.session_name, pane.pane_id).await {
+        Ok(details) => details,
+        Err(error) if is_already_closed_error(&error, target) => LiveDetails::default(),
+        Err(error) => return Err(error),
+    };
     let mut pane_info = PaneInfo::new(pane.pane_id, window.id, session_id);
     pane_info.index = target.pane_index;
     pane_info.size = pane_size_from_details(&details, &window.size);
@@ -189,6 +195,13 @@ async fn current_session_info(
     client: &TransportClient,
     session_name: &rmux_proto::SessionName,
 ) -> Result<Option<ListedSession>> {
+    Ok(list_session_entries(client)
+        .await?
+        .into_iter()
+        .find(|session| &session.name == session_name))
+}
+
+async fn list_session_entries(client: &TransportClient) -> Result<Vec<ListedSession>> {
     let response = client
         .request(Request::ListSessions(ListSessionsRequest {
             format: Some(SESSION_INFO_FORMAT.to_owned()),
@@ -203,14 +216,13 @@ async fn current_session_info(
         response => return Err(unexpected_response("list-sessions", response)),
     };
 
-    for line in String::from_utf8_lossy(&output).lines() {
-        let session = parse_session_line(line)?;
-        if &session.name == session_name {
-            return Ok(Some(session));
-        }
-    }
-
-    Ok(None)
+    let mut sessions = String::from_utf8_lossy(&output)
+        .lines()
+        .map(parse_session_line)
+        .collect::<Result<Vec<_>>>()?;
+    sessions.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+    sessions.dedup_by(|left, right| left.name == right.name);
+    Ok(sessions)
 }
 
 async fn current_window_entry(
@@ -271,15 +283,55 @@ pub(super) async fn current_pane_entry(
 
 pub(super) async fn current_pane_ref_for_id(
     client: &TransportClient,
+    preferred_session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
+) -> Result<Option<PaneRef>> {
+    for sweep in 0..PANE_ID_RESOLUTION_SWEEPS {
+        // Preserve the originating alias whenever the pane is visible there,
+        // including when it appears between the two bounded sweeps.
+        if let Some(target) =
+            current_pane_ref_for_id_in_session(client, preferred_session_name, pane_id).await?
+        {
+            return Ok(Some(target));
+        }
+
+        // Refresh the inventory on the retry so a move into a newly created
+        // session is visible. Reverse the second sweep to revisit sessions
+        // that may have received a pane after the first sweep passed them.
+        let mut sessions = list_session_entries(client).await?;
+        if sweep > 0 {
+            sessions.reverse();
+        }
+        for session in sessions {
+            if &session.name == preferred_session_name {
+                continue;
+            }
+            if let Some(target) =
+                current_pane_ref_for_id_in_session(client, &session.name, pane_id).await?
+            {
+                return Ok(Some(target));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn current_pane_ref_for_id_in_session(
+    client: &TransportClient,
     session_name: &rmux_proto::SessionName,
     pane_id: PaneId,
 ) -> Result<Option<PaneRef>> {
     let target = PaneRef::new(session_name.clone(), 0, 0);
     match list_all_pane_entries(client, &target).await {
-        Ok(entries) => Ok(entries
-            .into_iter()
-            .find(|entry| entry.pane_id == pane_id)
-            .map(|entry| PaneRef::new(session_name.clone(), entry.window_index, entry.pane_index))),
+        Ok(mut entries) => {
+            entries.sort_by_key(|entry| (entry.window_index, entry.pane_index));
+            Ok(entries
+                .into_iter()
+                .find(|entry| entry.pane_id == pane_id)
+                .map(|entry| {
+                    PaneRef::new(session_name.clone(), entry.window_index, entry.pane_index)
+                }))
+        }
         Err(error) if is_already_closed_error(&error, &target) => Ok(None),
         Err(error) => Err(error),
     }
@@ -326,36 +378,69 @@ async fn list_pane_entries(
         .collect()
 }
 
-pub(super) async fn fetch_live_details_or_default(
+async fn fetch_live_details_by_id(
     client: &TransportClient,
-    target: &PaneRef,
+    session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
 ) -> Result<LiveDetails> {
-    match fetch_live_details(client, target).await {
-        Ok(details) => Ok(details),
-        Err(error) if is_already_closed_error(&error, target) => Ok(LiveDetails::default()),
-        Err(error) => Err(error),
-    }
-}
-
-async fn fetch_live_details(client: &TransportClient, target: &PaneRef) -> Result<LiveDetails> {
     let response = client
-        .request(Request::DisplayMessage(DisplayMessageRequest {
-            target: Some(Target::Pane(target.into())),
-            print: true,
-            message: Some(PANE_INFO_FORMAT.to_owned()),
-            empty_target_context: false,
-        }))
+        .request(Request::ListPanes(Box::new(ListPanesRequest {
+            target: session_name.clone(),
+            target_window_index: None,
+            format: Some(PANE_INFO_FORMAT.to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await?;
 
     let output = match response {
-        Response::DisplayMessage(response) => response.output,
-        response => return Err(unexpected_response("display-message", response)),
+        Response::ListPanes(response) => response.output.stdout,
+        response => return Err(unexpected_response("list-panes", response)),
     };
 
-    let bytes = output.map(|out| out.stdout).unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes);
-    let line = text.lines().next().unwrap_or("");
-    parse_details_line(line)
+    for line in String::from_utf8_lossy(&output).lines() {
+        let details = parse_details_line(line)?;
+        if details.pane_id == Some(pane_id) {
+            return Ok(details);
+        }
+    }
+    Ok(LiveDetails::default())
+}
+
+pub(super) async fn pane_title_for_id(
+    client: &TransportClient,
+    session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
+) -> Result<Option<String>> {
+    let response = client
+        .request(Request::ListPanes(Box::new(ListPanesRequest {
+            target: session_name.clone(),
+            target_window_index: None,
+            format: Some(PANE_TITLE_FORMAT.to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
+        .await;
+    let output = match response {
+        Ok(Response::ListPanes(response)) => response.output.stdout,
+        Ok(response) => return Err(unexpected_response("list-panes", response)),
+        Err(RmuxError::Protocol {
+            source: rmux_proto::RmuxError::SessionNotFound(missing),
+        }) if missing == session_name.as_str() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+
+    for line in String::from_utf8_lossy(&output).lines() {
+        let Some((raw_id, title)) = line.split_once('\t') else {
+            return Err(parse_error("pane title line omitted title separator"));
+        };
+        if parse_pane_id(raw_id)? == pane_id {
+            return Ok(Some(title.to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 pub(super) fn parse_details_line(line: &str) -> Result<LiveDetails> {

@@ -392,32 +392,27 @@ claims for expression arithmetic must describe these undefined cases as RMUX's
 deterministic Linux-oracle behavior rather than byte-identical tmux behavior on
 every CPU.
 
-### C-D50: OSC 10/11/12 colour queries are answered from the emulator
+### C-D50: OSC 10/11/12 queries round-trip only application-set colours
 
 A pane program that queries the terminal's default colours (`OSC 10;?`,
 `OSC 11;?`, `OSC 12;?`) inside a detached tmux 3.7b session receives no
 answer at all (probed 2026-07-11: the query times out silently), so
-theme-detecting TUIs fall back to a guessed palette. RMUX answers these
-queries from the emulator on every pane, attached or detached, while tmux
-forwards them to the attached client's real terminal when one is present
-(probed 2026-07-11: the outer receives the query verbatim and its answer, if
-any, is relayed): RMUX instead reports the colour the application last set
-via the same OSC, and otherwise impersonates
-a conventional dark terminal (X11 rgb:cccc/cccc/cccc foreground and cursor
-on rgb:0000/0000/0000 background), overridable per daemon with
-`RMUX_DEFAULT_FOREGROUND`, `RMUX_DEFAULT_BACKGROUND`, and
-`RMUX_DEFAULT_CURSOR_COLOUR`. `OSC 110/111/112` resets restore those
-defaults. The impersonated answer is reported even to attached clients, whose
-real terminal colours the daemon does not currently know; answering with the
-attached client's true theme is a possible future refinement.
+theme-detecting TUIs fall back to their own palette. With an attached client,
+tmux forwards the query to the real outer terminal and relays its answer, if
+any (probed 2026-07-11). RMUX does not currently forward this query across the
+attach transport. It reports a colour only when the pane application already
+set that exact OSC 10/11/12 slot; otherwise the query remains unanswered. This
+avoids presenting a daemon-wide guessed dark palette as the attached client's
+real theme. `OSC 110/111/112` resets the corresponding slot to unknown.
 
 Test/fixture: `crates/rmux-core/src/input/tests/osc_dcs_misc.rs` covers the
-query replies for all three slots with both terminators, the set-then-query
-round trip, and the reset behavior.
+unknown-query silence for all three slots with both terminators, the
+set-then-query round trip, and reset-to-unknown behavior.
 
 Inventory impact: OSC colour handling remains advertised, but compatibility
-claims must describe query answering as an RMUX extension for
-theme-detection, not byte-identical tmux behavior.
+claims must describe attached query forwarding as unsupported. Per-pane
+application-set colour round-tripping is RMUX product behavior, not a claim of
+byte-identical tmux behavior.
 
 ### C-D51: Windows bracketed paste is detected from console input bursts
 
@@ -429,17 +424,22 @@ typed one and a pasted newline arrives as `VK_RETURN` exactly like a typed
 Enter, with no per-record injected flag (probed against conhost 2026-07-11:
 pasting reaches the app as ordinary key-downs carrying their real virtual-key
 codes). RMUX therefore treats a single `ReadConsoleInputW` batch carrying two or
-more plain character key-downs, with no mouse or Control/Alt key, as a paste and
-wraps it in bracketed-paste markers; the daemon then keeps or strips them like a
-Unix paste. Markers embedded in the pasted content are stripped before wrapping
-so crafted clipboard data cannot break out of the envelope. This is a best-effort
-heuristic and a residual divergence: a single-character paste is not bracketed
-(indistinguishable from a keystroke); two or more genuine keystrokes — or a
-multi-character IME commit — that conhost happens to return in one batch are
-bracketed; and a paste larger than one `ReadConsoleInputW` batch (32 records,
-16 characters) is bracketed across batches using the input-buffer drain as the
-end signal, so a mid-paste buffer drain can split one paste into adjacent
-bracketed regions.
+more plain character key-downs, with no Control/Alt key, as a paste and wraps it
+in bracketed-paste markers; the daemon then keeps or strips them like a Unix
+paste. A native `MOUSE_EVENT` coalesced into that read is suppressed instead of
+making the text live, but still updates the tracked button state so the next
+move cannot become a phantom drag. Mouse-looking SGR bytes delivered as
+`KEY_EVENT` records have no trustworthy mouse provenance and remain inside the
+paste envelope. Markers embedded in the pasted content are stripped before
+wrapping so crafted clipboard data cannot break out of the envelope. This is a
+best-effort heuristic and a residual divergence: a single-character paste is
+not bracketed (indistinguishable from a keystroke); two or more genuine
+keystrokes — or a multi-character IME commit — that conhost happens to return
+in one batch are bracketed; a paste larger than one `ReadConsoleInputW` batch
+(32 records, 16 characters) is bracketed across batches using the input-buffer
+drain as the end signal, so a mid-paste buffer drain can split one paste into
+adjacent bracketed regions; and a host that exposes mouse input only as SGR
+`KEY_EVENT` bytes loses those mouse events by deliberate fail-close policy.
 
 Because this can wrap burst-delivered typed text, the daemon strips
 bracketed-paste markers before feeding input to the command prompt on Windows
@@ -495,3 +495,74 @@ tests in `crates/rmux-server/src/pane_io/reader.rs` and
 Inventory impact: OSC 52 clipboard writes are advertised and honored on Windows
 under set-clipboard on; inbound clipboard queries remain a forward-to-outer
 approximation pending get-clipboard support.
+
+### C-D53: recognized variable-length controls use a streaming idle budget
+
+tmux 3.7b applies the configured keyboard `escape-time` while an attached
+client has supplied an unterminated variable-length control. A live probe on
+2026-07-13 with `escape-time` set to 500 ms retained an incomplete OSC 52 body
+at 100 ms and delivered its bytes to the pane by 600 ms. RMUX uses the same
+keyboard deadline while the bytes are still ambiguous, then promotes a
+recognized bracketed-paste, consumed OSC, or Kitty graphics APC opener to an
+eight-second idle deadline. Each newly received fragment resets that streaming
+idle deadline; unrelated output or status wakeups do not. This prevents a
+valid paste or graphics transfer from being split merely because a transport
+read pauses longer than keyboard `escape-time`, while still bounding abandoned
+input.
+
+Test/fixture: `crates/rmux-server/src/pane_io/pending_escape.rs` covers the
+complete retained grammar and its deadline transitions;
+`crates/rmux-server/src/pane_io/tests.rs` exercises split OSC/APC/paste input,
+invalid CSI bodies, timer fairness under a continuously ready socket, and
+keyboard-suffix replacement through the production attach path.
+
+Inventory impact: `escape-time` remains the keyboard ambiguity budget, not a
+promise that every recognized variable-length transfer is cut at that value.
+
+### C-D54: control EOF closes transport before finite queued work completes
+
+With tmux 3.7b, EOF closes a plain control client with a final `%exit`; an
+already active finite `run-shell` can finish, but a later queued frame is
+dropped. This was measured on 2026-07-13 with two marker-writing frames: the
+first marker appeared and the second did not. RMUX also emits `%exit` and
+closes the transport promptly, but deliberately keeps the authenticated queue
+lease alive to finish finite frames already accepted from that client. It
+cancels selected indefinite waits, stops on explicit exit or shutdown, and
+prevents a same-PID replacement registration from overtaking the old drain.
+No post-EOF reply is written to the closed transport.
+
+Test/fixture: `crates/rmux-server/src/control/tests.rs` names the intentional
+cases `..._product_divergence` and covers finite follow-on work, conditional
+waits, parse failures, explicit exit, kill-server, shutdown cancellation,
+permissions, and same-PID lease ordering. The oracle-backed guard and `%exit`
+tuple remains covered by
+`tests/tmux_compat_surface_matrix/client_control.rs`.
+
+Inventory impact: control-mode framing and terminal `%exit` remain compatible;
+automation side effects after transport EOF intentionally favor completion
+over tmux's later-frame drop.
+
+### C-D55: malformed mouse and timed-out paste fragments fail closed
+
+tmux 3.7b accepts empty decimal fields in SGR mouse input as zero and, after
+`escape-time`, forwards a partial bracketed-paste end marker to the pane as
+ordinary bytes. Both behaviors were measured on 2026-07-13: an empty-button
+SGR click was consumed as mouse input, while an incomplete `ESC [ 20` suffix
+was delivered after the paste body. RMUX requires all three SGR decimal fields
+to be present, consumes overflowed or unterminated frames at a fixed 32-byte
+syntax bound, and discards an impossible completed coordinate. If a recognized
+bracketed paste reaches its idle deadline, RMUX forwards the body but removes
+every trailing proper prefix of either paste delimiter. These policies prevent
+malformed control prefixes from being reinterpreted as prompt text, bindings,
+or a second live escape sequence.
+
+Test/fixture: `crates/rmux-server/src/input_keys/tests.rs` covers missing,
+zero, overflowing, and attacker-sized SGR fields;
+`crates/rmux-server/src/handler_send_keys_tests/attached_input_bounds.rs` pins
+the production retention bound; and
+`crates/rmux-server/src/handler_pane/attached_input/bracketed_paste.rs` covers
+all partial delimiter suffixes and fixed-point neutralization.
+
+Inventory impact: mouse and paste support remain advertised, but malformed
+SGR acceptance and timed-out delimiter bytes are intentionally stricter than
+tmux 3.7b.

@@ -61,6 +61,7 @@ pub use state_events::{
     PaneStateOption,
 };
 pub(crate) use target::is_already_closed_pane_error;
+use target::{is_stale_pane_id_target_error, stale_slot_error};
 use title::{get_title, set_title};
 
 pub(crate) async fn resolve_pane_ref_for_id(
@@ -117,14 +118,17 @@ pub struct PaneOptionMutation {
     pub changed: bool,
 }
 
-/// Opaque handle for one daemon pane slot.
+/// Opaque handle for one daemon pane slot or stable pane identity.
 ///
-/// A pane handle addresses a `(session, window, pane)` triple rather than
-/// caching a `PaneId`. Every operation resolves that slot against the
-/// daemon's current state, so:
+/// Slot handles address a `(session, window, pane)` triple. Handles created
+/// by `pane_by_id` retain a stable `PaneId`; identity lookup, snapshots, and
+/// output/render stream opening resolve its current session dynamically,
+/// preferring the session view from which the handle originated. This means:
 ///
 /// * linked windows and grouped sessions keep returning the same stable
 ///   `%N` identity through every sibling view, and
+/// * stable-id render and snapshot handles follow inter-session pane moves,
+///   while slot handles remain scoped to their original slot, and
 /// * stale handles for an already-closed pane resolve to typed
 ///   `None`/empty results — never to a panic and never to a `PaneId` from
 ///   a prior epoch.
@@ -210,16 +214,38 @@ impl Pane {
     pub(crate) async fn resolved_proto_target_ref(
         &self,
     ) -> Result<Option<rmux_proto::PaneTargetRef>> {
-        if self.stable_id.is_some() {
-            return Ok(Some(self.proto_target_ref()));
+        if let Some(pane_id) = self.stable_id {
+            return Ok(current_pane_ref_for_id(
+                &self.transport,
+                &self.target.session_name,
+                pane_id,
+            )
+            .await?
+            .map(|target| rmux_proto::PaneTargetRef::by_id(target.session_name, pane_id)));
         }
         Ok(self.id().await?.map(|pane_id| {
             rmux_proto::PaneTargetRef::by_id(self.target.session_name.clone(), pane_id)
         }))
     }
 
+    pub(crate) async fn required_resolved_proto_target_ref(
+        &self,
+    ) -> Result<rmux_proto::PaneTargetRef> {
+        self.resolved_proto_target_ref().await?.ok_or_else(|| {
+            self.stable_id.map_or_else(
+                || stale_slot_error(&self.target),
+                |pane_id| RmuxError::pane_not_found(self.target.session_name.clone(), pane_id),
+            )
+        })
+    }
+
     pub(crate) const fn is_stable_id(&self) -> bool {
         self.stable_id.is_some()
+    }
+
+    pub(crate) fn pin_to_id(mut self, pane_id: PaneId) -> Self {
+        self.stable_id = Some(pane_id);
+        self
     }
 
     /// Subscribes to the live raw pane output as a typed byte stream.
@@ -249,7 +275,22 @@ impl Pane {
         &self,
         start: PaneOutputStart,
     ) -> Result<PaneOutputStream> {
-        PaneOutputStream::open(self.transport.clone(), self.proto_target_ref(), start).await
+        let target = self.required_resolved_proto_target_ref().await?;
+        crate::capabilities::require(&self.transport, &[rmux_proto::CAPABILITY_SDK_PANE_BY_ID])
+            .await?;
+        match PaneOutputStream::open(self.transport.clone(), target.clone(), start).await {
+            Ok(stream) => Ok(stream),
+            Err(error) if self.is_stable_id() && is_stale_pane_id_target_error(&error, &target) => {
+                let pane_id = self
+                    .stable_id
+                    .expect("stable-id retry is guarded by is_stable_id");
+                let retry_target = self.resolved_proto_target_ref().await?.ok_or_else(|| {
+                    RmuxError::pane_not_found(self.target.session_name.clone(), pane_id)
+                })?;
+                PaneOutputStream::open(self.transport.clone(), retry_target, start).await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Collects bounded raw pane output bytes until the pane process exits.

@@ -5,7 +5,8 @@ use rmux_core::LifecycleEvent;
 use rmux_proto::{OptionName, PaneStateClosedReason, PaneTarget, RmuxError, Target, WindowTarget};
 
 use super::super::{
-    prepare_lifecycle_event, scripting_support::format_context_for_target, RequestHandler,
+    exited_output_support::RetainedExitedPaneIdentities, prepare_lifecycle_event,
+    scripting_support::format_context_for_target, RequestHandler,
 };
 use super::pane_kill_effects::KillPaneLifecycleBatch;
 use crate::format_runtime::render_runtime_template;
@@ -29,7 +30,9 @@ enum PaneExitPlan {
     },
     RemovePane {
         runtime_session_name: rmux_proto::SessionName,
+        runtime_session_id: rmux_proto::SessionId,
         session_name: rmux_proto::SessionName,
+        target_session_id: rmux_proto::SessionId,
         target: PaneTarget,
         window_destroyed: bool,
         affected_sessions: Vec<rmux_proto::SessionName>,
@@ -41,6 +44,7 @@ enum PaneExitPlan {
     },
     RemoveSession {
         runtime_session_name: rmux_proto::SessionName,
+        runtime_session_id: rmux_proto::SessionId,
         session_name: rmux_proto::SessionName,
         session_id: rmux_proto::SessionId,
         target: PaneTarget,
@@ -187,6 +191,14 @@ impl RequestHandler {
                         let Some(window) = session.window_at(target.window_index()) else {
                             return;
                         };
+                        let target_session_id = session.id();
+                        let Some(runtime_session_id) = state
+                            .sessions
+                            .session(&runtime_session_name)
+                            .map(rmux_core::Session::id)
+                        else {
+                            return;
+                        };
                         let only_window_remaining = session.windows().len() == 1;
                         let only_pane_remaining = window.pane_count() == 1;
                         let linked_window = only_pane_remaining
@@ -272,6 +284,7 @@ impl RequestHandler {
                             );
                             Some(PaneExitPlan::RemoveSession {
                                 runtime_session_name,
+                                runtime_session_id,
                                 session_name: target.session_name().clone(),
                                 session_id: removed_session.id(),
                                 target,
@@ -326,7 +339,9 @@ impl RequestHandler {
                                     );
                                     Some(PaneExitPlan::RemovePane {
                                         runtime_session_name,
+                                        runtime_session_id,
                                         session_name: target.session_name().clone(),
+                                        target_session_id,
                                         target,
                                         window_destroyed: result.response.window_destroyed,
                                         affected_sessions,
@@ -419,7 +434,9 @@ impl RequestHandler {
             }
             PaneExitPlan::RemovePane {
                 runtime_session_name,
+                runtime_session_id,
                 session_name,
+                target_session_id,
                 target,
                 window_destroyed,
                 affected_sessions,
@@ -433,8 +450,10 @@ impl RequestHandler {
                     &runtime_session_name,
                     event.pane_id,
                     &target,
+                    RetainedExitedPaneIdentities::new(target_session_id, runtime_session_id),
                     &output,
-                );
+                )
+                .await;
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
                 self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
                     .await;
@@ -492,6 +511,7 @@ impl RequestHandler {
             }
             PaneExitPlan::RemoveSession {
                 runtime_session_name,
+                runtime_session_id,
                 session_name,
                 session_id,
                 target,
@@ -504,8 +524,10 @@ impl RequestHandler {
                     &runtime_session_name,
                     event.pane_id,
                     &target,
+                    RetainedExitedPaneIdentities::new(session_id, runtime_session_id),
                     &output,
-                );
+                )
+                .await;
                 self.remove_session_leases(std::slice::from_ref(&(
                     session_name.clone(),
                     session_id,
@@ -526,19 +548,22 @@ impl RequestHandler {
         }
     }
 
-    fn retain_removed_pane_output(
+    async fn retain_removed_pane_output(
         &self,
         runtime_session_name: &rmux_proto::SessionName,
         pane_id: rmux_core::PaneId,
         target: &PaneTarget,
+        identities: RetainedExitedPaneIdentities,
         output: &ExitedPaneOutput,
     ) {
         if let Some(sender) = output.sender() {
             self.retain_exited_pane_output(
                 target.clone(),
                 PaneOutputSubscriptionKey::new(runtime_session_name.clone(), pane_id),
+                identities,
                 sender,
-            );
+            )
+            .await;
         }
     }
 

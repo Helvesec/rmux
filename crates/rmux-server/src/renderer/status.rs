@@ -33,7 +33,7 @@ mod runs;
 #[path = "status/status_format.rs"]
 mod status_format;
 
-pub(super) use geometry::StatusGeometry;
+pub(crate) use geometry::StatusGeometry;
 pub(super) use message::format_status_message_line;
 pub(super) use prompt::prompt_status_runs;
 pub(super) use runs::{sanitize_status_text, status_runs_width, StatusRun};

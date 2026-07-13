@@ -16,7 +16,7 @@ use rmux_proto::{
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
 use crate::pane_terminals::{session_not_found, HandlerState};
 
-use super::RequestHandler;
+use super::{PaneOutputSubscriptionReconciliation, RequestHandler};
 
 // Keep lag diagnostics well below the detached RPC frame cap after bincode
 // overhead and the rest of the response envelope are added.
@@ -68,11 +68,14 @@ impl OutputSubscriptionState {
         }
     }
 
-    fn remove_pane(&mut self, pane: &PaneOutputSubscriptionKey) {
-        for record in self.registry.remove_pane(pane) {
+    fn remove_pane(&mut self, pane: &PaneOutputSubscriptionKey) -> bool {
+        let removed = self.registry.remove_pane(pane);
+        let removed_any = !removed.is_empty();
+        for record in removed {
             self.receivers.remove(&record.id());
         }
         self.draining_panes.remove(pane);
+        removed_any
     }
 
     fn rekey_pane(
@@ -174,86 +177,96 @@ impl RequestHandler {
         start: PaneOutputSubscriptionStart,
     ) -> Response {
         let now = Instant::now();
-        let (subscription_id, target, pane_id, cursor) = {
-            let (target, pane_key, output) = match self
-                .pane_output_subscription_source(&target_ref, start, now)
-                .await
-            {
-                Ok(source) => source,
-                Err(error) => return Response::Error(ErrorResponse { error }),
-            };
-            let receiver = match start {
-                PaneOutputSubscriptionStart::Now => output.subscribe(),
-                PaneOutputSubscriptionStart::Oldest => output.subscribe_from_oldest(),
-            };
-
-            let mut subscriptions = self
-                .subscriptions
-                .lock()
-                .expect("subscription registry mutex must not be poisoned");
-            subscriptions.cleanup_stale(now);
-            let record =
-                match subscriptions
-                    .registry
-                    .subscribe(connection_id, pane_key.clone(), now)
-                {
-                    Ok(record) => record,
-                    Err(error) => {
-                        return Response::Error(ErrorResponse {
-                            error: subscription_limit_error(error),
-                        });
-                    }
-                };
-            let cursor = cursor_dto(receiver.cursor());
-            let subscription_id = record.id();
-            subscriptions.receivers.insert(record.id(), receiver);
-            (subscription_id, target, pane_key.pane_id(), cursor)
+        let live_error = {
+            // Keep the state guard until the registry insert commits. Every
+            // runtime-owner mutation takes the same state -> subscriptions
+            // lock order, so a subscription is registered wholly before or
+            // wholly after its key is rekeyed.
+            let state = self.state.lock().await;
+            let source = resolve_pane_target_ref(&state, &target_ref).and_then(|target| {
+                let pane_key = state.pane_output_subscription_key_for_target(&target)?;
+                let output = state.pane_output_for_target(
+                    target.session_name(),
+                    target.window_index(),
+                    target.pane_index(),
+                )?;
+                Ok((target, pane_key, output))
+            });
+            match source {
+                Ok(source) => {
+                    #[cfg(test)]
+                    tests::pause_before_live_subscription_commit(&source.1).await;
+                    return self.register_pane_output_subscription(
+                        connection_id,
+                        start,
+                        now,
+                        source,
+                    );
+                }
+                Err(error) => error,
+            }
         };
 
+        if start == PaneOutputSubscriptionStart::Oldest {
+            // Serialize a retained lookup and its registry insertion with
+            // rename-session. The retained cache and pane-output registry are
+            // both rekeyed while rename holds this state guard, preventing a
+            // subscriber from cloning an old-name record and registering it
+            // after the rename transaction.
+            let _state = self.state.lock().await;
+            match retained_lookup(self, &target_ref, now) {
+                Ok(Some((target, retained))) => {
+                    return self.register_pane_output_subscription(
+                        connection_id,
+                        start,
+                        now,
+                        (target, retained.pane().clone(), retained.output().clone()),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            }
+        }
+        Response::Error(ErrorResponse { error: live_error })
+    }
+
+    fn register_pane_output_subscription(
+        &self,
+        connection_id: u64,
+        start: PaneOutputSubscriptionStart,
+        now: Instant,
+        source: (PaneTarget, PaneOutputSubscriptionKey, PaneOutputSender),
+    ) -> Response {
+        let (target, pane_key, output) = source;
+        let receiver = match start {
+            PaneOutputSubscriptionStart::Now => output.subscribe(),
+            PaneOutputSubscriptionStart::Oldest => output.subscribe_from_oldest(),
+        };
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned");
+        subscriptions.cleanup_stale(now);
+        let record = match subscriptions
+            .registry
+            .subscribe(connection_id, pane_key.clone(), now)
+        {
+            Ok(record) => record,
+            Err(error) => {
+                return Response::Error(ErrorResponse {
+                    error: subscription_limit_error(error),
+                });
+            }
+        };
+        let cursor = cursor_dto(receiver.cursor());
+        let subscription_id = record.id();
+        subscriptions.receivers.insert(record.id(), receiver);
         Response::SubscribePaneOutput(SubscribePaneOutputResponse {
             subscription_id,
             target,
-            pane_id,
+            pane_id: pane_key.pane_id(),
             cursor,
         })
-    }
-
-    async fn pane_output_subscription_source(
-        &self,
-        target_ref: &PaneTargetRef,
-        start: PaneOutputSubscriptionStart,
-        now: Instant,
-    ) -> Result<(PaneTarget, PaneOutputSubscriptionKey, PaneOutputSender), RmuxError> {
-        let live_result = {
-            let state = self.state.lock().await;
-            match resolve_pane_target_ref(&state, target_ref) {
-                Ok(target) => {
-                    let pane_key = state.pane_output_subscription_key_for_target(&target);
-                    let output = state.pane_output_for_target(
-                        target.session_name(),
-                        target.window_index(),
-                        target.pane_index(),
-                    );
-                    match (pane_key, output) {
-                        (Ok(pane_key), Ok(output)) => Ok((target, pane_key, output)),
-                        (Err(error), _) | (_, Err(error)) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
-        };
-
-        match live_result {
-            Ok(source) => Ok(source),
-            Err(live_error) => {
-                if start == PaneOutputSubscriptionStart::Oldest {
-                    if let Some((target, retained)) = retained_lookup(self, target_ref, now)? {
-                        return Ok((target, retained.pane().clone(), retained.output().clone()));
-                    }
-                }
-                Err(live_error)
-            }
-        }
     }
 
     pub(in crate::handler) async fn handle_unsubscribe_pane_output(
@@ -383,10 +396,35 @@ impl RequestHandler {
                 .lock()
                 .expect("subscription registry mutex must not be poisoned");
             for pane in panes {
-                subscriptions.remove_pane(pane);
+                let _ = subscriptions.remove_pane(pane);
             }
         }
         let _ = self.request_shutdown_if_pending();
+    }
+
+    /// Applies the complete pane-output registry delta for one committed state
+    /// mutation while the caller still owns the state lock.
+    ///
+    /// Returning whether a live record was removed lets callers retry pending
+    /// idle shutdown only after both state and registry locks have been
+    /// released.
+    pub(in crate::handler) fn apply_pane_output_subscription_reconciliation(
+        &self,
+        reconciliation: PaneOutputSubscriptionReconciliation,
+    ) -> bool {
+        let (rekeys, removals) = reconciliation.into_parts();
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned");
+        for (previous, current) in rekeys {
+            subscriptions.rekey_pane(&previous, current);
+        }
+        let mut removed_any = false;
+        for pane in removals {
+            removed_any = subscriptions.remove_pane(&pane) || removed_any;
+        }
+        removed_any
     }
 
     pub(crate) fn rekey_pane_output_subscriptions(

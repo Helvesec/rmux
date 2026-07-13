@@ -17,6 +17,7 @@ use super::{require_web_share, unexpected_response, WebShareHandle};
 pub struct WebShareBuilder<'a> {
     transport: &'a TransportClient,
     scope: WebShareScope,
+    pane: Option<&'a Pane>,
     frontend_url: Option<String>,
     public_base_url: Option<String>,
     tunnel_provider: Option<String>,
@@ -40,6 +41,7 @@ impl<'a> WebShareBuilder<'a> {
         Self {
             transport,
             scope,
+            pane: None,
             frontend_url: None,
             public_base_url: None,
             tunnel_provider: None,
@@ -57,6 +59,15 @@ impl<'a> WebShareBuilder<'a> {
             spectator: true,
             kill_session_on_expire: false,
         }
+    }
+
+    fn new_pane(pane: &'a Pane) -> Self {
+        let mut builder = Self::new(
+            pane.transport(),
+            WebShareScope::Pane(pane.proto_target_ref()),
+        );
+        builder.pane = Some(pane);
+        builder
     }
 
     /// Sets the maximum lifetime for the share.
@@ -242,8 +253,11 @@ impl<'a> WebShareBuilder<'a> {
         self
     }
 
-    async fn run(self) -> Result<WebShareHandle> {
+    async fn run(mut self) -> Result<WebShareHandle> {
         require_web_share(self.transport).await?;
+        if let Some(pane) = self.pane {
+            self.scope = WebShareScope::Pane(pane.required_resolved_proto_target_ref().await?);
+        }
         let controls = self.operator && matches!(&self.scope, WebShareScope::Session(_));
         let response = self
             .transport
@@ -312,10 +326,7 @@ impl Pane {
     /// Starts a web-share builder for this pane.
     #[must_use]
     pub fn share(&self) -> WebShareBuilder<'_> {
-        WebShareBuilder::new(
-            self.transport(),
-            WebShareScope::Pane(self.proto_target_ref()),
-        )
+        WebShareBuilder::new_pane(self)
     }
 }
 
@@ -344,8 +355,36 @@ fn system_time_to_unix(value: SystemTime) -> Result<u64> {
 mod tests {
     use super::{system_time_to_unix, whole_seconds_ceil, WebShareBuilder};
     use crate::transport::TransportClient;
-    use rmux_proto::{SessionName, WebShareScope};
+    use crate::{Pane, PaneRef, RmuxEndpoint};
+    use rmux_proto::{
+        encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse,
+        ListPanesResponse, PaneId, PaneTargetRef, Request, Response, SessionName, WebShareRequest,
+        WebShareScope,
+    };
     use std::time::{Duration, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    async fn read_request(stream: &mut DuplexStream) -> Request {
+        let mut decoder = FrameDecoder::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            if let Some(request) = decoder
+                .next_frame::<Request>()
+                .expect("request frame decodes")
+            {
+                return request;
+            }
+            let read = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(read, 0, "client closed before request");
+            decoder.push_bytes(&buffer[..read]);
+        }
+    }
+
+    async fn write_response(stream: &mut DuplexStream, response: Response) {
+        let frame = encode_frame(&response).expect("response encodes");
+        stream.write_all(&frame).await.expect("write response");
+        stream.flush().await.expect("flush response");
+    }
 
     #[test]
     fn ttl_ceil_rejects_only_explicit_zero_later() {
@@ -385,5 +424,78 @@ mod tests {
 
         assert!(builder.url_options.show_viewers);
         assert!(builder.require_pin);
+    }
+
+    #[tokio::test]
+    async fn pane_share_resolves_visible_slot_to_stable_id_before_create() {
+        let alpha = SessionName::new("alpha").expect("valid session");
+        let (client, mut server) = tokio::io::duplex(8192);
+        let transport = TransportClient::spawn(client);
+        let pane = Pane::new(
+            PaneRef::new(alpha.clone(), 1, 3),
+            RmuxEndpoint::Default,
+            None,
+            transport,
+        );
+
+        let share = tokio::spawn(async move { pane.share().no_pin().await });
+
+        assert!(matches!(
+            read_request(&mut server).await,
+            Request::Handshake(_)
+        ));
+        let mut handshake = HandshakeResponse::current();
+        if !handshake
+            .capabilities
+            .iter()
+            .any(|capability| capability == rmux_proto::CAPABILITY_WEB_SHARE)
+        {
+            handshake
+                .capabilities
+                .push(rmux_proto::CAPABILITY_WEB_SHARE.to_owned());
+        }
+        write_response(&mut server, Response::Handshake(handshake)).await;
+
+        match read_request(&mut server).await {
+            Request::ListPanes(request) => {
+                assert_eq!(request.target, alpha);
+                assert_eq!(request.target_window_index, Some(1));
+            }
+            request => panic!("expected visible slot resolution, got {request:?}"),
+        }
+        write_response(
+            &mut server,
+            Response::ListPanes(ListPanesResponse {
+                output: CommandOutput::from_stdout("1:3:%7\n"),
+            }),
+        )
+        .await;
+
+        match read_request(&mut server).await {
+            Request::WebShare(request) => match *request {
+                WebShareRequest::Create(request) => assert_eq!(
+                    request.scope,
+                    WebShareScope::Pane(PaneTargetRef::by_id(
+                        SessionName::new("alpha").expect("valid session"),
+                        PaneId::new(7),
+                    ))
+                ),
+                request => panic!("expected web-share create, got {request:?}"),
+            },
+            request => panic!("expected web-share request, got {request:?}"),
+        }
+        write_response(
+            &mut server,
+            Response::Error(ErrorResponse {
+                error: rmux_proto::RmuxError::Server("stop after target assertion".to_owned()),
+            }),
+        )
+        .await;
+
+        let result = share.await.expect("share task completes");
+        let Err(error) = result else {
+            panic!("stub server must stop the share after observing the request");
+        };
+        assert!(error.to_string().contains("stop after target assertion"));
     }
 }

@@ -83,6 +83,8 @@ mod registration;
 mod resize_policy;
 #[path = "handler_attach/state.rs"]
 mod state;
+#[path = "handler_attach/switch_commit.rs"]
+mod switch_commit;
 
 pub(crate) use crate::client_flags::ClientFlags;
 pub(in crate::handler) use resize_policy::{
@@ -93,6 +95,7 @@ pub(super) use state::{
     ActiveAttach, ActiveAttachIdentity, ActiveAttachState, DisplayPanesClientState,
     DisplayPanesLabel,
 };
+pub(in crate::handler) use switch_commit::AttachedSwitchCommitRequest;
 
 impl RequestHandler {
     pub(crate) async fn handle_attached_keystroke(
@@ -414,6 +417,9 @@ impl RequestHandler {
             return Err(attached_client_required(command_name));
         };
         if expected_attach_id.is_some_and(|expected| active.id != expected) {
+            return Err(attached_client_required(command_name));
+        }
+        if active.closing.load(Ordering::SeqCst) {
             return Err(attached_client_required(command_name));
         }
         if expected_current_session_id.is_some_and(|expected| active.session_id != expected) {
@@ -804,21 +810,35 @@ pub(super) fn attach_target_for_session(
             render_size: None,
             window_index: None,
             selection: None,
+            window_size_override: None,
             master: AttachTargetMaster::Clone,
             socket_path,
         },
     )
 }
 
+pub(super) struct AttachSessionSwitchRenderOptions<'a> {
+    pub(super) attached_count: usize,
+    pub(super) terminal_context: &'a OuterTerminalContext,
+    pub(super) socket_path: &'a Path,
+    pub(super) render_stream: bool,
+    pub(super) selection: Option<&'a SwitchTargetSelection>,
+    pub(super) window_size_override: Option<(u32, TerminalSize)>,
+}
+
 pub(super) fn attach_target_for_session_switch(
     state: &HandlerState,
     session_name: &rmux_proto::SessionName,
-    attached_count: usize,
-    terminal_context: &OuterTerminalContext,
-    socket_path: &Path,
-    render_stream: bool,
-    selection: Option<&SwitchTargetSelection>,
+    options: AttachSessionSwitchRenderOptions<'_>,
 ) -> Result<AttachTarget, rmux_proto::RmuxError> {
+    let AttachSessionSwitchRenderOptions {
+        attached_count,
+        terminal_context,
+        socket_path,
+        render_stream,
+        selection,
+        window_size_override,
+    } = options;
     #[cfg(feature = "web")]
     let master = if render_stream {
         AttachTargetMaster::Omit
@@ -841,6 +861,7 @@ pub(super) fn attach_target_for_session_switch(
             render_size: None,
             window_index: None,
             selection,
+            window_size_override,
             master,
             socket_path,
         },
@@ -867,6 +888,7 @@ pub(super) fn attach_render_target_for_session_window(
             render_size: None,
             window_index,
             selection: None,
+            window_size_override: None,
             master: AttachTargetMaster::Omit,
             socket_path,
         },
@@ -890,6 +912,7 @@ pub(super) fn attach_render_target_for_session_with_prompt(
             render_size: request.render_size,
             window_index: None,
             selection: None,
+            window_size_override: None,
             master: AttachTargetMaster::Omit,
             socket_path: request.socket_path,
         },
@@ -917,6 +940,7 @@ struct AttachTargetRenderOptions<'a> {
     render_size: Option<TerminalSize>,
     window_index: Option<u32>,
     selection: Option<&'a SwitchTargetSelection>,
+    window_size_override: Option<(u32, TerminalSize)>,
     master: AttachTargetMaster,
     socket_path: &'a Path,
 }
@@ -936,6 +960,7 @@ fn attach_target_for_session_with_prompt(
         options.render_size,
         options.window_index,
         options.selection,
+        options.window_size_override,
     )?;
     let session = session.as_ref();
     let pane_output_sender = state.pane_output_for_target(
@@ -1000,17 +1025,17 @@ fn attach_target_for_session_with_prompt(
         .as_slice(),
     );
     for pane in session.window().panes() {
-        let copy_screen = state.pane_copy_mode_render_screen(session_name, pane.id());
-        if let Some(screen) = copy_screen.as_ref() {
+        let copy_snapshot = state.pane_copy_mode_render_snapshot(session_name, pane.id());
+        if let Some(snapshot) = copy_snapshot.as_ref() {
             let pane_frame = if options.prompt.is_some() {
-                renderer::render_pane_screen_preserving_prompt_cursor(
+                renderer::render_copy_mode_pane_screen_preserving_prompt_cursor(
                     session,
                     &state.options,
                     pane,
-                    screen,
+                    snapshot,
                 )
             } else {
-                renderer::render_pane_screen(session, &state.options, pane, screen)
+                renderer::render_copy_mode_pane_screen(session, &state.options, pane, snapshot)
             };
             render_frame.extend_from_slice(pane_frame.as_slice());
         } else if let Some(screen) = state.pane_screen(session_name, pane.id()) {
@@ -1026,7 +1051,7 @@ fn attach_target_for_session_with_prompt(
             };
             render_frame.extend_from_slice(pane_frame.as_slice());
         }
-        if pane.index() == session.active_pane_index() && copy_screen.is_some() {
+        if pane.index() == session.active_pane_index() && copy_snapshot.is_some() {
             if let (Some(summary), Some(stats)) = (
                 state.pane_copy_mode_summary(session_name, pane.id()),
                 state.pane_history_size_stats(session_name, pane.id()),
@@ -1097,7 +1122,15 @@ fn attach_target_for_session_with_prompt(
         session_name: session_name.clone(),
         pane_master: match options.master {
             AttachTargetMaster::Clone if !active_pane_is_starting => {
-                Some(state.active_pane_master(session_name)?)
+                if options.selection.is_some() {
+                    Some(state.clone_pane_master(
+                        session_name,
+                        session.active_window_index(),
+                        session.active_pane_index(),
+                    )?)
+                } else {
+                    Some(state.active_pane_master(session_name)?)
+                }
             }
             AttachTargetMaster::Clone | AttachTargetMaster::Omit => None,
         },
@@ -1135,30 +1168,40 @@ fn attach_render_session<'a>(
     size: Option<TerminalSize>,
     window_index: Option<u32>,
     selection: Option<&SwitchTargetSelection>,
+    window_size_override: Option<(u32, TerminalSize)>,
 ) -> Result<Cow<'a, rmux_core::Session>, rmux_proto::RmuxError> {
-    let sized = sized_session(session, size);
+    let mut rendered = sized_session(session, size);
+    if let Some((window_index, selected_size)) = window_size_override {
+        rendered
+            .to_mut()
+            .resize_window(window_index, selected_size)?;
+    }
     if let Some(selection) = selection {
         if selection.session_name() != session.name() {
             return Err(rmux_proto::RmuxError::Server(
                 "switch render selection changed sessions before commit".to_owned(),
             ));
         }
-        let mut selected = sized.into_owned();
-        selection.apply_to_session(&mut selected)?;
-        return Ok(Cow::Owned(selected));
-    }
-    let Some(window_index) = window_index else {
-        return Ok(sized);
-    };
-    if sized.active_window_index() == window_index || !sized.windows().contains_key(&window_index) {
-        return Ok(sized);
+        selection.apply_to_session(rendered.to_mut())?;
+    } else if let Some(window_index) = window_index {
+        if rendered.active_window_index() != window_index
+            && rendered.windows().contains_key(&window_index)
+        {
+            rendered
+                .to_mut()
+                .select_window(window_index)
+                .expect("selected web render window was validated above");
+        }
     }
 
-    let mut selected = sized.into_owned();
-    selected
-        .select_window(window_index)
-        .expect("selected web render window was validated above");
-    Ok(Cow::Owned(selected))
+    if let Some((window_index, _)) = window_size_override {
+        if rendered.active_window_index() == window_index {
+            let active_size = rendered.window().size();
+            rendered.to_mut().resize_active_window_terminal(active_size);
+        }
+    }
+
+    Ok(rendered)
 }
 
 fn pane_passthrough_enabled(

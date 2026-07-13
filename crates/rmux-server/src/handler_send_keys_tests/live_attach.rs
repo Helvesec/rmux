@@ -5,6 +5,14 @@ use rmux_core::LifecycleEvent;
 const LONG_PREFIX_CHAIN_REPETITIONS: usize = 8_192;
 const LARGE_FOCUS_CHAIN_REPETITIONS: usize = 4_096;
 const PROMPT_CANCEL_CHAIN_REPETITIONS: usize = 512;
+// These stress cases execute one real binding command per repetition in a
+// debug test binary. Keep the 8K recursion regression load and give parallel
+// nextest runs headroom without removing the finite completion bound.
+const LONG_PREFIX_CHAIN_TIMEOUT: Duration = if cfg!(windows) {
+    Duration::from_secs(120)
+} else {
+    Duration::from_secs(60)
+};
 const ITERATIVE_INPUT_CHAIN_TIMEOUT: Duration = if cfg!(windows) {
     Duration::from_secs(60)
 } else {
@@ -668,7 +676,7 @@ async fn live_attach_meta_unicode_prefix2_dispatches() {
 async fn live_attach_active_prefix_table_keeps_large_reroute_chain_bounded() {
     let input = b"yx".repeat(LONG_PREFIX_CHAIN_REPETITIONS);
     tokio::time::timeout(
-        BOUNDED_REROUTE_CHAIN_TIMEOUT,
+        LONG_PREFIX_CHAIN_TIMEOUT,
         assert_prefix_chunks(
             "printable-prefix-active-large",
             "x",
@@ -712,7 +720,7 @@ async fn live_attach_long_prefix_chain_is_processed_iteratively() {
     let input = b"\x02X".repeat(LONG_PREFIX_CHAIN_REPETITIONS);
 
     tokio::time::timeout(
-        ITERATIVE_INPUT_CHAIN_TIMEOUT,
+        LONG_PREFIX_CHAIN_TIMEOUT,
         handler.handle_attached_live_input_for_test(requester_pid, &input),
     )
     .await
@@ -2607,7 +2615,7 @@ async fn live_attach_mouse_sequences_dispatch_default_mouse_bindings() {
 }
 
 #[tokio::test]
-async fn live_attach_mouse_sequences_are_ignored_when_mouse_option_is_off() {
+async fn live_attach_forwards_pane_requested_mouse_when_mouse_option_is_off() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
@@ -2617,7 +2625,7 @@ async fn live_attach_mouse_sequences_are_ignored_when_mouse_option_is_off() {
     {
         let mut state = handler.state.lock().await;
         state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1002h")
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1002h\x1b[?1006h")
             .expect("mouse motion mode transcript update");
     }
 
@@ -2626,7 +2634,43 @@ async fn live_attach_mouse_sequences_are_ignored_when_mouse_option_is_off() {
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
 
-    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-mouse-off", 0).await;
+    let expected = b"\x1b[<32;2;2M";
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-pane-mouse-off",
+        expected.len(),
+    )
+    .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<32;2;2M")
+        .await
+        .expect("live attach mouse input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+
+    let active_attach = handler.active_attach.lock().await;
+    let event = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .and_then(|active| active.mouse.current_event.as_ref());
+    assert!(event.is_none());
+}
+
+#[tokio::test]
+async fn live_attach_ignores_mouse_when_option_and_pane_tracking_are_off() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-no-mouse", 0).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[<32;2;2M")
@@ -2635,13 +2679,12 @@ async fn live_attach_mouse_sequences_are_ignored_when_mouse_option_is_off() {
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, b"").await;
-
     let active_attach = handler.active_attach.lock().await;
-    let event = active_attach
+    assert!(active_attach
         .by_pid
         .get(&requester_pid)
-        .and_then(|active| active.mouse.current_event.as_ref());
-    assert!(event.is_none());
+        .and_then(|active| active.mouse.current_event.as_ref())
+        .is_none());
 }
 
 #[tokio::test]

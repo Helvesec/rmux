@@ -59,8 +59,8 @@ The same RMUX attach emitted initial `%output` for the current backlog before
 
 ## C-D44 shutdown hook run-shell delivery
 
-Reproduction, measured July 8, 2026 with `/Users/pingudelfuego/.local/bin/tmux`
-(`tmux 3.7b`) and `target/debug/rmux`:
+Reproduction, measured July 8, 2026 with the pinned tmux 3.7b oracle and
+`target/debug/rmux`:
 
 ```sh
 new-session -d -s victim 'sleep 30'
@@ -91,8 +91,8 @@ RMUX exited 1 with `invalid session: ` for both commands.
 
 ## C-D47 kill-window last-window CLI fallback
 
-Reproduction, measured July 8, 2026 with `/Users/pingudelfuego/.local/bin/tmux`
-(`tmux 3.7b`) and `target/debug/rmux`:
+Reproduction, measured July 8, 2026 with the pinned tmux 3.7b oracle and
+`target/debug/rmux`:
 
 ```sh
 new-session -d -s keep 'sleep 30'

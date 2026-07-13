@@ -135,7 +135,7 @@ impl RequestHandler {
         target: &WindowTarget,
     ) -> Result<Option<WindowTarget>, RmuxError> {
         for _ in 0..ATTACHED_SIZE_RECONCILE_ATTEMPTS {
-            let selection = self.selected_attached_window_size(target).await?;
+            let selection = self.selected_attached_window_size(target, None).await?;
             let mut state = self.state.lock().await;
             if state.sessions.session(target.session_name()).is_none() {
                 return Ok(None);
@@ -268,9 +268,10 @@ impl RequestHandler {
         })
     }
 
-    async fn selected_attached_window_size(
+    pub(in crate::handler) async fn selected_attached_window_size(
         &self,
         target: &WindowTarget,
+        incoming_client_size: Option<TerminalSize>,
     ) -> Result<AttachedSizeSelection, RmuxError> {
         let (policy, aggressive_resize, linked_sessions, session_id, window_id) = {
             let state = self.state.lock().await;
@@ -309,7 +310,8 @@ impl RequestHandler {
         };
         let (candidates, active_attach_epoch) = {
             let active_attach = self.active_attach.lock().await;
-            let candidates = attached_size_candidates(&active_attach, &linked_sessions, None);
+            let candidates =
+                attached_size_candidates(&active_attach, &linked_sessions, incoming_client_size);
             (candidates, self.active_attach_epoch.load(Ordering::Acquire))
         };
         Ok(AttachedSizeSelection {
@@ -321,7 +323,7 @@ impl RequestHandler {
             aggressive_resize,
             linked_sessions,
             active_attach_epoch,
-            incoming_client_size: None,
+            incoming_client_size,
         })
     }
 

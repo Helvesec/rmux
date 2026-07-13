@@ -161,6 +161,37 @@ fn selection_style_overlay_composes_like_tmux_screen_select_cell() {
 }
 
 #[test]
+fn row_range_style_overlay_is_inclusive_and_paints_blank_cells() {
+    let mut screen = new_screen(6, 1, 10);
+    parse(&mut screen, b"ab");
+    let style = crate::style::Style::parse("bg=cyan,fg=black").expect("valid overlay style");
+
+    screen.overlay_style_on_row_range(0, 1, 5, &style);
+
+    let mut colours = Vec::new();
+    assert!(screen.visit_visible_line_cells(0, 6, |cell| {
+        colours.push((cell.fg(), cell.bg()));
+    }));
+    assert_eq!(colours[0], (COLOUR_DEFAULT, COLOUR_DEFAULT));
+    assert_eq!(&colours[1..], &[(0, 6); 5]);
+}
+
+#[test]
+fn row_range_style_overlay_clamps_to_the_visible_grid() {
+    let mut screen = new_screen(3, 1, 10);
+    parse(&mut screen, b"abc");
+    let style = crate::style::Style::parse("bg=red").expect("valid overlay style");
+
+    screen.overlay_style_on_row_range(0, 2, u32::MAX, &style);
+
+    let mut backgrounds = Vec::new();
+    assert!(screen.visit_visible_line_cells(0, 3, |cell| {
+        backgrounds.push(cell.bg());
+    }));
+    assert_eq!(backgrounds, vec![COLOUR_DEFAULT, COLOUR_DEFAULT, 1]);
+}
+
+#[test]
 fn selection_style_overlay_consumes_selected_cell_markers() {
     let mut screen = new_screen(10, 2, 10);
     screen.mark_selected_row_range(0, 2, 4);

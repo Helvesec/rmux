@@ -44,6 +44,57 @@ impl RequestHandler {
         self.alerts_queue_window_locked_inner(state, target, flags, attached_count, false)
     }
 
+    /// Clears the family's silence state and rearms each represented winlink.
+    ///
+    /// Callers that serialize pane-output observation may run this before a
+    /// lifecycle hook wait, then use `alerts_queue_window_locked_without_silence_reset`
+    /// for the final alert application. This keeps timer ordering tied to the
+    /// observed activity without holding a global dispatch lock across hooks.
+    pub(in crate::handler) fn reset_window_family_silence_locked(
+        &self,
+        state: &mut HandlerState,
+        target: &WindowTarget,
+    ) -> bool {
+        let target_exists = state
+            .sessions
+            .session(target.session_name())
+            .and_then(|session| session.window_at(target.window_index()))
+            .is_some();
+        if !target_exists {
+            return false;
+        }
+
+        let family_targets =
+            state.window_linked_window_targets(target.session_name(), target.window_index());
+        let timer_resets = family_targets
+            .iter()
+            .map(|family_target| {
+                (
+                    family_target.clone(),
+                    monitor_silence_seconds(
+                        &state.options,
+                        family_target.session_name(),
+                        family_target.window_index(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        for family_target in family_targets {
+            let Some(session) = state.sessions.session_mut(family_target.session_name()) else {
+                continue;
+            };
+            if let Some(window) = session.window_at_mut(family_target.window_index()) {
+                window.clear_alert_flags(WINDOW_SILENCE);
+            }
+            let _ =
+                session.clear_winlink_alert_flags(family_target.window_index(), WINLINK_SILENCE);
+        }
+        for (family_target, seconds) in timer_resets {
+            self.configure_silence_timer_locked(state, family_target, seconds);
+        }
+        true
+    }
+
     fn alerts_queue_window_locked_inner(
         &self,
         state: &mut HandlerState,
@@ -63,34 +114,7 @@ impl RequestHandler {
 
         // Only reset the silence timer on activity/bell, not when silence itself fires.
         if reset_family_silence && flags.intersects(WINDOW_ACTIVITY.union(WINDOW_BELL)) {
-            let family_targets =
-                state.window_linked_window_targets(target.session_name(), target.window_index());
-            let timer_resets = family_targets
-                .iter()
-                .map(|family_target| {
-                    (
-                        family_target.clone(),
-                        monitor_silence_seconds(
-                            &state.options,
-                            family_target.session_name(),
-                            family_target.window_index(),
-                        ),
-                    )
-                })
-                .collect::<Vec<_>>();
-            for family_target in family_targets {
-                let Some(session) = state.sessions.session_mut(family_target.session_name()) else {
-                    continue;
-                };
-                if let Some(window) = session.window_at_mut(family_target.window_index()) {
-                    window.clear_alert_flags(WINDOW_SILENCE);
-                }
-                let _ = session
-                    .clear_winlink_alert_flags(family_target.window_index(), WINLINK_SILENCE);
-            }
-            for (family_target, seconds) in timer_resets {
-                self.configure_silence_timer_locked(state, family_target, seconds);
-            }
+            let _ = self.reset_window_family_silence_locked(state, &target);
         }
 
         let alerts_enabled = alert_flags_enabled(

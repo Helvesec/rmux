@@ -41,6 +41,26 @@ pub(super) fn is_already_closed_pane_id_error(
     )
 }
 
+pub(super) fn is_stale_pane_id_target_error(
+    error: &RmuxError,
+    target: &rmux_proto::PaneTargetRef,
+) -> bool {
+    let rmux_proto::PaneTargetRef::Id {
+        session_name,
+        pane_id,
+    } = target
+    else {
+        return false;
+    };
+    is_already_closed_pane_id_error(error, session_name, *pane_id)
+        || matches!(
+            error,
+            RmuxError::Protocol {
+                source: rmux_proto::RmuxError::SessionNotFound(missing_session),
+            } if missing_session == session_name.as_str()
+        )
+}
+
 pub(super) trait TargetSelector {
     fn session_name(&self) -> &rmux_proto::SessionName;
     fn matches_invalid_target(&self, value: &str, reason: &str) -> bool;

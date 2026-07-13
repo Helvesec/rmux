@@ -6,8 +6,8 @@ use rmux_proto::{
 
 use super::super::{
     defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event_if_enabled,
-    scripting_support::format_context_for_target, DeferredLifecycleEvent, QueuedLifecycleEvent,
-    RequestHandler,
+    scripting_support::format_context_for_target, DeferredLifecycleEvent,
+    PaneOutputSubscriptionKeySnapshot, QueuedLifecycleEvent, RequestHandler,
 };
 use super::pane_timer_mutations::BreakPaneTimerTargetPlan;
 use crate::format_runtime::render_runtime_template;
@@ -187,12 +187,19 @@ impl RequestHandler {
             WindowTarget::with_window(target_session_name.clone(), request.target.window_index());
         let (response, layout_targets, refresh_sessions) = {
             let mut state = self.state.lock().await;
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
+                &state,
+                &[source_session_name.clone(), target_session_name.clone()],
+            );
             let source_identity = PaneTransferWindowIdentity::capture(&state, &request.source);
             let target_identity = PaneTransferWindowIdentity::capture(&state, &request.target);
             let refresh_sessions =
                 pane_transfer_refresh_sessions(&state, &source_window, Some(&target_window));
             let response = match state.swap_pane(request) {
-                Ok(response) => Response::SwapPane(response),
+                Ok(response) => {
+                    self.rekey_pane_output_subscriptions(&subscription_keys.rekeys_after(&state));
+                    Response::SwapPane(response)
+                }
                 Err(error) => Response::Error(ErrorResponse { error }),
             };
             let layout_targets = matches!(response, Response::SwapPane(_))
@@ -239,6 +246,10 @@ impl RequestHandler {
         };
         let (response, effects, removed_sessions, layout_targets) = {
             let mut state = self.state.lock().await;
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
+                &state,
+                &[source_session_name.clone(), target_session_name.clone()],
+            );
             let timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
             let source_identity = PaneTransferWindowIdentity::capture(&state, &request.source);
             let target_identity = PaneTransferWindowIdentity::capture(&state, &request.target);
@@ -256,6 +267,7 @@ impl RequestHandler {
                         Vec::new(),
                         &[],
                     );
+                    self.rekey_pane_output_subscriptions(&subscription_keys.rekeys_after(&state));
                     Response::JoinPane(response)
                 }
                 Err(error) => Response::Error(ErrorResponse { error }),
@@ -307,6 +319,10 @@ impl RequestHandler {
         };
         let (response, effects, removed_sessions, layout_targets) = {
             let mut state = self.state.lock().await;
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
+                &state,
+                &[source_session_name.clone(), target_session_name.clone()],
+            );
             let timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
             let source_identity = PaneTransferWindowIdentity::capture(&state, &request.source);
             let target_identity = PaneTransferWindowIdentity::capture(&state, &request.target);
@@ -324,6 +340,7 @@ impl RequestHandler {
                         Vec::new(),
                         &[],
                     );
+                    self.rekey_pane_output_subscriptions(&subscription_keys.rekeys_after(&state));
                     Response::MovePane(response)
                 }
                 Err(error) => Response::Error(ErrorResponse { error }),
@@ -371,6 +388,13 @@ impl RequestHandler {
         let explicit_name = request.name.is_some();
         let (response, effects, removed_sessions, source_layout_target, linked_event) = {
             let mut state = self.state.lock().await;
+            let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
+                &state,
+                &[
+                    request.source.session_name().clone(),
+                    target_session_name.clone(),
+                ],
+            );
             let mut timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
             let timer_target_plan = BreakPaneTimerTargetPlan::capture(&state, &request);
             let timer_fanout_source = WindowTarget::with_window(
@@ -409,6 +433,7 @@ impl RequestHandler {
                         Vec::new(),
                         &[],
                     );
+                    self.rekey_pane_output_subscriptions(&subscription_keys.rekeys_after(&state));
                     Response::BreakPane(response)
                 }
                 Err(error) => Response::Error(ErrorResponse { error }),

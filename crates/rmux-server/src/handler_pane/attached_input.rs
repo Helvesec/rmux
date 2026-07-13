@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 use rmux_core::{key_code_lookup_bits, key_code_to_bytes, key_string_lookup_string};
-use rmux_proto::{OptionName, PaneTarget, RmuxError, Target, DEFAULT_MAX_FRAME_LENGTH};
+use rmux_proto::{OptionName, PaneTarget, RmuxError, Target};
 #[cfg(windows)]
 use rmux_pty::WindowsConsoleKeyEvent;
 
@@ -23,7 +23,10 @@ use crate::client_flags::ClientFlags;
 use crate::handler::overlay_support::AttachedOverlayInput;
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{decode_attached_key, AttachedKeyDecode};
-use crate::mouse::{classify_mouse_events, layout_for_session, ClassifiedMouseEvent};
+use crate::mouse::{
+    classify_mouse_events, layout_for_session, mouse_event_for_pane_passthrough,
+    ClassifiedMouseEvent,
+};
 use crate::pane_io::{AttachControl, OverlayFrame};
 
 #[path = "attached_input/bracketed_paste.rs"]
@@ -32,17 +35,20 @@ pub(super) mod bracketed_paste;
 mod kitty_graphics;
 #[path = "attached_input/live.rs"]
 mod live;
+#[path = "attached_input/retained.rs"]
+mod retained;
 #[path = "attached_input/synchronized.rs"]
 mod synchronized;
 #[path = "attached_input/terminal_response.rs"]
 mod terminal_response;
 
+pub(in crate::handler) use retained::{
+    retain_partial_attached_control_input, retain_partial_attached_escape_input,
+};
 use synchronized::{
     prepare_attached_bracketed_paste_forwards, prepare_attached_key_forwards,
     write_prepared_attached_pane_forwards,
 };
-
-const MAX_RETAINED_ATTACHED_CONTROL_INPUT: usize = DEFAULT_MAX_FRAME_LENGTH;
 
 #[derive(Clone, Copy)]
 enum AttachedPaneForward<'a> {
@@ -52,24 +58,6 @@ enum AttachedPaneForward<'a> {
         key: WindowsConsoleKeyEvent,
         bytes: &'a [u8],
     },
-}
-
-pub(in crate::handler) fn retain_partial_attached_control_input(
-    context: &str,
-    pending_input: &mut Vec<u8>,
-) -> io::Result<()> {
-    let retained = pending_input.len();
-    if retained <= MAX_RETAINED_ATTACHED_CONTROL_INPUT {
-        return Ok(());
-    }
-
-    pending_input.clear();
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "{context} retained {retained} bytes of partial attached control input; maximum is {MAX_RETAINED_ATTACHED_CONTROL_INPUT}"
-        ),
-    ))
 }
 
 impl RequestHandler {
@@ -192,10 +180,9 @@ impl RequestHandler {
         // a marker whose bytes straddle the pending_input / bytes seam
         // (delivered across two socket reads or attach-input frames) still
         // collapses to nothing.
+        let new_input_at = pending_input.len();
         pending_input.extend_from_slice(bytes);
-        let scrubbed = bracketed_paste::strip_bracketed_paste_markers(pending_input);
-        pending_input.clear();
-        pending_input.extend_from_slice(&scrubbed);
+        bracketed_paste::strip_bracketed_paste_markers_after_append(pending_input, new_input_at);
         let mut deferred_refresh = false;
         let mut offset = 0;
         let mut try_batched_text = true;
@@ -236,7 +223,7 @@ impl RequestHandler {
                         .await
                         .map_err(io_other)?;
                 }
-                retain_partial_attached_control_input("prompt input", pending_input)?;
+                retain_partial_attached_escape_input("prompt input", pending_input)?;
                 return Ok(None);
             };
             offset += consumed;
@@ -272,10 +259,9 @@ impl RequestHandler {
         // rationale — mode-tree also decodes input as keys. Strip the
         // concatenated buffer so a marker straddling pending_input / bytes
         // still collapses.
+        let new_input_at = pending_input.len();
         pending_input.extend_from_slice(bytes);
-        let scrubbed = bracketed_paste::strip_bracketed_paste_markers(pending_input);
-        pending_input.clear();
-        pending_input.extend_from_slice(&scrubbed);
+        bracketed_paste::strip_bracketed_paste_markers_after_append(pending_input, new_input_at);
         let backspace = self.attached_backspace_byte().await;
         let mut offset = 0;
 
@@ -294,9 +280,9 @@ impl RequestHandler {
                     MouseDecode::Discard { size } => {
                         offset += size;
                     }
-                    MouseDecode::Partial => {
+                    MouseDecode::Partial | MouseDecode::Overlong => {
                         pending_input.drain(..offset);
-                        retain_partial_attached_control_input("mode-tree mouse", pending_input)?;
+                        retain_partial_attached_escape_input("mode-tree mouse", pending_input)?;
                         return Ok(None);
                     }
                     MouseDecode::Invalid => {
@@ -328,7 +314,7 @@ impl RequestHandler {
                     }
                     ExtendedKeyDecode::Partial => {
                         pending_input.drain(..offset);
-                        retain_partial_attached_control_input(
+                        retain_partial_attached_escape_input(
                             "mode-tree extended key",
                             pending_input,
                         )?;
@@ -350,13 +336,13 @@ impl RequestHandler {
                 }
                 AttachedKeyDecode::Partial => {
                     pending_input.drain(..offset);
-                    retain_partial_attached_control_input("mode-tree attached key", pending_input)?;
+                    retain_partial_attached_escape_input("mode-tree attached key", pending_input)?;
                     return Ok(None);
                 }
                 AttachedKeyDecode::Invalid => {
                     let Some((event, consumed)) = decode_prompt_input_event(slice) else {
                         pending_input.drain(..offset);
-                        retain_partial_attached_control_input(
+                        retain_partial_attached_escape_input(
                             "mode-tree prompt input",
                             pending_input,
                         )?;
@@ -399,14 +385,13 @@ impl RequestHandler {
                 Some("on")
             )
         };
-        if !mouse_enabled {
-            return Ok(());
-        }
         if self.mode_tree_active(attach_pid).await {
-            let _ = self
-                .handle_mode_tree_mouse_event(attach_pid, raw)
-                .await
-                .map_err(io_other)?;
+            if mouse_enabled {
+                let _ = self
+                    .handle_mode_tree_mouse_event(attach_pid, raw)
+                    .await
+                    .map_err(io_other)?;
+            }
             return Ok(());
         }
         let attached_count = self.attached_count(&session_name).await;
@@ -417,6 +402,17 @@ impl RequestHandler {
         let Some(layout) = layout else {
             return Ok(());
         };
+        if !mouse_enabled {
+            let Some(event) = mouse_event_for_pane_passthrough(&layout, raw) else {
+                return Ok(());
+            };
+            let Some(target) = event.pane_target.clone() else {
+                return Ok(());
+            };
+            self.forward_attached_mouse_event_to_pane(&target, &event)
+                .await?;
+            return Ok(());
+        }
         let (classified, click_deadline) = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
@@ -633,6 +629,52 @@ impl RequestHandler {
         if self.attached_client_input_is_read_only(attach_pid).await? {
             pending_input.clear();
             return Ok(false);
+        }
+
+        // An unterminated SGR mouse field that has already overflowed `u16`
+        // can never become a valid event. Forwarding its CSI bytes on timeout
+        // would merely move the incomplete control sequence into the pane's
+        // terminal parser, where it could consume otherwise ordinary input.
+        // Discard it before mode-specific Escape handling so prompts,
+        // overlays, mode trees, copy mode, and the live pane agree.
+        if matches!(decode_mouse(pending_input, None), MouseDecode::Overlong) {
+            pending_input.clear();
+            return Ok(false);
+        }
+
+        if let Some(body) = bracketed_paste::neutralize_timed_out_bracketed_paste(pending_input) {
+            pending_input.clear();
+            if body.is_empty() {
+                return Ok(false);
+            }
+            let completed_paste = bracketed_paste::encode_bracketed_paste_for_mode(&body, true);
+            return self
+                .handle_attached_live_input_inner(attach_pid, pending_input, &completed_paste)
+                .await;
+        }
+
+        if pending_input.first() == Some(&b'\x1b') && self.prompt_active(attach_pid).await {
+            pending_input.drain(..1);
+            let mut deferred_refresh = false;
+            self.handle_prompt_event_deferred_refresh(
+                attach_pid,
+                PromptInputEvent::Escape,
+                &mut deferred_refresh,
+            )
+            .await
+            .map_err(io_other)?;
+            if deferred_refresh && self.prompt_active(attach_pid).await {
+                self.flush_attached_prompt_refresh(attach_pid)
+                    .await
+                    .map_err(io_other)?;
+            }
+            return if pending_input.is_empty() {
+                Ok(false)
+            } else {
+                let remaining = std::mem::take(pending_input);
+                self.handle_attached_live_input_inner(attach_pid, pending_input, &remaining)
+                    .await
+            };
         }
 
         if pending_input.first() == Some(&b'\x1b') && self.overlay_active(attach_pid).await {
@@ -869,12 +911,8 @@ impl RequestHandler {
         let state = self.state.lock().await;
         let session = state.sessions.session(session_name)?;
         let size = session.window().size();
-        let status_on = state
-            .options
-            .resolve(Some(session.name()), OptionName::Status)
-            .map(|value| value != "off")
-            .unwrap_or(true);
-        let usable_rows = size.rows.saturating_sub(u16::from(status_on));
+        let geometry = crate::renderer::StatusGeometry::for_session(session, &state.options);
+        let usable_rows = geometry.content_rows();
         if usable_rows == 0 || size.cols == 0 {
             return Some(Vec::new());
         }
@@ -884,11 +922,28 @@ impl RequestHandler {
         frame.extend_from_slice(b"\x1b[s\x1b[0m");
         for row in 0..usable_rows {
             frame.extend_from_slice(
-                format!("\x1b[{};1H{}", row.saturating_add(1), blank).as_bytes(),
+                format!(
+                    "\x1b[{};1H{}",
+                    geometry
+                        .content_y_offset()
+                        .saturating_add(row)
+                        .saturating_add(1),
+                    blank
+                )
+                .as_bytes(),
             );
         }
         frame.extend_from_slice(b"\x1b[0m\x1b[u");
         Some(frame)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn mode_tree_overlay_clear_frame_for_test(
+        &self,
+        session_name: &rmux_proto::SessionName,
+    ) -> Option<Vec<u8>> {
+        self.render_mode_tree_overlay_clear_frame(session_name)
+            .await
     }
 }
 

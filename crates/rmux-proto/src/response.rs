@@ -960,6 +960,7 @@ impl<'de> Visitor<'de> for SourceFileResponseVisitor {
 pub struct WaitForResponse;
 
 /// Terminal state for a daemon-backed SDK byte wait.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SdkWaitOutcome {
     /// The requested byte sequence was observed.
@@ -990,10 +991,9 @@ pub struct CancelSdkWaitResponse {
 impl CancelSdkWaitResponse {
     /// Returns the compatibility-preserving ACK used by armed SDK waits.
     ///
-    /// `SdkWaitOutcome` is a published exhaustive enum whose terminal outcomes
-    /// must stay source-compatible across patch releases. The daemon therefore
-    /// acknowledges an armed wait with this existing response shape instead of
-    /// adding a third `SdkWaitOutcome` variant.
+    /// Armed acknowledgement is deliberately kept outside the terminal
+    /// `SdkWaitOutcome` enum. This preserves the current release wire while the
+    /// non-exhaustive outcome type remains forward-compatible for SDK callers.
     #[must_use]
     pub const fn armed_ack(wait_id: SdkWaitId) -> Self {
         Self {
@@ -1118,11 +1118,10 @@ mod tests {
     }
 
     #[test]
-    fn sdk_wait_outcome_patch_surface_stays_terminal_only() {
+    fn known_sdk_wait_outcomes_are_terminal() {
+        #[allow(unreachable_patterns)]
         fn is_terminal(outcome: SdkWaitOutcome) -> bool {
-            match outcome {
-                SdkWaitOutcome::Matched | SdkWaitOutcome::Cancelled => true,
-            }
+            matches!(outcome, SdkWaitOutcome::Matched | SdkWaitOutcome::Cancelled)
         }
 
         assert!(is_terminal(SdkWaitOutcome::Matched));

@@ -912,13 +912,6 @@ fn parse_command_tail(args: &[OsString]) -> Option<Option<Vec<String>>> {
         .map(Some)
 }
 
-fn parse_joined_tail(args: &[OsString]) -> Option<Option<String>> {
-    if args.is_empty() {
-        return None;
-    }
-    parse_string_tail(args).map(|values| Some(values.join(" ")))
-}
-
 fn parse_single_tail(args: &[OsString]) -> Option<Option<String>> {
     let [value] = args else {
         return None;

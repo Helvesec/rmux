@@ -7,7 +7,7 @@ import argparse
 import json
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 
 REQUIRED_TARGETS = {
@@ -20,6 +20,9 @@ REQUIRED_TARGETS = {
 }
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^[0-9A-Za-z._:-]{8,128}$")
+PERSONAL_HOME_RE = re.compile(
+    r"(?:/(?:home|Users)/[^/\s\"']+(?:/|$)|[A-Za-z]:\\Users\\[^\\\s\"']+(?:\\|$))"
+)
 
 
 def fail(message: str) -> int:
@@ -27,9 +30,35 @@ def fail(message: str) -> int:
     return 1
 
 
+def find_personal_home(value: object, location: str = "$") -> str | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            match = find_personal_home(item, f"{location}.{key}")
+            if match is not None:
+                return match
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            match = find_personal_home(item, f"{location}[{index}]")
+            if match is not None:
+                return match
+    elif isinstance(value, str) and PERSONAL_HOME_RE.search(value):
+        return location
+    return None
+
+
+def is_absolute_path(value: object) -> bool:
+    return isinstance(value, str) and (
+        Path(value).is_absolute() or PureWindowsPath(value).is_absolute()
+    )
+
+
 def validate(path: Path, expected_platform: str | None) -> int:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
+
+    leaked_location = find_personal_home(payload)
+    if leaked_location is not None:
+        return fail(f"{path}: personal home path leaked at {leaked_location}")
 
     if payload.get("schema") != 2:
         return fail(f"{path}: expected schema 2")
@@ -87,6 +116,29 @@ def validate(path: Path, expected_platform: str | None) -> int:
         return fail(f"{path}: missing baseline/source binary identity")
     if wrapper_binary.get("size_bytes") != source_binary.get("size_bytes"):
         return fail(f"{path}: baseline binary size does not match source public binary")
+
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return fail(f"{path}: missing artifact paths")
+    portable_paths = [
+        ("binary.path", wrapper_binary.get("path")),
+        ("source.binary.path", source_binary.get("path")),
+        *[(f"artifacts.{name}", artifacts.get(name)) for name in (
+            "schema1_json",
+            "schema1_summary",
+            "baseline_file",
+            "baseline_summary",
+            "fixture_manifest",
+        )],
+        *[(f"source.layout.{name}.path", source_layout.get(name, {}).get("path"))
+          for name in ("public", "helper", "daemon")
+          if isinstance(source_layout.get(name), dict)],
+    ]
+    for label, value in portable_paths:
+        if not isinstance(value, str) or not value:
+            return fail(f"{path}: missing {label}")
+        if is_absolute_path(value):
+            return fail(f"{path}: {label} must be repository-relative")
 
     versions = payload.get("versions")
     if not isinstance(versions, dict) or not versions.get("rmux") or not versions.get("tmux"):

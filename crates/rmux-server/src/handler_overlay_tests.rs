@@ -3,8 +3,10 @@ use super::super::{
     RequestHandler,
 };
 use super::session_name;
+use crate::input_keys::MAX_SGR_MOUSE_FRAME_BYTES;
 use crate::mouse::{layout_for_session, StatusRangeType};
 use crate::pane_io::AttachControl;
+use rmux_proto::request::RefreshClientRequest;
 use rmux_proto::{
     BindKeyRequest, CapturePaneRequest, NewSessionExtRequest, NewSessionRequest, PaneTarget,
     Request, Response, ScopeSelector, SessionName, SetOptionMode, Target, TerminalSize,
@@ -254,6 +256,197 @@ async fn next_overlay_frame(
     }
 }
 
+fn full_refresh_client_request(target_pid: u32) -> RefreshClientRequest {
+    RefreshClientRequest {
+        target_client: Some(target_pid.to_string()),
+        adjustment: None,
+        clear_pan: false,
+        pan_left: false,
+        pan_right: false,
+        pan_up: false,
+        pan_down: false,
+        status_only: false,
+        clipboard_query: false,
+        flags: None,
+        flags_alias: None,
+        subscriptions: Vec::new(),
+        subscriptions_format: Vec::new(),
+        control_size: None,
+        colour_report: None,
+    }
+}
+
+async fn refresh_client_overlay_frame(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+) -> crate::pane_io::OverlayFrame {
+    let response = handler
+        .dispatch(
+            requester_pid,
+            Request::RefreshClient(Box::new(full_refresh_client_request(requester_pid))),
+        )
+        .await
+        .response;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "refresh-client should succeed, got {response:?}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let mut saw_switch = false;
+    loop {
+        let now = tokio::time::Instant::now();
+        assert!(now < deadline, "refresh-client overlay replay arrives");
+        match timeout(deadline - now, control_rx.recv())
+            .await
+            .expect("refresh-client control arrives")
+        {
+            Some(AttachControl::Switch(_)) => saw_switch = true,
+            Some(AttachControl::Overlay(frame)) => {
+                assert!(saw_switch, "base refresh must precede the overlay replay");
+                return frame;
+            }
+            Some(AttachControl::Refresh) => {}
+            other => panic!("expected refresh-client switch and overlay, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn refresh_client_replays_active_menu_after_base_switch() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("refresh-client-menu-overlay");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-menu -T Menu "First" "f" "display-message first""#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let frame = refresh_client_overlay_frame(&handler, requester_pid, &mut control_rx).await;
+    assert!(frame.persistent);
+    let rendered = String::from_utf8(frame.frame).expect("menu frame is utf-8");
+    assert!(rendered.contains("First"));
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"f")
+        .await
+        .expect("replayed menu remains interactive");
+    let active_attach = handler.active_attach.lock().await;
+    assert!(
+        active_attach.by_pid[&requester_pid].overlay.is_none(),
+        "menu action should dismiss the active overlay after refresh-client"
+    );
+}
+
+#[tokio::test]
+async fn refresh_client_replays_active_popup_after_base_switch() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("refresh-client-popup-overlay");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let frame = refresh_client_overlay_frame(&handler, requester_pid, &mut control_rx).await;
+    assert!(frame.persistent);
+    let rendered = String::from_utf8(frame.frame).expect("popup frame is utf-8");
+    assert!(rendered.contains("Popup"));
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x03")
+        .await
+        .expect("replayed popup remains interactive");
+    let active_attach = handler.active_attach.lock().await;
+    assert!(
+        active_attach.by_pid[&requester_pid].overlay.is_none(),
+        "popup control input should dismiss the active overlay after refresh-client"
+    );
+}
+
+#[tokio::test]
+async fn rename_session_rekeys_menu_and_popup_targets_before_they_handle_input() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("overlay-rename-alpha");
+    let beta = session_name("overlay-rename-beta");
+    let gamma = session_name("overlay-rename-gamma");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-menu -T Menu "First" "f" "display-message first""#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    let response = handler
+        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+            target: alpha,
+            new_name: beta.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RenameSession(_)),
+        "{response:?}"
+    );
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let Some(ClientOverlayState::Menu(menu)) =
+            active_attach.by_pid[&requester_pid].overlay.as_ref()
+        else {
+            panic!("menu remains active across rename");
+        };
+        assert_eq!(menu.current_target.session_name(), &beta);
+    }
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"f")
+        .await
+        .expect("renamed menu target remains actionable");
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    let response = handler
+        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+            target: beta,
+            new_name: gamma.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RenameSession(_)),
+        "{response:?}"
+    );
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let Some(ClientOverlayState::Popup(popup)) =
+            active_attach.by_pid[&requester_pid].overlay.as_ref()
+        else {
+            panic!("popup remains active across rename");
+        };
+        assert_eq!(popup.current_target.session_name(), &gamma);
+    }
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x03")
+        .await
+        .expect("renamed popup target remains interactive");
+}
+
 async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> String {
     let response = handler
         .handle(Request::CapturePane(Box::new(CapturePaneRequest {
@@ -387,21 +580,43 @@ async fn display_menu_unterminated_sgr_mouse_input_is_bounded() {
     .await;
     let _ = next_overlay_frame(&mut control_rx).await;
 
+    let mut malformed = b"\x1b[<".to_vec();
+    malformed.resize(MAX_SGR_MOUSE_FRAME_BYTES, b'9');
+    malformed.push(b'\r');
     let mut pending_input = Vec::new();
     handler
-        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b[<")
+        .handle_attached_live_input(requester_pid, &mut pending_input, &malformed)
         .await
-        .expect("partial menu mouse is retained");
-    assert_eq!(pending_input, b"\x1b[<");
-
-    let overflow = vec![b'9'; DEFAULT_MAX_FRAME_LENGTH - pending_input.len() + 1];
-    let err = handler
-        .handle_attached_live_input(requester_pid, &mut pending_input, &overflow)
-        .await
-        .expect_err("unterminated menu mouse should be bounded");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("menu overlay mouse"));
+        .expect("bounded malformed menu mouse is discarded as one batch");
     assert!(pending_input.is_empty());
+
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached client");
+        assert!(
+            matches!(active.overlay.as_ref(), Some(ClientOverlayState::Menu(_))),
+            "the same-batch Enter tail must not choose a menu item"
+        );
+    }
+
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
+        .await
+        .expect("a later Escape is retained for its ambiguity deadline");
+    handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("the later Escape still closes the menu at its deadline");
+    assert!(pending_input.is_empty());
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .expect("attached client");
+    assert!(active.overlay.is_none());
 }
 
 #[tokio::test]

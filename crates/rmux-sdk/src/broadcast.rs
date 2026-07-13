@@ -208,10 +208,35 @@ pub(crate) async fn broadcast(panes: &[Pane], input: Input<'_>) -> Result<Broadc
 
 async fn broadcast_daemon_side(panes: &[Pane], input: Input<'_>) -> Result<BroadcastResult> {
     crate::capabilities::require(panes[0].transport(), &[CAPABILITY_SDK_PANE_BROADCAST]).await?;
+    let mut targets = Vec::with_capacity(panes.len());
+    let mut request_to_original = Vec::with_capacity(panes.len());
+    let mut indexed_failures = Vec::new();
+    for (original_index, pane) in panes.iter().enumerate() {
+        match pane.required_resolved_proto_target_ref().await {
+            Ok(target) => {
+                targets.push(target);
+                request_to_original.push(original_index);
+            }
+            Err(error) => indexed_failures.push((
+                original_index,
+                BroadcastPaneFailure {
+                    target: pane.target().clone(),
+                    pane_id: None,
+                    error,
+                },
+            )),
+        }
+    }
+
+    if targets.is_empty() {
+        return Err(partial_broadcast(Vec::new(), indexed_failures));
+    }
+
+    let requested_target_count = targets.len();
     let response = panes[0]
         .transport()
         .request(Request::PaneBroadcastInput(PaneBroadcastInputRequest {
-            targets: panes.iter().map(Pane::proto_target_ref).collect(),
+            targets,
             keys: input_keys(input),
             literal: matches!(input, Input::Text(_)),
         }))
@@ -227,29 +252,53 @@ async fn broadcast_daemon_side(panes: &[Pane], input: Input<'_>) -> Result<Broad
         }
     };
 
-    let successes = response
-        .successes
-        .into_iter()
-        .map(|success| BroadcastPaneSuccess {
-            target: success.target.into(),
-            pane_id: success.pane_id,
-        })
-        .collect::<Vec<_>>();
-    let failures = response
-        .failures
-        .into_iter()
-        .map(|failure| {
-            let index = usize::try_from(failure.target_index).ok();
-            let target = index
-                .and_then(|index| panes.get(index))
-                .map(|pane| pane.target().clone())
-                .unwrap_or_else(|| fallback_target_from_ref(failure.target));
+    let mut indexed_successes = Vec::with_capacity(response.successes.len());
+    let mut seen = vec![false; requested_target_count];
+    for success in response.successes {
+        let (request_index, original_index) =
+            response_target_index(success.target_index, &request_to_original, "successful")?;
+        if std::mem::replace(&mut seen[request_index], true) {
+            return Err(duplicate_broadcast_outcome(success.target_index));
+        }
+        indexed_successes.push((
+            original_index,
+            BroadcastPaneSuccess {
+                target: panes[original_index].target().clone(),
+                pane_id: success.pane_id,
+            },
+        ));
+    }
+    for failure in response.failures {
+        let (request_index, original_index) =
+            response_target_index(failure.target_index, &request_to_original, "failed")?;
+        if std::mem::replace(&mut seen[request_index], true) {
+            return Err(duplicate_broadcast_outcome(failure.target_index));
+        }
+        indexed_failures.push((
+            original_index,
             BroadcastPaneFailure {
-                target,
+                target: panes[original_index].target().clone(),
                 pane_id: None,
                 error: RmuxError::protocol(failure.error),
-            }
-        })
+            },
+        ));
+    }
+
+    if let Some(request_index) = seen.iter().position(|seen| !seen) {
+        return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+            "rmux daemon omitted pane broadcast outcome for target index {request_index}"
+        ))));
+    }
+
+    indexed_successes.sort_by_key(|(index, _)| *index);
+    indexed_failures.sort_by_key(|(index, _)| *index);
+    let successes = indexed_successes
+        .into_iter()
+        .map(|(_, success)| success)
+        .collect::<Vec<_>>();
+    let failures = indexed_failures
+        .into_iter()
+        .map(|(_, failure)| failure)
         .collect::<Vec<_>>();
 
     if failures.is_empty() {
@@ -259,6 +308,51 @@ async fn broadcast_daemon_side(panes: &[Pane], input: Input<'_>) -> Result<Broad
             successes, failures,
         )))
     }
+}
+
+fn response_target_index(
+    target_index: u32,
+    request_to_original: &[usize],
+    outcome: &str,
+) -> Result<(usize, usize)> {
+    let request_index = usize::try_from(target_index).map_err(|_| {
+        RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+            "rmux daemon returned out-of-range {outcome} pane broadcast target index {target_index}"
+        )))
+    })?;
+    let original_index = request_to_original
+        .get(request_index)
+        .copied()
+        .ok_or_else(|| {
+            RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+            "rmux daemon returned out-of-range {outcome} pane broadcast target index {target_index}"
+        )))
+        })?;
+    Ok((request_index, original_index))
+}
+
+fn duplicate_broadcast_outcome(target_index: u32) -> RmuxError {
+    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+        "rmux daemon returned duplicate pane broadcast outcome for target index {target_index}"
+    )))
+}
+
+fn partial_broadcast(
+    mut indexed_successes: Vec<(usize, BroadcastPaneSuccess)>,
+    mut indexed_failures: Vec<(usize, BroadcastPaneFailure)>,
+) -> RmuxError {
+    indexed_successes.sort_by_key(|(index, _)| *index);
+    indexed_failures.sort_by_key(|(index, _)| *index);
+    RmuxError::partial_broadcast(PartialBroadcastFailure::new(
+        indexed_successes
+            .into_iter()
+            .map(|(_, success)| success)
+            .collect(),
+        indexed_failures
+            .into_iter()
+            .map(|(_, failure)| failure)
+            .collect(),
+    ))
 }
 
 async fn broadcast_client_side(panes: &[Pane], input: Input<'_>) -> Result<BroadcastResult> {
@@ -313,13 +407,6 @@ fn input_keys(input: Input<'_>) -> Vec<String> {
     }
 }
 
-fn fallback_target_from_ref(target: rmux_proto::PaneTargetRef) -> PaneRef {
-    match target {
-        rmux_proto::PaneTargetRef::Slot(target) => target.into(),
-        rmux_proto::PaneTargetRef::Id { session_name, .. } => PaneRef::new(session_name, 0, 0),
-    }
-}
-
 fn is_daemon_broadcast_unavailable(error: &RmuxError) -> bool {
     if crate::capabilities::is_unavailable(error, CAPABILITY_SDK_PANE_BROADCAST) {
         return true;
@@ -330,6 +417,10 @@ fn is_daemon_broadcast_unavailable(error: &RmuxError) -> bool {
 async fn send_one(pane: Pane, input: OwnedInput) -> PaneBroadcastOutcome {
     let target = pane.target().clone();
     let pane_id = pane.id().await.ok().flatten();
+    let pane = match pane_id {
+        Some(pane_id) => pane.pin_to_id(pane_id),
+        None => pane,
+    };
     let result = match input {
         OwnedInput::Text(text) => pane.send_text(text).await,
         OwnedInput::Key(key) => pane.send_key(key).await,
@@ -371,8 +462,8 @@ mod tests {
     use crate::{Pane, PaneId, PaneRef, RmuxEndpoint, SessionName};
     use rmux_proto::{
         encode_frame, CommandOutput, FrameDecoder, HandshakeRequest, HandshakeResponse,
-        ListPanesResponse, Request, Response, SendKeysExtRequest, SendKeysResponse,
-        CAPABILITY_HANDSHAKE, CAPABILITY_SDK_PANE_BROADCAST,
+        ListPanesResponse, PaneInputRequest, PaneTargetRef, Request, Response, SendKeysResponse,
+        CAPABILITY_HANDSHAKE, CAPABILITY_SDK_PANE_BROADCAST, CAPABILITY_SDK_PANE_BY_ID,
     };
 
     #[tokio::test]
@@ -407,7 +498,10 @@ mod tests {
             &mut server_stream,
             Response::Handshake(HandshakeResponse {
                 wire_version: rmux_proto::RMUX_WIRE_VERSION,
-                capabilities: vec![CAPABILITY_HANDSHAKE.to_owned()],
+                capabilities: vec![
+                    CAPABILITY_HANDSHAKE.to_owned(),
+                    CAPABILITY_SDK_PANE_BY_ID.to_owned(),
+                ],
             }),
         )
         .await;
@@ -428,17 +522,31 @@ mod tests {
         .await;
 
         match read_request(&mut server_stream).await {
-            Request::SendKeysExt(SendKeysExtRequest {
+            Request::ListPanes(request) => {
+                assert_eq!(request.target, session_name);
+                assert_eq!(request.target_window_index, None);
+            }
+            request => panic!("expected pinned delivery pane-id lookup, got {request:?}"),
+        }
+        write_response(
+            &mut server_stream,
+            Response::ListPanes(ListPanesResponse {
+                output: CommandOutput::from_stdout("0:0:%1\n"),
+            }),
+        )
+        .await;
+
+        match read_request(&mut server_stream).await {
+            Request::PaneInput(PaneInputRequest {
                 keys,
                 literal,
                 target,
-                ..
             }) => {
                 assert_eq!(keys, ["printf ok"]);
                 assert!(literal);
-                assert!(target.is_some());
+                assert_eq!(target, PaneTargetRef::by_id(session_name, PaneId::new(1)));
             }
-            request => panic!("expected client-side send-keys fallback, got {request:?}"),
+            request => panic!("expected client-side pane-input fallback, got {request:?}"),
         }
         write_response(
             &mut server_stream,
