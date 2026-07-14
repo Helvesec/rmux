@@ -496,6 +496,127 @@ async fn explicit_background_run_shell_target_survives_attached_switch() {
 }
 
 #[tokio::test]
+async fn explicit_background_shell_target_survives_origin_attach_detach() {
+    let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+    let requester_pid = 424_312;
+    let origin = session_name("run-shell-explicit-detach-origin");
+    let target = session_name("run-shell-explicit-detach-target");
+    create_background_identity_session(&handler, origin.clone()).await;
+    create_background_identity_session(&handler, target.clone()).await;
+
+    let root = temp_root("run-shell-explicit-detach");
+    std::fs::create_dir_all(&root).expect("explicit detach output root");
+    let output_path = root.join("completed.txt");
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, origin.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+
+    let response = with_expected_attach_and_session_identity(
+        identity,
+        origin,
+        identity.session_id(),
+        handler.handle_run_shell(
+            requester_pid,
+            RunShellRequest {
+                command: write_text_command(&output_path, "ok"),
+                arguments: Vec::new(),
+                background: true,
+                as_commands: false,
+                show_stderr: true,
+                delay_seconds: Some(RunShellDelaySeconds(0.05)),
+                start_directory: Some(root.clone()),
+                target: Some(PaneTarget::with_window(target, 0, 0)),
+                source_depth: None,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(response, Response::RunShell(RunShellResponse::background()));
+
+    let detached = handler.handle_detach_client_for_identity(identity).await;
+    assert!(
+        matches!(detached, Response::DetachClient(_)),
+        "{detached:?}"
+    );
+    wait_for_file_text(&output_path, "ok").await;
+    std::fs::remove_dir_all(root).expect("remove explicit detach output root");
+}
+
+#[tokio::test]
+async fn explicit_background_shell_target_survives_same_pid_attach_replacement() {
+    let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+    let requester_pid = 424_313;
+    let origin = session_name("run-shell-explicit-reuse-origin");
+    let replacement = session_name("run-shell-explicit-reuse-replacement");
+    let target = session_name("run-shell-explicit-reuse-target");
+    create_background_identity_session(&handler, origin.clone()).await;
+    create_background_identity_session(&handler, replacement.clone()).await;
+    create_background_identity_session(&handler, target.clone()).await;
+
+    let root = temp_root("run-shell-explicit-reuse");
+    std::fs::create_dir_all(&root).expect("explicit reuse output root");
+    let output_path = root.join("completed.txt");
+    let (origin_control_tx, _origin_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, origin.clone(), origin_control_tx)
+        .await;
+    let origin_identity = handler.active_attach_identity_for_test(requester_pid).await;
+
+    let response = with_expected_attach_and_session_identity(
+        origin_identity,
+        origin,
+        origin_identity.session_id(),
+        handler.handle_run_shell(
+            requester_pid,
+            RunShellRequest {
+                command: write_text_command(&output_path, "ok"),
+                arguments: Vec::new(),
+                background: true,
+                as_commands: false,
+                show_stderr: true,
+                delay_seconds: Some(RunShellDelaySeconds(0.05)),
+                start_directory: Some(root.clone()),
+                target: Some(PaneTarget::with_window(target, 0, 0)),
+                source_depth: None,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(response, Response::RunShell(RunShellResponse::background()));
+
+    let (replacement_control_tx, mut replacement_control_rx) =
+        tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, replacement.clone(), replacement_control_tx)
+        .await;
+    let replacement_identity = handler.active_attach_identity_for_test(requester_pid).await;
+    assert_ne!(
+        replacement_identity.attach_id(),
+        origin_identity.attach_id()
+    );
+    while replacement_control_rx.try_recv().is_ok() {}
+
+    wait_for_file_text(&output_path, "ok").await;
+    assert!(
+        handler
+            .current_live_attach_input(replacement_identity)
+            .await,
+        "explicit background shell must not invalidate the replacement registration"
+    );
+    while let Ok(control) = replacement_control_rx.try_recv() {
+        assert!(
+            !matches!(control, AttachControl::Detach),
+            "explicit background shell detached the replacement registration"
+        );
+    }
+    std::fs::remove_dir_all(root).expect("remove explicit reuse output root");
+}
+
+#[tokio::test]
 async fn background_run_shell_commands_still_emit_after_hooks_outside_hook_context() {
     let handler = RequestHandler::new();
     create_named_session(&handler, "run-shell-after-hooks").await;

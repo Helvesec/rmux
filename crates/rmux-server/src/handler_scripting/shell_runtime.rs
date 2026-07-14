@@ -283,12 +283,19 @@ impl RequestHandler {
             tokio::time::sleep(run_shell_delay_duration(delay_seconds.as_secs_f64())?).await;
         }
 
-        let expected_attach = validate_expected_attach_identity(self, requester_pid).await?;
         if target_policy.follows_attached_session() {
-            let identity = expected_attach.ok_or_else(|| {
-                RmuxError::Server("background command lost its attached client identity".to_owned())
-            })?;
+            let identity = validate_expected_attach_identity(self, requester_pid)
+                .await?
+                .ok_or_else(|| {
+                    RmuxError::Server(
+                        "background command lost its attached client identity".to_owned(),
+                    )
+                })?;
             request.target = Some(self.followed_attached_pane_target(identity).await?);
+        } else if request.as_commands {
+            // Command-mode jobs can act on the attached registration even
+            // with a fixed pane target, so retain the same-PID reuse guard.
+            let _ = validate_expected_attach_identity(self, requester_pid).await?;
         }
 
         if request.command.is_empty() {
