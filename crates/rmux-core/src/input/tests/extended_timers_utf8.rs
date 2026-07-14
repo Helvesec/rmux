@@ -28,10 +28,14 @@ fn kitty_keyboard_set_and_pop_update_csi_u_extended_keys() {
 }
 
 #[test]
-fn kitty_keyboard_query_reports_current_flag_state() {
-    let (p, _w) = parse(b"\x1b[>1u\x1b[?u");
-    let replies = String::from_utf8_lossy(&p.reply_buf);
-    assert_eq!(replies.as_ref(), "\x1b[?1u");
+fn kitty_keyboard_query_matches_tmux_without_advertising_support() {
+    // tmux 3.7b ignores the capability query both before and after an
+    // application explicitly enables Kitty keyboard handling. RMUX must not
+    // advertise the protocol while its key encoding remains incomplete, but
+    // an explicit opt-in must continue to select CSI-u encoding.
+    let (p, w) = parse(b"\x1b[?u\x1b[>1u\x1b[?u");
+    assert!(p.reply_buf.is_empty());
+    assert!(w.has_call("mode_set(0x240000)"));
 }
 
 // ─── Hardening: ground timer ───────────────────────────────────────

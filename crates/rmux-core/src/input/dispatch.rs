@@ -413,14 +413,10 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         CsiCommand::KittyKeyboardPop => {
             writer.mode_clear(mode::MODE_KEYS_KITTY | mode::MODE_KEYS_EXTENDED_2);
         }
-        CsiCommand::KittyKeyboardQuery => {
-            let flags = if (writer.current_mode() & mode::MODE_KEYS_KITTY) != 0 {
-                1
-            } else {
-                0
-            };
-            parser.reply(&format!("\x1b[?{flags}u"));
-        }
+        // Do not advertise Kitty keyboard support until every key class is
+        // encoded according to that protocol. Applications may still opt in
+        // explicitly with KittyKeyboardSet or KittyKeyboardPush.
+        CsiCommand::KittyKeyboardQuery => {}
         CsiCommand::Modoff => {
             let n = parser.param_list.get(0, 0, 0);
             if n != 4 {

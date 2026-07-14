@@ -600,7 +600,7 @@ fn visible_revision_reuse_map(previous: &[u64], next: &[u64]) -> Option<Vec<Opti
 #[cfg(test)]
 mod tests {
     use super::{visible_revision_reuse_map, PaneTranscript};
-    use rmux_core::{GridRenderOptions, ScreenCaptureRange, TerminalScreen};
+    use rmux_core::{input::mode, GridRenderOptions, ScreenCaptureRange, TerminalScreen};
     use rmux_proto::TerminalSize;
 
     fn transcript(cols: u16, rows: u16, limit: usize) -> PaneTranscript {
@@ -810,6 +810,20 @@ mod tests {
 
         assert_eq!(result.replies, b"\x1b[?1;2c");
         assert!(transcript.append_bytes_with_effects(b"").replies.is_empty());
+    }
+
+    #[test]
+    fn append_bytes_does_not_advertise_kitty_keyboard_support() {
+        let mut transcript = transcript(40, 4, 10);
+
+        assert!(transcript
+            .append_bytes_with_effects(b"\x1b[?u")
+            .replies
+            .is_empty());
+
+        let explicit_opt_in = transcript.append_bytes_with_effects(b"\x1b[>1u\x1b[?u");
+        assert!(explicit_opt_in.replies.is_empty());
+        assert_ne!(transcript.mode() & mode::MODE_KEYS_KITTY, 0);
     }
 
     #[test]
