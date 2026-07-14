@@ -8,7 +8,7 @@ use rmux_proto::{
 };
 
 use super::targets::{implicit_pane_target, implicit_session_name, implicit_window_target};
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::unsupported_flag;
 use super::{parse_session_name, parse_target_arg};
 
@@ -325,11 +325,11 @@ pub(super) fn parse_set_environment(
     let mut global = false;
     let mut format = false;
     let mut hidden = false;
-    let mut mode = Some(SetEnvironmentMode::Set);
+    let mut mode = SetEnvironmentMode::Set;
     let mut target = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -348,7 +348,7 @@ pub(super) fn parse_set_environment(
             }
             "-r" => {
                 let _ = args.optional();
-                mode = Some(SetEnvironmentMode::Clear);
+                select_set_environment_mode(&mut mode, SetEnvironmentMode::Clear);
             }
             "-t" => {
                 let _ = args.optional();
@@ -356,16 +356,40 @@ pub(super) fn parse_set_environment(
             }
             "-u" => {
                 let _ = args.optional();
-                mode = Some(SetEnvironmentMode::Unset);
+                select_set_environment_mode(&mut mode, SetEnvironmentMode::Unset);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "Fghru", "t") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('F') => format = true,
+                        CompactFlag::Bare('g') => global = true,
+                        CompactFlag::Bare('h') => hidden = true,
+                        CompactFlag::Bare('r') => {
+                            select_set_environment_mode(&mut mode, SetEnvironmentMode::Clear);
+                        }
+                        CompactFlag::Bare('u') => {
+                            select_set_environment_mode(&mut mode, SetEnvironmentMode::Unset);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_session_name(
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        _ => unreachable!("compact set-environment flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 
     let scope =
         build_global_or_session_scope("set-environment", global, target, sessions, find_context)?;
     let name = args.required("set-environment name")?;
-    let value = match mode.unwrap_or(SetEnvironmentMode::Set) {
+    let value = match mode {
         SetEnvironmentMode::Set => args
             .optional()
             .ok_or_else(|| RmuxError::Server("no value specified".to_owned()))?,
@@ -379,10 +403,18 @@ pub(super) fn parse_set_environment(
         scope,
         name,
         value,
-        mode,
+        mode: Some(mode),
         hidden,
         format,
     })))
+}
+
+fn select_set_environment_mode(current: &mut SetEnvironmentMode, requested: SetEnvironmentMode) {
+    if matches!(requested, SetEnvironmentMode::Unset)
+        || !matches!(*current, SetEnvironmentMode::Unset)
+    {
+        *current = requested;
+    }
 }
 
 pub(super) fn parse_show_options(

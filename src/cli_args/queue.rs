@@ -24,25 +24,6 @@ pub(super) fn parse_command_queue(arguments: &[OsString]) -> Result<ParsedComman
         .map_err(command_parse_error_to_clap)
 }
 
-pub(super) fn parse_command_queue_with_aliases(
-    arguments: &[OsString],
-    command_aliases: &[String],
-) -> Result<ParsedCommands, clap::Error> {
-    if arguments.is_empty() {
-        return Ok(ParsedCommands::default());
-    }
-
-    let arguments = arguments
-        .iter()
-        .map(|argument| command_argument_to_string(argument))
-        .collect::<Result<Vec<_>, _>>()?;
-    TmuxCommandParser::new()
-        .with_command_aliases(command_aliases.iter().cloned())
-        .with_exact_commands(super::RMUX_EXTENSION_COMMANDS)
-        .parse_arguments(&arguments)
-        .map_err(command_parse_error_to_clap)
-}
-
 pub(super) fn parse_runtime_command_groups(
     groups: &[RuntimeCommandGroup],
 ) -> Result<ParsedCommands, clap::Error> {

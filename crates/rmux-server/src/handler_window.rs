@@ -14,7 +14,8 @@ use super::{
 };
 use crate::hook_runtime::{hooks_disabled, PendingInlineHookFormat};
 use crate::pane_terminals::{
-    HandlerState, NewWindowOptions, RespawnWindowOptions, WindowSpawnOptions,
+    resolve_new_pane_process_command, HandlerState, NewWindowOptions, RespawnWindowOptions,
+    WindowSpawnOptions,
 };
 
 #[path = "handler_window/move_window_effects.rs"]
@@ -100,7 +101,7 @@ impl RequestHandler {
         let environment_overrides = request.environment;
         let start_directory = request.start_directory;
         let command = request.command;
-        let process_command = request
+        let explicit_process_command = request
             .process_command
             .or_else(|| crate::legacy_command::from_legacy_command(command.as_deref()));
         let socket_path = self.socket_path();
@@ -116,6 +117,11 @@ impl RequestHandler {
             if let Err(error) = super::require_expected_session_identity(&state, &session_name) {
                 return Response::Error(ErrorResponse { error });
             }
+            let process_command = resolve_new_pane_process_command(
+                &state.options,
+                &session_name,
+                explicit_process_command,
+            );
             let timer_sessions = state.sessions.session_group_members(&session_name);
             let timer_mutation =
                 self.plan_window_mutation_silence_timers_locked(&state, timer_sessions);

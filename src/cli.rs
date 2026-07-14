@@ -73,16 +73,14 @@ mod web_share_display;
 #[path = "cli/window_commands.rs"]
 mod window_commands;
 
-use crate::cli_args::{
-    parse, parse_with_runtime_aliases, parse_with_runtime_command_groups, scan_top_level_command,
-};
+use crate::cli_args::{parse, parse_with_runtime_command_groups, scan_top_level_command, Cli};
 use crate::cli_response::{expect_command_output, expect_command_success};
 use attach_transport::attach_with_connection;
-use client_commands::run_switch_client_on_connection;
 use client_commands::{
     client_terminal_context_from_cli, optional_client_flags, run_control_mode, run_detach_client,
     run_list_clients, run_refresh_client, run_suspend_client, run_switch_client,
 };
+use client_commands::{run_switch_client_on_connection, validate_nested_attach_before_connect};
 #[cfg(test)]
 use command_inventory::render_list_commands_line;
 pub(crate) use command_runner::{
@@ -94,9 +92,9 @@ use command_runner::{
     finish_command_success, unexpected_response, write_command_output, write_lines_output,
 };
 use control_mode_error::parse_failure as control_mode_parse_failure;
-use dispatch::dispatch_command_queue;
 #[cfg(test)]
-use dispatch::{command_has_start_server_flag, default_client_command};
+use dispatch::default_client_command;
+use dispatch::{command_has_start_server_flag, dispatch_command_queue};
 pub(crate) use error::{ExitFailure, ExitMessageTermination};
 use rmux_client::{
     connect, ensure_server_running_with_config, resolve_socket_path,
@@ -164,15 +162,12 @@ where
     }
     let runtime_resolution =
         alias_fallback::runtime_command_resolution_for_invocation(&args, invoked_as_tmux(&args))?;
-    let parsed_cli = match runtime_resolution.as_ref() {
-        Some(alias_fallback::RuntimeCommandResolution::Canonical(groups)) => {
-            parse_with_runtime_command_groups(args.clone(), groups)
-        }
-        Some(alias_fallback::RuntimeCommandResolution::LegacyAliases(aliases)) => {
-            parse_with_runtime_aliases(args.clone(), aliases)
-        }
-        None => parse(args.clone()),
-    };
+    if let Some(alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(exit_code)) =
+        runtime_resolution.as_ref()
+    {
+        return Ok(*exit_code);
+    }
+    let parsed_cli = parse_with_runtime_resolution(&args, runtime_resolution.as_ref());
     let mut cli = match parsed_cli {
         Ok(cli) => cli,
         Err(error) if runtime_resolution.is_some() => {
@@ -189,7 +184,7 @@ where
     let command_was_provided = cli.command.is_some();
     validate_top_level_invocation(&cli, command_was_provided)?;
     accept_compatibility_options(&cli);
-    let startup_config = startup_config_from_cli(&cli);
+    let mut startup_config = startup_config_from_cli(&cli);
 
     let socket_path = if invoked_as_tmux(&args) {
         resolve_tmux_compatible_socket_path(cli.socket_name(), cli.socket_path())
@@ -197,6 +192,53 @@ where
         resolve_socket_path(cli.socket_name(), cli.socket_path())
     }
     .map_err(ExitFailure::from_client)?;
+
+    if let Some(crate::cli_args::Command::AttachSession(args)) = cli.command.as_ref() {
+        validate_nested_attach_before_connect(args, &socket_path)?;
+    }
+
+    // A start-server command may create the daemon that loads command-alias
+    // definitions from `-f`. Resolve the original argv only after that config
+    // is ready, while retaining the startup connection so the empty daemon
+    // cannot exit between alias resolution and typed dispatch.
+    let mut startup_connection = None;
+    if runtime_resolution.is_none()
+        && cli.control_mode == 0
+        && !cli.no_fork
+        && !cli.no_start_server
+        && cli.shell_command.is_none()
+        && cli
+            .command
+            .as_ref()
+            .is_some_and(command_has_start_server_flag)
+    {
+        startup_connection = Some(
+            ensure_server_running_with_config(&socket_path, startup_config.auto_start.clone())
+                .map_err(ExitFailure::from_auto_start)
+                .map_err(|error| error.with_socket_context(&socket_path))?,
+        );
+        let cold_resolution = alias_fallback::runtime_command_resolution_after_startup(
+            &args,
+            &socket_path,
+            startup_connection
+                .as_mut()
+                .expect("startup connection was just stored"),
+        )?;
+        if let Some(alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(exit_code)) =
+            cold_resolution.as_ref()
+        {
+            return Ok(*exit_code);
+        }
+        if cold_resolution.is_some() {
+            cli = parse_with_runtime_resolution(&args, cold_resolution.as_ref())
+                .map_err(ExitFailure::from_clap)?;
+            cli.utf8 |= infer_client_utf8_from_env();
+            let command_was_provided = cli.command.is_some();
+            validate_top_level_invocation(&cli, command_was_provided)?;
+            accept_compatibility_options(&cli);
+            startup_config = startup_config_from_cli(&cli);
+        }
+    }
 
     if let Some(shell_command) = cli.shell_command.as_deref() {
         return run_shell_startup(
@@ -219,8 +261,23 @@ where
     }
     let client_terminal = client_terminal_context_from_cli(&cli);
     let commands = cli.into_command_queue();
-    dispatch_command_queue(commands, &socket_path, startup, client_terminal)
-        .map_err(|error| error.with_socket_context(&socket_path))
+    let result = dispatch_command_queue(commands, &socket_path, startup, client_terminal)
+        .map_err(|error| error.with_socket_context(&socket_path));
+    drop(startup_connection);
+    result
+}
+
+fn parse_with_runtime_resolution(
+    args: &[OsString],
+    resolution: Option<&alias_fallback::RuntimeCommandResolution>,
+) -> Result<Cli, clap::Error> {
+    match resolution {
+        Some(alias_fallback::RuntimeCommandResolution::Canonical(groups)) => {
+            parse_with_runtime_command_groups(args.to_vec(), groups)
+        }
+        Some(alias_fallback::RuntimeCommandResolution::LegacyDirect) | None => parse(args.to_vec()),
+        Some(alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(_)) => unreachable!(),
+    }
 }
 
 fn invoked_as_tmux(args: &[OsString]) -> bool {

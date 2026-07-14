@@ -1,7 +1,7 @@
 use crate::grid::{Grid, GridCell, GridCellFlags, GridLineFlags};
 use crate::input::mode;
 use crate::input::{CellState, InputEndType, ScreenWriter, COLOUR_DEFAULT};
-use crate::TerminalPassthrough;
+use crate::{TerminalPaletteIndex, TerminalPassthrough};
 
 use super::{SavedGrid, Screen, TITLE_STACK_MAX};
 
@@ -573,7 +573,27 @@ impl ScreenWriter for Screen {
         }
     }
 
-    fn osc_palette(&mut self, _data: &str, _end: InputEndType) {}
+    fn osc_palette(&mut self, data: &str, _end: InputEndType) {
+        // OSC 4 is a list of index/value pairs. tmux 3.7b forwards each valid
+        // query as its own canonical ST-terminated OSC while handling palette
+        // sets internally. RMUX does not maintain an outer-terminal palette,
+        // so keep set behaviour unchanged and relay only strict, bounded
+        // queries. The dedicated event kind bypasses generic raw-passthrough
+        // policy without reflecting arbitrary OSC payloads.
+        let mut fields = data.split(';');
+        while let Some(index) = fields.next() {
+            let Some(value) = fields.next() else {
+                break;
+            };
+            if value != "?" {
+                continue;
+            }
+            let Some(index) = TerminalPaletteIndex::parse(index) else {
+                continue;
+            };
+            self.push_terminal_passthrough(TerminalPassthrough::palette_query(index));
+        }
+    }
     fn osc_notification(&mut self, _data: &str) {}
     fn osc_fg_colour(&mut self, _data: &str, _end: InputEndType) {}
     fn osc_bg_colour(&mut self, _data: &str, _end: InputEndType) {}

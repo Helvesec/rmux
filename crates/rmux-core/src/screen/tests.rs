@@ -280,6 +280,59 @@ fn terminal_passthrough_keeps_newest_events_when_queue_is_full() {
 }
 
 #[test]
+fn osc4_palette_queries_are_bounded_split_and_canonicalized() {
+    let mut screen = new_screen(10, 2, 10);
+    let mut parser = InputParser::new();
+
+    parser.parse(b"\x1b]4;0;?;1;rgb:ffff/0000/0000;255;?", &mut screen);
+    assert!(screen.take_terminal_passthrough().is_empty());
+    parser.parse(b"\x07", &mut screen);
+
+    let queries = screen.take_terminal_passthrough();
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0].render_sequence(), b"\x1b]4;0;?\x1b\\");
+    assert_eq!(queries[1].render_sequence(), b"\x1b]4;255;?\x1b\\");
+    assert_eq!(
+        queries[0].palette_query_index(),
+        Some(crate::TerminalPaletteIndex::from(0))
+    );
+    assert_eq!(
+        queries[1].palette_query_index(),
+        Some(crate::TerminalPaletteIndex::from(255))
+    );
+
+    parser.parse(
+        b"\x1b]4;256;?;not-an-index;?;2;rgb:0000/0000/0000\x1b\\",
+        &mut screen,
+    );
+    assert!(
+        screen.take_terminal_passthrough().is_empty(),
+        "invalid indices and palette sets are never reflected to the outer terminal"
+    );
+}
+
+#[test]
+fn osc4_bel_and_st_queries_survive_every_fragmentation_boundary() {
+    for sequence in [b"\x1b]4;7;?\x07".as_slice(), b"\x1b]4;7;?\x1b\\".as_slice()] {
+        for split in 0..=sequence.len() {
+            let mut screen = new_screen(10, 2, 10);
+            let mut parser = InputParser::new();
+
+            parser.parse(&sequence[..split], &mut screen);
+            // The parser completes ST at its ESC introducer, before the
+            // trailing backslash arrives. Preserve any event emitted there
+            // and ensure the continuation neither loses nor duplicates it.
+            let mut queries = screen.take_terminal_passthrough();
+            parser.parse(&sequence[split..], &mut screen);
+
+            queries.extend(screen.take_terminal_passthrough());
+            assert_eq!(queries.len(), 1, "split at {split}");
+            assert_eq!(queries[0].render_sequence(), b"\x1b]4;7;?\x1b\\");
+        }
+    }
+}
+
+#[test]
 fn title_stack_keeps_newest_entries_when_full() {
     let mut screen = new_screen(10, 2, 10);
 

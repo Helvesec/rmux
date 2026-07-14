@@ -913,6 +913,32 @@ mod tests {
     }
 
     #[test]
+    fn pane_delta_keeps_styled_zwj_text_at_right_edge() {
+        let size = TerminalSize { cols: 5, rows: 3 };
+        let session = Session::new(session_name("alpha"), size);
+        let pane = session.window().active_pane().expect("active pane");
+        let options = OptionStore::new();
+        let before = Screen::new(size, 100);
+        let mut after = Screen::new(size, 100);
+        let mut parser = InputParser::new();
+        parser.parse("\x1b[31m👩\u{200d}💻ABC".as_bytes(), &mut after);
+        let before = PaneRenderSnapshot::capture(&session, &options, pane, &before)
+            .expect("before snapshot");
+        let after =
+            PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
+
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+            panic!("composed-cell repaint should stay incremental");
+        };
+        let frame = String::from_utf8(delta.frame().to_vec()).expect("delta frame is utf-8");
+
+        assert!(
+            frame.contains("\u{1b}[31m👩\u{200d}💻ABC"),
+            "delta repaint must preserve styled ZWJ cells and following text: {frame:?}"
+        );
+    }
+
+    #[test]
     fn pane_delta_trims_plain_ascii_padding_for_short_line_growth() {
         let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
         let pane = session.window().active_pane().expect("active pane");

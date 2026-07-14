@@ -24,6 +24,14 @@ fn assert_tiny_direct(args: &[&str], command: &str) {
     }
 }
 
+fn assert_tiny_starts_server(args: &[&str], expected: bool) {
+    match TinyInvocation::parse(&os_args(args)) {
+        TinyInvocation::Direct(parsed) => assert_eq!(parsed.starts_server(), expected),
+        TinyInvocation::Fallback => panic!("{args:?} unexpectedly fell back to helper"),
+        TinyInvocation::Version => panic!("{args:?} unexpectedly parsed as version"),
+    }
+}
+
 fn assert_tiny_fallback(args: &[&str]) {
     match TinyInvocation::parse(&os_args(args)) {
         TinyInvocation::Fallback => {}
@@ -83,6 +91,25 @@ fn tiny_runtime_alias_probe_uses_the_original_command_arguments() {
             "$HOME".to_owned(),
         ])
     );
+}
+
+#[test]
+fn tiny_start_server_inventory_covers_every_cold_alias_entry_path() {
+    for args in [
+        &["rmux", "start-server"][..],
+        &["rmux", "new-session", "-d"][..],
+        &["rmux", "attach-session"][..],
+    ] {
+        assert_tiny_starts_server(args, true);
+    }
+
+    for args in [
+        &["rmux", "list-sessions"][..],
+        &["rmux", "has-session", "-t", "alpha"][..],
+        &["rmux", "kill-server"][..],
+    ] {
+        assert_tiny_starts_server(args, false);
+    }
 }
 
 #[test]

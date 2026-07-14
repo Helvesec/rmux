@@ -384,7 +384,7 @@ impl RequestHandler {
     ) -> Response {
         let target_client = request.target_client.clone();
         let resolved_path = resolve_buffer_path(&request.path, request.cwd.as_deref());
-        let content = match fs::read(&resolved_path) {
+        let content = match read_buffer_file(resolved_path).await {
             Ok(content) => content,
             Err(error) => {
                 return Response::Error(ErrorResponse {
@@ -626,6 +626,12 @@ impl RequestHandler {
             .send_attach_control(attach_pid, AttachControl::Write(payload), command_name)
             .await;
     }
+}
+
+async fn read_buffer_file(path: PathBuf) -> io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || fs::read(path))
+        .await
+        .map_err(|error| io::Error::other(format!("buffer file reader failed: {error}")))?
 }
 
 fn resolve_buffer_path(path: &str, cwd: Option<&Path>) -> PathBuf {

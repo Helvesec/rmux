@@ -3,6 +3,7 @@
 mod common;
 
 use std::error::Error;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,9 +11,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_proto::{encode_frame, FrameDecoder, HasSessionRequest, Request, Response};
-use rmux_sdk::{EnsureSession, Input, PaneCloseOutcome, PaneSet, RmuxBuilder, SessionName};
+use rmux_sdk::{
+    EnsureSession, Input, PaneCloseOutcome, PaneRef, PaneSet, RmuxBuilder, RmuxError, SessionName,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::time::Instant;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -167,6 +170,72 @@ async fn pane_set_close_all_reports_per_pane_outcomes() -> TestResult {
     harness.finish().await
 }
 
+#[tokio::test]
+async fn pane_set_expect_any_timeout_bounds_stalled_identity_rpc() -> TestResult {
+    let root = TestRoot::new("expect-any-stalled-id");
+    std::fs::create_dir_all(root.path())?;
+    let socket_path = root.path().join("daemon.sock");
+    let listener = UnixListener::bind(&socket_path)?;
+    let pane = RmuxBuilder::new()
+        .unix_socket(&socket_path)
+        .default_timeout(Duration::from_secs(1))
+        .build()
+        .pane(PaneRef::new(session_name("sdkpanesetanyid"), 0, 0))
+        .await?;
+    let panes = PaneSet::new([pane]);
+
+    let (guarded, server) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            panes
+                .expect_any()
+                .visible_text_contains("never")
+                .timeout(Duration::from_millis(25)),
+        ),
+        hold_first_list_panes_response(listener),
+    );
+    server?;
+    let outcome = guarded.expect("the public PaneSet deadline must beat the external watchdog");
+    let any = outcome.any().expect("expect_any returns any outcome");
+    assert!(!any.matched());
+    assert_eq!(any.failures().len(), 1);
+    assert_timed_out(any.failures()[0].error(), "wait for pane snapshot text");
+    Ok(())
+}
+
+#[tokio::test]
+async fn pane_set_expect_all_timeout_bounds_stalled_identity_rpc() -> TestResult {
+    let root = TestRoot::new("expect-all-stalled-id");
+    std::fs::create_dir_all(root.path())?;
+    let socket_path = root.path().join("daemon.sock");
+    let listener = UnixListener::bind(&socket_path)?;
+    let pane = RmuxBuilder::new()
+        .unix_socket(&socket_path)
+        .default_timeout(Duration::from_secs(1))
+        .build()
+        .pane(PaneRef::new(session_name("sdkpanesetallid"), 0, 0))
+        .await?;
+    let panes = PaneSet::new([pane]);
+
+    let (guarded, server) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            panes
+                .expect_all()
+                .visible_text_contains("never")
+                .timeout(Duration::from_millis(25)),
+        ),
+        hold_first_list_panes_response(listener),
+    );
+    server?;
+    let outcome = guarded.expect("the public PaneSet deadline must beat the external watchdog");
+    let all = outcome.all().expect("expect_all returns all outcome");
+    assert!(!all.is_success());
+    assert_eq!(all.failures().len(), 1);
+    assert_timed_out(all.failures()[0].error(), "wait for pane snapshot text");
+    Ok(())
+}
+
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
@@ -192,6 +261,46 @@ async fn read_response(stream: &mut UnixStream) -> TestResult<Response> {
             return Err("connection closed before response frame".into());
         }
         decoder.push_bytes(&read_buffer[..bytes_read]);
+    }
+}
+
+async fn hold_first_list_panes_response(listener: UnixListener) -> TestResult {
+    let (mut stream, _) = listener.accept().await?;
+    let request = read_request(&mut stream).await?;
+    assert!(
+        matches!(request, Request::ListPanes(_)),
+        "PaneSet identity setup must list panes, got {request:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    Ok(())
+}
+
+async fn read_request(stream: &mut UnixStream) -> TestResult<Request> {
+    let mut decoder = FrameDecoder::new();
+    let mut read_buffer = [0_u8; 8192];
+
+    loop {
+        if let Some(request) = decoder.next_frame::<Request>()? {
+            return Ok(request);
+        }
+
+        let bytes_read = stream.read(&mut read_buffer).await?;
+        if bytes_read == 0 {
+            return Err("connection closed before request frame".into());
+        }
+        decoder.push_bytes(&read_buffer[..bytes_read]);
+    }
+}
+
+fn assert_timed_out(error: &RmuxError, expected_operation: &str) {
+    match error {
+        RmuxError::Transport {
+            operation, source, ..
+        } => {
+            assert_eq!(*operation, expected_operation);
+            assert_eq!(source.kind(), io::ErrorKind::TimedOut);
+        }
+        other => panic!("expected typed timeout transport error, got {other:?}"),
     }
 }
 

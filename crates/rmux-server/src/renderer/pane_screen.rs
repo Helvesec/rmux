@@ -3,8 +3,9 @@ use std::borrow::Cow;
 use rmux_core::input::mode;
 use rmux_core::style::{Style, StyleCell};
 use rmux_core::{
-    formats::FormatContext, text_width as tmux_text_width, GridRenderOptions, OptionStore, Pane,
-    Screen, ScreenCaptureRange, Session, Utf8Config,
+    formats::FormatContext, text_width as tmux_text_width,
+    truncate_to_width as tmux_truncate_to_width, GridRenderOptions, OptionStore, Pane, Screen,
+    ScreenCaptureRange, Session, Utf8Config,
 };
 use rmux_proto::OptionName;
 
@@ -333,7 +334,55 @@ pub(crate) fn truncate_rendered_pane_line(line: &[u8], width: usize, utf8: &Utf8
     if width == 0 {
         return Vec::new();
     }
+    if line.is_ascii() {
+        return truncate_rendered_ascii_pane_line(line, width, utf8);
+    }
 
+    let Ok(line_text) = std::str::from_utf8(line) else {
+        return Vec::new();
+    };
+    let mut visible_text = String::with_capacity(line.len());
+    let mut index = 0_usize;
+    while index < line.len() {
+        if line[index] == 0x1b {
+            index = ansi_sequence_end(line, index);
+            continue;
+        }
+
+        let Some(ch) = line_text[index..].chars().next() else {
+            break;
+        };
+        visible_text.push(ch);
+        index += ch.len_utf8();
+    }
+    let visible_prefix_len = tmux_truncate_to_width(&visible_text, width, utf8).len();
+
+    let mut output = Vec::with_capacity(line.len().min(width.saturating_mul(4)));
+    let mut visible_copied = 0_usize;
+    index = 0;
+    while index < line.len() {
+        if line[index] == 0x1b {
+            let end = ansi_sequence_end(line, index);
+            output.extend_from_slice(&line[index..end]);
+            index = end;
+            continue;
+        }
+
+        let Some(ch) = line_text[index..].chars().next() else {
+            break;
+        };
+        let ch_len = ch.len_utf8();
+        if visible_copied.saturating_add(ch_len) > visible_prefix_len {
+            break;
+        }
+        output.extend_from_slice(&line[index..index + ch_len]);
+        visible_copied += ch_len;
+        index += ch_len;
+    }
+    output
+}
+
+fn truncate_rendered_ascii_pane_line(line: &[u8], width: usize, utf8: &Utf8Config) -> Vec<u8> {
     let mut output = Vec::with_capacity(line.len().min(width.saturating_mul(4)));
     let mut used = 0_usize;
     let mut index = 0_usize;
@@ -345,22 +394,15 @@ pub(crate) fn truncate_rendered_pane_line(line: &[u8], width: usize, utf8: &Utf8
             continue;
         }
 
-        let Ok(rest) = std::str::from_utf8(&line[index..]) else {
-            break;
-        };
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
-        let ch_len = ch.len_utf8();
         let mut buf = [0_u8; 4];
-        let text = ch.encode_utf8(&mut buf);
+        let text = char::from(line[index]).encode_utf8(&mut buf);
         let cell_width = tmux_text_width(text, utf8);
         if cell_width != 0 && used.saturating_add(cell_width) > width {
             break;
         }
-        output.extend_from_slice(&line[index..index + ch_len]);
+        output.push(line[index]);
         used = used.saturating_add(cell_width);
-        index += ch_len;
+        index += 1;
     }
     output
 }

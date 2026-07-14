@@ -4,10 +4,15 @@ use std::time::{Duration, Instant};
 use crate::clock_mode::{ClockModeState, CLOCK_MODE_NAME};
 use crate::copy_mode::{CopyModeRenderSnapshot, CopyModeState, CopyModeSummary};
 use rmux_core::{
-    style::Style, GridRenderOptions, Screen, ScreenCaptureRange, TerminalPassthrough,
-    TerminalScreen, Utf8Config,
+    style::Style, GridRenderOptions, Screen, ScreenCaptureRange, TerminalPaletteIndex,
+    TerminalPassthrough, TerminalScreen, Utf8Config,
 };
 use rmux_proto::TerminalSize;
+
+#[path = "pane_transcript/palette_queries.rs"]
+mod palette_queries;
+
+use palette_queries::PendingPaletteQueries;
 
 pub(crate) type SharedPaneTranscript = Arc<Mutex<PaneTranscript>>;
 
@@ -27,6 +32,7 @@ pub(crate) struct PaneTranscript {
     next_clock_generation: u64,
     ground_timer_started_at: Option<Instant>,
     ground_timer_token: u64,
+    pending_palette_queries: PendingPaletteQueries,
     #[cfg(test)]
     utf8_config: Utf8Config,
 }
@@ -81,6 +87,7 @@ impl PaneTranscript {
             next_clock_generation: 1,
             ground_timer_started_at: None,
             ground_timer_token: 0,
+            pending_palette_queries: PendingPaletteQueries::default(),
             #[cfg(test)]
             utf8_config: Utf8Config::default(),
         }
@@ -114,6 +121,7 @@ impl PaneTranscript {
         let title_after = self.terminal.screen().title().to_owned();
         let title_changed = title_after != title_before;
         let passthroughs = self.terminal.take_terminal_passthrough();
+        self.pending_palette_queries.register(&passthroughs, now);
         let dropped_passthrough_count = self.terminal.take_terminal_passthrough_dropped_count();
         let replies = self.terminal.take_replies();
         let ground_timer = self.refresh_ground_timer(now);
@@ -126,6 +134,22 @@ impl PaneTranscript {
             replies,
             ground_timer,
         }
+    }
+
+    /// Consumes one correlated OSC 4 response for a recently emitted query.
+    /// Unsolicited, expired, and duplicate terminal responses are rejected so
+    /// attach input cannot become an arbitrary control-sequence injection path.
+    pub(crate) fn consume_palette_query_response(&mut self, index: TerminalPaletteIndex) -> bool {
+        self.pending_palette_queries.consume(index, Instant::now())
+    }
+
+    #[cfg(test)]
+    fn consume_palette_query_response_at(
+        &mut self,
+        index: TerminalPaletteIndex,
+        now: Instant,
+    ) -> bool {
+        self.pending_palette_queries.consume(index, now)
     }
 
     fn refresh_ground_timer(&mut self, now: Instant) -> Option<PaneGroundTimer> {
@@ -190,6 +214,7 @@ impl PaneTranscript {
         let _ = self.terminal.take_replies();
         self.ground_timer_started_at = None;
         self.ground_timer_token = self.ground_timer_token.saturating_add(1);
+        self.pending_palette_queries.clear();
         self.mode = None;
     }
 
@@ -600,8 +625,11 @@ fn visible_revision_reuse_map(previous: &[u64], next: &[u64]) -> Option<Vec<Opti
 #[cfg(test)]
 mod tests {
     use super::{visible_revision_reuse_map, PaneTranscript};
-    use rmux_core::{input::mode, GridRenderOptions, ScreenCaptureRange, TerminalScreen};
+    use rmux_core::{
+        input::mode, GridRenderOptions, ScreenCaptureRange, TerminalPaletteIndex, TerminalScreen,
+    };
     use rmux_proto::TerminalSize;
+    use std::time::{Duration, Instant};
 
     fn transcript(cols: u16, rows: u16, limit: usize) -> PaneTranscript {
         PaneTranscript::new(limit, TerminalSize { cols, rows })
@@ -778,6 +806,62 @@ mod tests {
         )
         .expect("capture is utf8");
         assert!(!capture.contains("52;c"));
+    }
+
+    #[test]
+    fn osc4_queries_register_only_bounded_correlated_responses() {
+        let mut transcript = transcript(40, 4, 10);
+        let index = TerminalPaletteIndex::from(0);
+
+        let first = transcript.append_bytes_with_effects(b"\x1b]4;0;?\x07");
+        assert_eq!(first.passthroughs.len(), 1);
+        assert_eq!(first.passthroughs[0].render_sequence(), b"\x1b]4;0;?\x1b\\");
+        assert!(transcript.consume_palette_query_response(index));
+        assert!(
+            !transcript.consume_palette_query_response(index),
+            "an unsolicited duplicate response must be rejected"
+        );
+
+        transcript.append_bytes_with_effects(b"\x1b]4;0;?;0;?\x1b\\");
+        assert!(transcript.consume_palette_query_response(index));
+        assert!(transcript.consume_palette_query_response(index));
+        assert!(!transcript.consume_palette_query_response(index));
+
+        for _ in 0..20 {
+            transcript.append_bytes_with_effects(b"\x1b]4;0;?\x07");
+        }
+        for _ in 0..8 {
+            assert!(transcript.consume_palette_query_response(index));
+        }
+        assert!(
+            !transcript.consume_palette_query_response(index),
+            "repeated unanswered queries stay capped"
+        );
+    }
+
+    #[test]
+    fn osc4_query_response_correlation_expires_and_reset_clears_it() {
+        let mut transcript = transcript(40, 4, 10);
+        let index = TerminalPaletteIndex::from(7);
+
+        transcript.append_bytes_with_effects(b"\x1b]4;7;?\x1b\\");
+        assert!(!transcript
+            .consume_palette_query_response_at(index, Instant::now() + Duration::from_secs(9),));
+
+        transcript.append_bytes_with_effects(b"\x1b]4;7;?\x07");
+        transcript.reset_terminal_state();
+        assert!(!transcript.consume_palette_query_response(index));
+    }
+
+    #[test]
+    fn osc4_invalid_indices_and_sets_never_open_a_response_slot() {
+        let mut transcript = transcript(40, 4, 10);
+
+        let result =
+            transcript.append_bytes_with_effects(b"\x1b]4;256;?;0;rgb:0000/0000/0000;bad;?\x07");
+        assert!(result.passthroughs.is_empty());
+        assert!(!transcript.consume_palette_query_response(TerminalPaletteIndex::from(0)));
+        assert!(!transcript.consume_palette_query_response(TerminalPaletteIndex::from(255)));
     }
 
     #[test]

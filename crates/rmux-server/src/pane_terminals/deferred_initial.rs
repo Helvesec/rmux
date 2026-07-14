@@ -9,9 +9,10 @@ use super::lifecycle_state::terminal_size_from_geometry;
 use super::pane_lifecycle::{clone_terminal_for_exit_watcher, clone_terminal_for_output_reader};
 use super::{
     pane_terminal_geometry_for_session, session_not_found, CompletedDeferredInitialPane,
-    DeferredInitialPaneConsoleInputAction, DeferredInitialPaneInput, DeferredInitialPaneInputFlush,
-    DeferredInitialPaneSpawn, HandlerState, InitialPaneSpawnOptions, PaneExitMetadata,
-    PaneLifecycleSpawn, PaneOutputSpawn, StartingPane,
+    DeferredInitialPaneConsoleInputAction, DeferredInitialPaneIdentity, DeferredInitialPaneInput,
+    DeferredInitialPaneInputDrain, DeferredInitialPaneInputFlush, DeferredInitialPaneSpawn,
+    HandlerState, InitialPaneSpawnOptions, PaneExitMetadata, PaneLifecycleSpawn, PaneOutputSpawn,
+    StartingPane,
 };
 
 const STARTING_PANE_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -106,12 +107,11 @@ impl HandlerState {
         Ok(DeferredInitialPaneSpawn {
             runtime_session_name,
             visible_session_name: session_name.clone(),
-            pane_id: pane.id,
+            identity: DeferredInitialPaneIdentity::new(pane.id, generation),
             geometry: pane_geometry,
             profile,
             runtime_window_name,
             command: spawn.command.cloned(),
-            generation,
             pane_alert_callback: spawn.pane_alert_callback,
             pane_exit_callback: spawn.pane_exit_callback,
         })
@@ -133,12 +133,15 @@ impl HandlerState {
         job: DeferredInitialPaneSpawn,
         mut terminal: PaneTerminal,
     ) -> Result<Option<CompletedDeferredInitialPane>, RmuxError> {
-        let Some(runtime_session_name) = self.starting_runtime_session_for_job(&job) else {
+        let identity = job.identity;
+        let pane_id = identity.pane_id();
+        let Some(runtime_session_name) =
+            self.starting_runtime_session_for_identity(&job.runtime_session_name, identity)
+        else {
             return Ok(None);
         };
-        let Some(target) = self.pane_target_for_runtime_pane(&runtime_session_name, job.pane_id)
-        else {
-            self.remove_starting_pane(&runtime_session_name, job.pane_id);
+        let Some(target) = self.pane_target_for_runtime_pane(&runtime_session_name, pane_id) else {
+            self.remove_starting_pane_if_identity(&runtime_session_name, identity);
             return Ok(None);
         };
         let (pane_geometry, session_size, terminal_pixels) = {
@@ -181,18 +184,19 @@ impl HandlerState {
             })?;
         let pid = terminal.pid();
         let output_reader =
-            clone_terminal_for_output_reader(&mut terminal, target.session_name(), job.pane_id)?;
+            clone_terminal_for_output_reader(&mut terminal, target.session_name(), pane_id)?;
         let exit_watcher =
-            clone_terminal_for_exit_watcher(&terminal, target.session_name(), job.pane_id)?;
+            clone_terminal_for_exit_watcher(&terminal, target.session_name(), pane_id)?;
         let (queued_input, input_writer) = {
             let starting = self
                 .starting_panes
                 .get_mut(&runtime_session_name)
-                .and_then(|panes| panes.get_mut(&job.pane_id))
+                .and_then(|panes| panes.get_mut(&pane_id))
+                .filter(|starting| starting.generation == identity.generation())
                 .ok_or_else(|| {
                     RmuxError::Server(format!(
                         "missing starting pane state for pane id {} in session {}",
-                        job.pane_id.as_u32(),
+                        pane_id.as_u32(),
                         runtime_session_name
                     ))
                 })?;
@@ -213,18 +217,18 @@ impl HandlerState {
         if self.terminals.contains_session(&runtime_session_name) {
             self.terminals.insert_pane(
                 runtime_session_name.clone(),
-                job.pane_id,
+                pane_id,
                 target.window_index(),
                 target.pane_index(),
                 terminal,
             )?;
         } else {
             self.terminals
-                .insert_session(runtime_session_name.clone(), job.pane_id, terminal)?;
+                .insert_session(runtime_session_name.clone(), pane_id, terminal)?;
         }
         let output_sequence = self.activate_pending_pane_output(
             &runtime_session_name,
-            job.pane_id,
+            pane_id,
             PaneOutputSpawn {
                 geometry: pane_geometry,
                 initial_title: None,
@@ -234,14 +238,13 @@ impl HandlerState {
                 pane_exit_callback: job.pane_exit_callback,
             },
         )?;
-        self.mark_pane_lifecycle_running(job.pane_id, Some(pid));
-        self.update_pane_lifecycle_output_sequence(job.pane_id, output_sequence);
+        self.mark_pane_lifecycle_running(pane_id, Some(pid));
+        self.update_pane_lifecycle_output_sequence(pane_id, output_sequence);
         self.sync_pane_lifecycle_dimensions_for_session(target.session_name());
 
         Ok(Some(CompletedDeferredInitialPane {
-            visible_session_name: target.session_name().clone(),
-            runtime_session_name,
-            pane_id: job.pane_id,
+            runtime_session_name_hint: runtime_session_name,
+            identity,
             pane_pid: pid,
             input_writer,
             queued_input,
@@ -250,15 +253,22 @@ impl HandlerState {
 
     pub(crate) fn take_deferred_initial_pane_input_or_finish(
         &mut self,
-        runtime_session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Result<Option<DeferredInitialPaneInputFlush>, RmuxError> {
+        runtime_session_name_hint: &SessionName,
+        identity: DeferredInitialPaneIdentity,
+    ) -> Result<DeferredInitialPaneInputDrain, RmuxError> {
+        let Some(runtime_session_name) =
+            self.starting_runtime_session_for_identity(runtime_session_name_hint, identity)
+        else {
+            return Ok(DeferredInitialPaneInputDrain::Missing);
+        };
+        let pane_id = identity.pane_id();
         let Some(starting) = self
             .starting_panes
-            .get_mut(runtime_session_name)
+            .get_mut(&runtime_session_name)
             .and_then(|panes| panes.get_mut(&pane_id))
+            .filter(|starting| starting.generation == identity.generation())
         else {
-            return Ok(None);
+            return Ok(DeferredInitialPaneInputDrain::Missing);
         };
 
         if starting.queued_input.is_empty() {
@@ -266,43 +276,55 @@ impl HandlerState {
             // queue. A writer can now either enqueue before this removal and
             // be drained, or observe no StartingPane and write to the live
             // terminal; it can never enqueue into an entry removed later.
-            let _ = self.remove_starting_pane(runtime_session_name, pane_id);
-            return Ok(None);
+            let _ = self.remove_starting_pane_if_identity(&runtime_session_name, identity);
+            return Ok(DeferredInitialPaneInputDrain::Finished {
+                runtime_session_name,
+            });
         }
 
         let queued_input = starting.queued_input.drain(..).collect::<Vec<_>>();
         starting.queued_input_bytes = 0;
-        let target = self.pane_target_for_runtime_pane(runtime_session_name, pane_id);
+        let target = self.pane_target_for_runtime_pane(&runtime_session_name, pane_id);
         let Some(target) = target else {
-            let _ = self.remove_starting_pane(runtime_session_name, pane_id);
-            return Ok(None);
+            let _ = self.remove_starting_pane_if_identity(&runtime_session_name, identity);
+            return Ok(DeferredInitialPaneInputDrain::Finished {
+                runtime_session_name,
+            });
         };
         let input_writer = self.terminals.clone_pane_master(
-            runtime_session_name,
+            &runtime_session_name,
             pane_id,
             target.window_index(),
             target.pane_index(),
         )?;
         let pane_pid = self.terminals.pane_pid(
-            runtime_session_name,
+            &runtime_session_name,
             pane_id,
             target.window_index(),
             target.pane_index(),
         )?;
 
-        Ok(Some(DeferredInitialPaneInputFlush {
-            input_writer,
-            pane_pid,
-            queued_input,
-        }))
+        Ok(DeferredInitialPaneInputDrain::Flush {
+            runtime_session_name,
+            flush: DeferredInitialPaneInputFlush {
+                input_writer,
+                pane_pid,
+                queued_input,
+            },
+        })
     }
 
     pub(crate) fn finish_deferred_initial_pane_input_after_error(
         &mut self,
-        runtime_session_name: &SessionName,
-        pane_id: PaneId,
+        runtime_session_name_hint: &SessionName,
+        identity: DeferredInitialPaneIdentity,
     ) {
-        let _ = self.remove_starting_pane(runtime_session_name, pane_id);
+        let Some(runtime_session_name) =
+            self.starting_runtime_session_for_identity(runtime_session_name_hint, identity)
+        else {
+            return;
+        };
+        let _ = self.remove_starting_pane_if_identity(&runtime_session_name, identity);
     }
 
     pub(crate) fn cancel_starting_pane(
@@ -319,31 +341,31 @@ impl HandlerState {
         job: &DeferredInitialPaneSpawn,
         error: &RmuxError,
     ) -> Option<PaneExitEvent> {
-        let runtime_session_name = self.starting_runtime_session_for_job(job)?;
+        let identity = job.identity;
+        let pane_id = identity.pane_id();
+        let runtime_session_name =
+            self.starting_runtime_session_for_identity(&job.runtime_session_name, identity)?;
         let visible_session_name = self
-            .pane_target_for_runtime_pane(&runtime_session_name, job.pane_id)
+            .pane_target_for_runtime_pane(&runtime_session_name, pane_id)
             .map(|target| target.session_name().clone())
             .unwrap_or_else(|| job.visible_session_name.clone());
-        let _ = self.remove_starting_pane(&runtime_session_name, job.pane_id);
+        let _ = self.remove_starting_pane_if_identity(&runtime_session_name, identity);
         let message = format!(
             "failed to spawn pane {} in session {}: {error}",
-            job.pane_id.as_u32(),
+            pane_id.as_u32(),
             visible_session_name
         );
         self.add_message(message.clone());
         let bytes = format!("{message}\r\n").into_bytes();
-        let _ = self.append_bytes_to_runtime_pane_transcript(
-            &runtime_session_name,
-            job.pane_id,
-            &bytes,
-        );
+        let _ =
+            self.append_bytes_to_runtime_pane_transcript(&runtime_session_name, pane_id, &bytes);
         if let Some(sender) = self
             .pane_outputs
             .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&job.pane_id))
+            .and_then(|panes| panes.get(&pane_id))
         {
-            let _ = sender.send_for_generation(Some(job.generation), bytes);
-            let _ = sender.send_for_generation(Some(job.generation), Vec::new());
+            let _ = sender.send_for_generation(Some(identity.generation()), bytes);
+            let _ = sender.send_for_generation(Some(identity.generation()), Vec::new());
         }
         let metadata = PaneExitMetadata {
             status: Some(1),
@@ -353,12 +375,12 @@ impl HandlerState {
         self.dead_panes
             .entry(runtime_session_name.clone())
             .or_default()
-            .insert(job.pane_id, metadata);
-        self.mark_pane_lifecycle_exited(job.pane_id, metadata);
+            .insert(pane_id, metadata);
+        self.mark_pane_lifecycle_exited(pane_id, metadata);
         Some(PaneExitEvent::eof_published(
             runtime_session_name,
-            job.pane_id,
-            Some(job.generation),
+            pane_id,
+            Some(identity.generation()),
         ))
     }
 
@@ -508,31 +530,41 @@ impl HandlerState {
     fn starting_generation_matches(
         &self,
         runtime_session_name: &SessionName,
-        pane_id: PaneId,
-        generation: u64,
+        identity: DeferredInitialPaneIdentity,
     ) -> bool {
         self.starting_panes
             .get(runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .is_some_and(|pane| pane.generation == generation)
+            .and_then(|panes| panes.get(&identity.pane_id()))
+            .is_some_and(|pane| pane.generation == identity.generation())
     }
 
-    fn starting_runtime_session_for_job(
+    pub(crate) fn starting_runtime_session_for_identity(
         &self,
-        job: &DeferredInitialPaneSpawn,
+        runtime_session_name_hint: &SessionName,
+        identity: DeferredInitialPaneIdentity,
     ) -> Option<SessionName> {
-        if self.starting_generation_matches(&job.runtime_session_name, job.pane_id, job.generation)
-        {
-            return Some(job.runtime_session_name.clone());
+        if self.starting_generation_matches(runtime_session_name_hint, identity) {
+            return Some(runtime_session_name_hint.clone());
         }
         self.starting_panes
             .iter()
             .find(|(_, panes)| {
                 panes
-                    .get(&job.pane_id)
-                    .is_some_and(|pane| pane.generation == job.generation)
+                    .get(&identity.pane_id())
+                    .is_some_and(|pane| pane.generation == identity.generation())
             })
             .map(|(session_name, _)| session_name.clone())
+    }
+
+    fn remove_starting_pane_if_identity(
+        &mut self,
+        runtime_session_name: &SessionName,
+        identity: DeferredInitialPaneIdentity,
+    ) -> Option<StartingPane> {
+        if !self.starting_generation_matches(runtime_session_name, identity) {
+            return None;
+        }
+        self.remove_starting_pane(runtime_session_name, identity.pane_id())
     }
 
     fn remove_starting_pane(
@@ -548,3 +580,7 @@ impl HandlerState {
         removed
     }
 }
+
+#[cfg(test)]
+#[path = "deferred_initial/tests.rs"]
+mod tests;

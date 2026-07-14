@@ -15,8 +15,6 @@ use crate::diagnostics::FEATURE_TRANSPORT_WINDOWS_PIPE;
 use crate::transport::TransportClient;
 use crate::{Result, RmuxEndpoint, RmuxError};
 #[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-#[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED,
 };
@@ -375,10 +373,13 @@ pub(super) async fn connect_transport(
 }
 
 #[cfg(windows)]
-async fn connect_windows_pipe(pipe: &str, timeout: Option<Duration>) -> Result<NamedPipeClient> {
+async fn connect_windows_pipe(
+    pipe: &str,
+    timeout: Option<Duration>,
+) -> Result<rmux_ipc::WindowsPipeClient> {
     let deadline = StartupDeadline::from_timeout(timeout);
     loop {
-        match ClientOptions::new().open(std::path::Path::new(pipe)) {
+        match rmux_ipc::connect_windows_pipe(OsStr::new(pipe)).await {
             Ok(stream) => return Ok(stream),
             Err(error) if windows_pipe_connect_retryable(&error) => {
                 if deadline.is_elapsed() {

@@ -94,11 +94,7 @@ fn prepare_attach_session(
     startup: StartupOptions,
     client_terminal: ClientTerminalContext,
 ) -> Result<PreparedAttachSession, ExitFailure> {
-    let nested_context =
-        detect_context() == ClientContext::Nested && inherited_rmux_socket_matches(socket_path);
-    if nested_context {
-        validate_nested_attach_session(&args)?;
-    }
+    let nested_context = validate_nested_attach_before_connect(&args, socket_path)?;
     let nested_target = args.target.as_ref().map(ToString::to_string);
     let target_spec = args.target.as_ref().map(ToString::to_string);
     let nested_skip_environment_update = args.skip_environment_update;
@@ -134,6 +130,18 @@ fn prepare_attach_session(
         nested_skip_environment_update,
         nested_toggle_read_only,
     })
+}
+
+pub(super) fn validate_nested_attach_before_connect(
+    args: &AttachSessionArgs,
+    socket_path: &Path,
+) -> Result<bool, ExitFailure> {
+    let nested_context =
+        detect_context() == ClientContext::Nested && inherited_rmux_socket_matches(socket_path);
+    if nested_context {
+        validate_nested_attach_session(args)?;
+    }
+    Ok(nested_context)
 }
 
 fn run_nested_attach_session_as_switch_client(

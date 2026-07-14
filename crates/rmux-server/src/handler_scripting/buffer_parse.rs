@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{DeleteBufferRequest, ListBuffersRequest, LoadBufferRequest, Request, RmuxError};
 
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::{missing_argument, unsupported_flag};
 use super::{implicit_pane_target, parse_pane_target};
 
@@ -13,8 +13,8 @@ pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxE
     let mut new_name = None;
     let mut set_clipboard = false;
     let mut target_client = None;
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -39,7 +39,30 @@ pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxE
                 let _ = args.optional();
                 set_clipboard = true;
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "aw", "bnt") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('a') => append = true,
+                        CompactFlag::Bare('w') => set_clipboard = true,
+                        compact_flag @ CompactFlag::Value { flag: 'b', .. } => {
+                            name = Some(compact_flag.value_or_next(&mut args, "-b buffer name")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'n', .. } => {
+                            new_name =
+                                Some(compact_flag.value_or_next(&mut args, "-n buffer name")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target_client =
+                                Some(compact_flag.value_or_next(&mut args, "-t target-client")?);
+                        }
+                        _ => unreachable!("compact set-buffer flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
     let content_parts = args.remaining();
@@ -238,4 +261,44 @@ fn parse_optional_buffer_name(
         }
     }
     Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(value: &str) -> String {
+        value.to_owned()
+    }
+
+    #[test]
+    fn parse_set_buffer_accepts_bare_cluster_before_value_flags() {
+        let request = parse_set_buffer(CommandTokens::new(vec![
+            token("-aw"),
+            token("-baudit"),
+            token("tail"),
+        ]))
+        .expect("clustered set-buffer flags parse");
+
+        let Request::SetBuffer(request) = request else {
+            panic!("expected set-buffer request");
+        };
+        assert!(request.append);
+        assert!(request.set_clipboard);
+        assert_eq!(request.name.as_deref(), Some("audit"));
+        assert_eq!(request.content, b"tail");
+    }
+
+    #[test]
+    fn parse_set_buffer_stops_parsing_flags_at_separator() {
+        let request = parse_set_buffer(CommandTokens::new(vec![token("--"), token("-aw")]))
+            .expect("separator preserves flag-looking buffer content");
+
+        let Request::SetBuffer(request) = request else {
+            panic!("expected set-buffer request");
+        };
+        assert!(!request.append);
+        assert!(!request.set_clipboard);
+        assert_eq!(request.content, b"-aw");
+    }
 }

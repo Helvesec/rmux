@@ -797,7 +797,7 @@ impl TinyCommand {
         let socket_path = self.socket_path();
         let mut connection = match connect_or_absent(socket_path) {
             Ok(ConnectResult::Connected(connection)) => connection,
-            Ok(ConnectResult::Absent) => return Ok(false),
+            Ok(ConnectResult::Absent) => return Ok(self.starts_server()),
             Err(error)
                 if self.is_kill_server()
                     && legacy_shutdown_fallback_wire_version(&error).is_some() =>
@@ -872,6 +872,13 @@ impl TinyCommand {
 
     const fn is_kill_server(&self) -> bool {
         matches!(self, Self::KillServer { .. })
+    }
+
+    const fn starts_server(&self) -> bool {
+        matches!(
+            self,
+            Self::StartServer { .. } | Self::AttachSession { .. } | Self::NewSession { .. }
+        )
     }
 
     fn socket_path(&self) -> &Path {

@@ -4,7 +4,9 @@ use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use rmux_ipc::{connect_blocking, endpoint_for_label, wait_for_peer_close, LocalListener};
+use rmux_ipc::{
+    connect_blocking, connect_windows_pipe, endpoint_for_label, wait_for_peer_close, LocalListener,
+};
 use rmux_os::identity::{IdentityResolver, UserIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
@@ -73,6 +75,39 @@ async fn named_pipe_roundtrip_uses_bound_endpoint() -> std::io::Result<()> {
     .await
     .expect("client roundtrip timed out")
     .expect("client roundtrip task")?;
+
+    timeout(WINDOWS_IPC_TEST_TIMEOUT, accept)
+        .await
+        .expect("accept task timed out")
+        .expect("accept task")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn async_named_pipe_connect_uses_the_verified_client_boundary() -> std::io::Result<()> {
+    let endpoint = endpoint_for_label(format!("async-verified-{}", std::process::id()))?;
+    let listener = LocalListener::bind(&endpoint)?;
+
+    let accept = tokio::spawn(async move {
+        let (mut stream, _peer) = listener.accept().await?;
+        let mut request = [0_u8; 4];
+        stream.read_exact(&mut request).await?;
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong").await?;
+        std::io::Result::Ok(())
+    });
+
+    tokio::task::yield_now().await;
+    let mut client = timeout(
+        WINDOWS_IPC_TEST_TIMEOUT,
+        connect_windows_pipe(endpoint.as_pipe_name()),
+    )
+    .await
+    .expect("verified async client connect timed out")?;
+    client.write_all(b"ping").await?;
+    let mut response = [0_u8; 4];
+    client.read_exact(&mut response).await?;
+    assert_eq!(&response, b"pong");
 
     timeout(WINDOWS_IPC_TEST_TIMEOUT, accept)
         .await

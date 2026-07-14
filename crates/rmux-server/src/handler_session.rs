@@ -18,7 +18,10 @@ use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminals::InitialPaneSpawnOptions;
 #[cfg(windows)]
-use crate::pane_terminals::{CompletedDeferredInitialPane, DeferredInitialPaneSpawn, HandlerState};
+use crate::pane_terminals::{
+    CompletedDeferredInitialPane, DeferredInitialPaneIdentity, DeferredInitialPaneInputDrain,
+    DeferredInitialPaneSpawn, HandlerState,
+};
 use crate::terminal::{parse_environment_assignments, validate_process_command};
 
 #[path = "handler_session/client_environment.rs"]
@@ -873,9 +876,8 @@ impl RequestHandler {
 
     #[cfg(windows)]
     async fn finish_deferred_initial_pane_spawn(&self, completed: CompletedDeferredInitialPane) {
-        let session_name = completed.visible_session_name.clone();
-        let runtime_session_name = completed.runtime_session_name.clone();
-        let pane_id = completed.pane_id;
+        let identity = completed.identity;
+        let mut runtime_session_name_hint = completed.runtime_session_name_hint.clone();
         let mut pending = completed.input_writer.map(|input_writer| {
             crate::pane_terminals::DeferredInitialPaneInputFlush {
                 input_writer,
@@ -884,8 +886,12 @@ impl RequestHandler {
             }
         });
 
-        self.wait_for_deferred_initial_pane_ready(&runtime_session_name, pane_id)
-            .await;
+        if let Some(current_runtime_session_name) = self
+            .wait_for_deferred_initial_pane_ready(&runtime_session_name_hint, identity)
+            .await
+        {
+            runtime_session_name_hint = current_runtime_session_name;
+        }
 
         let input_grace_deadline = tokio::time::Instant::now() + DEFERRED_INITIAL_PANE_INPUT_GRACE;
         loop {
@@ -901,8 +907,8 @@ impl RequestHandler {
                     let mut state = self.state.lock().await;
                     state.add_message(error.to_string());
                     state.finish_deferred_initial_pane_input_after_error(
-                        &runtime_session_name,
-                        pane_id,
+                        &runtime_session_name_hint,
+                        identity,
                     );
                     break;
                 }
@@ -917,66 +923,109 @@ impl RequestHandler {
 
             let drained = {
                 let mut state = self.state.lock().await;
-                state.take_deferred_initial_pane_input_or_finish(&runtime_session_name, pane_id)
+                state.take_deferred_initial_pane_input_or_finish(
+                    &runtime_session_name_hint,
+                    identity,
+                )
             };
             match drained {
-                Ok(Some(next)) => {
-                    pending = Some(next);
+                Ok(DeferredInitialPaneInputDrain::Flush {
+                    runtime_session_name,
+                    flush,
+                }) => {
+                    runtime_session_name_hint = runtime_session_name;
+                    pending = Some(flush);
                 }
-                Ok(None) => {
+                Ok(DeferredInitialPaneInputDrain::Finished {
+                    runtime_session_name,
+                }) => {
+                    runtime_session_name_hint = runtime_session_name;
+                    break;
+                }
+                Ok(DeferredInitialPaneInputDrain::Missing) => {
                     break;
                 }
                 Err(error) => {
                     let mut state = self.state.lock().await;
                     state.add_message(error.to_string());
                     state.finish_deferred_initial_pane_input_after_error(
-                        &runtime_session_name,
-                        pane_id,
+                        &runtime_session_name_hint,
+                        identity,
                     );
                     break;
                 }
             }
         }
 
-        self.refresh_attached_session(&session_name).await;
-        self.refresh_control_session(&session_name).await;
+        self.refresh_deferred_initial_pane(&runtime_session_name_hint, identity)
+            .await;
     }
 
     #[cfg(windows)]
     async fn wait_for_deferred_initial_pane_ready(
         &self,
-        runtime_session_name: &SessionName,
-        pane_id: PaneId,
-    ) {
-        let Some(mut receiver) = ({
+        runtime_session_name_hint: &SessionName,
+        identity: DeferredInitialPaneIdentity,
+    ) -> Option<SessionName> {
+        let (runtime_session_name, mut receiver) = ({
             let state = self.state.lock().await;
-            state.subscribe_runtime_pane_output_from_oldest(runtime_session_name, pane_id)
-        }) else {
-            return;
-        };
+            let runtime_session_name =
+                state.starting_runtime_session_for_identity(runtime_session_name_hint, identity)?;
+            let receiver = state.subscribe_runtime_pane_output_from_oldest(
+                &runtime_session_name,
+                identity.pane_id(),
+            )?;
+            Some((runtime_session_name, receiver))
+        })?;
 
         let deadline = tokio::time::Instant::now() + DEFERRED_INITIAL_PANE_READY_TIMEOUT;
         loop {
             while let Some(item) = receiver.try_recv() {
                 if deferred_initial_pane_ready_item(&item) {
                     tokio::time::sleep(DEFERRED_INITIAL_PANE_READY_SETTLE).await;
-                    return;
+                    return Some(runtime_session_name);
                 }
             }
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return;
+                return Some(runtime_session_name);
             }
 
             match tokio::time::timeout(deadline - now, receiver.recv()).await {
                 Ok(item) if deferred_initial_pane_ready_item(&item) => {
                     tokio::time::sleep(DEFERRED_INITIAL_PANE_READY_SETTLE).await;
-                    return;
+                    return Some(runtime_session_name);
                 }
                 Ok(_) => {}
-                Err(_) => return,
+                Err(_) => return Some(runtime_session_name),
             }
+        }
+    }
+
+    #[cfg(windows)]
+    async fn refresh_deferred_initial_pane(
+        &self,
+        runtime_session_name_hint: &SessionName,
+        identity: DeferredInitialPaneIdentity,
+    ) {
+        let refresh_identity = {
+            let state = self.state.lock().await;
+            let runtime_session_name = state.resolve_pane_event_runtime_session(
+                runtime_session_name_hint,
+                identity.pane_id(),
+                Some(identity.generation()),
+            );
+            runtime_session_name.and_then(|runtime_session_name| {
+                let target = state
+                    .pane_target_for_runtime_pane(&runtime_session_name, identity.pane_id())?;
+                let session = state.sessions.session(target.session_name())?;
+                Some((target.session_name().clone(), session.id()))
+            })
+        };
+        if let Some((session_name, session_id)) = refresh_identity {
+            self.refresh_attached_session_for_session_identity(&session_name, session_id)
+                .await;
         }
     }
 

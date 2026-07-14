@@ -6,6 +6,7 @@ use rmux_core::{formats::FormatContext, Pane, Session, Window};
 use rmux_proto::{RmuxError, SessionName};
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::pane_indices::visible_pane_index;
 use crate::pane_terminals::HandlerState;
 
 use super::mode_tree_filter::matches_mode_tree_filter;
@@ -243,7 +244,7 @@ fn render_tree_window_line(
     )
 }
 
-fn render_tree_pane_line(
+pub(super) fn render_tree_pane_line(
     mode: &ModeTreeClientState,
     state: &HandlerState,
     session: &Session,
@@ -272,10 +273,11 @@ fn render_tree_pane_line(
         render_runtime_template("#{pane_current_command}", &context, false),
         render_runtime_template("#{pane_flags}", &context, false)
     );
+    let pane_index = visible_pane_index(session, &state.options, window_index, pane.index());
     render_tree_named_line(
         mode,
         context,
-        &pane.index().to_string(),
+        &pane_index.to_string(),
         mode.row_format
             .as_deref()
             .unwrap_or(TMUX_WINDOW_TREE_DEFAULT_FORMAT),

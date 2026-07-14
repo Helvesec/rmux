@@ -6,7 +6,9 @@
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use crate::{Pane, PaneSnapshot, PaneTextMatch, Result, RmuxError, WaitTimeoutError};
 
@@ -215,8 +217,17 @@ impl Locator {
             .timeout
             .or_else(|| crate::wait::resolved_wait_timeout(self.pane.configured_default_timeout()));
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let mut last_snapshot = None;
         loop {
-            let snapshot = self.pane.snapshot().await?;
+            let snapshot = crate::wait::snapshot_with_wait_deadline(
+                &self.pane,
+                "wait for locator snapshot",
+                timeout,
+                deadline,
+                last_snapshot.as_ref(),
+                || format!("strict locator {}", self.describe()),
+            )
+            .await?;
             let matches = self.resolve(&snapshot).await?;
             match matches.len() {
                 1 => {
@@ -237,6 +248,7 @@ impl Locator {
                 )));
             }
             sleep_until_next_poll(deadline, self.poll_interval).await;
+            last_snapshot = Some(snapshot);
         }
     }
 
@@ -452,8 +464,17 @@ async fn wait_for_assertion(locator: Locator, kind: LocatorAssertionKind) -> Res
         .timeout
         .or_else(|| crate::wait::resolved_wait_timeout(locator.pane.configured_default_timeout()));
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let mut last_snapshot = None;
     loop {
-        let snapshot = locator.pane.snapshot().await?;
+        let snapshot = crate::wait::snapshot_with_wait_deadline(
+            &locator.pane,
+            "wait for locator snapshot",
+            timeout,
+            deadline,
+            last_snapshot.as_ref(),
+            || description.clone(),
+        )
+        .await?;
         let matches = locator.resolve(&snapshot).await?;
         match assertion_outcome(&matches, &kind) {
             AssertionOutcome::Matched => return Ok(snapshot),
@@ -474,6 +495,7 @@ async fn wait_for_assertion(locator: Locator, kind: LocatorAssertionKind) -> Res
             )));
         }
         sleep_until_next_poll(deadline, locator.poll_interval).await;
+        last_snapshot = Some(snapshot);
     }
 }
 
@@ -486,8 +508,17 @@ async fn wait_until(
         .timeout
         .or_else(|| crate::wait::resolved_wait_timeout(locator.pane.configured_default_timeout()));
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let mut last_snapshot = None;
     loop {
-        let snapshot = locator.pane.snapshot().await?;
+        let snapshot = crate::wait::snapshot_with_wait_deadline(
+            &locator.pane,
+            "wait for locator snapshot",
+            timeout,
+            deadline,
+            last_snapshot.as_ref(),
+            || description.clone(),
+        )
+        .await?;
         let matches = locator.resolve(&snapshot).await?;
         if predicate(&matches, &snapshot) {
             return Ok(snapshot);
@@ -500,6 +531,7 @@ async fn wait_until(
             )));
         }
         sleep_until_next_poll(deadline, locator.poll_interval).await;
+        last_snapshot = Some(snapshot);
     }
 }
 

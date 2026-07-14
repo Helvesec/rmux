@@ -17,7 +17,9 @@ use rmux_proto::{
     SdkWaitForOutputRefRequest, SdkWaitForOutputResponse, SdkWaitOutcome,
     CAPABILITY_SDK_WAITS_ARMED,
 };
-use rmux_sdk::{EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName};
+use rmux_sdk::{
+    EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName, TerminalLoadState,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::Instant;
@@ -565,6 +567,116 @@ async fn expect_visible_text_timeout_includes_last_snapshot() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn visible_text_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("visible-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.expect_visible_text()
+            .to_contain("never")
+            .timeout(Duration::from_millis(30)),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for pane snapshot text");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_state_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("load-state-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.wait_for_load_state(TerminalLoadState::Quiet)
+            .timeout(Duration::from_millis(30)),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for terminal load-state snapshot");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn locator_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("locator-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.get_by_text("never")
+            .wait_for()
+            .timeout(Duration::from_millis(30)),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for locator snapshot");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn locator_assertion_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("locator-assert-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.get_by_text("never")
+            .expect()
+            .to_be_visible()
+            .timeout(Duration::from_millis(30)),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for locator snapshot");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn locator_action_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("locator-action-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.get_by_text("never")
+            .timeout(Duration::from_millis(30))
+            .click(),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for locator snapshot");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
 async fn pane_for(socket_path: &Path, timeout: Duration) -> TestResult<Pane> {
     let rmux = RmuxBuilder::new()
         .unix_socket(socket_path)
@@ -731,6 +843,23 @@ async fn expect_snapshot(peer: &mut Peer, text: &str, revision: u64) -> TestResu
 
     peer.write_response(Response::PaneSnapshot(snapshot_response(text, revision)))
         .await
+}
+
+async fn hold_first_snapshot_response(listener: UnixListener) -> TestResult {
+    let mut peer = accept_peer(&listener).await?;
+    expect_list_panes(&mut peer).await?;
+    let mut request = peer.expect_request().await?;
+    if matches!(request, Request::Handshake(_)) {
+        peer.write_response(Response::Handshake(HandshakeResponse::current()))
+            .await?;
+        request = peer.expect_request().await?;
+    }
+    assert!(
+        matches!(request, Request::PaneSnapshotRef(_)),
+        "snapshot wait must issue a pane snapshot RPC, got {request:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    Ok(())
 }
 
 fn snapshot_response(text: &str, revision: u64) -> PaneSnapshotResponse {

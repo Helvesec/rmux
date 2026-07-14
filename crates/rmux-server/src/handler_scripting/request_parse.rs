@@ -312,7 +312,7 @@ fn parse_no_argument_request(args: CommandTokens, command: &str) -> Result<Reque
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmux_proto::PaneTarget;
+    use rmux_proto::{PaneTarget, ScopeSelector, SetEnvironmentMode};
 
     fn parse_request(command: &str, args: &[&str]) -> Request {
         parse_request_from_parts(
@@ -353,5 +353,73 @@ mod tests {
         assert!(request.copy_mode_command);
         assert_mouse_target(request.target.as_ref());
         assert_eq!(request.keys, vec!["select-word"]);
+    }
+
+    #[test]
+    fn set_environment_accepts_compact_global_unset_flags() {
+        let Request::SetEnvironment(request) =
+            parse_request("set-environment", &["-gu", "AUDIT_VAR"])
+        else {
+            panic!("set-environment -gu should parse as SetEnvironment");
+        };
+
+        assert_eq!(request.scope, ScopeSelector::Global);
+        assert_eq!(request.mode, Some(SetEnvironmentMode::Unset));
+        assert_eq!(request.name, "AUDIT_VAR");
+        assert!(request.value.is_empty());
+    }
+
+    #[test]
+    fn set_environment_compact_target_consumes_only_its_value() {
+        let Request::SetEnvironment(request) =
+            parse_request("set-environment", &["-Fhtalpha", "AUDIT_VAR", "#{version}"])
+        else {
+            panic!("set-environment compact target should parse as SetEnvironment");
+        };
+
+        let ScopeSelector::Session(scope) = request.scope else {
+            panic!("compact -t should select session scope");
+        };
+        assert_eq!(scope.as_str(), "alpha");
+        assert!(request.format);
+        assert!(request.hidden);
+        assert_eq!(request.name, "AUDIT_VAR");
+        assert_eq!(request.value, "#{version}");
+    }
+
+    #[test]
+    fn set_environment_unset_takes_precedence_over_clear() {
+        // Measured against the pinned tmux 3.7b oracle on 2026-07-14:
+        // compact and separated `-r -u`/`-u -r` all use `-u` semantics.
+        for arguments in [
+            vec!["-gru".to_owned(), "AUDIT_VAR".to_owned()],
+            vec!["-gur".to_owned(), "AUDIT_VAR".to_owned()],
+            vec![
+                "-g".to_owned(),
+                "-r".to_owned(),
+                "-u".to_owned(),
+                "AUDIT_VAR".to_owned(),
+            ],
+            vec![
+                "-g".to_owned(),
+                "-u".to_owned(),
+                "-r".to_owned(),
+                "AUDIT_VAR".to_owned(),
+            ],
+        ] {
+            let Request::SetEnvironment(request) = parse_request_from_parts(
+                "set-environment".to_owned(),
+                arguments,
+                None,
+                &SessionStore::default(),
+                &OptionStore::default(),
+                &TargetFindContext::new(None),
+            )
+            .expect("set-environment accepts combined mode flags") else {
+                panic!("expected set-environment request");
+            };
+
+            assert_eq!(request.mode, Some(SetEnvironmentMode::Unset));
+        }
     }
 }

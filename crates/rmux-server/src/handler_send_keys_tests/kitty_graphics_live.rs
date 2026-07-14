@@ -377,6 +377,243 @@ async fn live_attach_osc_sequences_are_consumed_at_attach_boundary() {
 }
 
 #[tokio::test]
+async fn live_attach_correlated_palette_responses_reach_the_pane_with_bel_or_st() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("live-attach-palette-response");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b]4;0;?;7;?\x07")
+            .expect("pane emits two palette queries");
+    }
+
+    let bel = b"\x1b]4;0;rgb:0000/1111/ffff\x07";
+    let st = b"\x1b]4;7;rgb:1111/2222/3333\x1b\\";
+    let mut expected = bel.to_vec();
+    expected.extend_from_slice(st);
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-palette-response",
+        expected.len(),
+    )
+    .await;
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, &bel[..bel.len() - 1])
+        .await
+        .expect("fragmented BEL palette response body");
+    assert_eq!(pending_input, bel[..bel.len() - 1]);
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, &bel[bel.len() - 1..])
+        .await
+        .expect("BEL palette response terminator");
+    assert!(pending_input.is_empty());
+
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, &st[..st.len() - 1])
+        .await
+        .expect("fragmented ST palette response body");
+    assert_eq!(pending_input, st[..st.len() - 1]);
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, &st[st.len() - 1..])
+        .await
+        .expect("ST palette response terminator");
+    assert!(pending_input.is_empty());
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_palette_response_rejects_unsolicited_mismatched_and_duplicate_input() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("live-attach-palette-correlation");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b]4;7;?\x1b\\")
+            .expect("pane emits palette query for index 7");
+    }
+
+    let expected = b"\x1b]4;7;rgb:1111/2222/3333\x07";
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-palette-correlation",
+        expected.len(),
+    )
+    .await;
+    let mut pending_input = Vec::new();
+
+    for rejected in [
+        b"\x1b]4;0;rgb:0000/0000/0000\x07".as_slice(),
+        b"\x1b]4;7;not-rgb\x07".as_slice(),
+    ] {
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, rejected)
+            .await
+            .expect("uncorrelated palette input is safely consumed");
+        assert!(pending_input.is_empty());
+    }
+
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, expected)
+        .await
+        .expect("matching palette response");
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, expected)
+        .await
+        .expect("duplicate palette response is safely consumed");
+    assert!(pending_input.is_empty());
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_palette_response_is_correlated_to_the_current_pane() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("live-attach-palette-pane-correlation");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+
+    let first = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let second = PaneTarget::with_window(alpha.clone(), 0, 1);
+    let selected = handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: first.clone(),
+            title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
+        })))
+        .await;
+    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b]4;7;?\x07")
+            .expect("first pane emits palette query");
+        state.start_pane_input_capture_for_test(&first);
+        state.start_pane_input_capture_for_test(&second);
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let response = b"\x1b]4;7;rgb:1111/2222/3333\x1b\\";
+    let selected = handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: second.clone(),
+            title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
+        })))
+        .await;
+    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, response)
+        .await
+        .expect("response on wrong pane is safely consumed");
+
+    let selected = handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: first.clone(),
+            title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
+        })))
+        .await;
+    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, response)
+        .await
+        .expect("response reaches its queried pane");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&first),
+        Some(response.to_vec())
+    );
+    assert_eq!(state.pane_input_capture_for_test(&second), Some(Vec::new()));
+}
+
+#[tokio::test]
+async fn concurrent_palette_responses_consume_exactly_one_query_slot() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("live-attach-palette-concurrency");
+    let first_pid = 91_001;
+    let second_pid = 91_002;
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let mut control_receivers = Vec::new();
+    for requester_pid in [first_pid, second_pid] {
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let _attach_id = handler
+            .register_attach(requester_pid, alpha.clone(), control_tx)
+            .await;
+        control_receivers.push(control_rx);
+    }
+    let target = PaneTarget::new(alpha.clone(), 0);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b]4;7;?\x1b\\")
+            .expect("pane emits one palette query");
+        state.start_pane_input_capture_for_test(&target);
+    }
+
+    let response = b"\x1b]4;7;rgb:1111/2222/3333\x07";
+    let mut first_pending = Vec::new();
+    let mut second_pending = Vec::new();
+    let (first_result, second_result) = tokio::join!(
+        handler.handle_attached_live_input(first_pid, &mut first_pending, response),
+        handler.handle_attached_live_input(second_pid, &mut second_pending, response),
+    );
+    first_result.expect("first concurrent response is handled");
+    second_result.expect("second concurrent response is handled");
+    assert!(first_pending.is_empty());
+    assert!(second_pending.is_empty());
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&target),
+        Some(response.to_vec()),
+        "one query slot authorizes exactly one concurrent response"
+    );
+    drop(control_receivers);
+}
+
+#[tokio::test]
 async fn ambiguous_alt_right_bracket_is_forwarded_after_escape_timeout() {
     let handler = RequestHandler::new();
     let alpha = session_name("live-alt-right-bracket");

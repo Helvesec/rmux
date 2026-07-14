@@ -2,7 +2,9 @@
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use crate::{Pane, PaneSnapshot, Result, RmuxError, WaitTimeoutError};
 
@@ -104,7 +106,20 @@ async fn wait_until_quiet(wait: TerminalLoadStateWait) -> Result<PaneSnapshot> {
         .timeout
         .or_else(|| crate::wait::resolved_wait_timeout(wait.pane.configured_default_timeout()));
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
-    let mut last = wait.pane.snapshot().await?;
+    let mut last = crate::wait::snapshot_with_wait_deadline(
+        &wait.pane,
+        "wait for terminal load-state snapshot",
+        timeout,
+        deadline,
+        None,
+        || {
+            format!(
+                "terminal load state {:?} for {:?}",
+                wait.state, wait.quiet_for
+            )
+        },
+    )
+    .await?;
     let mut stable_since = Instant::now();
 
     loop {
@@ -122,7 +137,20 @@ async fn wait_until_quiet(wait: TerminalLoadStateWait) -> Result<PaneSnapshot> {
             )));
         }
         sleep_until_next_poll(deadline, wait.poll_interval).await;
-        let snapshot = wait.pane.snapshot().await?;
+        let snapshot = crate::wait::snapshot_with_wait_deadline(
+            &wait.pane,
+            "wait for terminal load-state snapshot",
+            timeout,
+            deadline,
+            Some(&last),
+            || {
+                format!(
+                    "terminal load state {:?} for {:?}",
+                    wait.state, wait.quiet_for
+                )
+            },
+        )
+        .await?;
         if snapshot.revision == last.revision && snapshot.visible_text() == last.visible_text() {
             continue;
         }

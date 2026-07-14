@@ -5,7 +5,7 @@ use rmux_proto::request::{
 use rmux_proto::{Request, RmuxError};
 
 use super::parse_session_name;
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::unsupported_flag;
 
 pub(super) fn parse_switch_client(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -20,8 +20,8 @@ pub(super) fn parse_switch_client(mut args: CommandTokens) -> Result<Request, Rm
     let mut skip_environment_update = false;
     let mut zoom = false;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -66,8 +66,41 @@ pub(super) fn parse_switch_client(mut args: CommandTokens) -> Result<Request, Rm
                 let _ = args.optional();
                 zoom = true;
             }
-            flag if flag.starts_with('-') => return Err(unsupported_flag("switch-client", flag)),
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "ElnprZ", "cOTt") else {
+                    if token.starts_with('-') {
+                        return Err(unsupported_flag("switch-client", &token));
+                    }
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('E') => skip_environment_update = true,
+                        CompactFlag::Bare('l') => last_session = true,
+                        CompactFlag::Bare('n') => next_session = true,
+                        CompactFlag::Bare('p') => previous_session = true,
+                        CompactFlag::Bare('r') => toggle_read_only = true,
+                        CompactFlag::Bare('Z') => zoom = true,
+                        compact_flag @ CompactFlag::Value { flag: 'c', .. } => {
+                            target_client =
+                                Some(compact_flag.value_or_next(&mut args, "-c target-client")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'O', .. } => {
+                            sort_order =
+                                Some(compact_flag.value_or_next(&mut args, "-O sort-order")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'T', .. } => {
+                            key_table =
+                                Some(compact_flag.value_or_next(&mut args, "-T key-table")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(compact_flag.value_or_next(&mut args, "-t target")?);
+                        }
+                        _ => unreachable!("compact switch-client flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
     args.no_extra("switch-client")?;
@@ -105,8 +138,8 @@ pub(super) fn parse_detach_client(mut args: CommandTokens) -> Result<Request, Rm
     let mut kill_on_detach = false;
     let mut exec_command = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -131,8 +164,35 @@ pub(super) fn parse_detach_client(mut args: CommandTokens) -> Result<Request, Rm
                 let _ = args.optional();
                 target_client = Some(args.required("-t target-client")?);
             }
-            flag if flag.starts_with('-') => return Err(unsupported_flag("detach-client", flag)),
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "aP", "Est") else {
+                    if token.starts_with('-') {
+                        return Err(unsupported_flag("detach-client", &token));
+                    }
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('a') => all_other_clients = true,
+                        CompactFlag::Bare('P') => kill_on_detach = true,
+                        compact_flag @ CompactFlag::Value { flag: 'E', .. } => {
+                            exec_command =
+                                Some(compact_flag.value_or_next(&mut args, "-E shell-command")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 's', .. } => {
+                            target_session = Some(parse_session_name(
+                                compact_flag.value_or_next(&mut args, "-s target-session")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target_client =
+                                Some(compact_flag.value_or_next(&mut args, "-t target-client")?);
+                        }
+                        _ => unreachable!("compact detach-client flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
     args.no_extra("detach-client")?;
@@ -158,8 +218,8 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
     let mut status_only = false;
     let mut pan_up = false;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -208,8 +268,41 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
                 let _ = args.optional();
                 pan_up = true;
             }
-            flag if flag.starts_with('-') => return Err(unsupported_flag("refresh-client", flag)),
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "cDlLRSU", "CfFt") else {
+                    if token.starts_with('-') {
+                        return Err(unsupported_flag("refresh-client", &token));
+                    }
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('c') => clear_pan = true,
+                        CompactFlag::Bare('D') => pan_down = true,
+                        CompactFlag::Bare('l') => clipboard_query = true,
+                        CompactFlag::Bare('L') => pan_left = true,
+                        CompactFlag::Bare('R') => pan_right = true,
+                        CompactFlag::Bare('S') => status_only = true,
+                        CompactFlag::Bare('U') => pan_up = true,
+                        compact_flag @ CompactFlag::Value { flag: 'C', .. } => {
+                            control_size =
+                                Some(compact_flag.value_or_next(&mut args, "-C widthxheight")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'f', .. } => {
+                            flags = Some(compact_flag.value_or_next(&mut args, "-f flags")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'F', .. } => {
+                            flags_alias = Some(compact_flag.value_or_next(&mut args, "-F flags")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target_client =
+                                Some(compact_flag.value_or_next(&mut args, "-t target-client")?);
+                        }
+                        _ => unreachable!("compact refresh-client flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 
@@ -249,8 +342,8 @@ pub(super) fn parse_list_clients(mut args: CommandTokens) -> Result<Request, Rmu
     let mut reversed = false;
     let mut target_session = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -275,8 +368,35 @@ pub(super) fn parse_list_clients(mut args: CommandTokens) -> Result<Request, Rmu
                 let _ = args.optional();
                 target_session = Some(parse_session_name(args.required("-t target-session")?)?);
             }
-            flag if flag.starts_with('-') => return Err(unsupported_flag("list-clients", flag)),
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "r", "FfOt") else {
+                    if token.starts_with('-') {
+                        return Err(unsupported_flag("list-clients", &token));
+                    }
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('r') => reversed = true,
+                        compact_flag @ CompactFlag::Value { flag: 'F', .. } => {
+                            format = Some(compact_flag.value_or_next(&mut args, "-F format")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'f', .. } => {
+                            filter = Some(compact_flag.value_or_next(&mut args, "-f filter")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'O', .. } => {
+                            sort_order = Some(compact_flag.value_or_next(&mut args, "-O order")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target_session = Some(parse_session_name(
+                                compact_flag.value_or_next(&mut args, "-t target-session")?,
+                            )?);
+                        }
+                        _ => unreachable!("compact list-clients flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
     args.no_extra("list-clients")?;
@@ -343,8 +463,8 @@ pub(super) fn parse_server_access(mut args: CommandTokens) -> Result<Request, Rm
     let mut write = false;
     let mut target = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -373,19 +493,41 @@ pub(super) fn parse_server_access(mut args: CommandTokens) -> Result<Request, Rm
                 let _ = args.optional();
                 target = Some(args.required("-t target-pane")?);
             }
-            "--help" => return Err(unsupported_flag("server-access", "--help")),
-            "-" => {
-                return Err(RmuxError::Server(
-                    "command server-access: invalid flag -".to_owned(),
-                ));
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "adlrw", "t") else {
+                    match token.as_str() {
+                        "--help" => return Err(unsupported_flag("server-access", "--help")),
+                        "-" => {
+                            return Err(RmuxError::Server(
+                                "command server-access: invalid flag -".to_owned(),
+                            ));
+                        }
+                        flag if flag.starts_with("--") => {
+                            return Err(RmuxError::Server(
+                                "command server-access: invalid flag --".to_owned(),
+                            ));
+                        }
+                        flag if flag.starts_with('-') => {
+                            return Err(unsupported_flag("server-access", flag));
+                        }
+                        _ => break,
+                    }
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('a') => add = true,
+                        CompactFlag::Bare('d') => deny = true,
+                        CompactFlag::Bare('l') => list = true,
+                        CompactFlag::Bare('r') => read_only = true,
+                        CompactFlag::Bare('w') => write = true,
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(compact_flag.value_or_next(&mut args, "-t target-pane")?);
+                        }
+                        _ => unreachable!("compact server-access flags are prevalidated"),
+                    }
+                }
             }
-            flag if flag.starts_with("--") => {
-                return Err(RmuxError::Server(
-                    "command server-access: invalid flag --".to_owned(),
-                ));
-            }
-            flag if flag.starts_with('-') => return Err(unsupported_flag("server-access", flag)),
-            _ => break,
         }
     }
 

@@ -8,7 +8,7 @@ use rmux_core::{
 };
 use rmux_proto::OptionScopeSelector;
 
-use crate::cli_args::{scan_top_level_command, RuntimeCommandGroup};
+use crate::cli_args::{scan_top_level_command, RuntimeCommandGroup, TopLevelCommandScan};
 use crate::cli_response::expect_command_output;
 use crate::command_alias_snapshot::{decode_command_alias_definitions, definition_matches_name};
 use crate::runtime_command_expansion::{
@@ -20,7 +20,14 @@ use super::ExitFailure;
 
 pub(super) enum RuntimeCommandResolution {
     Canonical(Vec<RuntimeCommandGroup>),
-    LegacyAliases(Vec<String>),
+    LegacyDirect,
+    LegacyServerDispatch(i32),
+}
+
+struct RuntimeCommandInvocation {
+    arguments: Vec<String>,
+    groups: Vec<Vec<String>>,
+    control_mode: u8,
 }
 
 pub(super) fn run_unknown_command_through_server_aliases(
@@ -42,6 +49,14 @@ pub(super) fn run_unknown_command_through_server_aliases(
             format!("unknown command: {command_name}"),
         ));
     }
+    run_raw_command_through_server(&command_args, socket_path, connection)
+}
+
+fn run_raw_command_through_server(
+    command_args: &[String],
+    socket_path: &Path,
+    connection: &mut Connection,
+) -> Result<i32, ExitFailure> {
     let queue_command = command_args
         .iter()
         .map(|argument| tmux_quote_argument(argument))
@@ -81,23 +96,9 @@ pub(super) fn runtime_command_resolution_for_invocation(
     args: &[OsString],
     invoked_as_tmux: bool,
 ) -> Result<Option<RuntimeCommandResolution>, ExitFailure> {
-    let Ok(scan) = scan_top_level_command(args.get(1..).unwrap_or(&[])) else {
+    let Some((scan, invocation)) = prepare_runtime_command_invocation(args) else {
         return Ok(None);
     };
-    if scan.no_fork || scan.shell_command.is_some() || scan.command.is_empty() {
-        return Ok(None);
-    }
-    let Some(arguments) = args_to_strings(&scan.command) else {
-        return Ok(None);
-    };
-    if arguments.is_empty() {
-        return Ok(None);
-    }
-    let Some(groups) = split_literal_command_groups(&scan.command) else {
-        return Ok(None);
-    };
-    let legacy_kill_fallback = queue_starts_with_kill_server(&groups);
-
     let socket_path = if invoked_as_tmux {
         resolve_tmux_compatible_socket_path(
             scan.socket_name.as_deref(),
@@ -123,13 +124,69 @@ pub(super) fn runtime_command_resolution_for_invocation(
         }
     };
 
-    let canonical = match expand_runtime_command_segment(&mut connection, &arguments) {
+    resolve_runtime_command_with_connection(&mut connection, &socket_path, invocation)
+}
+
+pub(super) fn runtime_command_resolution_after_startup(
+    args: &[OsString],
+    socket_path: &Path,
+    connection: &mut Connection,
+) -> Result<Option<RuntimeCommandResolution>, ExitFailure> {
+    let Some((_, invocation)) = prepare_runtime_command_invocation(args) else {
+        return Ok(None);
+    };
+    resolve_runtime_command_with_connection(connection, socket_path, invocation)
+}
+
+fn prepare_runtime_command_invocation(
+    args: &[OsString],
+) -> Option<(TopLevelCommandScan, RuntimeCommandInvocation)> {
+    let scan = scan_top_level_command(args.get(1..).unwrap_or(&[])).ok()?;
+    if scan.no_fork || scan.shell_command.is_some() || scan.command.is_empty() {
+        return None;
+    }
+    let arguments = args_to_strings(&scan.command)?;
+    if arguments.is_empty() {
+        return None;
+    }
+    let groups = split_literal_command_groups(&scan.command)?;
+    let control_mode = scan.control_mode;
+    Some((
+        scan,
+        RuntimeCommandInvocation {
+            arguments,
+            groups,
+            control_mode,
+        },
+    ))
+}
+
+fn resolve_runtime_command_with_connection(
+    connection: &mut Connection,
+    socket_path: &Path,
+    invocation: RuntimeCommandInvocation,
+) -> Result<Option<RuntimeCommandResolution>, ExitFailure> {
+    let RuntimeCommandInvocation {
+        arguments,
+        groups,
+        control_mode,
+    } = invocation;
+    let legacy_kill_fallback = queue_starts_with_kill_server(&groups);
+
+    let canonical = match expand_runtime_command_segment(connection, &arguments) {
         Ok(Some(canonical)) => canonical,
-        Ok(None) if scan.control_mode != 0 => return Ok(None),
+        Ok(None) if control_mode != 0 => return Ok(None),
         Ok(None) => {
-            let aliases = server_command_alias_definitions(&mut connection)
-                .map_err(|error| error.with_socket_context(&socket_path))?;
-            return Ok(Some(RuntimeCommandResolution::LegacyAliases(aliases)));
+            let aliases = server_command_alias_definitions(connection)
+                .map_err(|error| error.with_socket_context(socket_path))?;
+            if !queue_uses_server_alias(&groups, &aliases) {
+                return Ok(Some(RuntimeCommandResolution::LegacyDirect));
+            }
+            let exit_code = run_raw_command_through_server(&arguments, socket_path, connection)
+                .map_err(|error| error.with_socket_context(socket_path))?;
+            return Ok(Some(RuntimeCommandResolution::LegacyServerDispatch(
+                exit_code,
+            )));
         }
         Err(error) if legacy_kill_fallback && error.previous_wire_version().is_some() => {
             return Ok(None);
@@ -142,16 +199,16 @@ pub(super) fn runtime_command_resolution_for_invocation(
                 }
                 RuntimeCommandExpansionError::Protocol(message) => ExitFailure::new(1, message),
             };
-            let failure = if scan.control_mode == 0 || failure.is_unsupported_wire_version() {
+            let failure = if control_mode == 0 || failure.is_unsupported_wire_version() {
                 failure
             } else {
                 super::control_mode_error::exit_failure_for_count(
                     failure.exit_code(),
                     failure.message(),
-                    scan.control_mode,
+                    control_mode,
                 )
             };
-            return Err(failure.with_socket_context(&socket_path));
+            return Err(failure.with_socket_context(socket_path));
         }
     };
 
@@ -203,6 +260,40 @@ fn queue_starts_with_kill_server(groups: &[Vec<String>]) -> bool {
         return false;
     };
     matches!(parsed.commands(), [command] if command.name() == "kill-server" && command.arguments().is_empty())
+}
+
+fn queue_uses_server_alias(groups: &[Vec<String>], aliases: &[String]) -> bool {
+    groups
+        .iter()
+        .filter_map(|group| alias_lookup_command_name(group))
+        .any(|name| {
+            aliases
+                .iter()
+                .any(|definition| definition_matches_name(definition, name))
+        })
+}
+
+fn alias_lookup_command_name(group: &[String]) -> Option<&str> {
+    let (first, tail) = group.split_first()?;
+    if is_parse_time_assignment(first) {
+        tail.first().map(String::as_str)
+    } else {
+        Some(first)
+    }
+}
+
+// Keep this in lockstep with rmux-core's argv assignment grammar: an ASCII
+// identifier followed by `=`, with the remainder belonging to the value.
+fn is_parse_time_assignment(argument: &str) -> bool {
+    let Some((name, _)) = argument.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn normalize_alias_fallback_error(error: ExitFailure) -> ExitFailure {
@@ -343,6 +434,56 @@ mod tests {
             vec!["display-message".to_owned()],
             vec!["kill-server".to_owned()],
         ]));
+    }
+
+    #[test]
+    fn legacy_fallback_detects_aliases_in_any_command_group() {
+        let groups = vec![
+            vec!["list-sessions".to_owned()],
+            vec!["probe".to_owned(), "argument".to_owned()],
+        ];
+        let aliases = vec!["probe=display-message -p ok".to_owned()];
+
+        assert!(queue_uses_server_alias(&groups, &aliases));
+        assert!(!queue_uses_server_alias(
+            &[vec!["list-sessions".to_owned()]],
+            &aliases,
+        ));
+    }
+
+    #[test]
+    fn legacy_fallback_detects_alias_after_parse_time_assignment() {
+        let groups = vec![vec!["FOO=x".to_owned(), "probe".to_owned()]];
+        let aliases = vec!["probe=display-message -p $FOO".to_owned()];
+
+        assert!(queue_uses_server_alias(&groups, &aliases));
+        assert_eq!(alias_lookup_command_name(&groups[0]), Some("probe"));
+        assert!(is_parse_time_assignment("FOO=x"));
+        assert!(is_parse_time_assignment("_FOO=x=y"));
+        assert!(!is_parse_time_assignment("1FOO=x"));
+        assert!(!is_parse_time_assignment("FOO-BAR=x"));
+    }
+
+    #[test]
+    fn legacy_fallback_keeps_nested_commands_and_builtin_abbreviations_server_owned() {
+        let aliases = vec![
+            "nested=display-message -p nested".to_owned(),
+            "list-sessions=display-message -p override".to_owned(),
+        ];
+
+        assert!(!queue_uses_server_alias(
+            &[vec![
+                "if-shell".to_owned(),
+                "-F".to_owned(),
+                "1".to_owned(),
+                "nested".to_owned(),
+            ]],
+            &aliases,
+        ));
+        assert!(!queue_uses_server_alias(
+            &[vec!["list-sess".to_owned()]],
+            &aliases,
+        ));
     }
 
     #[test]

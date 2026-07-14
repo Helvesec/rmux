@@ -9,7 +9,7 @@ use super::super::{
 };
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_io::AttachControl;
-use crate::pane_terminals::HandlerState;
+use crate::pane_terminals::{resolve_new_pane_process_command, HandlerState};
 use crate::terminal::validate_process_command;
 
 use super::pane_kill_effects::{after_kill_pane_target, KillPaneLifecycleBatch};
@@ -115,9 +115,9 @@ impl RequestHandler {
             rmux_proto::SplitWindowTarget::Pane(target) => Target::Pane(target.clone()),
         };
         let socket_path = self.socket_path();
-        let process_command = process_command
+        let explicit_process_command = process_command
             .or_else(|| crate::legacy_command::from_legacy_command(command.as_deref()));
-        if let Err(error) = validate_process_command(process_command.as_ref()) {
+        if let Err(error) = validate_process_command(explicit_process_command.as_ref()) {
             return Response::Error(ErrorResponse { error });
         }
         let attached_count = self.attached_count(&session_name).await;
@@ -130,6 +130,11 @@ impl RequestHandler {
             {
                 return Response::Error(ErrorResponse { error });
             }
+            let process_command = resolve_new_pane_process_command(
+                &state.options,
+                &session_name,
+                explicit_process_command,
+            );
             let start_directory = match render_start_directory_template(
                 &state,
                 &format_target,

@@ -1289,6 +1289,10 @@ mod prompt_tests;
 mod pane_command_tests;
 
 #[cfg(test)]
+#[path = "handler_default_command_tests.rs"]
+mod default_command_tests;
+
+#[cfg(test)]
 #[path = "handler_pane_family_lifecycle_tests.rs"]
 mod pane_family_lifecycle_tests;
 

@@ -107,6 +107,70 @@ fn windows_automation_wait_snapshot_and_locator_work_end_to_end() -> Result<(), 
     Ok(())
 }
 
+#[test]
+fn windows_send_keys_wait_pane_exit_preserves_full_process_status() -> Result<(), Box<dyn Error>> {
+    let _serial_guard = windows_cli_serial::acquire("automation-cli-windows-exit-status")?;
+    let label = unique_label("automation-cli-windows-exit-status")?;
+    let _server = ServerGuard::new(label.clone());
+
+    for exit_status in [0, 7, 513] {
+        let session = format!("exit-{exit_status}");
+        assert_success(
+            rmux_command(&label)
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session,
+                    "cmd.exe",
+                    "/D",
+                    "/Q",
+                    "/K",
+                ])
+                .stdin(Stdio::null())
+                .output()?,
+            format!("create {session}"),
+        )?;
+        assert_success(
+            rmux_command(&label)
+                .args([
+                    "set-window-option",
+                    "-t",
+                    &format!("{session}:0"),
+                    "remain-on-exit",
+                    "on",
+                ])
+                .stdin(Stdio::null())
+                .output()?,
+            format!("enable remain-on-exit for {session}"),
+        )?;
+
+        let output = rmux_command(&label)
+            .args([
+                "send-keys",
+                "-t",
+                &format!("{session}:0.0"),
+                "--wait-pane-exit",
+                "--timeout",
+                "8s",
+                "--",
+                &format!("exit {exit_status}"),
+                "Enter",
+            ])
+            .stdin(Stdio::null())
+            .output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(exit_status),
+            "Windows process status must cross the CLI without 8-bit truncation\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    Ok(())
+}
+
 fn run_json(label: &str, args: &[&str]) -> Result<Value, Box<dyn Error>> {
     let output = rmux_command(label)
         .args(args)

@@ -37,6 +37,8 @@ pub(super) mod bracketed_paste;
 mod kitty_graphics;
 #[path = "attached_input/live.rs"]
 mod live;
+#[path = "attached_input/palette_response.rs"]
+mod palette_response;
 #[path = "attached_input/retained.rs"]
 mod retained;
 #[path = "attached_input/synchronized.rs"]

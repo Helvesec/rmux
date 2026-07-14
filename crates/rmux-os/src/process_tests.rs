@@ -168,6 +168,25 @@ fn parses_nul_separated_environment() {
     assert_eq!(environment.get("B").map(String::as_str), Some("two"));
 }
 
+#[test]
+fn utf8_environment_snapshot_skips_only_unrepresentable_entries() {
+    let environment = environment_from_nul_entries(
+        b"PATH=/client/bin\0BAD=foo\xffbar\0MALFORMED\0HOME=/client/home\0\0",
+    )
+    .expect("valid environment entries should remain available");
+
+    assert_eq!(
+        environment.get("PATH").map(String::as_str),
+        Some("/client/bin")
+    );
+    assert_eq!(
+        environment.get("HOME").map(String::as_str),
+        Some("/client/home")
+    );
+    assert_eq!(environment.get("BAD"), None);
+    assert_eq!(environment.get("MALFORMED"), None);
+}
+
 #[cfg(unix)]
 #[test]
 fn parses_raw_nul_separated_environment_without_utf8_filtering() {

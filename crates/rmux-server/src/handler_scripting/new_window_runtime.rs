@@ -17,7 +17,9 @@ use crate::handler::{
     RequestHandler,
 };
 use crate::hook_runtime::{capture_inline_hooks, PendingInlineHookFormat};
-use crate::pane_terminals::{NewWindowOptions, WindowSpawnOptions};
+use crate::pane_terminals::{
+    resolve_new_pane_process_command, NewWindowOptions, WindowSpawnOptions,
+};
 
 impl RequestHandler {
     pub(super) async fn execute_queued_new_window(
@@ -102,13 +104,18 @@ impl RequestHandler {
                 &socket_path,
             )
             .await?;
-        let process_command =
+        let explicit_process_command =
             crate::legacy_command::from_legacy_command(rendered_command.as_deref());
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let (response, inline_hooks) = capture_inline_hooks(async {
             let (response, linked_event) = {
                 let mut state = self.state.lock().await;
+                let process_command = resolve_new_pane_process_command(
+                    &state.options,
+                    &target,
+                    explicit_process_command,
+                );
                 let timer_sessions = state.sessions.session_group_members(&target);
                 let timer_mutation =
                     self.plan_window_mutation_silence_timers_locked(&state, timer_sessions);

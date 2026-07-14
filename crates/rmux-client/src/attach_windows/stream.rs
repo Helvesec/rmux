@@ -113,6 +113,7 @@ where
         mut action_completion_rx,
         locked,
         windows_console_key_enabled,
+        error_cleanup,
     } = channels;
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&initial_bytes);
@@ -314,10 +315,18 @@ where
     }
     .await;
 
+    let cleanup_result = if attach_result.is_err() && !screen_tracker.was_stopped() {
+        match error_cleanup {
+            Some(bytes) => output.write_frame(bytes),
+            None => Ok(()),
+        }
+    } else {
+        Ok(())
+    };
     let drain_result = finish_attach_output(output).await;
-    match (attach_result, drain_result) {
-        (_, Err(error)) => Err(error),
-        (result, Ok(())) => result,
+    match (attach_result, cleanup_result, drain_result) {
+        (_, _, Err(error)) | (_, Err(error), Ok(())) => Err(error),
+        (result, Ok(()), Ok(())) => result,
     }
 }
 
@@ -1189,6 +1198,7 @@ pub(super) struct AttachAsyncChannels {
         mpsc::UnboundedReceiver<std::result::Result<AttachActionOutcome, ClientError>>,
     locked: Arc<AttachLockState>,
     windows_console_key_enabled: bool,
+    error_cleanup: Option<Vec<u8>>,
 }
 
 impl AttachAsyncChannels {
@@ -1209,7 +1219,13 @@ impl AttachAsyncChannels {
             action_completion_rx,
             locked,
             windows_console_key_enabled,
+            error_cleanup: None,
         }
+    }
+
+    pub(super) fn with_error_cleanup(mut self, error_cleanup: Option<Vec<u8>>) -> Self {
+        self.error_cleanup = error_cleanup;
+        self
     }
 }
 

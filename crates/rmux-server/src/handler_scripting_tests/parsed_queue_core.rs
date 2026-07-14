@@ -1182,6 +1182,79 @@ async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
 }
 
 #[tokio::test]
+async fn parsed_queue_compact_client_and_overlay_flags_preserve_their_meaning() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("compact-flags");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let state = handler.state.lock().await;
+    let current = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))));
+    let parse = |command: &str, arguments: &[&str]| {
+        crate::handler::scripting_support::parse_request_from_parts(
+            command.to_owned(),
+            arguments.iter().map(|value| (*value).to_owned()).collect(),
+            None,
+            &state.sessions,
+            &state.options,
+            &current,
+        )
+        .unwrap_or_else(|error| panic!("{command} compact flags should parse: {error}"))
+    };
+
+    let Request::DetachClientExt(request) = parse("detach-client", &["-aP"]) else {
+        panic!("expected detach-client request");
+    };
+    assert!(request.all_other_clients);
+    assert!(request.kill_on_detach);
+
+    let Request::RefreshClient(request) = parse("refresh-client", &["-cL"]) else {
+        panic!("expected refresh-client request");
+    };
+    assert!(request.clear_pan);
+    assert!(request.pan_left);
+
+    let Request::SwitchClientExt3(request) = parse("switch-client", &["-Er"]) else {
+        panic!("expected switch-client request");
+    };
+    assert!(request.skip_environment_update);
+    assert!(request.toggle_read_only);
+
+    let Request::ListClients(request) = parse("list-clients", &["-rFclient"]) else {
+        panic!("expected list-clients request");
+    };
+    assert!(request.reversed);
+    assert_eq!(request.format.as_deref(), Some("client"));
+
+    let Request::ServerAccess(request) = parse("server-access", &["-lr"]) else {
+        panic!("expected server-access request");
+    };
+    assert!(request.list);
+    assert!(request.read_only);
+
+    let Request::DisplayPanes(request) = parse("display-panes", &["-bN"]) else {
+        panic!("expected display-panes request");
+    };
+    assert!(request.non_blocking);
+    assert!(request.no_command);
+    assert_eq!(request.template, None);
+
+    let Request::LastPane(request) = parse("last-pane", &["-de"]) else {
+        panic!("expected last-pane request");
+    };
+    assert_eq!(request.input_disabled, Some(false));
+}
+
+#[tokio::test]
 async fn parsed_queue_refresh_client_reserved_wire_flags_are_unknown() {
     let handler = RequestHandler::new();
     for (command, flag) in [

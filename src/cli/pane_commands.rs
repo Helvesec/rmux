@@ -39,10 +39,10 @@ pub(super) fn run_last_pane(args: LastPaneArgs, socket_path: &Path) -> Result<i3
     run_command_resolved(socket_path, "last-pane", move |connection| {
         let target =
             resolve_window_target_or_current(connection, args.target.as_ref(), "last-pane")?;
-        let input_disabled = if args.disable_input {
-            Some(true)
-        } else if args.enable_input {
+        let input_disabled = if args.enable_input {
             Some(false)
+        } else if args.disable_input {
+            Some(true)
         } else {
             None
         };

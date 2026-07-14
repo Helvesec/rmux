@@ -199,6 +199,10 @@ run_tmux_authority_smoke() {
 
 run_rmux_smoke() {
   local sock="tiny-review-$$"
+  local cold_new_sock="tiny-cold-new-$$"
+  local cold_start_sock="tiny-cold-start-$$"
+  local cold_attach_sock="tiny-cold-attach-$$"
+  local cold_alias_config="$XDG_CONFIG_HOME/rmux/rmux.conf"
   local real="$SMOKE_ROOT/real.sock"
   local link="$SMOKE_ROOT/link.sock"
   local missing="$SMOKE_ROOT/missing.conf"
@@ -209,9 +213,40 @@ run_rmux_smoke() {
   cleanup_rmux() {
     "$RMUX" -L "$sock" set-option -s -u 'command-alias[20]' >/dev/null 2>&1 || true
     "$RMUX" -L "$sock" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$cold_new_sock" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$cold_start_sock" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$cold_attach_sock" kill-server >/dev/null 2>&1 || true
     "$RMUX" -S "$real" kill-server >/dev/null 2>&1 || true
+    rm -f "$cold_alias_config"
   }
   trap cleanup_rmux RETURN
+
+  mkdir -p "$(dirname "$cold_alias_config")"
+  cat >"$cold_alias_config" <<'EOF'
+set-option -s command-alias[30] 'new-session=new-session -d -s tiny-cold-new-aliased'
+set-option -s command-alias[31] 'start-server=new-session -d -s tiny-cold-start-aliased'
+set-option -s command-alias[32] 'attach-session=new-session -d -s tiny-cold-attach-aliased'
+EOF
+
+  run_capture cold_new_alias -L "$cold_new_sock" new-session -d
+  assert_rc cold_new_alias 0
+  assert_trace cold_new_alias "rmux tiny: fallback: runtime command-alias"
+  [ "$("$RMUX" -L "$cold_new_sock" list-sessions -F '#{session_name}')" = \
+    "tiny-cold-new-aliased" ] || die "cold tiny new-session bypassed its config alias"
+
+  run_capture cold_start_alias -L "$cold_start_sock" start-server
+  assert_rc cold_start_alias 0
+  assert_trace cold_start_alias "rmux tiny: fallback: runtime command-alias"
+  [ "$("$RMUX" -L "$cold_start_sock" list-sessions -F '#{session_name}')" = \
+    "tiny-cold-start-aliased" ] || die "cold tiny start-server bypassed its config alias"
+
+  run_capture cold_attach_alias -L "$cold_attach_sock" attach-session
+  assert_rc cold_attach_alias 0
+  assert_trace cold_attach_alias "rmux tiny: fallback: runtime command-alias"
+  [ "$("$RMUX" -L "$cold_attach_sock" list-sessions -F '#{session_name}')" = \
+    "tiny-cold-attach-aliased" ] || die "cold tiny attach-session bypassed its config alias"
+
+  rm -f "$cold_alias_config"
 
   "$RMUX" -L "$sock" new-session -d -s alpha sleep 60 >/dev/null
   "$RMUX" -L "$sock" new-session -d -s prefixdemo sleep 60 >/dev/null

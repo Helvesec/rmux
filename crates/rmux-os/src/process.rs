@@ -590,8 +590,12 @@ fn environment_from_nul_entries(environ: &[u8]) -> Option<HashMap<String, String
         if entry.is_empty() {
             continue;
         }
-        let entry = std::str::from_utf8(entry).ok()?;
-        let (name, value) = entry.split_once('=')?;
+        let Ok(entry) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
         values.insert(name.to_owned(), value.to_owned());
     }
     Some(values)

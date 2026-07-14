@@ -63,10 +63,7 @@ mod prompt;
 pub(crate) use prompt::{ConfirmBeforeArgs, PromptArgs, PromptHistoryArgs};
 #[path = "cli_args/queue.rs"]
 mod queue;
-use queue::{
-    command_from_parsed, parse_command_queue, parse_command_queue_with_aliases,
-    parse_runtime_command_groups,
-};
+use queue::{command_from_parsed, parse_command_queue, parse_runtime_command_groups};
 #[path = "cli_args/script.rs"]
 mod script;
 use script::parse_source_file_args;
@@ -145,23 +142,6 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeCommandGroup {
     Canonical(String),
-}
-
-pub(crate) fn parse_with_runtime_aliases<I, T>(
-    args: I,
-    runtime_aliases: &[String],
-) -> Result<Cli, clap::Error>
-where
-    I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
-{
-    let raw = parse_raw_cli(args)?;
-    if raw.control_mode != 0 {
-        return Cli::from_raw_control(raw);
-    }
-    let parsed_commands = parse_command_queue_with_aliases(&raw.command, runtime_aliases)?;
-    reject_parse_time_assignments_without_runtime_bridge(&parsed_commands)?;
-    Cli::from_raw(raw, parsed_commands, false)
 }
 
 fn reject_parse_time_assignments_without_runtime_bridge(

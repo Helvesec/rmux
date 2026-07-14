@@ -736,7 +736,7 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
 }
 
 #[tokio::test]
-async fn list_clients_exposes_attached_key_table_and_prefix_state() {
+async fn list_clients_exposes_effective_attached_key_table_and_prefix_state() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -762,6 +762,21 @@ async fn list_clients_exposes_attached_key_table_and_prefix_state() {
         "idle attached clients should report the root key table"
     );
 
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha),
+            option: OptionName::KeyTable,
+            value: "off".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)));
+    assert_eq!(
+        list_client_prefix_state(&handler).await,
+        "0|off\n",
+        "idle clients should report the configured effective key table"
+    );
+
     handler
         .set_attached_key_table(
             requester_pid,
@@ -775,6 +790,16 @@ async fn list_clients_exposes_attached_key_table_and_prefix_state() {
         list_client_prefix_state(&handler).await,
         "1|prefix\n",
         "prefix-active attached clients should report the prefix table"
+    );
+
+    handler
+        .set_attached_key_table(requester_pid, None, None)
+        .await
+        .expect("clearing the transient key table should succeed");
+    assert_eq!(
+        list_client_prefix_state(&handler).await,
+        "0|off\n",
+        "clearing a transient table should reveal the configured table again"
     );
 }
 

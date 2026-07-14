@@ -24,7 +24,8 @@ use rmux_core::command_parser::COMMAND_TABLE;
 use rmux_proto::{
     encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse,
     ListSessionsResponse, OptionScopeSelector, Request, Response, RmuxError, ShowOptionsResponse,
-    CONTROL_CONTROL_END, CONTROL_CONTROL_START, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
+    SourceFileResponse, CONTROL_CONTROL_END, CONTROL_CONTROL_START, RMUX_FRAME_MAGIC,
+    RMUX_WIRE_VERSION,
 };
 use rmux_pty::TerminalSize;
 
@@ -223,7 +224,7 @@ fn read_current_wire_request(stream: &mut UnixStream) -> io::Result<Request> {
 fn serve_same_wire_handshake_and_alias_snapshot(
     listener: &UnixListener,
     alias_snapshot: impl Into<Vec<u8>>,
-) -> io::Result<()> {
+) -> io::Result<UnixStream> {
     let (mut stream, request) = accept_current_wire_request(listener)?;
     if !matches!(request, Request::Handshake(_)) {
         return Err(io::Error::new(
@@ -252,7 +253,8 @@ fn serve_same_wire_handshake_and_alias_snapshot(
             output: CommandOutput::from_stdout(alias_snapshot),
         }))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-    )
+    )?;
+    Ok(stream)
 }
 
 fn spawn_alias_fallback_incompatible_wire_server(
@@ -270,7 +272,10 @@ fn spawn_same_wire_server_without_runtime_expansion(
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     Ok(thread::spawn(move || {
-        serve_same_wire_handshake_and_alias_snapshot(&listener, Vec::new())?;
+        drop(serve_same_wire_handshake_and_alias_snapshot(
+            &listener,
+            Vec::new(),
+        )?);
 
         let (mut command_stream, request) = accept_current_wire_request(&listener)?;
         if !matches!(request, Request::ListSessions(_)) {
@@ -298,12 +303,19 @@ fn spawn_same_wire_server_without_runtime_expansion_or_alias(
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     Ok(thread::spawn(move || {
-        serve_same_wire_handshake_and_alias_snapshot(&listener, Vec::new())
+        drop(serve_same_wire_handshake_and_alias_snapshot(
+            &listener,
+            Vec::new(),
+        )?);
+        Ok(())
     }))
 }
 
-fn spawn_same_wire_server_with_canonical_alias(
+fn spawn_same_wire_server_expecting_raw_alias(
     socket_path: &Path,
+    alias_snapshot: &'static [u8],
+    expected_stdin: &'static str,
+    response_stdout: &'static str,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
@@ -311,30 +323,34 @@ fn spawn_same_wire_server_with_canonical_alias(
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     Ok(thread::spawn(move || {
-        serve_same_wire_handshake_and_alias_snapshot(
-            &listener,
-            b"command-alias[20] \"list-sessions=list-sessions -F alias-marker\"\n".to_vec(),
-        )?;
-
-        let (mut command_stream, request) = accept_current_wire_request(&listener)?;
-        let Request::ListSessions(request) = request else {
+        let mut command_stream =
+            serve_same_wire_handshake_and_alias_snapshot(&listener, alias_snapshot.to_vec())?;
+        let request = read_current_wire_request(&mut command_stream)?;
+        let Request::SourceFile(request) = request else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("expected aliased list-sessions request, got {request:?}"),
+                format!("expected one raw source-file request, got {request:?}"),
             ));
         };
-        if request.format.as_deref() != Some("alias-marker") {
+        if request.paths != ["-"] || request.stdin.as_deref() != Some(expected_stdin) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("canonical alias was not applied: {request:?}"),
+                format!("expected unexpanded argv {expected_stdin:?}, got {request:?}"),
             ));
         }
         command_stream.write_all(
-            &encode_frame(&Response::ListSessions(ListSessionsResponse {
-                output: CommandOutput::from_stdout("legacy-alias\n"),
-            }))
+            &encode_frame(&Response::SourceFile(SourceFileResponse::from_output(
+                CommandOutput::from_stdout(response_stdout),
+            )))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         )?;
+        let mut trailing = [0_u8; 1];
+        if command_stream.read(&mut trailing)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy alias fallback sent more than one raw request",
+            ));
+        }
         Ok(())
     }))
 }
@@ -394,7 +410,13 @@ fn same_wire_daemon_without_runtime_expansion_keeps_direct_cli_compatible(
 
     let output = harness.run(&["list-sessions"])?;
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
     assert_eq!(stdout(&output), "legacy-compatible\n");
     assert!(stderr(&output).is_empty());
     server.join().expect("fake same-wire server should exit")?;
@@ -405,12 +427,101 @@ fn same_wire_daemon_without_runtime_expansion_keeps_direct_cli_compatible(
 fn same_wire_daemon_without_runtime_expansion_keeps_canonical_alias_override(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("same-wire-canonical-alias")?;
-    let server = spawn_same_wire_server_with_canonical_alias(harness.socket_path())?;
+    let server = spawn_same_wire_server_expecting_raw_alias(
+        harness.socket_path(),
+        b"command-alias[20] \"list-sessions=list-sessions -F alias-marker\"\n",
+        "list-sessions",
+        "legacy-alias\n",
+    )?;
 
     let output = harness.run(&["list-sessions"])?;
 
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
     assert_eq!(stdout(&output), "legacy-alias\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_expands_queue_alias_once(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-single-alias-expansion")?;
+    let server = spawn_same_wire_server_expecting_raw_alias(
+        harness.socket_path(),
+        b"command-alias[20] \"probe=clear-prompt-history\"\ncommand-alias[21] \"clear-prompt-history=display-message -p SECOND\"\n",
+        "display-message -p 'literal value' ; probe",
+        "single-expansion\n",
+    )?;
+
+    let output = harness.run(&["display-message", "-p", "literal value", ";", "probe"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(stdout(&output), "single-expansion\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_preserves_alias_assignment(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-alias-assignment")?;
+    let server = spawn_same_wire_server_expecting_raw_alias(
+        harness.socket_path(),
+        b"command-alias[20] \"assign=FOO=bar display-message -p '$FOO'\"\n",
+        "assign",
+        "bar\n",
+    )?;
+
+    let output = harness.run(&["assign"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(stdout(&output), "bar\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_preserves_assignment_before_alias(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-assignment-before-alias")?;
+    let server = spawn_same_wire_server_expecting_raw_alias(
+        harness.socket_path(),
+        b"command-alias[20] \"probe=display-message -p '$FOO'\"\n",
+        "FOO=x probe",
+        "x\n",
+    )?;
+
+    let output = harness.run(&["FOO=x", "probe"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(stdout(&output), "x\n");
     assert!(stderr(&output).is_empty());
     server.join().expect("fake same-wire server should exit")?;
     Ok(())

@@ -21,6 +21,7 @@ use super::super::pane_prompt_input::{
 };
 use super::bracketed_paste::{decode_bracketed_paste_after_append, BracketedPasteDecode};
 use super::kitty_graphics::{decode_kitty_graphics_apc_after_append, KittyGraphicsApcDecode};
+use super::palette_response::{ModalPaletteInput, ModalPaletteInputSegment};
 use super::terminal_response::{
     decode_attached_terminal_control_after_append, decode_focus_event, TerminalControlEvent,
     TerminalResponseDecode,
@@ -476,35 +477,22 @@ impl RequestHandler {
             return Ok(AttachedLiveInputStep::Complete(false));
         }
         self.clear_attached_focus_alerts(identity).await;
-        if self.prompt_active_for_identity(identity).await {
-            let remaining = self
-                .handle_attached_prompt_input(identity, pending_input, bytes)
-                .await?;
-            return Ok(attached_mode_input_step(remaining));
+        if self
+            .attached_modal_surface_active_for_identity(identity)
+            .await
+        {
+            if let Some(input) = self.split_attached_modal_palette_input(pending_input, bytes) {
+                pending_input.clear();
+                return self
+                    .handle_attached_modal_palette_input(identity, pending_input, input)
+                    .await;
+            }
         }
-        if self.mode_tree_active_for_identity(identity).await {
-            let remaining = self
-                .handle_attached_mode_tree_input(identity, pending_input, bytes)
-                .await?;
-            return Ok(attached_mode_input_step(remaining));
-        }
-        if self.overlay_active_for_identity(identity).await {
-            return match self
-                .handle_attached_overlay_input_for_identity(identity, pending_input, bytes)
-                .await?
-            {
-                AttachedOverlayInput::Consumed => Ok(AttachedLiveInputStep::Complete(false)),
-                AttachedOverlayInput::Reroute(bytes) => Ok(AttachedLiveInputStep::Reroute {
-                    bytes,
-                    forwarded: false,
-                }),
-            };
-        }
-        if self.display_panes_active_for_identity(identity).await {
-            let remaining = self
-                .handle_attached_display_panes_input_for_identity(identity, pending_input, bytes)
-                .await?;
-            return Ok(attached_mode_input_step(remaining));
+        if let Some(step) = self
+            .handle_attached_modal_input_step(identity, pending_input, bytes)
+            .await?
+        {
+            return Ok(step);
         }
         let target = self
             .attached_input_target_for_identity(identity)
@@ -801,6 +789,26 @@ impl RequestHandler {
                     raw_start = offset;
                     continue;
                 }
+                TerminalResponseDecode::PaletteResponse { size, index } => {
+                    if raw_start < offset {
+                        self.write_attached_bytes_for_identity(
+                            identity,
+                            &pending_input[raw_start..offset],
+                        )
+                        .await?;
+                        forwarded_to_pane = true;
+                    }
+                    forwarded_to_pane |= self
+                        .write_attached_palette_response_for_identity(
+                            identity,
+                            index,
+                            &pending_input[offset..offset + size],
+                        )
+                        .await?;
+                    offset += size;
+                    raw_start = offset;
+                    continue;
+                }
                 TerminalResponseDecode::Partial => {
                     if raw_start < offset {
                         self.write_attached_bytes_for_identity(
@@ -1080,6 +1088,136 @@ impl RequestHandler {
         Ok(AttachedLiveInputStep::Complete(forwarded_to_pane))
     }
 
+    async fn handle_attached_modal_input_step(
+        &self,
+        identity: ActiveAttachIdentity,
+        pending_input: &mut Vec<u8>,
+        bytes: &[u8],
+    ) -> io::Result<Option<AttachedLiveInputStep>> {
+        if self.prompt_active_for_identity(identity).await {
+            let remaining = self
+                .handle_attached_prompt_input(identity, pending_input, bytes)
+                .await?;
+            return Ok(Some(attached_mode_input_step(remaining)));
+        }
+        if self.mode_tree_active_for_identity(identity).await {
+            let remaining = self
+                .handle_attached_mode_tree_input(identity, pending_input, bytes)
+                .await?;
+            return Ok(Some(attached_mode_input_step(remaining)));
+        }
+        if self.overlay_active_for_identity(identity).await {
+            return match self
+                .handle_attached_overlay_input_for_identity(identity, pending_input, bytes)
+                .await?
+            {
+                AttachedOverlayInput::Consumed => Ok(Some(AttachedLiveInputStep::Complete(false))),
+                AttachedOverlayInput::Reroute(bytes) => Ok(Some(AttachedLiveInputStep::Reroute {
+                    bytes,
+                    forwarded: false,
+                })),
+            };
+        }
+        if self.display_panes_active_for_identity(identity).await {
+            let remaining = self
+                .handle_attached_display_panes_input_for_identity(identity, pending_input, bytes)
+                .await?;
+            return Ok(Some(attached_mode_input_step(remaining)));
+        }
+        Ok(None)
+    }
+
+    async fn handle_attached_modal_palette_input(
+        &self,
+        identity: ActiveAttachIdentity,
+        pending_input: &mut Vec<u8>,
+        input: ModalPaletteInput,
+    ) -> io::Result<AttachedLiveInputStep> {
+        let ModalPaletteInput { segments, retained } = input;
+        let mut segments = VecDeque::from(segments);
+        let mut modal_pending = Vec::new();
+        let mut forwarded = false;
+
+        while let Some(segment) = segments.pop_front() {
+            let bytes = match segment {
+                ModalPaletteInputSegment::Input(bytes) => bytes,
+                ModalPaletteInputSegment::Response { index, bytes } => {
+                    if !self
+                        .attached_modal_surface_active_for_identity(identity)
+                        .await
+                    {
+                        let mut rerouted = modal_pending;
+                        rerouted.extend_from_slice(&bytes);
+                        append_modal_palette_remainder(&mut rerouted, segments, &retained);
+                        return Ok(AttachedLiveInputStep::Reroute {
+                            bytes: rerouted,
+                            forwarded,
+                        });
+                    }
+                    if self
+                        .write_attached_palette_response_for_identity(identity, index, &bytes)
+                        .await?
+                    {
+                        forwarded = true;
+                        continue;
+                    }
+                    // No live query slot exists on the current pane. Preserve
+                    // the prior modal behavior byte-for-byte by passing this
+                    // uncorrelated sequence through the surface's decoder.
+                    bytes
+                }
+            };
+
+            let Some(step) = self
+                .handle_attached_modal_input_step(identity, &mut modal_pending, &bytes)
+                .await?
+            else {
+                let mut rerouted = modal_pending;
+                rerouted.extend_from_slice(&bytes);
+                append_modal_palette_remainder(&mut rerouted, segments, &retained);
+                return Ok(AttachedLiveInputStep::Reroute {
+                    bytes: rerouted,
+                    forwarded,
+                });
+            };
+            match step {
+                AttachedLiveInputStep::Complete(step_forwarded) => {
+                    forwarded |= step_forwarded;
+                }
+                AttachedLiveInputStep::Reroute {
+                    bytes,
+                    forwarded: step_forwarded,
+                } => {
+                    let mut rerouted = modal_pending;
+                    rerouted.extend_from_slice(&bytes);
+                    append_modal_palette_remainder(&mut rerouted, segments, &retained);
+                    return Ok(AttachedLiveInputStep::Reroute {
+                        bytes: rerouted,
+                        forwarded: forwarded | step_forwarded,
+                    });
+                }
+            }
+        }
+
+        modal_pending.extend_from_slice(&retained);
+        if modal_pending.is_empty() {
+            return Ok(AttachedLiveInputStep::Complete(forwarded));
+        }
+        if self
+            .attached_modal_surface_active_for_identity(identity)
+            .await
+        {
+            *pending_input = modal_pending;
+            retain_partial_attached_control_input("modal palette response", pending_input)?;
+            Ok(AttachedLiveInputStep::Complete(forwarded))
+        } else {
+            Ok(AttachedLiveInputStep::Reroute {
+                bytes: modal_pending,
+                forwarded,
+            })
+        }
+    }
+
     async fn try_forward_plain_attached_bytes_fast(
         &self,
         identity: ActiveAttachIdentity,
@@ -1212,6 +1350,27 @@ impl RequestHandler {
             && active.mode_tree.is_none()
             && active.overlay.is_none()
             && active.display_panes.is_none())
+    }
+
+    async fn attached_modal_surface_active_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+    ) -> bool {
+        let active_attach = self.active_attach.lock().await;
+        let Some(active) = active_attach
+            .by_pid
+            .get(&identity.attach_pid())
+            .filter(|active| {
+                identity.matches_active(active)
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+        else {
+            return false;
+        };
+        active.prompt.is_some()
+            || active.mode_tree.is_some()
+            || active.overlay.is_some()
+            || active.display_panes.is_some()
     }
 
     async fn attached_key_table_active(&self, identity: ActiveAttachIdentity) -> bool {
@@ -1464,6 +1623,17 @@ fn attached_mode_input_step(remaining: Option<Vec<u8>>) -> AttachedLiveInputStep
         },
         None => AttachedLiveInputStep::Complete(false),
     }
+}
+
+fn append_modal_palette_remainder(
+    bytes: &mut Vec<u8>,
+    mut segments: VecDeque<ModalPaletteInputSegment>,
+    retained: &[u8],
+) {
+    while let Some(segment) = segments.pop_front() {
+        bytes.extend_from_slice(&segment.into_bytes());
+    }
+    bytes.extend_from_slice(retained);
 }
 
 fn is_plain_attached_fast_path_input(bytes: &[u8]) -> bool {

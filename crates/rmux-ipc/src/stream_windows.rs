@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
@@ -44,6 +43,9 @@ const WINDOWS_SYNTHETIC_UID: u32 = 0;
 
 /// Async local byte stream used by the server runtime.
 pub type LocalStream = NamedPipeServer;
+
+/// Async named-pipe client returned by the verified Windows connector.
+pub type WindowsPipeClient = NamedPipeClient;
 
 /// Blocking local byte stream used by the CLI.
 pub struct BlockingLocalStream {
@@ -120,7 +122,7 @@ pub fn connect_blocking(
         .build()?;
     let deadline = Instant::now() + timeout;
     loop {
-        match runtime.block_on(open_named_pipe_client(&pipe_name)) {
+        match runtime.block_on(connect_windows_pipe(&pipe_name)) {
             Ok(inner) => {
                 return Ok(BlockingLocalStream {
                     inner,
@@ -210,13 +212,19 @@ fn connect_retryable(error: &io::Error) -> bool {
     )
 }
 
-async fn open_named_pipe_client(pipe_name: &OsString) -> io::Result<NamedPipeClient> {
+/// Opens a Tokio named-pipe client with RMUX's restricted access rights and
+/// verifies that the server belongs to the current Windows user.
+///
+/// Callers should use this boundary instead of Tokio's unrestricted
+/// `ClientOptions::open` so every asynchronous RMUX client applies the same
+/// server-identity policy as [`connect_blocking`].
+pub async fn connect_windows_pipe(pipe_name: &std::ffi::OsStr) -> io::Result<WindowsPipeClient> {
     let client = open_named_pipe_client_handle(pipe_name)?;
     validate_named_pipe_server_identity(&client)?;
     Ok(client)
 }
 
-fn open_named_pipe_client_handle(pipe_name: &OsString) -> io::Result<NamedPipeClient> {
+fn open_named_pipe_client_handle(pipe_name: &std::ffi::OsStr) -> io::Result<NamedPipeClient> {
     let wide = pipe_name
         .encode_wide()
         .chain(std::iter::once(0))

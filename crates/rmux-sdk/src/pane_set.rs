@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 use crate::{
     BroadcastResult, Input, Pane, PaneCloseOutcome, PaneId, PaneRef, PaneSnapshot, Result,
@@ -68,10 +69,12 @@ impl PaneSet {
     /// Call [`PaneSetBatch::is_success`] when the caller requires every pane
     /// to succeed.
     pub async fn snapshot_all(&self) -> PaneSetBatch<PaneSnapshot> {
-        run_all(
-            self.panes.clone(),
-            |pane| async move { pane.snapshot().await },
-        )
+        run_all(self.panes.clone(), |pane| async move {
+            let target = pane.target().clone();
+            let pane_id = pane.id().await.ok().flatten();
+            let result = pane.snapshot().await;
+            (target, pane_id, result)
+        })
         .await
     }
 
@@ -412,7 +415,7 @@ impl<'a> PaneSetVisibleTextWait<'a> {
                 PaneSetVisibleTextOutcome::All(
                     run_all(self.panes.to_vec(), move |pane| {
                         let matcher = matcher.clone();
-                        async move { wait_visible_text(pane, matcher, timeout, poll_interval).await }
+                        wait_visible_text_for_pane(pane, matcher, timeout, poll_interval)
                     })
                     .await,
                 )
@@ -427,12 +430,12 @@ impl<'a> PaneSetVisibleTextWait<'a> {
             let matcher = self.matcher.clone();
             let timeout = self.timeout;
             let poll_interval = self.poll_interval;
-            tasks.spawn(async move {
-                let target = pane.target().clone();
-                let pane_id = pane.id().await.ok().flatten();
-                let result = wait_visible_text(pane, matcher, timeout, poll_interval).await;
-                (target, pane_id, result)
-            });
+            tasks.spawn(wait_visible_text_for_pane(
+                pane,
+                matcher,
+                timeout,
+                poll_interval,
+            ));
         }
 
         let mut failures = Vec::new();
@@ -517,37 +520,66 @@ async fn wait_visible_text(
     pane: Pane,
     matcher: VisibleSetMatcher,
     timeout: Option<Duration>,
+    deadline: Option<Instant>,
     poll_interval: Option<Duration>,
 ) -> Result<PaneSnapshot> {
     match matcher {
         VisibleSetMatcher::Contains(pattern) => {
             let wait = pane.expect_visible_text().to_contain(pattern);
-            apply_visible_options(wait, timeout, poll_interval).await
+            apply_visible_options(wait, timeout, deadline, poll_interval).await
         }
         VisibleSetMatcher::Any(patterns) => {
             let wait = pane.expect_visible_text().to_match_any(patterns);
-            apply_visible_options(wait, timeout, poll_interval).await
+            apply_visible_options(wait, timeout, deadline, poll_interval).await
         }
         VisibleSetMatcher::All(patterns) => {
             let wait = pane.expect_visible_text().to_match_all(patterns);
-            apply_visible_options(wait, timeout, poll_interval).await
+            apply_visible_options(wait, timeout, deadline, poll_interval).await
         }
     }
+}
+
+async fn wait_visible_text_for_pane(
+    pane: Pane,
+    matcher: VisibleSetMatcher,
+    timeout_override: Option<Duration>,
+    poll_interval: Option<Duration>,
+) -> PaneTaskOutcome<PaneSnapshot> {
+    let target = pane.target().clone();
+    let timeout = timeout_override
+        .or_else(|| crate::wait::resolved_wait_timeout(pane.configured_default_timeout()));
+    let deadline = timeout.map(|duration| Instant::now() + duration);
+    let pane_id = match crate::wait::with_wait_deadline(
+        crate::wait::WAIT_FOR_TEXT_OPERATION,
+        timeout,
+        deadline,
+        pane.id(),
+    )
+    .await
+    {
+        Ok(pane_id) => pane_id,
+        Err(error) if crate::wait::is_wait_deadline_error(&error) => {
+            return (target, None, Err(error));
+        }
+        Err(_) => None,
+    };
+    let result = wait_visible_text(pane, matcher, timeout, deadline, poll_interval).await;
+    (target, pane_id, result)
 }
 
 async fn apply_visible_options(
     mut wait: crate::VisibleTextWait<'_>,
     timeout: Option<Duration>,
+    deadline: Option<Instant>,
     poll_interval: Option<Duration>,
 ) -> Result<PaneSnapshot> {
-    if let Some(timeout) = timeout {
-        wait = wait.timeout(timeout);
-    }
     if let Some(poll_interval) = poll_interval {
         wait = wait.poll_interval(poll_interval);
     }
-    wait.await
+    wait.run_with_deadline(timeout, deadline).await
 }
+
+type PaneTaskOutcome<T> = (PaneRef, Option<PaneId>, Result<T>);
 
 async fn run_all<T, Fut>(
     panes: Vec<Pane>,
@@ -555,15 +587,13 @@ async fn run_all<T, Fut>(
 ) -> PaneSetBatch<T>
 where
     T: Send + 'static,
-    Fut: Future<Output = Result<T>> + Send + 'static,
+    Fut: Future<Output = PaneTaskOutcome<T>> + Send + 'static,
 {
     let mut tasks = JoinSet::new();
     for (index, pane) in panes.into_iter().enumerate() {
         let operation = operation.clone();
         tasks.spawn(async move {
-            let target = pane.target().clone();
-            let pane_id = pane.id().await.ok().flatten();
-            let result = operation(pane).await;
+            let (target, pane_id, result) = operation(pane).await;
             (index, target, pane_id, result)
         });
     }

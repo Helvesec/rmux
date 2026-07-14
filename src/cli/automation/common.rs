@@ -12,6 +12,7 @@ use crate::cli_args::TargetSpec;
 use crate::cli_response::tmux_cli_error_message;
 
 use super::super::{resolve_pane_target_or_current, ExitFailure};
+use super::pane_exit::PaneExitStatus;
 
 pub(super) const SCHEMA_VERSION: u8 = 1;
 pub(super) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -408,7 +409,7 @@ pub(super) fn sleep_poll_interval() {
 
 pub(super) enum PaneProcessState {
     Alive,
-    Exited(Value),
+    Exited(PaneExitStatus),
 }
 
 pub(super) fn pane_process_state(
@@ -489,11 +490,7 @@ fn pane_process_state_for_slot(
     let output = match response {
         Response::ListPanes(response) => response.output,
         Response::Error(_) => {
-            return Ok(PaneProcessState::Exited(json!({
-                "stale": true,
-                "exit_status": null,
-                "exit_signal": null,
-            })));
+            return Ok(PaneProcessState::Exited(PaneExitStatus::stale()));
         }
         other => {
             return Err(ExitFailure::new(
@@ -512,19 +509,14 @@ fn pane_process_state_for_slot(
             continue;
         }
         if fields.get(1).copied() == Some("1") {
-            return Ok(PaneProcessState::Exited(json!({
-                "stale": false,
-                "exit_status": parse_i32_field(fields.get(2).copied()),
-                "exit_signal": parse_i32_field(fields.get(3).copied()),
-            })));
+            return Ok(PaneProcessState::Exited(PaneExitStatus::known(
+                parse_i32_field(fields.get(2).copied()),
+                parse_i32_field(fields.get(3).copied()),
+            )));
         }
         return Ok(PaneProcessState::Alive);
     }
-    Ok(PaneProcessState::Exited(json!({
-        "stale": true,
-        "exit_status": null,
-        "exit_signal": null,
-    })))
+    Ok(PaneProcessState::Exited(PaneExitStatus::stale()))
 }
 
 fn pane_process_state_for_id(
@@ -542,11 +534,7 @@ fn pane_process_state_for_id(
     let output = match response {
         Response::ListPanes(response) => response.output,
         Response::Error(_) => {
-            return Ok(PaneProcessState::Exited(json!({
-                "stale": true,
-                "exit_status": null,
-                "exit_signal": null,
-            })));
+            return Ok(PaneProcessState::Exited(PaneExitStatus::stale()));
         }
         other => {
             return Err(ExitFailure::new(
@@ -565,19 +553,14 @@ fn pane_process_state_for_id(
             continue;
         }
         if fields.get(1).copied() == Some("1") {
-            return Ok(PaneProcessState::Exited(json!({
-                "stale": false,
-                "exit_status": parse_i32_field(fields.get(2).copied()),
-                "exit_signal": parse_i32_field(fields.get(3).copied()),
-            })));
+            return Ok(PaneProcessState::Exited(PaneExitStatus::known(
+                parse_i32_field(fields.get(2).copied()),
+                parse_i32_field(fields.get(3).copied()),
+            )));
         }
         return Ok(PaneProcessState::Alive);
     }
-    Ok(PaneProcessState::Exited(json!({
-        "stale": true,
-        "exit_status": null,
-        "exit_signal": null,
-    })))
+    Ok(PaneProcessState::Exited(PaneExitStatus::stale()))
 }
 
 fn parse_pane_id(value: &str) -> Option<PaneId> {
@@ -588,11 +571,10 @@ fn parse_pane_id(value: &str) -> Option<PaneId> {
         .map(PaneId::new)
 }
 
-fn parse_i32_field(value: Option<&str>) -> Value {
+fn parse_i32_field(value: Option<&str>) -> Option<i32> {
     value
         .filter(|value| !value.is_empty())
         .and_then(|value| value.parse::<i32>().ok())
-        .map_or(Value::Null, Value::from)
 }
 
 #[cfg(test)]

@@ -22,6 +22,8 @@ pub use stream::{
     PeerIdentity,
 };
 #[cfg(windows)]
+pub use stream::{connect_windows_pipe, WindowsPipeClient};
+#[cfg(windows)]
 pub use windows_mutex::{
     acquire_named_mutex, NamedMutexAcquire, NamedMutexError, NamedMutexGuard, MAX_NAMED_MUTEX_LEN,
 };

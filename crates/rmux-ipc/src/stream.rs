@@ -23,7 +23,9 @@ use rustix::net::RecvFlags;
 mod windows;
 
 #[cfg(windows)]
-pub use windows::{connect_blocking, BlockingLocalStream, LocalStream};
+pub use windows::{
+    connect_blocking, connect_windows_pipe, BlockingLocalStream, LocalStream, WindowsPipeClient,
+};
 
 /// Identity of a connected local peer.
 #[derive(Debug, Clone, PartialEq, Eq)]

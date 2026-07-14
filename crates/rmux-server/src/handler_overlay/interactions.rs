@@ -1,5 +1,6 @@
 use std::io;
 
+use rmux_core::KeyCode;
 use rmux_proto::RmuxError;
 
 use super::super::prompt_support::PromptInputEvent;
@@ -314,28 +315,31 @@ impl RequestHandler {
         Ok(())
     }
 
-    pub(super) async fn handle_popup_raw_input(
+    pub(super) async fn handle_popup_key_input(
         &self,
         attach_pid: u32,
+        key: KeyCode,
         bytes: &[u8],
     ) -> io::Result<bool> {
-        self.handle_popup_raw_input_with_identity(attach_pid, None, bytes)
+        self.handle_popup_key_input_with_identity(attach_pid, None, key, bytes)
             .await
     }
 
-    pub(super) async fn handle_popup_raw_input_for_identity(
+    pub(super) async fn handle_popup_key_input_for_identity(
         &self,
         identity: ActiveAttachIdentity,
+        key: KeyCode,
         bytes: &[u8],
     ) -> io::Result<bool> {
-        self.handle_popup_raw_input_with_identity(identity.attach_pid(), Some(identity), bytes)
+        self.handle_popup_key_input_with_identity(identity.attach_pid(), Some(identity), key, bytes)
             .await
     }
 
-    async fn handle_popup_raw_input_with_identity(
+    async fn handle_popup_key_input_with_identity(
         &self,
         attach_pid: u32,
         identity: Option<ActiveAttachIdentity>,
+        key: KeyCode,
         bytes: &[u8],
     ) -> io::Result<bool> {
         let popup = {
@@ -374,6 +378,11 @@ impl RequestHandler {
 
         if bytes.is_empty() {
             return Ok(true);
+        }
+        if popup.scrollable_text.is_some() {
+            return self
+                .handle_scrollable_popup_key_input(attach_pid, identity, popup.id, key)
+                .await;
         }
         if (bytes == b"\x1b" || bytes == b"\x03")
             && ((!popup.close_on_exit && !popup.close_on_zero_exit) || popup.no_job)

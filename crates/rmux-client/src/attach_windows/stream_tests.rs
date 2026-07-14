@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use super::super::action::{run_attach_action, AttachActionExecutor};
+use super::super::terminal_cleanup::fallback_attach_stop_sequence;
 use super::*;
 use crate::attach_lock_state::AttachLockState;
 
@@ -1239,6 +1241,88 @@ async fn output_writer_failure_wakes_attach_loop_while_server_is_idle(
 }
 
 #[tokio::test]
+async fn abrupt_eof_queues_cleanup_after_output_and_drops_the_only_writer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(8);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, _action_rx) = std::sync::mpsc::channel();
+    let (_completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let output = DropTrackingOutput {
+        dropped: Arc::clone(&dropped),
+        written: Arc::clone(&written),
+    };
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(b"render-before-eof".to_vec()),
+    )
+    .await?;
+    drop(server);
+    let error = drive_async_attach(
+        reader,
+        writer,
+        Vec::new(),
+        output,
+        AttachScreenTracker::default(),
+        AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true)
+            .with_error_cleanup(Some(fallback_attach_stop_sequence("xterm-256color"))),
+    )
+    .await
+    .expect_err("abrupt daemon EOF must fail an unstopped attach");
+
+    assert!(
+        matches!(
+            error,
+            ClientError::Io(ref error) if error.kind() == io::ErrorKind::UnexpectedEof
+        ),
+        "unexpected attach error: {error}"
+    );
+    assert!(dropped.load(Ordering::SeqCst), "output writer must stop");
+    let mut expected = b"render-before-eof".to_vec();
+    expected.extend_from_slice(&fallback_attach_stop_sequence("xterm-256color"));
+    assert_eq!(
+        *written.lock().expect("output mutex poisoned"),
+        expected,
+        "cleanup must be the final frame drained by the existing writer"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_detach_does_not_enqueue_error_cleanup() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut scenario = AttachScenario::with_error_cleanup(RecordingActions::default());
+    let mut server = scenario.take_server();
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+
+    assert!(scenario.join().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn observed_attach_stop_does_not_enqueue_error_cleanup(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::with_error_cleanup(RecordingActions::default());
+    let mut server = scenario.take_server();
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    drop(server);
+
+    assert_eq!(scenario.join().await?, ALT_SCREEN_EXIT_FALLBACK);
+    Ok(())
+}
+
+#[tokio::test]
 async fn mouse_sequences_toggle_windows_console_mouse_actions(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut scenario = AttachScenario::new(RecordingActions::default());
@@ -1409,6 +1493,24 @@ impl AttachScenario {
         windows_console_key_enabled: bool,
         screen_tracker: AttachScreenTracker,
     ) -> Self {
+        Self::with_options(actions, windows_console_key_enabled, screen_tracker, None)
+    }
+
+    fn with_error_cleanup(actions: RecordingActions) -> Self {
+        Self::with_options(
+            actions,
+            true,
+            AttachScreenTracker::default(),
+            Some(fallback_attach_stop_sequence("xterm-256color")),
+        )
+    }
+
+    fn with_options(
+        actions: RecordingActions,
+        windows_console_key_enabled: bool,
+        screen_tracker: AttachScreenTracker,
+        error_cleanup: Option<Vec<u8>>,
+    ) -> Self {
         let (client_stream, server) = tokio::io::duplex(4096);
         let (reader, writer) = tokio::io::split(client_stream);
         let (input_tx, input_rx) = mpsc::channel(8);
@@ -1445,7 +1547,8 @@ impl AttachScenario {
                     completion_rx,
                     locked,
                     windows_console_key_enabled,
-                ),
+                )
+                .with_error_cleanup(error_cleanup),
             )
             .await
         });
@@ -1573,6 +1676,32 @@ impl Write for FailingOutput {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct DropTrackingOutput {
+    dropped: Arc<AtomicBool>,
+    written: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Write for DropTrackingOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.written
+            .lock()
+            .map_err(|_| io::Error::other("output mutex poisoned"))?
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for DropTrackingOutput {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
     }
 }
 

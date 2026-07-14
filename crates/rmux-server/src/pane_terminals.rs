@@ -32,6 +32,8 @@ mod deferred_initial;
 mod lifecycle_state;
 #[path = "pane_terminals/marked_pane.rs"]
 mod marked_pane;
+#[path = "pane_terminals/new_pane_command.rs"]
+mod new_pane_command;
 #[path = "pane_terminals/pane_access.rs"]
 mod pane_access;
 #[path = "pane_terminals/pane_lifecycle.rs"]
@@ -74,6 +76,7 @@ pub(crate) use lifecycle_state::PaneLifecycleProcessState;
 use lifecycle_state::PaneLifecycleSpawn;
 pub(crate) use lifecycle_state::PaneLifecycleState;
 use marked_pane::MarkedPane;
+pub(crate) use new_pane_command::resolve_new_pane_process_command;
 pub(in crate::pane_terminals) use pane_lifecycle::{
     terminate_removed_terminals, LinkedWindowTransferRemovalPlan, PreparedWindowTerminal,
 };
@@ -116,21 +119,44 @@ pub(crate) struct InitialPaneSpawnOptions<'a> {
 pub(crate) struct DeferredInitialPaneSpawn {
     pub(crate) runtime_session_name: SessionName,
     pub(crate) visible_session_name: SessionName,
-    pub(crate) pane_id: PaneId,
+    pub(crate) identity: DeferredInitialPaneIdentity,
     pub(crate) geometry: PaneGeometry,
     pub(crate) profile: TerminalProfile,
     pub(crate) runtime_window_name: Option<String>,
     pub(crate) command: Option<ProcessCommand>,
-    pub(crate) generation: u64,
     pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
     pub(crate) pane_exit_callback: Option<PaneExitCallback>,
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredInitialPaneIdentity {
+    pane_id: PaneId,
+    generation: u64,
+}
+
+#[cfg(windows)]
+impl DeferredInitialPaneIdentity {
+    fn new(pane_id: PaneId, generation: u64) -> Self {
+        Self {
+            pane_id,
+            generation,
+        }
+    }
+
+    pub(crate) fn pane_id(self) -> PaneId {
+        self.pane_id
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[cfg(windows)]
 pub(crate) struct CompletedDeferredInitialPane {
-    pub(crate) visible_session_name: SessionName,
-    pub(crate) runtime_session_name: SessionName,
-    pub(crate) pane_id: PaneId,
+    pub(crate) runtime_session_name_hint: SessionName,
+    pub(crate) identity: DeferredInitialPaneIdentity,
     pub(crate) pane_pid: u32,
     pub(crate) input_writer: Option<rmux_pty::PtyMaster>,
     pub(crate) queued_input: Vec<DeferredInitialPaneInput>,
@@ -141,6 +167,18 @@ pub(crate) struct DeferredInitialPaneInputFlush {
     pub(crate) input_writer: rmux_pty::PtyMaster,
     pub(crate) pane_pid: u32,
     pub(crate) queued_input: Vec<DeferredInitialPaneInput>,
+}
+
+#[cfg(windows)]
+pub(crate) enum DeferredInitialPaneInputDrain {
+    Flush {
+        runtime_session_name: SessionName,
+        flush: DeferredInitialPaneInputFlush,
+    },
+    Finished {
+        runtime_session_name: SessionName,
+    },
+    Missing,
 }
 
 #[cfg(windows)]

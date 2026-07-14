@@ -1,9 +1,15 @@
+use rmux_core::TerminalPaletteIndex;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TerminalResponseDecode {
     NotResponse,
     Partial,
     PaneBound {
         size: usize,
+    },
+    PaletteResponse {
+        size: usize,
+        index: TerminalPaletteIndex,
     },
     Matched {
         size: usize,
@@ -155,14 +161,47 @@ fn decode_osc_sequence(input: &[u8], new_input_at: usize) -> TerminalResponseDec
     let mut index = new_input_at.saturating_sub(1).max(2).min(input.len());
     while index < input.len() {
         match input[index] {
-            b'\x07' => return matched(index + 1, None),
+            b'\x07' => return decode_complete_osc_sequence(input, index, index + 1),
             b'\x1b' if input.get(index + 1) == Some(&b'\\') => {
-                return matched(index + 2, None);
+                return decode_complete_osc_sequence(input, index, index + 2);
             }
             _ => index += 1,
         }
     }
     TerminalResponseDecode::Partial
+}
+
+fn decode_complete_osc_sequence(
+    input: &[u8],
+    body_end: usize,
+    size: usize,
+) -> TerminalResponseDecode {
+    if input.starts_with(b"\x1b]4;") {
+        if let Some(index) = decode_palette_response_body(&input[b"\x1b]4;".len()..body_end]) {
+            return TerminalResponseDecode::PaletteResponse { size, index };
+        }
+    }
+    matched(size, None)
+}
+
+fn decode_palette_response_body(body: &[u8]) -> Option<TerminalPaletteIndex> {
+    let separator = body.iter().position(|byte| *byte == b';')?;
+    let (index, value) = body.split_at(separator);
+    let index = std::str::from_utf8(index)
+        .ok()
+        .and_then(TerminalPaletteIndex::parse)?;
+    let rgb = value.get(1..)?.strip_prefix(b"rgb:")?;
+    let mut channels = rgb.split(|byte| *byte == b'/');
+    for _ in 0..3 {
+        let channel = channels.next()?;
+        if channel.is_empty() || channel.len() > 4 || !channel.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+    }
+    if channels.next().is_some() {
+        return None;
+    }
+    Some(index)
 }
 
 fn is_plausible_terminal_response_prefix(input: &[u8]) -> bool {
@@ -179,7 +218,8 @@ fn is_csi_final(byte: u8) -> bool {
 mod tests {
     use super::{
         decode_attached_terminal_control, decode_attached_terminal_control_after_append,
-        decode_focus_event, decode_terminal_response, TerminalControlEvent, TerminalResponseDecode,
+        decode_focus_event, decode_terminal_response, TerminalControlEvent, TerminalPaletteIndex,
+        TerminalResponseDecode,
     };
 
     #[test]
@@ -329,6 +369,60 @@ mod tests {
             decode_attached_terminal_control(b"\x1b]52;c;AAAA", false),
             TerminalResponseDecode::Partial
         );
+    }
+
+    #[test]
+    fn decodes_bounded_palette_responses_with_bel_or_st() {
+        for (response, index) in [
+            (b"\x1b]4;0;rgb:0000/1111/ffff\x07".as_slice(), 0),
+            (b"\x1b]4;255;rgb:0/a/FFFF\x1b\\".as_slice(), 255),
+        ] {
+            assert_eq!(
+                decode_attached_terminal_control(response, false),
+                TerminalResponseDecode::PaletteResponse {
+                    size: response.len(),
+                    index: TerminalPaletteIndex::from(index),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn fragmented_palette_response_is_partial_until_its_terminator() {
+        let response = b"\x1b]4;7;rgb:1111/2222/3333\x1b\\";
+        for split in 2..response.len() {
+            assert_eq!(
+                decode_attached_terminal_control(&response[..split], false),
+                TerminalResponseDecode::Partial,
+                "palette response split at byte {split}"
+            );
+        }
+        assert_eq!(
+            decode_attached_terminal_control(response, false),
+            TerminalResponseDecode::PaletteResponse {
+                size: response.len(),
+                index: TerminalPaletteIndex::from(7),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_or_out_of_range_palette_sequences_are_consumed_not_forwarded() {
+        for response in [
+            b"\x1b]4;256;rgb:0000/0000/0000\x07".as_slice(),
+            b"\x1b]4;0;not-rgb\x07".as_slice(),
+            b"\x1b]4;0;rgb:00000/0/0\x07".as_slice(),
+            b"\x1b]4;0;rgb:0/0/0;echo\x07".as_slice(),
+        ] {
+            assert_eq!(
+                decode_attached_terminal_control(response, false),
+                TerminalResponseDecode::Matched {
+                    size: response.len(),
+                    event: None,
+                },
+                "malformed OSC 4 must stay at the attach boundary: {response:?}"
+            );
+        }
     }
 
     #[test]

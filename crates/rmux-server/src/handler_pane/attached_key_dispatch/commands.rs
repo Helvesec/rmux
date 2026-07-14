@@ -4,6 +4,7 @@ use rmux_proto::{
 };
 use tokio::task::AbortHandle;
 
+use crate::handler::overlay_support::AttachedHelpContext;
 use crate::hook_runtime::{current_hook_formats, hooks_disabled, with_hook_execution};
 use crate::mouse::AttachedMouseEvent;
 
@@ -212,18 +213,22 @@ pub(super) async fn execute_attached_binding_commands(
 
     match execution {
         Ok(output) => {
-            if attached_live_input && parsed_commands_open_attached_output(&commands) {
+            if attached_live_input && parsed_commands_are_attached_help(&commands) {
                 if let Some(identity) = live_identity {
                     if !handler.current_live_attach_input(identity).await {
                         return Ok(());
                     }
                 }
                 if let Err(error) = handler
-                    .show_attached_command_output_popup(
-                        attach_pid,
-                        requester_pid,
-                        dispatch_target,
-                        "list-keys (q/Esc=close)",
+                    .show_attached_key_help_popup(
+                        AttachedHelpContext {
+                            attach_pid,
+                            requester_pid,
+                            expected_identity: live_identity,
+                            expected_session_name: &session_name,
+                            expected_session_id: session_id,
+                            target: &dispatch_target,
+                        },
                         &output,
                     )
                     .await
@@ -290,11 +295,16 @@ fn parsed_command_blocks_for_prompt(command: &ParsedCommand) -> bool {
     }
 }
 
-fn parsed_commands_open_attached_output(commands: &ParsedCommands) -> bool {
-    commands
-        .commands()
-        .iter()
-        .any(|command| command.name() == "list-keys")
+fn parsed_commands_are_attached_help(commands: &ParsedCommands) -> bool {
+    let [command] = commands.commands() else {
+        return false;
+    };
+    command.name() == "list-keys"
+        && command
+            .arguments()
+            .iter()
+            .filter_map(CommandArgument::as_string)
+            .any(|argument| argument.starts_with('-') && argument[1..].contains('N'))
 }
 
 #[cfg(test)]
@@ -329,5 +339,28 @@ mod tests {
             .parse_one_group("display-panes -b")
             .unwrap();
         assert!(!parsed_commands_block_for_prompt(&parsed));
+    }
+
+    #[test]
+    fn attached_help_detection_is_narrow_to_a_single_notes_listing() {
+        use rmux_core::command_parser::CommandParser;
+
+        let parser = CommandParser::new();
+        let notes = parser.parse_one_group("list-keys -N").unwrap();
+        assert!(parsed_commands_are_attached_help(&notes));
+
+        let combined = parser.parse_one_group("list-keys -1N").unwrap();
+        assert!(parsed_commands_are_attached_help(&combined));
+
+        let plain = parser.parse_one_group("list-keys").unwrap();
+        assert!(!parsed_commands_are_attached_help(&plain));
+
+        let other = parser.parse_one_group("display-message -p hello").unwrap();
+        assert!(!parsed_commands_are_attached_help(&other));
+
+        let queue = parser
+            .parse_one_group("list-keys -N ; display-message done")
+            .unwrap();
+        assert!(!parsed_commands_are_attached_help(&queue));
     }
 }

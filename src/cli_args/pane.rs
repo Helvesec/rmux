@@ -610,16 +610,10 @@ impl SelectLayoutArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("input")
-        .required(false)
-        .multiple(false)
-        .args(["disable_input", "enable_input"])
-))]
 pub(crate) struct LastPaneArgs {
-    #[arg(short = 'd', action = ArgAction::SetTrue, group = "input")]
+    #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) disable_input: bool,
-    #[arg(short = 'e', action = ArgAction::SetTrue, group = "input")]
+    #[arg(short = 'e', action = ArgAction::SetTrue)]
     pub(crate) enable_input: bool,
     #[arg(short = 'Z', action = ArgAction::SetTrue)]
     pub(crate) keep_zoom: bool,

@@ -7,6 +7,191 @@ use std::fs;
 use common_cross::{assert_success, CrossPlatformHarness};
 
 #[test]
+fn direct_cli_accepts_clustered_scripting_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("direct-scripting-clusters")?;
+    harness.success(["new-session", "-d", "-s", "anchor"])?;
+
+    harness.success([
+        "bind-key",
+        "-nr",
+        "-N",
+        "direct-note",
+        "C-a",
+        "display-message",
+        "-p",
+        "direct-cluster",
+    ])?;
+    assert_binding_contains(&harness, "C-a", "direct-cluster")?;
+
+    harness.success(["set-buffer", "-b", "direct-audit", "head"])?;
+    harness.success(["set-buffer", "-aw", "-b", "direct-audit", "tail"])?;
+    assert_eq!(
+        harness.stdout(["show-buffer", "-b", "direct-audit"])?,
+        "headtail"
+    );
+
+    harness.success(["set-environment", "-g", "DIRECT_CLUSTER_ENV", "keep"])?;
+    harness.success(["set-environment", "-gu", "DIRECT_CLUSTER_ENV"])?;
+    assert_environment_missing(&harness, "DIRECT_CLUSTER_ENV")
+}
+
+#[test]
+fn source_file_accepts_clustered_scripting_flags_and_parse_only_stays_inert(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("source-bind-key-cluster")?;
+    harness.success(["new-session", "-d", "-s", "anchor"])?;
+    harness.success(["set-buffer", "-b", "source-audit", "head"])?;
+    harness.success(["set-environment", "-g", "SOURCE_CLUSTER_ENV", "keep"])?;
+    let config = harness.tmpdir().join("clustered-bind-key.conf");
+    fs::write(
+        &config,
+        "bind-key -nrTroot -N 'source note' C-b display-message -p source-cluster\n\
+         set-buffer -aw -b source-audit tail\n\
+         set-environment -gu SOURCE_CLUSTER_ENV\n",
+    )?;
+
+    harness.success([OsStr::new("source-file"), config.as_os_str()])?;
+    assert_binding_contains(&harness, "C-b", "source-cluster")?;
+    assert_eq!(
+        harness.stdout(["show-buffer", "-b", "source-audit"])?,
+        "headtail"
+    );
+    assert_environment_missing(&harness, "SOURCE_CLUSTER_ENV")?;
+
+    harness.success(["set-buffer", "-b", "source-audit", "stable"])?;
+    harness.success(["set-environment", "-g", "SOURCE_CLUSTER_ENV", "stable"])?;
+    let parse_only = harness.tmpdir().join("clustered-bind-key-parse-only.conf");
+    fs::write(
+        &parse_only,
+        "bind-key -nr C-c display-message -p parse-only-cluster\n\
+         set-buffer -aw -b source-audit ignored\n\
+         set-environment -gu SOURCE_CLUSTER_ENV\n",
+    )?;
+    harness.success([
+        OsStr::new("source-file"),
+        OsStr::new("-n"),
+        parse_only.as_os_str(),
+    ])?;
+    assert_binding_absent(&harness, "C-c", "parse-only-cluster")?;
+    assert_eq!(
+        harness.stdout(["show-buffer", "-b", "source-audit"])?,
+        "stable"
+    );
+    assert_environment(&harness, "SOURCE_CLUSTER_ENV=stable")
+}
+
+#[test]
+fn startup_config_accepts_clustered_scripting_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("startup-bind-key-cluster")?;
+    let config = harness.tmpdir().join("clustered-bind-key-startup.conf");
+    fs::write(
+        &config,
+        "bind-key -nr -T root C-d display-message -p startup-cluster\n\
+         set-buffer -b startup-audit head\n\
+         set-buffer -aw -b startup-audit tail\n\
+         set-environment -g STARTUP_CLUSTER_ENV keep\n\
+         set-environment -gu STARTUP_CLUSTER_ENV\n",
+    )?;
+
+    harness.success([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("requested"),
+    ])?;
+    assert_binding_contains(&harness, "C-d", "startup-cluster")?;
+    assert_eq!(
+        harness.stdout(["show-buffer", "-b", "startup-audit"])?,
+        "headtail"
+    );
+    assert_environment_missing(&harness, "STARTUP_CLUSTER_ENV")
+}
+
+#[test]
+fn source_file_parse_only_accepts_remaining_compact_flag_families() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("source-remaining-compact-flags")?;
+    harness.success(["new-session", "-d", "-s", "anchor"])?;
+    let config = harness.tmpdir().join("remaining-compact-flags.conf");
+    fs::write(
+        &config,
+        "detach-client -aP\n\
+         refresh-client -cL\n\
+         switch-client -Er\n\
+         list-clients -rF client\n\
+         server-access -lr\n\
+         display-panes -bN\n\
+         last-pane -de\n",
+    )?;
+
+    harness.success([
+        OsStr::new("source-file"),
+        OsStr::new("-n"),
+        config.as_os_str(),
+    ])?;
+    Ok(())
+}
+
+#[test]
+fn startup_config_keeps_commands_around_compact_client_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("startup-compact-client-flags")?;
+    let config = harness.tmpdir().join("compact-client-startup.conf");
+    fs::write(
+        &config,
+        "set-environment -g COMPACT_CLIENT_BEFORE ok\n\
+         list-clients -rF client\n\
+         set-environment -g COMPACT_CLIENT_AFTER ok\n",
+    )?;
+
+    harness.success([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("requested"),
+    ])?;
+    assert_environment(&harness, "COMPACT_CLIENT_BEFORE=ok")?;
+    assert_environment(&harness, "COMPACT_CLIENT_AFTER=ok")
+}
+
+#[test]
+fn if_shell_accepts_clustered_scripting_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("if-shell-bind-key-cluster")?;
+    harness.success(["new-session", "-d", "-s", "anchor"])?;
+    harness.success(["set-buffer", "-b", "if-shell-audit", "head"])?;
+    harness.success(["set-environment", "-g", "IF_SHELL_CLUSTER_ENV", "keep"])?;
+
+    harness.success([
+        "if-shell",
+        "-F",
+        "1",
+        "bind-key -nrTroot C-e display-message -p if-shell-cluster",
+    ])?;
+    assert_binding_contains(&harness, "C-e", "if-shell-cluster")?;
+
+    harness.success([
+        "if-shell",
+        "-F",
+        "1",
+        "set-buffer -aw -b if-shell-audit tail",
+    ])?;
+    assert_eq!(
+        harness.stdout(["show-buffer", "-b", "if-shell-audit"])?,
+        "headtail"
+    );
+
+    harness.success([
+        "if-shell",
+        "-F",
+        "1",
+        "set-environment -gu IF_SHELL_CLUSTER_ENV",
+    ])?;
+    assert_environment_missing(&harness, "IF_SHELL_CLUSTER_ENV")
+}
+
+#[test]
 fn source_file_accepts_clustered_new_session_flags() -> Result<(), Box<dyn Error>> {
     let harness = CrossPlatformHarness::new("source-new-session-cluster")?;
     harness.success(["new-session", "-d", "-s", "anchor"])?;
@@ -463,6 +648,45 @@ fn assert_environment(
     let output = harness.run(["show-environment", "-g", name])?;
     assert_success(&output)?;
     assert_eq!(String::from_utf8(output.stdout)?.trim(), expected_line);
+    Ok(())
+}
+
+fn assert_environment_missing(
+    harness: &CrossPlatformHarness,
+    name: &str,
+) -> Result<(), Box<dyn Error>> {
+    let output = harness.run(["show-environment", "-g", name])?;
+    assert!(
+        !output.status.success(),
+        "environment variable {name} unexpectedly remained: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    Ok(())
+}
+
+fn assert_binding_contains(
+    harness: &CrossPlatformHarness,
+    key: &str,
+    expected: &str,
+) -> Result<(), Box<dyn Error>> {
+    let output = harness.stdout(["list-keys", "-T", "root"])?;
+    assert!(
+        output.contains(expected),
+        "binding {key} did not contain {expected:?}: {output:?}"
+    );
+    Ok(())
+}
+
+fn assert_binding_absent(
+    harness: &CrossPlatformHarness,
+    key: &str,
+    unexpected: &str,
+) -> Result<(), Box<dyn Error>> {
+    let output = harness.stdout(["list-keys", "-T", "root"])?;
+    assert!(
+        !output.contains(unexpected),
+        "parse-only unexpectedly installed binding {key}: {output:?}"
+    );
     Ok(())
 }
 

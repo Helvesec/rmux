@@ -1,5 +1,6 @@
 mod common;
 mod discovery;
+mod pane_exit;
 mod session;
 mod snapshot;
 mod stream;

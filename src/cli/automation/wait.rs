@@ -19,6 +19,7 @@ use super::common::{
     stable_pane_ref_for_slot, timeout_deadline, visible_text, write_json, PaneProcessState,
     DEFAULT_STABLE_FOR,
 };
+use super::pane_exit::PaneExitStatus;
 use super::stream;
 
 const CLIENT_FIELD_SEPARATOR: char = '\u{1f}';
@@ -37,6 +38,7 @@ pub(crate) fn run_wait_pane(args: WaitPaneArgs, socket_path: &Path) -> Result<i3
     match wait_condition(&mut connection, target.clone(), &condition, deadline, None)? {
         WaitCompletion::Matched { pane_exit } => {
             if args.json {
+                let pane_exit = pane_exit.map_or(Value::Null, PaneExitStatus::json_value);
                 return write_json(&json!({
                     "schema_version": 1,
                     "ok": true,
@@ -111,10 +113,7 @@ pub(crate) fn run_send_keys_with_wait(
         );
         let _ = wait_connection.unsubscribe_pane_output(subscription_id);
         return match result? {
-            WaitCompletion::Matched { pane_exit } => {
-                let _ = pane_exit;
-                Ok(0)
-            }
+            WaitCompletion::Matched { .. } => Ok(0),
             WaitCompletion::TimedOut => Err(timeout_error(condition.name(), started_at)),
             WaitCompletion::Lag { missed_events } => Err(next_text_lag_error(missed_events)),
         };
@@ -145,10 +144,20 @@ pub(crate) fn run_send_keys_with_wait(
         deadline,
         baseline_revision,
     )? {
-        WaitCompletion::Matched { .. } => Ok(0),
+        WaitCompletion::Matched { pane_exit } => send_keys_wait_exit_code(&condition, pane_exit),
         WaitCompletion::TimedOut => Err(timeout_error(condition.name(), started_at)),
         WaitCompletion::Lag { missed_events } => Err(next_text_lag_error(missed_events)),
     }
+}
+
+fn send_keys_wait_exit_code(
+    condition: &WaitCondition,
+    pane_exit: Option<PaneExitStatus>,
+) -> Result<i32, ExitFailure> {
+    if !matches!(condition, WaitCondition::PaneExit) {
+        return Ok(0);
+    }
+    PaneExitStatus::send_keys_exit_code(pane_exit)
 }
 
 fn write_timeout_result(
@@ -281,7 +290,7 @@ impl WaitCondition {
 }
 
 enum WaitCompletion {
-    Matched { pane_exit: Value },
+    Matched { pane_exit: Option<PaneExitStatus> },
     TimedOut,
     Lag { missed_events: u64 },
 }
@@ -319,9 +328,7 @@ fn wait_visible_text(
         let snapshot = pane_snapshot(connection, target.clone())?;
         if visible_text(&snapshot).contains(text) || !find_visible_text(&snapshot, text).is_empty()
         {
-            return Ok(WaitCompletion::Matched {
-                pane_exit: Value::Null,
-            });
+            return Ok(WaitCompletion::Matched { pane_exit: None });
         }
         if Instant::now() >= deadline {
             return Ok(WaitCompletion::TimedOut);
@@ -343,7 +350,9 @@ fn wait_quiet(
 
     loop {
         if let PaneProcessState::Exited(pane_exit) = pane_process_state(connection, &target)? {
-            return Ok(WaitCompletion::Matched { pane_exit });
+            return Ok(WaitCompletion::Matched {
+                pane_exit: Some(pane_exit),
+            });
         }
         let snapshot = pane_snapshot(connection, target.clone())?;
         if require_revision_change_from.is_some_and(|baseline| snapshot.revision != baseline) {
@@ -354,9 +363,7 @@ fn wait_quiet(
             stable_since = Instant::now();
         }
         if observed_required_change && stable_since.elapsed() >= stable_for {
-            return Ok(WaitCompletion::Matched {
-                pane_exit: Value::Null,
-            });
+            return Ok(WaitCompletion::Matched { pane_exit: None });
         }
         if Instant::now() >= deadline {
             return Ok(WaitCompletion::TimedOut);
@@ -381,7 +388,9 @@ fn wait_pane_exit(
                         return Ok(WaitCompletion::Lag { missed_events });
                     }
                 }
-                return Ok(WaitCompletion::Matched { pane_exit: value });
+                return Ok(WaitCompletion::Matched {
+                    pane_exit: Some(value),
+                });
             }
         }
         if Instant::now() >= deadline {
@@ -468,9 +477,7 @@ fn wait_next_text_subscription(
         }
         for bytes in batch.chunks {
             if observe_needle(&mut tail, &bytes, needle) {
-                return Ok(WaitCompletion::Matched {
-                    pane_exit: Value::Null,
-                });
+                return Ok(WaitCompletion::Matched { pane_exit: None });
             }
         }
         if batch.saw_eof {
@@ -741,7 +748,11 @@ fn target_name(target: &PaneTargetRef) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{lag_json_value, observe_needle};
+    use std::time::Duration;
+
+    use super::{
+        lag_json_value, observe_needle, send_keys_wait_exit_code, PaneExitStatus, WaitCondition,
+    };
 
     #[test]
     fn next_text_observer_matches_across_output_chunks() {
@@ -770,5 +781,16 @@ mod tests {
         assert_eq!(value["condition"], "next-text");
         assert_eq!(value["target"], "%1");
         assert_eq!(value["missed_events"], 7);
+    }
+
+    #[test]
+    fn quiet_completion_does_not_claim_the_observed_process_status() {
+        let condition = WaitCondition::Quiet(Duration::from_millis(100));
+
+        assert_eq!(
+            send_keys_wait_exit_code(&condition, Some(PaneExitStatus::known(Some(7), None)),)
+                .expect("quiet reports completion rather than process success"),
+            0
+        );
     }
 }

@@ -213,17 +213,6 @@ fn runtime_alias_assignments_are_applied_before_the_validated_command() {
 }
 
 #[test]
-fn legacy_runtime_aliases_reject_assignments_without_the_new_bridge() {
-    let error = super::super::parse_with_runtime_aliases(
-        ["rmux", "zz"],
-        &["zz=FOO=bar display-message -p bar".to_owned()],
-    )
-    .expect_err("a legacy daemon cannot apply parse-time assignments atomically");
-
-    assert!(error.to_string().contains("unknown command: FOO=bar"));
-}
-
-#[test]
 fn invalid_runtime_alias_tail_is_rejected_before_assignments_can_dispatch() {
     let error = super::super::parse_with_runtime_command_groups(
         ["rmux", "zz"],

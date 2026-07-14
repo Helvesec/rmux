@@ -8,6 +8,7 @@ use rmux_proto::request::SwitchClientExt3Request;
 use rmux_proto::{CommandOutput, OptionName, RmuxError};
 
 use crate::handler_support::attached_client_required;
+use crate::key_table::effective_client_key_table_name;
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::{session_not_found, HandlerState};
@@ -121,9 +122,19 @@ impl RequestHandler {
     }
 
     pub(in crate::handler) async fn list_clients_snapshot(&self) -> Vec<ListClientSnapshot> {
-        let options = {
+        let (options, default_key_tables) = {
             let state = self.state.lock().await;
-            state.options.clone()
+            let default_key_tables = state
+                .sessions
+                .iter()
+                .map(|(session_name, session)| {
+                    (
+                        session_name.clone(),
+                        effective_client_key_table_name(&state, session, None),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            (state.options.clone(), default_key_tables)
         };
         let attach_clients = {
             let active_attach = self.active_attach.lock().await;
@@ -149,7 +160,10 @@ impl RequestHandler {
                         termtype: String::new(),
                         termfeatures: outer_terminal.features_string(),
                         utf8: active.terminal_context.utf8(),
-                        key_table: active.key_table_name.clone(),
+                        key_table: active
+                            .key_table_name
+                            .clone()
+                            .or_else(|| default_key_tables.get(&active.session_name).cloned()),
                         uid: active.uid,
                         user: active.user.clone(),
                         flags: format_attached_client_flags(active),
@@ -242,6 +256,7 @@ impl RequestHandler {
                 .sessions
                 .session(session_name)
                 .ok_or_else(|| session_not_found(session_name))?;
+            let key_table = effective_client_key_table_name(&state, session, key_table.as_deref());
             let session = attach_support::sized_session(session, Some(client_size));
             let outer_terminal = OuterTerminal::resolve(&state.options, terminal_context);
             let frame = crate::renderer::render_status_only_with_attached_count_and_prompt(
@@ -251,7 +266,7 @@ impl RequestHandler {
                 crate::renderer::StatusRenderContext {
                     prompt: prompt.as_ref(),
                     state: Some(&state),
-                    key_table: key_table.as_deref(),
+                    key_table: Some(&key_table),
                     socket_path: Some(&socket_path),
                     ..crate::renderer::StatusRenderContext::default()
                 },

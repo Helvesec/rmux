@@ -15,6 +15,10 @@ use crate::ClientError;
 
 #[path = "attach_windows/action.rs"]
 mod action;
+#[path = "attach_windows/console_coordination.rs"]
+mod console_coordination;
+#[path = "attach_windows/console_input_read.rs"]
+mod console_input_read;
 #[path = "attach_windows/input.rs"]
 mod input;
 #[path = "attach_windows/metrics.rs"]
@@ -31,6 +35,12 @@ mod stream;
 mod terminal;
 #[path = "attach/terminal_cleanup.rs"]
 mod terminal_cleanup;
+#[path = "attach_windows/vt_input_passthrough.rs"]
+mod vt_input_passthrough;
+#[path = "attach_windows/vt_mode_scanner.rs"]
+mod vt_mode_scanner;
+#[path = "attach_windows/windows_version.rs"]
+mod windows_version;
 
 use crate::attach_lock_state::AttachLockState;
 use screen::AttachScreenTracker;
@@ -104,7 +114,7 @@ where
     let raw_terminal = RawTerminal::enter().map_err(ClientError::from)?;
     let _ = raw_terminal.flush_pending_input();
     let screen_tracker = AttachScreenTracker::default();
-    let result = drive_attach_stream_with_terminal_state(
+    drive_attach_stream_with_terminal_state(
         stream,
         initial_bytes,
         raw_terminal,
@@ -112,11 +122,7 @@ where
         input,
         output,
         windows_console_key_enabled,
-    );
-    if result.is_err() && !screen_tracker.was_stopped() {
-        let _ = terminal::restore_attach_terminal_state();
-    }
-    result
+    )
 }
 
 fn drive_attach_stream_with_terminal_state<Input, Output>(
@@ -149,6 +155,9 @@ where
             resize_rx,
             actions: action::ManagedTerminalActions::new(raw_terminal),
             windows_console_key_enabled,
+            error_cleanup: Some(terminal_cleanup::fallback_attach_stop_sequence(
+                &std::env::var("TERM").unwrap_or_default(),
+            )),
         },
     )
 }
@@ -173,6 +182,7 @@ where
             resize_rx: closed_resize_rx(),
             actions: action::StreamOnlyActions,
             windows_console_key_enabled: false,
+            error_cleanup: None,
         },
     )
 }
@@ -181,6 +191,7 @@ struct AttachLoopInputs<Actions> {
     resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
     actions: Actions,
     windows_console_key_enabled: bool,
+    error_cleanup: Option<Vec<u8>>,
 }
 
 fn drive_attach_stream_inner<Input, Output, Actions>(
@@ -200,6 +211,7 @@ where
         resize_rx,
         actions,
         windows_console_key_enabled,
+        error_cleanup,
     } = loop_inputs;
     let input_join_policy = input_join_policy(input.as_raw_handle());
     let (input_tx, input_rx) = mpsc::channel(ATTACH_INPUT_QUEUE_CAPACITY);
@@ -228,7 +240,8 @@ where
                 action_completion_rx,
                 Arc::clone(&lock_state),
                 windows_console_key_enabled,
-            ),
+            )
+            .with_error_cleanup(error_cleanup),
         )
         .await
     });

@@ -119,9 +119,9 @@ pub(crate) struct SetEnvironmentArgs {
     pub(crate) format: bool,
     #[arg(short = 'h', action = ArgAction::SetTrue)]
     pub(crate) hidden: bool,
-    #[arg(short = 'r', action = ArgAction::SetTrue, conflicts_with = "unset")]
+    #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) clear: bool,
-    #[arg(short = 'u', action = ArgAction::SetTrue, conflicts_with = "clear")]
+    #[arg(short = 'u', action = ArgAction::SetTrue)]
     pub(crate) unset: bool,
     pub(crate) name: String,
     #[arg(allow_hyphen_values = true)]

@@ -93,7 +93,9 @@ pub use target_find::{
     command_target_metadata, CommandTargetMetadata, CommandTargetSpec, TargetFindContext,
     TargetFindFlags, TargetFindType, UnresolvedTarget,
 };
-pub use terminal_passthrough::{TerminalPassthrough, TerminalPassthroughKind};
+pub use terminal_passthrough::{
+    TerminalPaletteIndex, TerminalPassthrough, TerminalPassthroughKind,
+};
 pub use terminal_screen::TerminalScreen;
 pub use terminal_sequences::{alternate_screen_enter_sequence, alternate_screen_exit_sequence};
 pub use transcript::{ScreenCaptureRange, Transcript};

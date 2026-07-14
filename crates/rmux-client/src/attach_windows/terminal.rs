@@ -25,8 +25,8 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
+use super::console_coordination::ATTACH_CONSOLE_IO;
 use super::shell_command::{command_from_legacy, command_from_spec};
-use super::terminal_cleanup::fallback_attach_stop_sequence;
 
 /// Result type for raw-terminal lifecycle operations.
 pub type Result<T> = std::result::Result<T, AttachError>;
@@ -231,12 +231,12 @@ impl ConsoleRestorePoint {
     }
 
     fn restore(self) {
-        let _ = unsafe {
+        let _ = ATTACH_CONSOLE_IO.synchronized(|| unsafe {
             // SAFETY: The handle and mode were captured from a successful
             // GetConsoleMode call while entering raw mode. Restoration is best
             // effort because this may run from a console-control callback.
             SetConsoleMode(self.handle as HANDLE, self.mode)
-        };
+        });
     }
 }
 
@@ -382,14 +382,6 @@ const fn should_restore_for_console_event(event: u32) -> bool {
             | CTRL_LOGOFF_EVENT
             | CTRL_SHUTDOWN_EVENT
     )
-}
-
-pub(super) fn restore_attach_terminal_state() -> Result<()> {
-    let mut stdout = io::stdout();
-    let term = std::env::var("TERM").unwrap_or_default();
-    stdout.write_all(&fallback_attach_stop_sequence(&term))?;
-    stdout.flush()?;
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -540,37 +532,46 @@ impl ConsoleApi for Win32Console {
     }
 
     fn get_console_mode(&self, handle: Self::Handle) -> Result<Option<u32>> {
-        let mut mode = 0;
-        let ok = unsafe {
-            // SAFETY: handle is a valid std handle and mode points to writable storage.
-            GetConsoleMode(handle, &mut mode)
-        };
-        if ok == 0 {
-            return console_mode_absent_or_error();
-        }
-        Ok(Some(mode))
+        ATTACH_CONSOLE_IO.synchronized(|| {
+            let mut mode = 0;
+            let ok = unsafe {
+                // SAFETY: handle is a valid std handle and mode points to
+                // writable storage.
+                GetConsoleMode(handle, &mut mode)
+            };
+            if ok == 0 {
+                return console_mode_absent_or_error();
+            }
+            Ok(Some(mode))
+        })?
     }
 
     fn set_console_mode(&self, handle: Self::Handle, mode: u32) -> Result<()> {
-        let ok = unsafe {
-            // SAFETY: handle is a console handle and mode is a bitmask accepted by Win32.
-            SetConsoleMode(handle, mode)
-        };
-        if ok == 0 {
-            return Err(AttachError::Io(io::Error::last_os_error()));
-        }
-        Ok(())
+        ATTACH_CONSOLE_IO.synchronized(|| {
+            let ok = unsafe {
+                // SAFETY: handle is a console handle and mode is a bitmask
+                // accepted by Win32.
+                SetConsoleMode(handle, mode)
+            };
+            if ok == 0 {
+                return Err(AttachError::Io(io::Error::last_os_error()));
+            }
+            Ok(())
+        })?
     }
 
     fn flush_console_input(&self, handle: Self::Handle) -> Result<()> {
-        let ok = unsafe {
-            // SAFETY: handle is a valid console input handle captured by ConsoleMode.
-            FlushConsoleInputBuffer(handle)
-        };
-        if ok == 0 {
-            return Err(AttachError::Io(io::Error::last_os_error()));
-        }
-        Ok(())
+        ATTACH_CONSOLE_IO.synchronized(|| {
+            let ok = unsafe {
+                // SAFETY: handle is a valid console input handle captured by
+                // ConsoleMode.
+                FlushConsoleInputBuffer(handle)
+            };
+            if ok == 0 {
+                return Err(AttachError::Io(io::Error::last_os_error()));
+            }
+            Ok(())
+        })?
     }
 }
 
@@ -670,15 +671,17 @@ pub(super) fn wait_for_key_input(handle: HANDLE, timeout_ms: u32) -> io::Result<
 }
 
 fn console_input_is_readable(handle: HANDLE) -> io::Result<bool> {
-    let mut event_count = 0;
-    let ok = unsafe {
-        // SAFETY: handle is borrowed and event_count points to writable storage.
-        GetNumberOfConsoleInputEvents(handle, &mut event_count)
-    };
-    if ok == 0 {
-        return invalid_console_input_as_readable();
-    }
-    Ok(event_count > 0)
+    ATTACH_CONSOLE_IO.synchronized(|| {
+        let mut event_count = 0;
+        let ok = unsafe {
+            // SAFETY: handle is borrowed and event_count points to writable storage.
+            GetNumberOfConsoleInputEvents(handle, &mut event_count)
+        };
+        if ok == 0 {
+            return invalid_console_input_as_readable();
+        }
+        Ok(event_count > 0)
+    })?
 }
 
 fn invalid_console_input_as_readable() -> io::Result<bool> {

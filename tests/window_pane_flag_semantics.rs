@@ -478,6 +478,20 @@ fn last_pane_input_flags_apply_to_the_selected_last_pane() -> Result<(), Box<dyn
     );
     assert!(stderr(&enabled_capture).is_empty());
 
+    assert_success(&harness.run(&["select-pane", "-t", "s:0.1"])?);
+    assert_success(&harness.run(&["last-pane", "-de", "-t", "s:0"])?);
+    assert_success(&harness.run(&["send-keys", "-t", "s:0.0", "combined", "Enter"])?);
+    std::thread::sleep(SETTLE);
+
+    let combined_capture = harness.run(&["capture-pane", "-p", "-t", "s:0.0"])?;
+    assert_eq!(combined_capture.status.code(), Some(0));
+    assert!(
+        stdout(&combined_capture).contains("combined"),
+        "tmux gives last-pane -e precedence when -d is also present: {:?}",
+        stdout(&combined_capture)
+    );
+    assert!(stderr(&combined_capture).is_empty());
+
     terminate_child(daemon.child_mut())?;
     Ok(())
 }

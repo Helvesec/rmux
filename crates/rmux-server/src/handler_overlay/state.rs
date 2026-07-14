@@ -8,6 +8,7 @@ use crate::renderer::{render_popup_overlay, OverlayRect, PopupRenderSpec};
 
 use super::menu::MenuOverlayState;
 use super::popup_job::{PopupDragMode, PopupJob, PopupSurface};
+use super::scrollable::ScrollablePopupText;
 
 #[derive(Debug, Clone)]
 pub(in crate::handler) enum ClientOverlayState {
@@ -66,6 +67,7 @@ pub(in crate::handler) struct PopupOverlayState {
     pub(in crate::handler) close_any_key: bool,
     pub(in crate::handler) no_job: bool,
     pub(in crate::handler) surface: Arc<StdMutex<PopupSurface>>,
+    pub(in crate::handler) scrollable_text: Option<ScrollablePopupText>,
     pub(in crate::handler) job: Option<PopupJob>,
     pub(in crate::handler) nested_menu: Option<MenuOverlayState>,
     pub(in crate::handler) dragging: PopupDragMode,
@@ -73,13 +75,17 @@ pub(in crate::handler) struct PopupOverlayState {
 
 impl PopupOverlayState {
     fn render(&self) -> Vec<u8> {
+        let content_lines = self.scrollable_text.as_ref().map_or_else(
+            || self.surface.lock().expect("popup surface").lines(),
+            |text| text.visible_lines(self.content_size().rows),
+        );
         let popup_frame = render_popup_overlay(&PopupRenderSpec {
             rect: self.rect,
             title: self.title.clone(),
             style: self.style.clone(),
             border_style: self.border_style.clone(),
             border_lines: self.border_lines,
-            content_lines: self.surface.lock().expect("popup surface").lines(),
+            content_lines,
         });
         if let Some(menu) = &self.nested_menu {
             let mut frame = popup_frame;

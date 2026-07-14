@@ -5,7 +5,7 @@ use rmux_proto::{
     SelectLayoutTarget, SelectOldLayoutRequest, SpreadLayoutRequest, TerminalSize,
 };
 
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::{parse_percentage, parse_u64};
 use super::{
     implicit_pane_target, implicit_session_name, implicit_window_target, parse_layout_name,
@@ -22,8 +22,8 @@ pub(super) fn parse_display_panes(
     let mut no_command = false;
     let mut target_client = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -48,7 +48,27 @@ pub(super) fn parse_display_panes(
                 let _ = args.optional();
                 target_client = Some(args.required("-t target-client")?);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "bN", "dt") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('b') => non_blocking = true,
+                        CompactFlag::Bare('N') => no_command = true,
+                        compact_flag @ CompactFlag::Value { flag: 'd', .. } => {
+                            let value = compact_flag.value_or_next(&mut args, "-d duration")?;
+                            duration_ms = Some(parse_u64("display-panes", "-d", &value)?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target_client =
+                                Some(compact_flag.value_or_next(&mut args, "-t target-client")?);
+                        }
+                        _ => unreachable!("compact display-panes flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 

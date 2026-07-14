@@ -110,6 +110,47 @@ fn rendered_pane_line_truncates_to_pane_width_without_counting_sgr() {
 }
 
 #[test]
+fn rendered_pane_line_keeps_composed_cells_at_pane_width() {
+    let utf8 = Utf8Config::default();
+
+    for (line, expected) in [
+        ("👋🏽ABC", "👋🏽ABC"),
+        ("👩\u{200d}💻ABC", "👩\u{200d}💻ABC"),
+        ("\u{1b}[31m👋🏽\u{1b}[32mABC", "\u{1b}[31m👋🏽\u{1b}[32mABC"),
+    ] {
+        let clipped = String::from_utf8(super::truncate_rendered_pane_line(
+            line.as_bytes(),
+            5,
+            &utf8,
+        ))
+        .expect("rendered pane line is utf-8");
+
+        assert_eq!(clipped, expected, "line {line:?}");
+    }
+}
+
+#[test]
+fn pane_render_keeps_modified_emoji_text_at_right_edge() {
+    let size = TerminalSize { cols: 5, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with("👋🏽ABC".as_bytes(), size);
+
+    let frame = String::from_utf8(super::render_pane_screen(
+        &session,
+        &OptionStore::new(),
+        pane,
+        &screen,
+    ))
+    .expect("pane frame is utf-8");
+
+    assert!(
+        frame.contains("👋🏽ABC"),
+        "full repaint must preserve the complete composed cell and following text: {frame:?}"
+    );
+}
+
+#[test]
 fn copy_mode_position_truncation_does_not_style_separator_before_bracket() {
     let session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 4 });
     let pane = session.window().pane(0).expect("pane 0 exists");

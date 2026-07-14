@@ -809,6 +809,8 @@ async fn replace_transcript_contents(
 #[path = "handler_attach_tests/lifecycle.rs"]
 mod lifecycle;
 
+#[path = "handler_attach_tests/attached_help.rs"]
+mod attached_help;
 #[path = "handler_attach_tests/prefix_navigation.rs"]
 mod prefix_navigation;
 

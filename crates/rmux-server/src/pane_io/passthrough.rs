@@ -45,6 +45,10 @@ fn passthrough_enabled(target: &OpenAttachTarget, kind: TerminalPassthroughKind)
     match kind {
         TerminalPassthroughKind::Raw => target.raw_passthrough,
         TerminalPassthroughKind::Clipboard => target.outer_terminal.clipboard_passthrough_enabled(),
+        // This is a strict, parser-produced OSC 4 query for a u8 palette
+        // index, not arbitrary raw passthrough. It must reach the outer
+        // terminal even when allow-passthrough is disabled.
+        TerminalPassthroughKind::PaletteQuery => true,
         TerminalPassthroughKind::KittyGraphics => target.kitty_graphics_passthrough,
         TerminalPassthroughKind::Sixel => target.sixel_passthrough,
     }
@@ -83,7 +87,7 @@ fn passthrough_requires_cursor_position(kind: TerminalPassthroughKind) -> bool {
         TerminalPassthroughKind::Raw
         | TerminalPassthroughKind::KittyGraphics
         | TerminalPassthroughKind::Sixel => true,
-        TerminalPassthroughKind::Clipboard => false,
+        TerminalPassthroughKind::Clipboard | TerminalPassthroughKind::PaletteQuery => false,
     }
 }
 
@@ -103,7 +107,7 @@ fn append_cursor_position(
 
 #[cfg(test)]
 mod tests {
-    use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
+    use rmux_core::{OptionStore, PaneGeometry, TerminalPaletteIndex, TerminalPassthrough};
     use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode};
 
     use super::{append_cursor_position, render_passthroughs};
@@ -329,6 +333,39 @@ mod tests {
             &[TerminalPassthrough::clipboard(b"\x1b]52;c;?\x07".to_vec())],
         );
         assert_eq!(frame, b"\x1b]52;c;?\x07");
+    }
+
+    #[test]
+    fn render_passthroughs_forwards_typed_palette_query_without_raw_gate_or_cursor_motion() {
+        let pane_output = pane_output_channel();
+        let target = OpenAttachTarget {
+            session_name: SessionName::new("alpha").expect("valid session name"),
+            predicted_echo: Default::default(),
+            predicted_echo_started_at: None,
+            pane_output: Some(pane_output.subscribe()),
+            render_frame: Vec::new(),
+            outer_terminal: OuterTerminal::resolve(
+                &OptionStore::default(),
+                OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+            ),
+            cursor_style: 0,
+            active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
+            raw_passthrough: false,
+            kitty_graphics_passthrough: false,
+            sixel_passthrough: false,
+            persistent_overlay_state_id: None,
+            live_pane: None,
+            render_stream: false,
+        };
+
+        let frame = render_passthroughs(
+            &target,
+            &[TerminalPassthrough::palette_query(
+                TerminalPaletteIndex::from(7),
+            )],
+        );
+
+        assert_eq!(frame, b"\x1b]4;7;?\x1b\\");
     }
 
     #[test]

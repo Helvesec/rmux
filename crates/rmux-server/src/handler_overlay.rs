@@ -44,6 +44,9 @@ mod mouse;
 use mouse::is_mouse_prefix;
 #[path = "handler_overlay/popup_job.rs"]
 mod popup_job;
+#[path = "handler_overlay/scrollable.rs"]
+mod scrollable;
+pub(in crate::handler) use scrollable::AttachedHelpContext;
 #[path = "handler_overlay/state.rs"]
 mod state;
 pub(super) use state::{ClientOverlayState, PopupOverlayState};
@@ -229,8 +232,8 @@ impl RequestHandler {
                     }
                     continue;
                 }
-                let consumed = match decode_attached_key(slice, backspace) {
-                    AttachedKeyDecode::Matched { size, .. } => size,
+                let (consumed, key) = match decode_attached_key(slice, backspace) {
+                    AttachedKeyDecode::Matched { size, key } => (size, key),
                     AttachedKeyDecode::Partial => {
                         pending_input.drain(..offset);
                         retain_partial_attached_escape_input(
@@ -239,15 +242,15 @@ impl RequestHandler {
                         )?;
                         return Ok(AttachedOverlayInput::Consumed);
                     }
-                    AttachedKeyDecode::Invalid => slice.len(),
+                    AttachedKeyDecode::Invalid => (slice.len(), rmux_core::KEYC_UNKNOWN),
                 };
                 let raw = pending_input[offset..offset + consumed].to_vec();
                 let handled = match identity {
                     Some(identity) => {
-                        self.handle_popup_raw_input_for_identity(identity, &raw)
+                        self.handle_popup_key_input_for_identity(identity, key, &raw)
                             .await?
                     }
-                    None => self.handle_popup_raw_input(attach_pid, &raw).await?,
+                    None => self.handle_popup_key_input(attach_pid, key, &raw).await?,
                 };
                 if !handled {
                     break;
@@ -415,10 +418,21 @@ impl RequestHandler {
             AttachedOverlayRoute::Popup { .. } => {
                 let _ = match identity {
                     Some(identity) => {
-                        self.handle_popup_raw_input_for_identity(identity, b"\x1b")
-                            .await?
+                        self.handle_popup_key_input_for_identity(
+                            identity,
+                            rmux_core::KeyCode::from(b'\x1b'),
+                            b"\x1b",
+                        )
+                        .await?
                     }
-                    None => self.handle_popup_raw_input(attach_pid, b"\x1b").await?,
+                    None => {
+                        self.handle_popup_key_input(
+                            attach_pid,
+                            rmux_core::KeyCode::from(b'\x1b'),
+                            b"\x1b",
+                        )
+                        .await?
+                    }
                 };
             }
         }
@@ -849,8 +863,14 @@ impl RequestHandler {
         attach_pid: u32,
         terminate_popup_job: bool,
     ) -> Result<(), RmuxError> {
-        self.clear_interactive_overlay_with_identity(attach_pid, None, None, terminate_popup_job)
-            .await
+        self.clear_interactive_overlay_with_identity(
+            attach_pid,
+            None,
+            None,
+            None,
+            terminate_popup_job,
+        )
+        .await
     }
 
     pub(super) async fn clear_interactive_overlay_for_identity(
@@ -861,6 +881,7 @@ impl RequestHandler {
         self.clear_interactive_overlay_with_identity(
             identity.attach_pid(),
             Some(identity),
+            None,
             None,
             terminate_popup_job,
         )
@@ -878,6 +899,7 @@ impl RequestHandler {
             identity.attach_pid(),
             Some(identity),
             Some((session_name, session_id)),
+            None,
             terminate_popup_job,
         )
         .await
@@ -901,11 +923,29 @@ impl RequestHandler {
         }
     }
 
+    pub(super) async fn clear_interactive_overlay_for_optional_identity_and_id(
+        &self,
+        attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+        overlay_id: u64,
+        terminate_popup_job: bool,
+    ) -> Result<(), RmuxError> {
+        self.clear_interactive_overlay_with_identity(
+            attach_pid,
+            identity,
+            None,
+            Some(overlay_id),
+            terminate_popup_job,
+        )
+        .await
+    }
+
     async fn clear_interactive_overlay_with_identity(
         &self,
         attach_pid: u32,
         expected_identity: Option<ActiveAttachIdentity>,
         expected_session: Option<(&rmux_proto::SessionName, rmux_proto::SessionId)>,
+        expected_overlay_id: Option<u64>,
         terminate_popup_job: bool,
     ) -> Result<(), RmuxError> {
         let (control_tx, render_generation, overlay_generation, popup_job) = {
@@ -922,6 +962,11 @@ impl RequestHandler {
                     })
                 })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
+            if expected_overlay_id.is_some_and(|expected| {
+                active.overlay.as_ref().map(ClientOverlayState::id) != Some(expected)
+            }) {
+                return Ok(());
+            }
             let popup_job = match active.overlay.take() {
                 Some(ClientOverlayState::Popup(popup)) if terminate_popup_job => popup.job,
                 _ => None,

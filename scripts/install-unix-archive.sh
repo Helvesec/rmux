@@ -155,7 +155,7 @@ restore_target() {
     fi
     rm -f "$target" || return 1
     [ ! -e "$target" ] && [ ! -L "$target" ]
-    return
+    return 0
   fi
 
   target_dir="$(dirname "$target")"

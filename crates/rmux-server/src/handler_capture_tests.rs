@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 use super::RequestHandler;
 use rmux_core::{input::InputParser, Screen};
 use rmux_proto::types::OptionScopeSelector;
+#[cfg(unix)]
+use rmux_proto::ListBuffersRequest;
 use rmux_proto::{
     CapturePaneRequest, CapturePaneTargetActionRequest, LoadBufferRequest, NewSessionRequest,
     PaneTarget, Request, Response, SaveBufferRequest, SendKeysRequest, SetBufferRequest,
@@ -384,6 +386,52 @@ async fn load_buffer_reads_server_file() {
         b"loaded data"
     );
 
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn load_buffer_waiting_on_fifo_does_not_block_other_requests() {
+    let handler = RequestHandler::new();
+    let path = temp_path("load-fifo");
+    let output = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .output()
+        .expect("run mkfifo");
+    assert!(
+        output.status.success(),
+        "mkfifo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        std::fs::write(writer_path, b"fifo data").expect("write fifo");
+    });
+    let load_handler = handler.clone();
+    let load_path = path.clone();
+    let load = tokio::spawn(async move {
+        load_handler
+            .handle(Request::LoadBuffer(Box::new(load_buffer_request(
+                &load_path, None, "fifo",
+            ))))
+            .await
+    });
+
+    let concurrent_response = tokio::time::timeout(Duration::from_millis(500), async {
+        tokio::task::yield_now().await;
+        handler
+            .handle(Request::ListBuffers(ListBuffersRequest::default()))
+            .await
+    })
+    .await
+    .expect("a blocked FIFO read must not stall unrelated daemon requests");
+    assert!(matches!(concurrent_response, Response::ListBuffers(_)));
+
+    let load_response = load.await.expect("load-buffer task should finish");
+    assert!(matches!(load_response, Response::LoadBuffer(_)));
+    writer.join().expect("FIFO writer should finish");
     let _ = std::fs::remove_file(path);
 }
 

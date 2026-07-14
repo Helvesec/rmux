@@ -200,6 +200,63 @@ fn runtime_command_aliases_override_direct_builtin_commands() -> Result<(), Box<
 }
 
 #[test]
+fn cold_start_config_alias_applies_to_first_builtin_product_divergence(
+) -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("cold-start-first-command-alias")?;
+    let config = harness.tmpdir().join("cold-start-alias.conf");
+    fs::write(
+        &config,
+        "set-option -s command-alias[20] 'new-session=COLD_ALIAS=ok new-session -d -s aliased ; display-message -p \"$COLD_ALIAS\"'\n",
+    )?;
+
+    let output = harness.run([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+    ])?;
+
+    assert_success(&output)?;
+    assert_eq!(String::from_utf8(output.stdout)?, "ok\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        harness.stdout(["list-sessions", "-F", "#{session_name}"])?,
+        "aliased\n"
+    );
+    assert_eq!(
+        harness.stdout(["show-environment", "-g", "COLD_ALIAS"])?,
+        "COLD_ALIAS=ok\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn cold_start_config_alias_respects_no_start_server() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("cold-start-alias-no-server")?;
+    let config = harness.tmpdir().join("cold-start-alias.conf");
+    fs::write(
+        &config,
+        "set-option -s command-alias[20] 'new-session=new-session -d -s forbidden'\n",
+    )?;
+
+    let output = harness.run([
+        OsStr::new("-N"),
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+    ])?;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no server running") || stderr.contains("error connecting"),
+        "stderr={stderr:?}",
+    );
+    assert!(!harness.run(["list-sessions"])?.status.success());
+    Ok(())
+}
+
+#[test]
 fn runtime_command_aliases_are_not_expanded_twice() -> Result<(), Box<dyn Error>> {
     let harness = AcceptanceHarness::new("runtime-command-alias-single-expansion")?;
     harness.success(["new-session", "-d", "-s", "alpha"])?;

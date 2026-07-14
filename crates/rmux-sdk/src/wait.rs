@@ -14,15 +14,16 @@ use rmux_proto::{
     SdkWaitForOutputRefRequest, SdkWaitId, SdkWaitOutcome, CAPABILITY_SDK_PANE_BY_ID,
     CAPABILITY_SDK_WAITS_ARMED,
 };
+use tokio::time::Instant;
 
 use crate::handles::{connect_transport_to_endpoint, Pane};
 use crate::transport::{DropGuard, PendingResponse, TransportClient};
-use crate::{Result, RmuxError};
+use crate::{PaneSnapshot, Result, RmuxError};
 
 pub use visible::{VisibleTextExpectation, VisibleTextWait, WaitTimeoutError};
 
 const WAIT_FOR_BYTES_OPERATION: &str = "wait for pane output bytes";
-const WAIT_FOR_TEXT_OPERATION: &str = "wait for pane snapshot text";
+pub(crate) const WAIT_FOR_TEXT_OPERATION: &str = "wait for pane snapshot text";
 const WAIT_FOR_NEXT_BYTES_OPERATION: &str = "wait for next pane output bytes";
 const WAIT_FOR_TEXT_NEXT_OPERATION: &str = "wait for next pane output text";
 const WAIT_FOR_EXIT_OPERATION: &str = "wait for pane process exit";
@@ -312,6 +313,56 @@ where
     }
 }
 
+pub(crate) async fn with_wait_deadline<F, T>(
+    operation: &'static str,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let Some(deadline) = deadline else {
+        return future.await;
+    };
+    let timeout = timeout.expect("deadline implies timeout");
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(wait_timeout_error(operation, timeout));
+    }
+    tokio::time::timeout(remaining, future)
+        .await
+        .map_err(|_| wait_timeout_error(operation, timeout))?
+}
+
+pub(crate) async fn snapshot_with_wait_deadline(
+    pane: &Pane,
+    operation: &'static str,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    last_snapshot: Option<&PaneSnapshot>,
+    description: impl FnOnce() -> String,
+) -> Result<PaneSnapshot> {
+    match with_wait_deadline(operation, timeout, deadline, pane.snapshot()).await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) if is_wait_deadline_error(&error) && last_snapshot.is_some() => {
+            Err(RmuxError::wait_timeout(WaitTimeoutError::new(
+                description(),
+                timeout.expect("deadline implies timeout"),
+                last_snapshot.expect("checked snapshot presence").clone(),
+            )))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn is_wait_deadline_error(error: &RmuxError) -> bool {
+    matches!(
+        error,
+        RmuxError::Transport { source, .. } if source.kind() == io::ErrorKind::TimedOut
+    )
+}
+
 pub(crate) fn resolved_wait_timeout(default_timeout: Option<Duration>) -> Option<Duration> {
     crate::bootstrap::discovery::resolve_timeout(None, default_timeout)
 }
@@ -518,5 +569,26 @@ mod tests {
             .expect("untimed ready future completes");
 
         assert_eq!(value, 7);
+    }
+
+    #[tokio::test]
+    async fn finite_wait_deadline_bounds_an_in_flight_rpc() {
+        let timeout = Duration::from_millis(10);
+        let error = with_wait_deadline(
+            "test snapshot RPC",
+            Some(timeout),
+            Some(Instant::now() + timeout),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .expect_err("pending RPC must not outlive the overall wait deadline");
+
+        match error {
+            RmuxError::Transport { operation, source } => {
+                assert_eq!(operation, "test snapshot RPC");
+                assert_eq!(source.kind(), io::ErrorKind::TimedOut);
+            }
+            other => panic!("expected typed transport timeout, got {other:?}"),
+        }
     }
 }

@@ -5,17 +5,21 @@ use std::sync::OnceLock;
 use rmux_proto::AttachedWindowsConsoleKey;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetNumberOfConsoleInputEvents, ReadConsoleInputW, FROM_LEFT_1ST_BUTTON_PRESSED,
-    FROM_LEFT_2ND_BUTTON_PRESSED, FROM_LEFT_3RD_BUTTON_PRESSED, INPUT_RECORD, KEY_EVENT,
-    KEY_EVENT_RECORD, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, MOUSE_EVENT, MOUSE_EVENT_RECORD,
-    MOUSE_HWHEELED, MOUSE_MOVED, MOUSE_WHEELED, RIGHTMOST_BUTTON_PRESSED, RIGHT_ALT_PRESSED,
-    RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
+    GetConsoleMode, FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED,
+    FROM_LEFT_3RD_BUTTON_PRESSED, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED,
+    LEFT_CTRL_PRESSED, MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_HWHEELED, MOUSE_MOVED, MOUSE_WHEELED,
+    RIGHTMOST_BUTTON_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12,
     VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT, VK_LCONTROL,
     VK_LEFT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT,
     VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+};
+
+use super::console_coordination::{ConsoleIoCoordinator, ATTACH_CONSOLE_IO};
+use super::console_input_read::{
+    read_console_input_batch_with, ConsoleInputApi, ConsoleInputRead, Win32ConsoleInput,
 };
 
 const ATTACH_INPUT_CHUNK_LIMIT: usize = 4096;
@@ -100,10 +104,13 @@ impl ConsoleInputReader {
     pub(super) fn from_handle(handle: RawHandle) -> Option<Self> {
         let handle = handle as HANDLE;
         let mut mode = 0;
-        let ok = unsafe {
-            // SAFETY: `mode` is writable and `handle` is only borrowed for this capability probe.
-            GetConsoleMode(handle, &mut mode)
-        };
+        let ok = ATTACH_CONSOLE_IO
+            .synchronized(|| unsafe {
+                // SAFETY: `mode` is writable and `handle` is only borrowed for
+                // this capability probe.
+                GetConsoleMode(handle, &mut mode)
+            })
+            .ok()?;
         (ok != 0).then_some(Self {
             handle,
             pending_high_surrogate: None,
@@ -114,24 +121,31 @@ impl ConsoleInputReader {
     }
 
     pub(super) fn read_key_inputs(&mut self) -> io::Result<Vec<AttachInput>> {
-        let mut records = [INPUT_RECORD::default(); CONSOLE_INPUT_RECORD_BATCH];
-        let mut records_read = 0;
-        let ok = unsafe {
-            // SAFETY: `records` points to writable INPUT_RECORD storage and `records_read` is a
-            // valid output pointer. The console handle is borrowed for the duration of the call.
-            ReadConsoleInputW(
-                self.handle,
-                records.as_mut_ptr(),
-                records.len() as u32,
-                &mut records_read,
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        self.read_key_inputs_with(&ATTACH_CONSOLE_IO, &Win32ConsoleInput)
+    }
 
-        let mut events = Vec::with_capacity(records_read as usize);
-        for record in &records[..records_read as usize] {
+    fn read_key_inputs_with<Api>(
+        &mut self,
+        coordinator: &ConsoleIoCoordinator,
+        api: &Api,
+    ) -> io::Result<Vec<AttachInput>>
+    where
+        Api: ConsoleInputApi,
+    {
+        let mut records = [INPUT_RECORD::default(); CONSOLE_INPUT_RECORD_BATCH];
+        let ConsoleInputRead::Records {
+            records_read,
+            drained,
+        } = read_console_input_batch_with(coordinator, api, self.handle, &mut records)?
+        else {
+            // Teardown may flush an input which was readable immediately
+            // before the attach input-read lease was acquired. Preserve all
+            // decoder and paste state until a real record batch is available.
+            return Ok(Vec::new());
+        };
+
+        let mut events = Vec::with_capacity(records_read);
+        for record in &records[..records_read] {
             match u32::from(record.EventType) {
                 KEY_EVENT => {
                     let event = unsafe {
@@ -159,7 +173,6 @@ impl ConsoleInputReader {
         // "a") and a pasted newline arrives as VK_RETURN just like a typed Enter,
         // so there is no per-record "injected" flag. If the buffer still holds
         // events after this batch the paste continues into the next one.
-        let drained = self.console_input_drained();
         Ok(encode_input_batch(
             &events,
             drained,
@@ -168,15 +181,6 @@ impl ConsoleInputReader {
             &mut self.pending_high_surrogate,
             &mut self.last_mouse_button_state,
         ))
-    }
-
-    fn console_input_drained(&self) -> bool {
-        let mut pending = 0;
-        let ok = unsafe {
-            // SAFETY: `pending` is writable and `self.handle` is a live console input handle.
-            GetNumberOfConsoleInputEvents(self.handle, &mut pending)
-        };
-        ok != 0 && pending == 0
     }
 }
 
@@ -977,15 +981,24 @@ fn marker_adjusted_end(bytes: &[u8], start: usize, end: usize, marker: &[u8]) ->
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::io;
+    use std::sync::Mutex;
+
+    use super::super::console_coordination::ConsoleIoCoordinator;
+    use super::super::console_input_read::ConsoleInputApi;
     use super::{
         attach_input_chunks, encode_input_batch, encode_key_event, encode_mouse_event,
         strip_embedded_paste_markers, windows_console_key_for_event, AttachInput, BatchEvent,
-        ConsoleKeyEvent, ATTACH_INPUT_CHUNK_LIMIT, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
+        ConsoleInputReader, ConsoleKeyEvent, ATTACH_INPUT_CHUNK_LIMIT, BRACKETED_PASTE_END,
+        BRACKETED_PASTE_START,
     };
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::{
-        FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED, LEFT_ALT_PRESSED,
-        LEFT_CTRL_PRESSED, MOUSE_EVENT_RECORD, MOUSE_HWHEELED, MOUSE_MOVED, MOUSE_WHEELED,
-        RIGHTMOST_BUTTON_PRESSED, RIGHT_ALT_PRESSED, SHIFT_PRESSED,
+        FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED, INPUT_RECORD, INPUT_RECORD_0,
+        KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED,
+        MOUSE_EVENT_RECORD, MOUSE_HWHEELED, MOUSE_MOVED, MOUSE_WHEELED, RIGHTMOST_BUTTON_PRESSED,
+        RIGHT_ALT_PRESSED, SHIFT_PRESSED,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F5, VK_HOME, VK_LEFT, VK_RETURN,
@@ -1064,6 +1077,173 @@ mod tests {
         framed.extend_from_slice(bytes);
         framed.extend_from_slice(BRACKETED_PASTE_END);
         framed
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FakeConsoleCall {
+        EventCount,
+        Flush,
+        Read,
+    }
+
+    struct FakeConsoleState {
+        records: VecDeque<INPUT_RECORD>,
+        calls: Vec<FakeConsoleCall>,
+    }
+
+    struct FakeConsoleInput {
+        state: Mutex<FakeConsoleState>,
+    }
+
+    impl FakeConsoleInput {
+        fn new(records: impl IntoIterator<Item = INPUT_RECORD>) -> Self {
+            Self {
+                state: Mutex::new(FakeConsoleState {
+                    records: records.into_iter().collect(),
+                    calls: Vec::new(),
+                }),
+            }
+        }
+
+        fn flush(&self) {
+            let mut state = self.state.lock().expect("fake console remains usable");
+            state.calls.push(FakeConsoleCall::Flush);
+            state.records.clear();
+        }
+
+        fn calls(&self) -> Vec<FakeConsoleCall> {
+            self.state
+                .lock()
+                .expect("fake console remains usable")
+                .calls
+                .clone()
+        }
+    }
+
+    impl ConsoleInputApi for FakeConsoleInput {
+        fn event_count(&self, _handle: HANDLE) -> io::Result<u32> {
+            let mut state = self.state.lock().expect("fake console remains usable");
+            state.calls.push(FakeConsoleCall::EventCount);
+            u32::try_from(state.records.len())
+                .map_err(|_| io::Error::other("fake console record count overflow"))
+        }
+
+        fn read_records(&self, _handle: HANDLE, records: &mut [INPUT_RECORD]) -> io::Result<usize> {
+            let mut state = self.state.lock().expect("fake console remains usable");
+            state.calls.push(FakeConsoleCall::Read);
+            let records_read = records.len().min(state.records.len());
+            for record in records.iter_mut().take(records_read) {
+                *record = state
+                    .records
+                    .pop_front()
+                    .expect("the fake queue length was checked");
+            }
+            Ok(records_read)
+        }
+    }
+
+    fn console_key_input_record(byte: u8) -> INPUT_RECORD {
+        INPUT_RECORD {
+            EventType: KEY_EVENT as u16,
+            Event: INPUT_RECORD_0 {
+                KeyEvent: KEY_EVENT_RECORD {
+                    bKeyDown: 1,
+                    wRepeatCount: 1,
+                    wVirtualKeyCode: u16::from(byte),
+                    wVirtualScanCode: 0,
+                    uChar: KEY_EVENT_RECORD_0 {
+                        UnicodeChar: u16::from(byte),
+                    },
+                    dwControlKeyState: 0,
+                },
+            },
+        }
+    }
+
+    fn fake_console_reader() -> ConsoleInputReader {
+        ConsoleInputReader {
+            handle: std::ptr::null_mut(),
+            pending_high_surrogate: None,
+            last_mouse_button_state: 0,
+            paste_open: false,
+            paste_carryover: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn readiness_then_teardown_flush_skips_read_without_mutating_decoder_state() {
+        let api = FakeConsoleInput::new([console_key_input_record(b'x')]);
+        let handle = std::ptr::null_mut();
+        assert_eq!(
+            api.event_count(handle).expect("readiness probe succeeds"),
+            1,
+            "the outer wait observed readable input"
+        );
+        api.flush();
+
+        let mut reader = fake_console_reader();
+        reader.pending_high_surrogate = Some(0xd83d);
+        reader.last_mouse_button_state = FROM_LEFT_1ST_BUTTON_PRESSED;
+        reader.paste_open = true;
+        reader.paste_carryover = b"\x1b[20".to_vec();
+        let coordinator = ConsoleIoCoordinator::new();
+
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("the flushed race is an empty nonblocking read");
+
+        assert!(inputs.is_empty());
+        assert_eq!(reader.pending_high_surrogate, Some(0xd83d));
+        assert_eq!(reader.last_mouse_button_state, FROM_LEFT_1ST_BUTTON_PRESSED);
+        assert!(reader.paste_open);
+        assert_eq!(reader.paste_carryover, b"\x1b[20");
+        assert_eq!(
+            api.calls(),
+            [
+                FakeConsoleCall::EventCount,
+                FakeConsoleCall::Flush,
+                FakeConsoleCall::EventCount,
+            ],
+            "the coordinated recheck must return before the blocking read"
+        );
+    }
+
+    #[test]
+    fn coordinated_console_reads_preserve_multi_batch_paste_framing() {
+        let source = vec![b'a'; super::CONSOLE_INPUT_RECORD_BATCH + 1];
+        let api = FakeConsoleInput::new(source.iter().copied().map(console_key_input_record));
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+
+        let first = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("the first console batch is read");
+        assert!(
+            reader.paste_open,
+            "one queued record remains after the batch"
+        );
+        let second = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("the final console batch is read");
+
+        let actual = first
+            .iter()
+            .chain(&second)
+            .flat_map(|input| input.payload().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, bracketed_text(&source));
+        assert!(!reader.paste_open, "the drained batch closes the paste");
+        assert_eq!(
+            api.calls(),
+            [
+                FakeConsoleCall::EventCount,
+                FakeConsoleCall::Read,
+                FakeConsoleCall::EventCount,
+                FakeConsoleCall::EventCount,
+                FakeConsoleCall::Read,
+                FakeConsoleCall::EventCount,
+            ]
+        );
     }
 
     #[test]

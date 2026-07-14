@@ -11,6 +11,7 @@ use tokio::time::sleep;
 
 use super::{client_support::SwitchTargetSelection, RequestHandler};
 use crate::handler_support::attached_client_required;
+use crate::key_table::effective_client_key_table_name;
 use crate::outer_terminal::{CursorScope, OuterTerminal, OuterTerminalContext};
 use crate::pane_io::{AttachControl, AttachTarget, LivePaneRender, OverlayFrame};
 use crate::pane_terminals::{session_not_found, HandlerState};
@@ -995,6 +996,7 @@ fn attach_target_for_session_with_prompt(
         options.window_size_override,
     )?;
     let session = session.as_ref();
+    let key_table = effective_client_key_table_name(state, session, options.key_table);
     let pane_output_sender = state.pane_output_for_target(
         session_name,
         session.active_window_index(),
@@ -1050,7 +1052,7 @@ fn attach_target_for_session_with_prompt(
                     .map(|pane_state| pane_state.title.as_str())
                     .filter(|title| !title.is_empty()),
                 state: Some(state),
-                key_table: options.key_table,
+                key_table: Some(&key_table),
                 socket_path: Some(options.socket_path),
             },
         )
