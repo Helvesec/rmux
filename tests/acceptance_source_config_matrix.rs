@@ -7,6 +7,94 @@ use std::fs;
 use common_cross::{assert_success, CrossPlatformHarness};
 
 #[test]
+fn source_file_accepts_clustered_new_session_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("source-new-session-cluster")?;
+    harness.success(["new-session", "-d", "-s", "anchor"])?;
+    let config = harness.tmpdir().join("clustered-new-session.conf");
+    fs::write(&config, "new-session -dP -s sourced\n")?;
+
+    harness.success([OsStr::new("source-file"), config.as_os_str()])?;
+    harness.success(["has-session", "-t", "sourced"])?;
+    Ok(())
+}
+
+#[test]
+fn startup_config_accepts_clustered_new_session_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("startup-new-session-cluster")?;
+    let config = harness.tmpdir().join("clustered-new-session.conf");
+    fs::write(&config, "new-session -dP -s configured\n")?;
+
+    harness.success([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("requested"),
+    ])?;
+    harness.success(["has-session", "-t", "configured"])?;
+    harness.success(["has-session", "-t", "requested"])?;
+    Ok(())
+}
+
+#[test]
+fn source_file_accepts_clustered_swap_window_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("source-swap-window-cluster")?;
+    create_swap_window_fixture(&harness, "source")?;
+    let config = harness.tmpdir().join("clustered-swap-window.conf");
+    fs::write(&config, "swap-window -ds source:0 -tsource:1\n")?;
+
+    harness.success([OsStr::new("source-file"), config.as_os_str()])?;
+    assert_swap_window_order(&harness, "source", "0:one\n1:zero\n")
+}
+
+#[test]
+fn if_shell_accepts_clustered_swap_window_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("if-shell-swap-window-cluster")?;
+    create_swap_window_fixture(&harness, "ifshell")?;
+
+    harness.success([
+        "if-shell",
+        "-F",
+        "1",
+        "swap-window -dt ifshell:1 -sifshell:0",
+    ])?;
+    assert_swap_window_order(&harness, "ifshell", "0:one\n1:zero\n")
+}
+
+#[test]
+fn command_queue_preserves_swap_window_value_flag_boundaries() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("queue-swap-window-cluster")?;
+    create_swap_window_fixture(&harness, "queued")?;
+    harness.success(["new-window", "-d", "-t", "queued:2", "-n", "d"])?;
+
+    harness.success(["run-shell", "-C", "swap-window -sd -t queued:1"])?;
+    assert_swap_window_order(&harness, "queued", "0:zero\n1:d\n2:one\n")
+}
+
+#[test]
+fn startup_config_accepts_clustered_swap_window_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("startup-swap-window-cluster")?;
+    let config = harness.tmpdir().join("clustered-swap-window.conf");
+    fs::write(
+        &config,
+        "new-session -d -s configured -n zero\n\
+         new-window -d -t configured:1 -n one\n\
+         swap-window -ds configured:0 -tconfigured:1\n",
+    )?;
+
+    harness.success([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("requested"),
+    ])?;
+    assert_swap_window_order(&harness, "configured", "0:one\n1:zero\n")
+}
+
+#[test]
 fn source_file_accepts_lf_crlf_unicode_paths_and_parse_only_has_no_side_effects(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CrossPlatformHarness::new("source-config-matrix")?;
@@ -268,6 +356,67 @@ fn startup_config_unquoted_windows_powershell_default_shell_starts_powershell(
     Ok(())
 }
 
+#[test]
+#[cfg(windows)]
+fn windows_source_startup_and_queued_commands_preserve_windows_paths() -> Result<(), Box<dyn Error>>
+{
+    let source_harness = CrossPlatformHarness::new("source-config-win-unc")?;
+    source_harness.success(["new-session", "-d", "-s", "cfg"])?;
+    let source = source_harness.tmpdir().join("windows-unc-source.conf");
+    fs::write(
+        &source,
+        r#"set-environment -g RMUX_UNC_SOURCE "\\server\share"
+if-shell -F 1 { set-environment -g RMUX_UNC_QUEUE "\\server\share" }
+set-environment -g RMUX_DEVICE_SOURCE "\\?\C:\rmux\config"
+set-environment -g RMUX_RELATIVE_SOURCE ".\scripts\tool.ps1"
+if-shell -F 1 { set-environment -g RMUX_RELATIVE_QUEUE "..\scripts\tool.ps1" }
+set-environment -g RMUX_EMBEDDED_SOURCE "--script=.\scripts\tool.ps1"
+"#,
+    )?;
+    source_harness.success([OsStr::new("source-file"), source.as_os_str()])?;
+    assert_environment(&source_harness, r"RMUX_UNC_SOURCE=\\server\share")?;
+    assert_environment(&source_harness, r"RMUX_UNC_QUEUE=\\server\share")?;
+    assert_environment(&source_harness, r"RMUX_DEVICE_SOURCE=\\?\C:\rmux\config")?;
+    assert_environment(&source_harness, r"RMUX_RELATIVE_SOURCE=.\scripts\tool.ps1")?;
+    assert_environment(&source_harness, r"RMUX_RELATIVE_QUEUE=..\scripts\tool.ps1")?;
+    assert_environment(
+        &source_harness,
+        r"RMUX_EMBEDDED_SOURCE=--script=.\scripts\tool.ps1",
+    )?;
+
+    let startup_harness = CrossPlatformHarness::new("startup-config-win-unc")?;
+    let startup = startup_harness.tmpdir().join("windows-unc-startup.conf");
+    fs::write(
+        &startup,
+        r#"set-environment -g RMUX_UNC_STARTUP "\\server\share"
+set-environment -g RMUX_RELATIVE_STARTUP ".\scripts\tool.ps1"
+"#,
+    )?;
+    startup_harness.success([
+        OsStr::new("-f"),
+        startup.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("startup"),
+    ])?;
+    assert_environment(&startup_harness, r"RMUX_UNC_STARTUP=\\server\share")?;
+    assert_environment(
+        &startup_harness,
+        r"RMUX_RELATIVE_STARTUP=.\scripts\tool.ps1",
+    )?;
+
+    startup_harness.success([
+        "set-environment",
+        "-g",
+        "RMUX_RELATIVE_DIRECT",
+        r".\scripts\tool.ps1",
+    ])?;
+    assert_environment(&startup_harness, r"RMUX_RELATIVE_DIRECT=.\scripts\tool.ps1")?;
+
+    Ok(())
+}
+
 fn assert_option(
     harness: &CrossPlatformHarness,
     option_name: &str,
@@ -275,6 +424,31 @@ fn assert_option(
 ) -> Result<(), Box<dyn Error>> {
     let actual = harness.stdout(["show-options", "-gqv", option_name])?;
     assert_eq!(actual.trim(), expected, "unexpected option {option_name}");
+    Ok(())
+}
+
+fn create_swap_window_fixture(
+    harness: &CrossPlatformHarness,
+    session: &str,
+) -> Result<(), Box<dyn Error>> {
+    harness.success(["new-session", "-d", "-s", session, "-n", "zero"])?;
+    let target = format!("{session}:1");
+    harness.success(["new-window", "-d", "-t", target.as_str(), "-n", "one"])
+}
+
+fn assert_swap_window_order(
+    harness: &CrossPlatformHarness,
+    session: &str,
+    expected: &str,
+) -> Result<(), Box<dyn Error>> {
+    let actual = harness.stdout([
+        "list-windows",
+        "-t",
+        session,
+        "-F",
+        "#{window_index}:#{window_name}",
+    ])?;
+    assert_eq!(actual, expected);
     Ok(())
 }
 

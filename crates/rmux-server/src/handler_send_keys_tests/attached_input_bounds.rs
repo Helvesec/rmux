@@ -393,7 +393,10 @@ async fn completed_pending_mouse_does_not_charge_large_plain_tail_to_retained_bo
         if cfg!(windows) {
             Duration::from_secs(60)
         } else {
-            Duration::from_secs(2)
+            // This is the maximum transport frame, not an interactive-latency
+            // assertion. Keep a bounded budget that survives full-suite CPU
+            // contention while still catching pathological decode work.
+            Duration::from_secs(8)
         },
         handler.handle_attached_live_input(
             requester_pid,

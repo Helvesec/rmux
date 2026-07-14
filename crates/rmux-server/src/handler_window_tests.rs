@@ -4,19 +4,112 @@ use rmux_proto::{
     DisplayMessageRequest, HookLifecycle, HookName, KillSessionRequest, KillWindowRequest,
     LastWindowRequest, LinkWindowRequest, ListPanesRequest, ListWindowsRequest, MoveWindowRequest,
     MoveWindowTarget, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest,
-    OptionName, PaneTarget, PreviousWindowRequest, RenameSessionRequest, RenameWindowRequest,
-    Request, ResizeWindowAdjustment, ResizeWindowRequest, ResolveTargetRequest, ResolveTargetType,
-    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest, ScopeSelector,
-    SelectWindowRequest, SessionName, SetOptionMode, SetOptionRequest, SplitDirection,
-    SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, Target, TerminalSize,
-    UnlinkWindowRequest, WindowTarget,
+    OptionName, PaneTarget, PreviousWindowRequest, ProcessCommand, RenameSessionRequest,
+    RenameWindowRequest, Request, ResizeWindowAdjustment, ResizeWindowRequest,
+    ResolveTargetRequest, ResolveTargetType, RespawnWindowRequest, Response, RotateWindowDirection,
+    RotateWindowRequest, ScopeSelector, SelectWindowRequest, SessionName, SetOptionMode,
+    SetOptionRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapWindowRequest,
+    Target, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
+}
+
+fn unique_window_temp_path(label: &str) -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "rmux-window-{label}-{}-{unique}",
+        std::process::id()
+    ))
+}
+
+#[cfg(unix)]
+fn window_shell_quote(path: &Path) -> String {
+    crate::test_shell::sh_quote_path(path)
+}
+
+#[cfg(unix)]
+fn window_respawn_replay_command(output: &Path, tag: &str) -> String {
+    format!(
+        "printf '%s:%s:{tag}\\n' \"$(pwd)\" \"$RMUX_RESPAWN\" >> {}; sleep 60",
+        window_shell_quote(output)
+    )
+}
+
+#[cfg(unix)]
+fn window_respawn_shell_identity_command(output: &Path, tag: &str) -> String {
+    format!(
+        "printf '%s:%s:{tag}\\n' \"${{0##*/}}\" \"$SHELL\" >> {}; sleep 60",
+        window_shell_quote(output)
+    )
+}
+
+#[cfg(windows)]
+fn window_respawn_replay_command(output: &Path, tag: &str) -> String {
+    crate::test_shell::powershell_encoded_command(&format!(
+        "[System.IO.File]::AppendAllText({}, ((Get-Location).Path + ':' + $env:RMUX_RESPAWN + ':{}' + [char]10)); Start-Sleep -Seconds 60",
+        crate::test_shell::powershell_quote_path(output),
+        tag
+    ))
+}
+
+#[cfg(windows)]
+fn expected_window_spawn_cwd(path: &Path) -> String {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let rendered = canonical.display().to_string();
+    if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        rendered
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&rendered)
+            .to_owned()
+    }
+}
+
+#[cfg(unix)]
+fn expected_window_spawn_cwd(path: &Path) -> String {
+    path.display().to_string()
+}
+
+async fn wait_for_window_file_contents(path: &Path, expected: &str) {
+    #[cfg(windows)]
+    let timeout = Duration::from_secs(20);
+    #[cfg(not(windows))]
+    let timeout = Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) if contents == expected => return,
+            Ok(_) | Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Ok(contents) => panic!(
+                "timed out waiting for {} to contain {:?}, got {:?}",
+                path.display(),
+                expected,
+                contents
+            ),
+            Err(error) => panic!(
+                "timed out waiting for {} to exist with {:?}: {error}",
+                path.display(),
+                expected
+            ),
+        }
+    }
+}
+
+fn window_respawn_probe_line(cwd: &str, environment: &str, tag: &str) -> String {
+    format!("{cwd}:{environment}:{tag}\n")
 }
 
 async fn create_session(handler: &RequestHandler, name: &str) {
@@ -88,6 +181,19 @@ async fn enable_global_monitor_silence(handler: &RequestHandler) {
 }
 
 #[cfg(unix)]
+async fn set_window_test_default_shell(handler: &RequestHandler, shell: &str) {
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::DefaultShell,
+            value: shell.to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+}
+
+#[cfg(unix)]
 fn quiet_window_test_command() -> Vec<String> {
     ["/bin/sh", "-c", "sleep 60"]
         .into_iter()
@@ -139,6 +245,8 @@ async fn insert_window(handler: &RequestHandler, session_name: &SessionName, win
                 socket_path: Path::new("/tmp/rmux-test.sock"),
                 spawn_environment: None,
                 environment_overrides: None,
+                respawn_shell: None,
+                respawn_environment: None,
                 pane_alert_callback: None,
                 pane_exit_callback: None,
             },

@@ -6,6 +6,8 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rmux_proto::{CONTROL_CONTROL_END, CONTROL_CONTROL_START};
+
 #[test]
 fn cli_acceptance_matrix_exercises_real_daemon_state() -> Result<(), Box<dyn Error>> {
     let harness = AcceptanceHarness::new("cli-matrix")?;
@@ -61,6 +63,607 @@ fn cli_acceptance_matrix_exercises_real_daemon_state() -> Result<(), Box<dyn Err
         "list-sessions did not report created session; output: {sessions:?}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn runtime_command_aliases_override_direct_builtin_commands() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("direct-runtime-command-alias")?;
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+    harness.success([
+        "set-option",
+        "-g",
+        "command-alias[20]",
+        "list-sessions=display-message -p canonical-override",
+    ])?;
+    harness.success([
+        "set-option",
+        "-g",
+        "command-alias[21]",
+        "ls=display-message -p short-override",
+    ])?;
+
+    assert_eq!(harness.stdout(["list-sessions"])?, "canonical-override\n");
+    assert_eq!(harness.stdout(["ls"])?, "short-override\n");
+    assert_eq!(
+        harness.stdout([
+            "list-sessions",
+            ";",
+            "display-message",
+            "-p",
+            "unalias",
+            ";",
+            "ls",
+        ])?,
+        "canonical-override\nunalias\nshort-override\n"
+    );
+
+    let source = harness.tmpdir().join("runtime-command-alias.conf");
+    fs::write(&source, "list-sessions\nls\n")?;
+    assert_eq!(
+        harness.stdout([OsStr::new("source-file"), source.as_os_str()])?,
+        "canonical-override\nshort-override\n"
+    );
+
+    let literal = "space ; dollar $HOME slash\\ quote' double\"";
+    harness.success([
+        "set-option",
+        "-g",
+        "command-alias[20]",
+        "list-sessions=display-message -p --",
+    ])?;
+    assert_eq!(
+        harness.stdout(["list-sessions", literal])?,
+        format!("{literal}\n")
+    );
+    assert_eq!(harness.stdout(["list-sessions", "semi\\;"])?, "semi;\n");
+
+    let multiline = "one\ntwo\rthree\tfour";
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "list-sessions=display-message -p \"one\\ntwo\\rthree\\tfour\"",
+    ])?;
+    assert_eq!(harness.stdout(["list-sessions"])?, format!("{multiline}\n"));
+
+    let server_value = "line1\nline2\rline3\t$slash\\quote\"`";
+    harness.success(["set-environment", "-g", "ALIAS_VISIBLE", server_value])?;
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "list-sessions=display-message -p \"$ALIAS_VISIBLE\"",
+    ])?;
+    assert_eq!(
+        harness.stdout(["list-sessions"])?,
+        format!("{server_value}\n")
+    );
+    fs::write(&source, "list-sessions\n")?;
+    assert_eq!(
+        harness.stdout([OsStr::new("source-file"), source.as_os_str()])?,
+        format!("{server_value}\n")
+    );
+
+    let hidden_value = "hidden\nvalue\\with$dollar";
+    harness.success(["set-environment", "-gh", "ALIAS_HIDDEN", hidden_value])?;
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "list-sessions=display-message -p \"$ALIAS_HIDDEN\"",
+    ])?;
+    assert_eq!(
+        harness.stdout(["list-sessions"])?,
+        format!("{hidden_value}\n")
+    );
+    assert_eq!(
+        harness.stdout([OsStr::new("source-file"), source.as_os_str()])?,
+        format!("{hidden_value}\n")
+    );
+
+    let display_only_value = "a\"\\b";
+    harness.success([
+        "set-environment",
+        "-g",
+        "ALIAS_DISPLAY_ONLY",
+        display_only_value,
+    ])?;
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "list-sessions=display-message -p \"$ALIAS_DISPLAY_ONLY\"",
+    ])?;
+    assert_eq!(
+        harness.stdout(["list-sessions"])?,
+        format!("{display_only_value}\n")
+    );
+
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "list-sessions=if-shell -F 1 { display-message -p nested-alias }",
+    ])?;
+    assert_eq!(harness.stdout(["list-sessions"])?, "nested-alias\n");
+
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "find-sessions=display-message -p extension-override",
+    ])?;
+    assert_eq!(harness.stdout(["find-sessions"])?, "extension-override\n");
+
+    Ok(())
+}
+
+#[test]
+fn runtime_command_aliases_are_not_expanded_twice() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("runtime-command-alias-single-expansion")?;
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "foo=if-shell -F 1 \"display-message -p foo\"",
+    ])?;
+    harness.success([
+        "set-option",
+        "-sa",
+        "command-alias",
+        "if-shell=display-message -p second",
+    ])?;
+
+    assert_eq!(harness.stdout(["foo"])?, "foo\n");
+    Ok(())
+}
+
+#[test]
+fn runtime_alias_parse_time_assignments_persist_without_set_environment_hooks(
+) -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("runtime-alias-assignments")?;
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+    harness.success(["set-environment", "-gu", "ASSIGNMENT_HOOK"])?;
+    harness.success([
+        "set-hook",
+        "-g",
+        "after-set-environment",
+        "set-environment -g ASSIGNMENT_HOOK fired",
+    ])?;
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "zz=FOO=bar display-message -p \"$FOO\"",
+    ])?;
+
+    assert_eq!(harness.stdout(["zz"])?, "bar\n");
+    assert_eq!(
+        harness.stdout(["show-environment", "-g", "FOO"])?,
+        "FOO=bar\n"
+    );
+    assert!(!harness
+        .run(["show-environment", "-g", "ASSIGNMENT_HOOK"])?
+        .status
+        .success());
+    Ok(())
+}
+
+#[test]
+fn invalid_runtime_alias_does_not_apply_parse_time_assignments_product_divergence(
+) -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("runtime-alias-invalid-assignment")?;
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+    harness.success(["set-environment", "-gu", "INVALID_ALIAS_VALUE"])?;
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "bad=INVALID_ALIAS_VALUE=written new-window -Q",
+    ])?;
+
+    assert!(!harness.run(["bad"])?.status.success());
+    assert!(!harness
+        .run(["show-environment", "-g", "INVALID_ALIAS_VALUE"])?
+        .status
+        .success());
+    Ok(())
+}
+
+#[test]
+fn runtime_alias_preparse_has_no_show_options_hook_side_effects() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("runtime-alias-hook-isolation")?;
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+    harness.success(["set-environment", "-gu", "ALIAS_HOOK"])?;
+    harness.success([
+        "set-hook",
+        "-g",
+        "after-show-options",
+        "set-environment -g ALIAS_HOOK fired",
+    ])?;
+
+    harness.success(["list-sessions"])?;
+    assert!(!harness
+        .run(["show-environment", "-g", "ALIAS_HOOK"])?
+        .status
+        .success());
+
+    harness.success(["show-options", "-g", "status"])?;
+    assert_eq!(
+        harness.stdout(["show-environment", "-g", "ALIAS_HOOK"])?,
+        "ALIAS_HOOK=fired\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_preparse_preserves_stateful_and_extension_queue_order() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("runtime-preparse-queue-order")?;
+    harness.success([
+        "new-session",
+        "-d",
+        "-s",
+        "created",
+        ";",
+        "new-window",
+        "-d",
+        "-t",
+        "created",
+        "-n",
+        "second",
+    ])?;
+    assert_eq!(
+        harness
+            .stdout(["list-windows", "-t", "created", "-F", "#{window_name}"])?
+            .lines()
+            .count(),
+        2
+    );
+
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "ls=display-message -p alias-segment",
+    ])?;
+    assert_eq!(
+        harness.stdout([
+            "ls",
+            ";",
+            "find-sessions",
+            "--name",
+            "does-not-exist",
+            ";",
+            "ls",
+        ])?,
+        "alias-segment\nalias-segment\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn runtime_command_aliases_use_one_ordered_snapshot() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("runtime-command-alias-snapshot")?;
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "list-sessions=display-message -p old",
+    ])?;
+
+    assert_eq!(
+        harness.stdout([
+            "set-option",
+            "-s",
+            "command-alias",
+            "list-sessions=display-message -p new",
+            ";",
+            "list-sessions",
+        ])?,
+        "old\n"
+    );
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "list-sessions=display-message -p old",
+    ])?;
+    assert_eq!(
+        harness.stdout([
+            "set-option",
+            "-s",
+            "command-alias",
+            "",
+            ";",
+            "list-sessions",
+        ])?,
+        "old\n"
+    );
+
+    let disabled_default = harness.run(["split-pane", "-d", "-t", "alpha:0.0"])?;
+    assert!(!disabled_default.status.success());
+    assert_eq!(
+        String::from_utf8(disabled_default.stderr)?,
+        "unknown command: split-pane\n"
+    );
+    assert_eq!(
+        harness
+            .stdout(["list-panes", "-t", "alpha", "-F", "#{pane_index}"])?
+            .lines()
+            .count(),
+        1
+    );
+
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "dup=display-message -p first",
+    ])?;
+    harness.success([
+        "set-option",
+        "-sa",
+        "command-alias",
+        "dup=display-message -p second",
+    ])?;
+    assert_eq!(harness.stdout(["dup"])?, "first\n");
+
+    Ok(())
+}
+
+#[test]
+fn runtime_command_aliases_keep_client_transitions_typed() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("runtime-command-alias-client-transitions")?;
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+    harness.success(["set-environment", "-g", "ALIAS_TARGET", "alpha"])?;
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "list-sessions=attach-session -t \"$ALIAS_TARGET\"",
+    ])?;
+
+    let attach = harness.run(["list-sessions"])?;
+    assert!(!attach.status.success());
+    assert_eq!(
+        String::from_utf8(attach.stderr)?,
+        "open terminal failed: not a terminal\n"
+    );
+
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "kill-server=display-message -p alias-survives",
+    ])?;
+    assert_eq!(harness.stdout(["kill-server"])?, "alias-survives\n");
+    harness.success(["has-session", "-t", "alpha"])?;
+
+    harness.success(["set-environment", "-g", "ALIAS_COMMAND", "kill-server"])?;
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "list-sessions=$ALIAS_COMMAND",
+    ])?;
+    harness.success(["list-sessions"])?;
+    assert!(!harness
+        .run(["has-session", "-t", "alpha"])?
+        .status
+        .success());
+
+    Ok(())
+}
+
+#[test]
+fn control_mode_leaves_runtime_alias_expansion_to_the_server() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("runtime-command-alias-control")?;
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+    harness.success(["set-option", "-s", "command-alias", ""])?;
+
+    let control = harness.run(["-C", "split-pane", "-d", "-t", "alpha:0.0"])?;
+    assert_eq!(control.status.code(), Some(1));
+    assert!(control.stderr.is_empty());
+    let control_stdout = String::from_utf8(control.stdout)?;
+    assert!(control_stdout.contains("unknown command: split-pane"));
+    assert!(control_stdout.contains("%exit"));
+    assert_eq!(
+        harness
+            .stdout(["list-panes", "-t", "alpha", "-F", "#{pane_index}"])?
+            .lines()
+            .count(),
+        1
+    );
+
+    Ok(())
+}
+
+#[test]
+fn control_mode_validates_flags_and_keeps_literal_newlines_in_one_command(
+) -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("runtime-command-alias-control-framing")?;
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+
+    let invalid = harness.run(["-C", "list-sessions", "-Z"])?;
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(invalid.stderr.is_empty());
+    let invalid_stdout = String::from_utf8(invalid.stdout)?;
+    assert!(
+        invalid_stdout.contains("unknown flag -Z"),
+        "{invalid_stdout:?}"
+    );
+    assert!(invalid_stdout.contains("%exit"), "{invalid_stdout:?}");
+
+    let invalid_control_control = harness.run(["-CC", "list-sessions", "-Z"])?;
+    assert_eq!(invalid_control_control.status.code(), Some(1));
+    assert!(invalid_control_control.stderr.is_empty());
+    let expected_control_control = format!(
+        "{CONTROL_CONTROL_START}command list-sessions: unknown flag -Z\n%exit\n{CONTROL_CONTROL_END}"
+    );
+    assert_eq!(
+        invalid_control_control.stdout,
+        expected_control_control.as_bytes(),
+        "control-control prevalidation errors must be exactly DCS framed"
+    );
+
+    let lone_dash = harness.run(["-C", "list-sessions", "-"])?;
+    assert_eq!(lone_dash.status.code(), Some(1));
+    assert!(lone_dash.stderr.is_empty());
+    let lone_dash_stdout = String::from_utf8(lone_dash.stdout)?;
+    assert!(lone_dash_stdout.contains("%exit"), "{lone_dash_stdout:?}");
+    assert!(
+        !lone_dash_stdout.contains("unknown flag -"),
+        "{lone_dash_stdout:?}"
+    );
+
+    let invalid_terminal = harness.run(["-C", "kill-server", "-Z"])?;
+    assert_eq!(invalid_terminal.status.code(), Some(1));
+    assert!(invalid_terminal.stderr.is_empty());
+    let invalid_terminal_stdout = String::from_utf8(invalid_terminal.stdout)?;
+    assert!(
+        invalid_terminal_stdout.contains("command kill-server: unknown flag -Z"),
+        "{invalid_terminal_stdout:?}"
+    );
+    assert!(
+        invalid_terminal_stdout.contains("%exit"),
+        "{invalid_terminal_stdout:?}"
+    );
+    harness.success(["has-session", "-t", "alpha"])?;
+
+    let injected = harness.run(["-C", "list-sessions", "--bad\n%exit"])?;
+    assert_eq!(injected.status.code(), Some(1));
+    assert!(injected.stderr.is_empty());
+    let injected_stdout = String::from_utf8(injected.stdout)?;
+    assert_eq!(
+        injected_stdout
+            .lines()
+            .filter(|line| *line == "%exit")
+            .count(),
+        1,
+        "{injected_stdout:?}"
+    );
+    assert!(
+        injected_stdout.contains("--bad\\n%exit"),
+        "{injected_stdout:?}"
+    );
+
+    let injected_control_control = harness.run(["-CC", "list-sessions", "--bad\n%exit"])?;
+    assert_eq!(injected_control_control.status.code(), Some(1));
+    assert!(injected_control_control.stderr.is_empty());
+    let injected_control_control_stdout = String::from_utf8(injected_control_control.stdout)?;
+    let inner = injected_control_control_stdout
+        .strip_prefix(CONTROL_CONTROL_START)
+        .and_then(|value| value.strip_suffix(CONTROL_CONTROL_END))
+        .ok_or("control-control injection diagnostic lost its exact DCS envelope")?;
+    assert_eq!(
+        inner
+            .lines()
+            .filter(|line| line.starts_with('%'))
+            .collect::<Vec<_>>(),
+        vec!["%exit"],
+        "{injected_control_control_stdout:?}"
+    );
+    assert!(
+        inner.contains("--bad\\n%exit"),
+        "{injected_control_control_stdout:?}"
+    );
+
+    let injected_value = harness.run([
+        "-C",
+        "set-hook",
+        "-g",
+        "bad\n%exit",
+        "display-message -p ignored",
+    ])?;
+    assert_eq!(injected_value.status.code(), Some(1));
+    assert!(injected_value.stderr.is_empty());
+    let injected_value_stdout = String::from_utf8(injected_value.stdout)?;
+    assert_eq!(
+        injected_value_stdout
+            .lines()
+            .filter(|line| line.starts_with('%'))
+            .collect::<Vec<_>>(),
+        vec!["%exit"],
+        "{injected_value_stdout:?}"
+    );
+
+    let injected_command = harness.run(["-C", "bad\n%exit"])?;
+    assert_eq!(injected_command.status.code(), Some(1));
+    assert!(injected_command.stderr.is_empty());
+    let injected_command_stdout = String::from_utf8(injected_command.stdout)?;
+    assert_eq!(
+        injected_command_stdout
+            .lines()
+            .filter(|line| line.starts_with('%'))
+            .collect::<Vec<_>>(),
+        vec!["%exit"],
+        "{injected_command_stdout:?}"
+    );
+
+    let injected_command_control_control = harness.run(["-CC", "bad\n%exit"])?;
+    assert_eq!(injected_command_control_control.status.code(), Some(1));
+    assert!(injected_command_control_control.stderr.is_empty());
+    let injected_command_control_control_stdout =
+        String::from_utf8(injected_command_control_control.stdout)?;
+    let inner = injected_command_control_control_stdout
+        .strip_prefix(CONTROL_CONTROL_START)
+        .and_then(|value| value.strip_suffix(CONTROL_CONTROL_END))
+        .ok_or("control-control command diagnostic lost its exact DCS envelope")?;
+    assert_eq!(
+        inner
+            .lines()
+            .filter(|line| line.starts_with('%'))
+            .collect::<Vec<_>>(),
+        vec!["%exit"],
+        "{injected_command_control_control_stdout:?}"
+    );
+
+    let literal = harness.run(["-C", "display-message", "-p", "literal\nlist-sessions"])?;
+    assert_eq!(literal.status.code(), Some(0));
+    assert!(literal.stderr.is_empty());
+    let literal_stdout = String::from_utf8(literal.stdout)?;
+    assert_eq!(
+        literal_stdout.matches("%begin").count(),
+        1,
+        "{literal_stdout:?}"
+    );
+    assert_eq!(
+        literal_stdout.matches("%end").count(),
+        1,
+        "{literal_stdout:?}"
+    );
+
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "zz=CONTROL_ALIAS_VALUE=ok display-message -p \"$CONTROL_ALIAS_VALUE\"",
+    ])?;
+    let aliased = harness.run(["-C", "zz"])?;
+    assert_eq!(aliased.status.code(), Some(0));
+    assert!(aliased.stderr.is_empty());
+    let aliased_stdout = String::from_utf8(aliased.stdout)?;
+    assert_eq!(
+        aliased_stdout.matches("%begin").count(),
+        1,
+        "{aliased_stdout:?}"
+    );
+    assert_eq!(
+        aliased_stdout.matches("%end").count(),
+        1,
+        "{aliased_stdout:?}"
+    );
+    assert!(
+        aliased_stdout.lines().any(|line| line == "ok"),
+        "{aliased_stdout:?}"
+    );
+    assert_eq!(
+        harness.stdout(["show-environment", "-g", "CONTROL_ALIAS_VALUE"])?,
+        "CONTROL_ALIAS_VALUE=ok\n"
+    );
     Ok(())
 }
 

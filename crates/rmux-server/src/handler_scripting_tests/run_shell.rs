@@ -448,6 +448,7 @@ async fn background_run_shell_builds_environment_for_followed_attached_session()
     .await;
 
     wait_for_file_text(&output_path, "beta").await;
+    wait_for_detached_request_count(&handler, 0).await;
     std::fs::remove_dir_all(root).expect("remove background environment output root");
 }
 
@@ -542,6 +543,7 @@ async fn explicit_background_shell_target_survives_origin_attach_detach() {
         "{detached:?}"
     );
     wait_for_file_text(&output_path, "ok").await;
+    wait_for_detached_request_count(&handler, 0).await;
     std::fs::remove_dir_all(root).expect("remove explicit detach output root");
 }
 
@@ -601,6 +603,7 @@ async fn explicit_background_shell_target_survives_same_pid_attach_replacement()
     while replacement_control_rx.try_recv().is_ok() {}
 
     wait_for_file_text(&output_path, "ok").await;
+    wait_for_detached_request_count(&handler, 0).await;
     assert!(
         handler
             .current_live_attach_input(replacement_identity)
@@ -1182,4 +1185,40 @@ fn parsed_new_session_accepts_skip_environment_update() {
     assert!(request.skip_environment_update);
     assert_eq!(request.session_name, Some(session_name("alpha")));
     assert!(request.detached);
+}
+
+#[test]
+fn parsed_new_session_accepts_compact_bare_and_value_flags() {
+    let handler = RequestHandler::new();
+    let state = handler.state.blocking_lock();
+    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+        "new-session".to_owned(),
+        vec![
+            "-dEPsalpha".to_owned(),
+            "-x120".to_owned(),
+            "-y".to_owned(),
+            "40".to_owned(),
+        ],
+        None,
+        &state.sessions,
+        &state.options,
+        &TargetFindContext::new(None),
+    )
+    .expect("clustered new-session flags parse");
+
+    let Request::NewSessionExt(request) = parsed else {
+        panic!("expected NewSessionExt request");
+    };
+
+    assert!(request.detached);
+    assert!(request.skip_environment_update);
+    assert!(request.print_session_info);
+    assert_eq!(request.session_name, Some(session_name("alpha")));
+    assert_eq!(
+        request.size,
+        Some(TerminalSize {
+            cols: 120,
+            rows: 40
+        })
+    );
 }

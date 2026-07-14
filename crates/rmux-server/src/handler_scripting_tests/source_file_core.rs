@@ -565,6 +565,161 @@ async fn source_file_parse_only_reports_parse_without_executing() {
 }
 
 #[tokio::test]
+async fn internal_runtime_expansion_skips_source_only_flag_validation_without_executing() {
+    let handler = RequestHandler::new();
+    let request = SourceFileRequest {
+        paths: vec![INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH.to_owned()],
+        quiet: false,
+        parse_only: true,
+        verbose: true,
+        expand_paths: false,
+        target: None,
+        caller_cwd: None,
+        stdin: Some(
+            encode_internal_runtime_command_arguments(&[
+                "set-environment".to_owned(),
+                "-gh".to_owned(),
+                "SECRET".to_owned(),
+                "value".to_owned(),
+            ])
+            .expect("runtime argv serializes"),
+        ),
+    };
+
+    let Response::SourceFile(response) =
+        handler.handle(Request::SourceFile(Box::new(request))).await
+    else {
+        panic!("internal runtime expansion should return canonical output");
+    };
+    assert_eq!(response.exit_status(), None);
+    assert_eq!(
+        response
+            .command_output()
+            .expect("canonical output")
+            .stdout(),
+        b"set-environment -gh SECRET value"
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
+                scope: ScopeSelector::Global,
+                name: Some("SECRET".to_owned()),
+                hidden: true,
+                shell_format: false,
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
+async fn internal_parse_time_assignments_apply_visible_and_hidden_values() {
+    let handler = RequestHandler::new();
+    let request = SourceFileRequest {
+        paths: vec![INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
+        quiet: false,
+        parse_only: false,
+        verbose: false,
+        expand_paths: false,
+        target: None,
+        caller_cwd: None,
+        stdin: Some("FOO=bar ; %hidden SECRET=shh".to_owned()),
+    };
+
+    assert!(matches!(
+        handler.handle(Request::SourceFile(Box::new(request))).await,
+        Response::SourceFile(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
+                scope: ScopeSelector::Global,
+                name: Some("FOO".to_owned()),
+                hidden: false,
+                shell_format: false,
+            }))
+            .await,
+        Response::ShowEnvironment(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
+                scope: ScopeSelector::Global,
+                name: Some("SECRET".to_owned()),
+                hidden: true,
+                shell_format: false,
+            }))
+            .await,
+        Response::ShowEnvironment(_)
+    ));
+}
+
+#[tokio::test]
+async fn internal_parse_time_assignment_payload_rejects_commands_atomically() {
+    let handler = RequestHandler::new();
+    let request = SourceFileRequest {
+        paths: vec![INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
+        quiet: false,
+        parse_only: false,
+        verbose: false,
+        expand_paths: false,
+        target: None,
+        caller_cwd: None,
+        stdin: Some("FOO=bar ; display-message no".to_owned()),
+    };
+
+    assert!(matches!(
+        handler.handle(Request::SourceFile(Box::new(request))).await,
+        Response::Error(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
+                scope: ScopeSelector::Global,
+                name: Some("FOO".to_owned()),
+                hidden: false,
+                shell_format: false,
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
+async fn mixed_or_unknown_internal_source_paths_fail_closed_without_execution() {
+    let handler = RequestHandler::new();
+    for reserved_path in [
+        INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
+        INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
+        INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH,
+        "\0rmux-unknown-internal-v1",
+    ] {
+        let response = handler
+            .handle(Request::SourceFile(Box::new(SourceFileRequest {
+                paths: vec![reserved_path.to_owned(), "-".to_owned()],
+                quiet: false,
+                parse_only: false,
+                verbose: false,
+                expand_paths: false,
+                target: None,
+                caller_cwd: None,
+                stdin: Some("set-buffer -b internal-path-canary mutated".to_owned()),
+            })))
+            .await;
+        assert!(matches!(response, Response::Error(_)), "{response:?}");
+    }
+
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("internal-path-canary".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
 async fn source_file_parse_only_validates_command_flags_without_executing() {
     let handler = RequestHandler::new();
     let root = temp_root("parse-only-invalid-command");
@@ -1729,14 +1884,12 @@ async fn source_file_grouped_new_window_insertion_preserves_and_arms_silence_tim
     };
 
     let root = temp_root("grouped-new-window-silence-timers");
-    write_config(
-        &root.join("new-window.conf"),
-        &format!("new-window -b -d -t {owner}:0\n"),
-    );
+    let config_path = root.join("new-window.conf");
+    write_config(&config_path, &format!("new-window -b -d -t {owner}:0\n"));
     let response = handler
         .handle(source_file_request(
-            vec!["new-window.conf".to_owned()],
-            Some(root.clone()),
+            vec![config_path.to_string_lossy().into_owned()],
+            Some(std::env::temp_dir()),
         ))
         .await;
     fs::remove_dir_all(root).expect("remove grouped new-window config root");

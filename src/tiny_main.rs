@@ -20,11 +20,15 @@ use rmux_client::{
     ConnectResult, Connection, StartServerError,
 };
 use rmux_core::formats::{DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT};
+use rmux_core::{
+    command_inventory::RMUX_EXTENSION_COMMANDS,
+    command_parser::{CommandParser, ParsedCommands},
+};
 use rmux_proto::request::{
     AttachSessionExt2Request, AttachSessionExt3Request, KillSessionRequest, NewSessionExtRequest,
 };
 use rmux_proto::{
-    CapturePaneTargetActionRequest, JoinPaneRequest, ListSessionsRequest,
+    CapturePaneTargetActionRequest, JoinPaneRequest, ListSessionsRequest, OptionScopeSelector,
     ResizePaneTargetActionRequest, ResolveTargetType, Response, RmuxError, SetOptionMode,
     SourceFileResponse, SplitDirection, SplitWindowTargetActionRequest, Target,
     CAPABILITY_ATTACH_RENDER, CAPABILITY_ATTACH_RESIZE_GEOMETRY, RMUX_WIRE_VERSION,
@@ -37,6 +41,8 @@ mod output;
 mod parse;
 mod trace;
 
+use crate::command_alias_snapshot::{decode_command_alias_definitions, definition_matches_name};
+use crate::runtime_command_expansion::expand_runtime_command_segment;
 use crate::tmux_error_surface::{source_file_error_uses_stdout, tmux_cli_error_message};
 #[cfg(not(windows))]
 use helper::daemon_helper_path;
@@ -74,8 +80,17 @@ pub(crate) fn main() {
                 .map_err(|error| error.to_string())
         }
         TinyInvocation::Direct(command) => {
-            trace_direct(command.name());
-            command.run(&args)
+            match command.runtime_alias_requires_full_helper(&args) {
+                Ok(true) => {
+                    trace_fallback("runtime command-alias");
+                    exec_full_helper(&args)
+                }
+                Ok(false) => {
+                    trace_direct(command.name());
+                    command.run(&args)
+                }
+                Err(error) => Err(error),
+            }
         }
         TinyInvocation::Fallback => {
             trace_fallback("unsupported invocation");
@@ -769,6 +784,138 @@ impl TinyCommand {
             } => run_source_file(&socket_path, request),
         }
     }
+
+    fn runtime_alias_requires_full_helper(
+        &self,
+        original_args: &[OsString],
+    ) -> Result<bool, String> {
+        let arguments = tiny_invoked_command_arguments(original_args)
+            .ok_or_else(|| "tiny command invocation contains invalid UTF-8".to_owned())?;
+        if arguments.is_empty() {
+            return Err("tiny command invocation did not contain a command name".to_owned());
+        }
+        let socket_path = self.socket_path();
+        let mut connection = match connect_or_absent(socket_path) {
+            Ok(ConnectResult::Connected(connection)) => connection,
+            Ok(ConnectResult::Absent) => return Ok(false),
+            Err(error)
+                if self.is_kill_server()
+                    && legacy_shutdown_fallback_wire_version(&error).is_some() =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(client_error(socket_path, error)),
+        };
+        let canonical = match expand_runtime_command_segment(&mut connection, &arguments) {
+            Ok(Some(canonical)) => canonical,
+            Ok(None) => {
+                return self.legacy_alias_requires_full_helper(&mut connection, &arguments[0]);
+            }
+            Err(error) if self.is_kill_server() && error.previous_wire_version().is_some() => {
+                return Ok(false);
+            }
+            Err(error) => return Err(format!("{}: {error}", socket_path.display())),
+        };
+        let local = CommandParser::new()
+            .parse_arguments(&arguments)
+            .map_err(|error| error.to_string())?;
+        let server = if canonical.is_empty() {
+            ParsedCommands::default()
+        } else {
+            CommandParser::new()
+                .with_command_aliases(std::iter::empty::<String>())
+                .with_exact_commands(RMUX_EXTENSION_COMMANDS)
+                .parse_one_group(&canonical)
+                .map_err(|error| error.to_string())?
+        };
+        Ok(local.commands() != server.commands() || local.assignments() != server.assignments())
+    }
+
+    fn legacy_alias_requires_full_helper(
+        &self,
+        connection: &mut Connection,
+        command_name: &str,
+    ) -> Result<bool, String> {
+        let response = connection
+            .show_options(
+                OptionScopeSelector::ServerGlobal,
+                Some("command-alias".to_owned()),
+                false,
+                false,
+                true,
+            )
+            .map_err(|error| client_error(self.socket_path(), error))?;
+        let definitions = match response {
+            Response::ShowOptions(response) => {
+                decode_command_alias_definitions(response.command_output().stdout())
+                    .map_err(|error| error.to_string())?
+            }
+            Response::Error(error)
+                if self.is_kill_server() && previous_wire_error(&error.error).is_some() =>
+            {
+                return Ok(false);
+            }
+            Response::Error(error) => {
+                return Err(tmux_cli_error_message("show-options", &error.error));
+            }
+            response => {
+                return Err(format!(
+                    "protocol error: command-alias probe returned {}",
+                    response.command_name()
+                ));
+            }
+        };
+        Ok(definitions
+            .iter()
+            .any(|definition| definition_matches_name(definition, command_name)))
+    }
+
+    const fn is_kill_server(&self) -> bool {
+        matches!(self, Self::KillServer { .. })
+    }
+
+    fn socket_path(&self) -> &Path {
+        match self {
+            Self::StartServer { socket_path }
+            | Self::ListSessions { socket_path }
+            | Self::HasSession { socket_path, .. }
+            | Self::ListWindows { socket_path, .. }
+            | Self::ListPanes { socket_path, .. }
+            | Self::KillServer { socket_path }
+            | Self::CapturePane { socket_path, .. }
+            | Self::AttachSession { socket_path, .. }
+            | Self::SplitWindow { socket_path, .. }
+            | Self::NewWindow { socket_path, .. }
+            | Self::NewSession { socket_path, .. }
+            | Self::KillSession { socket_path, .. }
+            | Self::ShowOptions { socket_path, .. }
+            | Self::RenameWindow { socket_path, .. }
+            | Self::SelectWindow { socket_path, .. }
+            | Self::KillPane { socket_path, .. }
+            | Self::JoinPane { socket_path, .. }
+            | Self::SetOption { socket_path, .. }
+            | Self::ResizePane { socket_path, .. }
+            | Self::DisplayMessage { socket_path, .. }
+            | Self::SendKeys { socket_path, .. }
+            | Self::SourceFile { socket_path, .. } => socket_path,
+        }
+    }
+}
+
+fn tiny_invoked_command_arguments(args: &[OsString]) -> Option<Vec<String>> {
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].to_str()? {
+            "-L" | "-S" => index += 2,
+            _ => {
+                return args[index..]
+                    .iter()
+                    .map(|argument| argument.to_str().map(str::to_owned))
+                    .collect();
+            }
+        }
+    }
+    Some(Vec::new())
 }
 
 fn tiny_socket(
@@ -1446,9 +1593,14 @@ fn kill_server_connection_closed(error: &ClientError) -> bool {
 
 fn legacy_shutdown_fallback_wire_version(error: &ClientError) -> Option<u32> {
     match error {
-        ClientError::Protocol(RmuxError::UnsupportedWireVersion { got, .. })
-            if (1..RMUX_WIRE_VERSION).contains(got) =>
-        {
+        ClientError::Protocol(error) => previous_wire_error(error),
+        _ => None,
+    }
+}
+
+fn previous_wire_error(error: &RmuxError) -> Option<u32> {
+    match error {
+        RmuxError::UnsupportedWireVersion { got, .. } if (1..RMUX_WIRE_VERSION).contains(got) => {
             Some(*got)
         }
         _ => None,

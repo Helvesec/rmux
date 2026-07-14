@@ -7,7 +7,7 @@ use rmux_proto::{
 };
 
 use super::super::DEFAULT_SESSION_SIZE;
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::{parse_u16, unsupported_flag};
 use super::{implicit_session_name, parse_session_name};
 
@@ -50,7 +50,64 @@ pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, Rmux
                 command.extend(args.remaining());
                 break;
             }
-            flag if flag.starts_with('-') => return Err(unsupported_flag("new-session", flag)),
+            flag if flag.starts_with('-') => {
+                let Some(cluster) = parse_compact_flag_cluster(flag, "ADdEPX", "cefFnstxy") else {
+                    return Err(unsupported_flag("new-session", flag));
+                };
+                for compact_flag in cluster {
+                    match compact_flag {
+                        CompactFlag::Bare('A') => attach_if_exists = true,
+                        CompactFlag::Bare('D') => detach_other_clients = true,
+                        CompactFlag::Bare('d') => detached = true,
+                        CompactFlag::Bare('E') => skip_environment_update = true,
+                        CompactFlag::Bare('P') => print_session_info = true,
+                        CompactFlag::Bare('X') => kill_other_clients = true,
+                        CompactFlag::Bare(flag) => {
+                            return Err(unsupported_flag("new-session", &format!("-{flag}")));
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'c', .. } => {
+                            working_directory =
+                                Some(compact_flag.value_or_next(&mut args, "-c start-directory")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'e', .. } => {
+                            environment
+                                .push(compact_flag.value_or_next(&mut args, "-e name=value")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'f', .. } => {
+                            flags.push(compact_flag.value_or_next(&mut args, "-f flags")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'F', .. } => {
+                            print_format =
+                                Some(compact_flag.value_or_next(&mut args, "-F format")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'n', .. } => {
+                            window_name =
+                                Some(compact_flag.value_or_next(&mut args, "-n window-name")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 's', .. } => {
+                            session_name = Some(parse_session_name(
+                                compact_flag.value_or_next(&mut args, "-s session")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            group_target = Some(parse_session_name(
+                                compact_flag.value_or_next(&mut args, "-t group")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'x', .. } => {
+                            let value = compact_flag.value_or_next(&mut args, "-x value")?;
+                            cols = Some(parse_u16("new-session", "-x", &value)?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'y', .. } => {
+                            let value = compact_flag.value_or_next(&mut args, "-y value")?;
+                            rows = Some(parse_u16("new-session", "-y", &value)?);
+                        }
+                        CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("new-session", &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
             _ => {
                 command.push(token);
                 command.extend(args.remaining());

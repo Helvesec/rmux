@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::fmt;
 
-use crate::command_parser::COMMAND_TABLE;
+use crate::command_parser::{CommandEntry, COMMAND_TABLE};
 use crate::formats::{render_template, FormatContext};
 
 #[path = "command_inventory/signatures.rs"]
@@ -11,22 +11,69 @@ mod signatures;
 
 use signatures::LIST_COMMAND_SIGNATURES;
 
-const RMUX_EXTENSION_COMMANDS: &[&str] = &[
-    "capabilities",
-    "claude",
-    "doctor",
-    "setup",
-    "wait-pane",
-    "pane-snapshot",
-    "stream-pane",
-    "collect-pane-output",
-    "locator",
-    "expect-pane",
-    "find-panes",
-    "find-sessions",
-    "broadcast-keys",
-    "with-session",
-    "web-share",
+/// Exact-only RMUX command extensions shared by client parsing and internal
+/// server canonicalization. They never participate in tmux prefix matching.
+pub const RMUX_EXTENSION_COMMANDS: &[CommandEntry] = &[
+    CommandEntry {
+        name: "capabilities",
+        alias: None,
+    },
+    CommandEntry {
+        name: "claude",
+        alias: None,
+    },
+    CommandEntry {
+        name: "doctor",
+        alias: None,
+    },
+    CommandEntry {
+        name: "setup",
+        alias: None,
+    },
+    CommandEntry {
+        name: "wait-pane",
+        alias: None,
+    },
+    CommandEntry {
+        name: "pane-snapshot",
+        alias: None,
+    },
+    CommandEntry {
+        name: "stream-pane",
+        alias: None,
+    },
+    CommandEntry {
+        name: "collect-pane-output",
+        alias: None,
+    },
+    CommandEntry {
+        name: "locator",
+        alias: None,
+    },
+    CommandEntry {
+        name: "expect-pane",
+        alias: None,
+    },
+    CommandEntry {
+        name: "find-panes",
+        alias: None,
+    },
+    CommandEntry {
+        name: "find-sessions",
+        alias: None,
+    },
+    CommandEntry {
+        name: "broadcast-keys",
+        alias: None,
+    },
+    CommandEntry {
+        name: "with-session",
+        alias: None,
+    },
+    CommandEntry {
+        name: "web-share",
+        alias: None,
+    },
 ];
 
 /// A typed command-name resolution failure from `list-commands`.
@@ -150,7 +197,9 @@ fn list_command_alias(name: &str) -> Option<&'static str> {
 }
 
 fn is_rmux_extension(name: &str) -> bool {
-    RMUX_EXTENSION_COMMANDS.contains(&name)
+    RMUX_EXTENSION_COMMANDS
+        .iter()
+        .any(|entry| entry.name == name)
 }
 
 fn render_list_commands_template(template: &str, name: &str, alias: &str, usage: &str) -> String {
@@ -192,7 +241,13 @@ mod tests {
             .map(|entry| entry.name)
             .collect::<Vec<_>>();
         assert_eq!(&names[..parser_names.len()], parser_names);
-        assert_eq!(&names[parser_names.len()..], RMUX_EXTENSION_COMMANDS);
+        assert_eq!(
+            &names[parser_names.len()..],
+            RMUX_EXTENSION_COMMANDS
+                .iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

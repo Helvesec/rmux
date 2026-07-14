@@ -1079,6 +1079,26 @@ fn if_shell_preserves_nested_stdout_from_output_commands() -> Result<(), Box<dyn
 }
 
 #[test]
+fn if_shell_preserves_prior_stdout_when_a_later_nested_command_fails() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("if-shell-output-before-error")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&[
+        "if-shell",
+        "-F",
+        "1",
+        "display-message -p BEFORE ; select-window -t definitely-missing",
+    ])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout(&output), "BEFORE\n");
+    assert_eq!(stderr(&output), "can't find window: definitely-missing\n");
+    Ok(())
+}
+
+#[test]
 fn if_shell_format_truthiness_matches_tmux_numeric_zero_prefix() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("if-shell-format-truthiness")?;
     let _daemon = harness.start_hidden_daemon()?;

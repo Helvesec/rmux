@@ -1,5 +1,5 @@
 use rmux_core::PaneId;
-use rmux_proto::{ProcessCommand, RmuxError, SessionName};
+use rmux_proto::{RmuxError, SessionName};
 
 use crate::pane_io::PaneExitEvent;
 use crate::pane_terminal_lookup::initial_pane;
@@ -65,6 +65,7 @@ impl HandlerState {
         let runtime_window_name = profile.runtime_window_name(spawn.command);
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
+        let respawn_shell = profile.shell().to_path_buf();
         self.apply_automatic_window_name(session_name, pane.window_index, automatic_window_name)?;
         self.terminals.insert_pending_session(
             runtime_session_name.clone(),
@@ -74,9 +75,11 @@ impl HandlerState {
             session_id,
             window_id,
             pane_id: pane.id,
-            command: spawn.command.map(ProcessCommand::display_command),
+            process_command: spawn.command.cloned(),
             working_directory: Some(lifecycle_cwd),
+            respawn_shell,
             private_environment: spawn.environment_overrides.map(<[String]>::to_vec),
+            respawn_environment: None,
             dimensions: terminal_size_from_geometry(pane.geometry),
             pid: None,
         });

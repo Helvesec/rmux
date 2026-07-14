@@ -62,8 +62,8 @@ async fn list_sessions_format_uses_each_sessions_active_pane_context() {
     let beta_dir = root.join("beta");
     std::fs::create_dir_all(&alpha_dir).expect("create alpha dir");
     std::fs::create_dir_all(&beta_dir).expect("create beta dir");
-    let alpha_dir = std::fs::canonicalize(&alpha_dir).expect("canonicalize alpha dir");
-    let beta_dir = std::fs::canonicalize(&beta_dir).expect("canonicalize beta dir");
+    let alpha_dir = canonical_context_path(&alpha_dir);
+    let beta_dir = canonical_context_path(&beta_dir);
 
     for (name, path) in [("alpha", &alpha_dir), ("beta", &beta_dir)] {
         let created = handler
@@ -126,8 +126,8 @@ async fn session_path_stays_at_session_cwd_when_pane_cwds_differ() {
     let split_dir = root.join("split");
     std::fs::create_dir_all(&session_dir).expect("create session dir");
     std::fs::create_dir_all(&split_dir).expect("create split dir");
-    let session_dir = std::fs::canonicalize(&session_dir).expect("canonicalize session dir");
-    let split_dir = std::fs::canonicalize(&split_dir).expect("canonicalize split dir");
+    let session_dir = canonical_context_path(&session_dir);
+    let split_dir = canonical_context_path(&split_dir);
     let session = session_name("session-path-context");
 
     let created = handler
@@ -198,6 +198,21 @@ async fn session_path_stays_at_session_cwd_when_pane_cwds_differ() {
     );
 
     let _ = std::fs::remove_dir_all(root);
+}
+
+fn canonical_context_path(path: &std::path::Path) -> std::path::PathBuf {
+    let canonical = std::fs::canonicalize(path).expect("canonicalize context directory");
+    #[cfg(windows)]
+    {
+        let rendered = canonical.to_string_lossy();
+        if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    canonical
 }
 
 fn rendered_context_path(path: &std::path::Path) -> String {

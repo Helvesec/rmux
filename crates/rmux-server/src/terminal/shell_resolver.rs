@@ -68,7 +68,11 @@ pub(super) fn normalize_shell_path(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(unix)]
-pub(super) fn resolve_program_path(path: &Path, _environment: &HashMap<String, String>) -> PathBuf {
+pub(super) fn resolve_program_path_from(
+    path: &Path,
+    _environment: &HashMap<String, String>,
+    _current_dir: &Path,
+) -> PathBuf {
     path.to_path_buf()
 }
 
@@ -80,15 +84,37 @@ pub(super) fn normalize_shell_path(path: PathBuf) -> PathBuf {
 
 #[cfg(windows)]
 pub(super) fn resolve_program_path(path: &Path, environment: &HashMap<String, String>) -> PathBuf {
+    resolve_program_path_with_base(path, environment, None)
+}
+
+#[cfg(windows)]
+pub(super) fn resolve_program_path_from(
+    path: &Path,
+    environment: &HashMap<String, String>,
+    current_dir: &Path,
+) -> PathBuf {
+    resolve_program_path_with_base(path, environment, Some(current_dir))
+}
+
+#[cfg(windows)]
+fn resolve_program_path_with_base(
+    path: &Path,
+    environment: &HashMap<String, String>,
+    current_dir: Option<&Path>,
+) -> PathBuf {
     if path.components().count() > 1 {
         return path.to_path_buf();
     }
 
-    find_program_on_path(path, environment).unwrap_or_else(|| path.to_path_buf())
+    find_program_on_path(path, environment, current_dir).unwrap_or_else(|| path.to_path_buf())
 }
 
 #[cfg(windows)]
-fn find_program_on_path(path: &Path, environment: &HashMap<String, String>) -> Option<PathBuf> {
+fn find_program_on_path(
+    path: &Path,
+    environment: &HashMap<String, String>,
+    current_dir: Option<&Path>,
+) -> Option<PathBuf> {
     let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
     if matches!(name.as_str(), "cmd" | "cmd.exe") {
         return cmd_shell_path(environment);
@@ -97,7 +123,7 @@ fn find_program_on_path(path: &Path, environment: &HashMap<String, String>) -> O
         return windows_powershell_path(environment);
     }
 
-    search_path(path, environment)
+    search_path(path, environment, current_dir)
 }
 
 #[cfg(windows)]
@@ -111,16 +137,42 @@ fn inherited_client_shell(environment: &HashMap<String, String>) -> Option<PathB
 }
 
 #[cfg(windows)]
-fn search_path(path: &Path, environment: &HashMap<String, String>) -> Option<PathBuf> {
+fn search_path(
+    path: &Path,
+    environment: &HashMap<String, String>,
+    current_dir: Option<&Path>,
+) -> Option<PathBuf> {
     let path_value = environment_or_process_os_value(environment, "PATH")?;
     let pathext = environment_or_process_os_value(environment, "PATHEXT");
-    search_path_in(path, path_value.as_os_str(), pathext.as_deref())
+    search_path_in_from(
+        path,
+        path_value.as_os_str(),
+        pathext.as_deref(),
+        current_dir,
+    )
 }
 
 #[cfg(windows)]
 fn search_path_in(path: &Path, path_value: &OsStr, pathext: Option<&OsStr>) -> Option<PathBuf> {
+    search_path_in_from(path, path_value, pathext, None)
+}
+
+#[cfg(windows)]
+fn search_path_in_from(
+    path: &Path,
+    path_value: &OsStr,
+    pathext: Option<&OsStr>,
+    current_dir: Option<&Path>,
+) -> Option<PathBuf> {
     let extensions = executable_extensions(path, pathext);
     for directory in env::split_paths(path_value) {
+        let directory = if directory.is_absolute() {
+            directory
+        } else if let Some(current_dir) = current_dir {
+            current_dir.join(directory)
+        } else {
+            directory
+        };
         for extension in &extensions {
             let candidate = directory.join(format!("{}{}", path.to_string_lossy(), extension));
             if candidate.is_file() && is_usable_shell_candidate(&candidate) {
@@ -339,6 +391,23 @@ mod tests {
         ]);
 
         let resolved = resolve_program_path(Path::new("rmux-probe"), &environment);
+
+        assert_eq!(resolved, bin.join("rmux-probe.EXE"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_program_path_uses_child_cwd_for_relative_path_entries() {
+        let root = unique_test_dir("relative-effective-path");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("bin test directory");
+        fs::write(bin.join("rmux-probe.exe"), b"").expect("probe fixture");
+        let environment = HashMap::from([
+            ("PATH".to_owned(), "bin".to_owned()),
+            ("PATHEXT".to_owned(), ".EXE".to_owned()),
+        ]);
+
+        let resolved = resolve_program_path_from(Path::new("rmux-probe"), &environment, &root);
 
         assert_eq!(resolved, bin.join("rmux-probe.EXE"));
         let _ = fs::remove_dir_all(root);

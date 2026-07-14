@@ -1,14 +1,21 @@
 #![cfg(windows)]
 
+use std::env;
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmux_pty::{
-    write_windows_console_key, ChildCommand, PtyMaster, PtyPair, SpawnedPty, TerminalSize,
-    WindowsConsoleKeyEvent,
+    write_windows_console_key, write_windows_console_key_then_interrupt_if_processed, ChildCommand,
+    PtyMaster, PtyPair, SpawnedPty, TerminalSize, WindowsConsoleKeyEvent,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+use windows_sys::Win32::System::Console::{
+    GetConsoleMode, GetStdHandle, SetConsoleCtrlHandler, SetConsoleMode, CTRL_C_EVENT,
+    ENABLE_PROCESSED_INPUT, STD_INPUT_HANDLE,
+};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_TERMINATE,
@@ -18,6 +25,17 @@ use windows_sys::Win32::System::Threading::{
 mod job;
 
 const CONPTY_CHILD_OUTPUT_TIMEOUT: Duration = Duration::from_secs(15);
+const CTRL_C_COUNT_PATH_ENV: &str = "RMUX_TEST_CTRL_C_COUNT_PATH";
+
+static CTRL_C_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn count_ctrl_c(kind: u32) -> i32 {
+    if kind == CTRL_C_EVENT {
+        CTRL_C_CALLBACK_COUNT.fetch_add(1, Ordering::SeqCst);
+        return 1;
+    }
+    0
+}
 
 #[test]
 fn conpty_pair_opens_resizes_and_clones_master() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,6 +94,110 @@ fn conpty_interactive_cmd_accepts_written_input() -> Result<(), Box<dyn std::err
         "expected interactive marker in ConPTY output, got {:?}",
         String::from_utf8_lossy(&output)
     );
+    Ok(())
+}
+
+#[test]
+fn conpty_processed_ctrl_c_callback_helper() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(count_path) = env::var_os(CTRL_C_COUNT_PATH_ENV) else {
+        return Ok(());
+    };
+
+    let input = unsafe {
+        // SAFETY: STD_INPUT_HANDLE requests the current process console input.
+        GetStdHandle(STD_INPUT_HANDLE)
+    };
+    let mut mode = 0_u32;
+    let got_mode = unsafe {
+        // SAFETY: input is the ConPTY console input handle and mode is writable.
+        GetConsoleMode(input, &mut mode)
+    };
+    if got_mode == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let set_mode = unsafe {
+        // SAFETY: input is a valid console input handle and mode preserves all
+        // existing flags while enabling processed Ctrl-C handling.
+        SetConsoleMode(input, mode | ENABLE_PROCESSED_INPUT)
+    };
+    if set_mode == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let installed = unsafe {
+        // SAFETY: count_ctrl_c has the process-static callback signature Win32
+        // requires and remains valid for the lifetime of this helper process.
+        SetConsoleCtrlHandler(Some(count_ctrl_c), 1)
+    };
+    if installed == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    println!("RMUX_CTRL_C_COUNT_READY");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        fs::write(
+            &count_path,
+            CTRL_C_CALLBACK_COUNT.load(Ordering::SeqCst).to_string(),
+        )?;
+        thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+#[test]
+fn conpty_processed_ctrl_c_emits_one_interrupt_per_key() -> Result<(), Box<dyn std::error::Error>> {
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let count_path = env::temp_dir().join(format!(
+        "rmux-ctrl-c-count-{}-{suffix}.txt",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&count_path);
+
+    let mut spawned = ChildCommand::new(env::current_exe()?)
+        .args([
+            "--exact",
+            "conpty_processed_ctrl_c_callback_helper",
+            "--nocapture",
+        ])
+        .env(CTRL_C_COUNT_PATH_ENV, count_path.as_os_str())
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let ready = read_until(
+        spawned.master(),
+        b"RMUX_CTRL_C_COUNT_READY",
+        Duration::from_secs(3),
+    )?;
+    assert!(
+        ready
+            .windows(b"RMUX_CTRL_C_COUNT_READY".len())
+            .any(|window| window == b"RMUX_CTRL_C_COUNT_READY"),
+        "Ctrl-C count helper did not become ready: {:?}",
+        String::from_utf8_lossy(&ready)
+    );
+
+    write_windows_console_key_then_interrupt_if_processed(
+        spawned.child().pid(),
+        WindowsConsoleKeyEvent::ctrl_c(),
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let observed = loop {
+        let callbacks = fs::read_to_string(&count_path)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if callbacks > 0 || Instant::now() >= deadline {
+            break callbacks;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert!(observed > 0, "Ctrl-C helper did not receive an interrupt");
+    thread::sleep(Duration::from_millis(250));
+    let callbacks = fs::read_to_string(&count_path)?.parse::<usize>()?;
+
+    spawned.child().terminate_forcefully()?;
+    let _ = spawned.child_mut().wait()?;
+    let _ = fs::remove_file(&count_path);
+    assert_eq!(callbacks, 1, "one Ctrl-C key must emit one interrupt");
     Ok(())
 }
 

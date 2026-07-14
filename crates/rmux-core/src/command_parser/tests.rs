@@ -160,6 +160,116 @@ fn preserves_standard_escaped_backslashes_in_windows_drive_paths() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn preserves_literal_and_escaped_windows_unc_paths() {
+    for input in [
+        r#"set-environment -g AUDIT_PATH "\\server\share""#,
+        r#"set-environment -g AUDIT_PATH "\\\\server\\share""#,
+    ] {
+        let commands = CommandParser::new().parse(input).unwrap();
+        assert_eq!(
+            commands.commands()[0].arguments()[2].as_string(),
+            Some(r"\\server\share"),
+            "input: {input}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_literal_and_escaped_windows_device_paths() {
+    for input in [
+        r#"set-environment -g AUDIT_PATH "\\?\C:\Users\RMUXUser""#,
+        r#"set-environment -g AUDIT_PATH "\\\\?\\C:\\Users\\RMUXUser""#,
+    ] {
+        let commands = CommandParser::new().parse(input).unwrap();
+        assert_eq!(
+            commands.commands()[0].arguments()[2].as_string(),
+            Some(r"\\?\C:\Users\RMUXUser"),
+            "input: {input}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_non_path_leading_escaped_text_semantics() {
+    let commands = CommandParser::new()
+        .parse(r#"display-message "\\n""#)
+        .unwrap();
+
+    assert_eq!(
+        commands.commands()[0].arguments()[0].as_string(),
+        Some(r"\n")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_relative_and_embedded_windows_paths() {
+    for (input, expected) in [
+        (
+            r#"display-message ".\scripts\tool.ps1""#,
+            r".\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "..\scripts\tool.ps1""#,
+            r"..\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=.\scripts\tool.ps1""#,
+            r"--script=.\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=C:\scripts\tool.ps1""#,
+            r"--script=C:\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=C:\folder=one\tool.ps1""#,
+            r"--script=C:\folder=one\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=\\server\share\tool.ps1""#,
+            r"--script=\\server\share\tool.ps1",
+        ),
+    ] {
+        let commands = CommandParser::new().parse(input).unwrap();
+        assert_eq!(
+            commands.commands()[0].arguments()[0].as_string(),
+            Some(expected),
+            "input: {input}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_escape_semantics_when_a_later_separator_exists() {
+    let commands = CommandParser::new()
+        .parse(
+            r#"display-message "\n/later" "\t/later" "\u263A/later" "\101/later" "\a\b\e\f\s\v\r\n\t\101\u263A/later""#,
+        )
+        .unwrap();
+    let args = commands.commands()[0].arguments();
+
+    assert_eq!(args[0].as_string(), Some("\n/later"));
+    assert_eq!(args[1].as_string(), Some("\t/later"));
+    assert_eq!(args[2].as_string(), Some("☺/later"));
+    assert_eq!(args[3].as_string(), Some("A/later"));
+    assert_eq!(
+        args[4].as_string(),
+        Some("\x07\x08\x1b\x0c \x0b\r\n\tA☺/later")
+    );
+
+    for input in [
+        r#"display-message "\400/later""#,
+        r#"display-message "\u12xz/later""#,
+    ] {
+        assert!(CommandParser::new().parse(input).is_err(), "input: {input}");
+    }
+}
+
 #[test]
 fn expands_variables_and_tilde_at_tokenization_boundary() {
     let commands = CommandParser::new()
@@ -718,6 +828,23 @@ fn resolved_command_alias_option_entries_replace_default_aliases() {
             .parse("choose-window")
             .is_err(),
         "runtime command-alias array should be the source of truth"
+    );
+}
+
+#[test]
+fn duplicate_command_alias_names_use_the_first_array_entry() {
+    let commands = CommandParser::new()
+        .with_command_aliases([
+            "say=display-message -p first",
+            "say=display-message -p second",
+        ])
+        .parse_arguments(["say"])
+        .expect("duplicate runtime alias should parse");
+
+    assert_eq!(commands.commands()[0].name(), "display-message");
+    assert_eq!(
+        commands.commands()[0].arguments()[1].as_string(),
+        Some("first")
     );
 }
 

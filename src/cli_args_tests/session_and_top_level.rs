@@ -148,9 +148,10 @@ fn top_level_flags_parse_before_the_command() {
         }
         super::super::ConfigFileSelection::Default => panic!("expected custom config files"),
     }
+    assert_eq!(cli.control_command_lines(), &["list-sessions".to_owned()]);
     assert!(matches!(
-        cli.command.expect("parsed command"),
-        super::super::Command::ListSessions(_)
+        cli.command.expect("parsed control command"),
+        super::super::Command::Noop
     ));
 }
 

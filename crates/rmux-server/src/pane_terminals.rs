@@ -95,6 +95,8 @@ pub(crate) struct WindowSpawnOptions<'a> {
     pub(crate) socket_path: &'a Path,
     pub(crate) spawn_environment: Option<&'a HashMap<String, String>>,
     pub(crate) environment_overrides: Option<&'a [String]>,
+    pub(crate) respawn_shell: Option<&'a Path>,
+    pub(crate) respawn_environment: Option<&'a [String]>,
     pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
     pub(crate) pane_exit_callback: Option<PaneExitCallback>,
 }

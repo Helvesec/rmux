@@ -19,9 +19,10 @@ mod window_movement;
 
 use super::{
     session_not_found, HandlerState, KilledWindowResult, NewWindowOptions, PreparedWindowTerminal,
-    RemovedWindowHookContext, RespawnWindowOptions, SessionTransferSnapshot,
+    RemovedWindowHookContext, RespawnWindowOptions, SessionTransferSnapshot, WindowSpawnOptions,
 };
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::terminal::validate_process_command;
 
 #[path = "pane_terminals/window_removal.rs"]
 mod window_removal;
@@ -458,6 +459,42 @@ impl HandlerState {
             .first()
             .copied()
             .ok_or_else(|| RmuxError::Server("window has no panes".to_owned()))?;
+        let provenance = self.pane_respawn_provenance(pane_id);
+        let process_command = spawn.command.cloned().or_else(|| {
+            provenance
+                .as_ref()
+                .and_then(|provenance| provenance.process_command.clone())
+        });
+        validate_process_command(process_command.as_ref())?;
+        let start_directory = spawn
+            .start_directory
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| {
+                provenance
+                    .as_ref()
+                    .and_then(|provenance| provenance.working_directory.clone())
+            });
+        let respawn_environment = provenance
+            .as_ref()
+            .map(|provenance| provenance.private_environment.clone());
+        let respawn_shell = provenance
+            .as_ref()
+            .map(|provenance| provenance.shell.as_path());
+        let environment_overrides = spawn
+            .environment_overrides
+            .map(<[String]>::to_vec)
+            .or_else(|| respawn_environment.clone());
+        let spawn = WindowSpawnOptions {
+            start_directory: start_directory.as_deref(),
+            command: process_command.as_ref(),
+            socket_path: spawn.socket_path,
+            spawn_environment: spawn.spawn_environment,
+            environment_overrides: environment_overrides.as_deref(),
+            respawn_shell,
+            respawn_environment: respawn_environment.as_deref(),
+            pane_alert_callback: spawn.pane_alert_callback,
+            pane_exit_callback: spawn.pane_exit_callback,
+        };
         let removed_pane_ids = pane_ids
             .iter()
             .copied()

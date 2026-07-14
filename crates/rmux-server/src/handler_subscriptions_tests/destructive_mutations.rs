@@ -245,8 +245,56 @@ async fn linked_respawn_window_removes_sibling_subscription_and_preserves_retain
             },
         )
         .await;
-    let Response::PaneOutputCursor(cursor) = cursor else {
-        panic!("retained respawn subscription should remain readable: {cursor:?}");
+    let cursor = match cursor {
+        Response::PaneOutputCursor(cursor) => cursor,
+        Response::PaneOutputLag(lag) => {
+            assert_eq!(
+                lag.subscription_id, retained_subscription,
+                "respawn lag must belong to the retained subscription"
+            );
+            assert!(
+                lag.lag.missed_events > 0 && lag.lag.resume_sequence > lag.lag.expected_sequence,
+                "respawn lag must describe a real cleared lifetime-boundary gap: {lag:?}"
+            );
+            assert_eq!(
+                lag.lag.missed_events,
+                lag.lag.resume_sequence - lag.lag.expected_sequence,
+                "respawn lag count must cover the complete cleared sequence range"
+            );
+            assert_eq!(
+                lag.cursor.next_sequence, lag.lag.resume_sequence,
+                "respawn lag cursor must advance to the advertised resume sequence"
+            );
+            assert_eq!(
+                lag.cursor.missed_events, lag.lag.missed_events,
+                "respawn lag cursor must account for every missed event"
+            );
+            assert!(
+                lag.lag
+                    .recent
+                    .bytes
+                    .windows(expected.len())
+                    .any(|bytes| bytes == expected.as_slice()),
+                "respawn lag recovery must retain the new runtime output: {lag:?}"
+            );
+
+            let resumed = handler
+                .handle_pane_output_cursor(
+                    CONNECTION_ID,
+                    PaneOutputCursorRequest {
+                        subscription_id: retained_subscription,
+                        max_events: Some(16),
+                    },
+                )
+                .await;
+            let Response::PaneOutputCursor(cursor) = resumed else {
+                panic!("retained respawn subscription must resume after one lag: {resumed:?}");
+            };
+            cursor
+        }
+        response => {
+            panic!("retained respawn subscription should remain readable: {response:?}")
+        }
     };
     assert!(
         cursor.events.iter().any(|event| event.bytes == expected),

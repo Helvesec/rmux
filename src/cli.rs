@@ -28,6 +28,8 @@ mod command_inventory;
 mod command_runner;
 #[path = "cli/config_commands.rs"]
 mod config_commands;
+#[path = "cli/control_mode_error.rs"]
+mod control_mode_error;
 #[path = "cli/diagnose.rs"]
 mod diagnose;
 #[path = "cli/dispatch.rs"]
@@ -71,12 +73,9 @@ mod web_share_display;
 #[path = "cli/window_commands.rs"]
 mod window_commands;
 
-use rmux_client::{
-    connect, ensure_server_running_with_config, resolve_socket_path,
-    resolve_tmux_compatible_socket_path, Connection,
+use crate::cli_args::{
+    parse, parse_with_runtime_aliases, parse_with_runtime_command_groups, scan_top_level_command,
 };
-
-use crate::cli_args::parse;
 use crate::cli_response::{expect_command_output, expect_command_success};
 use attach_transport::attach_with_connection;
 use client_commands::run_switch_client_on_connection;
@@ -94,10 +93,15 @@ pub(crate) use command_runner::{
 use command_runner::{
     finish_command_success, unexpected_response, write_command_output, write_lines_output,
 };
+use control_mode_error::parse_failure as control_mode_parse_failure;
 use dispatch::dispatch_command_queue;
 #[cfg(test)]
 use dispatch::{command_has_start_server_flag, default_client_command};
-pub(crate) use error::ExitFailure;
+pub(crate) use error::{ExitFailure, ExitMessageTermination};
+use rmux_client::{
+    connect, ensure_server_running_with_config, resolve_socket_path,
+    resolve_tmux_compatible_socket_path, Connection,
+};
 use shell_startup::run_shell_startup;
 #[cfg(test)]
 use shell_startup::{same_file_identity_for_paths, usable_shell_path};
@@ -158,8 +162,27 @@ where
     if let Some(invocation) = capabilities::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return capabilities::run(invocation);
     }
-    let mut cli = match parse(args.clone()) {
+    let runtime_resolution =
+        alias_fallback::runtime_command_resolution_for_invocation(&args, invoked_as_tmux(&args))?;
+    let parsed_cli = match runtime_resolution.as_ref() {
+        Some(alias_fallback::RuntimeCommandResolution::Canonical(groups)) => {
+            parse_with_runtime_command_groups(args.clone(), groups)
+        }
+        Some(alias_fallback::RuntimeCommandResolution::LegacyAliases(aliases)) => {
+            parse_with_runtime_aliases(args.clone(), aliases)
+        }
+        None => parse(args.clone()),
+    };
+    let mut cli = match parsed_cli {
         Ok(cli) => cli,
+        Err(error) if runtime_resolution.is_some() => {
+            let control_mode = scan_top_level_command(args.get(1..).unwrap_or(&[]))
+                .map_or(0, |scan| scan.control_mode);
+            if control_mode != 0 {
+                return Err(control_mode_parse_failure(error, control_mode));
+            }
+            return Err(ExitFailure::from_clap(error));
+        }
         Err(error) => return parse_failure_or_absent_server(&args, error),
     };
     cli.utf8 |= infer_client_utf8_from_env();

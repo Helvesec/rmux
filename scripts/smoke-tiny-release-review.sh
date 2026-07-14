@@ -207,6 +207,7 @@ run_rmux_smoke() {
   "$RMUX" -L "$sock" kill-server >/dev/null 2>&1 || true
   "$RMUX" -S "$real" kill-server >/dev/null 2>&1 || true
   cleanup_rmux() {
+    "$RMUX" -L "$sock" set-option -s -u 'command-alias[20]' >/dev/null 2>&1 || true
     "$RMUX" -L "$sock" kill-server >/dev/null 2>&1 || true
     "$RMUX" -S "$real" kill-server >/dev/null 2>&1 || true
   }
@@ -215,6 +216,44 @@ run_rmux_smoke() {
   "$RMUX" -L "$sock" new-session -d -s alpha sleep 60 >/dev/null
   "$RMUX" -L "$sock" new-session -d -s prefixdemo sleep 60 >/dev/null
   "$RMUX" -L "$sock" new-session -d -s killtarget sleep 60 >/dev/null
+
+  "$RMUX" -L "$sock" set-environment -gu TINY_ALIAS_PERSISTED >/dev/null 2>&1 || true
+  "$RMUX" -L "$sock" set-option -s 'command-alias[20]' \
+    'list-sessions=TINY_ALIAS_PERSISTED=from-tiny display-message -p tiny-alias' >/dev/null
+  run_capture list_sessions_alias -L "$sock" list-sessions
+  assert_rc list_sessions_alias 0
+  assert_trace list_sessions_alias "rmux tiny: fallback: runtime command-alias"
+  assert_stdout_line list_sessions_alias "tiny-alias"
+  [ "$("$RMUX" -L "$sock" show-environment -g TINY_ALIAS_PERSISTED)" = \
+      "TINY_ALIAS_PERSISTED=from-tiny" ] ||
+    die "tiny runtime alias did not persist its parse-time assignment"
+  "$RMUX" -L "$sock" set-environment -gu TINY_ALIAS_PERSISTED >/dev/null
+  "$RMUX" -L "$sock" set-option -s -u 'command-alias[20]' >/dev/null
+
+  "$RMUX" -L "$sock" set-environment -gu TINY_ALIAS_ATOMIC >/dev/null 2>&1 || true
+  "$RMUX" -L "$sock" set-option -s 'command-alias[20]' \
+    'list-sessions=TINY_ALIAS_ATOMIC=mutated kill-server unexpected' >/dev/null
+  run_capture list_sessions_alias_invalid -L "$sock" list-sessions
+  [ "$(cat "$SMOKE_ROOT/list_sessions_alias_invalid.rc")" != "0" ] ||
+    die "invalid tiny runtime alias unexpectedly succeeded"
+  assert_trace list_sessions_alias_invalid \
+    "rmux tiny: fallback: runtime command-alias"
+  if "$RMUX" -L "$sock" show-environment -g TINY_ALIAS_ATOMIC >/dev/null 2>&1; then
+    die "invalid tiny runtime alias applied assignments before validation"
+  fi
+  "$RMUX" -L "$sock" has-session -t alpha >/dev/null ||
+    die "invalid tiny runtime alias stopped the server"
+  "$RMUX" -L "$sock" set-option -s -u 'command-alias[20]' >/dev/null
+
+  "$RMUX" -L "$sock" set-option -s 'command-alias[20]' \
+    'kill-server=display-message -p alias-survives' >/dev/null
+  run_capture kill_server_alias -L "$sock" kill-server
+  assert_rc kill_server_alias 0
+  assert_trace kill_server_alias "rmux tiny: fallback: runtime command-alias"
+  assert_stdout_line kill_server_alias "alias-survives"
+  "$RMUX" -L "$sock" list-sessions >/dev/null ||
+    die "tiny kill-server alias stopped the server"
+  "$RMUX" -L "$sock" set-option -s -u 'command-alias[20]' >/dev/null
 
   run_capture has_session_prefix -L "$sock" has-session -t prefixd
   assert_rc has_session_prefix 0

@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser};
 use rmux_core::{
+    command_inventory::RMUX_EXTENSION_COMMANDS,
     command_parser::{CommandEntry, ParsedCommands, COMMAND_TABLE},
     tmux_precedence,
 };
@@ -32,6 +33,9 @@ pub(crate) use config::{
     SetEnvironmentArgs, SetHookArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs,
     ShowHooksArgs, ShowOptionsArgs, ShowOptionsCommandKind,
 };
+#[path = "cli_args/control.rs"]
+mod control;
+use control::render_control_command_lines;
 #[path = "cli_args/automation.rs"]
 mod automation;
 pub(crate) use automation::{
@@ -59,7 +63,10 @@ mod prompt;
 pub(crate) use prompt::{ConfirmBeforeArgs, PromptArgs, PromptHistoryArgs};
 #[path = "cli_args/queue.rs"]
 mod queue;
-use queue::{command_from_parsed, parse_command_queue};
+use queue::{
+    command_from_parsed, parse_command_queue, parse_command_queue_with_aliases,
+    parse_runtime_command_groups,
+};
 #[path = "cli_args/script.rs"]
 mod script;
 use script::parse_source_file_args;
@@ -121,70 +128,73 @@ static IMPLEMENTED_COMMAND_SURFACE: OnceLock<Vec<&'static CommandEntry>> = OnceL
 
 static IMPLEMENTED_COMMAND_HELP: OnceLock<String> = OnceLock::new();
 
-const RMUX_EXTENSION_COMMANDS: &[CommandEntry] = &[
-    CommandEntry {
-        name: "capabilities",
-        alias: None,
-    },
-    CommandEntry {
-        name: "claude",
-        alias: None,
-    },
-    CommandEntry {
-        name: "doctor",
-        alias: None,
-    },
-    CommandEntry {
-        name: "setup",
-        alias: None,
-    },
-    CommandEntry {
-        name: "wait-pane",
-        alias: None,
-    },
-    CommandEntry {
-        name: "pane-snapshot",
-        alias: None,
-    },
-    CommandEntry {
-        name: "stream-pane",
-        alias: None,
-    },
-    CommandEntry {
-        name: "collect-pane-output",
-        alias: None,
-    },
-    CommandEntry {
-        name: "locator",
-        alias: None,
-    },
-    CommandEntry {
-        name: "expect-pane",
-        alias: None,
-    },
-    CommandEntry {
-        name: "find-panes",
-        alias: None,
-    },
-    CommandEntry {
-        name: "find-sessions",
-        alias: None,
-    },
-    CommandEntry {
-        name: "broadcast-keys",
-        alias: None,
-    },
-    CommandEntry {
-        name: "with-session",
-        alias: None,
-    },
-    CommandEntry {
-        name: "web-share",
-        alias: None,
-    },
-];
-
 pub(crate) fn parse<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let raw = parse_raw_cli(args)?;
+    if raw.control_mode != 0 {
+        return Cli::from_raw_control(raw);
+    }
+    let parsed_commands = parse_command_queue(&raw.command)?;
+    reject_parse_time_assignments_without_runtime_bridge(&parsed_commands)?;
+    Cli::from_raw(raw, parsed_commands, false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeCommandGroup {
+    Canonical(String),
+}
+
+pub(crate) fn parse_with_runtime_aliases<I, T>(
+    args: I,
+    runtime_aliases: &[String],
+) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let raw = parse_raw_cli(args)?;
+    if raw.control_mode != 0 {
+        return Cli::from_raw_control(raw);
+    }
+    let parsed_commands = parse_command_queue_with_aliases(&raw.command, runtime_aliases)?;
+    reject_parse_time_assignments_without_runtime_bridge(&parsed_commands)?;
+    Cli::from_raw(raw, parsed_commands, false)
+}
+
+fn reject_parse_time_assignments_without_runtime_bridge(
+    parsed_commands: &ParsedCommands,
+) -> Result<(), clap::Error> {
+    let Some(assignment) = parsed_commands.assignments().first() else {
+        return Ok(());
+    };
+    let token = format!("{}={}", assignment.name(), assignment.value());
+    let token = token
+        .chars()
+        .flat_map(char::escape_default)
+        .collect::<String>();
+    Err(clap::Error::raw(
+        clap::error::ErrorKind::InvalidSubcommand,
+        format!("unknown command: {token}"),
+    ))
+}
+
+pub(crate) fn parse_with_runtime_command_groups<I, T>(
+    args: I,
+    runtime_groups: &[RuntimeCommandGroup],
+) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let raw = parse_raw_cli(args)?;
+    let parsed_commands = parse_runtime_command_groups(runtime_groups)?;
+    Cli::from_raw(raw, parsed_commands, true)
+}
+
+fn parse_raw_cli<I, T>(args: I) -> Result<RawCli, clap::Error>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -193,9 +203,7 @@ where
     let mut command = RawCli::command();
     command = command.after_help(implemented_command_help());
     let matches = command.try_get_matches_from(args)?;
-    let raw = RawCli::from_arg_matches(&matches)?;
-    let parsed_commands = parse_command_queue(&raw.command)?;
-    Cli::from_raw(raw, parsed_commands)
+    RawCli::from_arg_matches(&matches)
 }
 
 /// Result of parsing only the clap-owned top-level prefix and opaque command
@@ -403,17 +411,36 @@ struct RawCli {
 }
 
 impl Cli {
-    fn from_raw(raw: RawCli, parsed_commands: ParsedCommands) -> Result<Self, clap::Error> {
+    fn from_raw_control(raw: RawCli) -> Result<Self, clap::Error> {
         let explicit_command_args = !raw.command.is_empty();
-        let control_command_lines = if parsed_commands.is_empty() {
+        let control_command_lines = render_control_command_lines(&raw.command)?;
+        let command_queue = explicit_command_args
+            .then_some(Command::Noop)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let primary_command = command_queue.first().cloned();
+        Ok(Self::from_raw_queue(
+            raw,
+            primary_command,
+            command_queue,
+            control_command_lines,
+        ))
+    }
+
+    fn from_raw(
+        raw: RawCli,
+        parsed_commands: ParsedCommands,
+        apply_runtime_assignments: bool,
+    ) -> Result<Self, clap::Error> {
+        let explicit_command_args = !raw.command.is_empty();
+        let control_command_lines = if raw.control_mode == 0 {
             Vec::new()
         } else {
-            parsed_commands
-                .commands()
-                .iter()
-                .map(rmux_core::command_parser::ParsedCommand::to_tmux_string)
-                .collect()
+            render_control_command_lines(&raw.command)?
         };
+        let runtime_assignments = apply_runtime_assignments
+            .then(|| parsed_commands.assignments_to_tmux_reparse_string())
+            .filter(|assignments| !assignments.is_empty());
         let mut command_queue = parsed_commands
             .into_commands()
             .into_iter()
@@ -422,7 +449,27 @@ impl Cli {
         if command_queue.is_empty() && explicit_command_args {
             command_queue.push(Command::Noop);
         }
-        Ok(Self {
+        let primary_command = command_queue.first().cloned();
+        if raw.control_mode == 0 {
+            if let Some(assignments) = runtime_assignments {
+                command_queue.insert(0, Command::ApplyParseTimeAssignments(assignments));
+            }
+        }
+        Ok(Self::from_raw_queue(
+            raw,
+            primary_command,
+            command_queue,
+            control_command_lines,
+        ))
+    }
+
+    fn from_raw_queue(
+        raw: RawCli,
+        primary_command: Option<Command>,
+        command_queue: Vec<Command>,
+        control_command_lines: Vec<String>,
+    ) -> Self {
+        Self {
             assume_256_colors: raw.assume_256_colors,
             control_mode: raw.control_mode,
             no_fork: raw.no_fork,
@@ -435,10 +482,10 @@ impl Cli {
             terminal_features: raw.terminal_features,
             utf8: raw.utf8,
             verbose: raw.verbose,
-            command: command_queue.first().cloned(),
+            command: primary_command,
             command_queue,
             control_command_lines,
-        })
+        }
     }
 
     pub(crate) fn socket_name(&self) -> Option<&std::ffi::OsStr> {
@@ -738,6 +785,7 @@ fn exact_short_flag(argument: &str, flags: &std::collections::BTreeSet<char>) ->
 #[derive(Debug, Clone)]
 pub(crate) enum Command {
     Noop,
+    ApplyParseTimeAssignments(String),
     NewSession(NewSessionArgs),
     StartServer(StartServerArgs),
     KillServer,

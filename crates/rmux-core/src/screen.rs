@@ -544,10 +544,14 @@ impl Screen {
         self.clear_selected_cells();
 
         let ch = if acs { acs::translate_acs(ch) } else { ch };
-        let width = u32::from(self.utf8_config.width(ch));
+        let requested_width = u32::from(self.utf8_config.width(ch));
         if self.combine_char(ch) {
             return;
         }
+        // A cell wider than the entire viewport cannot be represented with
+        // its normal padding. Preserve the glyph as a one-column cell rather
+        // than creating an out-of-bounds wide owner.
+        let width = requested_width.clamp(1, self.grid.sx());
 
         let automatic_wrap_continuation = self.pending_wrap && (self.mode & mode::MODE_WRAP) != 0;
         self.apply_pending_wrap();
@@ -628,7 +632,8 @@ impl Screen {
                 self.pending_wrap && (self.mode & mode::MODE_WRAP) != 0;
             self.apply_pending_wrap();
             if self.cursor_y >= self.grid.sy() {
-                return false;
+                self.write_ascii_run_slow(bytes, cell, acs);
+                return true;
             }
 
             let sx = self.grid.sx();
@@ -640,21 +645,27 @@ impl Screen {
             if (self.mode & mode::MODE_WRAP) == 0 {
                 let available = sx.saturating_sub(x) as usize;
                 if bytes.len() > available {
-                    return false;
+                    self.write_ascii_run_slow(bytes, cell, acs);
+                    return true;
                 }
             }
 
             let writable = sx.saturating_sub(x) as usize;
             if writable == 0 {
-                return false;
+                self.write_ascii_run_slow(bytes, cell, acs);
+                return true;
             }
             let chunk_len = bytes.len().min(writable);
             let (chunk, rest) = bytes.split_at(chunk_len);
-            let Some(line) = self.current_line_mut() else {
-                return false;
-            };
-            if !line.write_plain_ascii_run(x, chunk) {
-                return false;
+            let wrote_chunk = self
+                .current_line_mut()
+                .is_some_and(|line| line.write_plain_ascii_run(x, chunk));
+            if !wrote_chunk {
+                // Earlier chunks in this run may already have changed prior
+                // rows. Consume only the untouched suffix through the general
+                // writer so the caller never replays bytes already written.
+                self.write_ascii_run_slow(bytes, cell, acs);
+                return true;
             }
 
             if (self.mode & mode::MODE_WRAP) != 0 && x + chunk_len as u32 >= sx {
@@ -667,6 +678,12 @@ impl Screen {
             bytes = rest;
         }
         true
+    }
+
+    fn write_ascii_run_slow(&mut self, bytes: &[u8], cell: &CellState, acs: bool) {
+        for &byte in bytes {
+            self.write_char(char::from(byte), cell, acs);
+        }
     }
 
     fn break_previous_wrapped_line(&mut self) {
@@ -691,16 +708,18 @@ impl Screen {
             x -= 1;
         }
 
-        let Some(line) = self.grid.visible_line_mut(self.cursor_y) else {
+        let Some((target_x, previous)) = self.grid.visible_line(self.cursor_y).map(|line| {
+            let target_x = line.owning_cell_x(x).unwrap_or(x);
+            let previous = line
+                .cell(target_x)
+                .map(|cell| (cell.text().to_owned(), cell.width()));
+            (target_x, previous)
+        }) else {
             return matches!(
                 utf8_combine_char(None, ch, &self.utf8_config),
                 CombineResult::Discard
             );
         };
-        let target_x = line.owning_cell_x(x).unwrap_or(x);
-        let previous = line
-            .cell(target_x)
-            .map(|cell| (cell.text().to_owned(), cell.width()));
         let result = utf8_combine_char(
             previous
                 .as_ref()
@@ -714,6 +733,17 @@ impl Screen {
             CombineResult::Discard => true,
             CombineResult::Combined { text, width } => {
                 let previous_width = previous.as_ref().map_or(0, |(_, width)| *width);
+                let available_width = self.grid.sx().saturating_sub(target_x).max(1);
+                let width = width.min(u8::try_from(available_width).unwrap_or(u8::MAX));
+                if width != previous_width {
+                    // Width promotion may replace the owner of an adjacent
+                    // wide cell. Clear that owner's displaced padding before
+                    // installing the new owner/padding pair.
+                    self.overwrite_for_write(target_x, u32::from(width));
+                }
+                let Some(line) = self.grid.visible_line_mut(self.cursor_y) else {
+                    return true;
+                };
                 if let Some(cell) = line.cell_mut(target_x) {
                     cell.set_text(text);
                     cell.set_width(width);

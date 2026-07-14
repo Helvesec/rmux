@@ -3,7 +3,10 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use rmux_client::{connect, ClientError, Connection};
-use rmux_proto::{CommandOutput, PaneTarget, ResolveTargetType, Response, RmuxError, Target};
+use rmux_proto::{
+    CommandOutput, PaneTarget, ResolveTargetType, Response, RmuxError, Target,
+    CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION, INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH,
+};
 
 use crate::cli_response::{expect_command_output, expect_command_success, response_name};
 
@@ -142,9 +145,17 @@ fn queued_server_command_response(
     connection: &mut Connection,
     queue_command: String,
 ) -> Result<Response, ExitFailure> {
+    let source_path = if connection
+        .supports_capability(CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION)
+        .map_err(ExitFailure::from_client)?
+    {
+        INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH
+    } else {
+        "-"
+    };
     connection
         .source_file(
-            vec!["-".to_owned()],
+            vec![source_path.to_owned()],
             false,
             false,
             false,
@@ -161,6 +172,9 @@ fn finish_queued_server_command(
 ) -> Result<i32, ExitFailure> {
     if let Response::SourceFile(source) = &response {
         if source.exit_status().unwrap_or(0) != 0 && !source.stderr().is_empty() {
+            if let Some(output) = source.command_output() {
+                write_command_output(output)?;
+            }
             let message = String::from_utf8_lossy(source.stderr())
                 .trim_end_matches('\n')
                 .to_owned();

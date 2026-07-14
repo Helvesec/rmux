@@ -239,22 +239,6 @@ and fail-closed, but does not expose the flags through help, completions, or
 Inventory impact: the public command surface must not advertise these flags
 until parser, runtime, and oracle-backed behavior land together.
 
-### C-D42: respawn-pane without a command uses the default shell
-
-tmux 3.7b respawns a dead pane with its original command when no command is
-supplied. RMUX respawns with the session default shell. This preserves RMUX's
-current pane creation model, which does not retain enough command provenance to
-reconstruct every original argv safely.
-
-Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records a `remain-on-exit`
-session with a dead `true` pane. tmux 3.7b `respawn-pane -t w:1.0` exits 0 and
-`display-message -p -t w:1.0 '#{pane_current_command}'` prints `true`; RMUX
-exits 0 and prints `bash`.
-
-Inventory impact: RMUX must not claim tmux-compatible no-argument
-`respawn-pane` command resurrection until command provenance is stored and
-covered by tests.
-
 ### C-D43: control-mode attach replays initial pane backlog
 
 tmux 3.7b does not replay existing pane backlog as `%output` during the

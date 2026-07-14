@@ -15,15 +15,18 @@ use crate::outer_terminal::OuterTerminalContext;
 use rmux_core::command_parser::CommandParser;
 use rmux_core::TargetFindContext;
 use rmux_proto::{
-    BreakPaneRequest, DisplayMessageRequest, HookName, IfShellRequest, KillSessionRequest,
-    KillWindowRequest, LastWindowRequest, LinkWindowRequest, NewSessionExtRequest,
-    NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName, OptionScopeSelector,
-    PaneTarget, PreviousWindowRequest, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
-    RotateWindowDirection, RotateWindowRequest, RunShellDelaySeconds, RunShellRequest,
-    RunShellResponse, ScopeSelector, SelectPaneRequest, SessionName, SetEnvironmentRequest,
-    SetOptionMode, SetOptionRequest, ShowBufferRequest, ShowOptionsRequest, SourceFileRequest,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapPaneDirection, SwapPaneRequest,
-    Target, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse, WindowTarget,
+    encode_internal_runtime_command_arguments, BreakPaneRequest, DisplayMessageRequest, HookName,
+    IfShellRequest, KillSessionRequest, KillWindowRequest, LastWindowRequest, LinkWindowRequest,
+    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName,
+    OptionScopeSelector, PaneTarget, PreviousWindowRequest, Request, RespawnPaneRequest,
+    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest,
+    RunShellDelaySeconds, RunShellRequest, RunShellResponse, ScopeSelector, SelectPaneRequest,
+    SessionName, SetEnvironmentRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
+    ShowEnvironmentRequest, ShowOptionsRequest, SourceFileRequest, SplitDirection,
+    SplitWindowRequest, SplitWindowTarget, SwapPaneDirection, SwapPaneRequest, Target,
+    TerminalSize, WaitForMode, WaitForRequest, WaitForResponse, WindowTarget,
+    INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH, INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
+    INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -174,7 +177,10 @@ fn background_shell_test_timeout() -> std::time::Duration {
     }
     #[cfg(not(windows))]
     {
-        std::time::Duration::from_secs(2)
+        // Background shell startup competes with thousands of async tests in
+        // the full server suite. Keep this as a bounded liveness budget, not a
+        // scheduler-latency assertion.
+        std::time::Duration::from_secs(8)
     }
 }
 
@@ -375,6 +381,9 @@ mod parsed_queue_split;
 
 #[path = "handler_scripting_tests/parsed_queue_targets.rs"]
 mod parsed_queue_targets;
+
+#[path = "handler_scripting_tests/parsed_queue_swap_window.rs"]
+mod parsed_queue_swap_window;
 
 #[path = "handler_scripting_tests/parsed_queue_windows_mouse.rs"]
 mod parsed_queue_windows_mouse;

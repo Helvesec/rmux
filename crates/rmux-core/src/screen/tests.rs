@@ -787,6 +787,65 @@ fn variation_selector_combines_with_optional_force_wide() {
 }
 
 #[test]
+fn variation_selector_at_a_narrow_right_edge_keeps_valid_cell_topology() {
+    let mut screen = new_screen(1, 1, 10);
+    parse(&mut screen, "❤\u{fe0f}".as_bytes());
+
+    let line = screen.grid().visible_line(0).expect("visible line");
+    let heart = line.cell(0).expect("heart cell");
+    assert_eq!(heart.text(), "❤\u{fe0f}");
+    assert_eq!(heart.width(), 1);
+    assert!(!heart.is_padding());
+    assert_eq!(screen.cursor_position(), (0, 0));
+    assert_no_wide_cell_fragments(&screen);
+}
+
+#[test]
+fn direct_wide_glyph_in_a_one_column_screen_keeps_valid_cell_topology() {
+    let mut screen = new_screen(1, 1, 10);
+    parse(&mut screen, "界".as_bytes());
+
+    let line = screen.grid().visible_line(0).expect("visible line");
+    let glyph = line.cell(0).expect("wide glyph cell");
+    assert_eq!(glyph.text(), "界");
+    assert_eq!(glyph.width(), 1);
+    assert!(!glyph.is_padding());
+    assert_eq!(screen.cursor_position(), (0, 0));
+    assert_no_wide_cell_fragments(&screen);
+}
+
+#[test]
+fn variation_selector_promotion_clears_displaced_wide_cell_padding() {
+    let mut screen = new_screen(4, 1, 10);
+    parse(&mut screen, "A界\r❤\u{fe0f}\x1b[4GC".as_bytes());
+
+    let line = screen.grid().visible_line(0).expect("visible line");
+    assert_eq!(line.cell(0).expect("heart owner").text(), "❤\u{fe0f}");
+    assert_eq!(line.cell(0).expect("heart owner").width(), 2);
+    assert!(line.cell(1).expect("heart padding").is_padding());
+    assert_eq!(line.owning_cell_x(1), Some(0));
+    assert!(!line
+        .cell(2)
+        .expect("cleared displaced padding")
+        .is_padding());
+    assert_eq!(line.cell(2).expect("cleared displaced padding").text(), " ");
+    assert_eq!(line.cell(3).expect("positioned suffix").text(), "C");
+    assert_eq!(
+        screen
+            .render_visible_line_independent(
+                0,
+                GridRenderOptions {
+                    trim_spaces: false,
+                    ..GridRenderOptions::default()
+                }
+            )
+            .expect("rendered line"),
+        "❤\u{fe0f} C".as_bytes()
+    );
+    assert_no_wide_cell_fragments(&screen);
+}
+
+#[test]
 fn hangul_jamo_skin_tone_and_flags_combine_into_single_cells() {
     let mut screen = new_screen(8, 1, 10);
     parse(&mut screen, "각 👋🏽 🇨🇭".as_bytes());
@@ -931,6 +990,33 @@ fn backspace_wraps_to_previous_line_last_column() {
 
     <Screen as crate::input::ScreenWriter>::backspace(&mut screen);
     assert_eq!((screen.cursor_x, screen.cursor_y), (0, 0));
+}
+
+#[test]
+fn plain_ascii_run_fallback_is_invariant_to_pty_chunking_across_a_wide_cell() {
+    fn prepared_screen() -> Screen {
+        let mut screen = new_screen(4, 2, 10);
+        parse(&mut screen, "\x1b[2;1H界\x1b[1;3H".as_bytes());
+        screen
+    }
+
+    let mut single_chunk = prepared_screen();
+    parse(&mut single_chunk, b"abcd");
+
+    let mut split_chunks = prepared_screen();
+    parse(&mut split_chunks, b"ab");
+    parse(&mut split_chunks, b"cd");
+
+    let expected = vec!["  ab".to_owned(), "cd".to_owned()];
+    assert_eq!(single_chunk.capture_grid(false).lines, expected);
+    assert_eq!(
+        split_chunks.capture_grid(false).lines,
+        single_chunk.capture_grid(false).lines
+    );
+    assert_eq!(single_chunk.cursor_position(), (2, 1));
+    assert_eq!(split_chunks.cursor_position(), (2, 1));
+    assert_no_wide_cell_fragments(&single_chunk);
+    assert_no_wide_cell_fragments(&split_chunks);
 }
 
 #[test]

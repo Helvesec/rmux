@@ -26,12 +26,16 @@ impl StartupOptions {
         &self,
         command_has_start_server_flag: bool,
         command_requires_web: bool,
+        start_server_args: Option<&StartServerArgs>,
     ) -> Self {
-        let config = if command_requires_web {
+        let mut config = if command_requires_web {
             self.config.clone().with_web_required()
         } else {
             self.config.clone()
         };
+        if let Some(args) = start_server_args {
+            config = apply_web_auto_start_config(config, args);
+        }
         Self {
             no_start_server: self.no_start_server || !command_has_start_server_flag,
             config,

@@ -34,6 +34,9 @@ use super::source_files::{
     source_parse_error_with_line_offset, LoadedSourceFile, ParsedSourceFileCommand, SourceInput,
     SourceSyntax, SourcedParsedCommands, MAX_SOURCE_AGGREGATE_BYTES, MAX_SOURCE_MATCHED_FILES,
 };
+use super::source_internal::{
+    canonical_command_execution_request, validate_internal_source_file_path,
+};
 use super::targets::{
     active_session_target, queue_target_find_context, QueueTargetFindContextInput,
 };
@@ -155,7 +158,24 @@ impl RequestHandler {
         requester_pid: u32,
         request: SourceFileRequest,
     ) -> Response {
+        if let Err(error) = validate_internal_source_file_path(&request) {
+            return Response::Error(ErrorResponse { error });
+        }
+        let canonical_execution = match canonical_command_execution_request(&request) {
+            Ok(canonical_execution) => canonical_execution,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
+        if let Some(response) = self
+            .handle_internal_source_file_request(requester_pid, &request)
+            .await
+        {
+            return response;
+        }
         let mut command = ParsedSourceFileCommand::from(request);
+        if canonical_execution {
+            command.paths = vec!["-".to_owned()];
+            command.syntax = SourceSyntax::Canonical;
+        }
         let explicit_target = command.target.is_some();
         let socket_path = self.socket_path();
         let requester_environment = requester_environment_context(requester_pid, &socket_path);
@@ -179,7 +199,7 @@ impl RequestHandler {
             Ok(loaded) => loaded,
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
-        let strict_errors = command.syntax == SourceSyntax::Rmux;
+        let strict_errors = command.syntax != SourceSyntax::TmuxCompat;
         let mut stdout_errors = Vec::new();
         let mut stderr_errors = Vec::new();
         let mut stderr = Vec::new();
@@ -575,7 +595,7 @@ impl RequestHandler {
             }
             for input in inputs {
                 let input = match command.syntax {
-                    SourceSyntax::Rmux => input,
+                    SourceSyntax::Rmux | SourceSyntax::Canonical => input,
                     SourceSyntax::TmuxCompat => tmux_compat_input(&input),
                 };
                 if input.contents.trim().is_empty() {
@@ -715,6 +735,9 @@ impl RequestHandler {
         let state = self.state.lock().await;
         let mut parser =
             command_parser_from_state(&state).with_max_command_bytes(SOURCE_FILE_MAX_COMMAND_BYTES);
+        if syntax == SourceSyntax::Canonical {
+            parser = parser.with_command_aliases(std::iter::empty::<String>());
+        }
         let context = match target {
             Some(target) => format_context_for_target_with_server_values(
                 &state,

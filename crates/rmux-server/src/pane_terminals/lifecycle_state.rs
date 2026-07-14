@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use rmux_core::{PaneGeometry, PaneId};
-use rmux_proto::{SessionId, SessionName, TerminalSize, WindowId};
+use rmux_proto::{ProcessCommand, SessionId, SessionName, TerminalSize, WindowId};
 
 use super::{HandlerState, PaneExitMetadata};
 
@@ -17,6 +17,10 @@ impl PrivatePaneEnvironment {
     #[cfg(test)]
     pub(crate) fn as_slice(&self) -> &[String] {
         &self.0
+    }
+
+    fn to_vec(&self) -> Vec<String> {
+        self.0.clone()
     }
 }
 
@@ -64,8 +68,11 @@ pub(crate) struct PaneLifecycleState {
     pub(crate) window_id: WindowId,
     pub(crate) pane_id: PaneId,
     command: Option<Vec<String>>,
+    process_command: Option<ProcessCommand>,
     working_directory: Option<PathBuf>,
+    respawn_shell: PathBuf,
     private_environment: PrivatePaneEnvironment,
+    respawn_environment: PrivatePaneEnvironment,
     tags: Vec<String>,
     dimensions: TerminalSize,
     pub(crate) process: PaneLifecycleProcessState,
@@ -102,12 +109,22 @@ impl PaneLifecycleState {
         self.command.as_deref()
     }
 
+    #[cfg(test)]
+    pub(crate) fn process_command(&self) -> Option<&ProcessCommand> {
+        self.process_command.as_ref()
+    }
+
     pub(crate) fn encoded_command(&self) -> Option<String> {
         self.command.as_deref().map(format_command_field)
     }
 
     pub(crate) fn working_directory(&self) -> Option<&Path> {
         self.working_directory.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn respawn_shell(&self) -> &Path {
+        &self.respawn_shell
     }
 
     #[cfg(test)]
@@ -124,15 +141,34 @@ impl PaneLifecycleState {
     pub(crate) fn private_environment(&self) -> &[String] {
         self.private_environment.as_slice()
     }
+
+    #[cfg(test)]
+    pub(crate) fn respawn_environment(&self) -> &[String] {
+        self.respawn_environment.as_slice()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PaneRespawnProvenance {
+    pub(crate) process_command: Option<ProcessCommand>,
+    pub(crate) working_directory: Option<PathBuf>,
+    pub(crate) shell: PathBuf,
+    pub(crate) private_environment: Vec<String>,
 }
 
 pub(in crate::pane_terminals) struct PaneLifecycleSpawn {
     pub(in crate::pane_terminals) session_id: SessionId,
     pub(in crate::pane_terminals) window_id: WindowId,
     pub(in crate::pane_terminals) pane_id: PaneId,
-    pub(in crate::pane_terminals) command: Option<Vec<String>>,
+    pub(in crate::pane_terminals) process_command: Option<ProcessCommand>,
     pub(in crate::pane_terminals) working_directory: Option<PathBuf>,
+    pub(in crate::pane_terminals) respawn_shell: PathBuf,
     pub(in crate::pane_terminals) private_environment: Option<Vec<String>>,
+    /// Overrides the private environment retained for later command-less
+    /// respawns. `None` records the current private environment as the
+    /// baseline; respawn paths pass `Some` to keep the original baseline when
+    /// `-e` applies only to the replacement process.
+    pub(in crate::pane_terminals) respawn_environment: Option<Vec<String>>,
     pub(in crate::pane_terminals) dimensions: TerminalSize,
     pub(in crate::pane_terminals) pid: Option<u32>,
 }
@@ -164,7 +200,24 @@ impl HandlerState {
         spawn: PaneLifecycleSpawn,
         process: PaneLifecycleProcessState,
     ) -> u64 {
-        let previous = self.pane_lifecycle.remove(&spawn.pane_id);
+        let PaneLifecycleSpawn {
+            session_id,
+            window_id,
+            pane_id,
+            process_command,
+            working_directory,
+            respawn_shell,
+            private_environment,
+            respawn_environment,
+            dimensions,
+            pid: _,
+        } = spawn;
+        let command = process_command
+            .as_ref()
+            .map(ProcessCommand::display_command);
+        let respawn_environment =
+            respawn_environment.unwrap_or_else(|| private_environment.clone().unwrap_or_default());
+        let previous = self.pane_lifecycle.remove(&pane_id);
         let generation = previous
             .as_ref()
             .map_or(1, |state| state.generation.saturating_add(1));
@@ -174,18 +227,19 @@ impl HandlerState {
         let output_sequence = previous.as_ref().map_or(0, |state| state.output_sequence);
 
         self.pane_lifecycle.insert(
-            spawn.pane_id,
+            pane_id,
             PaneLifecycleState {
-                session_id: spawn.session_id,
-                window_id: spawn.window_id,
-                pane_id: spawn.pane_id,
-                command: spawn.command,
-                working_directory: spawn.working_directory,
-                private_environment: PrivatePaneEnvironment::new(
-                    spawn.private_environment.as_deref(),
-                ),
+                session_id,
+                window_id,
+                pane_id,
+                command,
+                process_command,
+                working_directory,
+                respawn_shell,
+                private_environment: PrivatePaneEnvironment::new(private_environment.as_deref()),
+                respawn_environment: PrivatePaneEnvironment::new(Some(&respawn_environment)),
                 tags: Vec::new(),
-                dimensions: spawn.dimensions,
+                dimensions,
                 process,
                 generation,
                 revision,
@@ -300,6 +354,16 @@ impl HandlerState {
 
     pub(crate) fn pane_lifecycle(&self, pane_id: PaneId) -> Option<&PaneLifecycleState> {
         self.pane_lifecycle.get(&pane_id)
+    }
+
+    pub(crate) fn pane_respawn_provenance(&self, pane_id: PaneId) -> Option<PaneRespawnProvenance> {
+        let lifecycle = self.pane_lifecycle.get(&pane_id)?;
+        Some(PaneRespawnProvenance {
+            process_command: lifecycle.process_command.clone(),
+            working_directory: lifecycle.working_directory.clone(),
+            shell: lifecycle.respawn_shell.clone(),
+            private_environment: lifecycle.respawn_environment.to_vec(),
+        })
     }
 }
 

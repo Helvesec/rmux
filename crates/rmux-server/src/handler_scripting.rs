@@ -75,6 +75,8 @@ mod shell_parse;
 mod shell_runtime;
 #[path = "handler_scripting/source_files.rs"]
 mod source_files;
+#[path = "handler_scripting/source_internal.rs"]
+mod source_internal;
 #[path = "handler_scripting/source_runtime.rs"]
 mod source_runtime;
 #[path = "handler_scripting/split_window_runtime.rs"]

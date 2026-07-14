@@ -66,6 +66,88 @@ async fn runtime_command_alias_option_drives_source_file_parser() {
 }
 
 #[tokio::test]
+async fn internal_canonical_execution_does_not_expand_aliases_again() {
+    let handler = RequestHandler::new();
+    set_command_alias(&handler, "if-shell=display-message -p second").await;
+
+    let response = handler
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("if-shell -F 1 \"display-message -p first\"".to_owned()),
+        })))
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .expect("canonical queue output")
+            .stdout(),
+        b"first\n"
+    );
+}
+
+#[tokio::test]
+async fn internal_canonical_execution_keeps_deferred_branch_aliases_dynamic() {
+    let handler = RequestHandler::new();
+    set_command_alias(&handler, "inner=display-message -p nested").await;
+
+    let response = handler
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("if-shell -F 1 inner".to_owned()),
+        })))
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .expect("deferred branch output")
+            .stdout(),
+        b"nested\n"
+    );
+}
+
+#[tokio::test]
+async fn internal_canonical_execution_rejects_malformed_shapes() {
+    let handler = RequestHandler::new();
+    let response = handler
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![
+                INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned(),
+                "-".to_owned(),
+            ],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("display-message -p no".to_owned()),
+        })))
+        .await;
+
+    let Response::Error(error) = response else {
+        panic!("malformed internal canonical request should fail: {response:?}");
+    };
+    assert!(error
+        .error
+        .to_string()
+        .contains("invalid internal source-file request path"));
+}
+
+#[tokio::test]
 async fn runtime_command_alias_option_drives_hook_registration_parser() {
     let handler = RequestHandler::new();
     set_command_alias(&handler, "sbuf=set-buffer -b aliased").await;

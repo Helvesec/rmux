@@ -1,14 +1,27 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use rmux_client::Connection;
-use rmux_core::command_inventory::has_tmux_command_candidate;
+use rmux_client::{connect, resolve_socket_path, resolve_tmux_compatible_socket_path, Connection};
+use rmux_core::{
+    command_inventory::{has_tmux_command_candidate, RMUX_EXTENSION_COMMANDS},
+    command_parser::CommandParser,
+};
 use rmux_proto::OptionScopeSelector;
 
+use crate::cli_args::{scan_top_level_command, RuntimeCommandGroup};
 use crate::cli_response::expect_command_output;
+use crate::command_alias_snapshot::{decode_command_alias_definitions, definition_matches_name};
+use crate::runtime_command_expansion::{
+    expand_runtime_command_segment, RuntimeCommandExpansionError,
+};
 
 use super::command_runner::run_queued_server_command_with_connection;
 use super::ExitFailure;
+
+pub(super) enum RuntimeCommandResolution {
+    Canonical(Vec<RuntimeCommandGroup>),
+    LegacyAliases(Vec<String>),
+}
 
 pub(super) fn run_unknown_command_through_server_aliases(
     args: &[OsString],
@@ -42,27 +55,154 @@ fn server_has_command_alias(
     connection: &mut Connection,
     command_name: &str,
 ) -> Result<bool, ExitFailure> {
+    Ok(server_command_alias_definitions(connection)?
+        .iter()
+        .any(|definition| definition_matches_name(definition, command_name)))
+}
+
+fn server_command_alias_definitions(
+    connection: &mut Connection,
+) -> Result<Vec<String>, ExitFailure> {
     let response = connection
         .show_options(
             OptionScopeSelector::ServerGlobal,
             Some("command-alias".to_owned()),
-            true,
+            false,
             false,
             true,
         )
         .map_err(ExitFailure::from_client)?;
     let output = expect_command_output(&response, "show-options")?;
-    let definitions = std::str::from_utf8(output.stdout())
-        .map_err(|_| ExitFailure::new(1, "invalid UTF-8 in command-alias options".to_owned()))?;
-    Ok(command_alias_output_contains(definitions, command_name))
+    decode_command_alias_definitions(output.stdout())
+        .map_err(|error| ExitFailure::new(1, error.to_string()))
 }
 
-fn command_alias_output_contains(definitions: &str, command_name: &str) -> bool {
-    definitions.lines().any(|definition| {
-        definition
-            .split_once('=')
-            .is_some_and(|(name, _)| name == command_name)
-    })
+pub(super) fn runtime_command_resolution_for_invocation(
+    args: &[OsString],
+    invoked_as_tmux: bool,
+) -> Result<Option<RuntimeCommandResolution>, ExitFailure> {
+    let Ok(scan) = scan_top_level_command(args.get(1..).unwrap_or(&[])) else {
+        return Ok(None);
+    };
+    if scan.no_fork || scan.shell_command.is_some() || scan.command.is_empty() {
+        return Ok(None);
+    }
+    let Some(arguments) = args_to_strings(&scan.command) else {
+        return Ok(None);
+    };
+    if arguments.is_empty() {
+        return Ok(None);
+    }
+    let Some(groups) = split_literal_command_groups(&scan.command) else {
+        return Ok(None);
+    };
+    let legacy_kill_fallback = queue_starts_with_kill_server(&groups);
+
+    let socket_path = if invoked_as_tmux {
+        resolve_tmux_compatible_socket_path(
+            scan.socket_name.as_deref(),
+            scan.socket_path.as_deref().map(Path::new),
+        )
+    } else {
+        resolve_socket_path(
+            scan.socket_name.as_deref(),
+            scan.socket_path.as_deref().map(Path::new),
+        )
+    };
+    let Some(socket_path) = socket_path.ok() else {
+        return Ok(None);
+    };
+    let mut connection = match connect(&socket_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let failure = ExitFailure::from_client_connect(&socket_path, error);
+            if failure.is_server_absent() {
+                return Ok(None);
+            }
+            return Err(failure.with_socket_context(&socket_path));
+        }
+    };
+
+    let canonical = match expand_runtime_command_segment(&mut connection, &arguments) {
+        Ok(Some(canonical)) => canonical,
+        Ok(None) if scan.control_mode != 0 => return Ok(None),
+        Ok(None) => {
+            let aliases = server_command_alias_definitions(&mut connection)
+                .map_err(|error| error.with_socket_context(&socket_path))?;
+            return Ok(Some(RuntimeCommandResolution::LegacyAliases(aliases)));
+        }
+        Err(error) if legacy_kill_fallback && error.previous_wire_version().is_some() => {
+            return Ok(None);
+        }
+        Err(error) => {
+            let failure = match error {
+                RuntimeCommandExpansionError::Client(error) => ExitFailure::from_client(error),
+                RuntimeCommandExpansionError::Server(error) => {
+                    ExitFailure::from_client(rmux_client::ClientError::Protocol(error))
+                }
+                RuntimeCommandExpansionError::Protocol(message) => ExitFailure::new(1, message),
+            };
+            let failure = if scan.control_mode == 0 || failure.is_unsupported_wire_version() {
+                failure
+            } else {
+                super::control_mode_error::exit_failure_for_count(
+                    failure.exit_code(),
+                    failure.message(),
+                    scan.control_mode,
+                )
+            };
+            return Err(failure.with_socket_context(&socket_path));
+        }
+    };
+
+    Ok(Some(RuntimeCommandResolution::Canonical(vec![
+        RuntimeCommandGroup::Canonical(canonical),
+    ])))
+}
+
+/// Mirrors `CommandParser::parse_arguments`: argv is already tokenized, and
+/// only an unescaped trailing semicolon terminates a command group.
+fn split_literal_command_groups(arguments: &[OsString]) -> Option<Vec<Vec<String>>> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+
+    for argument in arguments {
+        let mut value = argument.to_str()?.to_owned();
+        let mut ends_command = false;
+        if value.ends_with(';') {
+            value.pop();
+            if value.ends_with('\\') {
+                value.pop();
+                value.push(';');
+            } else {
+                ends_command = true;
+            }
+        }
+
+        if !ends_command || !value.is_empty() {
+            current.push(value);
+        }
+        if ends_command && !current.is_empty() {
+            groups.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    Some(groups)
+}
+
+fn queue_starts_with_kill_server(groups: &[Vec<String>]) -> bool {
+    let Some(group) = groups.first() else {
+        return false;
+    };
+    let parser = CommandParser::new()
+        .with_command_aliases(std::iter::empty::<String>())
+        .with_exact_commands(RMUX_EXTENSION_COMMANDS);
+    let Ok(parsed) = parser.parse_arguments(group) else {
+        return false;
+    };
+    matches!(parsed.commands(), [command] if command.name() == "kill-server" && command.arguments().is_empty())
 }
 
 fn normalize_alias_fallback_error(error: ExitFailure) -> ExitFailure {
@@ -103,11 +243,9 @@ fn command_arguments(args: &[OsString]) -> Option<Vec<String>> {
 }
 
 fn args_to_strings(args: &[OsString]) -> Option<Vec<String>> {
-    args.iter().map(os_string_to_string).collect()
-}
-
-fn os_string_to_string(value: &OsString) -> Option<String> {
-    value.to_str().map(str::to_owned)
+    args.iter()
+        .map(|value| value.to_str().map(str::to_owned))
+        .collect()
 }
 
 fn tmux_quote_argument(argument: &str) -> String {
@@ -138,8 +276,9 @@ fn tmux_quote_value(argument: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::ffi::OsStr;
+
+    use super::*;
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsStr::new).map(OsString::from).collect()
@@ -158,31 +297,52 @@ mod tests {
     }
 
     #[test]
+    fn argv_groups_preserve_escaped_semicolon_literals() {
+        assert_eq!(
+            split_literal_command_groups(&args(&[
+                "display-message",
+                "literal\\;",
+                ";",
+                "list-sessions;",
+            ])),
+            Some(vec![
+                vec!["display-message".to_owned(), "literal;".to_owned()],
+                vec!["list-sessions".to_owned()],
+            ])
+        );
+    }
+
+    #[test]
     fn tmux_quote_preserves_command_separators_and_quotes_values() {
         assert_eq!(tmux_quote_argument(""), "''");
         assert_eq!(tmux_quote_argument(";"), ";");
         assert_eq!(tmux_quote_argument("xyz;"), "xyz;");
         assert_eq!(tmux_quote_argument("hello world;"), "'hello world';");
         assert_eq!(tmux_quote_argument("xyz\\;"), "'xyz;'");
-        assert_eq!(tmux_quote_argument("display-message"), "display-message");
-        assert_eq!(tmux_quote_argument("hello world"), "'hello world'");
         assert_eq!(tmux_quote_argument("semi;colon"), "'semi;colon'");
         assert_eq!(tmux_quote_argument("it's"), "'it'\\''s'");
     }
 
     #[test]
-    fn alias_output_lookup_requires_an_exact_alias_name() {
-        let definitions = "say=display-message -p\nstatus=show-messages -JT\n";
-        assert!(command_alias_output_contains(definitions, "say"));
-        assert!(!command_alias_output_contains(definitions, "sa"));
-        assert!(!command_alias_output_contains(definitions, "FOO=bar"));
-    }
-
-    #[test]
-    fn builtin_candidate_lookup_preserves_parser_diagnostics() {
-        assert!(has_tmux_command_candidate("list"));
-        assert!(has_tmux_command_candidate("send-keys"));
-        assert!(!has_tmux_command_candidate("FOO=bar"));
+    fn legacy_fallback_accepts_canonical_and_unambiguous_kill_server_prefixes() {
+        assert!(queue_starts_with_kill_server(&[vec![
+            "kill-server".to_owned(),
+        ]]));
+        assert!(queue_starts_with_kill_server(&[vec![
+            "kill-serv".to_owned(),
+        ]]));
+        assert!(queue_starts_with_kill_server(&[
+            vec!["kill-server".to_owned()],
+            vec!["new-session".to_owned()],
+        ]));
+        assert!(!queue_starts_with_kill_server(&[vec![
+            "kill-server".to_owned(),
+            "unexpected".to_owned(),
+        ]]));
+        assert!(!queue_starts_with_kill_server(&[
+            vec!["display-message".to_owned()],
+            vec!["kill-server".to_owned()],
+        ]));
     }
 
     #[test]

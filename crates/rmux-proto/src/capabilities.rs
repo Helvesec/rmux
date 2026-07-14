@@ -56,6 +56,8 @@ pub const CAPABILITY_TARGET_CLIENT_COMMANDS: &str = "commands.target_client";
 pub const CAPABILITY_CLI_TARGET_ACTIONS: &str = "commands.cli_target_actions";
 /// Stable feature id for `capture-pane` with daemon-side target resolution.
 pub const CAPABILITY_CLI_CAPTURE_TARGET_ACTION: &str = "commands.cli_capture_target_action";
+/// Stable feature id for non-executing server-side CLI alias canonicalization.
+pub const CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION: &str = "commands.cli_runtime_command_expansion";
 /// Stable feature id for browser-visible pane sharing.
 ///
 /// This optional capability is advertised by daemons compiled with their web
@@ -89,6 +91,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_TARGET_CLIENT_COMMANDS,
     CAPABILITY_CLI_TARGET_ACTIONS,
     CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
+    CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION,
 ];
 
 /// Client-to-server version and capability negotiation request.

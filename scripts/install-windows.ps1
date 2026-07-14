@@ -72,6 +72,105 @@ function Copy-Tree([string]$Source, [string]$Destination) {
     }
 }
 
+function Assert-BinaryReplaceable([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "destination binary path exists but is not a file: $Path"
+    }
+
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+    } catch {
+        throw "destination binary is in use or cannot be replaced safely: $Path"
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Install-BinarySet([object[]]$Plan, [bool]$Verify) {
+    # Refuse the whole upgrade before its first mutation if any installed
+    # executable is already locked (most commonly a running rmux daemon).
+    foreach ($entry in $Plan) {
+        Assert-BinaryReplaceable $entry.Destination
+    }
+
+    $transactionRoot = Join-Path ([System.IO.Path]::GetTempPath()) `
+        ("rmux-install-backup-" + [System.Guid]::NewGuid().ToString("N"))
+    $backups = @()
+    New-Item -ItemType Directory -Path $transactionRoot | Out-Null
+
+    try {
+        for ($index = 0; $index -lt $Plan.Count; $index++) {
+            $entry = $Plan[$index]
+            $destinationDirectory = Split-Path -Parent $entry.Destination
+            New-Item -ItemType Directory -Force -Path $destinationDirectory | Out-Null
+
+            $existed = Test-Path -LiteralPath $entry.Destination -PathType Leaf
+            $backup = Join-Path $transactionRoot ("binary-$index.exe")
+            if ($existed) {
+                Copy-Item -LiteralPath $entry.Destination -Destination $backup
+            }
+            $backups += [pscustomobject]@{
+                Destination = $entry.Destination
+                Backup = $backup
+                Existed = $existed
+            }
+        }
+
+        # Close the small check-to-copy window created while taking backups.
+        foreach ($entry in $Plan) {
+            Assert-BinaryReplaceable $entry.Destination
+        }
+
+        foreach ($entry in $Plan) {
+            Copy-Item -Force -LiteralPath $entry.Source -Destination $entry.Destination
+        }
+        if ($Verify) {
+            Verify-InstalledLayout $Plan[$Plan.Count - 1].Destination
+        }
+    } catch {
+        $installError = $_.Exception.Message
+        $rollbackErrors = @()
+        for ($index = $backups.Count - 1; $index -ge 0; $index--) {
+            $record = $backups[$index]
+            try {
+                if ($record.Existed) {
+                    Copy-Item -Force -LiteralPath $record.Backup -Destination $record.Destination
+                    if ((Sha256File $record.Backup) -ne (Sha256File $record.Destination)) {
+                        throw "restored binary does not match its backup: $($record.Destination)"
+                    }
+                } else {
+                    if (Test-Path -LiteralPath $record.Destination) {
+                        Remove-Item -Force -LiteralPath $record.Destination -ErrorAction Stop
+                    }
+                    if (Test-Path -LiteralPath $record.Destination) {
+                        throw "new binary remained after rollback: $($record.Destination)"
+                    }
+                }
+            } catch {
+                $rollbackErrors += $_.Exception.Message
+            }
+        }
+
+        if ($rollbackErrors.Count -gt 0) {
+            throw "binary install failed: $installError; rollback also failed: $($rollbackErrors -join '; ')"
+        }
+        throw "binary install failed; previous binaries restored: $installError"
+    } finally {
+        Remove-Item -Recurse -Force -LiteralPath $transactionRoot -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-PackageRoot([string]$Root) {
     foreach ($required in @("rmux.exe", "libexec\rmux\rmux.exe", "rmux-daemon.exe")) {
         if (-not (Test-Path -LiteralPath (Join-Path $Root $required) -PathType Leaf)) {
@@ -129,24 +228,29 @@ function Install-PackageRoot([string]$PackageRoot, [string]$DestinationBin, [boo
         }
     }
 
-    New-Item -ItemType Directory -Force -Path $installBin | Out-Null
-    New-Item -ItemType Directory -Force -Path (Join-Path $installRoot "libexec\rmux") | Out-Null
+    $binaryPlan = @(
+        [pscustomobject]@{
+            Source = Join-Path $PackageRoot "libexec\rmux\rmux.exe"
+            Destination = Join-Path $installRoot "libexec\rmux\rmux.exe"
+        },
+        [pscustomobject]@{
+            Source = Join-Path $PackageRoot "rmux-daemon.exe"
+            Destination = Join-Path $installBin "rmux-daemon.exe"
+        },
+        [pscustomobject]@{
+            Source = Join-Path $PackageRoot "rmux.exe"
+            Destination = Join-Path $installBin "rmux.exe"
+        }
+    )
 
-    # Install private targets first so upgrades never expose a dispatcher that
-    # cannot reach its matching full helper.
-    Copy-Item `
-        -Force `
-        -LiteralPath (Join-Path $PackageRoot "libexec\rmux\rmux.exe") `
-        -Destination (Join-Path $installRoot "libexec\rmux\rmux.exe")
-    # rmux-daemon.exe must sit next to the installed rmux.exe: the hidden-daemon
-    # resolver (rmux-client auto_start) only looks for it as a sibling of the
-    # running binary, matching the Unix installer's bin/rmux-daemon placement.
-    # Installing it in the parent left the shipped daemon unreachable, so every
-    # server fell back to re-exec'ing the tiny bin\rmux.exe as a blocked shim.
-    Copy-Item `
-        -Force `
-        -LiteralPath (Join-Path $PackageRoot "rmux-daemon.exe") `
-        -Destination (Join-Path $installBin "rmux-daemon.exe")
+    try {
+        Install-BinarySet $binaryPlan $Verify
+    } catch {
+        Fail $_.Exception.Message
+    }
+
+    # Non-executable assets are installed only after the versioned binary set
+    # has committed successfully, so a locked daemon cannot leave mixed assets.
     Copy-Tree (Join-Path $PackageRoot "share") (Join-Path $installRoot "share")
 
     foreach ($optional in @("README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1", "SHA256SUMS.txt")) {
@@ -157,14 +261,6 @@ function Install-PackageRoot([string]$PackageRoot, [string]$DestinationBin, [boo
     }
 
     $destination = Join-Path $installBin "rmux.exe"
-    Copy-Item `
-        -Force `
-        -LiteralPath (Join-Path $PackageRoot "rmux.exe") `
-        -Destination $destination
-
-    if ($Verify) {
-        Verify-InstalledLayout $destination
-    }
 
     Write-Host "Installed rmux to $destination"
 

@@ -445,6 +445,7 @@ fn queue_compact_bare_flags(command_name: &str) -> Option<&'static str> {
         "show-hooks" => Some("gpw"),
         "split-window" => Some("bdfhIPvZP"),
         "swap-pane" => Some("dDUZ"),
+        "swap-window" => Some("d"),
         _ => None,
     }
 }
@@ -982,6 +983,47 @@ mod tests {
         .expect("send-keys mouse target resolves");
 
         assert_eq!(resolved, ["-X", "-t", "alpha:0.0", "select-word"]);
+    }
+
+    #[test]
+    fn queue_resolves_compact_swap_window_source_and_target_values() {
+        let mut sessions = session_store_with_alpha_beta();
+        let (window_index, _) = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created");
+        sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .rename_window(window_index, "one".to_owned())
+            .expect("second alpha window can be named");
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        for (arguments, expected) in [
+            (
+                vec!["-ds", "one", "-t", "alpha:0"],
+                vec!["-d", "-s", "alpha:1", "-t", "alpha:0"],
+            ),
+            (
+                vec!["-dt", "+1", "-s", "alpha:0"],
+                vec!["-d", "-t", "alpha:1", "-s", "alpha:0"],
+            ),
+        ] {
+            let resolved = resolve_queue_target_arguments(
+                "swap-window",
+                arguments.into_iter().map(str::to_owned).collect(),
+                &sessions,
+                &context,
+            )
+            .expect("compact swap-window targets resolve");
+
+            assert_eq!(resolved, expected);
+        }
     }
 
     #[test]

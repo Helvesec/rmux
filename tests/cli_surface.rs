@@ -5,7 +5,7 @@ mod common;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -22,8 +22,9 @@ use common::{
 use rmux_client::INTERNAL_DAEMON_FLAG;
 use rmux_core::command_parser::COMMAND_TABLE;
 use rmux_proto::{
-    encode_frame, ErrorResponse, FrameDecoder, Request, Response, RmuxError, CONTROL_CONTROL_END,
-    CONTROL_CONTROL_START, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
+    encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse,
+    ListSessionsResponse, OptionScopeSelector, Request, Response, RmuxError, ShowOptionsResponse,
+    CONTROL_CONTROL_END, CONTROL_CONTROL_START, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
 };
 use rmux_pty::TerminalSize;
 
@@ -123,43 +124,42 @@ fn write_legacy_incompatible_wire_response(
 }
 
 fn spawn_wire_v3_kill_server(socket_path: &Path) -> io::Result<JoinHandle<io::Result<()>>> {
+    spawn_wire_v3_kill_server_after_parse_probes(socket_path, 1)
+}
+
+fn spawn_wire_v3_kill_server_after_parse_probes(
+    socket_path: &Path,
+    capability_probe_count: usize,
+) -> io::Result<JoinHandle<io::Result<()>>> {
     if let Some(parent) = socket_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept()?;
-        let mut decoder = FrameDecoder::new();
-        let mut buffer = [0_u8; 1024];
-        loop {
-            match decoder.next_frame::<Request>() {
-                Ok(Some(Request::KillServer(_))) => break,
-                Ok(Some(request)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("expected kill-server request, got {request:?}"),
-                    ));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, error));
-                }
-            }
-
-            let bytes_read = stream.read(&mut buffer)?;
-            if bytes_read == 0 {
+        for _ in 0..capability_probe_count {
+            let (mut stream, request) = accept_current_wire_request(&listener)?;
+            if !matches!(request, Request::Handshake(_)) {
                 return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "client closed before sending first kill-server request",
+                    io::ErrorKind::InvalidData,
+                    format!("expected capability handshake, got {request:?}"),
                 ));
             }
-            decoder.push_bytes(&buffer[..bytes_read]);
+            write_legacy_incompatible_wire_response(&mut stream, 3)?;
+        }
+
+        let (mut stream, request) = accept_current_wire_request(&listener)?;
+        if !matches!(request, Request::KillServer(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected kill-server request, got {request:?}"),
+            ));
         }
         write_legacy_incompatible_wire_response(&mut stream, 3)?;
         drop(stream);
 
         let (mut stream, _) = listener.accept()?;
+        let mut buffer = [0_u8; 1024];
         let bytes_read = stream.read(&mut buffer)?;
         if bytes_read < 10 {
             return Err(io::Error::new(
@@ -193,10 +193,150 @@ fn spawn_wire_v3_kill_server(socket_path: &Path) -> io::Result<JoinHandle<io::Re
     Ok(handle)
 }
 
+fn accept_current_wire_request(listener: &UnixListener) -> io::Result<(UnixStream, Request)> {
+    let (mut stream, _) = listener.accept()?;
+    let request = read_current_wire_request(&mut stream)?;
+    Ok((stream, request))
+}
+
+fn read_current_wire_request(stream: &mut UnixStream) -> io::Result<Request> {
+    let mut decoder = FrameDecoder::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match decoder.next_frame::<Request>() {
+            Ok(Some(request)) => return Ok(request),
+            Ok(None) => {}
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        }
+
+        let bytes_read = stream.read(&mut buffer)?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client closed before sending a complete request",
+            ));
+        }
+        decoder.push_bytes(&buffer[..bytes_read]);
+    }
+}
+
+fn serve_same_wire_handshake_and_alias_snapshot(
+    listener: &UnixListener,
+    alias_snapshot: impl Into<Vec<u8>>,
+) -> io::Result<()> {
+    let (mut stream, request) = accept_current_wire_request(listener)?;
+    if !matches!(request, Request::Handshake(_)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected capability handshake, got {request:?}"),
+        ));
+    }
+    stream.write_all(
+        &encode_frame(&Response::Handshake(HandshakeResponse {
+            wire_version: RMUX_WIRE_VERSION,
+            capabilities: vec!["protocol.capabilities".to_owned()],
+        }))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    )?;
+
+    let request = read_current_wire_request(&mut stream)?;
+    if !matches!(request, Request::ShowOptions(_)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected legacy command-alias snapshot, got {request:?}"),
+        ));
+    }
+    stream.write_all(
+        &encode_frame(&Response::ShowOptions(ShowOptionsResponse {
+            scope: OptionScopeSelector::ServerGlobal,
+            output: CommandOutput::from_stdout(alias_snapshot),
+        }))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    )
+}
+
 fn spawn_alias_fallback_incompatible_wire_server(
     socket_path: &Path,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
     spawn_incompatible_wire_server(socket_path)
+}
+
+fn spawn_same_wire_server_without_runtime_expansion(
+    socket_path: &Path,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    if let Some(parent) = socket_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    Ok(thread::spawn(move || {
+        serve_same_wire_handshake_and_alias_snapshot(&listener, Vec::new())?;
+
+        let (mut command_stream, request) = accept_current_wire_request(&listener)?;
+        if !matches!(request, Request::ListSessions(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected direct list-sessions request, got {request:?}"),
+            ));
+        }
+        command_stream.write_all(
+            &encode_frame(&Response::ListSessions(ListSessionsResponse {
+                output: CommandOutput::from_stdout("legacy-compatible\n"),
+            }))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )?;
+        Ok(())
+    }))
+}
+
+fn spawn_same_wire_server_without_runtime_expansion_or_alias(
+    socket_path: &Path,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    if let Some(parent) = socket_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    Ok(thread::spawn(move || {
+        serve_same_wire_handshake_and_alias_snapshot(&listener, Vec::new())
+    }))
+}
+
+fn spawn_same_wire_server_with_canonical_alias(
+    socket_path: &Path,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    if let Some(parent) = socket_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    Ok(thread::spawn(move || {
+        serve_same_wire_handshake_and_alias_snapshot(
+            &listener,
+            b"command-alias[20] \"list-sessions=list-sessions -F alias-marker\"\n".to_vec(),
+        )?;
+
+        let (mut command_stream, request) = accept_current_wire_request(&listener)?;
+        let Request::ListSessions(request) = request else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected aliased list-sessions request, got {request:?}"),
+            ));
+        };
+        if request.format.as_deref() != Some("alias-marker") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("canonical alias was not applied: {request:?}"),
+            ));
+        }
+        command_stream.write_all(
+            &encode_frame(&Response::ListSessions(ListSessionsResponse {
+                output: CommandOutput::from_stdout("legacy-alias\n"),
+            }))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )?;
+        Ok(())
+    }))
 }
 
 #[test]
@@ -243,6 +383,55 @@ fn incompatible_wire_error_uses_simple_default_kill_server_command() -> Result<(
     server
         .join()
         .expect("fake incompatible server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_keeps_direct_cli_compatible(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-before-runtime-expansion")?;
+    let server = spawn_same_wire_server_without_runtime_expansion(harness.socket_path())?;
+
+    let output = harness.run(&["list-sessions"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "legacy-compatible\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_keeps_canonical_alias_override(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-canonical-alias")?;
+    let server = spawn_same_wire_server_with_canonical_alias(harness.socket_path())?;
+
+    let output = harness.run(&["list-sessions"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "legacy-alias\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_rejects_source_syntax() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("same-wire-source-syntax")?;
+    let server = spawn_same_wire_server_without_runtime_expansion_or_alias(harness.socket_path())?;
+
+    let output = harness.run(&["FOO=bar", "display-message", "-p", "hi"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert!(
+        stderr(&output).contains("unknown command: FOO=bar"),
+        "unexpected stderr: {:?}",
+        stderr(&output)
+    );
+    server.join().expect("fake same-wire server should exit")?;
     Ok(())
 }
 
@@ -1050,6 +1239,29 @@ fn kill_server_falls_back_to_wire_v3_shutdown_for_0_8_daemon() -> Result<(), Box
 
     assert_success(&output);
     server.join().expect("fake wire-v3 server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn queued_kill_server_tolerates_parse_probe_against_wire_v3_daemon() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("queued-kill-server-wire-v3-fallback")?;
+    let server = spawn_wire_v3_kill_server_after_parse_probes(harness.socket_path(), 1)?;
+
+    let output = harness.run(&[
+        "kill-server",
+        ";",
+        "new-session",
+        "-d",
+        "-s",
+        "must-not-start",
+    ])?;
+
+    assert_success(&output);
+    server.join().expect("fake wire-v3 server should exit")?;
+    assert!(!harness
+        .run(&["has-session", "-t", "must-not-start"])?
+        .status
+        .success());
     Ok(())
 }
 

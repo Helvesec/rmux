@@ -20,7 +20,6 @@ use crate::ProcessId;
 
 static CONSOLE_ATTACH_LOCK: Mutex<()> = Mutex::new(());
 const LEFT_CTRL_PRESSED: u32 = 0x0008;
-const PROCESSED_CTRL_C_INTERRUPT_ATTEMPTS: usize = 3;
 
 /// A Windows console keyboard event that can be injected into a ConPTY child.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -227,12 +226,10 @@ pub fn write_windows_console_key_then_interrupt_if_processed(
     trace_windows_key_injection(process_id, key);
     write_windows_console_key_to_handle(handle.as_raw_handle() as HANDLE, key)?;
     if mode & ENABLE_PROCESSED_INPUT != 0 {
-        // ConPTY foreground handoff can lag the first visible prompt/program
-        // output. A few short events match repeated terminal Ctrl-C well
-        // enough to close that race without breaking raw-mode Ctrl-C delivery.
-        for _ in 0..PROCESSED_CTRL_C_INTERRUPT_ATTEMPTS {
-            send_windows_console_interrupt_attached(process_id)?;
-        }
+        // One physical Ctrl-C must produce one console interrupt. Retrying the
+        // event here is observable by handlers that intentionally survive the
+        // first interrupt and can turn a single keystroke into a forced exit.
+        send_windows_console_interrupt_attached(process_id)?;
     }
     Ok(())
 }

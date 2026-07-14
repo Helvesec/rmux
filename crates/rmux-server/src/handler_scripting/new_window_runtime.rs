@@ -134,6 +134,8 @@ impl RequestHandler {
                             socket_path: &socket_path,
                             spawn_environment: spawn_environment.as_ref(),
                             environment_overrides: environment.as_deref(),
+                            respawn_shell: None,
+                            respawn_environment: None,
                             pane_alert_callback: Some(self.pane_alert_callback()),
                             pane_exit_callback: Some(self.pane_exit_callback()),
                         },

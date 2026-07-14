@@ -145,6 +145,7 @@ impl HandlerState {
         let runtime_window_name = profile.runtime_window_name(command);
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
+        let respawn_shell = profile.shell().to_path_buf();
         let mut terminal = match open_pane_terminal(
             new_pane_geometry,
             profile,
@@ -245,9 +246,11 @@ impl HandlerState {
             session_id,
             window_id,
             pane_id: new_pane_id,
-            command: command.map(ProcessCommand::display_command),
+            process_command: command.cloned(),
             working_directory: Some(lifecycle_cwd),
+            respawn_shell,
             private_environment: environment_overrides.map(<[String]>::to_vec),
+            respawn_environment: None,
             dimensions: terminal_size_from_geometry(new_pane_geometry),
             pid: Some(pid),
         });

@@ -2,7 +2,10 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use rmux_client::connect;
-use rmux_proto::{ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response};
+use rmux_proto::{
+    ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response,
+    INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
+};
 
 use super::attach_transport::{
     queued_attach_session_is_active, QueuedAttachSession, QueuedAttachSessionResult,
@@ -107,7 +110,11 @@ fn dispatch_commands(
     client_terminal: ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
     let mut exit_code = 0;
-    let queued_commands = commands.len() > 1;
+    let queued_commands = commands
+        .iter()
+        .filter(|command| !matches!(command, Command::ApplyParseTimeAssignments(_)))
+        .count()
+        > 1;
     let mut queued_attach_session = None::<QueuedAttachSession>;
     for (index, command) in commands.iter().cloned().enumerate() {
         let command_is_detach_client = matches!(&command, Command::DetachClient(_));
@@ -176,6 +183,7 @@ fn command_allows_detached_connection_reuse(candidate: &Command) -> bool {
     match candidate {
         Command::SendKeys(args) if args.has_wait() => false,
         Command::Noop => true,
+        Command::ApplyParseTimeAssignments(_) => false,
         Command::NewSession(_)
         | Command::StartServer(_)
         | Command::KillServer
@@ -289,13 +297,21 @@ fn dispatch(
     queue_attach_detach: bool,
     queued_attach_session: &mut Option<QueuedAttachSession>,
 ) -> Result<i32, ExitFailure> {
+    let start_server_args = match &command {
+        Command::StartServer(args) => Some(args),
+        _ => None,
+    };
     let command_startup = startup.for_command(
         command_has_start_server_flag(&command),
         command_requires_web_daemon(&command),
+        start_server_args,
     );
 
     match command {
         Command::Noop => run_noop(socket_path),
+        Command::ApplyParseTimeAssignments(assignments) => {
+            run_apply_parse_time_assignments(socket_path, assignments)
+        }
         Command::NewSession(args) => {
             run_new_session(args, socket_path, command_startup, client_terminal)
         }
@@ -787,6 +803,26 @@ fn run_noop(socket_path: &Path) -> Result<i32, ExitFailure> {
     Ok(0)
 }
 
+fn run_apply_parse_time_assignments(
+    socket_path: &Path,
+    assignments: String,
+) -> Result<i32, ExitFailure> {
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let response = connection
+        .source_file(
+            vec![INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
+            false,
+            false,
+            false,
+            false,
+            None,
+            Some(assignments),
+        )
+        .map_err(ExitFailure::from_client)?;
+    finish_command_success(response, "source-file")
+}
+
 fn looks_like_custom_layout(layout: &str) -> bool {
     layout.contains(',')
 }
@@ -797,7 +833,7 @@ fn invalid_layout_failure(layout: &str) -> ExitFailure {
 
 pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
     match command {
-        Command::Noop => false,
+        Command::Noop | Command::ApplyParseTimeAssignments(_) => false,
         Command::NewSession(_) | Command::StartServer(_) | Command::AttachSession(_) => true,
         Command::WebShare(args) => web_share_creates_share(args),
         _ => false,

@@ -7,7 +7,7 @@ use rmux_proto::{
     SwapWindowRequest, Target, UnlinkWindowRequest, WindowTarget,
 };
 
-use super::super::tokens::CommandTokens;
+use super::super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::super::values::unsupported_flag;
 use super::super::{
     implicit_session_name, implicit_window_target, marked_pane_target, parse_move_window_target,
@@ -510,7 +510,32 @@ pub(in crate::handler::scripting_support) fn parse_swap_window(
                     args.required("-t target")?,
                 )?);
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "d", "st") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('d') => detached = true,
+                        compact_flag @ CompactFlag::Value { flag: 's', .. } => {
+                            source = Some(parse_window_target(
+                                "swap-window",
+                                compact_flag.value_or_next(&mut args, "-s target")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_window_target(
+                                "swap-window",
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        CompactFlag::Bare(flag) | CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("swap-window", &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
         }
     }
     args.no_extra("swap-window")?;

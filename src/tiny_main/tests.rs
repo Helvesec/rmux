@@ -59,6 +59,33 @@ fn explicit_socket_path() -> String {
 }
 
 #[test]
+fn tiny_runtime_alias_probe_uses_the_original_command_arguments() {
+    assert_eq!(
+        tiny_invoked_command_arguments(&os_args(&["rmux", "list-sessions"])),
+        Some(vec!["list-sessions".to_owned()])
+    );
+    assert_eq!(
+        tiny_invoked_command_arguments(&os_args(&["rmux", "-L", "demo", "ls"])),
+        Some(vec!["ls".to_owned()])
+    );
+    assert_eq!(
+        tiny_invoked_command_arguments(&os_args(&[
+            "rmux",
+            "-S",
+            "/tmp/demo.sock",
+            "display-message",
+            "-p",
+            "$HOME",
+        ])),
+        Some(vec![
+            "display-message".to_owned(),
+            "-p".to_owned(),
+            "$HOME".to_owned(),
+        ])
+    );
+}
+
+#[test]
 fn long_version_stays_on_full_helper_path_for_tmux_compatibility() {
     assert_tiny_fallback(&["rmux", "--version"]);
 }

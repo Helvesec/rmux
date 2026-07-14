@@ -24,6 +24,47 @@ pub(super) fn parse_command_queue(arguments: &[OsString]) -> Result<ParsedComman
         .map_err(command_parse_error_to_clap)
 }
 
+pub(super) fn parse_command_queue_with_aliases(
+    arguments: &[OsString],
+    command_aliases: &[String],
+) -> Result<ParsedCommands, clap::Error> {
+    if arguments.is_empty() {
+        return Ok(ParsedCommands::default());
+    }
+
+    let arguments = arguments
+        .iter()
+        .map(|argument| command_argument_to_string(argument))
+        .collect::<Result<Vec<_>, _>>()?;
+    TmuxCommandParser::new()
+        .with_command_aliases(command_aliases.iter().cloned())
+        .with_exact_commands(super::RMUX_EXTENSION_COMMANDS)
+        .parse_arguments(&arguments)
+        .map_err(command_parse_error_to_clap)
+}
+
+pub(super) fn parse_runtime_command_groups(
+    groups: &[RuntimeCommandGroup],
+) -> Result<ParsedCommands, clap::Error> {
+    let parser = TmuxCommandParser::new()
+        .with_command_aliases(std::iter::empty::<String>())
+        .with_exact_commands(super::RMUX_EXTENSION_COMMANDS);
+    let mut parsed = ParsedCommands::default();
+
+    for group in groups {
+        let RuntimeCommandGroup::Canonical(rendered) = group;
+        if rendered.is_empty() {
+            continue;
+        }
+        let commands = parser
+            .parse_one_group(rendered)
+            .map_err(command_parse_error_to_clap)?;
+        parsed.append(commands);
+    }
+
+    Ok(parsed)
+}
+
 fn expand_cli_argument_aliases(arguments: Vec<String>) -> Vec<String> {
     let mut expanded = Vec::with_capacity(arguments.len() + 2);
     let mut command_start = true;
@@ -113,33 +154,20 @@ fn cli_command_error_message(message: &str) -> &str {
 
 pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, clap::Error> {
     let name = command.name().to_owned();
-    let queue_command = std::iter::once(name.clone())
-        .chain(
-            command
-                .arguments()
-                .iter()
-                .map(CommandArgument::to_tmux_string),
-        )
-        .collect::<Vec<_>>()
-        .join(" ");
+    let error_command_name = name.clone();
+    let queue_command = command.to_tmux_reparse_string();
     let arguments = command_arguments_for_clap(command.arguments());
-    match name.as_str() {
+    let parsed = match name.as_str() {
         "new-session" => parse_command_args("new-session", arguments).map(Command::NewSession),
         "start-server" => parse_command_args("start-server", arguments).map(Command::StartServer),
-        "kill-server" => {
-            parse_no_args("kill-server", arguments)?;
-            Ok(Command::KillServer)
-        }
+        "kill-server" => parse_no_args("kill-server", arguments).map(|()| Command::KillServer),
         "has-session" => parse_command_args("has-session", arguments).map(Command::HasSession),
         "kill-session" => parse_command_args("kill-session", arguments).map(Command::KillSession),
         "rename-session" => {
             parse_command_args("rename-session", arguments).map(Command::RenameSession)
         }
         "server-access" => parse_server_access_args(arguments).map(Command::ServerAccess),
-        "lock-server" => {
-            parse_no_args("lock-server", arguments)?;
-            Ok(Command::LockServer)
-        }
+        "lock-server" => parse_no_args("lock-server", arguments).map(|()| Command::LockServer),
         "lock-session" => parse_command_args("lock-session", arguments).map(Command::LockSession),
         "lock-client" => parse_command_args("lock-client", arguments).map(Command::LockClient),
         "new-window" => parse_command_args("new-window", arguments).map(Command::NewWindow),
@@ -354,7 +382,15 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
             name,
             arguments,
         })),
-    }
+    };
+
+    parsed.map_err(|mut error| {
+        error.insert(
+            clap::error::ContextKind::Custom,
+            clap::error::ContextValue::String(error_command_name),
+        );
+        error
+    })
 }
 
 fn command_arguments_for_clap(arguments: &[CommandArgument]) -> Vec<String> {
@@ -362,7 +398,7 @@ fn command_arguments_for_clap(arguments: &[CommandArgument]) -> Vec<String> {
         .iter()
         .map(|argument| match argument {
             CommandArgument::String(value) => value.clone(),
-            CommandArgument::Commands(_) => argument.to_tmux_string(),
+            CommandArgument::Commands(_) => argument.to_tmux_reparse_string(),
         })
         .collect()
 }

@@ -157,7 +157,7 @@ impl ParsedCommands {
     pub fn to_tmux_binding_string(&self) -> String {
         self.commands
             .iter()
-            .map(ParsedCommand::to_reparse_string)
+            .map(ParsedCommand::to_tmux_reparse_string)
             .collect::<Vec<_>>()
             .join(" \\; ")
     }
@@ -166,21 +166,8 @@ impl ParsedCommands {
     /// parsed again without applying display-only quote escaping twice.
     #[must_use]
     pub fn to_tmux_reparse_string(&self) -> String {
-        let mut rendered = String::new();
+        let mut rendered = self.assignments_to_tmux_reparse_string();
         let mut previous_line = None;
-        for assignment in &self.assignments {
-            if !rendered.is_empty() {
-                rendered.push_str(" ; ");
-            }
-            if assignment.hidden() {
-                rendered.push_str("%hidden ");
-            }
-            rendered.push_str(&escape_argument_for_reparse(&format!(
-                "{}={}",
-                assignment.name(),
-                assignment.value()
-            )));
-        }
         for command in &self.commands {
             if !rendered.is_empty() {
                 if previous_line.is_some_and(|line| line != command.line()) {
@@ -189,10 +176,31 @@ impl ParsedCommands {
                     rendered.push_str(" ; ");
                 }
             }
-            rendered.push_str(&command.to_reparse_string());
+            rendered.push_str(&command.to_tmux_reparse_string());
             previous_line = Some(command.line());
         }
         rendered
+    }
+
+    /// Converts only the parse-time assignments to a lossless command string.
+    #[must_use]
+    pub fn assignments_to_tmux_reparse_string(&self) -> String {
+        self.assignments
+            .iter()
+            .map(|assignment| {
+                let rendered = escape_argument_for_reparse(&format!(
+                    "{}={}",
+                    assignment.name(),
+                    assignment.value()
+                ));
+                if assignment.hidden() {
+                    format!("%hidden {rendered}")
+                } else {
+                    rendered
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ; ")
     }
 }
 
@@ -290,7 +298,10 @@ impl ParsedCommand {
             .join(" ")
     }
 
-    fn to_reparse_string(&self) -> String {
+    /// Converts this command to a lossless string for an internal
+    /// parse-execute bridge.
+    #[must_use]
+    pub fn to_tmux_reparse_string(&self) -> String {
         std::iter::once(self.name.clone())
             .chain(
                 self.arguments
@@ -698,7 +709,6 @@ impl CommandParser {
     fn find_command_alias(&self, name: &str) -> Option<&str> {
         self.command_aliases
             .iter()
-            .rev()
             .find(|alias| alias.name() == name)
             .map(CommandAlias::value)
     }
