@@ -123,27 +123,25 @@ pub(super) fn run_queued_server_command(
     queue_command: String,
 ) -> Result<i32, ExitFailure> {
     let response = with_command_connection(socket_path, |connection| {
-        queued_server_command_response(connection, socket_path, queue_command)
+        queued_server_command_response(connection, queue_command)
     })?;
     finish_queued_server_command(command_name, response)
 }
 
 pub(super) fn run_queued_server_command_with_connection(
     connection: &mut Connection,
-    socket_path: &Path,
+    _socket_path: &Path,
     command_name: &'static str,
     queue_command: String,
 ) -> Result<i32, ExitFailure> {
-    let response = queued_server_command_response(connection, socket_path, queue_command)?;
+    let response = queued_server_command_response(connection, queue_command)?;
     finish_queued_server_command(command_name, response)
 }
 
 fn queued_server_command_response(
     connection: &mut Connection,
-    socket_path: &Path,
     queue_command: String,
 ) -> Result<Response, ExitFailure> {
-    let target = inherited_pane_target(connection, socket_path)?;
     connection
         .source_file(
             vec!["-".to_owned()],
@@ -151,7 +149,7 @@ fn queued_server_command_response(
             false,
             false,
             false,
-            target,
+            None,
             Some(queue_command),
         )
         .map_err(ExitFailure::from_client)
@@ -169,9 +167,15 @@ fn finish_queued_server_command(
             return Err(ExitFailure::new(source.exit_status().unwrap_or(1), message));
         }
     }
+    let source_stdout_may_be_diagnostic = match &response {
+        Response::SourceFile(source) if command_name == "if-shell" => {
+            source.exit_status().is_some_and(|status| status != 0)
+        }
+        _ => true,
+    };
     if let Some(output) = response
         .command_output()
-        .filter(|output| !output.stdout().is_empty())
+        .filter(|output| source_stdout_may_be_diagnostic && !output.stdout().is_empty())
     {
         let rendered = String::from_utf8_lossy(output.stdout());
         if let Some(message) = strip_source_file_stdin_line_prefix(&rendered) {
@@ -183,6 +187,14 @@ fn finish_queued_server_command(
                 message.pop();
             }
             return Err(ExitFailure::new(1, message));
+        }
+    }
+    if let Response::SourceFile(source) = &response {
+        if let Some(exit_status) = source.exit_status().filter(|status| *status != 0) {
+            if let Some(output) = source.command_output() {
+                write_command_output(output)?;
+            }
+            return Ok(exit_status);
         }
     }
     finish_command_success(response, command_name)

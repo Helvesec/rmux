@@ -6,6 +6,52 @@ use rmux_proto::{PaneTarget, RmuxError, SessionId, SessionName};
 use super::RequestHandler;
 use crate::pane_terminals::HandlerState;
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct CopyModeMutationPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static COPY_MODE_MUTATION_PAUSE: std::sync::Mutex<
+    Option<(u32, std::sync::Arc<CopyModeMutationPause>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(in crate::handler) fn install_copy_mode_mutation_pause(
+    attach_pid: u32,
+) -> std::sync::Arc<CopyModeMutationPause> {
+    let pause = std::sync::Arc::new(CopyModeMutationPause::default());
+    *COPY_MODE_MUTATION_PAUSE
+        .lock()
+        .expect("copy-mode mutation pause lock") = Some((attach_pid, pause.clone()));
+    pause
+}
+
+#[cfg(test)]
+pub(super) async fn pause_after_copy_mode_mutation(attach_pid: u32) {
+    let pause = {
+        let mut installed = COPY_MODE_MUTATION_PAUSE
+            .lock()
+            .expect("copy-mode mutation pause lock");
+        let matches_pid = installed
+            .as_ref()
+            .is_some_and(|(paused_pid, _)| *paused_pid == attach_pid);
+        matches_pid.then(|| {
+            installed
+                .take()
+                .expect("matching copy-mode pause remains installed")
+                .1
+        })
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct CopyModeRefreshSessionIdentity {
     session_name: SessionName,

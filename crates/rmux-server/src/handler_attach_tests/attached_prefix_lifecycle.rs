@@ -1011,13 +1011,19 @@ async fn attached_binding_switch_client_rebases_its_command_queue() {
 }
 
 #[tokio::test]
-async fn attached_switch_preserves_explicit_nested_queue_targets() {
-    for entry_path in ["source-file", "if-shell", "run-shell"] {
+async fn attached_switch_rebases_wrappers_but_preserves_suffix_targets() {
+    for entry_path in [
+        "source-file",
+        "if-shell",
+        "run-shell",
+        "run-shell-suffix-target",
+    ] {
         let handler = RequestHandler::new();
         let requester_pid = match entry_path {
             "source-file" => u32::MAX - 90,
             "if-shell" => u32::MAX - 91,
             "run-shell" => u32::MAX - 92,
+            "run-shell-suffix-target" => u32::MAX - 88,
             _ => unreachable!("enumerated entry path"),
         };
         let alpha = session_name(&format!("explicit-{entry_path}-alpha"));
@@ -1035,7 +1041,12 @@ async fn attached_switch_preserves_explicit_nested_queue_targets() {
             Response::NewSession(_)
         ));
 
-        let nested = format!("switch-client -t {beta} ; new-window -d");
+        let suffix_has_explicit_target = entry_path == "run-shell-suffix-target";
+        let nested = if suffix_has_explicit_target {
+            format!("switch-client -t {beta} ; new-window -d -t {alpha}")
+        } else {
+            format!("switch-client -t {beta} ; new-window -d")
+        };
         let command = match entry_path {
             "source-file" => {
                 let source_path = std::env::temp_dir().join(format!(
@@ -1049,7 +1060,7 @@ async fn attached_switch_preserves_explicit_nested_queue_targets() {
                 )
             }
             "if-shell" => format!("if-shell -F -t {alpha}:0.0 1 {{ {nested} }}"),
-            "run-shell" => format!(
+            "run-shell" | "run-shell-suffix-target" => format!(
                 "run-shell -C -t {alpha}:0.0 {}",
                 quote_command_argument(&nested)
             ),
@@ -1068,9 +1079,11 @@ async fn attached_switch_preserves_explicit_nested_queue_targets() {
             handler.execute_parsed_commands_for_test(requester_pid, commands),
         )
         .await
-        .expect("explicit nested queue completes after attached switch");
+        .expect("nested queue completes after attached switch");
 
         let active_attach = handler.active_attach.lock().await;
+        let expected_alpha_windows = if suffix_has_explicit_target { 2 } else { 1 };
+        let expected_beta_windows = if suffix_has_explicit_target { 1 } else { 2 };
         assert_eq!(
             active_attach
                 .by_pid
@@ -1089,8 +1102,8 @@ async fn attached_switch_preserves_explicit_nested_queue_targets() {
                 .expect("explicit target session survives")
                 .windows()
                 .len(),
-            2,
-            "{entry_path} suffix must stay pinned to its explicit target"
+            expected_alpha_windows,
+            "{entry_path} must honor the suffix command's effective target"
         );
         assert_eq!(
             state
@@ -1099,10 +1112,82 @@ async fn attached_switch_preserves_explicit_nested_queue_targets() {
                 .expect("switched session survives")
                 .windows()
                 .len(),
-            1,
-            "{entry_path} suffix must not inherit the attached cursor"
+            expected_beta_windows,
+            "{entry_path} must distinguish wrapper context from a suffix command target"
         );
     }
+}
+
+#[tokio::test]
+async fn attached_run_shell_inherited_target_rebases_after_switch() {
+    let handler = RequestHandler::new();
+    let requester_pid = u32::MAX - 89;
+    let alpha = session_name("inherited-run-shell-alpha");
+    let beta = session_name("inherited-run-shell-beta");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: beta.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let response = handler
+        .handle(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
+            table_name: "prefix".to_owned(),
+            key: "W".to_owned(),
+            note: Some("inherited run-shell target rebase".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "run-shell".to_owned(),
+                "-C".to_owned(),
+                format!("switch-client -t {beta} ; new-window -d"),
+            ]),
+        })))
+        .await;
+    assert!(matches!(response, Response::BindKey(_)), "{response:?}");
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02W")
+        .await
+        .expect("inherited run-shell binding dispatches");
+
+    let active_attach = handler.active_attach.lock().await;
+    assert_eq!(
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached client remains registered")
+            .session_name,
+        beta
+    );
+    drop(active_attach);
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("source session survives")
+            .windows()
+            .len(),
+        1,
+        "an inherited run-shell target must not pin the queue tail to the source session"
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .expect("switched session survives")
+            .windows()
+            .len(),
+        2,
+        "the run-shell queue tail must follow the switched attached cursor"
+    );
 }
 
 #[tokio::test]

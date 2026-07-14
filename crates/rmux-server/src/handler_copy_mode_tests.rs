@@ -15,7 +15,7 @@ use rmux_core::{input::InputParser, Screen};
 use rmux_proto::{
     CapturePaneRequest, CopyModeRequest, ListPanesRequest, NewSessionExtRequest,
     OptionScopeSelector, PaneTarget, Request, Response, SendKeysExtRequest, SetOptionByNameRequest,
-    SetOptionMode, ShowBufferRequest, TerminalSize,
+    SetOptionMode, ShowBufferRequest, SwitchClientRequest, TerminalSize,
 };
 use tokio::time::sleep;
 
@@ -607,6 +607,67 @@ async fn copy_mode_copy_selection_and_cancel_writes_buffer() {
         .await;
     let output = buffer.command_output().expect("show-buffer returns output");
     assert!(String::from_utf8_lossy(output.stdout()).contains("needle"));
+}
+
+#[tokio::test]
+async fn attached_copy_mode_switch_after_mutation_is_not_a_fatal_input_error() {
+    let handler = std::sync::Arc::new(RequestHandler::new());
+    let requester_pid = 71_404;
+    let alpha = create_session(
+        &handler,
+        "copy-switch-alpha",
+        TerminalSize { cols: 40, rows: 4 },
+    )
+    .await;
+    let beta = create_session(
+        &handler,
+        "copy-switch-beta",
+        TerminalSize { cols: 40, rows: 4 },
+    )
+    .await;
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.session_name().clone(), control_tx)
+        .await;
+    assert!(matches!(
+        enter_copy_mode(&handler, &alpha, false).await,
+        Response::CopyMode(_)
+    ));
+
+    let pause = super::super::copy_mode_support::install_copy_mode_mutation_pause(requester_pid);
+    let input_handler = std::sync::Arc::clone(&handler);
+    let input = tokio::spawn(async move {
+        input_handler
+            .handle_attached_live_input_for_test(requester_pid, b"q")
+            .await
+    });
+    pause.reached.notified().await;
+
+    let switched = handler
+        .dispatch(
+            requester_pid,
+            Request::SwitchClient(SwitchClientRequest {
+                target: beta.session_name().clone(),
+            }),
+        )
+        .await
+        .response;
+    assert!(
+        matches!(switched, Response::SwitchClient(_)),
+        "{switched:?}"
+    );
+    pause.release.notify_one();
+
+    let result = input.await.expect("copy-mode input task joins");
+    assert!(
+        result.is_ok(),
+        "post-mutation switch must not fail input: {result:?}"
+    );
+    let active_session = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach.current_session_candidate(requester_pid)
+    };
+    assert_eq!(active_session.as_ref(), Some(beta.session_name()));
 }
 
 #[tokio::test]

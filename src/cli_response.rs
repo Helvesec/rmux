@@ -14,6 +14,7 @@ const QUEUED_SOURCE_FILE_SUCCESS_COMMANDS: &[&str] = &[
     "display-message",
     "display-menu",
     "display-popup",
+    "if-shell",
     "clear-prompt-history",
     "show-prompt-history",
 ];

@@ -485,18 +485,9 @@ impl RequestHandler {
             }
             return Ok(());
         }
-        let attached_count = {
-            let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .values()
-                .filter(|active| {
-                    active.session_name == session_name
-                        && active.session_id == session_id
-                        && !active.suspended
-                })
-                .count()
-        };
+        let attached_count = self
+            .attached_count_for_session_identity(&session_name, session_id)
+            .await;
         let layout = {
             let state = self.state.lock().await;
             ensure_session_identity(&state, &session_name, session_id).map_err(io_other)?;
@@ -577,18 +568,9 @@ impl RequestHandler {
         session_id: rmux_proto::SessionId,
     ) -> io::Result<()> {
         let attach_pid = identity.attach_pid();
-        let attached_count = {
-            let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .values()
-                .filter(|active| {
-                    active.session_name == session_name
-                        && active.session_id == session_id
-                        && !active.suspended
-                })
-                .count()
-        };
+        let attached_count = self
+            .attached_count_for_session_identity(&session_name, session_id)
+            .await;
         let layout = {
             let state = self.state.lock().await;
             ensure_session_identity(&state, &session_name, session_id).map_err(io_other)?;

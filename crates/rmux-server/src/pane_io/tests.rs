@@ -3,12 +3,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rmux_core::command_parser::CommandParser;
 use rmux_core::events::OutputCursorItem;
 use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
     AttachedKeystroke, BindKeyRequest, KeyDispatched, KillSessionRequest, NewSessionRequest,
-    PaneTarget, Request, Response, SessionName, TerminalSize, WaitForMode, WaitForRequest,
+    OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName, SetOptionMode,
+    TerminalSize, WaitForMode, WaitForRequest,
 };
 use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -70,6 +72,101 @@ async fn dispatch_live_attach_message_for_test(
         &mut locked,
     )
     .await
+}
+
+#[tokio::test]
+async fn forward_attach_resize_during_command_prompt_keeps_exact_identity_alive() {
+    let handler = Arc::new(RequestHandler::new());
+    let attach_pid = std::process::id();
+    let session_name =
+        SessionName::new("resize-command-prompt-identity").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(attach_pid).await;
+
+    let prompt = CommandParser::new()
+        .parse_one_group("command-prompt -b -p resize")
+        .expect("command-prompt parses");
+    handler
+        .execute_parsed_commands_for_test(attach_pid, prompt)
+        .await
+        .expect("background prompt starts");
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let attach_task = tokio::spawn(forward_attach(
+        stream,
+        test_attach_target(&session_name, b"BASE", None),
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+        LiveAttachInputContext::new(Arc::clone(&handler), identity),
+        false,
+    ));
+    let _ = read_attach_data_until(&mut peer, b"BASE").await;
+
+    peer.write_all(
+        &encode_attach_message(&AttachMessage::Resize(TerminalSize {
+            cols: 100,
+            rows: 30,
+        }))
+        .expect("encode resize"),
+    )
+    .await
+    .expect("send resize");
+    peer.write_all(
+        &encode_attach_message(&AttachMessage::Keystroke(AttachedKeystroke::new(
+            b"x".to_vec(),
+        )))
+        .expect("encode prompt key"),
+    )
+    .await
+    .expect("send prompt key after resize");
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut decoder = AttachFrameDecoder::new();
+        let mut bytes = [0_u8; 4096];
+        loop {
+            let bytes_read = peer.read(&mut bytes).await.expect("read attach output");
+            assert!(
+                bytes_read > 0,
+                "resize closed the attach before prompt input"
+            );
+            decoder.push_bytes(&bytes[..bytes_read]);
+            while let Some(message) = decoder.next_message().expect("decode attach output") {
+                if message == AttachMessage::KeyDispatched(KeyDispatched::new(1)) {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("prompt key acknowledgement after resize");
+    assert_eq!(
+        handler.active_attach_identity(attach_pid).await,
+        Some(identity),
+        "resize must preserve the exact attach identity"
+    );
+
+    shutdown_tx.send(()).expect("request attach shutdown");
+    attach_task
+        .await
+        .expect("attach task join")
+        .expect("attach exits cleanly");
 }
 
 async fn create_attach_input_test_session(handler: &RequestHandler, name: &str) -> PaneTarget {
@@ -269,6 +366,117 @@ async fn same_pid_replacement_publishes_while_old_binding_waits() {
         handler.attached_input_capture_for_test(&beta).await,
         Some(Vec::new())
     );
+}
+
+#[tokio::test]
+async fn unlock_flushes_resume_output_before_following_blocking_keystroke() {
+    let handler = Arc::new(RequestHandler::new());
+    let attach_pid = std::process::id();
+    let channel = "attach-unlock-output-barrier";
+    let session_name = SessionName::new("unlock-output-barrier").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let bound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "unlock-output-barrier".to_owned(),
+            key: "x".to_owned(),
+            note: Some("unlock output barrier".to_owned()),
+            repeat: false,
+            command: Some(vec![format!("wait-for {channel}")]),
+        })))
+        .await;
+    assert!(matches!(bound, Response::BindKey(_)), "{bound:?}");
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    handler
+        .set_attached_key_table_for_test(attach_pid, Some("unlock-output-barrier".to_owned()))
+        .await
+        .expect("activate blocking test key table");
+
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let stream = AttachTransport::from(stream);
+    let mut decoder = AttachFrameDecoder::new();
+    let mut coalesced = encode_attach_message(&AttachMessage::Unlock).expect("encode unlock");
+    coalesced.extend_from_slice(
+        &encode_attach_message(&AttachMessage::Keystroke(AttachedKeystroke::new(
+            b"x".to_vec(),
+        )))
+        .expect("encode blocking keystroke"),
+    );
+    decoder.push_bytes(&coalesced);
+    let live_input =
+        LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
+    let mut current_target =
+        open_attach_target(test_attach_target(&session_name, b"RESUMED", None), false)
+            .expect("open attach target");
+
+    let input_task = tokio::spawn(async move {
+        let mut pending_input = Vec::new();
+        let mut pending_escape_flush = PendingEscapeFlush::default();
+        let mut active_emit_cache = None;
+        let mut locked = true;
+        process_socket_messages(
+            &mut decoder,
+            &stream,
+            &live_input,
+            Some(&mut current_target),
+            PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
+            &mut active_emit_cache,
+            &mut locked,
+        )
+        .await?;
+        process_socket_messages(
+            &mut decoder,
+            &stream,
+            &live_input,
+            Some(&mut current_target),
+            PendingAttachInputState::new(&mut pending_input, &mut pending_escape_flush),
+            &mut active_emit_cache,
+            &mut locked,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while handler.wait_for_counts(channel).0 != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("following binding reaches wait-for");
+    assert!(
+        !input_task.is_finished(),
+        "the following keystroke must still be waiting"
+    );
+    let resume = read_attach_data_until(&mut peer, b"RESUMED").await;
+    assert!(
+        resume
+            .windows(b"RESUMED".len())
+            .any(|bytes| bytes == b"RESUMED"),
+        "unlock must restore the terminal before the following binding completes"
+    );
+
+    let signaled = handler
+        .handle(Request::WaitFor(WaitForRequest {
+            channel: channel.to_owned(),
+            mode: WaitForMode::Signal,
+        }))
+        .await;
+    assert!(matches!(signaled, Response::WaitFor(_)), "{signaled:?}");
+    input_task
+        .await
+        .expect("input task join")
+        .expect("coalesced input processing succeeds");
 }
 
 #[test]
@@ -2653,6 +2861,195 @@ async fn exited_after_same_source_render_switch_does_not_duplicate_dequeued_outp
                 .count(),
             1,
             "snapshot partition must deliver every output and passthrough exactly once: {marker:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn exited_after_non_coalesced_same_source_switches_forwards_passthroughs_once() {
+    let session_name =
+        SessionName::new("multi-render-switch-exit-drain").expect("valid session name");
+    let pane_output = pane_output_channel();
+    let mut clipboard_options = OptionStore::new();
+    clipboard_options
+        .set(
+            ScopeSelector::Global,
+            OptionName::SetClipboard,
+            "on".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("enable application clipboard passthrough");
+    let outer_terminal = OuterTerminal::resolve(
+        &clipboard_options,
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-kitty")]),
+    );
+    let passthroughs = |suffix: &str, clipboard_payload: &[u8]| {
+        vec![
+            TerminalPassthrough::raw(0, 0, format!("RAW-{suffix}").into_bytes()),
+            TerminalPassthrough::clipboard(clipboard_payload.to_vec()),
+            TerminalPassthrough::kitty_graphics(
+                0,
+                0,
+                format!("Gf=100;KITTY-{suffix}").into_bytes(),
+            ),
+            TerminalPassthrough::sixel(0, 0, format!("qSIXEL-{suffix}").into_bytes()),
+        ]
+    };
+
+    let mut initial = test_attach_target_with_protocols(
+        &session_name,
+        b"BASE-0",
+        None,
+        pane_output.clone(),
+        true,
+        true,
+    );
+    initial.pane_master = None;
+    initial.outer_terminal = outer_terminal.clone();
+    let mut current_target = open_attach_target(initial, true).expect("open initial target");
+
+    let sequence_0 = pane_output
+        .send_for_generation_with_passthroughs(
+            None,
+            b"OUTPUT-0".to_vec(),
+            passthroughs("0", b"\x1b]52;c;UDA=\x07"),
+        )
+        .expect("publish first output interval");
+    let mut replacement_1 = test_attach_target_with_protocols(
+        &session_name,
+        b"SNAPSHOT-1",
+        None,
+        pane_output.clone(),
+        true,
+        true,
+    );
+    replacement_1.pane_master = None;
+    replacement_1.outer_terminal = outer_terminal.clone();
+    assert_eq!(
+        replacement_1.pane_output_start_sequence,
+        sequence_0 + 1,
+        "first replacement must start after the first interval"
+    );
+
+    let sequence_1 = pane_output
+        .send_for_generation_with_passthroughs(
+            None,
+            b"OUTPUT-1".to_vec(),
+            passthroughs("1", b"\x1b]52;c;UDE=\x07"),
+        )
+        .expect("publish middle output interval");
+    let mut replacement_2 = test_attach_target_with_protocols(
+        &session_name,
+        b"SNAPSHOT-2",
+        None,
+        pane_output.clone(),
+        true,
+        true,
+    );
+    replacement_2.pane_master = None;
+    replacement_2.outer_terminal = outer_terminal;
+    assert_eq!(
+        replacement_2.pane_output_start_sequence,
+        sequence_1 + 1,
+        "second replacement must start after the middle interval"
+    );
+
+    let _sequence_2 = pane_output
+        .send_for_generation_with_passthroughs(
+            None,
+            b"OUTPUT-2".to_vec(),
+            passthroughs("2", b"\x1b]52;c;UDI=\x07"),
+        )
+        .expect("publish final output interval");
+
+    let first_item = current_target
+        .pane_output
+        .as_mut()
+        .and_then(super::types::PaneOutputReceiver::try_recv)
+        .expect("old receiver dequeues the first interval");
+    let pending_batch =
+        collect_attach_output_batch(first_item, current_target.pane_output.as_mut());
+
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let stream = AttachTransport::from(stream);
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    control_tx
+        .send(AttachControl::switch(replacement_1))
+        .expect("queue first same-source render refresh");
+    control_tx
+        .send(AttachControl::Write(b"INTERLEAVED-CONTROL".to_vec()))
+        .expect("separate the render refreshes so they cannot coalesce");
+    control_tx
+        .send(AttachControl::switch(replacement_2))
+        .expect("queue second same-source render refresh");
+    control_tx
+        .send(AttachControl::Exited)
+        .expect("queue terminal exit");
+
+    let mut render_generation = 0_u64;
+    let mut overlay_generation = 0_u64;
+    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay_visible = false;
+    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
+    let mut locked = false;
+    let mut deferred_controls = VecDeque::new();
+    let control_backlog = AtomicUsize::new(0);
+    let exit = apply_pending_attach_controls(
+        &mut deferred_controls,
+        Some(&mut control_rx),
+        &control_backlog,
+        &mut current_target,
+        &stream,
+        &mut render_generation,
+        &mut overlay_generation,
+        &mut persistent_overlay,
+        &mut persistent_overlay_visible,
+        &mut persistent_overlay_state_id,
+        &mut locked,
+        None,
+    )
+    .await
+    .expect("apply two refreshes and terminal exit");
+    let PendingAttachAction::Exit(exit) = exit else {
+        panic!("refreshes followed by Exited must terminate the attach");
+    };
+    let mut deferred_passthroughs = Vec::new();
+    finish_pending_attach_exit_with_batch(
+        exit.reason,
+        &stream,
+        &mut current_target,
+        &mut deferred_passthroughs,
+        pending_attach_exit_output_batch(
+            exit.drop_pending_output,
+            exit.snapshot_covered_output_before_sequence,
+            pending_batch,
+        ),
+    )
+    .await
+    .expect("finish multi-refresh exit");
+
+    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
+    for marker in [
+        b"RAW-0".as_slice(),
+        b"RAW-1".as_slice(),
+        b"RAW-2".as_slice(),
+        b"\x1b]52;c;UDA=\x07".as_slice(),
+        b"\x1b]52;c;UDE=\x07".as_slice(),
+        b"\x1b]52;c;UDI=\x07".as_slice(),
+        b"\x1b_Gf=100;KITTY-0\x1b\\".as_slice(),
+        b"\x1b_Gf=100;KITTY-1\x1b\\".as_slice(),
+        b"\x1b_Gf=100;KITTY-2\x1b\\".as_slice(),
+        b"\x1bPqSIXEL-0\x1b\\".as_slice(),
+        b"\x1bPqSIXEL-1\x1b\\".as_slice(),
+        b"\x1bPqSIXEL-2\x1b\\".as_slice(),
+    ] {
+        assert_eq!(
+            exited
+                .windows(marker.len())
+                .filter(|bytes| *bytes == marker)
+                .count(),
+            1,
+            "every passthrough must be delivered exactly once: {marker:?}"
         );
     }
 }

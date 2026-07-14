@@ -19,7 +19,7 @@ use crate::{EnsureSession, Result, RmuxError, Session, SessionId, SessionName};
 use rmux_proto::{
     CreateSessionLeaseRequest, KillSessionRequest, ReleaseSessionLeaseRequest,
     RenewSessionLeaseRequest, Request, Response, CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
-    CAPABILITY_SDK_SESSION_LEASE, CAPABILITY_SDK_SESSION_LEASE_BY_ID,
+    CAPABILITY_SDK_SESSION_LEASE, CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
 };
 
 use super::Rmux;
@@ -108,6 +108,7 @@ impl<'a> OwnedSessionBuilder<'a> {
             CleanupPolicy::KillOnOwnerExit => &[
                 CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
                 CAPABILITY_SDK_SESSION_LEASE,
+                CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
             ][..],
             CleanupPolicy::KillOnDrop | CleanupPolicy::Preserve => {
                 &[CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY][..]
@@ -156,7 +157,7 @@ impl<'a> OwnedSessionBuilder<'a> {
             session_id,
             cleanup_policy: self.cleanup_policy,
             lease,
-            signal_handlers_installed: Arc::new(AtomicBool::new(false)),
+            signal_handler_state: Arc::new(signals::SignalHandlerState::default()),
         };
         creation_rollback.disarm();
         Ok(owned)
@@ -179,7 +180,7 @@ pub struct OwnedSession {
     session_id: SessionId,
     cleanup_policy: CleanupPolicy,
     lease: Option<OwnedSessionLease>,
-    signal_handlers_installed: Arc<AtomicBool>,
+    signal_handler_state: Arc<signals::SignalHandlerState>,
 }
 
 impl OwnedSession {
@@ -263,7 +264,9 @@ impl OwnedSession {
     /// for Ctrl-C on every platform, and for SIGTERM/SIGHUP on Unix, then asks
     /// the daemon to kill the session. Dropping the returned guard aborts the
     /// background listener. Only one guard may be installed at a time; a second
-    /// call returns an error until the first guard is dropped.
+    /// call returns an error until the first guard is dropped. Preserving or
+    /// detaching ownership while the guard remains live atomically disarms its
+    /// cleanup action before ownership is released.
     pub fn install_default_signal_handlers(&self) -> Result<OwnedSessionSignalHandlers> {
         let Some(session) = self.session.as_ref() else {
             return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
@@ -281,13 +284,13 @@ impl OwnedSession {
             }
         };
         let transport = session.transport().clone();
-        let installed = Arc::clone(&self.signal_handlers_installed);
-        signals::install_default_signal_handlers(transport, cleanup_request, installed)
+        let state = Arc::clone(&self.signal_handler_state);
+        signals::install_default_signal_handlers(transport, cleanup_request, state)
     }
 
     /// Switches this owner to preserve mode after confirming ownership release.
     pub async fn preserve(mut self) -> Result<Self> {
-        self.ensure_signal_handlers_not_installed()?;
+        self.signal_handler_state.disarm_for_ownership_release()?;
         self.release_ownership_confirmed().await?;
         self.cleanup_policy = CleanupPolicy::Preserve;
         Ok(self)
@@ -295,7 +298,7 @@ impl OwnedSession {
 
     /// Detaches the guard and returns the underlying persistent session.
     pub async fn detach_owned(mut self) -> Result<Session> {
-        self.ensure_signal_handlers_not_installed()?;
+        self.signal_handler_state.disarm_for_ownership_release()?;
         self.release_ownership_confirmed().await?;
         self.cleanup_policy = CleanupPolicy::Preserve;
         Ok(self
@@ -329,16 +332,6 @@ impl OwnedSession {
         self.lease.take();
         Ok(())
     }
-
-    fn ensure_signal_handlers_not_installed(&self) -> Result<()> {
-        if !self.signal_handlers_installed.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
-            "drop owned-session signal handlers before preserving or detaching the session"
-                .to_owned(),
-        )))
-    }
 }
 
 #[derive(Debug)]
@@ -356,15 +349,16 @@ impl OwnedSessionLease {
     async fn start(session: &Session, session_id: SessionId, ttl: Duration) -> Result<Self> {
         let ttl_millis = ttl_millis(ttl)?;
         let transport = session.transport().clone();
-        crate::capabilities::require(&transport, &[CAPABILITY_SDK_SESSION_LEASE]).await?;
-        let lease_target =
-            if crate::capabilities::supports(&transport, &[CAPABILITY_SDK_SESSION_LEASE_BY_ID])
-                .await?
-            {
-                stable_session_target(session_id)
-            } else {
-                session.name().clone()
-            };
+        crate::capabilities::require_with_handshake(
+            &transport,
+            &[CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2],
+            &[
+                CAPABILITY_SDK_SESSION_LEASE,
+                CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
+            ],
+        )
+        .await?;
+        let lease_target = stable_session_target(session_id);
         let response = transport
             .request(Request::CreateSessionLease(CreateSessionLeaseRequest {
                 session_name: lease_target.clone(),

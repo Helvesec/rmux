@@ -785,8 +785,36 @@ fn send_keys_exact_pane_target_is_tiny_parseable() {
     let args = os_args(&["-t", "bench:0.0", "true", "Enter"]);
 
     let request = parse_send_keys(&args).expect("send-keys fast path");
-    assert_eq!(request.target.to_string(), "bench:0.0");
+    assert_eq!(request.raw_target, "bench:0.0");
     assert_eq!(request.keys, ["true".to_owned(), "Enter".to_owned()]);
+}
+
+#[test]
+fn send_keys_resolution_forwards_errors_before_any_mutation() {
+    let target = match Target::parse("bench:0.0").expect("exact pane target") {
+        Target::Pane(target) => target,
+        other => panic!("expected pane target, got {other:?}"),
+    };
+    let resolved = Response::ResolveTarget(rmux_proto::ResolveTargetResponse {
+        target: Target::Pane(target.clone()),
+    });
+    assert_eq!(send_keys_resolved_target(resolved), Ok(target));
+
+    let error = Response::Error(ErrorResponse {
+        error: RmuxError::SessionNotFound("missing".to_owned()),
+    });
+    assert_eq!(
+        send_keys_resolved_target(error),
+        Err("session not found: missing".to_owned())
+    );
+
+    let wrong_target = Response::ResolveTarget(rmux_proto::ResolveTargetResponse {
+        target: Target::Session(rmux_proto::SessionName::new("bench").expect("session name")),
+    });
+    assert_eq!(
+        send_keys_resolved_target(wrong_target),
+        Err("protocol error: resolve-target returned a non-pane target for send-keys".to_owned())
+    );
 }
 
 #[test]

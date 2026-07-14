@@ -85,11 +85,18 @@ struct AttachRegistrationIdentity {
     id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpectedAttachPolicy {
+    SessionCursor,
+    RegistrationOnly,
+}
+
 // Queue ownership follows the registration, while the attached session is a
 // cursor that may advance after a successful switch-client.
 struct ExpectedAttachIdentity {
     registration: AttachRegistrationIdentity,
     session_id: Cell<SessionId>,
+    policy: ExpectedAttachPolicy,
 }
 
 impl ExpectedAttachIdentity {
@@ -100,7 +107,14 @@ impl ExpectedAttachIdentity {
                 id: identity.attach_id(),
             },
             session_id: Cell::new(identity.session_id()),
+            policy: ExpectedAttachPolicy::SessionCursor,
         }
+    }
+
+    fn registration_only(identity: ActiveAttachIdentity) -> Self {
+        let mut expected = Self::new(identity);
+        expected.policy = ExpectedAttachPolicy::RegistrationOnly;
+        expected
     }
 
     fn snapshot(&self) -> ActiveAttachIdentity {
@@ -118,30 +132,49 @@ pub(in crate::handler) fn current_expected_attach_identity() -> Option<ActiveAtt
         .ok()
 }
 
+pub(in crate::handler) fn expected_attach_follows_registration() -> bool {
+    EXPECTED_ATTACH_IDENTITY
+        .try_with(|expected| expected.policy == ExpectedAttachPolicy::RegistrationOnly)
+        .unwrap_or(false)
+}
+
 pub(in crate::handler) async fn validate_expected_attach_identity(
     handler: &RequestHandler,
     requester_pid: u32,
 ) -> Result<Option<ActiveAttachIdentity>, RmuxError> {
-    let Some(identity) = current_expected_attach_identity() else {
+    let Some((identity, policy)) = EXPECTED_ATTACH_IDENTITY
+        .try_with(|expected| (expected.snapshot(), expected.policy))
+        .ok()
+    else {
         return Ok(None);
     };
-    let identity_is_current = if identity.attach_pid() == requester_pid {
+    let current_identity = if identity.attach_pid() == requester_pid {
         let active_attach = handler.active_attach.lock().await;
         active_attach
             .by_pid
             .get(&requester_pid)
-            .is_some_and(|active| {
+            .filter(|active| {
                 active.id == identity.attach_id()
-                    && active.session_id == identity.session_id()
                     && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
             })
+            .map(|active| ActiveAttachIdentity::new(requester_pid, active.id, active.session_id))
     } else {
-        false
+        None
     };
-    if !identity_is_current {
+    let Some(current_identity) = current_identity else {
+        return Err(changed_attach_identity_error());
+    };
+    if policy == ExpectedAttachPolicy::SessionCursor
+        && current_identity.session_id() != identity.session_id()
+    {
         return Err(changed_attach_identity_error());
     }
-    Ok(Some(identity))
+    if policy == ExpectedAttachPolicy::RegistrationOnly {
+        EXPECTED_ATTACH_IDENTITY
+            .try_with(|expected| expected.session_id.set(current_identity.session_id()))
+            .map_err(|_| changed_attach_identity_error())?;
+    }
+    Ok(Some(current_identity))
 }
 
 pub(in crate::handler) async fn with_expected_attach_identity<T, F>(
@@ -153,6 +186,18 @@ where
 {
     EXPECTED_ATTACH_IDENTITY
         .scope(ExpectedAttachIdentity::new(identity), future)
+        .await
+}
+
+pub(in crate::handler) async fn with_expected_attach_registration<T, F>(
+    identity: ActiveAttachIdentity,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    EXPECTED_ATTACH_IDENTITY
+        .scope(ExpectedAttachIdentity::registration_only(identity), future)
         .await
 }
 

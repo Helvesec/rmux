@@ -17,7 +17,7 @@ pub(super) struct TinyDisplayMessage {
 }
 
 pub(super) struct TinySendKeys {
-    pub(super) target: PaneTarget,
+    pub(super) raw_target: String,
     pub(super) keys: Vec<String>,
 }
 
@@ -755,7 +755,9 @@ pub(super) fn parse_send_keys(args: &[OsString]) -> Option<TinySendKeys> {
             }
             "-t" => {
                 index += 1;
-                target = Some(parse_pane_target(args.get(index)?.to_str()?)?);
+                let raw_target = args.get(index)?.to_str()?;
+                let _ = parse_pane_target(raw_target)?;
+                target = Some(raw_target.to_owned());
             }
             "-F" | "-H" | "-l" | "-K" | "-M" | "-p" | "-R" | "-X" => return None,
             "-N" | "-c" => return None,
@@ -769,7 +771,7 @@ pub(super) fn parse_send_keys(args: &[OsString]) -> Option<TinySendKeys> {
     }
 
     Some(TinySendKeys {
-        target: target?,
+        raw_target: target?,
         keys,
     })
 }

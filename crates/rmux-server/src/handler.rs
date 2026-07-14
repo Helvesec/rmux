@@ -156,6 +156,9 @@ pub(in crate::handler) use pane_output_subscription_rekeys::{
 };
 use pane_support::PaneSnapshotRevisionRegistry;
 use session_lease_support::SessionLeaseStore;
+pub(crate) use session_lease_support::{
+    with_session_lease_create_addressing, SessionLeaseCreateAddressing,
+};
 use subscription_support::OutputSubscriptionState;
 pub(in crate::handler) use switch_target_support::switch_client_target_find_type;
 pub(in crate::handler) use target_support::{
@@ -167,11 +170,11 @@ use wait_support::SdkWaitState;
 pub(in crate::handler) use web_request_identity::{
     current_expected_attach_identity, dispatch_with_expected_session_identity,
     dispatch_with_expected_window_identity, dispatch_with_expected_window_occurrence_identity,
-    rebase_expected_attach_session_after_switch, require_expected_session_identity,
-    require_expected_window_identity, resolve_expected_window_pane_target,
-    validate_expected_attach_identity, with_expected_attach_and_session_identity,
-    with_expected_attach_identity, with_expected_session_identity,
-    ExpectedWindowOccurrenceIdentity,
+    expected_attach_follows_registration, rebase_expected_attach_session_after_switch,
+    require_expected_session_identity, require_expected_window_identity,
+    resolve_expected_window_pane_target, validate_expected_attach_identity,
+    with_expected_attach_and_session_identity, with_expected_attach_registration,
+    with_expected_session_identity, ExpectedWindowOccurrenceIdentity,
 };
 
 /// Default detached session size used when `new-session` omits `-x` and `-y`.

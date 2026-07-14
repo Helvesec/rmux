@@ -416,6 +416,38 @@ impl RequestHandler {
         attach_count.saturating_add(control_count)
     }
 
+    pub(super) async fn attached_count_for_session_identity(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        session_id: SessionId,
+    ) -> usize {
+        let attach_count = {
+            let active_attach = self.active_attach.lock().await;
+            active_attach
+                .by_pid
+                .values()
+                .filter(|active| {
+                    &active.session_name == session_name
+                        && active.session_id == session_id
+                        && !active.suspended
+                })
+                .count()
+        };
+        let control_count = {
+            let active_control = self.active_control.lock().await;
+            active_control
+                .by_pid
+                .values()
+                .filter(|active| {
+                    active.session_name.as_ref() == Some(session_name)
+                        && active.session_id == Some(session_id)
+                })
+                .count()
+        };
+
+        attach_count.saturating_add(control_count)
+    }
+
     pub(super) async fn attached_count_after_switch(
         &self,
         session_name: &rmux_proto::SessionName,

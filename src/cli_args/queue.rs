@@ -290,7 +290,8 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
             .and_then(RunShellArgs::validate)
             .map(Command::RunShell),
         "source-file" => parse_source_file_args(arguments).map(Command::SourceFile),
-        "if-shell" => parse_command_args("if-shell", arguments).map(Command::IfShell),
+        "if-shell" => parse_queue_command_args::<IfShellArgs>("if-shell", arguments)
+            .map(|args| Command::IfShell(with_queue_command(args, queue_command))),
         "wait-for" => parse_command_args("wait-for", arguments).map(Command::WaitFor),
         "web-share" => super::web::parse_web_share_args(arguments).map(Command::WebShare),
         "command-prompt" => parse_queue_command_args::<PromptArgs>("command-prompt", arguments)

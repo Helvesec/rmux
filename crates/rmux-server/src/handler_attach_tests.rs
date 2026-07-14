@@ -854,3 +854,6 @@ mod server_lifecycle;
 
 #[path = "handler_attach_tests/client_security.rs"]
 mod client_security;
+
+#[path = "handler_attach_tests/attached_count_identity.rs"]
+mod attached_count_identity;

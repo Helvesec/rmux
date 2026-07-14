@@ -91,6 +91,43 @@ async fn source_file_preserves_target_client_and_show_hooks_flags() {
 }
 
 #[tokio::test]
+async fn source_file_background_run_shell_preserves_its_implicit_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("source-background-target-alpha");
+    let beta = session_name("source-background-target-beta");
+    let expected_window_name = "source-background-fixed-target";
+    create_background_identity_session(&handler, alpha.clone()).await;
+
+    let root = temp_root("background-implicit-target");
+    write_config(
+        &root.join("background.conf"),
+        &format!("run-shell -b -d 0.2 -C 'rename-window {expected_window_name}'\n"),
+    );
+    let response = handler
+        .handle(source_file_request(
+            vec!["background.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+    assert!(matches!(response, Response::SourceFile(_)), "{response:?}");
+
+    create_background_identity_session(&handler, beta.clone()).await;
+    wait_for_active_window_name(&handler, &alpha, expected_window_name).await;
+    let state = handler.state.lock().await;
+    assert_ne!(
+        state
+            .sessions
+            .session(&beta)
+            .and_then(|session| session.window_at(session.active_window_index()))
+            .and_then(rmux_core::Window::name),
+        Some(expected_window_name),
+        "source-file background target must not drift to a newer preferred session"
+    );
+    drop(state);
+    fs::remove_dir_all(root).expect("remove source background target root");
+}
+
+#[tokio::test]
 async fn source_file_show_window_options_rejects_h() {
     let handler = RequestHandler::new();
     let root = temp_root("show-window-options-h");

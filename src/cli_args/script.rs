@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{ArgAction, ArgGroup, Args};
 use rmux_proto::WaitForMode;
 
-use super::{parse_command_args, parse_target_spec, TargetSpec};
+use super::{parse_command_args, parse_target_spec, QueuedCommand, TargetSpec};
 
 pub(super) fn parse_source_file_args(
     arguments: Vec<String>,
@@ -109,6 +109,14 @@ pub(crate) struct IfShellArgs {
     pub(crate) then_command: String,
     #[arg(allow_hyphen_values = true)]
     pub(crate) else_command: Option<String>,
+    #[arg(skip = String::new())]
+    pub(crate) queue_command: String,
+}
+
+impl QueuedCommand for IfShellArgs {
+    fn set_queue_command(&mut self, queue_command: String) {
+        self.queue_command = queue_command;
+    }
 }
 
 #[derive(Debug, Clone, Args)]

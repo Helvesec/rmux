@@ -28,6 +28,7 @@ pub(in crate::handler) struct QueueExecutionContext {
     pub(super) current_file: Option<String>,
     pub(super) current_target: Option<Target>,
     pub(super) current_target_allows_canfail_fallback: bool,
+    pub(super) follows_attached_session: bool,
     pub(super) client_name: Option<String>,
     pub(super) mouse_target: Option<Target>,
     pub(super) mouse_event: Option<AttachedMouseEvent>,
@@ -41,6 +42,7 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            follows_attached_session: false,
             client_name: None,
             mouse_target: None,
             mouse_event: None,
@@ -54,6 +56,7 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            follows_attached_session: false,
             client_name: None,
             mouse_target: None,
             mouse_event: None,
@@ -71,6 +74,7 @@ impl QueueExecutionContext {
             current_file,
             current_target: self.current_target.clone(),
             current_target_allows_canfail_fallback: self.current_target_allows_canfail_fallback,
+            follows_attached_session: self.follows_attached_session,
             client_name: self.client_name.clone(),
             mouse_target: self.mouse_target.clone(),
             mouse_event: self.mouse_event.clone(),
@@ -82,6 +86,7 @@ impl QueueExecutionContext {
         current_target: Option<Target>,
     ) -> Self {
         self.current_target_allows_canfail_fallback = current_target.is_some();
+        self.follows_attached_session = false;
         self.current_target = current_target;
         self
     }
@@ -95,10 +100,22 @@ impl QueueExecutionContext {
         self
     }
 
-    pub(in crate::handler) fn rebase_implicit_current_target(&mut self, current_target: Target) {
-        if !self.uses_explicit_current_target() {
-            self.current_target = Some(current_target);
+    pub(in crate::handler) fn following_attached_session(mut self) -> Self {
+        if !self.current_target_allows_canfail_fallback {
+            self.follows_attached_session = true;
         }
+        self
+    }
+
+    pub(in crate::handler) fn follows_attached_session(&self) -> bool {
+        self.follows_attached_session
+    }
+
+    pub(in crate::handler) fn rebase_current_target_after_attached_switch(
+        &mut self,
+        current_target: Target,
+    ) {
+        self.current_target = Some(current_target);
     }
 
     pub(in crate::handler) fn uses_explicit_current_target(&self) -> bool {
@@ -432,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn attached_switch_rebases_only_implicit_queue_targets() {
+    fn attached_switch_rebases_every_queue_target() {
         let alpha = Target::Session(session_name("alpha"));
         let beta = Target::Session(session_name("beta"));
         let mut implicit = QueueExecutionContext::without_caller_cwd()
@@ -440,8 +457,8 @@ mod tests {
         let mut explicit =
             QueueExecutionContext::without_caller_cwd().with_current_target(Some(alpha));
 
-        implicit.rebase_implicit_current_target(beta.clone());
-        explicit.rebase_implicit_current_target(beta);
+        implicit.rebase_current_target_after_attached_switch(beta.clone());
+        explicit.rebase_current_target_after_attached_switch(beta);
 
         assert_eq!(
             implicit.current_target(),
@@ -449,7 +466,7 @@ mod tests {
         );
         assert_eq!(
             explicit.current_target(),
-            Some(&Target::Session(session_name("alpha")))
+            Some(&Target::Session(session_name("beta")))
         );
     }
 }

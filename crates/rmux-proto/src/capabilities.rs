@@ -44,6 +44,8 @@ pub const CAPABILITY_SDK_PANE_FOREGROUND: &str = "sdk.pane.foreground";
 pub const CAPABILITY_SDK_SESSION_LEASE: &str = "sdk.session.lease";
 /// Stable feature id for app-owned session lease requests addressed by session id.
 pub const CAPABILITY_SDK_SESSION_LEASE_BY_ID: &str = "sdk.session.lease.by_id";
+/// Stable feature id for connection-negotiated app-owned lease requests addressed by session id.
+pub const CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2: &str = "sdk.session.lease.by_id.v2";
 /// Stable feature id for owned-session creation that returns a stable session identity.
 pub const CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY: &str = "sdk.owned_session.stable_identity";
 /// Stable feature id for explicit SDK process launch modes.
@@ -81,6 +83,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_SDK_PANE_STATE_EVENTS,
     CAPABILITY_SDK_PANE_FOREGROUND,
     CAPABILITY_SDK_SESSION_LEASE,
+    CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
     CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
     CAPABILITY_SDK_PROCESS_COMMAND,
     CAPABILITY_TARGET_CLIENT_COMMANDS,
@@ -191,7 +194,7 @@ mod tests {
         CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
         CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_HANDSHAKE,
         CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY, CAPABILITY_SDK_SESSION_LEASE_BY_ID,
-        CAPABILITY_SDK_WAITS_ARMED,
+        CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2, CAPABILITY_SDK_WAITS_ARMED,
     };
     use crate::{RmuxError, RMUX_WIRE_VERSION};
 
@@ -229,13 +232,17 @@ mod tests {
     }
 
     #[test]
-    fn current_handshake_keeps_session_lease_addressing_nominal() {
+    fn current_handshake_versions_session_lease_identity_addressing() {
         let response = HandshakeResponse::current();
 
         assert!(!response
             .capabilities
             .iter()
             .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID));
+        assert!(response
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2));
     }
 
     #[test]

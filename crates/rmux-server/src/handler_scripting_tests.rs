@@ -15,10 +15,10 @@ use crate::outer_terminal::OuterTerminalContext;
 use rmux_core::command_parser::CommandParser;
 use rmux_core::TargetFindContext;
 use rmux_proto::{
-    BreakPaneRequest, DisplayMessageRequest, HookName, IfShellRequest, KillWindowRequest,
-    LastWindowRequest, LinkWindowRequest, NewSessionExtRequest, NewSessionRequest,
-    NewWindowRequest, NextWindowRequest, OptionName, OptionScopeSelector, PaneTarget,
-    PreviousWindowRequest, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
+    BreakPaneRequest, DisplayMessageRequest, HookName, IfShellRequest, KillSessionRequest,
+    KillWindowRequest, LastWindowRequest, LinkWindowRequest, NewSessionExtRequest,
+    NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName, OptionScopeSelector,
+    PaneTarget, PreviousWindowRequest, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
     RotateWindowDirection, RotateWindowRequest, RunShellDelaySeconds, RunShellRequest,
     RunShellResponse, ScopeSelector, SelectPaneRequest, SessionName, SetEnvironmentRequest,
     SetOptionMode, SetOptionRequest, ShowBufferRequest, ShowOptionsRequest, SourceFileRequest,
@@ -214,6 +214,45 @@ async fn create_background_identity_session(handler: &RequestHandler, session_na
         }))
         .await;
     assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+}
+
+async fn replace_background_identity_session(handler: &RequestHandler, session_name: SessionName) {
+    let response = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: session_name.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    create_background_identity_session(handler, session_name).await;
+}
+
+async fn wait_for_active_window_name(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+    expected: &str,
+) {
+    tokio::time::timeout(background_shell_test_timeout(), async {
+        loop {
+            let matches = {
+                let state = handler.state.lock().await;
+                state
+                    .sessions
+                    .session(session_name)
+                    .and_then(|session| session.window_at(session.active_window_index()))
+                    .and_then(rmux_core::Window::name)
+                    == Some(expected)
+            };
+            if matches {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background command follows the active attached session");
 }
 
 async fn wait_for_background_waiter(handler: &RequestHandler, channel: &str) {

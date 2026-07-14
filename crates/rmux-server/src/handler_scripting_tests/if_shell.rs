@@ -261,6 +261,160 @@ async fn background_if_shell_rejects_a_reused_attach_registration() {
 }
 
 #[tokio::test]
+async fn background_if_shell_queue_survives_a_same_registration_session_switch() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_308;
+    let alpha = session_name("if-shell-attach-switch-alpha");
+    let beta = session_name("if-shell-attach-switch-beta");
+    let wait_channel = "if-shell-attach-session-switch";
+    let followed_window_name = "if-shell-followed-attached-session";
+    create_background_identity_session(&handler, alpha.clone()).await;
+    create_background_identity_session(&handler, beta.clone()).await;
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "if-shell -b -F 1 {{ wait-for {wait_channel} ; rename-window {followed_window_name} }} ; switch-client -t {beta}"
+        ))
+        .expect("background if-shell and attached switch parse");
+    let output = with_expected_attach_and_session_identity(
+        identity,
+        alpha.clone(),
+        identity.session_id(),
+        handler.execute_parsed_commands_for_test(requester_pid, commands),
+    )
+    .await
+    .expect("same-registration attached switch keeps the outer queue valid");
+    assert!(output.stdout().is_empty());
+
+    let switched_identity = handler.active_attach_identity_for_test(requester_pid).await;
+    assert_eq!(switched_identity.attach_id(), identity.attach_id());
+    assert_eq!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached registration survives")
+            .session_name,
+        beta
+    );
+    wait_for_background_waiter(&handler, wait_channel).await;
+    replace_background_identity_session(&handler, alpha.clone()).await;
+    release_background_waiter(&handler, wait_channel).await;
+    wait_for_active_window_name(&handler, &beta, followed_window_name).await;
+    let state = handler.state.lock().await;
+    let replacement = state
+        .sessions
+        .session(&alpha)
+        .expect("replacement alpha exists");
+    assert_ne!(
+        replacement
+            .window_at(replacement.active_window_index())
+            .and_then(rmux_core::Window::name),
+        Some(followed_window_name),
+        "stale background context mutated the replacement alpha session"
+    );
+}
+
+async fn assert_explicit_background_if_shell_target_survives_switch(queued: bool) {
+    let handler = RequestHandler::new();
+    let requester_pid = if queued { 424_310 } else { 424_309 };
+    let suffix = if queued { "queue" } else { "request" };
+    let alpha = session_name(&format!("if-shell-explicit-{suffix}-alpha"));
+    let beta = session_name(&format!("if-shell-explicit-{suffix}-beta"));
+    let gamma = session_name(&format!("if-shell-explicit-{suffix}-gamma"));
+    let wait_channel = format!("if-shell-explicit-{suffix}-wait");
+    let expected_window_name = format!("if-shell-explicit-{suffix}-target");
+    create_background_identity_session(&handler, alpha.clone()).await;
+    create_background_identity_session(&handler, beta.clone()).await;
+    create_background_identity_session(&handler, gamma.clone()).await;
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+
+    if queued {
+        let commands = CommandParser::new()
+            .parse(&format!(
+                "if-shell -b -F -t {gamma}:0.0 1 {{ wait-for {wait_channel} ; rename-window {expected_window_name} }}"
+            ))
+            .expect("queued explicit background if-shell parses");
+        with_expected_attach_and_session_identity(
+            identity,
+            alpha.clone(),
+            identity.session_id(),
+            handler.execute_parsed_commands_for_test(requester_pid, commands),
+        )
+        .await
+        .expect("queued explicit background if-shell starts");
+    } else {
+        let response = with_expected_attach_and_session_identity(
+            identity,
+            alpha.clone(),
+            identity.session_id(),
+            handler.handle_if_shell(
+                requester_pid,
+                IfShellRequest {
+                    condition: "1".to_owned(),
+                    format_mode: true,
+                    then_command: format!(
+                        "wait-for {wait_channel} ; rename-window {expected_window_name}"
+                    ),
+                    else_command: None,
+                    target: Some(Target::Pane(PaneTarget::with_window(gamma.clone(), 0, 0))),
+                    caller_cwd: None,
+                    background: true,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            response,
+            Response::IfShell(rmux_proto::IfShellResponse::no_output())
+        );
+    }
+
+    wait_for_background_waiter(&handler, &wait_channel).await;
+    let switch = CommandParser::new()
+        .parse(&format!("switch-client -t {beta}"))
+        .expect("attached switch parses");
+    with_expected_attach_and_session_identity(
+        identity,
+        alpha,
+        identity.session_id(),
+        handler.execute_parsed_commands_for_test(requester_pid, switch),
+    )
+    .await
+    .expect("attached client switches while explicit background command waits");
+    release_background_waiter(&handler, &wait_channel).await;
+
+    wait_for_active_window_name(&handler, &gamma, &expected_window_name).await;
+    let state = handler.state.lock().await;
+    assert_ne!(
+        state
+            .sessions
+            .session(&beta)
+            .and_then(|session| session.window_at(session.active_window_index()))
+            .and_then(rmux_core::Window::name),
+        Some(expected_window_name.as_str()),
+        "explicit background if-shell target must not rebase onto the attached session"
+    );
+}
+
+#[tokio::test]
+async fn explicit_background_if_shell_targets_survive_attached_switch() {
+    assert_explicit_background_if_shell_target_survives_switch(false).await;
+    assert_explicit_background_if_shell_target_survives_switch(true).await;
+}
+
+#[tokio::test]
 async fn background_if_shell_is_tracked_as_detached_request_until_finished() {
     let handler = RequestHandler::new();
     use_platform_test_shell(&handler).await;

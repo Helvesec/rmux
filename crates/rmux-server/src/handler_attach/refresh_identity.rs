@@ -79,18 +79,12 @@ impl RequestHandler {
         session_id: rmux_proto::SessionId,
     ) -> bool {
         let attach_pid = identity.attach_pid();
-        let (attached_count, target) = {
+        let attached_count = self
+            .attached_count_for_session_identity(session_name, session_id)
+            .await;
+        let target = {
             let active_attach = self.active_attach.lock().await;
-            let attached_count = active_attach
-                .by_pid
-                .values()
-                .filter(|active| {
-                    &active.session_name == session_name
-                        && active.session_id == session_id
-                        && !active.suspended
-                })
-                .count();
-            let target = active_attach
+            active_attach
                 .by_pid
                 .get(&attach_pid)
                 .filter(|active| {
@@ -110,8 +104,7 @@ impl RequestHandler {
                         active.mode_tree.is_some(),
                         active.key_table_name.clone(),
                     )
-                });
-            (attached_count, target)
+                })
         };
         let Some((
             prompt,

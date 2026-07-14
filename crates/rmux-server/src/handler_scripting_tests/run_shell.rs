@@ -276,6 +276,226 @@ async fn background_run_shell_commands_reject_a_reused_attach_registration() {
 }
 
 #[tokio::test]
+async fn background_run_shell_commands_survive_a_same_registration_session_switch() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_305;
+    let alpha = session_name("run-shell-attach-switch-alpha");
+    let beta = session_name("run-shell-attach-switch-beta");
+    let wait_channel = "run-shell-attach-session-switch";
+    let followed_window_name = "run-shell-followed-attached-session";
+    create_background_identity_session(&handler, alpha.clone()).await;
+    create_background_identity_session(&handler, beta.clone()).await;
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "run-shell -b -C 'wait-for {wait_channel} ; rename-window {followed_window_name}' ; switch-client -t {beta}"
+        ))
+        .expect("background run-shell and attached switch parse");
+    let output = with_expected_attach_and_session_identity(
+        identity,
+        alpha.clone(),
+        identity.session_id(),
+        handler.execute_parsed_commands_for_test(requester_pid, commands),
+    )
+    .await
+    .expect("same-registration attached switch keeps the outer queue valid");
+    assert!(output.stdout().is_empty());
+
+    let switched_identity = handler.active_attach_identity_for_test(requester_pid).await;
+    assert_eq!(switched_identity.attach_id(), identity.attach_id());
+    assert_eq!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached registration survives")
+            .session_name,
+        beta
+    );
+    wait_for_background_waiter(&handler, wait_channel).await;
+    replace_background_identity_session(&handler, alpha.clone()).await;
+    release_background_waiter(&handler, wait_channel).await;
+    wait_for_active_window_name(&handler, &beta, followed_window_name).await;
+    let state = handler.state.lock().await;
+    let replacement = state
+        .sessions
+        .session(&alpha)
+        .expect("replacement alpha exists");
+    assert_ne!(
+        replacement
+            .window_at(replacement.active_window_index())
+            .and_then(rmux_core::Window::name),
+        Some(followed_window_name),
+        "stale background context mutated the replacement alpha session"
+    );
+}
+
+#[tokio::test]
+async fn background_run_shell_expands_implicit_formats_after_attached_switch() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_306;
+    let alpha = session_name("run-shell-format-switch-alpha");
+    let beta = session_name("run-shell-format-switch-beta");
+    create_background_identity_session(&handler, alpha.clone()).await;
+    create_background_identity_session(&handler, beta.clone()).await;
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "run-shell -b -d 0.05 -C 'set-buffer -b bg-format x#{{session_name}}' ; switch-client -t {beta}"
+        ))
+        .expect("background format expansion and attached switch parse");
+    with_expected_attach_and_session_identity(
+        identity,
+        alpha,
+        identity.session_id(),
+        handler.execute_parsed_commands_for_test(requester_pid, commands),
+    )
+    .await
+    .expect("attached switch completes before delayed background expansion");
+
+    wait_for_named_buffer(
+        &handler,
+        "bg-format",
+        format!("x{}", beta.as_str()).as_bytes(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn background_run_shell_builds_environment_for_followed_attached_session() {
+    let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+    let requester_pid = 424_311;
+    let alpha = session_name("run-shell-environment-switch-alpha");
+    let beta = session_name("run-shell-environment-switch-beta");
+    create_background_identity_session(&handler, alpha.clone()).await;
+    create_background_identity_session(&handler, beta.clone()).await;
+    for (session, value) in [(&alpha, "alpha"), (&beta, "beta")] {
+        let response = handler
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
+                scope: ScopeSelector::Session(session.clone()),
+                name: "RMUX_BG_TARGET".to_owned(),
+                value: value.to_owned(),
+                mode: None,
+                hidden: false,
+                format: false,
+            })))
+            .await;
+        assert!(
+            matches!(response, Response::SetEnvironment(_)),
+            "{response:?}"
+        );
+    }
+
+    let root = temp_root("run-shell-followed-environment");
+    std::fs::create_dir_all(&root).expect("background environment output root");
+    let output_path = root.join("target.txt");
+    #[cfg(unix)]
+    let shell_command = format!(
+        "printf '%s' \"$RMUX_BG_TARGET\" > {}",
+        shell_quote(&output_path)
+    );
+    #[cfg(windows)]
+    let shell_command = format!(
+        "[IO.File]::WriteAllText({}, $env:RMUX_BG_TARGET)",
+        crate::test_shell::powershell_quote_path(&output_path)
+    );
+
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+    with_expected_attach_and_session_identity(identity, alpha, identity.session_id(), async {
+        let response = handler
+            .handle_run_shell(
+                requester_pid,
+                RunShellRequest {
+                    command: shell_command,
+                    arguments: Vec::new(),
+                    background: true,
+                    as_commands: false,
+                    show_stderr: true,
+                    delay_seconds: Some(RunShellDelaySeconds(0.05)),
+                    start_directory: Some(root.clone()),
+                    target: None,
+                    source_depth: None,
+                },
+            )
+            .await;
+        assert_eq!(response, Response::RunShell(RunShellResponse::background()));
+
+        let switch = CommandParser::new()
+            .parse(&format!("switch-client -t {beta}"))
+            .expect("attached environment switch parses");
+        handler
+            .execute_parsed_commands_for_test(requester_pid, switch)
+            .await
+            .expect("attached environment switch executes");
+    })
+    .await;
+
+    wait_for_file_text(&output_path, "beta").await;
+    std::fs::remove_dir_all(root).expect("remove background environment output root");
+}
+
+#[tokio::test]
+async fn explicit_background_run_shell_target_survives_attached_switch() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_307;
+    let alpha = session_name("run-shell-explicit-switch-alpha");
+    let beta = session_name("run-shell-explicit-switch-beta");
+    let gamma = session_name("run-shell-explicit-switch-gamma");
+    let expected_window_name = "run-shell-explicit-target";
+    create_background_identity_session(&handler, alpha.clone()).await;
+    create_background_identity_session(&handler, beta.clone()).await;
+    create_background_identity_session(&handler, gamma.clone()).await;
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "run-shell -b -d 0.05 -C -t {gamma}:0.0 'rename-window {expected_window_name}' ; switch-client -t {beta}"
+        ))
+        .expect("explicit background target and attached switch parse");
+    with_expected_attach_and_session_identity(
+        identity,
+        alpha,
+        identity.session_id(),
+        handler.execute_parsed_commands_for_test(requester_pid, commands),
+    )
+    .await
+    .expect("attached switch does not cancel an explicit background target");
+
+    wait_for_active_window_name(&handler, &gamma, expected_window_name).await;
+    let state = handler.state.lock().await;
+    assert_ne!(
+        state
+            .sessions
+            .session(&beta)
+            .and_then(|session| session.window_at(session.active_window_index()))
+            .and_then(rmux_core::Window::name),
+        Some(expected_window_name),
+        "explicit background run-shell must not rebase onto the attached session"
+    );
+}
+
+#[tokio::test]
 async fn background_run_shell_commands_still_emit_after_hooks_outside_hook_context() {
     let handler = RequestHandler::new();
     create_named_session(&handler, "run-shell-after-hooks").await;

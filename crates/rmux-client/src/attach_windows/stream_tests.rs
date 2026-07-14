@@ -156,9 +156,7 @@ async fn lock_completion_preserves_a_concurrent_final_stop(
     .await?;
     write_server_message(&mut server, AttachMessage::Lock("block".to_owned())).await?;
 
-    let action =
-        tokio::task::spawn_blocking(move || action_rx.recv_timeout(Duration::from_secs(1)))
-            .await??;
+    let (action_rx, action) = receive_attach_action(action_rx).await?;
     assert!(matches!(action, AttachAction::LegacyLock(command) if command == "block"));
     let lock_prelude = wait_for_stop_generation(&screen_tracker, None).await?;
 
@@ -170,15 +168,35 @@ async fn lock_completion_preserves_a_concurrent_final_stop(
     let final_stop = wait_for_stop_generation(&screen_tracker, Some(lock_prelude)).await?;
 
     completion_tx.send(Ok(AttachActionOutcome::Unlock))?;
-    timeout(client).await???;
-
     assert_eq!(screen_tracker.current_stop_generation(), Some(final_stop));
     let mut frame = [0_u8; 64];
-    assert_eq!(
-        timeout(server.read(&mut frame)).await??,
-        0,
-        "a stale lock completion must close cleanly without sending unlock"
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), server.read(&mut frame))
+            .await
+            .is_err(),
+        "a stale lock completion must keep waiting without sending unlock"
     );
+    assert!(
+        !client.is_finished(),
+        "a final stop may be followed by a detach action in a later frame"
+    );
+
+    let command = AttachShellCommand::new(
+        "echo bye".to_owned(),
+        "pwsh.exe".to_owned(),
+        r"C:\work".to_owned(),
+    );
+    write_server_message(
+        &mut server,
+        AttachMessage::DetachExecShellCommand(command.clone()),
+    )
+    .await?;
+    let (_action_rx, final_action) = receive_attach_action(action_rx).await?;
+    assert!(
+        matches!(final_action, AttachAction::DetachExec(received) if received.command() == command.command() && received.shell() == command.shell() && received.cwd() == command.cwd())
+    );
+    completion_tx.send(Ok(AttachActionOutcome::Exit))?;
+    timeout(client).await???;
     Ok(())
 }
 

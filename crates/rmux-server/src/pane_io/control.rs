@@ -310,8 +310,16 @@ pub(super) async fn apply_pending_attach_controls(
                 if drop_live_output {
                     snapshot_covered_output_before_sequence = None;
                 } else if !should_drop_output {
-                    snapshot_covered_output_before_sequence =
-                        Some(next_target.pane_output_start_sequence);
+                    // Keep the earliest snapshot boundary for the batch that was
+                    // dequeued before control processing. A later same-source
+                    // receiver may already forward the interval between two
+                    // refreshes, so advancing this boundary would replay it on
+                    // exit.
+                    let next_boundary = next_target.pane_output_start_sequence;
+                    snapshot_covered_output_before_sequence = Some(
+                        snapshot_covered_output_before_sequence
+                            .map_or(next_boundary, |boundary| boundary.min(next_boundary)),
+                    );
                 }
                 let pending_passthroughs = if drop_live_output {
                     Vec::new()

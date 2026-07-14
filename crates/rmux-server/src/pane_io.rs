@@ -2175,6 +2175,10 @@ async fn process_socket_messages(
                     )
                     .await
                     .map_err(io::Error::other)?;
+                // Resuming terminal ownership is an inter-frame barrier. A
+                // following binding may block indefinitely, so flush the
+                // start sequence and render before decoding another frame.
+                break 'messages;
             }
             AttachMessage::KeyDispatched(_) => {
                 return Err(io::Error::other(

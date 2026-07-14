@@ -762,7 +762,6 @@ impl RequestHandler {
                     active.id != expected_attach_id
                         || &active.session_name != expected_session_name
                         || expected_session_id.is_some_and(|expected| active.session_id != expected)
-                        || (expected_session_id.is_some() && active.prompt.is_some())
                         || active.suspended
                         || active.closing.load(std::sync::atomic::Ordering::SeqCst)
                 },
@@ -770,6 +769,11 @@ impl RequestHandler {
                 return Err(crate::handler_support::attached_client_required(
                     "refresh-client",
                 ));
+            }
+            if expected_identity.is_some_and(|(_, _, expected_session_id)| {
+                expected_session_id.is_some() && active.prompt.is_some()
+            }) {
+                return Ok(());
             }
             let Some(overlay) = active.overlay.clone() else {
                 return Ok(());
@@ -804,13 +808,17 @@ impl RequestHandler {
                 active.id != expected_attach_id
                     || &active.session_name != expected_session_name
                     || expected_session_id.is_some_and(|expected| active.session_id != expected)
-                    || (expected_session_id.is_some() && active.prompt.is_some())
                     || active.suspended
             },
         ) {
             return Err(crate::handler_support::attached_client_required(
                 "refresh-client",
             ));
+        }
+        if expected_identity.is_some_and(|(_, _, expected_session_id)| {
+            expected_session_id.is_some() && active.prompt.is_some()
+        }) {
+            return Ok(());
         }
         if active
             .overlay

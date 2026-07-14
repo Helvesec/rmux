@@ -241,35 +241,6 @@ pub(super) fn resolve_target_spec(
     }
 }
 
-pub(super) fn resolve_target_spec_or_none_if_missing(
-    connection: &mut Connection,
-    target: &TargetSpec,
-    target_type: ResolveTargetType,
-    window_index: bool,
-    prefer_unattached: bool,
-) -> Result<Option<rmux_proto::Target>, ExitFailure> {
-    let response = connection
-        .resolve_target(
-            Some(target.raw().to_owned()),
-            target_type,
-            window_index,
-            prefer_unattached,
-        )
-        .map_err(ExitFailure::from_client)?;
-    match response {
-        Response::ResolveTarget(response) => Ok(Some(response.target)),
-        Response::Error(ErrorResponse { error })
-            if target_resolution_is_missing(&error, target_type) =>
-        {
-            Ok(None)
-        }
-        Response::Error(ErrorResponse { error }) => {
-            Err(target_resolution_failure(&error, target_type, target.raw()))
-        }
-        other => Err(unexpected_response("resolve-target", &other)),
-    }
-}
-
 fn target_resolution_failure(
     error: &RmuxError,
     target_type: ResolveTargetType,
@@ -283,21 +254,6 @@ fn target_resolution_failure(
         ExitFailure::ambiguous_target(message)
     } else {
         ExitFailure::new(1, message)
-    }
-}
-
-fn target_resolution_is_missing(error: &RmuxError, target_type: ResolveTargetType) -> bool {
-    match error {
-        RmuxError::SessionNotFound(_) | RmuxError::PaneNotFound { .. } => true,
-        RmuxError::InvalidTarget { reason, .. } => {
-            reason.starts_with("can't find ")
-                || (target_type == ResolveTargetType::Pane
-                    && reason == "pane index does not exist in session")
-                || (target_type == ResolveTargetType::Window
-                    && reason == "window index does not exist in session")
-        }
-        RmuxError::Server(message) => message == "no current target",
-        _ => false,
     }
 }
 
@@ -479,35 +435,5 @@ mod tests {
             "a:99",
         );
         assert_eq!(message, "can't find window: 99");
-    }
-
-    #[test]
-    fn optional_target_resolution_accepts_only_missing_targets() {
-        assert!(target_resolution_is_missing(
-            &RmuxError::SessionNotFound("alpha".to_owned()),
-            ResolveTargetType::Pane,
-        ));
-        assert!(target_resolution_is_missing(
-            &RmuxError::InvalidTarget {
-                value: "missing".to_owned(),
-                reason: "can't find pane: missing".to_owned(),
-            },
-            ResolveTargetType::Pane,
-        ));
-
-        assert!(!target_resolution_is_missing(
-            &RmuxError::InvalidTarget {
-                value: "alpha".to_owned(),
-                reason: "ambiguous target: alpha".to_owned(),
-            },
-            ResolveTargetType::Pane,
-        ));
-        assert!(!target_resolution_is_missing(
-            &RmuxError::InvalidTarget {
-                value: "alpha".to_owned(),
-                reason: "invalid pane syntax".to_owned(),
-            },
-            ResolveTargetType::Pane,
-        ));
     }
 }

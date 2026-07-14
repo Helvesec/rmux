@@ -245,9 +245,10 @@ where
                             && screen_tracker.was_stopped()
                             && !current_stop_owned_by_pending_resume
                         {
-                            terminal::resume_ctrl_c_input();
-                            locked.unlock();
-                            return Ok(());
+                            // A final detach action may follow its stop sequence
+                            // in a separate frame. Keep the attach reader alive
+                            // and input locked until that action or EOF arrives.
+                            continue;
                         }
                         if let Err(error) =
                             write_async_attach_message(&mut writer, AttachMessage::Unlock).await

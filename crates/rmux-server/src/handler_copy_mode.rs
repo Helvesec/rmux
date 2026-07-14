@@ -26,6 +26,9 @@ mod refresh_fanout;
 #[path = "handler_copy_mode/search.rs"]
 mod search;
 
+#[cfg(test)]
+pub(in crate::handler) use refresh_fanout::install_copy_mode_mutation_pause;
+
 use input::{attached_copy_mode_input_action, AttachedCopyModeInputAction};
 
 impl RequestHandler {
@@ -489,17 +492,12 @@ impl RequestHandler {
             }
         }
 
+        #[cfg(test)]
+        refresh_fanout::pause_after_copy_mode_mutation(requester_pid).await;
+
         let refresh_identities = self
             .prepare_copy_mode_refresh_fanout(&target, expected_session_id, mode_changed)
             .await?;
-        if let Some(identity) = identity {
-            let (session_name, session_id) = self
-                .attached_session_identity_for_identity(identity)
-                .await?;
-            if session_name != *target.session_name() || session_id != expected_session_id {
-                return Err(RmuxError::Server("attached session disappeared".to_owned()));
-            }
-        }
         self.refresh_copy_mode_session_identities(refresh_identities)
             .await;
 

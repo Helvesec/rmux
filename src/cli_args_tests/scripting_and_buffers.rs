@@ -319,6 +319,10 @@ fn if_shell_accepts_format_mode_target_and_optional_else_command() {
             assert_eq!(args.condition, "#{pane_active}");
             assert_eq!(args.then_command, "set-buffer yes");
             assert_eq!(args.else_command.as_deref(), Some("set-buffer no"));
+            assert_eq!(
+                args.queue_command,
+                "if-shell -F -t alpha:0.1 \"#{pane_active}\" \"set-buffer yes\" \"set-buffer no\""
+            );
         }
         _ => panic!("expected IfShell command"),
     }
@@ -347,7 +351,7 @@ fn if_shell_preserves_runtime_resolved_target_syntax() {
 }
 
 #[test]
-fn if_shell_marks_mouse_targets_for_server_side_fallback() {
+fn if_shell_preserves_mouse_target_for_server_queue() {
     let cli = parse_args(&[
         "if-shell",
         "-F",
@@ -359,10 +363,9 @@ fn if_shell_marks_mouse_targets_for_server_side_fallback() {
     .expect("mouse target should parse");
 
     match cli.command.expect("parsed command") {
-        super::super::Command::IfShell(args) => assert!(
-            args.target.expect("target").is_deferred_mouse_target(),
-            "mouse target must remain deferred"
-        ),
+        super::super::Command::IfShell(args) => {
+            assert_eq!(args.target.expect("target").raw(), "{mouse}")
+        }
         _ => panic!("expected IfShell command"),
     }
 }

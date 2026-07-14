@@ -235,9 +235,23 @@ run_rmux_smoke() {
   assert_trace display_message_prefix "rmux tiny: direct: display-message"
   assert_stdout_line display_message_prefix "prefixdemo"
 
+  "$RMUX" -L "$sock" set-buffer -b tiny-send-hook seed >/dev/null
+  "$RMUX" -L "$sock" set-hook -g command-error \
+    'set-buffer -a -b tiny-send-hook x' >/dev/null
+
   run_capture send_keys_prefix -L "$sock" send-keys -t prefixd:0.0 C-l
   assert_rc send_keys_prefix 0
   assert_trace send_keys_prefix "rmux tiny: direct: send-keys"
+  [ "$("$RMUX" -L "$sock" show-buffer -b tiny-send-hook)" = "seed" ] ||
+    die "successful tiny send-keys prefix resolution emitted command-error"
+
+  run_capture send_keys_missing -L "$sock" send-keys -t absent:0.0 C-l
+  [ "$(cat "$SMOKE_ROOT/send_keys_missing.rc")" != "0" ] ||
+    die "missing tiny send-keys target unexpectedly succeeded"
+  assert_trace send_keys_missing "rmux tiny: direct: send-keys"
+  [ "$("$RMUX" -L "$sock" show-buffer -b tiny-send-hook)" = "seedx" ] ||
+    die "failed tiny send-keys did not emit command-error exactly once"
+  "$RMUX" -L "$sock" set-hook -gu command-error >/dev/null
 
   run_capture if_shell_prefix -L "$sock" if-shell -F -t prefixd \
     '#{==:#{session_name},prefixdemo}' \

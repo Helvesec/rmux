@@ -25,9 +25,9 @@ use rmux_proto::request::{
 };
 use rmux_proto::{
     CapturePaneTargetActionRequest, JoinPaneRequest, ListSessionsRequest,
-    ResizePaneTargetActionRequest, Response, RmuxError, SetOptionMode, SourceFileResponse,
-    SplitDirection, SplitWindowTargetActionRequest, CAPABILITY_ATTACH_RENDER,
-    CAPABILITY_ATTACH_RESIZE_GEOMETRY, RMUX_WIRE_VERSION,
+    ResizePaneTargetActionRequest, ResolveTargetType, Response, RmuxError, SetOptionMode,
+    SourceFileResponse, SplitDirection, SplitWindowTargetActionRequest, Target,
+    CAPABILITY_ATTACH_RENDER, CAPABILITY_ATTACH_RESIZE_GEOMETRY, RMUX_WIRE_VERSION,
 };
 #[cfg(windows)]
 use rmux_proto::{CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_DAEMON_STATUS};
@@ -757,7 +757,7 @@ impl TinyCommand {
             Self::SendKeys {
                 socket_path,
                 request,
-            } => run_send_keys(original_args, &socket_path, request),
+            } => run_send_keys(&socket_path, request),
             Self::SourceFile {
                 socket_path,
                 request,
@@ -1038,19 +1038,35 @@ fn run_display_message(
     write_response_output_or_error(response, "display-message")
 }
 
-fn run_send_keys(
-    original_args: &[OsString],
-    socket_path: &Path,
-    request: TinySendKeys,
-) -> Result<i32, String> {
+fn run_send_keys(socket_path: &Path, request: TinySendKeys) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
-        .send_keys(request.target, request.keys)
+        .resolve_target(
+            Some(request.raw_target),
+            ResolveTargetType::Pane,
+            false,
+            false,
+        )
         .map_err(|error| error.to_string())?;
-    if response_needs_session_resolution_retry(&response) {
-        return exec_full_helper(original_args);
-    }
+    let target = send_keys_resolved_target(response)?;
+    let response = connection
+        .send_keys(target, request.keys)
+        .map_err(|error| error.to_string())?;
     write_response_output_or_error(response, "send-keys")
+}
+
+fn send_keys_resolved_target(response: Response) -> Result<rmux_proto::PaneTarget, String> {
+    match response {
+        Response::ResolveTarget(response) => match response.target {
+            Target::Pane(target) => Ok(target),
+            _ => Err(
+                "protocol error: resolve-target returned a non-pane target for send-keys"
+                    .to_owned(),
+            ),
+        },
+        Response::Error(error) => Err(tmux_cli_error_message("send-keys", &error.error)),
+        _ => Err("protocol error: unexpected response while resolving send-keys target".to_owned()),
+    }
 }
 
 fn run_new_window(

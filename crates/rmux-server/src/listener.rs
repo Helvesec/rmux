@@ -6,7 +6,7 @@ use std::time::Duration;
 use rmux_ipc::{wait_for_peer_close, LocalListener, LocalStream, PeerIdentity};
 use rmux_proto::{
     encode_frame, ErrorResponse, FrameDecoder, Request, Response, WaitForMode,
-    CAPABILITY_SDK_WAITS_ARMED,
+    CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2, CAPABILITY_SDK_WAITS_ARMED,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
@@ -16,8 +16,9 @@ use tracing::{debug, warn};
 use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
-    attach_support::AttachRegistration, ControlClientIdentity, ControlRegistration,
-    DetachedRequestGuard, PreparedSdkWait, RequestHandler,
+    attach_support::AttachRegistration, with_session_lease_create_addressing,
+    ControlClientIdentity, ControlRegistration, DetachedRequestGuard, PreparedSdkWait,
+    RequestHandler, SessionLeaseCreateAddressing,
 };
 use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
@@ -184,6 +185,7 @@ async fn serve_connection(
     let mut conn = Connection::new(stream);
     let detached_connection_guard = handler.begin_detached_connection(connection_id);
     let mut sdk_wait_armed_ack_enabled = false;
+    let mut session_lease_by_id_enabled = false;
 
     loop {
         tokio::select! {
@@ -214,6 +216,13 @@ async fn serve_connection(
                 if request_enables_sdk_wait_armed_ack(&request) {
                     sdk_wait_armed_ack_enabled = true;
                 }
+                let enables_session_lease_by_id =
+                    request_enables_session_lease_by_id(&request);
+                let session_lease_create_addressing = if session_lease_by_id_enabled {
+                    SessionLeaseCreateAddressing::StableId
+                } else {
+                    SessionLeaseCreateAddressing::Nominal
+                };
                 let cancel_on_peer_disconnect = request_cancels_on_peer_disconnect(&request);
                 debug!("dispatching {}", request.command_name());
                 let mut outcome = match request {
@@ -257,7 +266,10 @@ async fn serve_connection(
                     }
                     request => {
                         tokio::select! {
-                            outcome = handler.dispatch_for_connection(requester.pid, connection_id, request) => outcome,
+                            outcome = with_session_lease_create_addressing(
+                                session_lease_create_addressing,
+                                handler.dispatch_for_connection(requester.pid, connection_id, request),
+                            ) => outcome,
                             result = shutdown.changed() => {
                                 if result.is_ok() {
                                     debug!("closing client connection during shutdown");
@@ -272,6 +284,11 @@ async fn serve_connection(
                         }
                     }
                 };
+                if enables_session_lease_by_id
+                    && matches!(&outcome.response, Response::Handshake(_))
+                {
+                    session_lease_by_id_enabled = true;
+                }
                 // An attach registration is removed as soon as its last
                 // session closes, but its forwarder still has to deliver the
                 // terminal exit frame. Bridge that transition before any
@@ -560,6 +577,17 @@ fn request_enables_sdk_wait_armed_ack(request: &Request) -> bool {
     )
 }
 
+fn request_enables_session_lease_by_id(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Handshake(handshake)
+            if handshake
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2)
+    )
+}
+
 fn request_cancels_on_peer_disconnect(request: &Request) -> bool {
     matches!(
         request,
@@ -695,12 +723,13 @@ mod tests {
     use super::*;
     use crate::server_access::AccessMode;
     use rmux_proto::{
-        decode_frame, AttachSessionRequest, CancelSdkWaitResponse, DaemonStatusRequest,
-        ErrorResponse, HandshakeRequest, ListSessionsRequest, NewSessionRequest,
-        PaneOutputSubscriptionStart, PaneTarget, RenameSessionRequest, RmuxError,
-        SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome,
-        SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest, ShutdownIfIdleResponse, TerminalSize,
-        WaitForMode, WaitForRequest, WaitForResponse, RMUX_WIRE_VERSION,
+        decode_frame, AttachSessionRequest, CancelSdkWaitResponse, CreateSessionLeaseRequest,
+        DaemonStatusRequest, ErrorResponse, HandshakeRequest, HasSessionRequest,
+        ListSessionsRequest, NewSessionRequest, PaneOutputSubscriptionStart, PaneTarget,
+        RenameSessionRequest, RmuxError, SdkWaitForOutputRequest, SdkWaitForOutputResponse,
+        SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest,
+        ShutdownIfIdleResponse, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse,
+        RMUX_WIRE_VERSION,
     };
 
     #[test]
@@ -983,6 +1012,104 @@ mod tests {
                 outcome: SdkWaitOutcome::Matched,
             })
         );
+        drop(client);
+        connection_task.await.expect("connection task")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn negotiated_session_lease_by_id_survives_name_reuse_before_creation() -> io::Result<()>
+    {
+        let handler = Arc::new(RequestHandler::new());
+        let original_name = SessionName::new("lease-negotiated-owner").expect("valid session");
+        let renamed = SessionName::new("lease-negotiated-renamed").expect("valid session");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: original_name.clone(),
+                    detached: true,
+                    size: None,
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::RenameSession(RenameSessionRequest {
+                    target: original_name.clone(),
+                    new_name: renamed.clone(),
+                }))
+                .await,
+            Response::RenameSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: original_name.clone(),
+                    detached: true,
+                    size: None,
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+
+        let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+        write_test_request(
+            &mut client,
+            Request::Handshake(HandshakeRequest::requiring([
+                CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
+            ])),
+        )
+        .await?;
+        assert!(matches!(
+            read_test_response(&mut client).await?,
+            Response::Handshake(_)
+        ));
+
+        write_test_request(
+            &mut client,
+            Request::CreateSessionLease(CreateSessionLeaseRequest {
+                session_name: SessionName::new("$0").expect("stable session target"),
+                ttl_millis: 600,
+            }),
+        )
+        .await?;
+        assert!(matches!(
+            read_test_response(&mut client).await?,
+            Response::CreateSessionLease(_)
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let renamed_exists = handler
+                .handle(Request::HasSession(HasSessionRequest {
+                    target: renamed.clone(),
+                }))
+                .await;
+            if matches!(
+                renamed_exists,
+                Response::HasSession(rmux_proto::HasSessionResponse { exists: false })
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stable-id lease did not reap the originally created session"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            handler
+                .handle(Request::HasSession(HasSessionRequest {
+                    target: original_name,
+                }))
+                .await,
+            Response::HasSession(rmux_proto::HasSessionResponse { exists: true }),
+            "the session that reused the nominal name must survive"
+        );
+
         drop(client);
         connection_task.await.expect("connection task")?;
         Ok(())

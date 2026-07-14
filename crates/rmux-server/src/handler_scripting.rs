@@ -17,6 +17,7 @@ use super::control_support::{
     ControlClientIdentity, ControlQueueEofAction,
 };
 use super::{
+    active_session_target, current_expected_attach_identity, expected_attach_follows_registration,
     rebase_expected_attach_session_after_switch, validate_expected_attach_identity, RequestHandler,
 };
 use crate::control::ControlCommandResult;
@@ -128,6 +129,35 @@ struct QueuedCommandExecution {
 }
 
 impl RequestHandler {
+    async fn attached_queue_target_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+    ) -> Result<Target, RmuxError> {
+        let state = self.state.lock().await;
+        let active_attach = self.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&identity.attach_pid())
+            .filter(|active| {
+                active.id == identity.attach_id()
+                    && active.session_id == identity.session_id()
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .ok_or_else(|| {
+                RmuxError::Server(
+                    "attached client identity changed before background command execution"
+                        .to_owned(),
+                )
+            })?;
+        let session = state
+            .sessions
+            .session(&active.session_name)
+            .filter(|session| session.id() == active.session_id)
+            .ok_or_else(|| RmuxError::SessionNotFound(active.session_name.to_string()))?;
+        active_session_target(&state.sessions, session.name())
+            .ok_or_else(|| RmuxError::Server("attached session has no current target".to_owned()))
+    }
+
     #[cfg(test)]
     pub(crate) async fn execute_parsed_commands_for_test(
         &self,
@@ -430,11 +460,44 @@ impl RequestHandler {
             if queue.is_empty() {
                 break 'command_queue;
             }
-            if let Err(error) = validate_expected_attach_identity(self, requester_pid).await {
-                execution_errors.push(error.clone());
-                errors.push(error);
-                exit_status = Some(1);
-                break 'command_queue;
+            let expected_attach = match validate_expected_attach_identity(self, requester_pid).await
+            {
+                Ok(identity) => identity,
+                Err(error) => {
+                    execution_errors.push(error.clone());
+                    errors.push(error);
+                    exit_status = Some(1);
+                    break 'command_queue;
+                }
+            };
+            if expected_attach_follows_registration()
+                && contexts
+                    .iter()
+                    .any(QueueExecutionContext::follows_attached_session)
+            {
+                let Some(identity) = expected_attach else {
+                    let error = RmuxError::Server(
+                        "background command lost its attached client identity".to_owned(),
+                    );
+                    execution_errors.push(error.clone());
+                    errors.push(error);
+                    exit_status = Some(1);
+                    break 'command_queue;
+                };
+                let target = match self.attached_queue_target_for_identity(identity).await {
+                    Ok(target) => target,
+                    Err(error) => {
+                        execution_errors.push(error.clone());
+                        errors.push(error);
+                        exit_status = Some(1);
+                        break 'command_queue;
+                    }
+                };
+                for context in &mut contexts {
+                    if context.follows_attached_session() {
+                        context.rebase_current_target_after_attached_switch(target.clone());
+                    }
+                }
             }
             if control_queue_eof_action(control_identity) == ControlQueueEofAction::StopFrame {
                 break 'command_queue;
@@ -473,7 +536,7 @@ impl RequestHandler {
             let command_action = command_action.map(|execution| {
                 if let Some(target) = execution.attached_switch_target {
                     for context in &mut contexts {
-                        context.rebase_implicit_current_target(target.clone());
+                        context.rebase_current_target_after_attached_switch(target.clone());
                     }
                 }
                 execution.action
@@ -1226,7 +1289,10 @@ fn apply_queue_context_to_request(
 ) -> Request {
     match &mut request {
         Request::RunShell(run_shell) => {
-            if run_shell.target.is_none() {
+            let follows_attached_registration = run_shell.background
+                && current_expected_attach_identity().is_some()
+                && !context.uses_explicit_current_target();
+            if run_shell.target.is_none() && !follows_attached_registration {
                 if let Some(Target::Pane(target)) = context.current_target() {
                     run_shell.target = Some(target.clone());
                 }

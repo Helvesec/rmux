@@ -706,6 +706,169 @@ fn if_shell_missing_target_keeps_the_server_fallback() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn if_shell_target_resolution_has_one_logical_command_error_boundary() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("if-shell-command-error-boundary")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "if-shell-hook", "seed"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "command-error",
+        "set-buffer -a -b if-shell-hook x",
+    ])?);
+
+    let missing = harness.run(&[
+        "if-shell",
+        "-F",
+        "-t",
+        "missing",
+        "1",
+        "set-buffer -b if-shell-selected yes",
+    ])?;
+    assert_success(&missing);
+    assert!(stderr(&missing).is_empty());
+    assert_eq!(
+        stdout(&harness.run(&["show-buffer", "-b", "if-shell-hook"])?),
+        "seed",
+        "a successful missing-target fallback must not emit command-error"
+    );
+
+    let invalid = harness.run(&[
+        "if-shell",
+        "-F",
+        "-t",
+        "$bogus",
+        "1",
+        "set-buffer -b if-shell-selected no",
+    ])?;
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(stderr(&invalid).contains("must be followed by an unsigned integer"));
+    assert_eq!(
+        stdout(&harness.run(&["show-buffer", "-b", "if-shell-hook"])?),
+        "seedx",
+        "one failed logical if-shell command must emit command-error exactly once"
+    );
+    Ok(())
+}
+
+#[test]
+fn if_shell_current_target_can_fail_on_an_empty_server() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("if-shell-empty-current-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set-option", "-g", "exit-empty", "off"])?);
+    assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
+
+    let output = harness.run(&[
+        "if-shell",
+        "-F",
+        "-t",
+        ".",
+        "1",
+        "set-buffer -b if-shell-empty-current selected",
+    ])?;
+    assert_success(&output);
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty());
+    assert_eq!(
+        stdout(&harness.run(&["show-buffer", "-b", "if-shell-empty-current",])?),
+        "selected"
+    );
+    Ok(())
+}
+
+#[test]
+fn if_shell_ignores_a_stale_inherited_pane_without_emitting_command_error(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("if-shell-stale-inherited-pane")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "if-shell-hook", "seed"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "command-error",
+        "set-buffer -a -b if-shell-hook x",
+    ])?);
+
+    let rmux = format!("{},0,0", harness.socket_path().display());
+    let output = harness.run_with(
+        &[
+            "if-shell",
+            "-F",
+            "-t",
+            "alpha",
+            "1",
+            "set-buffer -b if-shell-selected yes",
+        ],
+        |command| {
+            command.env("RMUX", rmux);
+            command.env("RMUX_PANE", "%999999");
+        },
+    )?;
+    assert_success(&output);
+    assert!(stderr(&output).is_empty());
+    assert_eq!(
+        stdout(&harness.run(&["show-buffer", "-b", "if-shell-hook"])?),
+        "seed",
+        "a stale inherited pane must not create an auxiliary command-error boundary"
+    );
+    assert_eq!(
+        stdout(&harness.run(&["show-buffer", "-b", "if-shell-selected"])?),
+        "yes"
+    );
+    Ok(())
+}
+
+#[test]
+fn if_shell_preserves_source_file_shaped_stdout() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("if-shell-source-shaped-stdout")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&["if-shell", "-F", "1", "display-message -p -- '-:1: hello'"])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "-:1: hello\n");
+    assert!(stderr(&output).is_empty());
+
+    let invalid = harness.run(&[
+        "if-shell",
+        "-F",
+        "-t",
+        "$bogus",
+        "1",
+        "display-message -p unreachable",
+    ])?;
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(stdout(&invalid).is_empty());
+    assert!(stderr(&invalid).contains("must be followed by an unsigned integer"));
+    Ok(())
+}
+
+#[test]
+fn if_shell_propagates_a_nested_source_failure_after_stdout() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("if-shell-nested-source-status")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let invalid_config = harness.tmpdir().join("invalid.conf");
+    fs::write(&invalid_config, "definitely-not-an-rmux-command\n")?;
+    let branch = format!(
+        "display-message -p ok ; source-file '{}'",
+        invalid_config.display()
+    );
+
+    let output = harness.run(&["if-shell", "-F", "1", &branch])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).starts_with("ok\n"));
+    assert!(stdout(&output).contains("unknown command"));
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
 fn if_shell_mouse_target_keeps_the_server_fallback() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("if-shell-mouse-target-fallback")?;
     let _daemon = harness.start_hidden_daemon()?;

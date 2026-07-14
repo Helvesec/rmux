@@ -4,7 +4,8 @@ use rmux_proto::{
     encode_frame, CreateSessionLeaseResponse, ErrorResponse, FrameDecoder, HandshakeResponse,
     KillSessionResponse, NewSessionResponse, ReleaseSessionLeaseResponse,
     RenewSessionLeaseResponse, CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
-    CAPABILITY_SDK_SESSION_LEASE_BY_ID, RMUX_WIRE_VERSION, SUPPORTED_CAPABILITIES,
+    CAPABILITY_SDK_SESSION_LEASE_BY_ID, CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2, RMUX_WIRE_VERSION,
+    SUPPORTED_CAPABILITIES,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -65,10 +66,10 @@ impl FakeDaemon {
 
 #[cfg(any(unix, windows))]
 #[test]
-fn failed_signal_install_can_retry_then_detach_without_killing_the_session() {
-    let (runtime, owned, mut daemon, installed) = signal_install_fixture("retry-signal-owner");
+fn live_signal_guard_is_disarmed_by_detach_without_killing_the_session() {
+    let (runtime, owned, mut daemon, state) = signal_install_fixture("retry-signal-owner");
 
-    assert_signal_install_fails_without_latching(&owned, &installed);
+    assert_signal_install_fails_without_latching(&owned, &state);
 
     let guard = runtime
         .block_on(async { owned.install_default_signal_handlers() })
@@ -80,43 +81,57 @@ fn failed_signal_install_can_retry_then_detach_without_killing_the_session() {
         duplicate.to_string().contains("already installed"),
         "unexpected duplicate-install error: {duplicate}"
     );
-    drop(guard);
     let detached = runtime
         .block_on(owned.detach_owned())
-        .expect("dropping the retried guard permits detaching ownership");
+        .expect("detaching ownership must disarm the live signal guard");
+    assert!(state.is_disarmed(), "live signal cleanup must be disarmed");
+    assert!(
+        !state.try_begin_cleanup(),
+        "a signal after detach must not begin cleanup"
+    );
 
     runtime.block_on(async {
         assert!(
             tokio::time::timeout(Duration::from_millis(250), daemon.read_request())
                 .await
                 .is_err(),
-            "detach after a recovered installation must not kill the session"
+            "detach with a live signal guard must not kill the session"
         );
     });
+    drop(guard);
     drop(detached);
 }
 
 #[cfg(any(unix, windows))]
 #[test]
-fn failed_signal_install_can_preserve_without_killing_the_session() {
-    let (runtime, owned, mut daemon, installed) = signal_install_fixture("preserve-signal-owner");
+fn live_signal_guard_is_disarmed_by_preserve_without_killing_the_session() {
+    let (runtime, owned, mut daemon, state) = signal_install_fixture("preserve-signal-owner");
 
-    assert_signal_install_fails_without_latching(&owned, &installed);
+    assert_signal_install_fails_without_latching(&owned, &state);
 
+    let guard = runtime
+        .block_on(async { owned.install_default_signal_handlers() })
+        .expect("installation can be retried inside a Tokio runtime");
     let preserved = runtime
         .block_on(owned.preserve())
-        .expect("failed installation must not block preserving ownership");
+        .expect("preserving ownership must disarm the live signal guard");
+    assert!(state.is_disarmed(), "live signal cleanup must be disarmed");
+    assert!(
+        !state.try_begin_cleanup(),
+        "a signal after preserve must not begin cleanup"
+    );
     let keepalive = preserved.session().transport().clone();
-    drop(preserved);
 
     runtime.block_on(async {
         assert!(
             tokio::time::timeout(Duration::from_millis(250), daemon.read_request())
                 .await
                 .is_err(),
-            "preserve after a failed installation must disarm Drop cleanup"
+            "preserve with a live signal guard must not kill the session"
         );
     });
+    drop(guard);
+    drop(preserved);
     drop(keepalive);
 }
 
@@ -127,15 +142,15 @@ fn signal_install_fixture(
     tokio::runtime::Runtime,
     OwnedSession,
     FakeDaemon,
-    Arc<AtomicBool>,
+    Arc<signals::SignalHandlerState>,
 ) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("test runtime builds");
-    let (owned, daemon, installed) = runtime.block_on(async {
+    let (owned, daemon, state) = runtime.block_on(async {
         let (client_stream, server_stream) = tokio::io::duplex(1024);
-        let installed = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(signals::SignalHandlerState::default());
         let owned = OwnedSession {
             session: Some(Session::new(
                 SessionName::new(name).expect("valid session name"),
@@ -148,15 +163,18 @@ fn signal_install_fixture(
             session_id: SessionId::new(42),
             cleanup_policy: CleanupPolicy::KillOnDrop,
             lease: None,
-            signal_handlers_installed: Arc::clone(&installed),
+            signal_handler_state: Arc::clone(&state),
         };
-        (owned, FakeDaemon::new(server_stream), installed)
+        (owned, FakeDaemon::new(server_stream), state)
     });
-    (runtime, owned, daemon, installed)
+    (runtime, owned, daemon, state)
 }
 
 #[cfg(any(unix, windows))]
-fn assert_signal_install_fails_without_latching(owned: &OwnedSession, installed: &AtomicBool) {
+fn assert_signal_install_fails_without_latching(
+    owned: &OwnedSession,
+    state: &signals::SignalHandlerState,
+) {
     let error = owned
         .install_default_signal_handlers()
         .expect_err("installation outside a Tokio runtime must fail");
@@ -165,7 +183,7 @@ fn assert_signal_install_fails_without_latching(owned: &OwnedSession, installed:
         "unexpected installation error: {error}"
     );
     assert!(
-        !installed.load(Ordering::Acquire),
+        !state.is_installed(),
         "failed installation must release the single-handler reservation"
     );
 }
@@ -173,7 +191,7 @@ fn assert_signal_install_fails_without_latching(owned: &OwnedSession, installed:
 #[tokio::test]
 async fn released_owner_rejects_signal_handlers_without_latching_installation() {
     let (client_stream, _server_stream) = tokio::io::duplex(1024);
-    let installed = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(signals::SignalHandlerState::default());
     let owned = OwnedSession {
         session: Some(Session::new(
             SessionName::new("preserved-owner").expect("valid session name"),
@@ -186,7 +204,7 @@ async fn released_owner_rejects_signal_handlers_without_latching_installation() 
         session_id: SessionId::new(42),
         cleanup_policy: CleanupPolicy::Preserve,
         lease: None,
-        signal_handlers_installed: Arc::clone(&installed),
+        signal_handler_state: Arc::clone(&state),
     };
 
     let error = owned
@@ -200,39 +218,8 @@ async fn released_owner_rejects_signal_handlers_without_latching_installation() 
         "unexpected error: {error}"
     );
     assert!(
-        !installed.load(Ordering::Acquire),
+        !state.is_installed(),
         "rejected installation must not latch the single-handler flag"
-    );
-}
-
-#[tokio::test]
-async fn preserve_rejects_an_already_installed_stable_identity_signal_cleanup() {
-    let (client_stream, _server_stream) = tokio::io::duplex(1024);
-    let owned = OwnedSession {
-        session: Some(Session::new(
-            SessionName::new("preserved-signal-owner").expect("valid session name"),
-            crate::RmuxEndpoint::Default,
-            None,
-            TransportClient::spawn(client_stream),
-            true,
-            None,
-        )),
-        session_id: SessionId::new(43),
-        cleanup_policy: CleanupPolicy::KillOnDrop,
-        lease: None,
-        signal_handlers_installed: Arc::new(AtomicBool::new(true)),
-    };
-
-    let error = owned
-        .preserve()
-        .await
-        .expect_err("an active signal guard must block the preserve handoff");
-
-    assert!(
-        error
-            .to_string()
-            .contains("drop owned-session signal handlers before preserving or detaching"),
-        "unexpected error: {error}"
     );
 }
 
@@ -288,15 +275,16 @@ async fn legacy_wire_peer_is_rejected_before_owned_session_mutation_for_every_po
 }
 
 #[tokio::test]
-async fn owner_exit_uses_existing_bounded_lease_with_nominal_wire_address() {
+async fn owner_exit_uses_bounded_lease_with_stable_identity_address() {
     let (builder, mut daemon, session_name) =
         start_owned_builder(CleanupPolicy::KillOnOwnerExit).await;
     answer_new_session(&mut daemon, session_name.clone()).await;
+    answer_lease_identity_handshake(&mut daemon, current_capabilities()).await;
 
     let Request::CreateSessionLease(lease) = daemon.read_request().await else {
         panic!("owner-exit must use the existing bounded lease endpoint");
     };
-    assert_eq!(lease.session_name, session_name);
+    assert_eq!(lease.session_name.as_str(), "$42");
     assert_eq!(lease.ttl_millis, 600);
     daemon
         .write_response(Response::CreateSessionLease(CreateSessionLeaseResponse {
@@ -321,20 +309,22 @@ async fn owner_exit_uses_existing_bounded_lease_with_nominal_wire_address() {
 }
 
 #[tokio::test]
-async fn owner_exit_retains_nominal_wire_address_for_renew_and_release() {
-    let capabilities = SUPPORTED_CAPABILITIES
+async fn owner_exit_retains_stable_wire_address_for_renew_and_release() {
+    let capabilities: Vec<String> = SUPPORTED_CAPABILITIES
         .iter()
         .copied()
         .map(str::to_owned)
         .collect();
+    let handshake_capabilities = capabilities.clone();
     let (builder, mut daemon, session_name) =
         start_owned_builder_with_capabilities(CleanupPolicy::KillOnOwnerExit, capabilities).await;
     answer_new_session(&mut daemon, session_name.clone()).await;
+    answer_lease_identity_handshake(&mut daemon, handshake_capabilities).await;
 
     let Request::CreateSessionLease(lease) = daemon.read_request().await else {
-        panic!("current daemon must receive the existing nominal lease request");
+        panic!("current daemon must receive the negotiated identity lease request");
     };
-    assert_eq!(lease.session_name, session_name);
+    assert_eq!(lease.session_name.as_str(), "$42");
     daemon
         .write_response(Response::CreateSessionLease(CreateSessionLeaseResponse {
             token: 9,
@@ -348,9 +338,9 @@ async fn owner_exit_retains_nominal_wire_address_for_renew_and_release() {
         .expect("current lease capability must keep owner-exit usable");
 
     let Request::RenewSessionLease(renew) = daemon.read_request().await else {
-        panic!("nominal lease address must be retained for heartbeat renewal");
+        panic!("stable lease address must be retained for heartbeat renewal");
     };
-    assert_eq!(renew.session_name, session_name);
+    assert_eq!(renew.session_name.as_str(), "$42");
     daemon
         .write_response(Response::RenewSessionLease(RenewSessionLeaseResponse {
             renewed: true,
@@ -359,9 +349,9 @@ async fn owner_exit_retains_nominal_wire_address_for_renew_and_release() {
 
     let preserve = tokio::spawn(async move { owned.preserve().await });
     let Request::ReleaseSessionLease(release) = daemon.read_request().await else {
-        panic!("nominal lease address must be retained for ownership release");
+        panic!("stable lease address must be retained for ownership release");
     };
-    assert_eq!(release.session_name, session_name);
+    assert_eq!(release.session_name.as_str(), "$42");
     daemon
         .write_response(Response::ReleaseSessionLease(ReleaseSessionLeaseResponse {
             released: true,
@@ -370,44 +360,33 @@ async fn owner_exit_retains_nominal_wire_address_for_renew_and_release() {
     let preserved = preserve
         .await
         .expect("preserve task joins")
-        .expect("nominal lease release succeeds");
+        .expect("stable lease release succeeds");
     drop(preserved);
 }
 
 #[tokio::test]
-async fn owner_exit_honors_explicit_identity_lease_capability_from_compatible_daemon() {
+async fn owner_exit_rejects_legacy_identity_addressing_before_mutation() {
     let mut capabilities = SUPPORTED_CAPABILITIES
         .iter()
-        .map(|capability| (*capability).to_owned())
+        .copied()
+        .filter(|capability| *capability != CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2)
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     capabilities.push(CAPABILITY_SDK_SESSION_LEASE_BY_ID.to_owned());
-    let (builder, mut daemon, session_name) =
+    let (builder, mut daemon, _) =
         start_owned_builder_with_capabilities(CleanupPolicy::KillOnOwnerExit, capabilities).await;
-    answer_new_session(&mut daemon, session_name).await;
 
-    let Request::CreateSessionLease(lease) = daemon.read_request().await else {
-        panic!("identity-capable daemon must receive the negotiated lease request");
-    };
-    assert_eq!(lease.session_name.as_str(), "$42");
-    daemon
-        .write_response(Response::CreateSessionLease(CreateSessionLeaseResponse {
-            token: 11,
-            ttl_millis: 600,
-        }))
-        .await;
-
-    let owned = builder
+    let error = builder
         .await
         .expect("builder task joins")
-        .expect("explicit identity-capable lease builds");
-    drop(owned);
-    let Request::KillSession(cleanup) = daemon.read_request().await else {
-        panic!("owner-exit Drop must retain stable cleanup identity");
-    };
-    assert_eq!(cleanup.target.as_str(), "$42");
-    daemon
-        .write_response(Response::KillSession(KillSessionResponse { existed: true }))
-        .await;
+        .expect_err("legacy identity semantics must not authorize owned-session mutation");
+    assert!(
+        error
+            .to_string()
+            .contains(CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2),
+        "unexpected missing-capability error: {error}"
+    );
+    daemon.assert_no_follow_up_request().await;
 }
 
 #[tokio::test]
@@ -415,11 +394,12 @@ async fn owner_exit_rolls_back_created_session_when_lease_creation_fails() {
     let (builder, mut daemon, session_name) =
         start_owned_builder(CleanupPolicy::KillOnOwnerExit).await;
     answer_new_session(&mut daemon, session_name.clone()).await;
+    answer_lease_identity_handshake(&mut daemon, current_capabilities()).await;
 
     let Request::CreateSessionLease(lease) = daemon.read_request().await else {
         panic!("owner-exit must attempt its lease after session creation");
     };
-    assert_eq!(lease.session_name, session_name);
+    assert_eq!(lease.session_name.as_str(), "$42");
     daemon
         .write_response(Response::Error(ErrorResponse {
             error: rmux_proto::RmuxError::Server("injected lease rejection".to_owned()),
@@ -518,6 +498,30 @@ async fn answer_new_session(daemon: &mut FakeDaemon, session_name: SessionName) 
             session_name,
             detached: true,
             output: Some(rmux_proto::CommandOutput::from_stdout(b"$42\n")),
+        }))
+        .await;
+}
+
+fn current_capabilities() -> Vec<String> {
+    SUPPORTED_CAPABILITIES
+        .iter()
+        .copied()
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn answer_lease_identity_handshake(daemon: &mut FakeDaemon, capabilities: Vec<String>) {
+    let Request::Handshake(handshake) = daemon.read_request().await else {
+        panic!("owned-session lease must negotiate identity addressing on its connection");
+    };
+    assert!(handshake
+        .required_capabilities
+        .iter()
+        .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2));
+    daemon
+        .write_response(Response::Handshake(HandshakeResponse {
+            wire_version: RMUX_WIRE_VERSION,
+            capabilities,
         }))
         .await;
 }

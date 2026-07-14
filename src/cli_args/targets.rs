@@ -19,10 +19,6 @@ impl TargetSpec {
     pub(crate) fn exact(&self) -> Option<&Target> {
         self.exact.as_ref()
     }
-
-    pub(crate) fn is_deferred_mouse_target(&self) -> bool {
-        self.raw == "{mouse}"
-    }
 }
 
 impl fmt::Display for TargetSpec {

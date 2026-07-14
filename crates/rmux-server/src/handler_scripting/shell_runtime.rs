@@ -16,7 +16,7 @@ use super::super::pane_support::format_references_pane_pid;
 use super::super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::super::{
     attach_support::ActiveAttachIdentity, current_expected_attach_identity,
-    with_expected_attach_identity, RequestHandler,
+    validate_expected_attach_identity, with_expected_attach_registration, RequestHandler,
 };
 use super::command_args::CommandListArgument;
 use super::format_context::{format_context_for_target_with_server_values, global_format_context};
@@ -53,8 +53,20 @@ where
 {
     let control_scoped = with_background_control_identity(control_identity, future);
     match attach_identity {
-        Some(identity) => with_expected_attach_identity(identity, control_scoped).await,
+        Some(identity) => with_expected_attach_registration(identity, control_scoped).await,
         None => control_scoped.await,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellTargetPolicy {
+    Fixed,
+    FollowAttachedSession,
+}
+
+impl ShellTargetPolicy {
+    fn follows_attached_session(self) -> bool {
+        self == Self::FollowAttachedSession
     }
 }
 
@@ -93,12 +105,21 @@ impl RequestHandler {
         mut request: RunShellRequest,
         client_name: Option<String>,
     ) -> Response {
+        let target_was_captured = request.target.is_some();
         if request.target.is_none() {
             request.target = self.inherited_run_shell_target(requester_pid).await;
         }
         if request.background {
             let control_identity = current_control_queue_identity(requester_pid);
             let attach_identity = current_expected_attach_identity();
+            let target_policy = if attach_identity.is_some() && !target_was_captured {
+                ShellTargetPolicy::FollowAttachedSession
+            } else {
+                ShellTargetPolicy::Fixed
+            };
+            if target_policy.follows_attached_session() {
+                request.target = None;
+            }
             if let Some(delay_seconds) = request.delay_seconds {
                 if let Err(error) = run_shell_delay_duration(delay_seconds.as_secs_f64()) {
                     return Response::Error(ErrorResponse { error });
@@ -116,7 +137,7 @@ impl RequestHandler {
                     let _detached_request_guard = detached_request_guard;
                     let _requester_access_guard = requester_access_guard;
                     let _ = handler
-                        .run_shell_task(requester_pid, request, client_name)
+                        .run_shell_task(requester_pid, request, client_name, target_policy)
                         .await;
                 };
                 with_background_client_identities(control_identity, attach_identity, async move {
@@ -134,7 +155,12 @@ impl RequestHandler {
         }
 
         match self
-            .run_shell_task(requester_pid, request, client_name)
+            .run_shell_task(
+                requester_pid,
+                request,
+                client_name,
+                ShellTargetPolicy::Fixed,
+            )
             .await
         {
             Ok(RunShellTaskOutput::CommandOutput(output)) => {
@@ -165,6 +191,18 @@ impl RequestHandler {
         }
     }
 
+    async fn followed_attached_pane_target(
+        &self,
+        identity: ActiveAttachIdentity,
+    ) -> Result<PaneTarget, RmuxError> {
+        match self.attached_queue_target_for_identity(identity).await? {
+            Target::Pane(target) => Ok(target),
+            _ => Err(RmuxError::Server(
+                "attached session has no current pane target".to_owned(),
+            )),
+        }
+    }
+
     pub(in crate::handler) async fn handle_if_shell(
         &self,
         requester_pid: u32,
@@ -183,6 +221,11 @@ impl RequestHandler {
         if request.background {
             let control_identity = current_control_queue_identity(requester_pid);
             let attach_identity = current_expected_attach_identity();
+            let target_policy = if attach_identity.is_some() && request.target.is_none() {
+                ShellTargetPolicy::FollowAttachedSession
+            } else {
+                ShellTargetPolicy::Fixed
+            };
             let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
             let requester_access_guard =
@@ -195,7 +238,7 @@ impl RequestHandler {
                     let _detached_request_guard = detached_request_guard;
                     let _requester_access_guard = requester_access_guard;
                     let _ = handler
-                        .if_shell_task(requester_pid, request, client_name)
+                        .if_shell_task(requester_pid, request, client_name, target_policy)
                         .await;
                 };
                 with_background_client_identities(control_identity, attach_identity, async move {
@@ -213,7 +256,12 @@ impl RequestHandler {
         }
 
         match self
-            .if_shell_task(requester_pid, request, client_name)
+            .if_shell_task(
+                requester_pid,
+                request,
+                client_name,
+                ShellTargetPolicy::Fixed,
+            )
             .await
         {
             Ok(Some(output)) if !output.stdout().is_empty() => {
@@ -227,11 +275,20 @@ impl RequestHandler {
     async fn run_shell_task(
         &self,
         requester_pid: u32,
-        request: RunShellRequest,
+        mut request: RunShellRequest,
         client_name: Option<String>,
+        target_policy: ShellTargetPolicy,
     ) -> Result<RunShellTaskOutput, RmuxError> {
         if let Some(delay_seconds) = request.delay_seconds {
             tokio::time::sleep(run_shell_delay_duration(delay_seconds.as_secs_f64())?).await;
+        }
+
+        let expected_attach = validate_expected_attach_identity(self, requester_pid).await?;
+        if target_policy.follows_attached_session() {
+            let identity = expected_attach.ok_or_else(|| {
+                RmuxError::Server("background command lost its attached client identity".to_owned())
+            })?;
+            request.target = Some(self.followed_attached_pane_target(identity).await?);
         }
 
         if request.command.is_empty() {
@@ -239,6 +296,7 @@ impl RequestHandler {
         }
 
         if request.as_commands {
+            let has_fixed_target = request.target.is_some();
             let command = self
                 .expand_run_shell_command(&request, client_name.as_deref())
                 .await?;
@@ -251,9 +309,17 @@ impl RequestHandler {
             let current_target = self
                 .run_shell_commands_current_target(requester_pid, request.target)
                 .await;
-            let context = QueueExecutionContext::new(request.start_directory.clone())
-                .with_current_target(current_target)
-                .with_client_name(client_name.clone());
+            let context = QueueExecutionContext::new(request.start_directory.clone());
+            let context = match target_policy {
+                ShellTargetPolicy::FollowAttachedSession => context
+                    .with_implicit_current_target(current_target)
+                    .following_attached_session(),
+                ShellTargetPolicy::Fixed if has_fixed_target => {
+                    context.with_current_target(current_target)
+                }
+                ShellTargetPolicy::Fixed => context.with_implicit_current_target(current_target),
+            }
+            .with_client_name(client_name.clone());
             let context = match request.source_depth {
                 Some(depth) => context.for_sourced_commands(depth, None),
                 None => context,
@@ -327,9 +393,19 @@ impl RequestHandler {
     async fn if_shell_task(
         &self,
         requester_pid: u32,
-        request: IfShellRequest,
+        mut request: IfShellRequest,
         client_name: Option<String>,
+        target_policy: ShellTargetPolicy,
     ) -> Result<Option<CommandOutput>, RmuxError> {
+        let expected_attach = validate_expected_attach_identity(self, requester_pid).await?;
+        if target_policy.follows_attached_session() {
+            let identity = expected_attach.ok_or_else(|| {
+                RmuxError::Server("background command lost its attached client identity".to_owned())
+            })?;
+            request.target = Some(Target::Pane(
+                self.followed_attached_pane_target(identity).await?,
+            ));
+        }
         let expanded_condition = self
             .expand_if_shell_condition(&request, client_name.as_deref())
             .await?;
@@ -354,14 +430,19 @@ impl RequestHandler {
             .parse_command_string_one_group(&selected_command)
             .await?;
         let current_target = self.existing_target_or_none(request.target).await;
+        let context = QueueExecutionContext::new(request.caller_cwd);
+        let context = match target_policy {
+            ShellTargetPolicy::FollowAttachedSession => context
+                .with_implicit_current_target(current_target)
+                .following_attached_session(),
+            ShellTargetPolicy::Fixed if current_target.is_some() => {
+                context.with_current_target(current_target)
+            }
+            ShellTargetPolicy::Fixed => context.with_implicit_current_target(current_target),
+        }
+        .with_client_name(client_name);
         let output = self
-            .execute_parsed_commands(
-                requester_pid,
-                parsed,
-                QueueExecutionContext::new(request.caller_cwd)
-                    .with_current_target(current_target)
-                    .with_client_name(client_name),
-            )
+            .execute_parsed_commands(requester_pid, parsed, context)
             .await?;
         Ok((!output.stdout().is_empty()).then_some(output))
     }
@@ -567,13 +648,20 @@ impl RequestHandler {
         if command.background {
             let control_identity = current_control_queue_identity(requester_pid);
             let attach_identity = current_expected_attach_identity();
+            let follow_attached_session = attach_identity.is_some()
+                && command.target.is_none()
+                && !context.uses_explicit_current_target();
             let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
             let requester_access_guard =
                 self.begin_detached_requester_access(requester_pid, can_write);
             let handler = self.clone();
             let command = command.clone();
-            let context = context.clone();
+            let context = if follow_attached_session {
+                context.clone().following_attached_session()
+            } else {
+                context.clone()
+            };
             let hook_formats = current_hook_formats();
             let hook_context_active = crate::hook_runtime::hooks_disabled();
             if let Err(error) = spawn_background_async("rmux-if-shell-queue", move || async move {
@@ -685,8 +773,16 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         command: ParsedIfShellCommand,
-        context: QueueExecutionContext,
+        mut context: QueueExecutionContext,
     ) -> Result<(), RmuxError> {
+        let expected_attach = validate_expected_attach_identity(self, requester_pid).await?;
+        if context.follows_attached_session() {
+            let identity = expected_attach.ok_or_else(|| {
+                RmuxError::Server("background command lost its attached client identity".to_owned())
+            })?;
+            let target = self.followed_attached_pane_target(identity).await?;
+            context.rebase_current_target_after_attached_switch(Target::Pane(target));
+        }
         let effective_target = command
             .target
             .clone()

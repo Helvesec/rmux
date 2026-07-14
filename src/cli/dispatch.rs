@@ -2,9 +2,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use rmux_client::connect;
-use rmux_proto::{
-    ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, ResolveTargetType, Response,
-};
+use rmux_proto::{ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response};
 
 use super::attach_transport::{
     queued_attach_session_is_active, QueuedAttachSession, QueuedAttachSessionResult,
@@ -44,8 +42,7 @@ use super::session_commands::{
 };
 use super::target_resolution::{
     resolve_current_pane_target, resolve_current_session_target, resolve_pane_target_or_current,
-    resolve_pane_target_spec, resolve_select_layout_target_spec,
-    resolve_target_spec_or_none_if_missing, resolve_window_target_or_current,
+    resolve_pane_target_spec, resolve_select_layout_target_spec, resolve_window_target_or_current,
 };
 use super::web_commands::run_web_share;
 use super::window_commands::{
@@ -676,33 +673,7 @@ fn dispatch(
         Command::RunShell(args) => run_shell_foreground(socket_path, args),
         Command::SourceFile(args) => run_source_file(args, socket_path, command_startup),
         Command::IfShell(args) => {
-            run_command_resolved(socket_path, "if-shell", move |connection| {
-                let target = args
-                    .target
-                    .as_ref()
-                    .filter(|target| !target.is_deferred_mouse_target())
-                    .map(|target| {
-                        resolve_target_spec_or_none_if_missing(
-                            connection,
-                            target,
-                            ResolveTargetType::Pane,
-                            false,
-                            false,
-                        )
-                    })
-                    .transpose()?
-                    .flatten();
-                connection
-                    .if_shell(
-                        args.condition,
-                        args.format_mode,
-                        args.then_command,
-                        args.else_command,
-                        target,
-                        args.background,
-                    )
-                    .map_err(ExitFailure::from_client)
-            })
+            run_queued_server_command(socket_path, "if-shell", args.queue_command)
         }
         Command::WaitFor(args) => {
             let mode = args.mode();
