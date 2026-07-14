@@ -28,10 +28,9 @@ fn kitty_keyboard_set_and_pop_update_csi_u_extended_keys() {
 }
 
 #[test]
-fn kitty_keyboard_query_reports_current_flag_state() {
+fn kitty_keyboard_query_does_not_reply() {
     let (p, _w) = parse(b"\x1b[>1u\x1b[?u");
-    let replies = String::from_utf8_lossy(&p.reply_buf);
-    assert_eq!(replies.as_ref(), "\x1b[?1u");
+    assert!(p.reply_buf.is_empty());
 }
 
 // ─── Hardening: ground timer ───────────────────────────────────────
