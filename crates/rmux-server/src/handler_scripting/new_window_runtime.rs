@@ -40,6 +40,7 @@ impl RequestHandler {
             environment,
             command,
         } = command;
+        let start_directory = start_directory.or_else(|| context.caller_cwd.clone());
 
         let target_window_index = {
             let state = self.state.lock().await;

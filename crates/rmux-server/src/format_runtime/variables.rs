@@ -307,8 +307,14 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "mouse_sgr_flag" => self.pane_mode_flag(mode::MODE_MOUSE_SGR),
             "mouse_standard_flag" => self.pane_mode_flag(mode::MODE_MOUSE_STANDARD),
             "mouse_utf8_flag" => self.pane_mode_flag(mode::MODE_MOUSE_UTF8),
-            "pane_current_path" | "session_path" => self
+            "pane_current_path" => self
                 .pane_current_path()
+                .or_else(|| self.environment_value_by_name("PWD"))
+                .or_else(|| self.environment_value_by_name("HOME")),
+            "session_path" => self
+                .session
+                .and_then(Session::cwd)
+                .map(|path| path.to_string_lossy().into_owned())
                 .or_else(|| self.environment_value_by_name("PWD"))
                 .or_else(|| self.environment_value_by_name("HOME")),
             "pane_path" => Some(String::new()),

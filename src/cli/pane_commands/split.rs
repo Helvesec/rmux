@@ -17,9 +17,12 @@ use crate::cli_response::tmux_cli_error_message;
 const DEFAULT_SPLIT_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
 
 pub(in crate::cli) fn run_split_window(
-    args: SplitWindowArgs,
+    mut args: SplitWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    if args.start_directory.is_none() {
+        args.start_directory = std::env::current_dir().ok();
+    }
     if !cli_target_actions_enabled() {
         return run_split_window_legacy(args, socket_path);
     }

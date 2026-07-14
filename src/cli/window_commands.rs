@@ -645,6 +645,10 @@ fn resolve_current_session(
 }
 
 pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+    let start_directory = args
+        .start_directory
+        .clone()
+        .or_else(|| std::env::current_dir().ok());
     let print_target = args.print_target;
     let print_format = args
         .format
@@ -705,7 +709,7 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
             name,
             args.detached,
             (!args.environment.is_empty()).then_some(args.environment),
-            args.start_directory,
+            start_directory,
             (!args.command.is_empty()).then_some(args.command),
             insert_at_target,
         )

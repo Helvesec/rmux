@@ -117,6 +117,89 @@ async fn list_sessions_format_uses_each_sessions_active_pane_context() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn session_path_stays_at_session_cwd_when_pane_cwds_differ() {
+    let handler = RequestHandler::new();
+    let root =
+        std::env::temp_dir().join(format!("rmux-session-path-context-{}", std::process::id()));
+    let session_dir = root.join("session");
+    let split_dir = root.join("split");
+    std::fs::create_dir_all(&session_dir).expect("create session dir");
+    std::fs::create_dir_all(&split_dir).expect("create split dir");
+    let session_dir = std::fs::canonicalize(&session_dir).expect("canonicalize session dir");
+    let split_dir = std::fs::canonicalize(&split_dir).expect("canonicalize split dir");
+    let session = session_name("session-path-context");
+
+    let created = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: Some(session_dir.to_string_lossy().into_owned()),
+            detached: true,
+            size: None,
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let split = handler
+        .handle(Request::SplitWindowExt(Box::new(
+            rmux_proto::SplitWindowExtRequest {
+                target: SplitWindowTarget::Session(session.clone()),
+                direction: rmux_proto::SplitDirection::Vertical,
+                before: false,
+                environment: None,
+                command: None,
+                process_command: None,
+                start_directory: Some(split_dir.clone()),
+                keep_alive_on_exit: None,
+                detached: true,
+                size: None,
+                preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
+            },
+        )))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+
+    let response = handler
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
+            target: session,
+            format: Some("#{pane_index}|#{session_path}|#{pane_current_path}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+            target_window_index: None,
+        })))
+        .await;
+    let output = response
+        .command_output()
+        .expect("list-panes returns command output");
+    let stdout = std::str::from_utf8(output.stdout()).expect("utf-8");
+    assert_eq!(
+        stdout,
+        format!(
+            "0|{session_path}|{session_path}\n1|{session_path}|{split_path}\n",
+            session_path = rendered_context_path(&session_dir),
+            split_path = rendered_context_path(&split_dir),
+        )
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn rendered_context_path(path: &std::path::Path) -> String {
     path.display().to_string()
 }

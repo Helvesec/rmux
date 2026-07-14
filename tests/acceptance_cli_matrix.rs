@@ -93,6 +93,93 @@ fn kill_server_is_terminal_for_the_cli_command_queue() -> Result<(), Box<dyn Err
     Ok(())
 }
 
+#[test]
+fn detached_window_spawns_without_c_use_non_attached_caller_cwd() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("window-caller-cwd")?;
+    let session_cwd = harness.tmpdir().join("session-cwd");
+    let caller_cwd = harness.tmpdir().join("caller-cwd");
+    fs::create_dir_all(&session_cwd)?;
+    fs::create_dir_all(&caller_cwd)?;
+    let session_cwd = fs::canonicalize(session_cwd)?;
+    let caller_cwd = fs::canonicalize(caller_cwd)?;
+
+    harness.success_in(&session_cwd, ["new-session", "-d", "-s", "cwd-parity"])?;
+
+    // Simple forms exercise the tiny client path.
+    harness.success_in(
+        &caller_cwd,
+        ["new-window", "-d", "-t", "cwd-parity", "-n", "tiny-new"],
+    )?;
+    harness.success_in(&caller_cwd, ["split-window", "-d", "-t", "cwd-parity:0.0"])?;
+
+    // Environment flags force the full CLI path while preserving the same
+    // no-`-c` semantics.
+    harness.success_in(
+        &caller_cwd,
+        [
+            "new-window",
+            "-d",
+            "-t",
+            "cwd-parity",
+            "-n",
+            "full-new",
+            "-e",
+            "RMUX_CWD_PATH=full-new",
+        ],
+    )?;
+    harness.success_in(
+        &caller_cwd,
+        [
+            "split-window",
+            "-d",
+            "-t",
+            "cwd-parity:0.0",
+            "-e",
+            "RMUX_CWD_PATH=full-split",
+        ],
+    )?;
+
+    // Sourced commands carry the detached caller cwd through the queue.
+    let source = harness.tmpdir().join("window-cwd.conf");
+    fs::write(
+        &source,
+        "new-window -d -t cwd-parity -n source-new\nsplit-window -d -t cwd-parity:0.0\n",
+    )?;
+    harness.success_in(&caller_cwd, [OsStr::new("source-file"), source.as_os_str()])?;
+
+    let panes = harness.stdout(["list-panes", "-a", "-F", "#{pane_current_path}"])?;
+    let paths = panes.lines().map(normalized_path).collect::<Vec<_>>();
+    let expected_session = normalized_path(&session_cwd.to_string_lossy());
+    let expected_caller = normalized_path(&caller_cwd.to_string_lossy());
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| **path == expected_session)
+            .count(),
+        1,
+        "only the initial pane should keep the session cwd; paths={paths:?}"
+    );
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| **path == expected_caller)
+            .count(),
+        6,
+        "tiny, full, and source-file new/split paths should use the caller cwd; paths={paths:?}"
+    );
+    assert_eq!(paths.len(), 7, "unexpected pane count; paths={paths:?}");
+
+    Ok(())
+}
+
+fn normalized_path(path: &str) -> String {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let path = path.replace('\\', "/");
+    #[cfg(windows)]
+    let path = path.to_ascii_lowercase();
+    path.trim_end_matches('/').to_owned()
+}
+
 struct AcceptanceHarness {
     label: String,
     tmpdir: PathBuf,

@@ -364,6 +364,9 @@ mod if_shell;
 #[path = "handler_scripting_tests/parsed_queue_core.rs"]
 mod parsed_queue_core;
 
+#[path = "handler_scripting_tests/parsed_queue_cwd.rs"]
+mod parsed_queue_cwd;
+
 #[path = "handler_scripting_tests/queued_inventory.rs"]
 mod queued_inventory;
 

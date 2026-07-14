@@ -694,14 +694,19 @@ impl TinyCommand {
             } => run_attach_session(original_args, &socket_path, request),
             Self::SplitWindow {
                 socket_path,
-                request,
-            } => run_target_action(
-                original_args,
-                &socket_path,
-                "split-window",
-                RetryPolicy::DecodeOnly,
-                |connection| connection.split_window_target_action(request),
-            ),
+                mut request,
+            } => {
+                if request.start_directory.is_none() {
+                    request.start_directory = env::current_dir().ok();
+                }
+                run_target_action(
+                    original_args,
+                    &socket_path,
+                    "split-window",
+                    RetryPolicy::DecodeOnly,
+                    |connection| connection.split_window_target_action(request),
+                )
+            }
             Self::NewWindow {
                 socket_path,
                 request,
@@ -1074,6 +1079,7 @@ fn run_new_window(
     socket_path: &Path,
     request: TinyNewWindow,
 ) -> Result<i32, String> {
+    let start_directory = request.start_directory.or_else(|| env::current_dir().ok());
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .new_window_at_with_environment(
@@ -1082,7 +1088,7 @@ fn run_new_window(
             request.name,
             request.detached,
             None,
-            request.start_directory,
+            start_directory,
             request.command,
             false,
         )
