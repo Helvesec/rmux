@@ -147,8 +147,6 @@ pub(super) fn parse_detach_client(mut args: CommandTokens) -> Result<Request, Rm
 
 pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut target_client = None;
-    let mut subscriptions = Vec::new();
-    let mut subscriptions_format = Vec::new();
     let mut clear_pan = false;
     let mut control_size = None;
     let mut pan_down = false;
@@ -157,7 +155,6 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
     let mut clipboard_query = false;
     let mut pan_left = false;
     let mut pan_right = false;
-    let mut colour_report = None;
     let mut status_only = false;
     let mut pan_up = false;
 
@@ -166,14 +163,6 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
             "--" => {
                 let _ = args.optional();
                 break;
-            }
-            "-A" => {
-                let _ = args.optional();
-                subscriptions.push(args.required("-A pane:state")?);
-            }
-            "-B" => {
-                let _ = args.optional();
-                subscriptions_format.push(args.required("-B name:pane:format")?);
             }
             "-c" => {
                 let _ = args.optional();
@@ -206,10 +195,6 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
             "-R" => {
                 let _ = args.optional();
                 pan_right = true;
-            }
-            "-r" => {
-                let _ = args.optional();
-                colour_report = Some(args.required("-r pane:report")?);
             }
             "-S" => {
                 let _ = args.optional();
@@ -250,10 +235,10 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
         clipboard_query,
         flags,
         flags_alias,
-        subscriptions,
-        subscriptions_format,
+        subscriptions: Vec::new(),
+        subscriptions_format: Vec::new(),
         control_size,
-        colour_report,
+        colour_report: None,
     })))
 }
 

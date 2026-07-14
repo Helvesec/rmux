@@ -78,11 +78,31 @@ impl RequestHandler {
         requester_pid == std::process::id()
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn handle_attached_unlock(&self, attach_pid: u32) {
         let mut active_attach = self.active_attach.lock().await;
         if let Some(active) = active_attach.by_pid.get_mut(&attach_pid) {
             active.suspended = false;
         }
+    }
+
+    pub(crate) async fn handle_attached_unlock_for_identity(
+        &self,
+        identity: super::attach_support::ActiveAttachIdentity,
+    ) -> bool {
+        let mut active_attach = self.active_attach.lock().await;
+        let Some(active) = active_attach
+            .by_pid
+            .get_mut(&identity.attach_pid())
+            .filter(|active| {
+                identity.matches_active(active)
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+        else {
+            return false;
+        };
+        active.suspended = false;
+        true
     }
 
     pub(in crate::handler) async fn requester_uid(&self, requester_pid: u32) -> u32 {

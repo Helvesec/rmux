@@ -139,7 +139,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("previous-window", "(prev) [-a] [-t target-session]"),
     (
         "refresh-client",
-        "(refresh) [-cDlLRSU] [-A pane:state] [-B name:what:format] [-C XxY] [-f flags] [-r pane:report] [-t target-client] [adjustment]",
+        "(refresh) [-cDlLRSU] [-C XxY] [-f flags] [-t target-client] [adjustment]",
     ),
     ("rename-session", "(rename) [-t target-session] new-name"),
     ("rename-window", "(renamew) [-t target-window] new-name"),

@@ -184,6 +184,7 @@ mod tests {
             "invalid web-share pairing code",
             "missing web-share pairing code",
             "web-share connection limit reached",
+            "web-share authentication queue limit reached",
             "web-share does not exist or has expired",
             "web-share has no operator access",
         ] {

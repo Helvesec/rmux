@@ -751,12 +751,16 @@ fn sort_window_entries(
                 .window_index()
                 .cmp(&right.entry.target.window_index()),
             WindowListSortOrder::Name => left.entry.name.cmp(&right.entry.name),
-            WindowListSortOrder::Size => (left.entry.size.cols, left.entry.size.rows)
-                .cmp(&(right.entry.size.cols, right.entry.size.rows)),
+            WindowListSortOrder::Size => {
+                terminal_area(left.entry.size).cmp(&terminal_area(right.entry.size))
+            }
             WindowListSortOrder::Activity => right.activity_at.cmp(&left.activity_at),
             WindowListSortOrder::Creation => left.created_at.cmp(&right.created_at),
         };
         let primary = if reversed { primary.reverse() } else { primary };
+        if matches!(sort_order, WindowListSortOrder::Size) {
+            return primary;
+        }
         primary
             .then_with(|| stable_window_name_cmp(left, right))
             .then_with(|| {
@@ -766,6 +770,10 @@ fn sort_window_entries(
                     .cmp(&right.entry.target.window_index())
             })
     });
+}
+
+fn terminal_area(size: rmux_proto::TerminalSize) -> u64 {
+    u64::from(size.cols) * u64::from(size.rows)
 }
 
 fn stable_window_name_cmp(left: &WindowListRow, right: &WindowListRow) -> Ordering {
@@ -839,4 +847,63 @@ fn ensure_session_panes_exist(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_proto::{LayoutName, TerminalSize};
+
+    fn window_list_row(window_index: u32, name: &str, cols: u16, rows: u16) -> WindowListRow {
+        WindowListRow {
+            entry: WindowListEntry {
+                target: WindowTarget::with_window(
+                    SessionName::new("sort-area").expect("valid session name"),
+                    window_index,
+                ),
+                window_id: format!("@{window_index}"),
+                name: Some(name.to_owned()),
+                pane_count: 1,
+                size: TerminalSize { cols, rows },
+                layout: LayoutName::Tiled,
+                active: false,
+                last: false,
+                rendered: window_index.to_string(),
+            },
+            created_at: 0,
+            activity_at: 0,
+        }
+    }
+
+    #[test]
+    fn window_size_sort_uses_area_and_preserves_equal_area_order() {
+        let rows = || {
+            vec![
+                window_list_row(9, "z", 21, 10),
+                window_list_row(1, "a", 10, 21),
+                window_list_row(7, "middle", 59, 5),
+                window_list_row(3, "large", 20, 24),
+            ]
+        };
+
+        let mut ascending = rows();
+        sort_window_entries(&mut ascending, WindowListSortOrder::Size, false);
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|row| row.entry.target.window_index())
+                .collect::<Vec<_>>(),
+            [9, 1, 7, 3]
+        );
+
+        let mut descending = rows();
+        sort_window_entries(&mut descending, WindowListSortOrder::Size, true);
+        assert_eq!(
+            descending
+                .iter()
+                .map(|row| row.entry.target.window_index())
+                .collect::<Vec<_>>(),
+            [3, 7, 9, 1]
+        );
+    }
 }

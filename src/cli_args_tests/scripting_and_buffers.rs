@@ -325,6 +325,49 @@ fn if_shell_accepts_format_mode_target_and_optional_else_command() {
 }
 
 #[test]
+fn if_shell_preserves_runtime_resolved_target_syntax() {
+    for target in ["alph", "alpha*", "=alpha:", "$1", "@2", "%3", "{mouse}"] {
+        let cli = parse_args(&[
+            "if-shell",
+            "-F",
+            "-t",
+            target,
+            "#{pane_active}",
+            "set-buffer yes",
+        ])
+        .unwrap_or_else(|error| panic!("target {target:?} should parse: {error}"));
+
+        match cli.command.expect("parsed command") {
+            super::super::Command::IfShell(args) => {
+                assert_eq!(args.target.expect("target").raw(), target);
+            }
+            _ => panic!("expected IfShell command"),
+        }
+    }
+}
+
+#[test]
+fn if_shell_marks_mouse_targets_for_server_side_fallback() {
+    let cli = parse_args(&[
+        "if-shell",
+        "-F",
+        "-t",
+        "{mouse}",
+        "1",
+        "display-message -p ok",
+    ])
+    .expect("mouse target should parse");
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::IfShell(args) => assert!(
+            args.target.expect("target").is_deferred_mouse_target(),
+            "mouse target must remain deferred"
+        ),
+        _ => panic!("expected IfShell command"),
+    }
+}
+
+#[test]
 fn set_hook_accepts_target_scope_and_indexed_hook() {
     let cli = parse_args(&["set-hook", "-t", "alpha", "client-attached[2]", "true"]).unwrap();
 

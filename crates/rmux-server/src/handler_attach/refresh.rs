@@ -411,6 +411,7 @@ impl RequestHandler {
         delivered
     }
 
+    #[cfg(test)]
     pub(crate) async fn refresh_attached_client_base_only(
         &self,
         attach_pid: u32,
@@ -557,7 +558,10 @@ impl RequestHandler {
     }
 }
 
-fn enqueue_tracked_render_control(active: &mut ActiveAttach, command: AttachControl) -> bool {
+pub(super) fn enqueue_tracked_render_control(
+    active: &mut ActiveAttach,
+    command: AttachControl,
+) -> bool {
     debug_assert!(matches!(
         command,
         AttachControl::Refresh | AttachControl::Switch(_)

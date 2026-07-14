@@ -3,6 +3,8 @@ use rmux_proto::{
     CreateWebShareRequest, ListWebSharesRequest, PaneId, PaneTargetRef, SessionName,
     StopAllWebSharesRequest, WebShareScope, WebShareUrlOptions, WebTerminalTheme,
 };
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::pane_io::pane_output_channel_with_limits;
@@ -1138,6 +1140,187 @@ async fn connect_enforces_authenticated_process_capacity() {
 }
 
 #[tokio::test]
+async fn authentication_wait_capacity_is_per_key_and_releases_on_cancel() {
+    let registry = Arc::new(WebShareRegistry::new_with_authentication_limits(1, 2, 1, 2));
+    registry.mark_listener_available();
+    let created = registry
+        .create(spectator_share_request(true))
+        .expect("share creates");
+    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let pairing_code = created
+        .spectator_pairing_code
+        .expect("PIN-protected share has a pairing code");
+
+    let first_error = registry
+        .connect(&token, Some("definitely-not-the-pairing-code"))
+        .await
+        .expect_err("wrong PIN seeds the next attempt's backoff delay");
+    assert!(first_error.to_string().contains("pairing code"));
+    assert_eq!(registry.authenticated_connection_count(), 0);
+
+    let waiting_registry = Arc::clone(&registry);
+    let waiting_token = token.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_registry
+            .connect(&waiting_token, Some(&pairing_code))
+            .await
+    });
+    tokio::time::timeout(Duration::from_millis(50), async {
+        while registry.authentication_wait_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("backoff waiter must acquire authentication wait capacity");
+    assert_eq!(
+        registry.authenticated_connection_count(),
+        0,
+        "a backoff sleep must not consume established connection capacity"
+    );
+
+    let capped = tokio::time::timeout(Duration::from_millis(50), registry.connect(&token, None))
+        .await
+        .expect("a capped same-key attempt must not enter another backoff sleep")
+        .expect_err("the per-key authentication wait slot is occupied");
+    assert!(capped.to_string().contains("authentication queue limit"));
+
+    waiting.abort();
+    assert!(waiting
+        .await
+        .expect_err("waiter was cancelled")
+        .is_cancelled());
+    assert_eq!(
+        registry.authentication_wait_count(),
+        0,
+        "cancelling a backoff waiter must release its wait permit"
+    );
+}
+
+#[tokio::test]
+async fn backoff_waiter_does_not_block_an_unrelated_share() {
+    let registry = Arc::new(WebShareRegistry::new_with_authentication_limits(1, 2, 1, 2));
+    registry.mark_listener_available();
+    let protected = registry
+        .create(spectator_share_request(true))
+        .expect("protected share creates");
+    let unrelated = registry
+        .create(spectator_share_request(false))
+        .expect("unrelated share creates");
+    let protected_token =
+        token_from_url(protected.spectator_url.as_deref().expect("protected URL"));
+    let protected_pin = protected
+        .spectator_pairing_code
+        .expect("protected share has a PIN");
+    let unrelated_token =
+        token_from_url(unrelated.spectator_url.as_deref().expect("unrelated URL"));
+
+    registry
+        .connect(&protected_token, Some("wrong-pin"))
+        .await
+        .expect_err("wrong PIN seeds a backoff sleep");
+    let waiting_registry = Arc::clone(&registry);
+    let waiting_token = protected_token.clone();
+    let waiter = tokio::spawn(async move {
+        waiting_registry
+            .connect(&waiting_token, Some(&protected_pin))
+            .await
+    });
+    tokio::time::timeout(Duration::from_millis(50), async {
+        while registry.authentication_wait_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("protected share enters its bounded backoff wait");
+    assert_eq!(
+        registry.authenticated_connection_count(),
+        0,
+        "the sleeping auth attempt must not consume established capacity"
+    );
+
+    let unrelated_access = registry
+        .connect(&unrelated_token, None)
+        .await
+        .expect("an unrelated share must remain available during another share's backoff");
+    drop(unrelated_access);
+    waiter.abort();
+    let _ = waiter.await;
+}
+
+#[tokio::test]
+async fn authentication_wait_capacity_isolated_by_network_peer() {
+    let registry = Arc::new(WebShareRegistry::new_with_authentication_limits(4, 3, 2, 1));
+    registry.mark_listener_available();
+    let first = registry
+        .create(spectator_share_request(true))
+        .expect("first protected share creates");
+    let second = registry
+        .create(spectator_share_request(true))
+        .expect("second protected share creates");
+    let first_token = token_from_url(first.spectator_url.as_deref().expect("first URL"));
+    let first_pin = first
+        .spectator_pairing_code
+        .expect("first protected share has a PIN");
+    let second_token = token_from_url(second.spectator_url.as_deref().expect("second URL"));
+    let second_pin = second
+        .spectator_pairing_code
+        .expect("second protected share has a PIN");
+    let busy_peer = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+    let other_peer = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+
+    registry
+        .connect(&first_token, Some("wrong-pin"))
+        .await
+        .expect_err("first share gets a backoff delay");
+    registry
+        .connect(&second_token, Some("wrong-pin"))
+        .await
+        .expect_err("second share gets a backoff delay");
+
+    let first_registry = Arc::clone(&registry);
+    let first_waiter = tokio::spawn(async move {
+        first_registry
+            .connect_from_peer(&first_token, Some(&first_pin), busy_peer)
+            .await
+    });
+    tokio::time::timeout(Duration::from_millis(50), async {
+        while registry.authentication_wait_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first peer enters a backoff wait");
+
+    let same_peer_error = registry
+        .connect_from_peer(&second_token, Some(&second_pin), busy_peer)
+        .await
+        .expect_err("one peer cannot occupy waiters across shares");
+    assert!(same_peer_error
+        .to_string()
+        .contains("authentication queue limit"));
+
+    let second_registry = Arc::clone(&registry);
+    let other_peer_waiter = tokio::spawn(async move {
+        second_registry
+            .connect_from_peer(&second_token, Some(&second_pin), other_peer)
+            .await
+    });
+    tokio::time::timeout(Duration::from_millis(50), async {
+        while registry.authentication_wait_count() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("another peer can wait on another share");
+
+    first_waiter.abort();
+    other_peer_waiter.abort();
+    let _ = first_waiter.await;
+    let _ = other_peer_waiter.await;
+    assert_eq!(registry.authentication_wait_count(), 0);
+}
+
+#[tokio::test]
 async fn capability_tokens_grant_only_their_daemon_owned_roles() {
     let registry = available_registry();
     let created = registry
@@ -1285,6 +1468,28 @@ fn target() -> PaneTargetRef {
         SessionName::new("alpha").expect("valid session"),
         PaneId::new(7),
     )
+}
+
+fn spectator_share_request(require_pin: bool) -> CreateWebShareRequest {
+    CreateWebShareRequest {
+        scope: WebShareScope::Pane(target()),
+        public_base_url: None,
+        tunnel_provider: None,
+        frontend_url: None,
+        ttl_seconds: None,
+        expires_at_unix: None,
+        max_spectators: None,
+        max_operators: None,
+        url_options: Default::default(),
+        require_pin,
+        operator_pin: None,
+        spectator_pin: None,
+        terminal_palette: None,
+        operator: false,
+        spectator: true,
+        controls: false,
+        kill_session_on_expire: false,
+    }
 }
 
 fn token_from_url(url: &str) -> String {

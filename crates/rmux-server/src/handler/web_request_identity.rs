@@ -1,7 +1,8 @@
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 
 use rmux_proto::{
-    PaneId, PaneTarget, Request, Response, RmuxError, SessionId, SessionName, WindowId,
+    PaneId, PaneTarget, Request, Response, RmuxError, SessionId, SessionName, Target, WindowId,
     WindowTarget,
 };
 
@@ -9,13 +10,34 @@ use crate::hook_runtime::PendingInlineHook;
 use crate::pane_io::HandleOutcome;
 use crate::pane_terminals::{HandlerState, WindowLinkOccurrenceId};
 
-use super::RequestHandler;
+use super::{
+    attach_support::{ActiveAttachIdentity, AttachedSwitchCommittedTarget},
+    client_support::SwitchManagedClientIdentity,
+    RequestHandler,
+};
+
+#[cfg(test)]
+#[path = "web_request_identity/test_support.rs"]
+mod test_support;
+
+struct ExpectedSessionIdentity {
+    cursor: RefCell<ExpectedSessionCursor>,
+    window: Option<ExpectedWindowIdentity>,
+    policy: ExpectedSessionPolicy,
+}
 
 #[derive(Clone)]
-struct ExpectedSessionIdentity {
+struct ExpectedSessionCursor {
     name: SessionName,
     id: SessionId,
-    window: Option<ExpectedWindowIdentity>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpectedSessionPolicy {
+    CapturedOnly,
+    // Bindings may address another session explicitly, but their implicit
+    // attached-session cursor remains identity guarded and switch-rebased.
+    AttachedCommandQueue,
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +76,212 @@ impl ExpectedWindowOccurrenceIdentity {
 
 tokio::task_local! {
     static EXPECTED_SESSION_IDENTITY: ExpectedSessionIdentity;
+    static EXPECTED_ATTACH_IDENTITY: ExpectedAttachIdentity;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttachRegistrationIdentity {
+    pid: u32,
+    id: u64,
+}
+
+// Queue ownership follows the registration, while the attached session is a
+// cursor that may advance after a successful switch-client.
+struct ExpectedAttachIdentity {
+    registration: AttachRegistrationIdentity,
+    session_id: Cell<SessionId>,
+}
+
+impl ExpectedAttachIdentity {
+    fn new(identity: ActiveAttachIdentity) -> Self {
+        Self {
+            registration: AttachRegistrationIdentity {
+                pid: identity.attach_pid(),
+                id: identity.attach_id(),
+            },
+            session_id: Cell::new(identity.session_id()),
+        }
+    }
+
+    fn snapshot(&self) -> ActiveAttachIdentity {
+        ActiveAttachIdentity::new(
+            self.registration.pid,
+            self.registration.id,
+            self.session_id.get(),
+        )
+    }
+}
+
+pub(in crate::handler) fn current_expected_attach_identity() -> Option<ActiveAttachIdentity> {
+    EXPECTED_ATTACH_IDENTITY
+        .try_with(ExpectedAttachIdentity::snapshot)
+        .ok()
+}
+
+pub(in crate::handler) async fn validate_expected_attach_identity(
+    handler: &RequestHandler,
+    requester_pid: u32,
+) -> Result<Option<ActiveAttachIdentity>, RmuxError> {
+    let Some(identity) = current_expected_attach_identity() else {
+        return Ok(None);
+    };
+    let identity_is_current = if identity.attach_pid() == requester_pid {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .is_some_and(|active| {
+                active.id == identity.attach_id()
+                    && active.session_id == identity.session_id()
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+    } else {
+        false
+    };
+    if !identity_is_current {
+        return Err(changed_attach_identity_error());
+    }
+    Ok(Some(identity))
+}
+
+pub(in crate::handler) async fn with_expected_attach_identity<T, F>(
+    identity: ActiveAttachIdentity,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    EXPECTED_ATTACH_IDENTITY
+        .scope(ExpectedAttachIdentity::new(identity), future)
+        .await
+}
+
+pub(in crate::handler) async fn with_expected_attach_and_session_identity<T, F>(
+    identity: ActiveAttachIdentity,
+    name: SessionName,
+    session_id: SessionId,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    let identity =
+        ActiveAttachIdentity::new(identity.attach_pid(), identity.attach_id(), session_id);
+    with_expected_attach_identity(
+        identity,
+        with_expected_session_identity_inner(
+            name,
+            session_id,
+            None,
+            ExpectedSessionPolicy::AttachedCommandQueue,
+            future,
+        ),
+    )
+    .await
+}
+
+pub(in crate::handler) async fn rebase_expected_attach_session_after_switch(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    targeted_client: SwitchManagedClientIdentity,
+    response_session: &SessionName,
+    committed_target: Option<AttachedSwitchCommittedTarget>,
+) -> Result<Option<Target>, RmuxError> {
+    let Some(expected) = current_expected_attach_identity() else {
+        return Ok(None);
+    };
+    if expected.attach_pid() != requester_pid {
+        return Err(changed_attach_identity_error());
+    }
+    let expected_registration = AttachRegistrationIdentity {
+        pid: requester_pid,
+        id: expected.attach_id(),
+    };
+    let targets_requester = targeted_client
+        == (SwitchManagedClientIdentity::Attach {
+            pid: requester_pid,
+            attach_id: expected.attach_id(),
+        });
+    if matches!(
+        targeted_client,
+        SwitchManagedClientIdentity::Attach { pid, attach_id }
+            if pid == requester_pid && attach_id != expected.attach_id()
+    ) {
+        return Err(changed_attach_identity_error());
+    }
+    if !targets_requester {
+        return Ok(None);
+    }
+    let Some(committed_target) = committed_target else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    test_support::pause_before_attached_queue_switch_response_correlation(
+        expected_registration.pid,
+        expected_registration.id,
+    )
+    .await;
+
+    let state = handler.state.lock().await;
+    let active_attach = handler.active_attach.lock().await;
+    let Some(active) = active_attach.by_pid.get(&requester_pid).filter(|active| {
+        active.id == expected.attach_id()
+            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            && &active.session_name == response_session
+            && state
+                .sessions
+                .session(response_session)
+                .is_some_and(|session| session.id() == active.session_id)
+    }) else {
+        return Err(switch_response_identity_error());
+    };
+    if committed_target.target.session_name() != response_session {
+        return Err(switch_response_identity_error());
+    }
+    let session = state
+        .sessions
+        .session(response_session)
+        .filter(|session| {
+            session.id() == active.session_id && session.id() == committed_target.session_id
+        })
+        .ok_or_else(switch_response_identity_error)?;
+    let committed_identity_exists = session
+        .window_at(committed_target.target.window_index())
+        .filter(|window| window.id() == committed_target.window_id)
+        .and_then(|window| window.pane(committed_target.target.pane_index()))
+        .is_some_and(|pane| pane.id() == committed_target.pane_id);
+    if !committed_identity_exists {
+        return Err(switch_response_identity_error());
+    }
+    let session_id = active.session_id;
+    EXPECTED_ATTACH_IDENTITY
+        .try_with(|identity| {
+            if identity.registration != expected_registration {
+                return Err(changed_attach_identity_error());
+            }
+            identity.session_id.set(session_id);
+            Ok(())
+        })
+        .map_err(|_| changed_attach_identity_error())??;
+    let _ = EXPECTED_SESSION_IDENTITY.try_with(|identity| {
+        if identity.policy == ExpectedSessionPolicy::AttachedCommandQueue {
+            *identity.cursor.borrow_mut() = ExpectedSessionCursor {
+                name: response_session.clone(),
+                id: session_id,
+            };
+        }
+    });
+    Ok(Some(Target::Pane(committed_target.target)))
+}
+
+fn changed_attach_identity_error() -> RmuxError {
+    RmuxError::Server("attached client identity changed before queued command execution".to_owned())
+}
+
+fn switch_response_identity_error() -> RmuxError {
+    RmuxError::Server(
+        "switch-client response no longer matches the targeted client identity".to_owned(),
+    )
 }
 
 pub(in crate::handler) async fn with_expected_session_identity<T, F>(
@@ -64,16 +292,14 @@ pub(in crate::handler) async fn with_expected_session_identity<T, F>(
 where
     F: Future<Output = T>,
 {
-    EXPECTED_SESSION_IDENTITY
-        .scope(
-            ExpectedSessionIdentity {
-                name,
-                id,
-                window: None,
-            },
-            future,
-        )
-        .await
+    with_expected_session_identity_inner(
+        name,
+        id,
+        None,
+        ExpectedSessionPolicy::CapturedOnly,
+        future,
+    )
+    .await
 }
 
 pub(in crate::handler) async fn with_expected_window_identity<T, F>(
@@ -123,16 +349,36 @@ async fn with_expected_window_identity_inner<T, F>(
 where
     F: Future<Output = T>,
 {
+    with_expected_session_identity_inner(
+        name,
+        session_id,
+        Some(ExpectedWindowIdentity {
+            index: window_index,
+            id: window_id,
+            occurrence_id,
+        }),
+        ExpectedSessionPolicy::CapturedOnly,
+        future,
+    )
+    .await
+}
+
+async fn with_expected_session_identity_inner<T, F>(
+    name: SessionName,
+    id: SessionId,
+    window: Option<ExpectedWindowIdentity>,
+    policy: ExpectedSessionPolicy,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
     EXPECTED_SESSION_IDENTITY
         .scope(
             ExpectedSessionIdentity {
-                name,
-                id: session_id,
-                window: Some(ExpectedWindowIdentity {
-                    index: window_index,
-                    id: window_id,
-                    occurrence_id,
-                }),
+                cursor: RefCell::new(ExpectedSessionCursor { name, id }),
+                window,
+                policy,
             },
             future,
         )
@@ -255,8 +501,11 @@ pub(in crate::handler) fn require_expected_window_identity(
     target: &WindowTarget,
 ) -> Result<(), RmuxError> {
     require_expected_session_identity(state, target.session_name())?;
-    let expected = EXPECTED_SESSION_IDENTITY.try_with(Clone::clone).ok();
-    let Some(expected_window) = expected.and_then(|expected| expected.window) else {
+    let expected_window = EXPECTED_SESSION_IDENTITY
+        .try_with(|expected| expected.window)
+        .ok()
+        .flatten();
+    let Some(expected_window) = expected_window else {
         return Ok(());
     };
     let matches = expected_window.index == target.window_index()
@@ -284,8 +533,11 @@ pub(in crate::handler) fn resolve_expected_window_pane_target(
     session_name: &SessionName,
     pane_id: PaneId,
 ) -> Result<Option<PaneTarget>, RmuxError> {
-    let expected = EXPECTED_SESSION_IDENTITY.try_with(Clone::clone).ok();
-    let Some(expected_window) = expected.and_then(|expected| expected.window) else {
+    let expected_window = EXPECTED_SESSION_IDENTITY
+        .try_with(|expected| expected.window)
+        .ok()
+        .flatten();
+    let Some(expected_window) = expected_window else {
         return Ok(None);
     };
     let window_target = WindowTarget::with_window(session_name.clone(), expected_window.index);
@@ -312,10 +564,15 @@ pub(in crate::handler) fn require_expected_session_identity(
     state: &HandlerState,
     session_name: &SessionName,
 ) -> Result<(), RmuxError> {
-    let expected = EXPECTED_SESSION_IDENTITY.try_with(Clone::clone).ok();
-    let Some(expected) = expected else {
+    let expected = EXPECTED_SESSION_IDENTITY
+        .try_with(|expected| (expected.cursor.borrow().clone(), expected.policy))
+        .ok();
+    let Some((expected, policy)) = expected else {
         return Ok(());
     };
+    if policy == ExpectedSessionPolicy::AttachedCommandQueue && expected.name != *session_name {
+        return Ok(());
+    }
     let matches = expected.name == *session_name
         && state
             .sessions

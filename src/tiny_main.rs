@@ -21,11 +21,10 @@ use rmux_client::{
 };
 use rmux_core::formats::{DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT};
 use rmux_proto::request::{
-    AttachSessionExt2Request, AttachSessionExt3Request, DisplayMessageRequest, KillSessionRequest,
-    NewSessionExtRequest,
+    AttachSessionExt2Request, AttachSessionExt3Request, KillSessionRequest, NewSessionExtRequest,
 };
 use rmux_proto::{
-    CapturePaneTargetActionRequest, JoinPaneRequest, ListSessionsRequest, Request,
+    CapturePaneTargetActionRequest, JoinPaneRequest, ListSessionsRequest,
     ResizePaneTargetActionRequest, Response, RmuxError, SetOptionMode, SourceFileResponse,
     SplitDirection, SplitWindowTargetActionRequest, CAPABILITY_ATTACH_RENDER,
     CAPABILITY_ATTACH_RESIZE_GEOMETRY, RMUX_WIRE_VERSION,
@@ -754,11 +753,11 @@ impl TinyCommand {
             Self::DisplayMessage {
                 socket_path,
                 request,
-            } => run_display_message(&socket_path, request),
+            } => run_display_message(original_args, &socket_path, request),
             Self::SendKeys {
                 socket_path,
                 request,
-            } => run_send_keys(&socket_path, request),
+            } => run_send_keys(original_args, &socket_path, request),
             Self::SourceFile {
                 socket_path,
                 request,
@@ -1022,44 +1021,35 @@ fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
     }
 }
 
-fn run_display_message(socket_path: &Path, request: TinyDisplayMessage) -> Result<i32, String> {
+fn run_display_message(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinyDisplayMessage,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let target = request.target;
-    let message = request.message;
     let has_explicit_target = target.is_some();
     let response = connection
-        .display_message(target, true, message.clone())
+        .display_message(target, true, request.message)
         .map_err(|error| error.to_string())?;
-    if has_explicit_target && display_message_missing_target_uses_empty_context(&response) {
-        let response = connection
-            .roundtrip(&Request::DisplayMessage(DisplayMessageRequest {
-                target: None,
-                print: true,
-                message,
-                empty_target_context: true,
-            }))
-            .map_err(|error| error.to_string())?;
-        return write_response_output_or_error(response, "display-message");
+    if has_explicit_target && response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
     }
     write_response_output_or_error(response, "display-message")
 }
 
-fn display_message_missing_target_uses_empty_context(response: &Response) -> bool {
-    matches!(
-        response,
-        Response::Error(error)
-            if matches!(
-                &error.error,
-                RmuxError::InvalidTarget { .. } | RmuxError::SessionNotFound(_)
-            )
-    )
-}
-
-fn run_send_keys(socket_path: &Path, request: TinySendKeys) -> Result<i32, String> {
+fn run_send_keys(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinySendKeys,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .send_keys(request.target, request.keys)
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "send-keys")
 }
 

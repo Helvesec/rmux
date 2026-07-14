@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use rmux_proto::{encode_frame, FrameDecoder, HasSessionRequest, Request, Response};
+use rmux_proto::{
+    encode_frame, FrameDecoder, HasSessionRequest, RenameSessionRequest, Request, Response,
+};
 use rmux_sdk::{
     CleanupPolicy, EnsureSession, LeaseState, PaneCloseOutcome, PaneInfo, PaneProcessState,
     PaneRespawnOptions, ProcessSpec, RmuxBuilder, RmuxError, SessionName, SplitDirection,
@@ -422,6 +424,129 @@ async fn owned_session_signal_handlers_are_opt_in_and_unique() -> TestResult {
     harness.finish().await
 }
 
+#[tokio::test]
+async fn owned_session_cleanup_follows_rename_and_preserves_old_name_homonym() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("owned-cleanup-rename").await?;
+    let rmux = harness.rmux();
+    let old_name = session_name("sdkowncleanbefore");
+    let new_name = session_name("sdkowncleanafter");
+    let _keeper = EnsureSession::named(session_name("sdkowncleankeeper"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let mut owned = rmux.owned_session(old_name.clone()).await?;
+    rename_session(&harness.socket_path, old_name.clone(), new_name.clone()).await?;
+    let homonym = EnsureSession::named(old_name.clone())
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+
+    assert!(owned.cleanup().await?);
+    wait_for_session_absent(&rmux, new_name).await?;
+    assert!(
+        homonym.exists().await?,
+        "cleanup must preserve the old-name homonym"
+    );
+    homonym.kill().await?;
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn owned_session_drop_follows_rename_and_preserves_old_name_homonym() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("owned-drop-rename").await?;
+    let rmux = harness.rmux();
+    let old_name = session_name("sdkowndropbefore");
+    let new_name = session_name("sdkowndropafter");
+    let _keeper = EnsureSession::named(session_name("sdkowndropkeeper"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let owned = rmux.owned_session(old_name.clone()).await?;
+    rename_session(&harness.socket_path, old_name.clone(), new_name.clone()).await?;
+    let homonym = EnsureSession::named(old_name)
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+
+    drop(owned);
+    wait_for_session_absent(&rmux, new_name).await?;
+    assert!(
+        homonym.exists().await?,
+        "Drop must preserve the old-name homonym"
+    );
+    homonym.kill().await?;
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn owned_session_lease_renews_and_releases_by_identity_after_rename() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("owned-lease-rename").await?;
+    let rmux = harness.rmux();
+    let old_name = session_name("sdkownleasebefore");
+    let new_name = session_name("sdkownleaseafter");
+    let _keeper = EnsureSession::named(session_name("sdkownleasekeeper"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let owned = rmux
+        .owned_session(old_name.clone())
+        .cleanup_policy(CleanupPolicy::KillOnOwnerExit)
+        .lease_ttl(Duration::from_millis(600))
+        .await?;
+    rename_session(&harness.socket_path, old_name, new_name.clone()).await?;
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(
+        rmux.has_session(new_name.clone()).await?,
+        "stable-id heartbeat must keep a renamed session alive across multiple TTLs"
+    );
+    let preserved = owned.preserve().await?;
+    drop(preserved);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        rmux.has_session(new_name.clone()).await?,
+        "preserve must release the renamed session ownership token"
+    );
+    rmux.session(new_name).await?.kill().await?;
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn owned_session_signal_kill_follows_rename_and_preserves_homonym() -> TestResult {
+    use signal_hook::consts::signal::SIGINT;
+
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("owned-signal-rename").await?;
+    let rmux = harness.rmux();
+    let old_name = session_name("sdkownsignalbefore");
+    let new_name = session_name("sdkownsignalafter");
+    let _keeper = EnsureSession::named(session_name("sdkownsignalkeeper"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let owned = rmux.owned_session(old_name.clone()).await?;
+    let signal_guard = owned.install_default_signal_handlers()?;
+    rename_session(&harness.socket_path, old_name.clone(), new_name.clone()).await?;
+    let homonym = EnsureSession::named(old_name)
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+
+    signal_hook::low_level::raise(SIGINT)?;
+    wait_for_session_absent(&rmux, new_name).await?;
+    assert!(
+        homonym.exists().await?,
+        "signal cleanup must preserve the old-name homonym"
+    );
+    drop(signal_guard);
+    drop(owned);
+    homonym.kill().await?;
+    harness.finish().await
+}
+
 fn running_pid(info: &PaneInfo) -> TestResult<u32> {
     match info.process {
         PaneProcessState::Running { pid: Some(pid) } => Ok(pid),
@@ -564,6 +689,25 @@ async fn framed_request(socket_path: &Path, request: Request) -> TestResult<Resp
     let frame = encode_frame(&request)?;
     stream.write_all(&frame).await?;
     read_response(&mut stream).await
+}
+
+async fn rename_session(
+    socket_path: &Path,
+    target: SessionName,
+    new_name: SessionName,
+) -> TestResult {
+    let response = framed_request(
+        socket_path,
+        Request::RenameSession(RenameSessionRequest {
+            target,
+            new_name: new_name.clone(),
+        }),
+    )
+    .await?;
+    match response {
+        Response::RenameSession(response) if response.session_name == new_name => Ok(()),
+        response => Err(format!("unexpected rename-session response: {response:?}").into()),
+    }
 }
 
 async fn read_response(stream: &mut UnixStream) -> TestResult<Response> {

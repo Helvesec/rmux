@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use super::super::{
     attach_support::attach_target_for_session, client_environment_snapshot,
     effective_client_terminal_context, parse_client_flags, update_environment_from_client,
-    RequestHandler,
+    validate_expected_attach_identity, RequestHandler,
 };
 use super::switching::SwitchManagedClientIdentity;
 use crate::outer_terminal::OuterTerminalContext;
@@ -87,6 +87,12 @@ impl RequestHandler {
         request: AttachSessionExt2Request,
         render_stream: bool,
     ) -> HandleOutcome {
+        let expected_attach = match validate_expected_attach_identity(self, requester_pid).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                return HandleOutcome::response(Response::Error(ErrorResponse { error }));
+            }
+        };
         let mut session_name = match request.target {
             Some(session_name) => session_name,
             None => match self.preferred_session_name().await {
@@ -158,7 +164,14 @@ impl RequestHandler {
         {
             return HandleOutcome::response(Response::Error(ErrorResponse { error }));
         }
-        if let Some(client) = self.managed_client_for_pid(requester_pid).await {
+        let managed_client = match expected_attach {
+            Some(identity) => Some(SwitchManagedClientIdentity::Attach {
+                pid: identity.attach_pid(),
+                attach_id: identity.attach_id(),
+            }),
+            None => self.managed_client_for_pid(requester_pid).await,
+        };
+        if let Some(client) = managed_client {
             #[cfg(test)]
             super::switching::pause_after_switch_target_identity_capture(&session_name).await;
             if let SwitchManagedClientIdentity::Attach {

@@ -2,7 +2,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Write};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -173,12 +173,14 @@ impl ConsoleControlHandlerGuard {
             *state = None;
             return Err(AttachError::Io(io::Error::last_os_error()));
         }
+        CTRL_C_EVENT_ROUTER.enable();
         Ok(Self)
     }
 }
 
 impl Drop for ConsoleControlHandlerGuard {
     fn drop(&mut self) {
+        CTRL_C_EVENT_ROUTER.disable();
         if let Ok(mut state) = CTRL_HANDLER_STATE.lock() {
             *state = None;
         }
@@ -239,11 +241,114 @@ impl ConsoleRestorePoint {
 }
 
 static CTRL_HANDLER_STATE: Mutex<Option<ConsoleModeSnapshot>> = Mutex::new(None);
-static PENDING_CTRL_C_EVENT: AtomicBool = AtomicBool::new(false);
+static CTRL_C_EVENT_ROUTER: CtrlCEventRouter = CtrlCEventRouter::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum CtrlCEventState {
+    Disabled = 0,
+    Active = 1,
+    Pending = 2,
+    Suppressed = 3,
+}
+
+#[derive(Debug)]
+struct CtrlCEventRouter {
+    state: AtomicU8,
+}
+
+impl CtrlCEventRouter {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(CtrlCEventState::Disabled as u8),
+        }
+    }
+
+    fn enable(&self) {
+        self.state
+            .store(CtrlCEventState::Active as u8, Ordering::SeqCst);
+    }
+
+    fn disable(&self) {
+        self.state
+            .store(CtrlCEventState::Disabled as u8, Ordering::SeqCst);
+    }
+
+    fn suppress(&self) {
+        self.transition_to_suppressed();
+    }
+
+    fn resume(&self) {
+        let _ = self.state.compare_exchange(
+            CtrlCEventState::Suppressed as u8,
+            CtrlCEventState::Active as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn record(&self) {
+        loop {
+            match self.state.load(Ordering::SeqCst) {
+                state if state == CtrlCEventState::Active as u8 => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            CtrlCEventState::Active as u8,
+                            CtrlCEventState::Pending as u8,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn take_pending(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CtrlCEventState::Pending as u8,
+                CtrlCEventState::Active as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn transition_to_suppressed(&self) {
+        loop {
+            let current = self.state.load(Ordering::SeqCst);
+            if matches!(
+                current,
+                state if state == CtrlCEventState::Disabled as u8
+                    || state == CtrlCEventState::Suppressed as u8
+            ) {
+                return;
+            }
+            if self
+                .state
+                .compare_exchange(
+                    current,
+                    CtrlCEventState::Suppressed as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+}
 
 unsafe extern "system" fn raw_terminal_ctrl_handler(event: u32) -> i32 {
     if event == CTRL_C_EVENT {
-        PENDING_CTRL_C_EVENT.store(true, Ordering::SeqCst);
+        CTRL_C_EVENT_ROUTER.record();
         return 1;
     }
     if should_restore_for_console_event(event) {
@@ -257,7 +362,15 @@ unsafe extern "system" fn raw_terminal_ctrl_handler(event: u32) -> i32 {
 }
 
 pub(super) fn take_pending_ctrl_c_event() -> bool {
-    PENDING_CTRL_C_EVENT.swap(false, Ordering::SeqCst)
+    CTRL_C_EVENT_ROUTER.take_pending()
+}
+
+pub(super) fn suppress_ctrl_c_input() {
+    CTRL_C_EVENT_ROUTER.suppress();
+}
+
+pub(super) fn resume_ctrl_c_input() {
+    CTRL_C_EVENT_ROUTER.resume();
 }
 
 const fn should_restore_for_console_event(event: u32) -> bool {

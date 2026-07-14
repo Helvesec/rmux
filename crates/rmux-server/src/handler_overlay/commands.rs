@@ -191,7 +191,7 @@ impl RequestHandler {
             .build_display_popup_state(attach_pid, requester_pid, command, target)
             .await?;
 
-        {
+        let popup_identity = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -200,13 +200,17 @@ impl RequestHandler {
             active.overlay_state_id = active.overlay_state_id.saturating_add(1);
             popup.id = active.overlay_state_id;
             active.overlay = Some(ClientOverlayState::Popup(Box::new(popup.clone())));
-        }
+            active.identity(attach_pid)
+        };
 
         if let Some(job) = popup.job.clone() {
-            self.spawn_popup_waiter(attach_pid, popup.id, job.clone());
-            if let Err(error) =
-                self.spawn_popup_reader(attach_pid, popup.id, popup.surface.clone(), job.clone())
-            {
+            self.spawn_popup_waiter(popup_identity, popup.id, job.clone());
+            if let Err(error) = self.spawn_popup_reader(
+                popup_identity,
+                popup.id,
+                popup.surface.clone(),
+                job.clone(),
+            ) {
                 job.terminate();
                 return Err(error);
             }

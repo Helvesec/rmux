@@ -14,7 +14,10 @@ use super::super::control_support::{
 #[cfg(windows)]
 use super::super::pane_support::format_references_pane_pid;
 use super::super::target_support::{pane_id_target, requester_environment_pane_id};
-use super::super::RequestHandler;
+use super::super::{
+    attach_support::ActiveAttachIdentity, current_expected_attach_identity,
+    with_expected_attach_identity, RequestHandler,
+};
 use super::command_args::CommandListArgument;
 use super::format_context::{format_context_for_target_with_server_values, global_format_context};
 use super::queue::{QueueCommandAction, QueueExecutionContext};
@@ -37,6 +40,21 @@ where
     match identity {
         Some(identity) => with_control_queue_identity(identity, future).await,
         None => future.await,
+    }
+}
+
+async fn with_background_client_identities<T, F>(
+    control_identity: Option<ControlClientIdentity>,
+    attach_identity: Option<ActiveAttachIdentity>,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    let control_scoped = with_background_control_identity(control_identity, future);
+    match attach_identity {
+        Some(identity) => with_expected_attach_identity(identity, control_scoped).await,
+        None => control_scoped.await,
     }
 }
 
@@ -80,6 +98,7 @@ impl RequestHandler {
         }
         if request.background {
             let control_identity = current_control_queue_identity(requester_pid);
+            let attach_identity = current_expected_attach_identity();
             if let Some(delay_seconds) = request.delay_seconds {
                 if let Err(error) = run_shell_delay_duration(delay_seconds.as_secs_f64()) {
                     return Response::Error(ErrorResponse { error });
@@ -100,7 +119,7 @@ impl RequestHandler {
                         .run_shell_task(requester_pid, request, client_name)
                         .await;
                 };
-                with_background_control_identity(control_identity, async move {
+                with_background_client_identities(control_identity, attach_identity, async move {
                     if hook_context_active {
                         crate::hook_runtime::with_hook_execution(hook_formats, task).await;
                     } else {
@@ -163,6 +182,7 @@ impl RequestHandler {
     ) -> Response {
         if request.background {
             let control_identity = current_control_queue_identity(requester_pid);
+            let attach_identity = current_expected_attach_identity();
             let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
             let requester_access_guard =
@@ -178,7 +198,7 @@ impl RequestHandler {
                         .if_shell_task(requester_pid, request, client_name)
                         .await;
                 };
-                with_background_control_identity(control_identity, async move {
+                with_background_client_identities(control_identity, attach_identity, async move {
                     if hook_context_active {
                         crate::hook_runtime::with_hook_execution(hook_formats, task).await;
                     } else {
@@ -546,6 +566,7 @@ impl RequestHandler {
     ) -> Result<QueueCommandAction, RmuxError> {
         if command.background {
             let control_identity = current_control_queue_identity(requester_pid);
+            let attach_identity = current_expected_attach_identity();
             let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
             let requester_access_guard =
@@ -563,7 +584,7 @@ impl RequestHandler {
                         .execute_queued_if_shell_background(requester_pid, command, context)
                         .await;
                 };
-                with_background_control_identity(control_identity, async move {
+                with_background_client_identities(control_identity, attach_identity, async move {
                     if hook_context_active {
                         crate::hook_runtime::with_hook_execution(hook_formats, task).await;
                     } else {

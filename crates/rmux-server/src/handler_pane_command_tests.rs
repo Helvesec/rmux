@@ -9,10 +9,10 @@ use rmux_proto::{
     BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
     MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneKillRequest,
     PaneRespawnRequest, PaneSnapshotRequest, PaneTarget, PaneTargetRef, PipePaneRequest,
-    ProcessCommand, RenameWindowRequest, Request, RespawnPaneRequest, Response, ScopeSelector,
-    SelectPaneRequest, SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest,
-    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, TerminalSize,
-    WindowTarget,
+    ProcessCommand, RenameWindowRequest, Request, ResizePaneAdjustment, ResizePaneRequest,
+    RespawnPaneRequest, Response, ScopeSelector, SelectPaneRequest, SessionName,
+    SetHookMutationRequest, SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowExtRequest,
+    SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
 };
 use rmux_proto::{HookLifecycle, HookName};
 use tokio::sync::mpsc;
@@ -310,6 +310,74 @@ async fn list_panes_activity_sort_follows_selection_counter_like_tmux() {
     select(0).await;
     assert_eq!(list(false).await, "2\n1\n0\n");
     assert_eq!(list(true).await, "0\n1\n2\n");
+}
+
+#[tokio::test]
+async fn list_panes_size_sort_uses_area_in_both_directions() {
+    let handler = RequestHandler::new();
+    let session = session_name("list-panes-area-sort");
+    create_session(&handler, &session).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::ResizePane(ResizePaneRequest {
+                target: PaneTarget::with_window(session.clone(), 0, 0),
+                adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 59 },
+            }))
+            .await,
+        Response::ResizePane(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::ResizePane(ResizePaneRequest {
+                target: PaneTarget::with_window(session.clone(), 0, 0),
+                adjustment: ResizePaneAdjustment::AbsoluteHeight { rows: 5 },
+            }))
+            .await,
+        Response::ResizePane(_)
+    ));
+
+    let list = |reversed| {
+        Request::ListPanes(Box::new(ListPanesRequest {
+            target: session.clone(),
+            target_window_index: Some(0),
+            format: Some("#{pane_index}:#{pane_width}x#{pane_height}".to_owned()),
+            filter: None,
+            sort_order: Some("size".to_owned()),
+            reversed,
+        }))
+    };
+
+    assert_eq!(
+        list_stdout(handler.handle(list(false)).await),
+        "0:59x5\n2:20x24\n1:59x18\n"
+    );
+    assert_eq!(
+        list_stdout(handler.handle(list(true)).await),
+        "1:59x18\n2:20x24\n0:59x5\n"
+    );
 }
 
 async fn wait_for_dead_pane(

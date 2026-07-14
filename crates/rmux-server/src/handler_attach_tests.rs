@@ -15,9 +15,10 @@ use rmux_proto::{
     DetachClientExtRequest, DetachClientRequest, ErrorResponse, KeyDispatched, KillSessionRequest,
     LayoutName, LinkWindowRequest, ListPanesRequest, ListWindowsRequest, NewSessionRequest,
     NewWindowRequest, OptionName, PaneTarget, RenameSessionRequest, Request, ResizePaneAdjustment,
-    Response, RmuxError, ScopeSelector, SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest,
-    SelectWindowRequest, SendKeysRequest, SessionName, SetOptionMode, SetOptionRequest,
-    SplitWindowRequest, SplitWindowTarget, SwitchClientRequest, TerminalSize, WindowTarget,
+    ResolveTargetRequest, ResolveTargetType, Response, RmuxError, ScopeSelector,
+    SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest, SelectWindowRequest,
+    SendKeysRequest, SessionName, SetOptionMode, SetOptionRequest, SplitWindowRequest,
+    SplitWindowTarget, SwitchClientRequest, Target, TerminalSize, WindowTarget,
     CAPABILITY_ATTACH_RENDER,
 };
 #[cfg(unix)]

@@ -321,6 +321,62 @@ async fn grouped_new_session_without_explicit_name_uses_tmux_suffix_shape() {
 }
 
 #[tokio::test]
+async fn new_session_print_resolves_captured_identity_after_concurrent_rename() {
+    let handler = RequestHandler::new();
+    let old_name = session_name("print-before-rename");
+    let new_name = session_name("print-after-rename");
+    let session_id = handler.state.lock().await.sessions.next_session_id();
+    let pause = handler.install_new_session_output_pause(session_id);
+    let create_handler = handler.clone();
+    let create = tokio::spawn(async move {
+        create_handler
+            .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+                session_name: Some(old_name),
+                working_directory: None,
+                detached: true,
+                size: None,
+                environment: None,
+                group_target: None,
+                attach_if_exists: false,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                flags: None,
+                window_name: None,
+                print_session_info: true,
+                print_format: Some("#{session_name}:#{session_id}".to_owned()),
+                command: None,
+                process_command: None,
+                client_environment: None,
+                skip_environment_update: false,
+            })))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("new-session reaches the pre-print pause");
+    let renamed = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: session_name("print-before-rename"),
+            new_name: new_name.clone(),
+        }))
+        .await;
+    assert!(matches!(renamed, Response::RenameSession(_)), "{renamed:?}");
+    pause.release.notify_one();
+
+    assert_eq!(
+        create.await.expect("new-session task joins"),
+        Response::NewSession(rmux_proto::NewSessionResponse {
+            session_name: new_name.clone(),
+            detached: true,
+            output: Some(rmux_proto::CommandOutput::from_stdout(
+                format!("{new_name}:{session_id}\n").into_bytes(),
+            )),
+        })
+    );
+}
+
+#[tokio::test]
 async fn auto_named_session_uses_next_global_session_id_after_named_sessions() {
     let handler = RequestHandler::new();
     for name in ["0", "1", "bob"] {

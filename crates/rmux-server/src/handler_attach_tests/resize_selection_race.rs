@@ -1,8 +1,9 @@
 use super::{pane_terminal_size, session_name, RequestHandler};
 use crate::pane_io::AttachControl;
 use rmux_proto::{
-    KillWindowRequest, NewSessionRequest, NewWindowRequest, OptionName, Request, Response,
-    ScopeSelector, SetOptionMode, SetOptionRequest, TerminalSize, WindowTarget,
+    KillSessionRequest, KillWindowRequest, NewSessionRequest, NewWindowRequest, OptionName,
+    Request, Response, ScopeSelector, SetOptionMode, SetOptionRequest, TerminalGeometry,
+    TerminalPixels, TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 
@@ -11,6 +12,149 @@ const LARGE_SIZE: TerminalSize = TerminalSize {
     rows: 43,
 };
 const SMALL_SIZE: TerminalSize = TerminalSize { cols: 72, rows: 19 };
+
+#[tokio::test]
+async fn live_resize_aborts_if_the_attach_switches_after_geometry_capture() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("attached-resize-switch-alpha");
+    let beta = session_name("attached-resize-switch-beta");
+    for name in [&alpha, &beta] {
+        let created = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: name.clone(),
+                detached: true,
+                size: Some(SMALL_SIZE),
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    }
+    handler.wait_for_initial_panes_for_test().await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
+    let attach_pid = 7_509;
+    handler
+        .register_attach(attach_pid, alpha.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(attach_pid).await;
+    let beta_id = {
+        let state = handler.state.lock().await;
+        state.sessions.session(&beta).expect("beta session").id()
+    };
+    let pixels = TerminalPixels::new(1_320, 860);
+    let geometry = TerminalGeometry {
+        size: LARGE_SIZE,
+        pixels: Some(pixels),
+    };
+
+    // Hold state so resize can capture and publish its client geometry but
+    // cannot yet commit session pixels. Switch the same registration while it
+    // is blocked; the stale resize must then abandon every session mutation.
+    let state_guard = handler.state.lock().await;
+    let resize_handler = handler.clone();
+    let resize = tokio::spawn(async move {
+        resize_handler
+            .handle_attached_resize_geometry_for_identity(identity, geometry)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let mut active_attach = handler.active_attach.lock().await;
+            let active = active_attach
+                .by_pid
+                .get_mut(&attach_pid)
+                .expect("attached client survives");
+            if active.client_size == LARGE_SIZE && active.client_pixels == Some(pixels) {
+                active.session_name = beta.clone();
+                active.session_id = beta_id;
+                break;
+            }
+            drop(active_attach);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("resize reaches the post-capture state boundary");
+    handler.bump_active_attach_epoch();
+    drop(state_guard);
+
+    resize
+        .await
+        .expect("resize task join")
+        .expect("stale resize exits cleanly");
+    let state = handler.state.lock().await;
+    assert_eq!(state.attached_terminal_pixels_for_test(&alpha), None);
+    assert_eq!(state.attached_terminal_pixels_for_test(&beta), None);
+}
+
+#[tokio::test]
+async fn live_resize_never_mutates_a_recreated_same_name_session() {
+    let handler = RequestHandler::new();
+    let session_name = session_name("attached-resize-session-identity");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: Some(SMALL_SIZE),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    handler.wait_for_initial_panes_for_test().await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel::<AttachControl>();
+    let attach_pid = 7_510;
+    handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(attach_pid).await;
+    let original_session_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session_name)
+            .expect("original session")
+            .id()
+    };
+
+    let pause = handler.install_attached_size_selection_pause();
+    let resize = handler.handle_attached_resize_for_identity(identity, LARGE_SIZE);
+    let replace = async {
+        pause.reached.notified().await;
+        let killed = handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: session_name.clone(),
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await;
+        assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+        let recreated = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: Some(SMALL_SIZE),
+                environment: None,
+            }))
+            .await;
+        assert!(
+            matches!(recreated, Response::NewSession(_)),
+            "{recreated:?}"
+        );
+        pause.release.notify_one();
+    };
+    let (resized, ()) = tokio::join!(resize, replace);
+    resized.expect("stale resize exits without touching the replacement");
+
+    let state = handler.state.lock().await;
+    let replacement = state
+        .sessions
+        .session(&session_name)
+        .expect("replacement session survives");
+    assert_ne!(replacement.id(), original_session_id);
+    assert_eq!(replacement.window().size(), SMALL_SIZE);
+}
 
 #[tokio::test]
 async fn attached_size_selection_retries_after_the_captured_window_is_killed() {

@@ -1,4 +1,6 @@
 use super::*;
+use crate::handler::with_expected_attach_and_session_identity;
+use crate::pane_io::AttachControl;
 
 #[tokio::test]
 async fn if_shell_format_mode_dispatches_selected_rmux_command() {
@@ -166,6 +168,96 @@ async fn queued_background_if_shell_rejects_a_reused_control_registration() {
 
     assert_sessions_survive_background_control_reuse(&handler, &original, &replacement).await;
     drop((original_events, replacement_events));
+}
+
+async fn assert_background_if_shell_rejects_reused_attach_registration(queued: bool) {
+    let handler = RequestHandler::new();
+    let requester_pid = if queued { 424_208 } else { 424_207 };
+    let suffix = if queued { "queue" } else { "request" };
+    let original = session_name(&format!("if-shell-{suffix}-attach-original"));
+    let replacement = session_name(&format!("if-shell-{suffix}-attach-replacement"));
+    let wait_channel = format!("if-shell-{suffix}-attach-registration-reuse");
+    create_background_identity_session(&handler, original.clone()).await;
+    create_background_identity_session(&handler, replacement.clone()).await;
+    let (original_control_tx, _original_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, original.clone(), original_control_tx)
+        .await;
+    let original_identity = handler.active_attach_identity_for_test(requester_pid).await;
+
+    if queued {
+        let commands = CommandParser::new()
+            .parse(&format!(
+                "if-shell -b -F 1 {{ wait-for {wait_channel} ; detach-client }}"
+            ))
+            .expect("background queued if-shell command parses");
+        let output = with_expected_attach_and_session_identity(
+            original_identity,
+            original.clone(),
+            original_identity.session_id(),
+            handler.execute_parsed_commands_for_test(requester_pid, commands),
+        )
+        .await
+        .expect("background queued if-shell dispatch succeeds");
+        assert!(output.stdout().is_empty());
+    } else {
+        let response = with_expected_attach_and_session_identity(
+            original_identity,
+            original.clone(),
+            original_identity.session_id(),
+            handler.handle_if_shell(
+                requester_pid,
+                IfShellRequest {
+                    condition: "1".to_owned(),
+                    format_mode: true,
+                    then_command: format!("wait-for {wait_channel} ; detach-client"),
+                    else_command: None,
+                    target: None,
+                    caller_cwd: None,
+                    background: true,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            response,
+            Response::IfShell(rmux_proto::IfShellResponse::no_output())
+        );
+    }
+    wait_for_background_waiter(&handler, &wait_channel).await;
+
+    let (replacement_control_tx, mut replacement_control_rx) =
+        tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, replacement.clone(), replacement_control_tx)
+        .await;
+    let replacement_identity = handler.active_attach_identity_for_test(requester_pid).await;
+    while replacement_control_rx.try_recv().is_ok() {}
+
+    release_background_waiter(&handler, &wait_channel).await;
+    wait_for_detached_request_count(&handler, 0).await;
+    assert!(
+        handler
+            .current_live_attach_input(replacement_identity)
+            .await,
+        "stale background if-shell must not detach the same-PID replacement"
+    );
+    while let Ok(control) = replacement_control_rx.try_recv() {
+        assert!(
+            !matches!(control, AttachControl::Detach),
+            "stale background if-shell detached the replacement registration"
+        );
+    }
+
+    let state = handler.state.lock().await;
+    assert!(state.sessions.contains_session(&original));
+    assert!(state.sessions.contains_session(&replacement));
+}
+
+#[tokio::test]
+async fn background_if_shell_rejects_a_reused_attach_registration() {
+    assert_background_if_shell_rejects_reused_attach_registration(false).await;
+    assert_background_if_shell_rejects_reused_attach_registration(true).await;
 }
 
 #[tokio::test]

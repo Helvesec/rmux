@@ -8,10 +8,7 @@ async fn forward_attach_clears_persistent_overlay_with_fresh_switch_frame() {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let closing = Arc::new(AtomicBool::new(false));
-    let live_input = LiveAttachInputContext {
-        handler,
-        attach_pid: std::process::id(),
-    };
+    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
 
     let attach_task = tokio::spawn(forward_attach(
         stream,
@@ -84,10 +81,7 @@ async fn forward_attach_does_not_paint_stale_base_while_overlay_dismiss_refresh_
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let closing = Arc::new(AtomicBool::new(false));
-    let live_input = LiveAttachInputContext {
-        handler,
-        attach_pid: std::process::id(),
-    };
+    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
 
     let attach_task = tokio::spawn(forward_attach(
         stream,
@@ -154,10 +148,7 @@ async fn forward_attach_dismiss_epoch_rejects_queued_stale_tree_frames() {
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let closing = Arc::new(AtomicBool::new(false));
     let persistent_overlay_epoch = Arc::new(AtomicU64::new(0));
-    let live_input = LiveAttachInputContext {
-        handler,
-        attach_pid: std::process::id(),
-    };
+    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
 
     let attach_task = tokio::spawn(forward_attach(
         stream,
@@ -263,10 +254,7 @@ async fn forward_attach_defers_kitty_passthroughs_until_persistent_overlay_clear
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let closing = Arc::new(AtomicBool::new(false));
     let pane_output = pane_output_channel();
-    let live_input = LiveAttachInputContext {
-        handler,
-        attach_pid: std::process::id(),
-    };
+    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
 
     let attach_task = tokio::spawn(forward_attach(
         stream,
@@ -343,10 +331,7 @@ async fn forward_attach_defers_sixel_passthroughs_until_persistent_overlay_clear
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let closing = Arc::new(AtomicBool::new(false));
     let pane_output = pane_output_channel();
-    let live_input = LiveAttachInputContext {
-        handler,
-        attach_pid: std::process::id(),
-    };
+    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
 
     let attach_task = tokio::spawn(forward_attach(
         stream,
@@ -426,10 +411,7 @@ async fn forward_attach_drops_kitty_passthroughs_when_target_gate_is_disabled() 
     let (_control_tx, control_rx) = mpsc::unbounded_channel();
     let closing = Arc::new(AtomicBool::new(false));
     let pane_output = pane_output_channel();
-    let live_input = LiveAttachInputContext {
-        handler,
-        attach_pid: std::process::id(),
-    };
+    let live_input = LiveAttachInputContext::unregistered_for_test(handler, std::process::id());
 
     let attach_task = tokio::spawn(forward_attach(
         stream,

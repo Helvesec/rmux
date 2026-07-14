@@ -20,9 +20,9 @@ use rustix::termios::{tcsetwinsize, Winsize};
 use crate::attach_lock_state::AttachLockState;
 
 use super::{
-    attach_with_terminal, drain_resize_events, fallback_attach_stop_sequence, input_loop,
-    output_loop, terminal_size_from_fd, AttachScreenTracker, RawTerminal, ResizeWatcher,
-    SignalMaskGuard, TerminalSize,
+    attach_with_terminal, drain_resize_events, fallback_attach_stop_sequence, handle_attach_action,
+    input_loop, output_loop, terminal_size_from_fd, write_attach_unlock, AttachScreenTracker,
+    ClientAttachAction, RawTerminal, ResizeWatcher, SignalMaskGuard, TerminalSize,
 };
 
 static RESIZE_WATCHER_SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -222,6 +222,96 @@ fn lock_action_waits_for_an_inflight_unix_input_read_and_forward(
     input_thread
         .join()
         .map_err(|_| "input loop thread panicked")??;
+    Ok(())
+}
+
+#[test]
+fn unix_lock_actions_rearm_screen_before_sending_unlock() -> Result<(), Box<dyn std::error::Error>>
+{
+    let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
+    let (_master, slave) = pair.into_split();
+    let terminal = File::from(slave.into_owned_fd());
+    let raw_terminal = RawTerminal::from_fd(&terminal)?;
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+
+    for structured in [false, true] {
+        let (mut client_stream, mut server_stream) = UnixStream::pair()?;
+        let locked = Arc::new(AttachLockState::default());
+        let screen_tracker = AttachScreenTracker::default();
+        locked.lock();
+        let stop_generation = screen_tracker.mark_stopped();
+        let action = if structured {
+            ClientAttachAction::LockShell {
+                command: AttachShellCommand::new(
+                    "true".to_owned(),
+                    "/bin/sh".to_owned(),
+                    cwd.clone(),
+                ),
+                stop_generation: Some(stop_generation),
+            }
+        } else {
+            ClientAttachAction::Lock {
+                command: "true".to_owned(),
+                stop_generation: Some(stop_generation),
+            }
+        };
+
+        handle_attach_action(
+            Some(&raw_terminal),
+            &mut client_stream,
+            &locked,
+            &screen_tracker,
+            action,
+        )?;
+
+        assert!(
+            !screen_tracker.was_stopped(),
+            "successful lock action must rearm attach lifecycle"
+        );
+        assert!(!locked.is_locked());
+        let mut frame = [0_u8; 64];
+        let bytes_read = server_stream.read(&mut frame)?;
+        let mut decoder = AttachFrameDecoder::new();
+        decoder.push_bytes(&frame[..bytes_read]);
+        assert_eq!(decoder.next_message()?, Some(AttachMessage::Unlock));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn unix_unlock_write_failure_still_leaves_screen_rearmed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (mut client_stream, server_stream) = UnixStream::pair()?;
+    let screen_tracker = AttachScreenTracker::default();
+    let stop_generation = screen_tracker.mark_stopped();
+    drop(server_stream);
+
+    write_attach_unlock(&mut client_stream, &screen_tracker, Some(stop_generation))
+        .expect_err("closed peer must reject attach unlock");
+    assert!(
+        !screen_tracker.was_stopped(),
+        "failed unlock transport must trigger outer terminal cleanup"
+    );
+    Ok(())
+}
+
+#[test]
+fn unix_lock_completion_preserves_a_later_final_stop() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut client_stream, mut server_stream) = UnixStream::pair()?;
+    let screen_tracker = AttachScreenTracker::default();
+    let lock_prelude = screen_tracker.mark_stopped();
+    let final_stop = screen_tracker.mark_stopped();
+    server_stream.set_nonblocking(true)?;
+
+    write_attach_unlock(&mut client_stream, &screen_tracker, Some(lock_prelude))?;
+
+    assert_eq!(screen_tracker.current_stop_generation(), Some(final_stop));
+    let mut frame = [0_u8; 64];
+    let error = server_stream
+        .read(&mut frame)
+        .expect_err("a stale lock completion must not send unlock");
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     Ok(())
 }
 

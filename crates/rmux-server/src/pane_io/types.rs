@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use crate::client_flags::ClientFlags;
 use crate::control_mode::ControlModeUpgrade;
 #[cfg(any(unix, windows))]
-use crate::handler::RequestHandler;
+use crate::handler::{attach_support::ActiveAttachIdentity, RequestHandler};
 use crate::outer_terminal::OuterTerminal;
 
 use super::live_render::LivePaneRender;
@@ -196,7 +196,41 @@ impl AttachTarget {
 #[cfg(any(unix, windows))]
 pub(crate) struct LiveAttachInputContext {
     pub(crate) handler: Arc<RequestHandler>,
-    pub(crate) attach_pid: u32,
+    pub(crate) identity: ActiveAttachIdentity,
+    #[cfg(test)]
+    pub(crate) validate_identity: bool,
+}
+
+#[cfg(any(unix, windows))]
+impl LiveAttachInputContext {
+    pub(crate) fn new(handler: Arc<RequestHandler>, identity: ActiveAttachIdentity) -> Self {
+        Self {
+            handler,
+            identity,
+            #[cfg(test)]
+            validate_identity: true,
+        }
+    }
+
+    pub(crate) const fn attach_pid(&self) -> u32 {
+        self.identity.attach_pid()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn current_for_test(handler: Arc<RequestHandler>, attach_pid: u32) -> Self {
+        let identity = handler.active_attach_identity_for_test(attach_pid).await;
+        Self::new(handler, identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unregistered_for_test(handler: Arc<RequestHandler>, attach_pid: u32) -> Self {
+        let mut context = Self::new(
+            handler,
+            ActiveAttachIdentity::new(attach_pid, u64::MAX, rmux_proto::SessionId::new(u32::MAX)),
+        );
+        context.validate_identity = false;
+        context
+    }
 }
 
 pub(crate) struct HandleOutcome {

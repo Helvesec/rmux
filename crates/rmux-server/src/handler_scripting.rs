@@ -10,11 +10,15 @@ use rmux_proto::{
 };
 use std::collections::VecDeque;
 
+use super::attach_support::ActiveAttachIdentity;
+use super::client_support::capture_switch_client_target_identity;
 use super::control_support::{
     control_queue_eof_action, current_control_queue_identity, with_control_queue_identity,
     ControlClientIdentity, ControlQueueEofAction,
 };
-use super::RequestHandler;
+use super::{
+    rebase_expected_attach_session_after_switch, validate_expected_attach_identity, RequestHandler,
+};
 use crate::control::ControlCommandResult;
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 
@@ -93,7 +97,10 @@ pub(super) use self::format_context::{
 };
 pub(in crate::handler) use self::parser_context::command_parser_from_state;
 pub(super) use self::prompt_parse::{ParsedPromptHistoryCommand, PromptHistoryAction};
-use self::queue::{queue_action_from_response, remove_group_contexts, QueueInvocation, QueueMode};
+use self::queue::{
+    captures_attached_client_transition, queue_action_from_response, remove_group_contexts,
+    QueueInvocation, QueueMode,
+};
 pub(in crate::handler) use self::queue::{
     rename_pane_target_session, rename_target_session, rename_window_target_session,
 };
@@ -114,6 +121,11 @@ use super::target_support::requester_environment_pane_id;
 const SOURCE_FILE_NESTING_LIMIT: usize = 50;
 pub(in crate::handler) const CONTROL_QUEUE_INSERTED_COMMAND_LIMIT: usize = 1024;
 pub(in crate::handler) const CONTROL_QUEUE_STDOUT_LIMIT: usize = 4 * 1024 * 1024;
+
+struct QueuedCommandExecution {
+    action: QueueCommandAction,
+    attached_switch_target: Option<Target>,
+}
 
 impl RequestHandler {
     #[cfg(test)]
@@ -209,8 +221,55 @@ impl RequestHandler {
         commands: &ParsedCommands,
         context: &QueueExecutionContext,
     ) -> Result<bool, RmuxError> {
+        self.start_attached_prompt_binding_commands_with_identity(
+            requester_pid,
+            None,
+            commands,
+            context,
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn start_attached_prompt_binding_commands_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        session_name: rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
+        requester_pid: u32,
+        commands: &ParsedCommands,
+        context: &QueueExecutionContext,
+    ) -> Result<bool, RmuxError> {
+        self.start_attached_prompt_binding_commands_with_identity(
+            requester_pid,
+            Some((identity, session_name, session_id)),
+            commands,
+            context,
+        )
+        .await
+    }
+
+    async fn start_attached_prompt_binding_commands_with_identity(
+        &self,
+        requester_pid: u32,
+        identity: Option<(
+            ActiveAttachIdentity,
+            rmux_proto::SessionName,
+            rmux_proto::SessionId,
+        )>,
+        commands: &ParsedCommands,
+        context: &QueueExecutionContext,
+    ) -> Result<bool, RmuxError> {
         if commands.commands().len() != 1 {
             return Ok(false);
+        }
+
+        if identity
+            .as_ref()
+            .is_some_and(|(identity, _, _)| identity.attach_pid() != requester_pid)
+        {
+            return Err(RmuxError::Server(
+                "attached prompt identity changed client".to_owned(),
+            ));
         }
 
         self.apply_parse_time_assignments(requester_pid, commands, None)
@@ -220,7 +279,15 @@ impl RequestHandler {
             .first()
             .expect("single command checked")
             .clone();
-        let attached_session = self.current_session_candidate(requester_pid).await;
+        let attached_session = match identity.as_ref() {
+            Some((identity, session_name, _)) => {
+                if !self.current_live_attach_input(*identity).await {
+                    return Err(RmuxError::Server("attached client disappeared".to_owned()));
+                }
+                Some(session_name.clone())
+            }
+            None => self.current_session_candidate(requester_pid).await,
+        };
         let socket_path = self.socket_path();
         let requester_pane_id = context
             .current_target
@@ -229,6 +296,17 @@ impl RequestHandler {
             .flatten();
         let invocation = {
             let state = self.state.lock().await;
+            if identity
+                .as_ref()
+                .is_some_and(|(_, session_name, session_id)| {
+                    state
+                        .sessions
+                        .session(session_name)
+                        .is_none_or(|session| session.id() != *session_id)
+                })
+            {
+                return Err(RmuxError::Server("attached session disappeared".to_owned()));
+            }
             let marked_target = state.marked_pane_target();
             let find_context = queue_target_find_context(QueueTargetFindContextInput {
                 sessions: &state.sessions,
@@ -251,13 +329,43 @@ impl RequestHandler {
 
         match invocation {
             QueueInvocation::CommandPrompt(command) => {
-                self.start_attached_command_prompt_binding(requester_pid, command, context)
-                    .await?;
+                match identity {
+                    Some((identity, session_name, session_id)) => {
+                        self.start_attached_command_prompt_binding_for_identity(
+                            identity,
+                            session_name,
+                            session_id,
+                            requester_pid,
+                            command,
+                            context,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        self.start_attached_command_prompt_binding(requester_pid, command, context)
+                            .await?;
+                    }
+                }
                 Ok(true)
             }
             QueueInvocation::ConfirmBefore(command) => {
-                self.start_attached_confirm_before_binding(requester_pid, command, context)
-                    .await?;
+                match identity {
+                    Some((identity, session_name, session_id)) => {
+                        self.start_attached_confirm_before_binding_for_identity(
+                            identity,
+                            session_name,
+                            session_id,
+                            requester_pid,
+                            command,
+                            context,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        self.start_attached_confirm_before_binding(requester_pid, command, context)
+                            .await?;
+                    }
+                }
                 Ok(true)
             }
             _ => Ok(false),
@@ -273,6 +381,16 @@ impl RequestHandler {
         mode: QueueMode,
         expected_control_id: Option<u64>,
     ) -> ControlCommandResult {
+        if let Err(error) = validate_expected_attach_identity(self, requester_pid).await {
+            return ControlCommandResult {
+                stdout: Vec::new(),
+                error: Some(error.clone()),
+                source_file_error: None,
+                execution_error: Some(error),
+                exit_status: Some(1),
+                server_shutdown_started: false,
+            };
+        }
         let control_identity = expected_control_id
             .map(|control_id| ControlClientIdentity::new(requester_pid, control_id));
         if control_queue_eof_action(control_identity) == ControlQueueEofAction::StopFrame {
@@ -309,6 +427,15 @@ impl RequestHandler {
         let mut server_shutdown_started = false;
 
         'command_queue: loop {
+            if queue.is_empty() {
+                break 'command_queue;
+            }
+            if let Err(error) = validate_expected_attach_identity(self, requester_pid).await {
+                execution_errors.push(error.clone());
+                errors.push(error);
+                exit_status = Some(1);
+                break 'command_queue;
+            }
             if control_queue_eof_action(control_identity) == ControlQueueEofAction::StopFrame {
                 break 'command_queue;
             }
@@ -343,6 +470,14 @@ impl RequestHandler {
             if eof_action == ControlQueueEofAction::StopFrame {
                 break 'command_queue;
             }
+            let command_action = command_action.map(|execution| {
+                if let Some(target) = execution.attached_switch_target {
+                    for context in &mut contexts {
+                        context.rebase_implicit_current_target(target.clone());
+                    }
+                }
+                execution.action
+            });
             match command_action {
                 Ok(QueueCommandAction::Normal {
                     output: Some(output),
@@ -393,6 +528,13 @@ impl RequestHandler {
                     source_file_error,
                     exit_status: action_exit_status,
                 }) => {
+                    if let Err(error) = validate_expected_attach_identity(self, requester_pid).await
+                    {
+                        execution_errors.push(error.clone());
+                        errors.push(error);
+                        exit_status = Some(1);
+                        break 'command_queue;
+                    }
                     if let Some(output) = output {
                         if let Err(error) = append_queue_stdout(&mut stdout, output.stdout(), mode)
                         {
@@ -499,7 +641,7 @@ impl RequestHandler {
         context: &QueueExecutionContext,
         mode: QueueMode,
         expected_control_id: Option<u64>,
-    ) -> Result<QueueCommandAction, RmuxError> {
+    ) -> Result<QueuedCommandExecution, RmuxError> {
         let command_for_hooks = command.clone();
         if mode == QueueMode::Control {
             self.validate_control_queue_session_identity(
@@ -564,6 +706,7 @@ impl RequestHandler {
                 | QueueInvocation::SplitWindow(_)
         );
 
+        let mut attached_switch_target = None;
         let result = match invocation {
             QueueInvocation::NoOp => Ok(QueueCommandAction::Normal {
                 output: None,
@@ -586,13 +729,38 @@ impl RequestHandler {
                 let request = apply_queue_context_to_request(request, context);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
                 let request_for_hooks = request.clone();
-                let (outcome, inline_hooks) = Box::pin(self.dispatch_captured_with_client_name(
+                let captures_client_transition = captures_attached_client_transition(&request);
+                let dispatch = Box::pin(self.dispatch_captured_with_client_name(
                     requester_pid,
                     u64::from(requester_pid),
                     request,
                     context.client_name.clone(),
-                ))
-                .await;
+                ));
+                let ((outcome, inline_hooks), switch_client_capture) = if captures_client_transition
+                {
+                    capture_switch_client_target_identity(dispatch).await
+                } else {
+                    (dispatch.await, Default::default())
+                };
+                if captures_client_transition {
+                    if let Response::SwitchClient(response) = &outcome.response {
+                        let targeted_client =
+                            switch_client_capture.targeted_client.ok_or_else(|| {
+                                RmuxError::Server(
+                                    "switch-client response omitted its targeted client identity"
+                                        .to_owned(),
+                                )
+                            })?;
+                        attached_switch_target = rebase_expected_attach_session_after_switch(
+                            self,
+                            requester_pid,
+                            targeted_client,
+                            &response.session_name,
+                            switch_client_capture.committed_target,
+                        )
+                        .await?;
+                    }
+                }
                 let targeted_output_delivered =
                     if let Some((target, pane_id)) = explicit_target_run_shell.as_ref() {
                         self.deliver_targeted_run_shell_output(
@@ -703,7 +871,12 @@ impl RequestHandler {
             .await;
         }
 
-        result.map_err(|error| source_file_context_error(error, &command_for_hooks, context))
+        result
+            .map(|action| QueuedCommandExecution {
+                action,
+                attached_switch_target,
+            })
+            .map_err(|error| source_file_context_error(error, &command_for_hooks, context))
     }
 
     async fn deliver_targeted_run_shell_output(

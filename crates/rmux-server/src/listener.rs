@@ -342,8 +342,8 @@ async fn serve_connection(
                     };
                     let session_name = response.session_name.clone();
                     let terminal_context = attach.target.outer_terminal.context().clone();
-                    let attach_id = handler
-                        .register_attach_with_access(
+                    let attach_identity = handler
+                        .register_attach_identity_with_access(
                             requester.pid,
                             session_name.clone(),
                             Some(attach.session_id),
@@ -390,14 +390,16 @@ async fn serve_connection(
                         attach.control_backlog,
                         attach.closing,
                         attach.persistent_overlay_epoch,
-                        pane_io::LiveAttachInputContext {
-                            handler: Arc::clone(&handler),
-                            attach_pid: requester.pid,
-                        },
+                        pane_io::LiveAttachInputContext::new(
+                            Arc::clone(&handler),
+                            attach_identity,
+                        ),
                         attach.render_stream,
                     )
                     .await;
-                    handler.finish_attach(requester.pid, attach_id).await;
+                    handler
+                        .finish_attach(requester.pid, attach_identity.attach_id())
+                        .await;
                     drop(attach_forwarder_guard);
                     let _ = handler.request_shutdown_if_pending();
                     return result;

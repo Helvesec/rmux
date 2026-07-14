@@ -1182,21 +1182,27 @@ async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
 }
 
 #[tokio::test]
-async fn parsed_queue_refresh_client_r_is_accepted_but_runtime_unsupported() {
+async fn parsed_queue_refresh_client_reserved_wire_flags_are_unknown() {
     let handler = RequestHandler::new();
-    let parsed = CommandParser::new()
-        .parse("refresh-client -r %0")
-        .expect("refresh-client command parses");
+    for (command, flag) in [
+        ("refresh-client -A pane:on", "-A"),
+        ("refresh-client -B name:pane:format", "-B"),
+        ("refresh-client -r pane:rgb", "-r"),
+    ] {
+        let parsed = CommandParser::new()
+            .parse(command)
+            .expect("generic command parser preserves command arguments");
 
-    let error = handler
-        .execute_parsed_commands_for_test(std::process::id(), parsed)
-        .await
-        .expect_err("refresh-client -r should be accepted by parser and rejected by runtime");
+        let error = handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+            .expect_err("reserved refresh-client flag must fail during request parsing");
 
-    assert_eq!(
-        error,
-        rmux_proto::RmuxError::Server("refresh-client -r is not supported".to_owned())
-    );
+        assert_eq!(
+            error,
+            rmux_proto::RmuxError::Server(format!("command refresh-client: unknown flag {flag}"))
+        );
+    }
 }
 
 #[tokio::test]

@@ -16,14 +16,14 @@ pub(in crate::handler) enum ClientOverlayState {
 }
 
 impl ClientOverlayState {
-    pub(super) fn id(&self) -> u64 {
+    pub(in crate::handler) fn id(&self) -> u64 {
         match self {
             Self::Menu(menu) => menu.id,
             Self::Popup(popup) => popup.id,
         }
     }
 
-    pub(super) fn render(&self) -> Vec<u8> {
+    pub(in crate::handler) fn render(&self) -> Vec<u8> {
         match self {
             Self::Menu(menu) => menu.render(),
             Self::Popup(popup) => popup.render(),

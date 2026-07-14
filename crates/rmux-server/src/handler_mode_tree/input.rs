@@ -18,9 +18,29 @@ use super::mode_tree_selection::{
 };
 
 impl RequestHandler {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::handler) async fn handle_mode_tree_key_event(
         &self,
         attach_pid: u32,
+        event: PromptInputEvent,
+    ) -> Result<bool, RmuxError> {
+        self.handle_mode_tree_key_event_with_identity(attach_pid, None, event)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_mode_tree_key_event_for_identity(
+        &self,
+        identity: super::super::attach_support::ActiveAttachIdentity,
+        event: PromptInputEvent,
+    ) -> Result<bool, RmuxError> {
+        self.handle_mode_tree_key_event_with_identity(identity.attach_pid(), Some(identity), event)
+            .await
+    }
+
+    async fn handle_mode_tree_key_event_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<super::super::attach_support::ActiveAttachIdentity>,
         event: PromptInputEvent,
     ) -> Result<bool, RmuxError> {
         let (mut mode, action_identity) = {
@@ -28,7 +48,10 @@ impl RequestHandler {
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
-                .filter(|active| !active.closing.load(std::sync::atomic::Ordering::SeqCst))
+                .filter(|active| {
+                    identity.is_none_or(|identity| identity.matches_active(active))
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             let Some(mode) = active.mode_tree.clone() else {
                 return Ok(false);
@@ -308,9 +331,33 @@ impl RequestHandler {
             })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::handler) async fn handle_mode_tree_mouse_event(
         &self,
         attach_pid: u32,
+        event: MouseForwardEvent,
+    ) -> Result<bool, RmuxError> {
+        self.handle_mode_tree_mouse_event_with_identity(attach_pid, None, event)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_mode_tree_mouse_event_for_identity(
+        &self,
+        identity: super::super::attach_support::ActiveAttachIdentity,
+        event: MouseForwardEvent,
+    ) -> Result<bool, RmuxError> {
+        self.handle_mode_tree_mouse_event_with_identity(
+            identity.attach_pid(),
+            Some(identity),
+            event,
+        )
+        .await
+    }
+
+    async fn handle_mode_tree_mouse_event_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<super::super::attach_support::ActiveAttachIdentity>,
         event: MouseForwardEvent,
     ) -> Result<bool, RmuxError> {
         let mut mode = {
@@ -318,6 +365,7 @@ impl RequestHandler {
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
+                .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             let Some(mode) = active.mode_tree.clone() else {
                 return Ok(false);

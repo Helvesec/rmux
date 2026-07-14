@@ -182,24 +182,23 @@ impl RequestHandler {
         &self,
         session_name: &SessionName,
     ) {
-        let pause = KILL_SESSION_SELECTION_IDENTITY_PAUSE
-            .lock()
-            .expect("kill-session selection identity pause lock")
-            .iter()
-            .filter(|(paused_session, _)| paused_session == session_name)
-            .map(|(_, pause)| pause.clone())
-            .next();
+        // Consume the pause before waiting so a nested kill of the same
+        // session can make progress while this request is suspended. The
+        // deterministic race hook is intentionally one-shot.
+        let pause = {
+            let mut pauses = KILL_SESSION_SELECTION_IDENTITY_PAUSE
+                .lock()
+                .expect("kill-session selection identity pause lock");
+            pauses
+                .iter()
+                .position(|(paused_session, _)| paused_session == session_name)
+                .map(|index| pauses.remove(index).1)
+        };
         let Some(pause) = pause else {
             return;
         };
         pause.reached.notify_one();
         pause.release.notified().await;
-        let mut installed = KILL_SESSION_SELECTION_IDENTITY_PAUSE
-            .lock()
-            .expect("kill-session selection identity pause lock");
-        installed.retain(|(paused_session, current)| {
-            paused_session != session_name || !std::sync::Arc::ptr_eq(current, &pause)
-        });
     }
 
     #[cfg(test)]
@@ -809,11 +808,11 @@ impl RequestHandler {
         }
 
         match self
-            .render_new_session_output(&session_name, request.print_format.as_deref())
+            .render_new_session_output(created_session_id, request.print_format.as_deref())
             .await
         {
-            Ok(output) => Response::NewSession(NewSessionResponse {
-                session_name,
+            Ok((current_session_name, output)) => Response::NewSession(NewSessionResponse {
+                session_name: current_session_name,
                 detached,
                 output: Some(output),
             }),
@@ -1054,7 +1053,9 @@ impl RequestHandler {
         &self,
         request: rmux_proto::KillSessionRequest,
     ) -> Response {
-        self.handle_kill_session_with_identity(request, None).await
+        let expected_session_id = explicit_session_id_target(&request.target);
+        self.handle_kill_session_with_identity(request, expected_session_id)
+            .await
     }
 
     pub(in crate::handler) async fn handle_kill_session_identity(
@@ -1150,10 +1151,8 @@ impl RequestHandler {
         }
 
         #[cfg(test)]
-        if request.kill_all_except_target || request.kill_group {
-            self.pause_after_kill_session_selection_identity_capture(&session_name)
-                .await;
-        }
+        self.pause_after_kill_session_selection_identity_capture(&session_name)
+            .await;
 
         let (
             response,
@@ -1647,6 +1646,14 @@ fn session_pane_ids(session: &rmux_core::Session) -> Vec<PaneId> {
         .values()
         .flat_map(|window| window.panes().iter().map(|pane| pane.id()))
         .collect()
+}
+
+fn explicit_session_id_target(target: &SessionName) -> Option<SessionId> {
+    let raw_id = target.as_str().strip_prefix('$')?;
+    if raw_id.is_empty() || !raw_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw_id.parse::<u32>().ok().map(SessionId::new)
 }
 
 fn should_defer_windows_initial_pane(

@@ -14,6 +14,26 @@ use super::{
 };
 
 impl RequestHandler {
+    pub(in crate::handler) async fn reconcile_attached_session_identity_size_and_emit(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(), RmuxError> {
+        let active_window_id = {
+            let state = self.state.lock().await;
+            let active_window_id = state
+                .sessions
+                .iter()
+                .find(|(_, session)| session.id() == session_id)
+                .map(|(_, session)| session.window().id());
+            active_window_id
+        };
+        let Some(active_window_id) = active_window_id else {
+            return Ok(());
+        };
+        self.reconcile_attached_window_identity_size_and_emit(session_id, active_window_id)
+            .await
+    }
+
     pub(in crate::handler) async fn reconcile_attached_window_identity_size_and_emit(
         &self,
         session_id: SessionId,

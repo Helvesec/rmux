@@ -18,8 +18,8 @@ use super::{
     attached_client_matches_target, command_output_from_lines,
     control_support::{current_control_queue_identity, ManagedClient},
     format_client_uid, format_client_user, format_requester_uid, normalize_target_client,
-    session_selection_prefers_live_process, sort_list_clients, RequestHandler,
-    LIST_CLIENTS_TEMPLATE,
+    session_selection_prefers_live_process, sort_list_clients, validate_expected_attach_identity,
+    RequestHandler, LIST_CLIENTS_TEMPLATE,
 };
 
 #[path = "handler_client/attach.rs"]
@@ -34,7 +34,9 @@ mod switch_atomicity_tests;
 #[path = "handler_client/switching.rs"]
 mod switching;
 
-pub(in crate::handler) use switching::SwitchTargetSelection;
+pub(in crate::handler) use switching::{
+    capture_switch_client_target_identity, SwitchManagedClientIdentity, SwitchTargetSelection,
+};
 
 #[cfg(test)]
 #[derive(Debug, Default)]
@@ -152,22 +154,37 @@ impl RequestHandler {
         target_client: Option<&str>,
         command_name: &str,
     ) -> Result<ManagedClient, RmuxError> {
+        let expected_attach = validate_expected_attach_identity(self, requester_pid).await?;
         if let Some(identity) = current_control_queue_identity(requester_pid) {
             self.validate_control_queue_session_identity(requester_pid, identity.control_id())
                 .await?;
         }
 
         let Some(target_client) = target_client.map(normalize_target_client) else {
-            let client = self
-                .resolve_managed_client(requester_pid, command_name)
-                .await?;
+            let client = match expected_attach {
+                Some(identity) => ManagedClient::Attach {
+                    pid: identity.attach_pid(),
+                    attach_id: identity.attach_id(),
+                },
+                None => {
+                    self.resolve_managed_client(requester_pid, command_name)
+                        .await?
+                }
+            };
             pause_after_managed_client_resolution(client).await;
             return Ok(client);
         };
         if target_client == "=" {
-            let client = self
-                .resolve_managed_client(requester_pid, command_name)
-                .await?;
+            let client = match expected_attach {
+                Some(identity) => ManagedClient::Attach {
+                    pid: identity.attach_pid(),
+                    attach_id: identity.attach_id(),
+                },
+                None => {
+                    self.resolve_managed_client(requester_pid, command_name)
+                        .await?
+                }
+            };
             pause_after_managed_client_resolution(client).await;
             return Ok(client);
         }

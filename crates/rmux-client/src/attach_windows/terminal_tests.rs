@@ -95,6 +95,47 @@ fn console_control_handler_restores_for_process_exit_events() {
 }
 
 #[test]
+fn ctrl_c_router_drops_locked_events_without_leaking_after_resume() {
+    let router = CtrlCEventRouter::new();
+    router.enable();
+
+    router.record();
+    router.suppress();
+    assert!(
+        !router.take_pending(),
+        "entering lock must discard a not-yet-forwarded Ctrl-C"
+    );
+
+    router.record();
+    router.resume();
+    assert!(
+        !router.take_pending(),
+        "Ctrl-C received while locked must not leak after unlock"
+    );
+
+    router.record();
+    assert!(
+        router.take_pending(),
+        "Ctrl-C received after unlock must remain forwardable"
+    );
+    assert!(!router.take_pending(), "a Ctrl-C event is consumed once");
+}
+
+#[test]
+fn ctrl_c_router_does_not_activate_without_installed_handler() {
+    let router = CtrlCEventRouter::new();
+
+    router.suppress();
+    router.resume();
+    router.record();
+
+    assert!(
+        !router.take_pending(),
+        "stream-only attach must not activate process-wide Ctrl-C routing"
+    );
+}
+
+#[test]
 fn explicit_restore_and_drop_restore_original_modes() -> Result<()> {
     let input_original = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT;
     let output_original = PRESERVED_OUTPUT_FLAG;

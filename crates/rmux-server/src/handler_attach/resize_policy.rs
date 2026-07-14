@@ -68,6 +68,27 @@ impl RequestHandler {
         )))
     }
 
+    pub(in crate::handler) async fn attached_window_size_policy_for_session_identity(
+        &self,
+        session_name: &SessionName,
+        session_id: SessionId,
+    ) -> Result<AttachedWindowSizePolicy, RmuxError> {
+        let state = self.state.lock().await;
+        let Some(session) = state
+            .sessions
+            .session(session_name)
+            .filter(|session| session.id() == session_id)
+        else {
+            return Err(crate::pane_terminals::session_not_found(session_name));
+        };
+        let window_index = session.active_window_index();
+        Ok(policy_from_option_value(state.options.resolve_for_window(
+            session_name,
+            window_index,
+            OptionName::WindowSize,
+        )))
+    }
+
     pub(in crate::handler) async fn reconcile_attached_session_size(
         &self,
         session_name: &SessionName,

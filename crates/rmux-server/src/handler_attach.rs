@@ -77,6 +77,8 @@ async fn pause_after_attach_control_identity_capture(attach_pid: u32) {
 mod key_table;
 #[path = "handler_attach/refresh.rs"]
 mod refresh;
+#[path = "handler_attach/refresh_identity.rs"]
+mod refresh_identity;
 #[path = "handler_attach/registration.rs"]
 mod registration;
 #[path = "handler_attach/resize_policy.rs"]
@@ -90,14 +92,16 @@ pub(crate) use crate::client_flags::ClientFlags;
 pub(in crate::handler) use resize_policy::{
     surviving_attached_resize_targets, AttachedWindowSizePolicy,
 };
-pub(crate) use state::AttachRegistration;
 pub(super) use state::{
-    ActiveAttach, ActiveAttachIdentity, ActiveAttachState, DisplayPanesClientState,
-    DisplayPanesLabel,
+    ActiveAttach, ActiveAttachState, DisplayPanesClientState, DisplayPanesLabel,
 };
-pub(in crate::handler) use switch_commit::AttachedSwitchCommitRequest;
+pub(crate) use state::{ActiveAttachIdentity, AttachRegistration};
+pub(in crate::handler) use switch_commit::{
+    AttachedSwitchCommitOutcome, AttachedSwitchCommitRequest, AttachedSwitchCommittedTarget,
+};
 
 impl RequestHandler {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn handle_attached_keystroke(
         &self,
         attach_pid: u32,
@@ -110,6 +114,34 @@ impl RequestHandler {
                 "attached client disappeared".to_owned(),
             ));
         }
+        let byte_len = u32::try_from(keystroke.bytes().len()).map_err(|_| {
+            rmux_proto::RmuxError::Server("attached keystroke length overflow".to_owned())
+        })?;
+        if consumed {
+            Ok(KeyDispatched::new(byte_len))
+        } else {
+            Ok(KeyDispatched::forwarded(byte_len))
+        }
+    }
+
+    pub(crate) async fn handle_attached_keystroke_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        keystroke: &AttachedKeystroke,
+        consumed: bool,
+    ) -> Result<KeyDispatched, rmux_proto::RmuxError> {
+        let active_attach = self.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&identity.attach_pid())
+            .filter(|active| {
+                identity.matches_active(active)
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .ok_or_else(|| {
+                rmux_proto::RmuxError::Server("attached client disappeared".to_owned())
+            })?;
+        let _ = active;
         let byte_len = u32::try_from(keystroke.bytes().len()).map_err(|_| {
             rmux_proto::RmuxError::Server("attached keystroke length overflow".to_owned())
         })?;

@@ -22,6 +22,9 @@ const RUN_SHELL_TERMINATE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const RUN_SHELL_TRUNCATION_MARKER: &[u8] = b"\nrmux: run-shell output truncated\n";
 const RUN_SHELL_OUTPUT_LIMIT: usize = DEFAULT_MAX_FRAME_LENGTH - 64 * 1024;
 const MAX_BACKGROUND_TASKS: usize = 1024;
+// Queued scripting composes task-local and recursive command futures; keep headroom beyond the
+// 2 MiB default thread stack used by supported Windows targets.
+const BACKGROUND_TASK_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 static BACKGROUND_TASK_LIMITER: OnceLock<BackgroundTaskLimiter> = OnceLock::new();
 
@@ -36,6 +39,7 @@ where
     let permit = background_task_limiter().try_acquire()?;
     if std::thread::Builder::new()
         .name(thread_name.to_owned())
+        .stack_size(BACKGROUND_TASK_STACK_SIZE)
         .spawn(move || {
             let _permit = permit;
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()

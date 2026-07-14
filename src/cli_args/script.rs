@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, ArgGroup, Args};
-use rmux_proto::{Target, WaitForMode};
+use rmux_proto::WaitForMode;
 
-use super::{parse_command_args, parse_target, parse_target_spec, TargetSpec};
+use super::{parse_command_args, parse_target_spec, TargetSpec};
 
 pub(super) fn parse_source_file_args(
     arguments: Vec<String>,
@@ -101,8 +101,8 @@ pub(crate) struct IfShellArgs {
     pub(crate) background: bool,
     #[arg(short = 'F', action = ArgAction::SetTrue)]
     pub(crate) format_mode: bool,
-    #[arg(short = 't', value_parser = parse_target, allow_hyphen_values = true)]
-    pub(crate) target: Option<Target>,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true)]
     pub(crate) condition: String,
     #[arg(allow_hyphen_values = true)]

@@ -113,6 +113,39 @@ async fn source_file_show_window_options_rejects_h() {
 }
 
 #[tokio::test]
+async fn source_file_rejects_refresh_client_reserved_wire_flags() {
+    let handler = RequestHandler::new();
+    let root = temp_root("refresh-client-reserved-flags");
+
+    for (name, command, flag) in [
+        ("a.conf", "refresh-client -A pane:on\n", "-A"),
+        ("b.conf", "refresh-client -B name:pane:format\n", "-B"),
+        ("r.conf", "refresh-client -r pane:rgb\n", "-r"),
+    ] {
+        let config = root.join(name);
+        write_config(&config, command);
+        let response = handler
+            .handle(source_file_request(
+                vec![name.to_owned()],
+                Some(root.clone()),
+            ))
+            .await;
+        let Response::Error(response) = response else {
+            panic!("expected source-file to reject {flag}");
+        };
+        assert_eq!(
+            response.error,
+            rmux_proto::RmuxError::Server(format!(
+                "{}:1: command refresh-client: unknown flag {flag}",
+                config.display()
+            ))
+        );
+    }
+
+    fs::remove_dir_all(root).expect("remove refresh-client source root");
+}
+
+#[tokio::test]
 async fn source_file_uses_shared_parser_for_conditions_comments_and_continuations() {
     let handler = RequestHandler::new();
     let root = temp_root("cwd-[glob]");

@@ -644,6 +644,88 @@ fn if_shell_dispatches_nested_supported_command() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
+fn if_shell_resolves_runtime_target_selectors_before_dispatch() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("if-shell-runtime-targets")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alphabet"])?);
+
+    let ids = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alphabet:0.0",
+        "#{session_id}:#{window_id}:#{pane_id}",
+    ])?;
+    assert_eq!(ids.status.code(), Some(0));
+    assert!(stderr(&ids).is_empty());
+    let ids = stdout(&ids);
+    let ids = ids.trim().split(':').collect::<Vec<_>>();
+    assert_eq!(ids.len(), 3, "expected session, window, and pane ids");
+
+    for target in ["alph", "alpha*", "=alphabet:", ids[0], ids[1], ids[2]] {
+        assert_success(&harness.run(&[
+            "if-shell",
+            "-F",
+            "-t",
+            target,
+            "#{==:#{session_name},alphabet}",
+            "set-buffer -b if-shell-target resolved",
+            "set-buffer -b if-shell-target wrong-context",
+        ])?);
+        let selected = harness.run(&["show-buffer", "-b", "if-shell-target"])?;
+        assert_eq!(selected.status.code(), Some(0));
+        assert!(stderr(&selected).is_empty());
+        assert_eq!(
+            stdout(&selected),
+            "resolved",
+            "if-shell target {target:?} used the wrong format context"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn if_shell_missing_target_keeps_the_server_fallback() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("if-shell-missing-target-fallback")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&[
+        "if-shell",
+        "-F",
+        "-t",
+        "missing",
+        "1",
+        "display-message -p #{session_name}",
+    ])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "alpha\n");
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn if_shell_mouse_target_keeps_the_server_fallback() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("if-shell-mouse-target-fallback")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&[
+        "if-shell",
+        "-F",
+        "-t",
+        "{mouse}",
+        "1",
+        "display-message -p #{session_name}",
+    ])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "alpha\n");
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
 fn nested_commands_report_missing_session_without_invalid_target_wrapper(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("nested-missing-session-error")?;

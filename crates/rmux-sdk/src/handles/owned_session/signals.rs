@@ -11,66 +11,96 @@ use std::thread;
 use tokio::task::JoinHandle;
 
 use crate::transport::TransportClient;
-#[cfg(unix)]
-use crate::RmuxError;
-use crate::{Result, SessionName};
-use rmux_proto::{KillSessionRequest, Request};
+use crate::{Result, RmuxError};
+use rmux_proto::Request;
 
 pub(super) fn install_default_signal_handlers(
     transport: TransportClient,
-    target: SessionName,
+    cleanup_request: Request,
     installed: Arc<AtomicBool>,
 ) -> Result<OwnedSessionSignalHandlers> {
+    let reservation = SignalHandlerInstallReservation::acquire(installed)?;
     #[cfg(unix)]
-    {
-        install_unix_signal_handlers(transport, target, installed)
-    }
+    let handlers = install_unix_signal_handlers(
+        transport,
+        cleanup_request,
+        Arc::clone(&reservation.installed),
+    )?;
     #[cfg(windows)]
-    {
-        Ok(install_tokio_signal_handlers(transport, target, installed))
-    }
+    let handlers = install_tokio_signal_handlers(
+        transport,
+        cleanup_request,
+        Arc::clone(&reservation.installed),
+    )?;
     #[cfg(all(not(unix), not(windows)))]
-    {
-        let _ = (transport, target);
-        Ok(OwnedSessionSignalHandlers { installed })
+    let handlers = {
+        let _ = (transport, cleanup_request);
+        OwnedSessionSignalHandlers {
+            installed: Arc::clone(&reservation.installed),
+        }
+    };
+    reservation.commit();
+    Ok(handlers)
+}
+
+struct SignalHandlerInstallReservation {
+    installed: Arc<AtomicBool>,
+    committed: bool,
+}
+
+impl SignalHandlerInstallReservation {
+    fn acquire(installed: Arc<AtomicBool>) -> Result<Self> {
+        installed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                RmuxError::protocol(rmux_proto::RmuxError::Server(
+                    "owned session signal handlers are already installed".to_owned(),
+                ))
+            })?;
+        Ok(Self {
+            installed,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SignalHandlerInstallReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.installed.store(false, Ordering::Release);
+        }
     }
 }
 
 #[cfg(windows)]
 fn install_tokio_signal_handlers(
     transport: TransportClient,
-    target: SessionName,
+    cleanup_request: Request,
     installed: Arc<AtomicBool>,
-) -> OwnedSessionSignalHandlers {
-    let task = tokio::spawn(async move {
+) -> Result<OwnedSessionSignalHandlers> {
+    let runtime = current_runtime()?;
+    let task = runtime.spawn(async move {
         wait_for_default_shutdown_signal().await;
-        let _ = transport
-            .request(Request::KillSession(KillSessionRequest {
-                target,
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
-            .await;
+        let _ = transport.request(cleanup_request).await;
     });
 
-    OwnedSessionSignalHandlers { task, installed }
+    Ok(OwnedSessionSignalHandlers { task, installed })
 }
 
 #[cfg(unix)]
 fn install_unix_signal_handlers(
     transport: TransportClient,
-    target: SessionName,
+    cleanup_request: Request,
     installed: Arc<AtomicBool>,
 ) -> Result<OwnedSessionSignalHandlers> {
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
-    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
-        RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "owned session signal handlers require a Tokio runtime: {error}"
-        )))
-    })?;
+    let runtime = current_runtime()?;
     let mut signals =
         Signals::new([SIGINT, SIGTERM, SIGHUP]).map_err(|source| RmuxError::Transport {
             operation: "install owned-session signal handlers".to_owned(),
@@ -82,14 +112,7 @@ fn install_unix_signal_handlers(
         .spawn(move || {
             if signals.forever().next().is_some() {
                 runtime.spawn(async move {
-                    let _ = transport
-                        .request(Request::KillSession(KillSessionRequest {
-                            target,
-                            kill_all_except_target: false,
-                            clear_alerts: false,
-                            kill_group: false,
-                        }))
-                        .await;
+                    let _ = transport.request(cleanup_request).await;
                 });
             }
         })
@@ -102,6 +125,15 @@ fn install_unix_signal_handlers(
         signal_handle: handle,
         thread: Some(thread),
         installed,
+    })
+}
+
+#[cfg(any(unix, windows))]
+fn current_runtime() -> Result<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current().map_err(|error| {
+        RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+            "owned session signal handlers require a Tokio runtime: {error}"
+        )))
     })
 }
 

@@ -853,9 +853,7 @@ fn sort_pane_list_lines(rows: &mut [PaneListLine], sort_order: PaneListSortOrder
                 (left.window_index, left.pane_index).cmp(&(right.window_index, right.pane_index))
             }
             PaneListSortOrder::Name => left.title.cmp(&right.title),
-            PaneListSortOrder::Size => {
-                (left.size.cols(), left.size.rows()).cmp(&(right.size.cols(), right.size.rows()))
-            }
+            PaneListSortOrder::Size => pane_area(left.size).cmp(&pane_area(right.size)),
             // tmux sorts pane "activity" by active_point (selection
             // counter, oracle-probed 2026-07-09): ascending, index-stable
             // until a pane is actually selected.
@@ -863,10 +861,17 @@ fn sort_pane_list_lines(rows: &mut [PaneListLine], sort_order: PaneListSortOrder
             PaneListSortOrder::Creation => left.created_at.cmp(&right.created_at),
         };
         let primary = if reversed { primary.reverse() } else { primary };
+        if matches!(sort_order, PaneListSortOrder::Size) {
+            return primary;
+        }
         primary.then_with(|| {
             (left.window_index, left.pane_index).cmp(&(right.window_index, right.pane_index))
         })
     });
+}
+
+fn pane_area(size: rmux_core::PaneGeometry) -> u64 {
+    u64::from(size.cols()) * u64::from(size.rows())
 }
 
 pub(in crate::handler) fn command_output_from_lines(lines: &[String]) -> CommandOutput {
@@ -880,7 +885,49 @@ pub(in crate::handler) fn command_output_from_lines(lines: &[String]) -> Command
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmux_core::PaneGeometry;
     use rmux_proto::{PaneTarget, SessionName};
+
+    fn pane_list_line(pane_index: u32, cols: u16, rows: u16) -> PaneListLine {
+        PaneListLine {
+            window_index: 0,
+            pane_index,
+            size: PaneGeometry::new(0, 0, cols, rows),
+            title: String::new(),
+            created_at: 0,
+            active_point: 0,
+            rendered: pane_index.to_string(),
+        }
+    }
+
+    #[test]
+    fn pane_size_sort_uses_area_and_preserves_equal_area_order() {
+        let original = vec![
+            pane_list_line(9, 21, 10),
+            pane_list_line(1, 10, 21),
+            pane_list_line(7, 59, 5),
+            pane_list_line(3, 20, 24),
+        ];
+
+        let mut ascending = original;
+        sort_pane_list_lines(&mut ascending, PaneListSortOrder::Size, false);
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|row| row.pane_index)
+                .collect::<Vec<_>>(),
+            [9, 1, 7, 3]
+        );
+
+        sort_pane_list_lines(&mut ascending, PaneListSortOrder::Size, true);
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|row| row.pane_index)
+                .collect::<Vec<_>>(),
+            [3, 7, 9, 1]
+        );
+    }
 
     #[test]
     fn display_message_context_prefers_requester_pane_over_session_fallback() {

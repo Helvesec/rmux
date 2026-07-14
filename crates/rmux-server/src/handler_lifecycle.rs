@@ -574,22 +574,6 @@ impl RequestHandler {
         }
     }
 
-    pub(in crate::handler) async fn emit_and_wait(&self, event: LifecycleEvent) {
-        if let LifecycleEvent::PaneModeChanged { target } = &event {
-            self.refresh_automatic_window_name_for_pane_target(target)
-                .await;
-        }
-        if hooks_disabled() {
-            self.refresh_control_sessions_for_event(&event).await;
-            return;
-        }
-        let queued = {
-            let mut state = self.state.lock().await;
-            prepare_lifecycle_event(&mut state, &event)
-        };
-        self.emit_prepared_and_wait(queued).await;
-    }
-
     pub(in crate::handler) async fn emit_prepared_and_wait(&self, event: QueuedLifecycleEvent) {
         if hooks_disabled() {
             self.refresh_control_sessions_for_event(&event.event).await;

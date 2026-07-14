@@ -1,4 +1,6 @@
 use super::*;
+use crate::handler::with_expected_attach_and_session_identity;
+use crate::pane_io::AttachControl;
 use rmux_proto::{ErrorResponse, RmuxError};
 #[tokio::test]
 async fn run_shell_foreground_returns_stdout_like_tmux() {
@@ -212,6 +214,65 @@ async fn background_run_shell_commands_reject_a_reused_control_registration() {
 
     assert_sessions_survive_background_control_reuse(&handler, &original, &replacement).await;
     drop((original_events, replacement_events));
+}
+
+#[tokio::test]
+async fn background_run_shell_commands_reject_a_reused_attach_registration() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_205;
+    let original = session_name("run-shell-attach-original");
+    let replacement = session_name("run-shell-attach-replacement");
+    let wait_channel = "run-shell-attach-registration-reuse";
+    create_background_identity_session(&handler, original.clone()).await;
+    create_background_identity_session(&handler, replacement.clone()).await;
+    let (original_control_tx, _original_control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, original.clone(), original_control_tx)
+        .await;
+    let original_identity = handler.active_attach_identity_for_test(requester_pid).await;
+
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "run-shell -b -C 'wait-for {wait_channel} ; detach-client'"
+        ))
+        .expect("background run-shell command parses");
+    let output = with_expected_attach_and_session_identity(
+        original_identity,
+        original.clone(),
+        original_identity.session_id(),
+        handler.execute_parsed_commands_for_test(requester_pid, commands),
+    )
+    .await
+    .expect("background run-shell dispatch succeeds");
+    assert!(output.stdout().is_empty());
+    wait_for_background_waiter(&handler, wait_channel).await;
+
+    let (replacement_control_tx, mut replacement_control_rx) =
+        tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, replacement.clone(), replacement_control_tx)
+        .await;
+    let replacement_identity = handler.active_attach_identity_for_test(requester_pid).await;
+    while replacement_control_rx.try_recv().is_ok() {}
+
+    release_background_waiter(&handler, wait_channel).await;
+    wait_for_detached_request_count(&handler, 0).await;
+    assert!(
+        handler
+            .current_live_attach_input(replacement_identity)
+            .await,
+        "stale background run-shell queue must not detach the same-PID replacement"
+    );
+    while let Ok(control) = replacement_control_rx.try_recv() {
+        assert!(
+            !matches!(control, AttachControl::Detach),
+            "stale background run-shell queue detached the replacement registration"
+        );
+    }
+
+    let state = handler.state.lock().await;
+    assert!(state.sessions.contains_session(&original));
+    assert!(state.sessions.contains_session(&replacement));
 }
 
 #[tokio::test]

@@ -223,36 +223,21 @@ Inventory impact: RMUX must not advertise these split-window flags as supported
 runtime behavior until parser, command inventory, runtime, and oracle fixtures
 land together.
 
-### C-D40: list size ordering uses tuple order rather than area order
-
-For `list-panes -O size` and the equivalent window listing sort, tmux 3.7b
-orders by area. RMUX currently orders by the structured `(cols, rows)` tuple.
-The tuple sort is deterministic and stable, but not tmux-compatible.
-
-Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records a 3-pane session where
-tmux 3.7b `list-panes -O size -F '#{pane_index}:#{pane_width}x#{pane_height}'`
-prints `1:59x5,2:20x24,0:59x18`, while RMUX prints
-`2:20x24,1:59x5,0:59x18`.
-
-Inventory impact: list command inventory may continue to expose `-O size`, but
-docs must not promise tmux 3.7b area ordering until the comparator changes.
-
-### C-D41: refresh-client subscription flags are parsed but unsupported
+### C-D41: refresh-client subscription flags are unsupported and unadvertised
 
 tmux 3.7b accepts `refresh-client -A`, `-B`, and `-r` syntactically and then
 requires a current client for the measured detached invocations. RMUX rejects
-the same flags with explicit unsupported-feature errors because subscription
-semantics are not implemented.
+the same flags at the CLI and source-file parser because their subscription and
+colour-report semantics are not implemented.
 
 Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records tmux 3.7b
-`refresh-client -A %0:foo`, `refresh-client -B name:what:format`, and
-`refresh-client -r pane:fmt` exiting 1 with `no current client`; RMUX exits 1
-with `refresh-client -A is not supported`, `refresh-client -B is not supported`,
-and `refresh-client -r is not supported`.
+`refresh-client -A %0:foo`, `-B name:what:format`, and `-r pane:fmt` exiting 1
+with `no current client`. RMUX keeps the corresponding wire-v5 fields reserved
+and fail-closed, but does not expose the flags through help, completions, or
+`list-commands`.
 
-Inventory impact: command listings may show the parsed flags only as accepted
-syntax. User-facing docs must describe them as unsupported at runtime until the
-subscription behavior is implemented.
+Inventory impact: the public command surface must not advertise these flags
+until parser, runtime, and oracle-backed behavior land together.
 
 ### C-D42: respawn-pane without a command uses the default shell
 

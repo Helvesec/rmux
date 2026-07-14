@@ -286,16 +286,25 @@ pub struct RefreshClientRequest {
     /// Optional client-flag string from `-F`, which tmux treats as an alias for `-f`.
     #[serde(default)]
     pub flags_alias: Option<String>,
-    /// Optional control-mode subscription updates from `-A`.
+    /// Reserved wire-v5 field for control-mode subscription updates.
+    ///
+    /// RMUX 0.9 does not expose `refresh-client -A` and rejects non-empty
+    /// values fail-closed when received from an older client.
     #[serde(default)]
     pub subscriptions: Vec<String>,
-    /// Optional control-mode subscription definitions from `-B`.
+    /// Reserved wire-v5 field for control-mode subscription definitions.
+    ///
+    /// RMUX 0.9 does not expose `refresh-client -B` and rejects non-empty
+    /// values fail-closed when received from an older client.
     #[serde(default)]
     pub subscriptions_format: Vec<String>,
     /// Optional control-mode size string from `-C`.
     #[serde(default)]
     pub control_size: Option<String>,
-    /// Optional control-mode colour report request from `-r`.
+    /// Reserved wire-v5 field for control-mode colour reports.
+    ///
+    /// RMUX 0.9 does not expose `refresh-client -r` and rejects a populated
+    /// value fail-closed when received from an older client.
     #[serde(default)]
     pub colour_report: Option<String>,
 }

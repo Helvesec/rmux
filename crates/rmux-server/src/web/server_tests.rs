@@ -889,6 +889,103 @@ async fn handshake_rejects_wrong_pin_with_same_collapsed_close() {
 }
 
 #[tokio::test]
+async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
+    let handler = Arc::new(RequestHandler::new_with_web_authentication_limits(
+        1, 8, 8, 4,
+    ));
+    let protected_session = create_session(&handler, "websocket-protected-wait").await;
+    let protected = create_share(
+        &handler,
+        CreateWebShareRequest {
+            require_pin: true,
+            ..share_request(WebShareScope::Pane(
+                PaneTarget::new(protected_session, 0).into(),
+            ))
+        },
+    )
+    .await;
+    let unrelated_session = create_session(&handler, "websocket-unrelated-wait").await;
+    let unrelated = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(
+            PaneTarget::new(unrelated_session, 0).into(),
+        )),
+    )
+    .await;
+    let protected_token =
+        token_from_url(protected.spectator_url.as_deref().expect("protected URL"));
+    let protected_pin = protected
+        .spectator_pairing_code
+        .as_deref()
+        .expect("protected share has a PIN");
+    let wrong_pin = if protected_pin == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    let protected_token_id = SecretHashForCrypto::from_secret(&protected_token).token_id();
+    let unrelated_token =
+        token_from_url(unrelated.spectator_url.as_deref().expect("unrelated URL"));
+
+    // Four settled failures make the next attempt wait 800 ms, leaving enough
+    // time to complete a real encrypted handshake for the unrelated share.
+    for _ in 0..4 {
+        let HandshakeSession {
+            mut stream, task, ..
+        } = drive_handshake_through_auth(
+            Arc::clone(&handler),
+            &protected_token,
+            &protected_token_id,
+            &auth_text_with_pin(wrong_pin),
+        )
+        .await;
+        assert_close(&mut stream, 4000, "handshake_rejected").await;
+        drop(stream);
+        let _ = task.await.expect("failed PIN task joins");
+    }
+
+    let mut waiters = Vec::with_capacity(4);
+    for _ in 0..4 {
+        waiters.push(
+            drive_handshake_through_auth(
+                Arc::clone(&handler),
+                &protected_token,
+                &protected_token_id,
+                &auth_text_with_pin(protected_pin),
+            )
+            .await,
+        );
+    }
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while handler.web_authentication_wait_count() != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("four loopback connections enter authentication backoff");
+
+    let mut unrelated = TestWebSocket::connect(Arc::clone(&handler), &unrelated_token).await;
+    let ready = tokio::time::timeout(Duration::from_millis(600), unrelated.read_json())
+        .await
+        .expect("unrelated share reaches ready while protected share waits");
+    assert_eq!(ready["type"], "ready");
+
+    for waiter in waiters {
+        let HandshakeSession { stream, task, .. } = waiter;
+        drop(stream);
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("backoff task was cancelled")
+                .is_cancelled(),
+            "cancelling a backoff task must stop it"
+        );
+    }
+    unrelated.close().await;
+    assert_eq!(handler.web_authentication_wait_count(), 0);
+}
+
+#[tokio::test]
 async fn handshake_rejects_capacity_reached_with_collapsed_close() {
     // The share caps spectators at 1. Once that slot is held by a live viewer,
     // a second spectator hits the capacity-reached path after token auth. Keep

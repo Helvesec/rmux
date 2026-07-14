@@ -493,7 +493,7 @@ async fn refresh_client_flags_merge_incrementally() {
 }
 
 #[tokio::test]
-async fn refresh_client_unimplemented_control_mode_flags_are_rejected() {
+async fn refresh_client_reserved_wire_fields_from_old_clients_are_rejected() {
     use rmux_proto::request::RefreshClientRequest;
 
     let handler = RequestHandler::new();
@@ -514,37 +514,55 @@ async fn refresh_client_unimplemented_control_mode_flags_are_rejected() {
         .register_attach(std::process::id(), alpha, control_tx)
         .await;
 
-    let response = handler
-        .dispatch(
-            std::process::id(),
-            Request::RefreshClient(Box::new(RefreshClientRequest {
-                target_client: None,
-                adjustment: None,
-                clear_pan: false,
-                pan_left: false,
-                pan_right: false,
-                pan_up: false,
-                pan_down: false,
-                status_only: false,
-                clipboard_query: false,
-                flags: None,
-                flags_alias: None,
-                subscriptions: vec!["%0:on".to_owned()],
-                subscriptions_format: vec!["name:%0:#{pane_id}".to_owned()],
-                control_size: Some("80x24".to_owned()),
-                colour_report: Some("%0".to_owned()),
-            })),
-        )
-        .await
-        .response;
+    for (subscriptions, subscriptions_format, colour_report, expected) in [
+        (
+            vec!["%0:on".to_owned()],
+            Vec::new(),
+            None,
+            "refresh-client -A is not supported",
+        ),
+        (
+            Vec::new(),
+            vec!["name:%0:#{pane_id}".to_owned()],
+            None,
+            "refresh-client -B is not supported",
+        ),
+        (
+            Vec::new(),
+            Vec::new(),
+            Some("%0".to_owned()),
+            "refresh-client -r is not supported",
+        ),
+    ] {
+        let response = handler
+            .dispatch(
+                std::process::id(),
+                Request::RefreshClient(Box::new(RefreshClientRequest {
+                    target_client: None,
+                    adjustment: None,
+                    clear_pan: false,
+                    pan_left: false,
+                    pan_right: false,
+                    pan_up: false,
+                    pan_down: false,
+                    status_only: false,
+                    clipboard_query: false,
+                    flags: None,
+                    flags_alias: None,
+                    subscriptions,
+                    subscriptions_format,
+                    control_size: Some("80x24".to_owned()),
+                    colour_report,
+                })),
+            )
+            .await
+            .response;
 
-    assert!(
-        matches!(
+        assert_eq!(
             response,
             Response::Error(rmux_proto::ErrorResponse {
-                error: RmuxError::Server(ref message)
-            }) if message.contains("-A/-B/-r")
-        ),
-        "unimplemented control-mode refresh-client flags should fail explicitly, got {response:?}"
-    );
+                error: RmuxError::Server(expected.to_owned()),
+            })
+        );
+    }
 }

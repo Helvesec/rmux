@@ -937,6 +937,32 @@ impl RequestHandler {
         });
     }
 
+    pub(in crate::handler) async fn refresh_control_session_for_session_identity(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        session_id: SessionId,
+    ) {
+        let current = {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .session(session_name)
+                .is_some_and(|session| session.id() == session_id)
+        };
+        if !current {
+            return;
+        }
+        let mut active_control = self.active_control.lock().await;
+        active_control.by_pid.retain(|_, active| {
+            if active.session_name.as_ref() != Some(session_name)
+                || active.session_id != Some(session_id)
+            {
+                return true;
+            }
+            try_send_control_event(active, ControlServerEvent::Refresh)
+        });
+    }
+
     pub(super) async fn refresh_control_client_for_identity(
         &self,
         identity: ControlClientIdentity,

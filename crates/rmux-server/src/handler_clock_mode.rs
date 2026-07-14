@@ -129,11 +129,45 @@ impl RequestHandler {
         expected_attach_id: u64,
         session_name: &SessionName,
     ) -> Result<(), RmuxError> {
+        self.refresh_clock_overlay_with_expected_identity(
+            attach_pid,
+            expected_attach_id,
+            session_name,
+            None,
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn refresh_clock_overlay_for_session_identity(
+        &self,
+        identity: super::attach_support::ActiveAttachIdentity,
+        session_name: &SessionName,
+        session_id: rmux_proto::SessionId,
+    ) -> Result<(), RmuxError> {
+        self.refresh_clock_overlay_with_expected_identity(
+            identity.attach_pid(),
+            identity.attach_id(),
+            session_name,
+            Some(session_id),
+        )
+        .await
+    }
+
+    async fn refresh_clock_overlay_with_expected_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        session_name: &SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
+    ) -> Result<(), RmuxError> {
         let frame = {
             let state = self.state.lock().await;
             let Some(session) = state.sessions.session(session_name) else {
                 return Err(attached_client_required("refresh-client"));
             };
+            if expected_session_id.is_some_and(|expected| session.id() != expected) {
+                return Err(attached_client_required("refresh-client"));
+            }
             let pane_indexes = visible_clock_pane_indexes(&state, session_name);
             let frame = renderer::render_clock_overlay(
                 session,
@@ -151,6 +185,8 @@ impl RequestHandler {
             .filter(|active| {
                 active.id == expected_attach_id
                     && &active.session_name == session_name
+                    && expected_session_id.is_none_or(|expected| active.session_id == expected)
+                    && (expected_session_id.is_none() || active.prompt.is_none())
                     && !active.suspended
                     && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
             })

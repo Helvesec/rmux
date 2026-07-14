@@ -18,7 +18,7 @@ use crate::pane_io::AttachControl;
 #[cfg(test)]
 use crate::server_access::current_owner_uid;
 
-use super::state::{ActiveAttach, AttachRegistration};
+use super::state::{ActiveAttach, ActiveAttachIdentity, AttachRegistration};
 
 impl RequestHandler {
     #[cfg(test)]
@@ -88,6 +88,7 @@ impl RequestHandler {
         .expect("test attach registration session must remain current")
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_attach_with_access(
         &self,
         requester_pid: u32,
@@ -95,10 +96,28 @@ impl RequestHandler {
         expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
     ) -> Option<u64> {
+        self.register_attach_identity_with_access(
+            requester_pid,
+            session_name,
+            expected_session_id,
+            registration,
+        )
+        .await
+        .map(ActiveAttachIdentity::attach_id)
+    }
+
+    pub(crate) async fn register_attach_identity_with_access(
+        &self,
+        requester_pid: u32,
+        session_name: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
+        registration: AttachRegistration,
+    ) -> Option<ActiveAttachIdentity> {
         #[cfg(windows)]
         self.wait_for_windows_deferred_session_panes_ready(&session_name)
             .await;
         let mut replaced_key_table = None;
+        let mut replaced_overlay = None;
         let attached_session_name = session_name.clone();
         let state = self.state.lock().await;
         let session = state.sessions.session(&attached_session_name)?;
@@ -164,7 +183,7 @@ impl RequestHandler {
         ) {
             active_attach.forget_attached_client_windows(requester_pid);
             replaced_key_table = previous.key_table_name.clone();
-            super::terminate_overlay_job(previous.overlay.take());
+            replaced_overlay = previous.overlay.take();
             let _ = previous.control_tx.send(AttachControl::Detach);
             previous.closing.store(true, Ordering::SeqCst);
         }
@@ -178,6 +197,7 @@ impl RequestHandler {
         drop(active_attach);
         drop(state);
         self.bump_active_attach_epoch();
+        super::terminate_overlay_job(replaced_overlay);
 
         if let Some(table_name) = replaced_key_table {
             let mut state = self.state.lock().await;
@@ -191,7 +211,11 @@ impl RequestHandler {
         drop(state);
         self.refresh_clock_overlays_for_session(&attached_session_name)
             .await;
-        Some(attach_id)
+        Some(ActiveAttachIdentity::new(
+            requester_pid,
+            attach_id,
+            session_id,
+        ))
     }
 
     pub(crate) async fn finish_attach(&self, requester_pid: u32, attach_id: u64) {
@@ -240,5 +264,37 @@ impl RequestHandler {
             self.destroy_unattached_sessions(vec![(session_name, session_id)])
                 .await;
         }
+    }
+
+    pub(crate) async fn current_live_attach_input(&self, identity: ActiveAttachIdentity) -> bool {
+        let active_attach = self.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&identity.attach_pid())
+            .is_some_and(|active| {
+                identity.matches_active(active) && !active.closing.load(Ordering::SeqCst)
+            })
+    }
+
+    pub(crate) async fn active_attach_identity(
+        &self,
+        attach_pid: u32,
+    ) -> Option<ActiveAttachIdentity> {
+        self.active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .map(|active| active.identity(attach_pid))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn active_attach_identity_for_test(
+        &self,
+        attach_pid: u32,
+    ) -> ActiveAttachIdentity {
+        self.active_attach_identity(attach_pid)
+            .await
+            .expect("test attach must be registered")
     }
 }

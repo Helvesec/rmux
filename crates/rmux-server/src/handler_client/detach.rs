@@ -182,6 +182,32 @@ impl RequestHandler {
         .await
     }
 
+    pub(in crate::handler) async fn handle_detach_client_for_identity(
+        &self,
+        identity: super::super::attach_support::ActiveAttachIdentity,
+    ) -> Response {
+        match self
+            .detach_attach_client_with_mode(
+                identity.attach_pid(),
+                identity.attach_id(),
+                false,
+                None,
+                "detach-client",
+            )
+            .await
+        {
+            Ok(session_name) => {
+                self.emit(LifecycleEvent::ClientDetached {
+                    session_name,
+                    client_name: Some(identity.attach_pid().to_string()),
+                })
+                .await;
+                Response::DetachClient(DetachClientResponse)
+            }
+            Err(error) => Response::Error(ErrorResponse { error }),
+        }
+    }
+
     pub(in crate::handler) async fn handle_detach_client_ext(
         &self,
         requester_pid: u32,

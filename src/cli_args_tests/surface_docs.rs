@@ -94,6 +94,50 @@ fn synthetic_completion_tree_tracks_public_command_surface() {
 }
 
 #[test]
+fn refresh_client_unsupported_wire_flags_are_absent_from_cli_and_help() {
+    for arguments in [
+        &["refresh-client", "-A", "%0:on"][..],
+        &["refresh-client", "-B", "name:%0:#{pane_id}"][..],
+        &["refresh-client", "-r", "%0:rgb"][..],
+    ] {
+        let error = super::parse_args(arguments).expect_err("reserved flag must not parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    let help =
+        super::parse_args(&["refresh-client", "--help"]).expect_err("--help renders command help");
+    assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+    let help = help.to_string();
+    for unsupported in ["-A", "-B", "-r"] {
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with(unsupported)),
+            "refresh-client help advertised reserved flag {unsupported}: {help}"
+        );
+    }
+
+    let completion = super::super::completion_command();
+    let refresh = completion
+        .get_subcommands()
+        .find(|command| command.get_name() == "refresh-client")
+        .expect("refresh-client completion subcommand");
+    let shorts = refresh
+        .get_arguments()
+        .filter_map(|argument| argument.get_short())
+        .collect::<BTreeSet<_>>();
+    for unsupported in ['A', 'B', 'r'] {
+        assert!(!shorts.contains(&unsupported));
+    }
+    for supported in ['C', 'D', 'L', 'R', 'S', 'U', 'c', 'f', 'l', 't'] {
+        assert!(
+            shorts.contains(&supported),
+            "missing supported -{supported}"
+        );
+    }
+}
+
+#[test]
 fn command_target_flags_accept_hyphen_prefixed_values() {
     for args in [
         &["list-panes", "-t", "-scratch"][..],

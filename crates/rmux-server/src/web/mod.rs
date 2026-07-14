@@ -1,3 +1,4 @@
+mod auth_wait_limit;
 mod backoff;
 mod connection_limit;
 mod crypto;
@@ -19,7 +20,8 @@ pub(crate) use record::{
     WebShareRevokeReason, WebShareTarget,
 };
 pub(crate) use registry::{
-    ExpiredWebShare, ResolvedCreateWebShareRequest, WebShareExpiryPoll, WebShareRegistry,
+    ExpiredWebShare, ResolvedCreateWebShareRequest, WebShareAuthWaitPermit, WebShareExpiryPoll,
+    WebShareRegistry,
 };
 pub(crate) use secrets::SecretHash as SecretHashForCrypto;
 pub(crate) use server::spawn;

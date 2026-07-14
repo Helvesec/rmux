@@ -298,10 +298,10 @@ pub(super) fn run_refresh_client(
             clipboard_query: args.clipboard_query,
             flags: args.flags,
             flags_alias: args.flags_alias,
-            subscriptions: args.subscriptions,
-            subscriptions_format: args.subscriptions_format,
+            subscriptions: Vec::new(),
+            subscriptions_format: Vec::new(),
             control_size: args.control_size,
-            colour_report: args.colour_report,
+            colour_report: None,
         })
     })
 }

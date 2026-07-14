@@ -33,6 +33,8 @@ impl RequestHandler {
             target,
             AttachedKeyDispatch {
                 attach_pid,
+                live_identity: None,
+                live_session_id: None,
                 requester_pid,
                 current_target: Some(Target::Pane(target.clone())),
                 mouse_target: None,
@@ -53,6 +55,8 @@ impl RequestHandler {
     ) -> Result<bool, RmuxError> {
         let AttachedKeyDispatch {
             attach_pid,
+            live_identity,
+            live_session_id,
             requester_pid,
             current_target,
             mouse_target,
@@ -71,9 +75,20 @@ impl RequestHandler {
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
+                .filter(|active| {
+                    live_identity.is_none_or(|identity| {
+                        identity.matches_active(active)
+                            && live_session_id.is_some_and(|expected| {
+                                active.session_id == expected
+                                    && active.session_name == *target.session_name()
+                            })
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             (
                 active.session_name.clone(),
+                active.session_id,
                 active.key_table_name.clone(),
                 active.key_table_set_at,
                 active.repeat_deadline,
@@ -85,6 +100,7 @@ impl RequestHandler {
         let lookup_key = key_code_lookup_bits(key);
         let (
             session_name,
+            session_id,
             current_table_name,
             key_table_set_at,
             repeat_deadline,
@@ -104,6 +120,14 @@ impl RequestHandler {
             from_prefix_table,
         ) = {
             let state = self.state.lock().await;
+            if live_session_id.is_some()
+                && state
+                    .sessions
+                    .session(target.session_name())
+                    .is_none_or(|session| session.id() != session_id)
+            {
+                return Ok(true);
+            }
             let default_table = default_key_table_name(&state, target);
             let prefix_key = session_option_key(&state, &session_name, OptionName::Prefix);
             let prefix2_key = session_option_key(&state, &session_name, OptionName::Prefix2);
@@ -182,19 +206,40 @@ impl RequestHandler {
         let _ = (prefix_key, prefix2_key);
 
         if should_enter_prefix {
-            self.set_attached_key_table(attach_pid, Some(PREFIX_TABLE.to_owned()), Some(now))
-                .await?;
+            self.set_attached_key_table_for_dispatch(
+                attach_pid,
+                live_identity,
+                live_session_id,
+                &session_name,
+                Some(PREFIX_TABLE.to_owned()),
+                Some(now),
+            )
+            .await?;
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| {
+                    live_identity.is_none_or(|identity| {
+                        identity.matches_active_session(active, &session_name, session_id)
+                            && live_session_id == Some(session_id)
+                    })
+                })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             active.repeat_active = false;
             active.repeat_deadline = None;
             active.last_key = None;
             drop(active_attach);
             if prefix_timeout_ms != 0 {
-                self.schedule_attached_prefix_timeout(attach_pid, now, prefix_timeout_ms);
+                if let Some(identity) = live_identity {
+                    self.schedule_attached_prefix_timeout_for_identity(
+                        identity,
+                        now,
+                        prefix_timeout_ms,
+                    );
+                } else {
+                    self.schedule_attached_prefix_timeout(attach_pid, now, prefix_timeout_ms);
+                }
             }
             return Ok(true);
         }
@@ -204,9 +249,22 @@ impl RequestHandler {
                 .as_deref()
                 .is_some_and(|table_name| should_drop_unbound_prefix_key(table_name, lookup_key))
             {
-                self.set_attached_key_table(attach_pid, None, None).await?;
+                self.set_attached_key_table_for_dispatch(
+                    attach_pid,
+                    live_identity,
+                    live_session_id,
+                    &session_name,
+                    None,
+                    None,
+                )
+                .await?;
                 let mut active_attach = self.active_attach.lock().await;
-                if let Some(active) = active_attach.by_pid.get_mut(&attach_pid) {
+                if let Some(active) = active_attach.by_pid.get_mut(&attach_pid).filter(|active| {
+                    live_identity.is_none_or(|identity| {
+                        identity.matches_active_session(active, &session_name, session_id)
+                            && live_session_id == Some(session_id)
+                    })
+                }) {
                     active.repeat_active = false;
                     active.repeat_deadline = None;
                     active.last_key = None;
@@ -218,9 +276,22 @@ impl RequestHandler {
                     .as_deref()
                     .is_some_and(|table_name| table_name != default_table.as_str())
             {
-                self.set_attached_key_table(attach_pid, None, None).await?;
+                self.set_attached_key_table_for_dispatch(
+                    attach_pid,
+                    live_identity,
+                    live_session_id,
+                    &session_name,
+                    None,
+                    None,
+                )
+                .await?;
                 let mut active_attach = self.active_attach.lock().await;
-                if let Some(active) = active_attach.by_pid.get_mut(&attach_pid) {
+                if let Some(active) = active_attach.by_pid.get_mut(&attach_pid).filter(|active| {
+                    live_identity.is_none_or(|identity| {
+                        identity.matches_active_session(active, &session_name, session_id)
+                            && live_session_id == Some(session_id)
+                    })
+                }) {
                     active.repeat_active = false;
                     active.repeat_deadline = None;
                     active.last_key = None;
@@ -251,13 +322,27 @@ impl RequestHandler {
             && !binding.repeat();
 
         if should_return_to_default || should_clear_before_dispatch {
-            self.set_attached_key_table(attach_pid, None, None).await?;
+            self.set_attached_key_table_for_dispatch(
+                attach_pid,
+                live_identity,
+                live_session_id,
+                &session_name,
+                None,
+                None,
+            )
+            .await?;
         }
         {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| {
+                    live_identity.is_none_or(|identity| {
+                        identity.matches_active_session(active, &session_name, session_id)
+                            && live_session_id == Some(session_id)
+                    })
+                })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             if binding.repeat() {
                 active.repeat_active = true;
@@ -270,7 +355,11 @@ impl RequestHandler {
             }
         }
         if let Some(repeat_deadline) = repeat_deadline {
-            self.schedule_attached_repeat_timeout(attach_pid, repeat_deadline);
+            if let Some(identity) = live_identity {
+                self.schedule_attached_repeat_timeout_for_identity(identity, repeat_deadline);
+            } else {
+                self.schedule_attached_repeat_timeout(attach_pid, repeat_deadline);
+            }
         }
 
         if from_prefix_table {
@@ -288,14 +377,28 @@ impl RequestHandler {
         }
 
         if let Some(command) = direct_copy_mode_command(binding.commands()) {
-            Box::pin(self.execute_copy_mode_command(
-                requester_pid,
-                target.clone(),
-                &command.command,
-                &command.args,
-                command.repeat_count,
-            ))
-            .await?;
+            match live_identity {
+                Some(identity) => {
+                    Box::pin(self.execute_copy_mode_command_for_identity(
+                        identity,
+                        target.clone(),
+                        &command.command,
+                        &command.args,
+                        command.repeat_count,
+                    ))
+                    .await?;
+                }
+                None => {
+                    Box::pin(self.execute_copy_mode_command(
+                        requester_pid,
+                        target.clone(),
+                        &command.command,
+                        &command.args,
+                        command.repeat_count,
+                    ))
+                    .await?;
+                }
+            }
             return Ok(true);
         }
 
@@ -304,8 +407,10 @@ impl RequestHandler {
             self,
             AttachedBindingCommandContext {
                 attach_pid,
+                live_identity,
                 requester_pid,
                 session_name: session_name.clone(),
+                session_id,
                 attached_live_input,
                 dispatch_target,
                 mouse_target,
@@ -315,6 +420,36 @@ impl RequestHandler {
         ))
         .await?;
         Ok(true)
+    }
+
+    async fn set_attached_key_table_for_dispatch(
+        &self,
+        attach_pid: u32,
+        live_identity: Option<super::super::attach_support::ActiveAttachIdentity>,
+        live_session_id: Option<rmux_proto::SessionId>,
+        session_name: &rmux_proto::SessionName,
+        key_table_name: Option<String>,
+        key_table_set_at: Option<Instant>,
+    ) -> Result<(), RmuxError> {
+        match live_identity {
+            Some(identity) => {
+                let live_session_id = live_session_id.ok_or_else(|| {
+                    RmuxError::Server("attached client session identity missing".to_owned())
+                })?;
+                self.set_attached_key_table_for_client_session_identity(
+                    identity,
+                    session_name,
+                    live_session_id,
+                    key_table_name,
+                    key_table_set_at,
+                )
+                .await
+            }
+            None => {
+                self.set_attached_key_table(attach_pid, key_table_name, key_table_set_at)
+                    .await
+            }
+        }
     }
 
     async fn report_attached_command_error(

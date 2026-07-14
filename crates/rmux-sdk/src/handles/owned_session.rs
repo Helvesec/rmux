@@ -1,6 +1,8 @@
 //! App-owned session guard.
 
 mod signals;
+#[cfg(test)]
+mod tests;
 
 use std::future::{Future, IntoFuture};
 use std::ops::Deref;
@@ -13,10 +15,11 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::transport::{DropGuard, TransportClient};
-use crate::{EnsureSession, Result, RmuxError, Session, SessionName};
+use crate::{EnsureSession, Result, RmuxError, Session, SessionId, SessionName};
 use rmux_proto::{
     CreateSessionLeaseRequest, KillSessionRequest, ReleaseSessionLeaseRequest,
-    RenewSessionLeaseRequest, Request, Response, CAPABILITY_SDK_SESSION_LEASE,
+    RenewSessionLeaseRequest, Request, Response, CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
+    CAPABILITY_SDK_SESSION_LEASE, CAPABILITY_SDK_SESSION_LEASE_BY_ID,
 };
 
 use super::Rmux;
@@ -101,6 +104,16 @@ impl<'a> OwnedSessionBuilder<'a> {
         if self.cleanup_policy == CleanupPolicy::KillOnOwnerExit {
             validate_lease_ttl(self.lease_ttl)?;
         }
+        let capabilities = match self.cleanup_policy {
+            CleanupPolicy::KillOnOwnerExit => &[
+                CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
+                CAPABILITY_SDK_SESSION_LEASE,
+            ][..],
+            CleanupPolicy::KillOnDrop | CleanupPolicy::Preserve => {
+                &[CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY][..]
+            }
+        };
+        crate::ensure::preflight_owned_session_capabilities(self.rmux, capabilities).await?;
 
         if self.replace_existing {
             match self.rmux.session(self.name.clone()).await {
@@ -112,21 +125,41 @@ impl<'a> OwnedSessionBuilder<'a> {
             }
         }
 
-        let session = self
-            .rmux
-            .ensure_session(EnsureSession::named(self.name).create_only().detached(true))
-            .await?;
+        let (session, session_id) = crate::ensure::create_owned_session(
+            self.rmux,
+            EnsureSession::named(self.name).create_only().detached(true),
+            capabilities,
+        )
+        .await?;
+        let mut creation_rollback = DropGuard::best_effort(
+            session.transport().clone(),
+            session_identity_kill_request(session_id),
+        );
         let lease = if self.cleanup_policy == CleanupPolicy::KillOnOwnerExit {
-            Some(OwnedSessionLease::start(&session, self.lease_ttl).await?)
+            match OwnedSessionLease::start(&session, session_id, self.lease_ttl).await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    return Err(rollback_owned_session_creation(
+                        &session,
+                        session_id,
+                        error,
+                        &mut creation_rollback,
+                    )
+                    .await);
+                }
+            }
         } else {
             None
         };
-        Ok(OwnedSession {
+        let owned = OwnedSession {
             session: Some(session),
+            session_id,
             cleanup_policy: self.cleanup_policy,
             lease,
             signal_handlers_installed: Arc::new(AtomicBool::new(false)),
-        })
+        };
+        creation_rollback.disarm();
+        Ok(owned)
     }
 }
 
@@ -143,6 +176,7 @@ impl<'a> IntoFuture for OwnedSessionBuilder<'a> {
 #[derive(Debug)]
 pub struct OwnedSession {
     session: Option<Session>,
+    session_id: SessionId,
     cleanup_policy: CleanupPolicy,
     lease: Option<OwnedSessionLease>,
     signal_handlers_installed: Arc<AtomicBool>,
@@ -194,12 +228,16 @@ impl OwnedSession {
     /// Explicitly kills the owned session when the policy is not
     /// [`CleanupPolicy::Preserve`].
     pub async fn cleanup(&mut self) -> Result<bool> {
-        let Some(session) = self.session.as_ref() else {
+        if self.session.is_none() {
             return Ok(false);
-        };
+        }
         match self.cleanup_policy {
             CleanupPolicy::KillOnDrop | CleanupPolicy::KillOnOwnerExit => {
-                let killed = session.kill().await?;
+                let session = self
+                    .session
+                    .as_ref()
+                    .expect("active owned session must retain its session handle");
+                let killed = kill_session_identity_confirmed(session, self.session_id).await?;
                 self.session.take();
                 if let Some(lease) = self.lease.as_ref() {
                     lease.mark_not_leased();
@@ -232,32 +270,33 @@ impl OwnedSession {
                 "owned session no longer active".to_owned(),
             )));
         };
-        if self
-            .signal_handlers_installed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
-                "owned session signal handlers are already installed".to_owned(),
-            )));
-        }
-
+        let cleanup_request = match self.cleanup_policy {
+            CleanupPolicy::KillOnDrop | CleanupPolicy::KillOnOwnerExit => {
+                session_identity_kill_request(self.session_id)
+            }
+            CleanupPolicy::Preserve => {
+                return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                    "owned session ownership has already been released".to_owned(),
+                )));
+            }
+        };
         let transport = session.transport().clone();
-        let target = session.name().clone();
         let installed = Arc::clone(&self.signal_handlers_installed);
-        signals::install_default_signal_handlers(transport, target, installed)
+        signals::install_default_signal_handlers(transport, cleanup_request, installed)
     }
 
-    /// Switches this owner to preserve mode after confirming lease release.
+    /// Switches this owner to preserve mode after confirming ownership release.
     pub async fn preserve(mut self) -> Result<Self> {
-        self.release_lease_confirmed().await?;
+        self.ensure_signal_handlers_not_installed()?;
+        self.release_ownership_confirmed().await?;
         self.cleanup_policy = CleanupPolicy::Preserve;
         Ok(self)
     }
 
     /// Detaches the guard and returns the underlying persistent session.
     pub async fn detach_owned(mut self) -> Result<Session> {
-        self.release_lease_confirmed().await?;
+        self.ensure_signal_handlers_not_installed()?;
+        self.release_ownership_confirmed().await?;
         self.cleanup_policy = CleanupPolicy::Preserve;
         Ok(self
             .session
@@ -283,18 +322,29 @@ impl OwnedSession {
             .expect("owned session no longer contains a session")
     }
 
-    async fn release_lease_confirmed(&mut self) -> Result<()> {
+    async fn release_ownership_confirmed(&mut self) -> Result<()> {
         if let Some(lease) = self.lease.as_ref() {
             lease.release_confirmed().await?;
         }
         self.lease.take();
         Ok(())
     }
+
+    fn ensure_signal_handlers_not_installed(&self) -> Result<()> {
+        if !self.signal_handlers_installed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+            "drop owned-session signal handlers before preserving or detaching the session"
+                .to_owned(),
+        )))
+    }
 }
 
 #[derive(Debug)]
 struct OwnedSessionLease {
-    session_name: SessionName,
+    display_name: SessionName,
+    lease_target: SessionName,
     token: u64,
     transport: TransportClient,
     task: JoinHandle<()>,
@@ -303,13 +353,21 @@ struct OwnedSessionLease {
 }
 
 impl OwnedSessionLease {
-    async fn start(session: &Session, ttl: Duration) -> Result<Self> {
+    async fn start(session: &Session, session_id: SessionId, ttl: Duration) -> Result<Self> {
         let ttl_millis = ttl_millis(ttl)?;
         let transport = session.transport().clone();
         crate::capabilities::require(&transport, &[CAPABILITY_SDK_SESSION_LEASE]).await?;
+        let lease_target =
+            if crate::capabilities::supports(&transport, &[CAPABILITY_SDK_SESSION_LEASE_BY_ID])
+                .await?
+            {
+                stable_session_target(session_id)
+            } else {
+                session.name().clone()
+            };
         let response = transport
             .request(Request::CreateSessionLease(CreateSessionLeaseRequest {
-                session_name: session.name().clone(),
+                session_name: lease_target.clone(),
                 ttl_millis,
             }))
             .await?;
@@ -319,10 +377,9 @@ impl OwnedSessionLease {
             )));
         };
 
-        let session_name = session.name().clone();
         let token = response.token;
         let renew_transport = transport.clone();
-        let renew_session_name = session_name.clone();
+        let renew_session_name = lease_target.clone();
         let lost = Arc::new(AtomicBool::new(false));
         let renew_lost = Arc::clone(&lost);
         let (state_tx, _) = watch::channel(LeaseState::Active);
@@ -351,7 +408,8 @@ impl OwnedSessionLease {
         });
 
         Ok(Self {
-            session_name,
+            display_name: session.name().clone(),
+            lease_target,
             token,
             transport,
             task,
@@ -380,22 +438,15 @@ impl OwnedSessionLease {
         let _ = self.state_tx.send(LeaseState::NotLeased);
     }
 
-    fn mark_lost(&self) {
-        self.lost.store(true, Ordering::Release);
-        let _ = self.state_tx.send(LeaseState::Lost);
-    }
-
     async fn release_confirmed(&self) -> Result<bool> {
         if self.is_lost() {
-            return Err(RmuxError::from(
-                rmux_proto::RmuxError::owned_session_lease_lost(self.session_name.clone()),
-            ));
+            return Err(self.lost_error());
         }
 
         let response = self
             .transport
             .request(Request::ReleaseSessionLease(ReleaseSessionLeaseRequest {
-                session_name: self.session_name.clone(),
+                session_name: self.lease_target.clone(),
                 token: self.token,
             }))
             .await?;
@@ -405,14 +456,63 @@ impl OwnedSessionLease {
             )));
         };
         if response.released {
-            let _ = self.state_tx.send(LeaseState::NotLeased);
+            self.mark_not_leased();
             Ok(true)
         } else {
-            self.mark_lost();
-            Err(RmuxError::from(
-                rmux_proto::RmuxError::owned_session_lease_lost(self.session_name.clone()),
-            ))
+            self.lost.store(true, Ordering::Release);
+            let _ = self.state_tx.send(LeaseState::Lost);
+            Err(self.lost_error())
         }
+    }
+
+    fn lost_error(&self) -> RmuxError {
+        RmuxError::from(rmux_proto::RmuxError::owned_session_lease_lost(
+            self.display_name.clone(),
+        ))
+    }
+}
+
+async fn rollback_owned_session_creation(
+    session: &Session,
+    session_id: SessionId,
+    source_error: RmuxError,
+    rollback: &mut DropGuard,
+) -> RmuxError {
+    match kill_session_identity_confirmed(session, session_id).await {
+        Ok(_) => {
+            rollback.disarm();
+            source_error
+        }
+        Err(rollback_error) => {
+            RmuxError::collect(crate::CollectError::new(vec![source_error, rollback_error]))
+        }
+    }
+}
+
+fn stable_session_target(session_id: SessionId) -> SessionName {
+    SessionName::new(session_id.to_string()).expect("formatted session id is a valid target")
+}
+
+fn session_identity_kill_request(session_id: SessionId) -> Request {
+    Request::KillSession(KillSessionRequest {
+        target: stable_session_target(session_id),
+        kill_all_except_target: false,
+        clear_alerts: false,
+        kill_group: false,
+    })
+}
+
+async fn kill_session_identity_confirmed(session: &Session, session_id: SessionId) -> Result<bool> {
+    match session
+        .transport()
+        .request(session_identity_kill_request(session_id))
+        .await?
+    {
+        Response::KillSession(response) => Ok(response.existed),
+        response => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+            "daemon returned `{}` response for owned-session cleanup",
+            response.command_name()
+        )))),
     }
 }
 
@@ -482,24 +582,17 @@ impl Deref for OwnedSession {
 
 impl Drop for OwnedSession {
     fn drop(&mut self) {
-        if !matches!(
-            self.cleanup_policy,
-            CleanupPolicy::KillOnDrop | CleanupPolicy::KillOnOwnerExit
-        ) {
-            return;
-        }
+        self.lease.take();
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        let guard = DropGuard::best_effort(
-            session.transport().clone(),
-            Request::KillSession(KillSessionRequest {
-                target: session.name().clone(),
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }),
-        );
+        let request = match self.cleanup_policy {
+            CleanupPolicy::KillOnDrop | CleanupPolicy::KillOnOwnerExit => {
+                session_identity_kill_request(self.session_id)
+            }
+            CleanupPolicy::Preserve => return,
+        };
+        let guard = DropGuard::best_effort(session.transport().clone(), request);
         drop(guard);
     }
 }

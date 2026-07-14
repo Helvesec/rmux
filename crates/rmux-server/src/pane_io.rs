@@ -30,6 +30,101 @@ const ATTACH_INPUT_STACK_PAYLOAD: usize = 1024;
 const MAX_PREDICTED_LOCAL_ECHO_BYTES: usize = 16;
 #[cfg(unix)]
 const PREDICTED_LOCAL_ECHO_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct LiveAttachInputApplyPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static LIVE_ATTACH_INPUT_APPLY_PAUSE: std::sync::Mutex<
+    Option<(
+        crate::handler::attach_support::ActiveAttachIdentity,
+        Arc<LiveAttachInputApplyPause>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static LIVE_ATTACH_INPUT_VALIDATION_PAUSE: std::sync::Mutex<
+    Option<(
+        crate::handler::attach_support::ActiveAttachIdentity,
+        Arc<LiveAttachInputApplyPause>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn install_live_attach_input_apply_pause(
+    identity: crate::handler::attach_support::ActiveAttachIdentity,
+) -> Arc<LiveAttachInputApplyPause> {
+    let pause = Arc::new(LiveAttachInputApplyPause::default());
+    *LIVE_ATTACH_INPUT_APPLY_PAUSE
+        .lock()
+        .expect("live attach input pause lock") = Some((identity, Arc::clone(&pause)));
+    pause
+}
+
+#[cfg(test)]
+fn install_live_attach_input_validation_pause(
+    identity: crate::handler::attach_support::ActiveAttachIdentity,
+) -> Arc<LiveAttachInputApplyPause> {
+    let pause = Arc::new(LiveAttachInputApplyPause::default());
+    *LIVE_ATTACH_INPUT_VALIDATION_PAUSE
+        .lock()
+        .expect("live attach input validation pause lock") = Some((identity, Arc::clone(&pause)));
+    pause
+}
+
+#[cfg(test)]
+async fn pause_before_live_attach_input_validation(
+    identity: crate::handler::attach_support::ActiveAttachIdentity,
+) {
+    let pause = {
+        let mut installed = LIVE_ATTACH_INPUT_VALIDATION_PAUSE
+            .lock()
+            .expect("live attach input validation pause lock");
+        installed
+            .as_ref()
+            .is_some_and(|(expected, _)| *expected == identity)
+            .then(|| {
+                installed
+                    .take()
+                    .expect("matching validation pause remains installed")
+                    .1
+            })
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
+
+#[cfg(test)]
+async fn pause_after_live_attach_input_validation(
+    identity: crate::handler::attach_support::ActiveAttachIdentity,
+) {
+    let pause = {
+        let mut installed = LIVE_ATTACH_INPUT_APPLY_PAUSE
+            .lock()
+            .expect("live attach input pause lock");
+        installed
+            .as_ref()
+            .is_some_and(|(expected, _)| *expected == identity)
+            .then(|| {
+                installed
+                    .take()
+                    .expect("matching pause remains installed")
+                    .1
+            })
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
 mod attach_output_batch;
 mod attach_transport;
 mod control;
@@ -57,7 +152,8 @@ use attach_transport::{AttachTransport, TryAttachRead};
 use control::{
     apply_pending_attach_controls, coalesce_render_switches, recv_attach_control,
     redraw_after_persistent_overlay_state_advance, should_emit_overlay, switch_attach_target,
-    take_pending_live_passthroughs, PendingAttachAction, PendingAttachInputState,
+    take_pending_live_passthroughs, PendingAttachAction, PendingAttachExit,
+    PendingAttachInputState,
 };
 #[cfg(any(unix, windows))]
 use deferred_passthrough::{
@@ -209,7 +305,7 @@ pub(crate) async fn forward_attach(
             )
             .await?
             {
-                PendingAttachAction::Exit(reason) => {
+                PendingAttachAction::Exit(PendingAttachExit { reason, .. }) => {
                     finish_pending_attach_exit(
                         reason,
                         &stream,
@@ -299,6 +395,7 @@ pub(crate) async fn forward_attach(
                 &mut decoder,
                 &stream,
                 &live_input,
+                &closing,
                 &mut current_target,
                 &mut pending_input,
                 &mut active_emit_cache,
@@ -333,7 +430,7 @@ pub(crate) async fn forward_attach(
             )
             .await?
             {
-                PendingAttachAction::Exit(reason) => {
+                PendingAttachAction::Exit(PendingAttachExit { reason, .. }) => {
                     finish_pending_attach_exit(
                         reason,
                         &stream,
@@ -427,7 +524,7 @@ pub(crate) async fn forward_attach(
                             )
                             .await?
                             {
-                                PendingAttachAction::Exit(reason) => {
+                                PendingAttachAction::Exit(PendingAttachExit { reason, .. }) => {
                                     finish_pending_attach_exit(
                                         reason,
                                         &stream,
@@ -472,6 +569,7 @@ pub(crate) async fn forward_attach(
                         &mut decoder,
                         &stream,
                         &live_input,
+                        &closing,
                         &mut current_target,
                         &mut pending_input,
                         &mut active_emit_cache,
@@ -503,7 +601,7 @@ pub(crate) async fn forward_attach(
                     )
                     .await?
                     {
-                        PendingAttachAction::Exit(reason) => {
+                        PendingAttachAction::Exit(PendingAttachExit { reason, .. }) => {
                             finish_pending_attach_exit(
                                 reason,
                                 &stream,
@@ -612,6 +710,7 @@ pub(crate) async fn forward_attach(
                                             passthroughs,
                                             close_after_render,
                                             sustained,
+                                            ..
                                         } => {
                                             drained_sustained_output = sustained;
                                             live_passthroughs = passthroughs;
@@ -679,7 +778,7 @@ pub(crate) async fn forward_attach(
                     )
                     .await?
                     {
-                        PendingAttachAction::Exit(reason) => {
+                        PendingAttachAction::Exit(PendingAttachExit { reason, .. }) => {
                             finish_pending_attach_exit(
                                 reason,
                                 &stream,
@@ -770,7 +869,7 @@ pub(crate) async fn forward_attach(
                     }
                     let _ = live_input
                         .handler
-                        .refresh_attached_client_status(live_input.attach_pid, &session_name)
+                        .refresh_attached_client_status(live_input.attach_pid(), &session_name)
                         .await;
                     reschedule_status_refresh_for_session(
                         &mut status_refresh,
@@ -1124,9 +1223,8 @@ pub(crate) async fn forward_attach(
                     } else {
                         item
                     };
-                    let (raw_output_bytes, passthroughs, close_after_render, sustained_output) =
-                        match collect_attach_output_batch(item, current_target.pane_output.as_mut())
-                        {
+                    let pending_output_batch =
+                        match collect_attach_output_batch(item, current_target.pane_output.as_mut()) {
                         AttachOutputBatch::Closed => {
                             current_target.pane_output = None;
                             continue;
@@ -1141,12 +1239,7 @@ pub(crate) async fn forward_attach(
                             pane_refresh.schedule_sustained();
                             continue;
                         }
-                        AttachOutputBatch::Events {
-                            bytes,
-                            passthroughs,
-                            close_after_render,
-                            sustained,
-                        } => (bytes, passthroughs, close_after_render, sustained),
+                        batch @ AttachOutputBatch::Events { .. } => batch,
                         };
                     match apply_pending_attach_controls(
                         &mut deferred_controls,
@@ -1167,12 +1260,24 @@ pub(crate) async fn forward_attach(
                     )
                     .await?
                     {
-                        PendingAttachAction::Exit(reason) => {
-                            finish_pending_attach_exit(
+                        PendingAttachAction::Exit(PendingAttachExit {
+                            reason,
+                            drop_pending_output,
+                            snapshot_covered_output_before_sequence,
+                        }) => {
+                            // The receiver cursor already owns this batch. Hand it to the
+                            // terminal exit drain unless an earlier control deliberately
+                            // invalidated output from the old attach target.
+                            finish_pending_attach_exit_with_batch(
                                 reason,
                                 &stream,
                                 &mut current_target,
                                 &mut deferred_passthroughs,
+                                pending_attach_exit_output_batch(
+                                    drop_pending_output,
+                                    snapshot_covered_output_before_sequence,
+                                    pending_output_batch,
+                                ),
                             )
                             .await?;
                             log_attach_exit(&live_input, &current_target, reason);
@@ -1205,6 +1310,14 @@ pub(crate) async fn forward_attach(
                             continue;
                         }
                         PendingAttachAction::Refresh { target_changed } => {
+                            let AttachOutputBatch::Events {
+                                passthroughs,
+                                close_after_render,
+                                ..
+                            } = pending_output_batch
+                            else {
+                                unreachable!("closed and gap batches return before control dispatch")
+                            };
                             reschedule_status_refresh_if_target_changed(
                                 target_changed,
                                 &mut status_refresh,
@@ -1233,6 +1346,16 @@ pub(crate) async fn forward_attach(
                             continue;
                         }
                         PendingAttachAction::Write => {
+                            let AttachOutputBatch::Events {
+                                bytes: raw_output_bytes,
+                                passthroughs,
+                                close_after_render,
+                                sustained: sustained_output,
+                                ..
+                            } = pending_output_batch
+                            else {
+                                unreachable!("closed and gap batches return before control dispatch")
+                            };
                             if locked {
                                 if close_after_render {
                                     current_target.pane_output = None;
@@ -1352,7 +1475,7 @@ pub(crate) async fn forward_attach(
     .await;
 
     if let Err(error) = &result {
-        record_attach_error(live_input.attach_pid, &current_target.session_name, error);
+        record_attach_error(live_input.attach_pid(), &current_target.session_name, error);
         let _ = emit_attach_stop(&stream, &current_target).await;
     }
 
@@ -1399,7 +1522,11 @@ fn log_attach_exit(
     current_target: &types::OpenAttachTarget,
     reason: AttachExitReason,
 ) {
-    record_attach_exit(live_input.attach_pid, &current_target.session_name, reason);
+    record_attach_exit(
+        live_input.attach_pid(),
+        &current_target.session_name,
+        reason,
+    );
 }
 
 #[cfg(any(unix, windows))]
@@ -1409,6 +1536,39 @@ async fn finish_pending_attach_exit(
     current_target: &mut types::OpenAttachTarget,
     deferred_passthroughs: &mut Vec<TerminalPassthrough>,
 ) -> io::Result<()> {
+    finish_pending_attach_exit_with_batch(
+        reason,
+        stream,
+        current_target,
+        deferred_passthroughs,
+        None,
+    )
+    .await
+}
+
+#[cfg(any(unix, windows))]
+fn pending_attach_exit_output_batch(
+    drop_pending_output: bool,
+    snapshot_covered_output_before_sequence: Option<u64>,
+    batch: AttachOutputBatch,
+) -> Option<AttachOutputBatch> {
+    if drop_pending_output {
+        return None;
+    }
+    Some(match snapshot_covered_output_before_sequence {
+        Some(before_sequence) => batch.covered_by_render_snapshot(before_sequence),
+        None => batch,
+    })
+}
+
+#[cfg(any(unix, windows))]
+async fn finish_pending_attach_exit_with_batch(
+    reason: AttachExitReason,
+    stream: &AttachTransport,
+    current_target: &mut types::OpenAttachTarget,
+    deferred_passthroughs: &mut Vec<TerminalPassthrough>,
+    pending_batch: Option<AttachOutputBatch>,
+) -> io::Result<()> {
     if reason != AttachExitReason::AttachControlExited {
         return Ok(());
     }
@@ -1416,7 +1576,15 @@ async fn finish_pending_attach_exit(
     let mut output_bytes = Vec::new();
     let mut passthroughs = Vec::new();
     let mut saw_gap = false;
-    if let Some(mut pane_output) = current_target.pane_output.take() {
+    let output_closed = pending_batch.is_some_and(|batch| {
+        collect_final_attach_output_batch(batch, &mut output_bytes, &mut passthroughs, &mut saw_gap)
+    });
+    let pane_output = if output_closed {
+        None
+    } else {
+        current_target.pane_output.take()
+    };
+    if let Some(mut pane_output) = pane_output {
         #[cfg(not(windows))]
         while let Some(item) = pane_output.try_recv() {
             if collect_final_attach_output_item(
@@ -1488,7 +1656,18 @@ fn collect_final_attach_output_item(
     passthroughs: &mut Vec<TerminalPassthrough>,
     saw_gap: &mut bool,
 ) -> bool {
-    match collect_attach_output_batch(item, Some(pane_output)) {
+    let batch = collect_attach_output_batch(item, Some(pane_output));
+    collect_final_attach_output_batch(batch, output_bytes, passthroughs, saw_gap)
+}
+
+#[cfg(any(unix, windows))]
+fn collect_final_attach_output_batch(
+    batch: AttachOutputBatch,
+    output_bytes: &mut Vec<u8>,
+    passthroughs: &mut Vec<TerminalPassthrough>,
+    saw_gap: &mut bool,
+) -> bool {
+    match batch {
         AttachOutputBatch::Closed => true,
         AttachOutputBatch::Gap => {
             *saw_gap = true;
@@ -1499,6 +1678,7 @@ fn collect_final_attach_output_item(
             passthroughs: batch_passthroughs,
             close_after_render,
             sustained: _,
+            ..
         } => {
             output_bytes.extend_from_slice(&bytes);
             passthroughs.extend(batch_passthroughs);
@@ -1605,7 +1785,7 @@ async fn schedule_attach_render_refresh(
 ) {
     live_input
         .handler
-        .clear_attached_render_refresh_pending(live_input.attach_pid)
+        .clear_attached_render_refresh_pending(live_input.attach_pid())
         .await;
     *pane_refresh_requires_full = true;
     pane_refresh.note_interactive_output();
@@ -1628,12 +1808,12 @@ fn collect_pending_attach_output_batch_metadata(
 async fn refresh_current_attach_client(live_input: &LiveAttachInputContext) {
     if let Ok(session_name) = live_input
         .handler
-        .attached_session_name(live_input.attach_pid)
+        .attached_session_name(live_input.attach_pid())
         .await
     {
         live_input
             .handler
-            .refresh_attached_client(live_input.attach_pid, &session_name)
+            .refresh_attached_client(live_input.attach_pid(), &session_name)
             .await;
     }
 }
@@ -1687,6 +1867,23 @@ async fn flush_due_pending_escape_input(
         return Ok(());
     }
 
+    #[cfg(test)]
+    let skip_identity_validation = !live_input.validate_identity;
+    #[cfg(not(test))]
+    let skip_identity_validation = false;
+    if !skip_identity_validation
+        && !live_input
+            .handler
+            .current_live_attach_input(live_input.identity)
+            .await
+    {
+        pending_escape_flush.clear();
+        pending_input.clear();
+        return Err(io::Error::other(
+            "stale attach forwarder retained pending input",
+        ));
+    }
+
     pending_escape_flush.clear();
     if locked {
         pending_input.clear();
@@ -1695,7 +1892,7 @@ async fn flush_due_pending_escape_input(
 
     live_input
         .handler
-        .flush_attached_pending_escape_input(live_input.attach_pid, pending_input)
+        .flush_attached_pending_escape_input_for_identity(live_input.identity, pending_input)
         .await?;
     // Rerouting flushed remainder bytes can retain a fresh ambiguous prefix
     // (for example, a second ESC ] inside the body). Re-arm it immediately
@@ -1729,6 +1926,7 @@ async fn process_attach_socket_messages(
     decoder: &mut AttachFrameDecoder,
     stream: &AttachTransport,
     live_input: &LiveAttachInputContext,
+    closing: &AtomicBool,
     current_target: &mut types::OpenAttachTarget,
     pending_input: &mut Vec<u8>,
     active_emit_cache: &mut Option<(u64, rmux_proto::WindowTarget)>,
@@ -1737,7 +1935,7 @@ async fn process_attach_socket_messages(
     pending_escape_flush: &mut PendingEscapeFlush,
     last_client_input_at: &mut Option<Instant>,
 ) -> io::Result<()> {
-    if process_socket_messages(
+    let forwarded_to_pane = match process_socket_messages(
         decoder,
         stream,
         live_input,
@@ -1746,8 +1944,21 @@ async fn process_attach_socket_messages(
         active_emit_cache,
         locked,
     )
-    .await?
+    .await
     {
+        Ok(forwarded_to_pane) => forwarded_to_pane,
+        Err(_) if closing.load(Ordering::SeqCst) => {
+            // A terminal attach control is queued before `closing` is
+            // published. Input may already be between the queue poll and its
+            // identity check when close removes the registration. Discard that
+            // now-stale input and let the next loop iteration consume the
+            // terminal control, which owns the finite output drain.
+            PendingAttachInputState::new(pending_input, pending_escape_flush).clear();
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if forwarded_to_pane {
         mark_attach_interactive_input(pane_refresh, last_client_input_at);
         if pane_refresh.is_pending() {
             pane_refresh.schedule_immediate();
@@ -1767,6 +1978,16 @@ fn mark_attach_interactive_input(
 }
 
 #[cfg(any(unix, windows))]
+enum DeferredAttachInputOutput {
+    Frame(AttachMessage),
+    Unlock {
+        start_sequence: Vec<u8>,
+        outer_terminal: Box<crate::outer_terminal::OuterTerminal>,
+        render_frame: Vec<u8>,
+    },
+}
+
+#[cfg(any(unix, windows))]
 async fn process_socket_messages(
     decoder: &mut AttachFrameDecoder,
     stream: &AttachTransport,
@@ -1776,13 +1997,36 @@ async fn process_socket_messages(
     active_emit_cache: &mut Option<(u64, rmux_proto::WindowTarget)>,
     locked: &mut bool,
 ) -> io::Result<bool> {
+    // The transport read and frame accumulation have already completed. Each
+    // mutation below carries the immutable registration identity and validates
+    // it at its own atomic snapshot point; no guard spans PTY or command awaits.
+    #[cfg(test)]
+    pause_before_live_attach_input_validation(live_input.identity).await;
+    #[cfg(test)]
+    let skip_identity_validation = !live_input.validate_identity;
+    #[cfg(not(test))]
+    let skip_identity_validation = false;
+    if !skip_identity_validation
+        && !live_input
+            .handler
+            .current_live_attach_input(live_input.identity)
+            .await
+    {
+        let (pending_input, pending_escape_flush) = pending_input.parts_mut();
+        pending_input.clear();
+        pending_escape_flush.clear();
+        return Err(io::Error::other("stale attach forwarder input"));
+    }
+    #[cfg(test)]
+    pause_after_live_attach_input_validation(live_input.identity).await;
     let (pending_input, pending_escape_flush) = pending_input.parts_mut();
     let mut forwarded_to_pane = false;
+    let mut deferred_outputs = Vec::new();
     let mut data_scratch = [0_u8; ATTACH_INPUT_STACK_PAYLOAD];
-    loop {
+    'messages: loop {
         loop {
             if pending_escape_deadline_due(pending_escape_flush) {
-                return Ok(forwarded_to_pane);
+                break 'messages;
             }
             let Some(bytes) = decoder
                 .next_data_payload_into(&mut data_scratch)
@@ -1809,7 +2053,7 @@ async fn process_socket_messages(
         }
 
         if pending_escape_deadline_due(pending_escape_flush) {
-            return Ok(forwarded_to_pane);
+            break;
         }
         let Some(message) = decoder.next_message().map_err(invalid_attach_message)? else {
             break;
@@ -1842,8 +2086,8 @@ async fn process_socket_messages(
                 } else {
                     live_input
                         .handler
-                        .handle_attached_keystroke_input_with_active_cache(
-                            live_input.attach_pid,
+                        .handle_attached_keystroke_input_with_active_cache_for_identity(
+                            live_input.identity,
                             pending_input,
                             &keystroke,
                             active_emit_cache,
@@ -1858,26 +2102,28 @@ async fn process_socket_messages(
                 forwarded_to_pane |= keystroke_forwarded_to_pane;
                 let response = live_input
                     .handler
-                    .handle_attached_keystroke(
-                        live_input.attach_pid,
+                    .handle_attached_keystroke_for_identity(
+                        live_input.identity,
                         &keystroke,
                         !keystroke_forwarded_to_pane,
                     )
                     .await
                     .map_err(io::Error::other)?;
-                emit_attach_frame(stream, &AttachMessage::KeyDispatched(response)).await?;
+                deferred_outputs.push(DeferredAttachInputOutput::Frame(
+                    AttachMessage::KeyDispatched(response),
+                ));
             }
             AttachMessage::Resize(size) => {
                 live_input
                     .handler
-                    .handle_attached_resize(live_input.attach_pid, size)
+                    .handle_attached_resize_for_identity(live_input.identity, size)
                     .await
                     .map_err(io::Error::other)?;
             }
             AttachMessage::ResizeGeometry(geometry) => {
                 live_input
                     .handler
-                    .handle_attached_resize_geometry(live_input.attach_pid, geometry)
+                    .handle_attached_resize_geometry_for_identity(live_input.identity, geometry)
                     .await
                     .map_err(io::Error::other)?;
             }
@@ -1897,39 +2143,61 @@ async fn process_socket_messages(
                 ));
             }
             AttachMessage::Unlock => {
-                *locked = false;
-                if let Some(current_target) = current_target.as_deref() {
-                    emit_attach_bytes(
-                        stream,
-                        &current_target.outer_terminal.attach_start_sequence(),
-                    )
-                    .await?;
-                    emit_render_frame(
-                        stream,
-                        &current_target.outer_terminal,
-                        &current_target.render_frame,
-                    )
-                    .await?;
-                }
-                live_input
+                if !live_input
                     .handler
-                    .handle_attached_unlock(live_input.attach_pid)
-                    .await;
-                if let Ok(session_name) = live_input
-                    .handler
-                    .attached_session_name(live_input.attach_pid)
+                    .handle_attached_unlock_for_identity(live_input.identity)
                     .await
                 {
-                    live_input
-                        .handler
-                        .refresh_attached_client(live_input.attach_pid, &session_name)
-                        .await;
+                    pending_input.clear();
+                    pending_escape_flush.clear();
+                    return Err(io::Error::other("stale attach forwarder unlock"));
                 }
+                *locked = false;
+                if let Some(current_target) = current_target.as_deref() {
+                    deferred_outputs.push(DeferredAttachInputOutput::Unlock {
+                        start_sequence: current_target.outer_terminal.attach_start_sequence(),
+                        outer_terminal: Box::new(current_target.outer_terminal.clone()),
+                        render_frame: current_target.render_frame.clone(),
+                    });
+                }
+                let session_name = live_input
+                    .handler
+                    .attached_session_name_for_identity(live_input.identity)
+                    .await
+                    .map_err(io::Error::other)?;
+                live_input
+                    .handler
+                    .refresh_attached_client_for_identity(
+                        live_input.attach_pid(),
+                        live_input.identity.attach_id(),
+                        &session_name,
+                        "attach unlock",
+                    )
+                    .await
+                    .map_err(io::Error::other)?;
             }
             AttachMessage::KeyDispatched(_) => {
                 return Err(io::Error::other(
                     "received unexpected key dispatch acknowledgement from attach client",
                 ));
+            }
+        }
+    }
+
+    // Client writes can block behind transport backpressure. They are emitted
+    // only after all identity-checked state mutations are complete.
+    for output in deferred_outputs {
+        match output {
+            DeferredAttachInputOutput::Frame(message) => {
+                emit_attach_frame(stream, &message).await?;
+            }
+            DeferredAttachInputOutput::Unlock {
+                start_sequence,
+                outer_terminal,
+                render_frame,
+            } => {
+                emit_attach_bytes(stream, &start_sequence).await?;
+                emit_render_frame(stream, &outer_terminal, &render_frame).await?;
             }
         }
     }
@@ -1954,8 +2222,8 @@ async fn process_attach_data_payload(
     let _ = (stream, current_target);
     live_input
         .handler
-        .handle_attached_live_input_with_active_cache(
-            live_input.attach_pid,
+        .handle_attached_live_input_with_active_cache_for_identity(
+            live_input.identity,
             pending_input,
             bytes,
             active_emit_cache,

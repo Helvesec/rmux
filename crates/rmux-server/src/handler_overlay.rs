@@ -3,6 +3,7 @@ use std::io;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{RmuxError, TerminalGeometry, TerminalSize};
 
+use super::attach_support::ActiveAttachIdentity;
 use super::pane_support::{
     retain_partial_attached_escape_input, strip_bracketed_paste_markers_after_append,
 };
@@ -83,6 +84,7 @@ impl RequestHandler {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn overlay_active(&self, attach_pid: u32) -> bool {
         let active_attach = self.active_attach.lock().await;
         active_attach
@@ -91,11 +93,28 @@ impl RequestHandler {
             .is_some_and(|active| active.overlay.is_some())
     }
 
-    async fn attached_overlay_route(&self, attach_pid: u32) -> Option<AttachedOverlayRoute> {
+    pub(super) async fn overlay_active_for_identity(&self, identity: ActiveAttachIdentity) -> bool {
+        let active_attach = self.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&identity.attach_pid())
+            .is_some_and(|active| {
+                identity.matches_active(active)
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    && active.overlay.is_some()
+            })
+    }
+
+    async fn attached_overlay_route_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+    ) -> Option<AttachedOverlayRoute> {
         let active_attach = self.active_attach.lock().await;
         active_attach
             .by_pid
             .get(&attach_pid)
+            .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
             .and_then(|active| active.overlay.as_ref())
             .map(|overlay| match overlay {
                 ClientOverlayState::Menu(menu) => AttachedOverlayRoute::Menu(menu.id),
@@ -109,16 +128,46 @@ impl RequestHandler {
             })
     }
 
+    #[cfg(test)]
     pub(super) async fn handle_attached_overlay_input(
         &self,
         attach_pid: u32,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
     ) -> io::Result<AttachedOverlayInput> {
+        self.handle_attached_overlay_input_with_identity(attach_pid, None, pending_input, bytes)
+            .await
+    }
+
+    pub(super) async fn handle_attached_overlay_input_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        pending_input: &mut Vec<u8>,
+        bytes: &[u8],
+    ) -> io::Result<AttachedOverlayInput> {
+        self.handle_attached_overlay_input_with_identity(
+            identity.attach_pid(),
+            Some(identity),
+            pending_input,
+            bytes,
+        )
+        .await
+    }
+
+    async fn handle_attached_overlay_input_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+        pending_input: &mut Vec<u8>,
+        bytes: &[u8],
+    ) -> io::Result<AttachedOverlayInput> {
         let new_input_at = pending_input.len();
         pending_input.extend_from_slice(bytes);
 
-        let Some(overlay_route) = self.attached_overlay_route(attach_pid).await else {
+        let Some(overlay_route) = self
+            .attached_overlay_route_with_identity(attach_pid, identity)
+            .await
+        else {
             return Ok(AttachedOverlayInput::Reroute(std::mem::take(pending_input)));
         };
 
@@ -143,10 +192,21 @@ impl RequestHandler {
             while offset < pending_input.len() {
                 let slice = &pending_input[offset..];
                 if is_mouse_prefix(slice) {
-                    let last_mouse = self.attached_last_mouse_event(attach_pid).await;
+                    let last_mouse = match identity {
+                        Some(identity) => {
+                            self.attached_last_mouse_event_for_identity(identity).await
+                        }
+                        None => self.attached_last_mouse_event(attach_pid).await,
+                    };
                     match decode_mouse(slice, last_mouse) {
                         MouseDecode::Matched { size, event } => {
-                            self.handle_popup_mouse_event(attach_pid, event).await?;
+                            match identity {
+                                Some(identity) => {
+                                    self.handle_popup_mouse_event_for_identity(identity, event)
+                                        .await?
+                                }
+                                None => self.handle_popup_mouse_event(attach_pid, event).await?,
+                            }
                             offset += size;
                         }
                         MouseDecode::Discard { size } => offset += size,
@@ -160,7 +220,11 @@ impl RequestHandler {
                         }
                         MouseDecode::Invalid => offset += 1,
                     }
-                    if self.attached_overlay_route(attach_pid).await != Some(overlay_route) {
+                    if self
+                        .attached_overlay_route_with_identity(attach_pid, identity)
+                        .await
+                        != Some(overlay_route)
+                    {
                         break;
                     }
                     continue;
@@ -178,11 +242,22 @@ impl RequestHandler {
                     AttachedKeyDecode::Invalid => slice.len(),
                 };
                 let raw = pending_input[offset..offset + consumed].to_vec();
-                if !self.handle_popup_raw_input(attach_pid, &raw).await? {
+                let handled = match identity {
+                    Some(identity) => {
+                        self.handle_popup_raw_input_for_identity(identity, &raw)
+                            .await?
+                    }
+                    None => self.handle_popup_raw_input(attach_pid, &raw).await?,
+                };
+                if !handled {
                     break;
                 }
                 offset += consumed;
-                if self.attached_overlay_route(attach_pid).await != Some(overlay_route) {
+                if self
+                    .attached_overlay_route_with_identity(attach_pid, identity)
+                    .await
+                    != Some(overlay_route)
+                {
                     break;
                 }
             }
@@ -197,13 +272,21 @@ impl RequestHandler {
         let backspace = self.attached_backspace_byte().await;
         loop {
             if is_mouse_prefix(pending_input) {
-                let last_mouse = self.attached_last_mouse_event(attach_pid).await;
+                let last_mouse = match identity {
+                    Some(identity) => self.attached_last_mouse_event_for_identity(identity).await,
+                    None => self.attached_last_mouse_event(attach_pid).await,
+                };
                 match decode_mouse(pending_input, last_mouse) {
                     MouseDecode::Matched { size, event } => {
                         pending_input.drain(..size);
-                        self.handle_menu_mouse_event(attach_pid, event)
-                            .await
-                            .map_err(io::Error::other)?;
+                        match identity {
+                            Some(identity) => {
+                                self.handle_menu_mouse_event_for_identity(identity, event)
+                                    .await
+                            }
+                            None => self.handle_menu_mouse_event(attach_pid, event).await,
+                        }
+                        .map_err(io::Error::other)?;
                     }
                     MouseDecode::Discard { size } => {
                         pending_input.drain(..size);
@@ -216,7 +299,11 @@ impl RequestHandler {
                         pending_input.drain(..1);
                     }
                 }
-                if self.attached_overlay_route(attach_pid).await != Some(overlay_route) {
+                if self
+                    .attached_overlay_route_with_identity(attach_pid, identity)
+                    .await
+                    != Some(overlay_route)
+                {
                     break;
                 }
                 continue;
@@ -253,11 +340,20 @@ impl RequestHandler {
                 }
             };
             pending_input.drain(..consumed);
-            let handled = self
-                .handle_menu_input_event(attach_pid, event)
-                .await
-                .map_err(io::Error::other)?;
-            if !handled || self.attached_overlay_route(attach_pid).await != Some(overlay_route) {
+            let handled = match identity {
+                Some(identity) => {
+                    self.handle_menu_input_event_for_identity(identity, event)
+                        .await
+                }
+                None => self.handle_menu_input_event(attach_pid, event).await,
+            }
+            .map_err(io::Error::other)?;
+            if !handled
+                || self
+                    .attached_overlay_route_with_identity(attach_pid, identity)
+                    .await
+                    != Some(overlay_route)
+            {
                 break;
             }
         }
@@ -269,12 +365,29 @@ impl RequestHandler {
         }
     }
 
-    pub(crate) async fn flush_attached_overlay_escape_input(
+    pub(crate) async fn flush_attached_overlay_escape_input_for_identity(
         &self,
-        attach_pid: u32,
+        identity: ActiveAttachIdentity,
         pending_input: &mut Vec<u8>,
     ) -> io::Result<AttachedOverlayInput> {
-        let Some(overlay_route) = self.attached_overlay_route(attach_pid).await else {
+        self.flush_attached_overlay_escape_input_with_identity(
+            identity.attach_pid(),
+            Some(identity),
+            pending_input,
+        )
+        .await
+    }
+
+    async fn flush_attached_overlay_escape_input_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+        pending_input: &mut Vec<u8>,
+    ) -> io::Result<AttachedOverlayInput> {
+        let Some(overlay_route) = self
+            .attached_overlay_route_with_identity(attach_pid, identity)
+            .await
+        else {
             return Ok(AttachedOverlayInput::Reroute(std::mem::take(pending_input)));
         };
         if pending_input.first() != Some(&b'\x1b') {
@@ -284,12 +397,29 @@ impl RequestHandler {
         pending_input.drain(..1);
         match overlay_route {
             AttachedOverlayRoute::Menu(_) => {
-                self.handle_menu_input_event(attach_pid, PromptInputEvent::Escape)
-                    .await
-                    .map_err(io::Error::other)?;
+                match identity {
+                    Some(identity) => {
+                        self.handle_menu_input_event_for_identity(
+                            identity,
+                            PromptInputEvent::Escape,
+                        )
+                        .await
+                    }
+                    None => {
+                        self.handle_menu_input_event(attach_pid, PromptInputEvent::Escape)
+                            .await
+                    }
+                }
+                .map_err(io::Error::other)?;
             }
             AttachedOverlayRoute::Popup { .. } => {
-                let _ = self.handle_popup_raw_input(attach_pid, b"\x1b").await?;
+                let _ = match identity {
+                    Some(identity) => {
+                        self.handle_popup_raw_input_for_identity(identity, b"\x1b")
+                            .await?
+                    }
+                    None => self.handle_popup_raw_input(attach_pid, b"\x1b").await?,
+                };
             }
         }
 
@@ -300,18 +430,49 @@ impl RequestHandler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn handle_attached_resize(
         &self,
         attach_pid: u32,
         size: TerminalSize,
     ) -> Result<(), RmuxError> {
-        self.handle_attached_resize_geometry(attach_pid, TerminalGeometry::from_size(size))
-            .await
+        self.handle_attached_resize_geometry_with_identity(
+            attach_pid,
+            None,
+            TerminalGeometry::from_size(size),
+        )
+        .await
     }
 
-    pub(crate) async fn handle_attached_resize_geometry(
+    pub(crate) async fn handle_attached_resize_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        size: TerminalSize,
+    ) -> Result<(), RmuxError> {
+        self.handle_attached_resize_geometry_for_identity(
+            identity,
+            TerminalGeometry::from_size(size),
+        )
+        .await
+    }
+
+    pub(crate) async fn handle_attached_resize_geometry_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        geometry: TerminalGeometry,
+    ) -> Result<(), RmuxError> {
+        self.handle_attached_resize_geometry_with_identity(
+            identity.attach_pid(),
+            Some(identity),
+            geometry,
+        )
+        .await
+    }
+
+    async fn handle_attached_resize_geometry_with_identity(
         &self,
         attach_pid: u32,
+        expected_identity: Option<ActiveAttachIdentity>,
         geometry: TerminalGeometry,
     ) -> Result<(), RmuxError> {
         let size = geometry.size;
@@ -320,9 +481,14 @@ impl RequestHandler {
         }
 
         let mut close_overlay = false;
-        let (resized_session, ignores_size, client_size_changed) = {
+        let (resized_session, resized_session_id, ignores_size, client_size_changed) = {
             let mut active_attach = self.active_attach.lock().await;
-            let Some(active) = active_attach.by_pid.get(&attach_pid) else {
+            let Some(active) = active_attach.by_pid.get(&attach_pid).filter(|active| {
+                expected_identity.is_none_or(|identity| {
+                    identity.matches_active(active)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            }) else {
                 return Ok(());
             };
             let ignores_size = active
@@ -395,30 +561,130 @@ impl RequestHandler {
                     }
                 }
             }
-            (session_name, ignores_size, client_size_changed)
+            (
+                session_name,
+                active.session_id,
+                ignores_size,
+                client_size_changed,
+            )
         };
 
-        if !ignores_size
-            && self
-                .attached_window_size_policy_for_session(&resized_session)
+        let size_policy = match expected_identity {
+            Some(_) => {
+                self.attached_window_size_policy_for_session_identity(
+                    &resized_session,
+                    resized_session_id,
+                )
                 .await?
-                != super::attach_support::AttachedWindowSizePolicy::Manual
-        {
+            }
+            None => {
+                self.attached_window_size_policy_for_session(&resized_session)
+                    .await?
+            }
+        };
+        if !ignores_size && size_policy != super::attach_support::AttachedWindowSizePolicy::Manual {
             let mut state = self.state.lock().await;
+            if let Some(identity) = expected_identity {
+                let active_attach = self.active_attach.lock().await;
+                let current = active_attach.by_pid.get(&attach_pid).is_some_and(|active| {
+                    identity.matches_active_session(active, &resized_session, resized_session_id)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                });
+                let session_current = state
+                    .sessions
+                    .session(&resized_session)
+                    .is_some_and(|session| session.id() == resized_session_id);
+                if !current || !session_current {
+                    return Ok(());
+                }
+            }
             state.set_attached_terminal_pixels(&resized_session, geometry.pixels);
         }
-        self.reconcile_attached_session_size_and_emit(&resized_session)
-            .await?;
+        if let Some(identity) = expected_identity {
+            let current = {
+                let active_attach = self.active_attach.lock().await;
+                active_attach.by_pid.get(&attach_pid).is_some_and(|active| {
+                    identity.matches_active_session(active, &resized_session, resized_session_id)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            };
+            if !current {
+                return Ok(());
+            }
+            self.reconcile_attached_session_identity_size_and_emit(resized_session_id)
+                .await?;
+        } else {
+            self.reconcile_attached_session_size_and_emit(&resized_session)
+                .await?;
+        }
         if client_size_changed {
-            self.emit(LifecycleEvent::ClientResized {
+            let event = LifecycleEvent::ClientResized {
                 session_name: resized_session.clone(),
                 client_name: Some(attach_pid.to_string()),
-            })
-            .await;
+            };
+            if let Some(identity) = expected_identity {
+                let prepared = {
+                    let mut state = self.state.lock().await;
+                    let active_attach = self.active_attach.lock().await;
+                    let current = active_attach.by_pid.get(&attach_pid).is_some_and(|active| {
+                        identity.matches_active_session(
+                            active,
+                            &resized_session,
+                            resized_session_id,
+                        ) && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    });
+                    if !current
+                        || state
+                            .sessions
+                            .session(&resized_session)
+                            .is_none_or(|session| session.id() != resized_session_id)
+                    {
+                        return Ok(());
+                    }
+                    super::prepare_lifecycle_event(&mut state, &event)
+                };
+                self.emit_prepared(prepared).await;
+            } else {
+                self.emit(event).await;
+            }
         }
-        self.refresh_attached_session(&resized_session).await;
+        if let Some(identity) = expected_identity {
+            let current = {
+                let active_attach = self.active_attach.lock().await;
+                active_attach.by_pid.get(&attach_pid).is_some_and(|active| {
+                    identity.matches_active_session(active, &resized_session, resized_session_id)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            };
+            if current {
+                self.refresh_attached_session_for_session_identity(
+                    &resized_session,
+                    resized_session_id,
+                )
+                .await;
+            }
+        } else {
+            self.refresh_attached_session(&resized_session).await;
+        }
 
-        if close_overlay {
+        if let Some(identity) = expected_identity {
+            if close_overlay {
+                self.clear_interactive_overlay_for_session_identity(
+                    identity,
+                    &resized_session,
+                    resized_session_id,
+                    true,
+                )
+                .await?;
+            } else {
+                self.refresh_interactive_overlay_for_session_identity(
+                    identity,
+                    &resized_session,
+                    resized_session_id,
+                )
+                .await?;
+            }
+        } else if close_overlay {
             self.clear_interactive_overlay(attach_pid, true).await?;
         } else {
             self.refresh_interactive_overlay_if_active(attach_pid)
@@ -435,6 +701,25 @@ impl RequestHandler {
             .await
     }
 
+    pub(super) async fn refresh_interactive_overlay_for_optional_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+    ) -> Result<(), RmuxError> {
+        match identity {
+            Some(identity) => {
+                let session_name = self.attached_session_name_for_identity(identity).await?;
+                self.refresh_interactive_overlay_for_client_identity(
+                    attach_pid,
+                    identity.attach_id(),
+                    &session_name,
+                )
+                .await
+            }
+            None => self.refresh_interactive_overlay_if_active(attach_pid).await,
+        }
+    }
+
     pub(super) async fn refresh_interactive_overlay_for_client_identity(
         &self,
         attach_pid: u32,
@@ -443,7 +728,20 @@ impl RequestHandler {
     ) -> Result<(), RmuxError> {
         self.refresh_interactive_overlay_with_expected_identity(
             attach_pid,
-            Some((expected_attach_id, session_name)),
+            Some((expected_attach_id, session_name, None)),
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn refresh_interactive_overlay_for_session_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
+    ) -> Result<(), RmuxError> {
+        self.refresh_interactive_overlay_with_expected_identity(
+            identity.attach_pid(),
+            Some((identity.attach_id(), session_name, Some(session_id))),
         )
         .await
     }
@@ -451,20 +749,24 @@ impl RequestHandler {
     async fn refresh_interactive_overlay_with_expected_identity(
         &self,
         attach_pid: u32,
-        expected_identity: Option<(u64, &rmux_proto::SessionName)>,
+        expected_identity: Option<(u64, &rmux_proto::SessionName, Option<rmux_proto::SessionId>)>,
     ) -> Result<(), RmuxError> {
-        let (overlay, captured_attach_id, captured_session_name) = {
+        let (overlay, captured_attach_id, captured_session_name, captured_session_id) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            if expected_identity.is_some_and(|(expected_attach_id, expected_session_name)| {
-                active.id != expected_attach_id
-                    || &active.session_name != expected_session_name
-                    || active.suspended
-                    || active.closing.load(std::sync::atomic::Ordering::SeqCst)
-            }) {
+            if expected_identity.is_some_and(
+                |(expected_attach_id, expected_session_name, expected_session_id)| {
+                    active.id != expected_attach_id
+                        || &active.session_name != expected_session_name
+                        || expected_session_id.is_some_and(|expected| active.session_id != expected)
+                        || (expected_session_id.is_some() && active.prompt.is_some())
+                        || active.suspended
+                        || active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                },
+            ) {
                 return Err(crate::handler_support::attached_client_required(
                     "refresh-client",
                 ));
@@ -472,7 +774,12 @@ impl RequestHandler {
             let Some(overlay) = active.overlay.clone() else {
                 return Ok(());
             };
-            (overlay, active.id, active.session_name.clone())
+            (
+                overlay,
+                active.id,
+                active.session_name.clone(),
+                active.session_id,
+            )
         };
 
         let frame = overlay.render();
@@ -483,6 +790,7 @@ impl RequestHandler {
             .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
         if active.id != captured_attach_id
             || active.session_name != captured_session_name
+            || active.session_id != captured_session_id
             || active.closing.load(std::sync::atomic::Ordering::SeqCst)
         {
             return expected_identity.map_or(Ok(()), |_| {
@@ -491,11 +799,15 @@ impl RequestHandler {
                 ))
             });
         }
-        if expected_identity.is_some_and(|(expected_attach_id, expected_session_name)| {
-            active.id != expected_attach_id
-                || &active.session_name != expected_session_name
-                || active.suspended
-        }) {
+        if expected_identity.is_some_and(
+            |(expected_attach_id, expected_session_name, expected_session_id)| {
+                active.id != expected_attach_id
+                    || &active.session_name != expected_session_name
+                    || expected_session_id.is_some_and(|expected| active.session_id != expected)
+                    || (expected_session_id.is_some() && active.prompt.is_some())
+                    || active.suspended
+            },
+        ) {
             return Err(crate::handler_support::attached_client_required(
                 "refresh-client",
             ));
@@ -529,11 +841,78 @@ impl RequestHandler {
         attach_pid: u32,
         terminate_popup_job: bool,
     ) -> Result<(), RmuxError> {
-        let (control_tx, render_generation, popup_job) = {
+        self.clear_interactive_overlay_with_identity(attach_pid, None, None, terminate_popup_job)
+            .await
+    }
+
+    pub(super) async fn clear_interactive_overlay_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        terminate_popup_job: bool,
+    ) -> Result<(), RmuxError> {
+        self.clear_interactive_overlay_with_identity(
+            identity.attach_pid(),
+            Some(identity),
+            None,
+            terminate_popup_job,
+        )
+        .await
+    }
+
+    async fn clear_interactive_overlay_for_session_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
+        terminate_popup_job: bool,
+    ) -> Result<(), RmuxError> {
+        self.clear_interactive_overlay_with_identity(
+            identity.attach_pid(),
+            Some(identity),
+            Some((session_name, session_id)),
+            terminate_popup_job,
+        )
+        .await
+    }
+
+    pub(super) async fn clear_interactive_overlay_for_optional_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+        terminate_popup_job: bool,
+    ) -> Result<(), RmuxError> {
+        match identity {
+            Some(identity) => {
+                self.clear_interactive_overlay_for_identity(identity, terminate_popup_job)
+                    .await
+            }
+            None => {
+                self.clear_interactive_overlay(attach_pid, terminate_popup_job)
+                    .await
+            }
+        }
+    }
+
+    async fn clear_interactive_overlay_with_identity(
+        &self,
+        attach_pid: u32,
+        expected_identity: Option<ActiveAttachIdentity>,
+        expected_session: Option<(&rmux_proto::SessionName, rmux_proto::SessionId)>,
+        terminate_popup_job: bool,
+    ) -> Result<(), RmuxError> {
+        let (control_tx, render_generation, overlay_generation, popup_job) = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| {
+                    expected_identity.is_none_or(|identity| {
+                        identity.matches_active(active)
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    }) && expected_session.is_none_or(|(session_name, session_id)| {
+                        &active.session_name == session_name && active.session_id == session_id
+                    })
+                })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             let popup_job = match active.overlay.take() {
                 Some(ClientOverlayState::Popup(popup)) if terminate_popup_job => popup.job,
@@ -543,20 +922,13 @@ impl RequestHandler {
             (
                 active.control_tx.clone(),
                 active.render_generation,
+                active.overlay_generation,
                 popup_job,
             )
         };
         if let Some(job) = popup_job {
             job.terminate();
         }
-        let overlay_generation = {
-            let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .get(&attach_pid)
-                .map(|active| active.overlay_generation)
-                .unwrap_or_default()
-        };
         let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::persistent(
             Vec::new(),
             render_generation,
@@ -567,36 +939,27 @@ impl RequestHandler {
 
     pub(super) async fn popup_reader_tick(
         &self,
-        attach_pid: u32,
+        identity: ActiveAttachIdentity,
         popup_id: u64,
     ) -> Result<(), RmuxError> {
-        let active_attach = self.active_attach.lock().await;
-        let Some(active) = active_attach.by_pid.get(&attach_pid) else {
-            return Ok(());
-        };
-        if active
-            .overlay
-            .as_ref()
-            .map(|overlay| overlay.id() != popup_id)
-            .unwrap_or(true)
-        {
-            return Ok(());
-        }
-        drop(active_attach);
-        self.refresh_interactive_overlay_if_active(attach_pid).await
+        self.refresh_popup_overlay_for_identity(identity, popup_id)
+            .await
     }
 
     pub(super) async fn popup_job_finished(
         &self,
-        attach_pid: u32,
+        identity: ActiveAttachIdentity,
         popup_id: u64,
         status: i32,
     ) -> Result<(), RmuxError> {
-        let should_close = {
+        let clear = {
             let mut active_attach = self.active_attach.lock().await;
-            let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
+            let Some(active) = active_attach.by_pid.get_mut(&identity.attach_pid()) else {
                 return Ok(());
             };
+            if !identity.matches_active(active) {
+                return Ok(());
+            }
             let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
                 return Ok(());
             };
@@ -604,14 +967,78 @@ impl RequestHandler {
                 return Ok(());
             }
             popup.job = None;
-            popup.close_on_exit || (popup.close_on_zero_exit && status == 0)
+            let should_close = popup.close_on_exit || (popup.close_on_zero_exit && status == 0);
+            if !should_close {
+                None
+            } else {
+                let _ = active.overlay.take();
+                active.overlay_generation = active.overlay_generation.saturating_add(1);
+                Some((
+                    active.control_tx.clone(),
+                    active.render_generation,
+                    active.overlay_generation,
+                ))
+            }
         };
-        if should_close {
-            self.clear_interactive_overlay(attach_pid, false).await?;
+        if let Some((control_tx, render_generation, overlay_generation)) = clear {
+            let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::persistent(
+                Vec::new(),
+                render_generation,
+                overlay_generation,
+            )));
         } else {
-            self.refresh_interactive_overlay_if_active(attach_pid)
+            self.refresh_popup_overlay_for_identity(identity, popup_id)
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn refresh_popup_overlay_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        popup_id: u64,
+    ) -> Result<(), RmuxError> {
+        let overlay = {
+            let active_attach = self.active_attach.lock().await;
+            let Some(active) = active_attach.by_pid.get(&identity.attach_pid()) else {
+                return Ok(());
+            };
+            if !identity.matches_active(active)
+                || active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+            let Some(overlay) = active.overlay.clone() else {
+                return Ok(());
+            };
+            if overlay.id() != popup_id {
+                return Ok(());
+            }
+            overlay
+        };
+
+        let frame = overlay.render();
+        let mut active_attach = self.active_attach.lock().await;
+        let Some(active) = active_attach.by_pid.get_mut(&identity.attach_pid()) else {
+            return Ok(());
+        };
+        if !identity.matches_active(active)
+            || active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            || active
+                .overlay
+                .as_ref()
+                .is_none_or(|current| current.id() != popup_id)
+        {
+            return Ok(());
+        }
+        active.overlay_generation = active.overlay_generation.saturating_add(1);
+        let _ = active
+            .control_tx
+            .send(AttachControl::Overlay(OverlayFrame::persistent(
+                frame,
+                active.render_generation,
+                active.overlay_generation,
+            )));
         Ok(())
     }
 }

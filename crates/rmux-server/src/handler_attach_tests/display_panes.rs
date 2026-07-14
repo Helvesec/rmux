@@ -370,6 +370,61 @@ async fn refresh_client_replays_active_display_panes_after_base_switch() {
 }
 
 #[tokio::test]
+async fn session_identity_refresh_replays_display_panes_for_every_matching_client() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let session = session_name("identity-refresh-display-panes");
+    let mut control_rx = create_quiet_attached_session(&handler, requester_pid, &session).await;
+    drain_attach_controls(&mut control_rx);
+    let response = handler
+        .handle(Request::DisplayPanes(Box::new(
+            rmux_proto::DisplayPanesRequest {
+                target: session.clone(),
+                duration_ms: Some(60_000),
+                non_blocking: true,
+                no_command: true,
+                template: None,
+                target_client: None,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::DisplayPanes(_)),
+        "{response:?}"
+    );
+    let _ = recv_overlay_frame(&mut control_rx, "display-panes before identity refresh").await;
+    drain_attach_controls(&mut control_rx);
+    let session_id = handler.active_attach.lock().await.by_pid[&requester_pid].session_id;
+
+    handler
+        .refresh_attached_session_for_session_identity(&session, session_id)
+        .await;
+
+    let mut saw_switch = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let replayed = loop {
+        let now = tokio::time::Instant::now();
+        assert!(
+            now < deadline,
+            "identity refresh should replay display-panes"
+        );
+        match tokio::time::timeout(deadline - now, control_rx.recv())
+            .await
+            .expect("identity refresh control arrives")
+            .expect("attached client remains registered")
+        {
+            AttachControl::Switch(_) => saw_switch = true,
+            AttachControl::Overlay(frame) if saw_switch => break frame,
+            _ => {}
+        }
+    };
+    assert!(!replayed.frame.is_empty());
+    assert!(handler.active_attach.lock().await.by_pid[&requester_pid]
+        .display_panes
+        .is_some());
+}
+
+#[tokio::test]
 async fn refresh_client_replay_order_matches_overlay_input_priority() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
@@ -775,5 +830,91 @@ async fn attached_prefix_q_inside_choose_tree_restores_the_tree_overlay_without_
     assert!(
         restored_frame.contains("sort: index"),
         "display-panes timeout inside choose-tree should restore the tree overlay directly, got: {restored_frame:?}"
+    );
+}
+
+#[tokio::test]
+async fn old_display_panes_timer_cannot_clear_same_pid_replacement_state() {
+    let handler = RequestHandler::new();
+    let requester_pid = 920_051;
+    let alpha = session_name("display-panes-timer-identity");
+    let mut old_control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+
+    let first = handler
+        .handle(Request::DisplayPanes(Box::new(
+            rmux_proto::DisplayPanesRequest {
+                target: alpha.clone(),
+                duration_ms: Some(60_000),
+                non_blocking: true,
+                no_command: true,
+                template: None,
+                target_client: None,
+            },
+        )))
+        .await;
+    assert!(matches!(first, Response::DisplayPanes(_)), "{first:?}");
+    let _ = recv_overlay_frame(&mut old_control_rx, "old display-panes overlay").await;
+    let (old_identity, old_state_id) = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = &active_attach.by_pid[&requester_pid];
+        (
+            active.identity(requester_pid),
+            active
+                .display_panes
+                .as_ref()
+                .expect("old display-panes state")
+                .id,
+        )
+    };
+
+    let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), replacement_tx)
+        .await;
+    let replacement = handler
+        .handle(Request::DisplayPanes(Box::new(
+            rmux_proto::DisplayPanesRequest {
+                target: alpha,
+                duration_ms: Some(60_000),
+                non_blocking: true,
+                no_command: true,
+                template: None,
+                target_client: None,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(replacement, Response::DisplayPanes(_)),
+        "{replacement:?}"
+    );
+    let _ = recv_overlay_frame(&mut replacement_rx, "replacement display-panes overlay").await;
+    let replacement_state_id = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach.by_pid[&requester_pid]
+            .display_panes
+            .as_ref()
+            .expect("replacement display-panes state")
+            .id
+    };
+    assert_eq!(
+        old_state_id, replacement_state_id,
+        "the regression requires the per-registration state-id collision"
+    );
+
+    assert!(
+        !handler
+            .expire_display_panes_for_identity_for_test(old_identity, old_state_id)
+            .await
+            .expect("stale timer callback is ignored"),
+        "the old timer must report that it did not clear replacement state"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    assert_eq!(
+        active_attach.by_pid[&requester_pid]
+            .display_panes
+            .as_ref()
+            .map(|state| state.id),
+        Some(replacement_state_id),
+        "same-PID replacement display-panes state must survive the old timer"
     );
 }

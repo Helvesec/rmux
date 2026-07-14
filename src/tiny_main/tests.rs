@@ -1235,7 +1235,7 @@ fn tiny_response_errors_use_tmux_cli_error_surface() {
 }
 
 #[test]
-fn tiny_display_message_missing_explicit_target_uses_empty_context() {
+fn tiny_target_resolution_errors_require_canonical_helper_retry() {
     let invalid_target = Response::Error(ErrorResponse {
         error: RmuxError::InvalidTarget {
             value: "s:0.99".to_owned(),
@@ -1246,12 +1246,8 @@ fn tiny_display_message_missing_explicit_target_uses_empty_context() {
         error: RmuxError::SessionNotFound("bogus".to_owned()),
     });
 
-    assert!(display_message_missing_target_uses_empty_context(
-        &invalid_target
-    ));
-    assert!(display_message_missing_target_uses_empty_context(
-        &missing_session
-    ));
+    assert!(response_needs_session_resolution_retry(&invalid_target));
+    assert!(response_needs_session_resolution_retry(&missing_session));
 }
 
 #[test]

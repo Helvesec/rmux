@@ -71,15 +71,49 @@ pub(in crate::handler) struct ActiveAttach {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::handler) struct ActiveAttachIdentity {
+pub(crate) struct ActiveAttachIdentity {
     attach_pid: u32,
     attach_id: u64,
     session_id: SessionId,
 }
 
 impl ActiveAttachIdentity {
-    pub(in crate::handler) const fn attach_pid(self) -> u32 {
+    pub(crate) const fn new(attach_pid: u32, attach_id: u64, session_id: SessionId) -> Self {
+        Self {
+            attach_pid,
+            attach_id,
+            session_id,
+        }
+    }
+
+    pub(crate) const fn attach_pid(self) -> u32 {
         self.attach_pid
+    }
+
+    pub(crate) const fn attach_id(self) -> u64 {
+        self.attach_id
+    }
+
+    pub(crate) const fn session_id(self) -> SessionId {
+        self.session_id
+    }
+
+    pub(in crate::handler) fn matches_active(self, active: &ActiveAttach) -> bool {
+        // A live attach may legitimately switch sessions without changing its
+        // forwarder.  The registration id, not the current session id, owns
+        // the socket lifetime.
+        self.attach_id == active.id
+    }
+
+    pub(in crate::handler) fn matches_active_session(
+        self,
+        active: &ActiveAttach,
+        session_name: &rmux_proto::SessionName,
+        session_id: SessionId,
+    ) -> bool {
+        self.attach_id == active.id
+            && active.session_id == session_id
+            && &active.session_name == session_name
     }
 
     pub(in crate::handler) fn matches(
@@ -97,11 +131,7 @@ impl ActiveAttachIdentity {
 
 impl ActiveAttach {
     pub(in crate::handler) const fn identity(&self, attach_pid: u32) -> ActiveAttachIdentity {
-        ActiveAttachIdentity {
-            attach_pid,
-            attach_id: self.id,
-            session_id: self.session_id,
-        }
+        ActiveAttachIdentity::new(attach_pid, self.id, self.session_id)
     }
 }
 

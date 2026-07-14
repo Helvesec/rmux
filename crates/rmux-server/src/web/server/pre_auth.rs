@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
+
+use crate::web::auth_wait_limit::auth_peer_bucket;
 
 #[derive(Clone)]
 pub(super) struct PreAuthQueue {
@@ -59,7 +61,7 @@ impl PreAuthQueue {
         if state.entries.len() >= self.capacity {
             return None;
         }
-        let peer_bucket = peer_ip.map(pre_auth_peer_bucket);
+        let peer_bucket = peer_ip.map(auth_peer_bucket);
         if let Some(peer_bucket) = peer_bucket {
             let active_for_ip = state
                 .entries
@@ -96,17 +98,6 @@ impl PreAuthQueue {
     }
 }
 
-fn pre_auth_peer_bucket(peer_ip: IpAddr) -> IpAddr {
-    match peer_ip {
-        IpAddr::V4(addr) => IpAddr::V4(addr),
-        IpAddr::V6(addr) => {
-            let mut octets = addr.octets();
-            octets[8..].fill(0);
-            IpAddr::V6(Ipv6Addr::from(octets))
-        }
-    }
-}
-
 impl Drop for PreAuthGuard {
     fn drop(&mut self) {
         self.queue.remove(self.id);
@@ -117,7 +108,9 @@ impl Drop for PreAuthGuard {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    use super::{pre_auth_peer_bucket, PreAuthQueue};
+    use crate::web::auth_wait_limit::auth_peer_bucket;
+
+    use super::PreAuthQueue;
 
     #[test]
     fn pre_auth_queue_enforces_per_ip_capacity() {
@@ -156,7 +149,7 @@ mod tests {
         let third = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 3));
         let different_prefix = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1));
 
-        assert_eq!(pre_auth_peer_bucket(first), pre_auth_peer_bucket(second));
+        assert_eq!(auth_peer_bucket(first), auth_peer_bucket(second));
         let first_guard = queue
             .try_register_peer(first)
             .expect("first connection from /64 fits");

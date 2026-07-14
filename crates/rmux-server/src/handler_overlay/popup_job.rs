@@ -14,7 +14,7 @@ use tokio::time::sleep;
 
 use crate::terminal::{parse_environment_assignments, TerminalProfile};
 
-use super::super::RequestHandler;
+use super::super::{attach_support::ActiveAttachIdentity, RequestHandler};
 
 pub(in super::super) struct PopupSurface {
     parser: InputParser,
@@ -136,7 +136,7 @@ pub(super) fn spawn_popup_job(
 impl RequestHandler {
     pub(super) fn spawn_popup_reader(
         &self,
-        attach_pid: u32,
+        identity: ActiveAttachIdentity,
         popup_id: u64,
         surface: Arc<StdMutex<PopupSurface>>,
         job: PopupJob,
@@ -147,10 +147,15 @@ impl RequestHandler {
                 RmuxError::Server(format!("failed to clone popup pty fd: {error}"))
             })?
         };
-        spawn_popup_reader_task(self.clone(), attach_pid, popup_id, surface, reader_fd)
+        spawn_popup_reader_task(self.clone(), identity, popup_id, surface, reader_fd)
     }
 
-    pub(super) fn spawn_popup_waiter(&self, attach_pid: u32, popup_id: u64, job: PopupJob) {
+    pub(super) fn spawn_popup_waiter(
+        &self,
+        identity: ActiveAttachIdentity,
+        popup_id: u64,
+        job: PopupJob,
+    ) {
         let handler = self.clone();
         tokio::spawn(async move {
             loop {
@@ -169,9 +174,7 @@ impl RequestHandler {
                     }
                 };
                 if let Some(status) = status {
-                    let _ = handler
-                        .popup_job_finished(attach_pid, popup_id, status)
-                        .await;
+                    let _ = handler.popup_job_finished(identity, popup_id, status).await;
                     return;
                 }
                 sleep(Duration::from_millis(50)).await;
@@ -197,7 +200,7 @@ fn exit_signal(_status: std::process::ExitStatus) -> Option<i32> {
 #[cfg(unix)]
 fn spawn_popup_reader_task(
     handler: RequestHandler,
-    attach_pid: u32,
+    identity: ActiveAttachIdentity,
     popup_id: u64,
     surface: Arc<StdMutex<PopupSurface>>,
     reader_fd: PtyIo,
@@ -221,7 +224,7 @@ fn spawn_popup_reader_task(
                 .lock()
                 .expect("popup surface")
                 .append(&buffer[..bytes_read]);
-            let _ = handler.popup_reader_tick(attach_pid, popup_id).await;
+            let _ = handler.popup_reader_tick(identity, popup_id).await;
         }
     });
     Ok(())
@@ -230,7 +233,7 @@ fn spawn_popup_reader_task(
 #[cfg(windows)]
 fn spawn_popup_reader_task(
     handler: RequestHandler,
-    attach_pid: u32,
+    identity: ActiveAttachIdentity,
     popup_id: u64,
     surface: Arc<StdMutex<PopupSurface>>,
     reader: PtyIo,
@@ -253,7 +256,7 @@ fn spawn_popup_reader_task(
                 .append(&buffer[..bytes_read]);
             let handler = handler.clone();
             runtime.block_on(async move {
-                let _ = handler.popup_reader_tick(attach_pid, popup_id).await;
+                let _ = handler.popup_reader_tick(identity, popup_id).await;
             });
         }
     });

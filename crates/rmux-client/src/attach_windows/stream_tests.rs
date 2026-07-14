@@ -83,6 +83,186 @@ async fn suspend_request_runs_action_and_sends_unlock() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
+async fn lock_and_suspend_unlock_paths_rearm_attach_screen(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let screen_tracker = AttachScreenTracker::default();
+    let mut scenario = AttachScenario::with_screen_tracker(
+        RecordingActions::default(),
+        true,
+        screen_tracker.clone(),
+    );
+    let actions = scenario.actions.clone();
+    let mut server = scenario.take_server();
+    let requests = [
+        AttachMessage::Lock("legacy".to_owned()),
+        AttachMessage::LockShellCommand(AttachShellCommand::new(
+            "structured".to_owned(),
+            "pwsh.exe".to_owned(),
+            r"C:\work".to_owned(),
+        )),
+        AttachMessage::Suspend,
+    ];
+
+    for request in requests {
+        screen_tracker.mark_stopped();
+        write_server_message(&mut server, request).await?;
+        assert_eq!(
+            read_client_message(&mut server).await?,
+            AttachMessage::Unlock
+        );
+        assert!(
+            !screen_tracker.was_stopped(),
+            "successful resume must make a later EOF/reset abnormal again"
+        );
+    }
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+    assert_eq!(
+        actions.calls(),
+        vec!["lock:legacy", "lock:structured", "suspend", "detach-kill"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lock_completion_preserves_a_concurrent_final_stop(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(1);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let screen_tracker = AttachScreenTracker::default();
+    let client_tracker = screen_tracker.clone();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            SharedOutput::default(),
+            client_tracker,
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+        )
+        .await
+    });
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    write_server_message(&mut server, AttachMessage::Lock("block".to_owned())).await?;
+
+    let action =
+        tokio::task::spawn_blocking(move || action_rx.recv_timeout(Duration::from_secs(1)))
+            .await??;
+    assert!(matches!(action, AttachAction::LegacyLock(command) if command == "block"));
+    let lock_prelude = wait_for_stop_generation(&screen_tracker, None).await?;
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    let final_stop = wait_for_stop_generation(&screen_tracker, Some(lock_prelude)).await?;
+
+    completion_tx.send(Ok(AttachActionOutcome::Unlock))?;
+    timeout(client).await???;
+
+    assert_eq!(screen_tracker.current_stop_generation(), Some(final_stop));
+    let mut frame = [0_u8; 64];
+    assert_eq!(
+        timeout(server.read(&mut frame)).await??,
+        0,
+        "a stale lock completion must close cleanly without sending unlock"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lock_completion_preserves_a_newer_resumable_stop() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(1);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let screen_tracker = AttachScreenTracker::default();
+    let client_tracker = screen_tracker.clone();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            SharedOutput::default(),
+            client_tracker,
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+        )
+        .await
+    });
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    write_server_message(&mut server, AttachMessage::Lock("block".to_owned())).await?;
+    let (action_rx, first_action) = receive_attach_action(action_rx).await?;
+    assert!(matches!(
+        first_action,
+        AttachAction::LegacyLock(command) if command == "block"
+    ));
+    let lock_stop = wait_for_stop_generation(&screen_tracker, None).await?;
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    write_server_message(&mut server, AttachMessage::Suspend).await?;
+    let (action_rx, second_action) = receive_attach_action(action_rx).await?;
+    assert!(matches!(second_action, AttachAction::Suspend));
+    let suspend_stop = wait_for_stop_generation(&screen_tracker, Some(lock_stop)).await?;
+
+    completion_tx.send(Ok(AttachActionOutcome::Unlock))?;
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Unlock
+    );
+    assert_eq!(
+        screen_tracker.current_stop_generation(),
+        Some(suspend_stop),
+        "the older completion must not consume the newer resumable stop"
+    );
+    assert!(
+        !client.is_finished(),
+        "the attach must await the newer action"
+    );
+
+    completion_tx.send(Ok(AttachActionOutcome::Unlock))?;
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Unlock
+    );
+    assert!(
+        !screen_tracker.was_stopped(),
+        "the matching completion must rearm the attach"
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    let (_action_rx, final_action) = receive_attach_action(action_rx).await?;
+    assert!(matches!(final_action, AttachAction::DetachKill));
+    completion_tx.send(Ok(AttachActionOutcome::Exit))?;
+    timeout(client).await???;
+    Ok(())
+}
+
+#[tokio::test]
 async fn detach_exec_runs_action_before_exit() -> Result<(), Box<dyn std::error::Error>> {
     let mut scenario = AttachScenario::new(RecordingActions::default());
     let actions = scenario.actions.clone();
@@ -1199,6 +1379,18 @@ impl AttachScenario {
         actions: RecordingActions,
         windows_console_key_enabled: bool,
     ) -> Self {
+        Self::with_screen_tracker(
+            actions,
+            windows_console_key_enabled,
+            AttachScreenTracker::default(),
+        )
+    }
+
+    fn with_screen_tracker(
+        actions: RecordingActions,
+        windows_console_key_enabled: bool,
+        screen_tracker: AttachScreenTracker,
+    ) -> Self {
         let (client_stream, server) = tokio::io::duplex(4096);
         let (reader, writer) = tokio::io::split(client_stream);
         let (input_tx, input_rx) = mpsc::channel(8);
@@ -1227,7 +1419,7 @@ impl AttachScenario {
                 writer,
                 Vec::new(),
                 client_output,
-                AttachScreenTracker::default(),
+                screen_tracker,
                 AttachAsyncChannels::new(
                     input_rx,
                     resize_rx,
@@ -1462,6 +1654,35 @@ async fn write_server_message(
     let frame = encode_attach_message(&message)?;
     timeout(stream.write_all(&frame)).await??;
     Ok(())
+}
+
+async fn receive_attach_action(
+    receiver: std::sync::mpsc::Receiver<AttachAction>,
+) -> Result<(std::sync::mpsc::Receiver<AttachAction>, AttachAction), Box<dyn std::error::Error>> {
+    let (receiver, action) = tokio::task::spawn_blocking(move || {
+        let action = receiver.recv_timeout(Duration::from_secs(1));
+        (receiver, action)
+    })
+    .await?;
+    Ok((receiver, action?))
+}
+
+async fn wait_for_stop_generation(
+    tracker: &AttachScreenTracker,
+    previous: Option<AttachStopGeneration>,
+) -> Result<AttachStopGeneration, Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(generation) = tracker.current_stop_generation() {
+            if Some(generation) != previous {
+                return Ok(generation);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("timed out waiting for attach stop generation".into());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 async fn read_client_message(

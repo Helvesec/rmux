@@ -253,6 +253,287 @@ async fn attached_copy_mode_q_exits_and_refreshes_normal_surface() {
 }
 
 #[tokio::test]
+async fn attached_copy_mode_exit_refreshes_every_client_on_shared_pane() {
+    let handler = RequestHandler::new();
+    let first_pid = u32::MAX - 501;
+    let second_pid = u32::MAX - 502;
+    let alpha = session_name("alpha");
+    let mut first_rx = create_quiet_attached_session(&handler, first_pid, &alpha).await;
+    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(second_pid, alpha.clone(), second_tx)
+        .await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                option: OptionName::ModeKeys,
+                value: "vi".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::CopyMode(CopyModeRequest {
+                target: Some(target),
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: false,
+                mouse_drag_start: false,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }))
+            .await,
+        Response::CopyMode(_)
+    ));
+    drain_attach_controls(&mut first_rx);
+    drain_attach_controls(&mut second_rx);
+
+    handler
+        .handle_attached_live_input_for_test(first_pid, b"q")
+        .await
+        .expect("first client exits shared copy-mode");
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), first_rx.recv())
+            .await
+            .expect("first client should refresh")
+            .expect("first client channel should stay open"),
+        AttachControl::Switch(_)
+    ));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), second_rx.recv())
+            .await
+            .expect("second client should refresh")
+            .expect("second client channel should stay open"),
+        AttachControl::Switch(_)
+    ));
+}
+
+async fn assert_grouped_copy_mode_refresh_fanout(label: &str, automatic_rename: bool) {
+    let handler = RequestHandler::new();
+    let first_pid = u32::MAX - 601;
+    let second_pid = u32::MAX - 602;
+    let alpha = session_name(&format!("copy-group-{label}-alpha"));
+    let beta = session_name(&format!("copy-group-{label}-beta"));
+    let mut first_rx = create_quiet_attached_session(&handler, first_pid, &alpha).await;
+    let grouped = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(beta.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: Some(alpha.clone()),
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(grouped, Response::NewSession(_)), "{grouped:?}");
+    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(second_pid, beta.clone(), second_tx)
+        .await;
+
+    if !automatic_rename {
+        let response = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                option: OptionName::AutomaticRename,
+                value: "off".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    }
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                option: OptionName::ModeKeys,
+                value: "vi".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    drain_attach_controls(&mut first_rx);
+    drain_attach_controls(&mut second_rx);
+
+    let target = PaneTarget::new(alpha.clone(), 0);
+    assert!(matches!(
+        handler
+            .handle(Request::CopyMode(CopyModeRequest {
+                target: Some(target),
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: false,
+                mouse_drag_start: false,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }))
+            .await,
+        Response::CopyMode(_)
+    ));
+    assert_eq!(
+        pane_mode_status(&handler, &alpha).await,
+        "1:copy-mode:0:0\n"
+    );
+    assert_eq!(pane_mode_status(&handler, &beta).await, "1:copy-mode:0:0\n");
+    recv_matching_attach_control(&mut first_rx, "grouped copy-mode entry owner", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
+    recv_matching_attach_control(&mut second_rx, "grouped copy-mode entry peer", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
+    drain_attach_controls(&mut first_rx);
+    drain_attach_controls(&mut second_rx);
+
+    handler
+        .handle_attached_live_input_for_test(first_pid, b"q")
+        .await
+        .expect("first grouped client exits shared copy-mode");
+    assert_eq!(pane_mode_status(&handler, &alpha).await, "0:::\n");
+    assert_eq!(pane_mode_status(&handler, &beta).await, "0:::\n");
+    let first_frame =
+        recv_matching_attach_control(&mut first_rx, "grouped copy-mode exit owner", |control| {
+            matches!(control, AttachControl::Switch(_))
+        })
+        .await;
+    let second_frame =
+        recv_matching_attach_control(&mut second_rx, "grouped copy-mode exit peer", |control| {
+            matches!(control, AttachControl::Switch(_))
+        })
+        .await;
+    assert!(!take_render_frame(first_frame).is_empty());
+    let second_frame = take_render_frame(second_frame);
+    assert!(!second_frame.is_empty());
+    if automatic_rename {
+        assert!(
+            !second_frame.contains("[tmux]"),
+            "grouped peer exit frame must contain the restored automatic name"
+        );
+    }
+}
+
+#[tokio::test]
+async fn attached_copy_mode_refreshes_clients_in_every_grouped_session() {
+    assert_grouped_copy_mode_refresh_fanout("automatic", true).await;
+}
+
+#[tokio::test]
+async fn attached_copy_mode_group_fanout_does_not_require_an_automatic_name_change() {
+    assert_grouped_copy_mode_refresh_fanout("fixed-name", false).await;
+}
+
+#[tokio::test]
+async fn attached_copy_mode_refreshes_clients_on_linked_window_aliases() {
+    let handler = RequestHandler::new();
+    let owner_pid = u32::MAX - 603;
+    let linked_pid = u32::MAX - 604;
+    let owner = session_name("copy-linked-owner");
+    let linked = session_name("copy-linked-peer");
+    let mut owner_rx = create_quiet_attached_session(&handler, owner_pid, &owner).await;
+    let mut linked_rx = create_quiet_attached_session(&handler, linked_pid, &linked).await;
+    let response = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(owner.clone(), 0),
+            target: WindowTarget::with_window(linked.clone(), 0),
+            after: false,
+            before: false,
+            kill_destination: true,
+            detached: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
+                option: OptionName::AutomaticRename,
+                value: "off".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
+                option: OptionName::ModeKeys,
+                value: "vi".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    drain_attach_controls(&mut owner_rx);
+    drain_attach_controls(&mut linked_rx);
+
+    assert!(matches!(
+        handler
+            .handle(Request::CopyMode(CopyModeRequest {
+                target: Some(PaneTarget::new(owner.clone(), 0)),
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: false,
+                mouse_drag_start: false,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }))
+            .await,
+        Response::CopyMode(_)
+    ));
+    recv_matching_attach_control(&mut owner_rx, "linked copy-mode entry owner", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
+    recv_matching_attach_control(&mut linked_rx, "linked copy-mode entry peer", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
+    drain_attach_controls(&mut owner_rx);
+    drain_attach_controls(&mut linked_rx);
+
+    handler
+        .handle_attached_live_input_for_test(owner_pid, b"q")
+        .await
+        .expect("owner exits linked copy-mode");
+    assert_eq!(pane_mode_status(&handler, &owner).await, "0:::\n");
+    assert_eq!(pane_mode_status(&handler, &linked).await, "0:::\n");
+    recv_matching_attach_control(&mut owner_rx, "linked copy-mode exit owner", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
+    recv_matching_attach_control(&mut linked_rx, "linked copy-mode exit peer", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn attached_copy_mode_copies_selection_to_buffer_and_exits_cleanly() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
@@ -376,7 +657,7 @@ async fn attached_copy_mode_updates_automatic_window_name_on_entry_and_exit() {
         .expect("q exits copy-mode");
     let restored_status = display_target_format(
         &handler,
-        target,
+        target.clone(),
         "#{window_name}|#{pane_in_mode}|#{pane_mode}",
     )
     .await;
@@ -387,6 +668,34 @@ async fn attached_copy_mode_updates_automatic_window_name_on_entry_and_exit() {
     assert!(
         !restored_status.starts_with("[tmux]|"),
         "copy-mode exit should restore a process-derived automatic window name, got {restored_status:?}"
+    );
+    let stored_name = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(rmux_core::Window::name)
+            .expect("auto-named window should retain a stored name")
+            .to_owned()
+    };
+    assert_ne!(stored_name, "[tmux]");
+    let resolved = handler
+        .handle(Request::ResolveTarget(ResolveTargetRequest {
+            target: Some(stored_name),
+            target_type: ResolveTargetType::Window,
+            window_index: false,
+            prefer_unattached: false,
+        }))
+        .await;
+    assert!(
+        matches!(
+            resolved,
+            Response::ResolveTarget(rmux_proto::ResolveTargetResponse {
+                target: Target::Window(ref window),
+            }) if window == &WindowTarget::with_window(alpha, 0)
+        ),
+        "restored automatic name must resolve the live window, got {resolved:?}"
     );
 }
 

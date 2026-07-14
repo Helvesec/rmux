@@ -69,7 +69,7 @@ mod overlay;
 pub(crate) use overlay::{DisplayMenuArgs, DisplayPopupArgs};
 #[path = "cli_args/targets.rs"]
 mod targets;
-use targets::{parse_session_name, parse_target};
+use targets::parse_session_name;
 pub(crate) use targets::{parse_target_spec, TargetSpec};
 #[path = "cli_args/pane.rs"]
 mod pane;

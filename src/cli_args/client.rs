@@ -4,10 +4,6 @@ use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RefreshClientArgs {
-    #[arg(short = 'A')]
-    pub(crate) subscriptions: Vec<String>,
-    #[arg(short = 'B')]
-    pub(crate) subscriptions_format: Vec<String>,
     #[arg(short = 'c', action = ArgAction::SetTrue)]
     pub(crate) clear_pan: bool,
     #[arg(short = 'C')]
@@ -24,8 +20,6 @@ pub(crate) struct RefreshClientArgs {
     pub(crate) pan_left: bool,
     #[arg(short = 'R', action = ArgAction::SetTrue)]
     pub(crate) pan_right: bool,
-    #[arg(short = 'r')]
-    pub(crate) colour_report: Option<String>,
     #[arg(short = 'S', action = ArgAction::SetTrue)]
     pub(crate) status_only: bool,
     #[arg(short = 't', allow_hyphen_values = true)]

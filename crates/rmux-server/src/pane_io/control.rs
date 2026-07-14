@@ -205,11 +205,17 @@ pub(super) async fn switch_attach_target(
 }
 
 pub(super) enum PendingAttachAction {
-    Exit(AttachExitReason),
+    Exit(PendingAttachExit),
     Continue { target_changed: bool },
     InteractiveInput,
     Refresh { target_changed: bool },
     Write,
+}
+
+pub(super) struct PendingAttachExit {
+    pub(super) reason: AttachExitReason,
+    pub(super) drop_pending_output: bool,
+    pub(super) snapshot_covered_output_before_sequence: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -232,6 +238,7 @@ pub(super) async fn apply_pending_attach_controls(
     };
 
     let mut should_drop_output = false;
+    let mut snapshot_covered_output_before_sequence = None;
     let mut target_changed = false;
     loop {
         let control = deferred_controls
@@ -241,29 +248,37 @@ pub(super) async fn apply_pending_attach_controls(
         match control {
             Ok(AttachControl::Detach) => {
                 emit_detached_attach_stop(stream, current_target).await?;
-                return Ok(PendingAttachAction::Exit(
-                    AttachExitReason::AttachControlDetach,
-                ));
+                return Ok(PendingAttachAction::Exit(PendingAttachExit {
+                    reason: AttachExitReason::AttachControlDetach,
+                    drop_pending_output: should_drop_output,
+                    snapshot_covered_output_before_sequence,
+                }));
             }
             Ok(AttachControl::Exited) => {
-                return Ok(PendingAttachAction::Exit(
-                    AttachExitReason::AttachControlExited,
-                ));
+                return Ok(PendingAttachAction::Exit(PendingAttachExit {
+                    reason: AttachExitReason::AttachControlExited,
+                    drop_pending_output: should_drop_output,
+                    snapshot_covered_output_before_sequence,
+                }));
             }
             Ok(AttachControl::DetachKill) => {
                 emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::DetachKill).await?;
-                return Ok(PendingAttachAction::Exit(
-                    AttachExitReason::AttachControlDetachKill,
-                ));
+                return Ok(PendingAttachAction::Exit(PendingAttachExit {
+                    reason: AttachExitReason::AttachControlDetachKill,
+                    drop_pending_output: should_drop_output,
+                    snapshot_covered_output_before_sequence,
+                }));
             }
             Ok(AttachControl::DetachExecShellCommand(command)) => {
                 emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::DetachExecShellCommand(command))
                     .await?;
-                return Ok(PendingAttachAction::Exit(
-                    AttachExitReason::AttachControlDetachExec,
-                ));
+                return Ok(PendingAttachAction::Exit(PendingAttachExit {
+                    reason: AttachExitReason::AttachControlDetachExec,
+                    drop_pending_output: should_drop_output,
+                    snapshot_covered_output_before_sequence,
+                }));
             }
             Ok(AttachControl::InteractiveInput) => {
                 return Ok(PendingAttachAction::InteractiveInput);
@@ -278,7 +293,26 @@ pub(super) async fn apply_pending_attach_controls(
                     Some(control_rx),
                     control_backlog,
                 );
-                let drop_live_output = !next_target.is_coalescible_render_refresh();
+                let same_pane_source =
+                    current_target
+                        .pane_output
+                        .as_ref()
+                        .is_some_and(|current_output| {
+                            current_output.shares_pane_source_with(&next_target.pane_output)
+                        });
+                let preserve_live_output =
+                    next_target.is_coalescible_render_refresh() && same_pane_source;
+                let drop_live_output = !preserve_live_output;
+                if is_stale_persistent_switch(*persistent_overlay_state_id, next_target.as_ref()) {
+                    *render_generation = (*render_generation).saturating_add(switch_count);
+                    continue;
+                }
+                if drop_live_output {
+                    snapshot_covered_output_before_sequence = None;
+                } else if !should_drop_output {
+                    snapshot_covered_output_before_sequence =
+                        Some(next_target.pane_output_start_sequence);
+                }
                 let pending_passthroughs = if drop_live_output {
                     Vec::new()
                 } else {
@@ -287,10 +321,6 @@ pub(super) async fn apply_pending_attach_controls(
                         next_target.pane_output_start_sequence,
                     )
                 };
-                if is_stale_persistent_switch(*persistent_overlay_state_id, next_target.as_ref()) {
-                    *render_generation = (*render_generation).saturating_add(switch_count);
-                    continue;
-                }
                 if let Some(pending_input) = pending_input.as_mut() {
                     pending_input
                         .clear_if_pane_source_changed(current_target, next_target.as_ref());
@@ -424,6 +454,7 @@ pub(super) async fn apply_pending_attach_controls(
                 emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::LockShellCommand(command)).await?;
                 should_drop_output = true;
+                snapshot_covered_output_before_sequence = None;
             }
             Ok(AttachControl::Suspend) => {
                 if let Some(pending_input) = pending_input.as_mut() {
@@ -433,6 +464,7 @@ pub(super) async fn apply_pending_attach_controls(
                 emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::Suspend).await?;
                 should_drop_output = true;
+                snapshot_covered_output_before_sequence = None;
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => break,

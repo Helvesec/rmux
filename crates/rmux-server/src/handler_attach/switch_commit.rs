@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
-use rmux_proto::{RmuxError, SessionId, SessionName, TerminalGeometry, WindowTarget};
+use rmux_proto::{
+    PaneId, PaneTarget, RmuxError, SessionId, SessionName, TerminalGeometry, WindowId, WindowTarget,
+};
 
 use super::resize_policy::ATTACHED_SIZE_RECONCILE_ATTEMPTS;
 use super::{
@@ -25,6 +27,19 @@ pub(in crate::handler) struct AttachedSwitchCommitRequest {
     pub(in crate::handler) render_stream: bool,
     pub(in crate::handler) attached_count: usize,
     pub(in crate::handler) client_environment: Option<HashMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::handler) struct AttachedSwitchCommittedTarget {
+    pub(in crate::handler) target: PaneTarget,
+    pub(in crate::handler) session_id: SessionId,
+    pub(in crate::handler) window_id: WindowId,
+    pub(in crate::handler) pane_id: PaneId,
+}
+
+pub(in crate::handler) struct AttachedSwitchCommitOutcome {
+    pub(in crate::handler) previous_session_name: SessionName,
+    pub(in crate::handler) committed_target: AttachedSwitchCommittedTarget,
 }
 
 #[cfg(test)]
@@ -83,7 +98,7 @@ impl RequestHandler {
         attach_pid: u32,
         expected_attach_id: u64,
         request: AttachedSwitchCommitRequest,
-    ) -> Result<SessionName, RmuxError> {
+    ) -> Result<AttachedSwitchCommitOutcome, RmuxError> {
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
 
@@ -269,6 +284,45 @@ impl RequestHandler {
                 snapshot.restore(&mut state);
                 return Err(rollback_switch_runtime(&mut state, &window_target, error));
             }
+            let Some(committed_session) = state
+                .sessions
+                .session(&request.session_name)
+                .filter(|session| session.id() == request.session_id)
+            else {
+                snapshot.restore(&mut state);
+                return Err(rollback_switch_runtime(
+                    &mut state,
+                    &window_target,
+                    RmuxError::Server("switched attached session has no active target".to_owned()),
+                ));
+            };
+            let committed_window_index = committed_session.active_window_index();
+            let Some(committed_window) = committed_session.window_at(committed_window_index) else {
+                snapshot.restore(&mut state);
+                return Err(rollback_switch_runtime(
+                    &mut state,
+                    &window_target,
+                    RmuxError::Server("switched attached session has no active window".to_owned()),
+                ));
+            };
+            let Some(committed_pane) = committed_window.active_pane() else {
+                snapshot.restore(&mut state);
+                return Err(rollback_switch_runtime(
+                    &mut state,
+                    &window_target,
+                    RmuxError::Server("switched attached window has no active pane".to_owned()),
+                ));
+            };
+            let committed_target = AttachedSwitchCommittedTarget {
+                target: PaneTarget::with_window(
+                    request.session_name.clone(),
+                    committed_window_index,
+                    committed_pane.index(),
+                ),
+                session_id: committed_session.id(),
+                window_id: committed_window.id(),
+                pane_id: committed_pane.id(),
+            };
 
             let render_stream_refresh =
                 request.render_stream && target.is_coalescible_render_refresh();
@@ -346,7 +400,10 @@ impl RequestHandler {
                 self.finish_committed_mode_tree_dismissal(effects).await;
             }
             terminate_overlay_job(overlay_to_terminate);
-            return Ok(previous_session_name);
+            return Ok(AttachedSwitchCommitOutcome {
+                previous_session_name,
+                committed_target,
+            });
         }
 
         Err(RmuxError::Server(format!(

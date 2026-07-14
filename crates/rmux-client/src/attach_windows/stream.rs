@@ -30,9 +30,10 @@ use crate::ClientError;
 
 use super::action::{AttachAction, AttachActionOutcome};
 use super::metrics::AttachMetricsRecorder;
-use super::screen::{AttachScreenTracker, AttachStopDetector};
+use super::screen::{AttachScreenTracker, AttachStopDetector, AttachStopGeneration};
 #[cfg(test)]
 use super::screen::{ALT_SCREEN_EXIT_FALLBACK, DETACHED_BANNER_PREFIX, EXITED_BANNER};
+use super::terminal;
 use crate::attach_lock_state::AttachLockState;
 
 const ATTACH_OUTPUT_QUEUE_CAPACITY: usize = 64;
@@ -119,6 +120,7 @@ where
     let mut stop_detector = AttachStopDetector::new(screen_tracker.clone());
     let mut mouse_tracker = WindowsConsoleMouseTracker::default();
     let mut pending_actions = 0_usize;
+    let mut pending_resume_generations = VecDeque::new();
     let mut input_open = true;
     let mut resize_open = true;
     let mut pending_repeated_input: Option<PendingRepeatedAttachInput> = None;
@@ -137,6 +139,7 @@ where
                 action_tx: &action_tx,
                 locked: &locked,
                 pending_actions: &mut pending_actions,
+                pending_resume_generations: &mut pending_resume_generations,
                 metrics,
             },
         )?;
@@ -209,20 +212,72 @@ where
                 };
                 match completion {
                     Ok(AttachActionOutcome::Unlock) => {
+                        let stop_generation = pending_resume_generations.pop_front().ok_or_else(|| {
+                            ClientError::Io(io::Error::other(
+                                "attach action worker returned an unmatched unlock",
+                            ))
+                        })?;
                         pending_actions = pending_actions.saturating_sub(1);
-                        let unlock_result =
-                            write_async_attach_message(&mut writer, AttachMessage::Unlock).await;
                         if pending_actions == 0 {
+                            // The action worker cannot complete an exclusive
+                            // action until the input-loop lease is idle. Drop
+                            // everything that lease queued before the lock;
+                            // otherwise select scheduling could forward stale
+                            // input only after the attach is unlocked.
+                            pending_repeated_input = None;
+                            while input_rx.try_recv().is_ok() {}
+                        }
+                        // Rearm only the stop published by this lock/suspend
+                        // prelude. A newer stop belongs to a concurrent detach
+                        // or session exit and remains authoritative.
+                        let rearmed = stop_generation.is_some_and(|generation| {
+                            screen_tracker.rearm_if_current(generation)
+                        });
+                        let current_stop_owned_by_pending_resume = screen_tracker
+                            .current_stop_generation()
+                            .is_some_and(|current| {
+                                pending_resume_generations
+                                    .iter()
+                                    .flatten()
+                                    .any(|generation| *generation == current)
+                            });
+                        if !rearmed
+                            && screen_tracker.was_stopped()
+                            && !current_stop_owned_by_pending_resume
+                        {
+                            terminal::resume_ctrl_c_input();
+                            locked.unlock();
+                            return Ok(());
+                        }
+                        if let Err(error) =
+                            write_async_attach_message(&mut writer, AttachMessage::Unlock).await
+                        {
+                            if matches!(
+                                &error,
+                                ClientError::Io(error)
+                                    if screen_tracker.was_stopped()
+                                        && matches!(
+                                            error.kind(),
+                                            io::ErrorKind::ConnectionReset
+                                                | io::ErrorKind::BrokenPipe
+                                        )
+                            ) {
+                                terminal::resume_ctrl_c_input();
+                                locked.unlock();
+                                return Ok(());
+                            }
+                            return Err(error);
+                        }
+                        if pending_actions == 0 {
+                            terminal::resume_ctrl_c_input();
                             locked.unlock();
                         }
-                        unlock_result?;
                     }
                     Ok(AttachActionOutcome::Continue) => {}
                     Ok(AttachActionOutcome::Exit) => {
                         return Ok(());
                     }
                     Err(error) => {
-                        locked.unlock();
                         return Err(error);
                     }
                 }
@@ -326,6 +381,7 @@ fn drain_attach_messages(
         action_tx,
         locked,
         pending_actions,
+        pending_resume_generations,
         metrics,
     } = context;
     while let Some(message) = decoder.next_message().map_err(ClientError::from)? {
@@ -354,34 +410,58 @@ fn drain_attach_messages(
             }
             AttachMessage::KeyDispatched(_) => {}
             AttachMessage::DetachKill => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::DetachKill)?;
-                *pending_actions += 1;
+                send_exclusive_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    AttachAction::DetachKill,
+                )?;
             }
             AttachMessage::DetachExec(command) => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::LegacyDetachExec(command))?;
-                *pending_actions += 1;
+                send_exclusive_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    AttachAction::LegacyDetachExec(command),
+                )?;
             }
             AttachMessage::DetachExecShellCommand(command) => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::DetachExec(command))?;
-                *pending_actions += 1;
+                send_exclusive_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    AttachAction::DetachExec(command),
+                )?;
             }
             AttachMessage::Lock(command) => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::LegacyLock(command))?;
-                *pending_actions += 1;
+                send_resumable_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    pending_resume_generations,
+                    stop_detector.current_stop_generation(),
+                    AttachAction::LegacyLock(command),
+                )?;
             }
             AttachMessage::LockShellCommand(command) => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::Lock(command))?;
-                *pending_actions += 1;
+                send_resumable_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    pending_resume_generations,
+                    stop_detector.current_stop_generation(),
+                    AttachAction::Lock(command),
+                )?;
             }
             AttachMessage::Suspend => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::Suspend)?;
-                *pending_actions += 1;
+                send_resumable_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    pending_resume_generations,
+                    stop_detector.current_stop_generation(),
+                    AttachAction::Suspend,
+                )?;
             }
             AttachMessage::Resize(_) | AttachMessage::ResizeGeometry(_) => {
                 return Err(ClientError::Protocol(RmuxError::Decode(
@@ -1138,6 +1218,7 @@ struct DrainContext<'context> {
     action_tx: &'context std_mpsc::Sender<AttachAction>,
     locked: &'context Arc<AttachLockState>,
     pending_actions: &'context mut usize,
+    pending_resume_generations: &'context mut VecDeque<Option<AttachStopGeneration>>,
     metrics: &'context mut AttachMetricsRecorder,
 }
 
@@ -1214,6 +1295,36 @@ fn send_attach_action(
     action_tx
         .send(action)
         .map_err(|_| ClientError::Io(io::Error::other("attach action worker stopped")))
+}
+
+fn send_exclusive_attach_action(
+    action_tx: &std_mpsc::Sender<AttachAction>,
+    locked: &Arc<AttachLockState>,
+    pending_actions: &mut usize,
+    action: AttachAction,
+) -> std::result::Result<(), ClientError> {
+    // Suppression is process-wide because Win32 console-control callbacks are
+    // process-wide. It is armed before the attach input lock; any callback
+    // racing this transition is either consumed by an already-active input
+    // read or discarded, never retained across the lock boundary.
+    terminal::suppress_ctrl_c_input();
+    locked.lock();
+    send_attach_action(action_tx, action)?;
+    *pending_actions += 1;
+    Ok(())
+}
+
+fn send_resumable_attach_action(
+    action_tx: &std_mpsc::Sender<AttachAction>,
+    locked: &Arc<AttachLockState>,
+    pending_actions: &mut usize,
+    pending_resume_generations: &mut VecDeque<Option<AttachStopGeneration>>,
+    stop_generation: Option<AttachStopGeneration>,
+    action: AttachAction,
+) -> std::result::Result<(), ClientError> {
+    send_exclusive_attach_action(action_tx, locked, pending_actions, action)?;
+    pending_resume_generations.push_back(stop_generation);
+    Ok(())
 }
 
 async fn write_async_attach_message<Writer>(

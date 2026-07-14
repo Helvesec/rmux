@@ -2752,7 +2752,10 @@ async fn setup_two_pane_mouse_click(
     handler: &RequestHandler,
     alpha: &rmux_proto::SessionName,
     requester_pid: u32,
-) -> String {
+) -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+) {
     let split = handler
         .handle(Request::SplitWindow(SplitWindowRequest {
             target: SplitWindowTarget::Session(alpha.clone()),
@@ -2774,7 +2777,7 @@ async fn setup_two_pane_mouse_click(
     assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
     enable_mouse(handler).await;
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
@@ -2790,7 +2793,10 @@ async fn setup_two_pane_mouse_click(
             pane.geometry().y().saturating_add(1),
         )
     };
-    format!("\x1b[<0;{};{}M", click_x + 1, click_y + 1)
+    (
+        format!("\x1b[<0;{};{}M", click_x + 1, click_y + 1),
+        control_rx,
+    )
 }
 
 #[tokio::test]
@@ -2823,7 +2829,8 @@ async fn live_attach_mouse_binding_executes_every_command_in_the_sequence() {
         .await;
     assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
-    let mouse_down = setup_two_pane_mouse_click(&handler, &alpha, requester_pid).await;
+    let (mouse_down, control_rx) =
+        setup_two_pane_mouse_click(&handler, &alpha, requester_pid).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, mouse_down.as_bytes())
         .await
@@ -2852,6 +2859,53 @@ async fn live_attach_mouse_binding_executes_every_command_in_the_sequence() {
         );
         sleep(Duration::from_millis(10)).await;
     }
+    drop(control_rx);
+}
+
+#[tokio::test]
+async fn live_attach_mouse_binding_switch_client_rebases_its_command_queue() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("mouse-switch-alpha");
+    let beta = session_name("mouse-switch-beta");
+    let requester_pid = u32::MAX - 77;
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    create_send_keys_test_session(&handler, &beta).await;
+    let rebound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "root".to_owned(),
+            key: "MouseDown1Pane".to_owned(),
+            note: Some("mouse-switch-client-queue".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "switch-client".to_owned(),
+                "-t".to_owned(),
+                beta.to_string(),
+                ";".to_owned(),
+                "set-buffer".to_owned(),
+                "-b".to_owned(),
+                "mouse-switch-tail".to_owned(),
+                "done".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
+
+    let (mouse_down, control_rx) =
+        setup_two_pane_mouse_click(&handler, &alpha, requester_pid).await;
+    handler
+        .handle_attached_live_input_for_test(requester_pid, mouse_down.as_bytes())
+        .await
+        .expect("live attach mouse switch binding");
+
+    wait_for_buffer(&handler, "mouse-switch-tail", "done").await;
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .expect("attached client remains registered");
+    assert_eq!(active.session_name, beta);
+    drop(control_rx);
 }
 
 #[tokio::test]
@@ -2923,7 +2977,8 @@ async fn live_attach_mouse_binding_run_shell_tail_writes_its_file() {
         .await;
     assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
 
-    let mouse_down = setup_two_pane_mouse_click(&handler, &alpha, requester_pid).await;
+    let (mouse_down, control_rx) =
+        setup_two_pane_mouse_click(&handler, &alpha, requester_pid).await;
     handler
         .handle_attached_live_input_for_test(requester_pid, mouse_down.as_bytes())
         .await
@@ -2959,6 +3014,7 @@ async fn live_attach_mouse_binding_run_shell_tail_writes_its_file() {
         1,
         "select-pane head of the sequence must also run"
     );
+    drop(control_rx);
 }
 
 #[tokio::test]

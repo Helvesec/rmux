@@ -1117,3 +1117,50 @@ async fn kill_session_clear_alerts_does_not_request_shutdown() {
         "kill-session -C should not request shutdown while the session survives"
     );
 }
+
+#[tokio::test]
+async fn kill_session_explicit_id_follows_concurrent_rename_and_preserves_old_name_homonym() {
+    let handler = RequestHandler::new();
+    let original = create_quiet_kill_session(&handler, "kill-id-rename-original").await;
+    let original_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&original)
+        .expect("created session exists")
+        .id();
+    let stable_target = SessionName::new(original_id.to_string()).expect("session id is a target");
+    let renamed = session_name("kill-id-rename-current");
+    let pause = handler.install_kill_session_selection_identity_pause(original.clone());
+
+    let kill_handler = handler.clone();
+    let kill = tokio::spawn(async move {
+        kill_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: stable_target,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await
+    });
+
+    pause.reached.notified().await;
+    let rename = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: original.clone(),
+            new_name: renamed.clone(),
+        }))
+        .await;
+    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
+    let homonym = create_quiet_kill_session(&handler, original.as_str()).await;
+    pause.release.notify_one();
+
+    assert_eq!(
+        kill.await.expect("kill task joins"),
+        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
+    );
+    wait_for_session_state(&handler, renamed, false).await;
+    wait_for_session_state(&handler, homonym, true).await;
+}

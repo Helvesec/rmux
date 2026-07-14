@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -26,7 +27,7 @@ use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
 use crate::web::{
     ResolvedCreateWebShareRequest, WebPaneTarget, WebSessionTarget, WebShareAccess,
-    WebShareExpiryPoll, WebShareTarget,
+    WebShareAuthWaitPermit, WebShareExpiryPoll, WebShareTarget,
 };
 use rmux_core::{input::mode, PaneId};
 
@@ -48,6 +49,30 @@ pub(crate) use stream::{
 };
 
 impl RequestHandler {
+    #[cfg(test)]
+    pub(crate) fn new_with_web_authentication_limits(
+        max_connections: usize,
+        max_waiters: usize,
+        max_waiters_per_key: usize,
+        max_waiters_per_peer: usize,
+    ) -> Self {
+        let mut handler = Self::new();
+        handler.web_shares = Arc::new(
+            crate::web::WebShareRegistry::new_with_authentication_limits(
+                max_connections,
+                max_waiters,
+                max_waiters_per_key,
+                max_waiters_per_peer,
+            ),
+        );
+        handler
+    }
+
+    #[cfg(test)]
+    pub(crate) fn web_authentication_wait_count(&self) -> usize {
+        self.web_shares.authentication_wait_count()
+    }
+
     #[cfg(test)]
     pub(crate) async fn open_web_share(
         &self,
@@ -143,12 +168,34 @@ impl RequestHandler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn open_web_share_token_id(
         &self,
         token_id: &str,
         pin: Option<&str>,
     ) -> Result<WebShareStream, RmuxError> {
         let access = self.web_shares.connect_token_id(token_id, pin).await?;
+        self.open_web_share_access(access).await
+    }
+
+    pub(crate) fn reserve_web_share_authentication(
+        &self,
+        token_id: &str,
+        peer: Option<IpAddr>,
+    ) -> Result<WebShareAuthWaitPermit, RmuxError> {
+        self.web_shares.reserve_authentication_wait(token_id, peer)
+    }
+
+    pub(crate) async fn open_web_share_token_id_with_wait(
+        &self,
+        token_id: &str,
+        pin: Option<&str>,
+        auth_wait: &WebShareAuthWaitPermit,
+    ) -> Result<WebShareStream, RmuxError> {
+        let access = self
+            .web_shares
+            .connect_token_id_with_wait(token_id, pin, auth_wait)
+            .await?;
         self.open_web_share_access(access).await
     }
 
@@ -257,8 +304,8 @@ impl RequestHandler {
         // drain. Closing the last session removes the active-attach entry
         // before the browser has received its terminal exit frame.
         let attach_forwarder_guard = self.begin_attach_forwarder();
-        let attach_id = self
-            .register_attach_with_access(
+        let attach_identity = self
+            .register_attach_identity_with_access(
                 attach_pid,
                 session_target.name().clone(),
                 Some(session_target.id()),
@@ -291,14 +338,13 @@ impl RequestHandler {
                 control_backlog,
                 closing,
                 persistent_overlay_epoch,
-                LiveAttachInputContext {
-                    handler: Arc::new(task_handler.clone()),
-                    attach_pid,
-                },
+                LiveAttachInputContext::new(Arc::new(task_handler.clone()), attach_identity),
                 true,
             )
             .await;
-            task_handler.finish_attach(attach_pid, attach_id).await;
+            task_handler
+                .finish_attach(attach_pid, attach_identity.attach_id())
+                .await;
             drop(attach_forwarder_guard);
             let _ = task_handler.request_shutdown_if_pending();
             if let Err(error) = result {

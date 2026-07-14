@@ -230,6 +230,23 @@ run_rmux_smoke() {
   assert_trace list_panes_prefix "rmux tiny: direct: list-panes"
   assert_stdout_not_empty list_panes_prefix
 
+  run_capture display_message_prefix -L "$sock" display-message -p -t prefixd '#{session_name}'
+  assert_rc display_message_prefix 0
+  assert_trace display_message_prefix "rmux tiny: direct: display-message"
+  assert_stdout_line display_message_prefix "prefixdemo"
+
+  run_capture send_keys_prefix -L "$sock" send-keys -t prefixd:0.0 C-l
+  assert_rc send_keys_prefix 0
+  assert_trace send_keys_prefix "rmux tiny: direct: send-keys"
+
+  run_capture if_shell_prefix -L "$sock" if-shell -F -t prefixd \
+    '#{==:#{session_name},prefixdemo}' \
+    'display-message -p target-resolved' \
+    'display-message -p wrong-target'
+  assert_rc if_shell_prefix 0
+  assert_trace if_shell_prefix "rmux tiny: fallback: unsupported invocation"
+  assert_stdout_line if_shell_prefix "target-resolved"
+
   run_capture kill_session_prefix -L "$sock" kill-session -t killtar
   assert_rc kill_session_prefix 0
   assert_trace kill_session_prefix "rmux tiny: direct: kill-session"

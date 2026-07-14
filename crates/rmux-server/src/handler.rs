@@ -165,9 +165,12 @@ pub(in crate::handler) use target_support::{
 };
 use wait_support::SdkWaitState;
 pub(in crate::handler) use web_request_identity::{
-    dispatch_with_expected_session_identity, dispatch_with_expected_window_identity,
-    dispatch_with_expected_window_occurrence_identity, require_expected_session_identity,
+    current_expected_attach_identity, dispatch_with_expected_session_identity,
+    dispatch_with_expected_window_identity, dispatch_with_expected_window_occurrence_identity,
+    rebase_expected_attach_session_after_switch, require_expected_session_identity,
     require_expected_window_identity, resolve_expected_window_pane_target,
+    validate_expected_attach_identity, with_expected_attach_and_session_identity,
+    with_expected_attach_identity, with_expected_session_identity,
     ExpectedWindowOccurrenceIdentity,
 };
 

@@ -77,6 +77,8 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 
 struct AttachedKeyDispatch {
     attach_pid: u32,
+    live_identity: Option<super::attach_support::ActiveAttachIdentity>,
+    live_session_id: Option<rmux_proto::SessionId>,
     requester_pid: u32,
     current_target: Option<Target>,
     mouse_target: Option<Target>,

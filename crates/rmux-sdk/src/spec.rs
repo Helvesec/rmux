@@ -280,13 +280,16 @@ impl From<AttachSessionSpec> for rmux_proto::AttachSessionExt2Request {
     }
 }
 
-/// Control-mode subscription fields for `refresh-client`.
+/// Reserved wire-v5 control-mode subscription fields for `refresh-client`.
+///
+/// RMUX 0.9 does not implement these fields. Populating either field produces
+/// a request that the server rejects fail-closed.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionSpec {
-    /// Control-mode subscription updates from `refresh-client -A`.
+    /// Reserved subscription-update field; unsupported by RMUX 0.9.
     #[serde(default)]
     pub subscriptions: Vec<String>,
-    /// Control-mode subscription definitions from `refresh-client -B`.
+    /// Reserved subscription-definition field; unsupported by RMUX 0.9.
     #[serde(default)]
     pub subscriptions_format: Vec<String>,
 }
@@ -327,13 +330,13 @@ pub struct RefreshClientSpec {
     /// Optional client-flag string from `-F`.
     #[serde(default)]
     pub flags_alias: Option<String>,
-    /// Control-mode subscription fields.
+    /// Reserved control-mode subscription fields; unsupported by RMUX 0.9.
     #[serde(default)]
     pub subscriptions: SubscriptionSpec,
     /// Optional control-mode size string from `-C`.
     #[serde(default)]
     pub control_size: Option<String>,
-    /// Optional control-mode colour report request from `-r`.
+    /// Reserved wire-v5 colour-report field; unsupported by RMUX 0.9.
     #[serde(default)]
     pub colour_report: Option<String>,
 }

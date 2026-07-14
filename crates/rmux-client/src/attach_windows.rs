@@ -268,6 +268,48 @@ where
     Ok(())
 }
 
+struct AttachInputReadLease<'a> {
+    state: &'a AttachLockState,
+}
+
+impl<'a> AttachInputReadLease<'a> {
+    fn acquire(state: &'a AttachLockState) -> Option<Self> {
+        state.begin_input_read().then_some(Self { state })
+    }
+}
+
+impl Drop for AttachInputReadLease<'_> {
+    fn drop(&mut self) {
+        self.state.finish_input_read();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingCtrlCForward {
+    None,
+    Sent,
+    InputClosed,
+}
+
+fn forward_pending_ctrl_c_event(
+    input_tx: &mpsc::Sender<input::AttachInput>,
+    lock_state: &AttachLockState,
+) -> PendingCtrlCForward {
+    let Some(_input_read_lease) = AttachInputReadLease::acquire(lock_state) else {
+        return PendingCtrlCForward::None;
+    };
+    if !terminal::take_pending_ctrl_c_event() {
+        return PendingCtrlCForward::None;
+    }
+    if input_tx
+        .blocking_send(input::synthetic_ctrl_c_input())
+        .is_err()
+    {
+        return PendingCtrlCForward::InputClosed;
+    }
+    PendingCtrlCForward::Sent
+}
+
 fn input_loop<Input>(
     mut input: Input,
     input_tx: mpsc::Sender<input::AttachInput>,
@@ -292,23 +334,19 @@ where
             lock_state.wait_while_locked();
             continue;
         }
-        if terminal::take_pending_ctrl_c_event() && !lock_state.is_locked() {
-            let input = input::synthetic_ctrl_c_input();
-            if input_tx.blocking_send(input).is_err() {
-                return Ok(());
-            }
-            continue;
+        match forward_pending_ctrl_c_event(&input_tx, &lock_state) {
+            PendingCtrlCForward::None => {}
+            PendingCtrlCForward::Sent => continue,
+            PendingCtrlCForward::InputClosed => return Ok(()),
         }
 
         if !terminal::wait_for_key_input(input_handle, 50).map_err(ClientError::Io)? {
             if lock_state.is_closed() || input_tx.is_closed() {
                 return Ok(());
             }
-            if terminal::take_pending_ctrl_c_event() && !lock_state.is_locked() {
-                let input = input::synthetic_ctrl_c_input();
-                if input_tx.blocking_send(input).is_err() {
-                    return Ok(());
-                }
+            match forward_pending_ctrl_c_event(&input_tx, &lock_state) {
+                PendingCtrlCForward::None | PendingCtrlCForward::Sent => {}
+                PendingCtrlCForward::InputClosed => return Ok(()),
             }
             continue;
         }

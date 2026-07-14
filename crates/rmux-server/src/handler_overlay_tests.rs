@@ -293,6 +293,12 @@ async fn refresh_client_overlay_frame(
         "refresh-client should succeed, got {response:?}"
     );
 
+    refresh_overlay_frame_after_base_switch(control_rx).await
+}
+
+async fn refresh_overlay_frame_after_base_switch(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+) -> crate::pane_io::OverlayFrame {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     let mut saw_switch = false;
     loop {
@@ -373,6 +379,164 @@ async fn refresh_client_replays_active_popup_after_base_switch() {
         active_attach.by_pid[&requester_pid].overlay.is_none(),
         "popup control input should dismiss the active overlay after refresh-client"
     );
+}
+
+#[tokio::test]
+async fn cancelling_prompt_replays_the_menu_it_temporarily_hid() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("prompt-cancel-menu-overlay");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_quiet_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-menu -T Menu "First" "f" "display-message first""#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    run_overlay_command(&handler, requester_pid, "command-prompt -b -p Prompt").await;
+    assert!(handler
+        .attached_prompt_render(requester_pid)
+        .await
+        .is_some());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while control_rx.try_recv().is_ok() {}
+
+    handler.clear_prompt_for_attach(requester_pid).await;
+    let expected_render_generation =
+        handler.active_attach.lock().await.by_pid[&requester_pid].render_generation;
+
+    let frame = refresh_overlay_frame_after_base_switch(&mut control_rx).await;
+    assert_eq!(frame.render_generation, expected_render_generation);
+    assert!(frame.persistent);
+    let rendered = String::from_utf8(frame.frame).expect("menu frame is utf-8");
+    assert!(
+        rendered.contains("First"),
+        "prompt cancellation must restore the still-active menu, got {rendered:?}"
+    );
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"f")
+        .await
+        .expect("restored menu remains interactive");
+    assert!(handler.active_attach.lock().await.by_pid[&requester_pid]
+        .overlay
+        .is_none());
+}
+
+#[tokio::test]
+async fn session_identity_refresh_keeps_the_underlying_menu_hidden_by_a_prompt() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("identity-refresh-prompt-menu");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_quiet_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-menu -T Menu "First" "f" "display-message first""#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    run_overlay_command(&handler, requester_pid, "command-prompt -b -p Prompt").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while control_rx.try_recv().is_ok() {}
+    let session_id = handler.active_attach.lock().await.by_pid[&requester_pid].session_id;
+
+    handler
+        .refresh_attached_session_for_session_identity(&alpha, session_id)
+        .await;
+
+    let mut saw_prompt = false;
+    while let Ok(control) = control_rx.try_recv() {
+        match control {
+            AttachControl::Switch(target) => {
+                let rendered = String::from_utf8_lossy(&target.render_frame);
+                saw_prompt |= rendered.contains("Prompt");
+            }
+            AttachControl::Overlay(frame) => {
+                assert!(
+                    !String::from_utf8_lossy(&frame.frame).contains("First"),
+                    "an active prompt must keep the underlying menu hidden"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_prompt,
+        "identity refresh should repaint the active prompt"
+    );
+    handler.clear_prompt_for_attach(requester_pid).await;
+}
+
+#[tokio::test]
+async fn stale_same_pid_popup_callbacks_cannot_mutate_replacement_popup() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-callback-identity");
+    let requester_pid = 920_041;
+    let mut old_control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -E -T Old -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut old_control_rx).await;
+    let (old_identity, old_popup_id) = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = &active_attach.by_pid[&requester_pid];
+        (
+            active.identity(requester_pid),
+            active.overlay.as_ref().expect("old popup active").id(),
+        )
+    };
+
+    let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), replacement_tx)
+        .await;
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -E -T Replacement -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let replacement_frame = next_overlay_frame(&mut replacement_rx).await;
+    assert!(
+        String::from_utf8_lossy(&replacement_frame.frame).contains("Replacement"),
+        "replacement popup must be active before old callbacks run"
+    );
+    let replacement_popup_id = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach.by_pid[&requester_pid]
+            .overlay
+            .as_ref()
+            .expect("replacement popup active")
+            .id()
+    };
+    assert_eq!(
+        old_popup_id, replacement_popup_id,
+        "the regression requires the per-registration popup id collision"
+    );
+
+    handler
+        .popup_reader_tick(old_identity, old_popup_id)
+        .await
+        .expect("stale reader callback is ignored");
+    handler
+        .popup_job_finished(old_identity, old_popup_id, 0)
+        .await
+        .expect("stale waiter callback is ignored");
+
+    let active_attach = handler.active_attach.lock().await;
+    let active = &active_attach.by_pid[&requester_pid];
+    assert!(
+        matches!(active.overlay, Some(ClientOverlayState::Popup(_))),
+        "old reader/waiter callbacks must not refresh or close B's colliding popup"
+    );
+    assert_eq!(active.overlay.as_ref().map(ClientOverlayState::id), Some(1));
 }
 
 #[tokio::test]

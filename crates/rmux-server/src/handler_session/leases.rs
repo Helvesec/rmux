@@ -28,65 +28,98 @@ static EXPIRED_SESSION_LEASE_REAP_PAUSE: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[derive(Debug)]
-struct SessionLease {
+struct SessionOwnership {
     token: u64,
-    session_id: SessionId,
+    wire_session_name: SessionName,
+    current_session_name: SessionName,
     deadline: Instant,
 }
 
 /// Daemon-side owner lease registry for app-owned sessions.
 #[derive(Debug, Default)]
 pub(crate) struct SessionLeaseStore {
-    leases: HashMap<SessionName, SessionLease>,
+    ownerships: HashMap<SessionId, SessionOwnership>,
     next_token: u64,
 }
 
 impl SessionLeaseStore {
-    fn create(&mut self, session_name: SessionName, session_id: SessionId, ttl: Duration) -> u64 {
-        self.next_token = self.next_token.saturating_add(1).max(1);
-        let token = self.next_token;
-        self.leases.insert(
-            session_name,
-            SessionLease {
+    fn create_lease(
+        &mut self,
+        session_name: SessionName,
+        session_id: SessionId,
+        ttl: Duration,
+    ) -> Result<u64, RmuxError> {
+        let token = self
+            .next_token
+            .checked_add(1)
+            .ok_or_else(|| RmuxError::Server("session lease token space exhausted".to_owned()))?;
+        self.next_token = token;
+        self.ownerships.insert(
+            session_id,
+            SessionOwnership {
                 token,
-                session_id,
+                wire_session_name: session_name.clone(),
+                current_session_name: session_name,
                 deadline: Instant::now() + ttl,
             },
         );
-        token
+        Ok(token)
     }
 
-    fn renew(&mut self, session_name: &SessionName, token: u64, ttl: Duration) -> bool {
-        let Some(lease) = self.leases.get_mut(session_name) else {
+    fn renew(
+        &mut self,
+        sessions: &rmux_core::SessionStore,
+        wire_session_name: &SessionName,
+        token: u64,
+        ttl: Duration,
+    ) -> bool {
+        let Some(session_id) = self.live_session_id(sessions, wire_session_name, token) else {
             return false;
         };
-        if lease.token != token {
-            return false;
-        }
-        lease.deadline = Instant::now() + ttl;
+        let ownership = self
+            .ownerships
+            .get_mut(&session_id)
+            .expect("validated lease ownership must remain present");
+        ownership.deadline = Instant::now() + ttl;
         true
     }
 
-    fn release(&mut self, session_name: &SessionName, token: u64) -> bool {
-        if self
-            .leases
-            .get(session_name)
-            .is_none_or(|lease| lease.token != token)
-        {
+    fn release(
+        &mut self,
+        sessions: &rmux_core::SessionStore,
+        wire_session_name: &SessionName,
+        token: u64,
+    ) -> bool {
+        let Some(session_id) = self.live_session_id(sessions, wire_session_name, token) else {
             return false;
-        }
-        self.leases.remove(session_name);
+        };
+        self.ownerships.remove(&session_id);
         true
+    }
+
+    fn live_session_id(
+        &self,
+        sessions: &rmux_core::SessionStore,
+        wire_session_name: &SessionName,
+        token: u64,
+    ) -> Option<SessionId> {
+        let (session_id, ownership) = self.ownerships.iter().find(|(_, ownership)| {
+            ownership.token == token && ownership.wire_session_name == *wire_session_name
+        })?;
+        sessions
+            .session_by_id(*session_id)
+            .is_some_and(|session| session.name() == &ownership.current_session_name)
+            .then_some(*session_id)
     }
 
     fn remove_sessions(&mut self, sessions: &[(SessionName, SessionId)]) {
         for (session_name, session_id) in sessions {
             if self
-                .leases
-                .get(session_name)
-                .is_some_and(|lease| lease.session_id == *session_id)
+                .ownerships
+                .get(session_id)
+                .is_some_and(|ownership| ownership.current_session_name == *session_name)
             {
-                self.leases.remove(session_name);
+                self.ownerships.remove(session_id);
             }
         }
     }
@@ -97,36 +130,29 @@ impl SessionLeaseStore {
         new_name: SessionName,
         session_id: SessionId,
     ) -> bool {
-        if self
-            .leases
-            .get(old_name)
-            .is_none_or(|lease| lease.session_id != session_id)
-        {
+        let Some(ownership) = self.ownerships.get_mut(&session_id) else {
+            return false;
+        };
+        if ownership.current_session_name != *old_name {
             return false;
         }
-        let lease = self
-            .leases
-            .remove(old_name)
-            .expect("matching session lease must still exist");
-        self.leases.insert(new_name, lease);
+        ownership.current_session_name = new_name;
         true
     }
 
     fn expired(&mut self, now: Instant) -> Vec<(SessionName, SessionId)> {
         let mut expired = self
-            .leases
+            .ownerships
             .iter()
-            .filter(|(_, lease)| lease.deadline <= now)
-            .map(|(session_name, lease)| (session_name.clone(), lease.session_id))
+            .filter(|(_, ownership)| ownership.deadline <= now)
+            .map(|(session_id, ownership)| (ownership.current_session_name.clone(), *session_id))
             .collect::<Vec<_>>();
         expired.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
         for (session_name, session_id) in &expired {
-            if self
-                .leases
-                .get(session_name)
-                .is_some_and(|lease| lease.session_id == *session_id && lease.deadline <= now)
-            {
-                self.leases.remove(session_name);
+            if self.ownerships.get(session_id).is_some_and(|ownership| {
+                ownership.current_session_name == *session_name && ownership.deadline <= now
+            }) {
+                self.ownerships.remove(session_id);
             }
         }
         expired
@@ -196,13 +222,17 @@ impl RequestHandler {
                 error: RmuxError::SessionNotFound(request.session_name.to_string()),
             });
         };
-        self.ensure_session_lease_janitor_started();
-        let token = self
+        let token = match self
             .session_leases
             .lock()
             .expect("session lease mutex must not be poisoned")
-            .create(request.session_name, session_id, ttl);
+            .create_lease(request.session_name, session_id, ttl)
+        {
+            Ok(token) => token,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
         drop(state);
+        self.ensure_session_lease_janitor_started();
 
         Response::CreateSessionLease(CreateSessionLeaseResponse {
             token,
@@ -218,11 +248,13 @@ impl RequestHandler {
             Ok(ttl) => ttl,
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
+        let state = self.state.lock().await;
         let renewed = self
             .session_leases
             .lock()
             .expect("session lease mutex must not be poisoned")
-            .renew(&request.session_name, request.token, ttl);
+            .renew(&state.sessions, &request.session_name, request.token, ttl);
+        drop(state);
         if !renewed {
             return Response::Error(ErrorResponse {
                 error: lease_lost_error(&request.session_name),
@@ -235,11 +267,13 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ReleaseSessionLeaseRequest,
     ) -> Response {
+        let state = self.state.lock().await;
         let released = self
             .session_leases
             .lock()
             .expect("session lease mutex must not be poisoned")
-            .release(&request.session_name, request.token);
+            .release(&state.sessions, &request.session_name, request.token);
+        drop(state);
         Response::ReleaseSessionLease(ReleaseSessionLeaseResponse { released })
     }
 
@@ -339,25 +373,48 @@ fn lease_lost_error(session_name: &SessionName) -> RmuxError {
 mod tests {
     use super::*;
 
+    fn create_session(
+        sessions: &mut rmux_core::SessionStore,
+        raw_name: &str,
+    ) -> (SessionName, SessionId) {
+        let session_name = SessionName::new(raw_name).expect("valid session name");
+        sessions
+            .create_session(session_name.clone(), rmux_proto::TerminalSize::new(80, 24))
+            .expect("session creation succeeds");
+        let session_id = sessions
+            .session(&session_name)
+            .expect("created session exists")
+            .id();
+        (session_name, session_id)
+    }
+
     #[test]
     fn stale_session_cleanup_preserves_recreated_session_lease() {
         let mut leases = SessionLeaseStore::default();
-        let session_name = SessionName::new("reused").expect("valid session name");
-        let old_session_id = SessionId::new(41);
-        let new_session_id = SessionId::new(42);
+        let mut sessions = rmux_core::SessionStore::new();
+        let (session_name, old_session_id) = create_session(&mut sessions, "reused");
         let ttl = Duration::from_secs(30);
 
-        let _old_token = leases.create(session_name.clone(), old_session_id, ttl);
-        let new_token = leases.create(session_name.clone(), new_session_id, ttl);
+        let old_token = leases
+            .create_lease(session_name.clone(), old_session_id, ttl)
+            .expect("old lease token");
         leases.remove_sessions(&[(session_name.clone(), old_session_id)]);
+        sessions
+            .remove_session(&session_name)
+            .expect("old session removal succeeds");
+        let (_, new_session_id) = create_session(&mut sessions, "reused");
+        let new_token = leases
+            .create_lease(session_name.clone(), new_session_id, ttl)
+            .expect("new lease token");
 
-        assert!(leases.renew(&session_name, new_token, ttl));
+        assert!(!leases.renew(&sessions, &session_name, old_token, ttl));
+        assert!(leases.renew(&sessions, &session_name, new_token, ttl));
         assert_eq!(
             leases
-                .leases
-                .get(&session_name)
-                .map(|lease| lease.session_id),
-            Some(new_session_id)
+                .ownerships
+                .get(&new_session_id)
+                .map(|ownership| ownership.current_session_name.clone()),
+            Some(session_name)
         );
     }
 
@@ -366,7 +423,9 @@ mod tests {
         let mut leases = SessionLeaseStore::default();
         let session_name = SessionName::new("expired").expect("valid session name");
         let session_id = SessionId::new(73);
-        let _token = leases.create(session_name.clone(), session_id, Duration::from_millis(1));
+        let _token = leases
+            .create_lease(session_name.clone(), session_id, Duration::from_millis(1))
+            .expect("lease token");
 
         let expired = leases.expired(Instant::now() + Duration::from_secs(1));
 
@@ -376,30 +435,97 @@ mod tests {
     #[test]
     fn rename_moves_only_the_matching_session_lease() {
         let mut leases = SessionLeaseStore::default();
-        let old_name = SessionName::new("before").expect("valid session name");
+        let mut sessions = rmux_core::SessionStore::new();
+        let (old_name, session_id) = create_session(&mut sessions, "before");
         let new_name = SessionName::new("after").expect("valid session name");
-        let session_id = SessionId::new(81);
         let ttl = Duration::from_secs(30);
-        let token = leases.create(old_name.clone(), session_id, ttl);
+        let token = leases
+            .create_lease(old_name.clone(), session_id, ttl)
+            .expect("lease token");
 
+        sessions
+            .rename_session(&old_name, new_name.clone())
+            .expect("session rename succeeds");
         assert!(leases.rename_session(&old_name, new_name.clone(), session_id));
-        assert!(!leases.renew(&old_name, token, ttl));
-        assert!(leases.renew(&new_name, token, ttl));
+        assert!(leases.renew(&sessions, &old_name, token, ttl));
+        assert!(!leases.renew(&sessions, &new_name, token, ttl));
+        assert_eq!(
+            leases.ownerships.get(&session_id).map(|ownership| {
+                (
+                    &ownership.wire_session_name,
+                    &ownership.current_session_name,
+                )
+            }),
+            Some((&old_name, &new_name))
+        );
     }
 
     #[test]
-    fn stale_rename_preserves_a_recreated_session_lease() {
+    fn renamed_lease_token_selects_original_identity_over_new_homonym() {
         let mut leases = SessionLeaseStore::default();
-        let old_name = SessionName::new("reused").expect("valid session name");
-        let new_name = SessionName::new("renamed").expect("valid session name");
-        let old_session_id = SessionId::new(91);
-        let new_session_id = SessionId::new(92);
+        let mut sessions = rmux_core::SessionStore::new();
+        let (wire_name, original_id) = create_session(&mut sessions, "reused");
+        let renamed = SessionName::new("renamed").expect("valid session name");
         let ttl = Duration::from_secs(30);
-        let _old_token = leases.create(old_name.clone(), old_session_id, ttl);
-        let new_token = leases.create(old_name.clone(), new_session_id, ttl);
+        let original_token = leases
+            .create_lease(wire_name.clone(), original_id, ttl)
+            .expect("original lease token");
 
-        assert!(!leases.rename_session(&old_name, new_name.clone(), old_session_id));
-        assert!(leases.renew(&old_name, new_token, ttl));
-        assert!(!leases.renew(&new_name, new_token, ttl));
+        sessions
+            .rename_session(&wire_name, renamed.clone())
+            .expect("session rename succeeds");
+        assert!(leases.rename_session(&wire_name, renamed, original_id));
+        let (_, homonym_id) = create_session(&mut sessions, "reused");
+        let homonym_token = leases
+            .create_lease(wire_name.clone(), homonym_id, ttl)
+            .expect("homonym lease token");
+
+        assert!(leases.renew(&sessions, &wire_name, original_token, ttl));
+        assert!(!leases.release(&sessions, &wire_name, u64::MAX));
+        assert!(leases.release(&sessions, &wire_name, original_token));
+        assert!(leases.renew(&sessions, &wire_name, homonym_token, ttl));
+        assert!(leases.ownerships.contains_key(&homonym_id));
+        assert!(!leases.ownerships.contains_key(&original_id));
+    }
+
+    #[test]
+    fn revoked_lease_cannot_attach_to_recreated_same_name() {
+        let mut leases = SessionLeaseStore::default();
+        let mut sessions = rmux_core::SessionStore::new();
+        let (session_name, old_session_id) = create_session(&mut sessions, "recreated");
+        let ttl = Duration::from_secs(30);
+        let old_token = leases
+            .create_lease(session_name.clone(), old_session_id, ttl)
+            .expect("old lease token");
+
+        leases.remove_sessions(&[(session_name.clone(), old_session_id)]);
+        sessions
+            .remove_session(&session_name)
+            .expect("old session removal succeeds");
+        let (_, new_session_id) = create_session(&mut sessions, "recreated");
+        let new_token = leases
+            .create_lease(session_name.clone(), new_session_id, ttl)
+            .expect("new lease token");
+
+        assert!(!leases.renew(&sessions, &session_name, old_token, ttl));
+        assert!(!leases.release(&sessions, &session_name, old_token));
+        assert!(leases.renew(&sessions, &session_name, new_token, ttl));
+        assert!(leases.ownerships.contains_key(&new_session_id));
+    }
+
+    #[test]
+    fn exhausted_token_space_fails_closed_without_reusing_a_token() {
+        let mut leases = SessionLeaseStore {
+            ownerships: HashMap::new(),
+            next_token: u64::MAX,
+        };
+        let session_name = SessionName::new("exhausted").expect("valid session name");
+
+        let error = leases
+            .create_lease(session_name, SessionId::new(1), Duration::from_secs(30))
+            .expect_err("token exhaustion must reject lease creation");
+
+        assert!(error.to_string().contains("token space exhausted"));
+        assert!(leases.ownerships.is_empty());
     }
 }

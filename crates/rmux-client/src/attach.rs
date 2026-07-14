@@ -36,7 +36,7 @@ use render_drain::{drain_available_attach_stream, flush_pending_render};
 #[cfg(test)]
 use resize::terminal_size_from_fd;
 use resize::{terminal_geometry_from_fd, ResizeWatcher, SignalMaskGuard};
-use screen::{AttachScreenTracker, AttachStopDetector};
+use screen::{AttachScreenTracker, AttachStopDetector, AttachStopGeneration};
 use terminal::current_process_pid;
 pub use terminal::{AttachError, RawTerminal, Result};
 
@@ -284,6 +284,7 @@ where
         )
     });
     let output_screen_tracker = state.screen_tracker.clone();
+    let action_screen_tracker = state.screen_tracker.clone();
     let output_thread = thread::spawn(move || {
         let result = output_loop(
             state.stream,
@@ -303,6 +304,7 @@ where
         state.raw_terminal,
         &mut lock_stream,
         &locked,
+        &action_screen_tracker,
         event_rx,
     );
     locked.close();
@@ -496,7 +498,13 @@ where
                         &mut pending_render_started_at,
                     )?;
                     locked.lock();
-                    send_attach_action(&event_tx, ClientAttachAction::Lock(command))?;
+                    send_attach_action(
+                        &event_tx,
+                        ClientAttachAction::Lock {
+                            command,
+                            stop_generation: screen_tracker.current_stop_generation(),
+                        },
+                    )?;
                 }
                 AttachMessage::LockShellCommand(command) => {
                     flush_pending_render_state(
@@ -505,7 +513,13 @@ where
                         &mut pending_render_started_at,
                     )?;
                     locked.lock();
-                    send_attach_action(&event_tx, ClientAttachAction::LockShell(command))?;
+                    send_attach_action(
+                        &event_tx,
+                        ClientAttachAction::LockShell {
+                            command,
+                            stop_generation: screen_tracker.current_stop_generation(),
+                        },
+                    )?;
                 }
                 AttachMessage::Suspend => {
                     flush_pending_render_state(
@@ -514,7 +528,12 @@ where
                         &mut pending_render_started_at,
                     )?;
                     locked.lock();
-                    send_attach_action(&event_tx, ClientAttachAction::Suspend)?;
+                    send_attach_action(
+                        &event_tx,
+                        ClientAttachAction::Suspend {
+                            stop_generation: screen_tracker.current_stop_generation(),
+                        },
+                    )?;
                 }
                 AttachMessage::DetachKill => {
                     flush_pending_render_state(
@@ -696,16 +715,17 @@ fn wait_for_output_thread(
     raw_terminal: Option<&RawTerminal>,
     lock_stream: &mut UnixStream,
     locked: &Arc<AttachLockState>,
+    screen_tracker: &AttachScreenTracker,
     event_rx: mpsc::Receiver<ClientAttachEvent>,
 ) -> std::result::Result<std::result::Result<(), ClientError>, ClientError> {
     while let Ok(ClientAttachEvent::Action(action)) = event_rx.recv() {
-        handle_attach_action(raw_terminal, lock_stream, locked, action)?;
+        handle_attach_action(raw_terminal, lock_stream, locked, screen_tracker, action)?;
     }
 
     while let Ok(event) = event_rx.try_recv() {
         match event {
             ClientAttachEvent::Action(action) => {
-                handle_attach_action(raw_terminal, lock_stream, locked, action)?;
+                handle_attach_action(raw_terminal, lock_stream, locked, screen_tracker, action)?;
             }
             ClientAttachEvent::OutputDone => {}
         }
@@ -727,10 +747,14 @@ fn handle_attach_action(
     raw_terminal: Option<&RawTerminal>,
     lock_stream: &mut UnixStream,
     locked: &Arc<AttachLockState>,
+    screen_tracker: &AttachScreenTracker,
     action: ClientAttachAction,
 ) -> std::result::Result<(), ClientError> {
     match action {
-        ClientAttachAction::Lock(command) => {
+        ClientAttachAction::Lock {
+            command,
+            stop_generation,
+        } => {
             locked.wait_until_input_idle();
             let Some(raw_terminal) = raw_terminal else {
                 locked.unlock();
@@ -741,11 +765,14 @@ fn handle_attach_action(
             let result = raw_terminal
                 .run_lock_command(&command)
                 .map_err(ClientError::from)
-                .and_then(|()| write_attach_message(lock_stream, AttachMessage::Unlock));
+                .and_then(|()| write_attach_unlock(lock_stream, screen_tracker, stop_generation));
             locked.unlock();
             result
         }
-        ClientAttachAction::LockShell(command) => {
+        ClientAttachAction::LockShell {
+            command,
+            stop_generation,
+        } => {
             locked.wait_until_input_idle();
             let Some(raw_terminal) = raw_terminal else {
                 locked.unlock();
@@ -756,11 +783,11 @@ fn handle_attach_action(
             let result = raw_terminal
                 .run_lock_shell_command(&command)
                 .map_err(ClientError::from)
-                .and_then(|()| write_attach_message(lock_stream, AttachMessage::Unlock));
+                .and_then(|()| write_attach_unlock(lock_stream, screen_tracker, stop_generation));
             locked.unlock();
             result
         }
-        ClientAttachAction::Suspend => {
+        ClientAttachAction::Suspend { stop_generation } => {
             locked.wait_until_input_idle();
             let Some(raw_terminal) = raw_terminal else {
                 locked.unlock();
@@ -771,7 +798,7 @@ fn handle_attach_action(
             let result = raw_terminal
                 .suspend_self()
                 .map_err(ClientError::from)
-                .and_then(|()| write_attach_message(lock_stream, AttachMessage::Unlock));
+                .and_then(|()| write_attach_unlock(lock_stream, screen_tracker, stop_generation));
             locked.unlock();
             result
         }
@@ -831,6 +858,34 @@ fn write_attach_message(
     stream.write_all(&frame).map_err(ClientError::Io)
 }
 
+fn write_attach_unlock(
+    stream: &mut UnixStream,
+    screen_tracker: &AttachScreenTracker,
+    stop_generation: Option<AttachStopGeneration>,
+) -> std::result::Result<(), ClientError> {
+    // Rearm only the stop published by this lock/suspend prelude. A newer
+    // generation belongs to a concurrent detach or session exit and must stay
+    // authoritative even when the local action completes later.
+    let rearmed =
+        stop_generation.is_some_and(|generation| screen_tracker.rearm_if_current(generation));
+    if !rearmed && screen_tracker.was_stopped() {
+        return Ok(());
+    }
+
+    match write_attach_message(stream, AttachMessage::Unlock) {
+        Err(ClientError::Io(error))
+            if screen_tracker.was_stopped()
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 fn write_attach_data(
     stream: &mut UnixStream,
     bytes: &[u8],
@@ -863,9 +918,17 @@ fn shutdown_attach_writes(stream: &UnixStream) -> std::result::Result<(), Client
 
 #[derive(Debug)]
 enum ClientAttachAction {
-    Lock(String),
-    LockShell(AttachShellCommand),
-    Suspend,
+    Lock {
+        command: String,
+        stop_generation: Option<AttachStopGeneration>,
+    },
+    LockShell {
+        command: AttachShellCommand,
+        stop_generation: Option<AttachStopGeneration>,
+    },
+    Suspend {
+        stop_generation: Option<AttachStopGeneration>,
+    },
     DetachKill,
     DetachExec(String),
     DetachExecShell(AttachShellCommand),
