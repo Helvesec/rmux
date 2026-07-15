@@ -3,8 +3,9 @@ use std::sync::atomic::AtomicUsize;
 
 use tokio::sync::mpsc;
 
+use super::attach_control::AttachControl;
 use super::control::try_recv_attach_control;
-use super::types::{AttachControl, AttachTarget, OpenAttachTarget, OverlayFrame};
+use super::types::{AttachTarget, OpenAttachTarget, OverlayFrame};
 
 pub(super) fn discard_stale_persistent_overlays(
     attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
@@ -16,7 +17,11 @@ pub(super) fn discard_stale_persistent_overlays(
     while let Some(control) = deferred_controls.pop_front() {
         match control {
             AttachControl::Switch(next_target)
-                if is_stale_persistent_switch(Some(barrier_state_id), next_target.as_ref()) => {}
+                if next_target
+                    .with_target(|target| {
+                        is_stale_persistent_switch(Some(barrier_state_id), target)
+                    })
+                    .unwrap_or(false) => {}
             AttachControl::Overlay(overlay)
                 if overlay
                     .persistent_state_id
@@ -32,7 +37,11 @@ pub(super) fn discard_stale_persistent_overlays(
     while let Ok(control) = try_recv_attach_control(control_rx, control_backlog) {
         match control {
             AttachControl::Switch(next_target)
-                if is_stale_persistent_switch(Some(barrier_state_id), next_target.as_ref()) => {}
+                if next_target
+                    .with_target(|target| {
+                        is_stale_persistent_switch(Some(barrier_state_id), target)
+                    })
+                    .unwrap_or(false) => {}
             AttachControl::Overlay(overlay)
                 if overlay
                     .persistent_state_id

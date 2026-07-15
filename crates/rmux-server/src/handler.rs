@@ -71,6 +71,8 @@ mod shutdown_support;
 #[path = "handler/web_request_identity.rs"]
 mod web_request_identity;
 pub(crate) use shutdown_support::DetachedRequestGuard;
+#[path = "handler/sdk_wait_quota.rs"]
+mod sdk_wait_quota;
 #[path = "handler_subscriptions.rs"]
 mod subscription_support;
 #[path = "handler_switch_target.rs"]

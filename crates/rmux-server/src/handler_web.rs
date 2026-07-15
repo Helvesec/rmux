@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::attach_support::{
     attach_render_target_for_session_window, attach_target_for_session, AttachRegistration,
-    ClientFlags, ATTACH_CONTROL_BACKLOG_LIMIT,
+    ClientFlags,
 };
 use super::pane_support::resolve_pane_target_ref;
 use super::RequestHandler;
@@ -807,34 +807,25 @@ impl RequestHandler {
                 "web session attach changed sessions".to_owned(),
             ));
         }
-        if active.control_backlog.load(Ordering::Acquire) >= ATTACH_CONTROL_BACKLOG_LIMIT {
-            let _ = active.control_tx.send(AttachControl::Detach);
-            active.closing.store(true, Ordering::SeqCst);
-            active_attach.remove_attached_client(attach_pid);
-            self.bump_active_attach_epoch();
-            return Err(RmuxError::Server(
-                "web session attach is not draining updates".to_owned(),
-            ));
-        }
         active.render_generation = active.render_generation.saturating_add(1);
         active.render_refresh_pending = false;
-        active.control_backlog.fetch_add(1, Ordering::AcqRel);
-        if active
-            .control_tx
-            .send(AttachControl::switch(target))
-            .is_err()
-        {
-            let _ =
+        if let Err(error) = active.control_tx.send(AttachControl::switch(target)) {
+            if error.is_full() {
                 active
-                    .control_backlog
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                        value.checked_sub(1)
-                    });
+                    .closing
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             active_attach.remove_attached_client(attach_pid);
             self.bump_active_attach_epoch();
-            return Err(RmuxError::Server(
-                "web session attach disappeared".to_owned(),
-            ));
+            return if error.is_full() {
+                Err(RmuxError::Server(
+                    "web session attach is not draining updates".to_owned(),
+                ))
+            } else {
+                Err(RmuxError::Server(
+                    "web session attach disappeared".to_owned(),
+                ))
+            };
         }
         Ok(true)
     }

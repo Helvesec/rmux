@@ -22,7 +22,7 @@ use super::websocket::{valid_client_key, WebSocket};
 use super::{crypto, crypto::EncryptedWebSocketReader};
 use crate::handler::{RequestHandler, WebShareStream};
 use http::{read_http_request, write_response, HttpRequest};
-use pre_auth::{PreAuthGuard, PreAuthQueue};
+use pre_auth::{PreAuthAdmission, PreAuthGuard, PreAuthQueue};
 use streams::{serve_pane_loop, serve_session_loop};
 
 const PRE_AUTH_SLOTS: usize = 64;
@@ -118,7 +118,7 @@ async fn serve(
         if let Err(error) = stream.set_nodelay(true) {
             warn!(%peer_addr, ?error, "failed to enable TCP_NODELAY for web-share client");
         }
-        let Some(pre_auth_guard) = pre_auth.try_register_peer(peer_addr.ip()) else {
+        let Some(pre_auth_admission) = pre_auth.admit_peer(peer_addr.ip()).await else {
             debug!(
                 %peer_addr,
                 "web-share pre-auth capacity reached; closing pending connection"
@@ -127,10 +127,29 @@ async fn serve(
         };
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(stream, handler, pre_auth_guard).await {
+            if let Err(error) = serve_admitted_connection(stream, handler, pre_auth_admission).await
+            {
                 debug!("web-share connection ended: {error}");
             }
         });
+    }
+}
+
+async fn serve_admitted_connection(
+    stream: TcpStream,
+    handler: Arc<RequestHandler>,
+    admission: PreAuthAdmission,
+) -> io::Result<()> {
+    let (guard, cancellation) = admission.into_parts();
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            // Load shedding must not create a faster observable path than the
+            // uniform pre-ready rejection delay.
+            sleep(UNIFORM_AUTH_DELAY).await;
+            Ok(())
+        },
+        result = serve_connection(stream, handler, guard) => result,
     }
 }
 
@@ -376,6 +395,12 @@ async fn complete_pre_ready_handshake(
         reject_handshake(&mut socket, "unknown_token").await?;
         return Ok(None);
     };
+    // A registry hit proves knowledge of a non-enumerable token id. From this
+    // point onward the connection is protected from pre-auth load shedding;
+    // unknown-token and incomplete peers remain replaceable.
+    if !pre_auth_guard.protect() {
+        return Ok(None);
+    }
     if !origin_allowed {
         reject_handshake(&mut socket, "origin_not_allowed").await?;
         return Ok(None);

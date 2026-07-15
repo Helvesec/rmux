@@ -119,6 +119,7 @@ async fn move_window_session_target_exits_source_and_refreshes_destination_attac
     let AttachControl::Switch(target) = destination_refresh else {
         panic!("expected destination Switch, got {destination_refresh:?}");
     };
+    let target = target.into_target();
     assert_eq!(target.session_name, destination);
     let active_attach = handler.active_attach.lock().await;
     assert!(!active_attach.by_pid.contains_key(&source_pid));

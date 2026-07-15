@@ -517,10 +517,12 @@ async fn assert_prefix_option_chunks(
         .await;
     assert!(matches!(rebound, Response::BindKey(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
+    let control_drain =
+        spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
     let capture =
         RawPaneInputProbe::start(&handler, &alpha, label, expected_pane_input.len()).await;
     let mut pending_input = Vec::new();
@@ -535,6 +537,7 @@ async fn assert_prefix_option_chunks(
     wait_for_buffer(&handler, "printable-prefix-hit", "yes").await;
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected_pane_input).await;
+    control_drain.abort();
 }
 
 #[tokio::test]
@@ -713,10 +716,12 @@ async fn live_attach_long_prefix_chain_is_processed_iteratively() {
         .await;
     assert!(matches!(rebound, Response::BindKey(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
+    let control_drain =
+        spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
     let input = b"\x02X".repeat(LONG_PREFIX_CHAIN_REPETITIONS);
 
     tokio::time::timeout(
@@ -727,6 +732,7 @@ async fn live_attach_long_prefix_chain_is_processed_iteratively() {
     .expect("long prefix chain must finish without recursive growth")
     .expect("long prefix chain dispatch succeeds");
 
+    control_drain.abort();
     let state = handler.state.lock().await;
     assert_eq!(
         state.buffers.get("long-prefix-chain"),
@@ -762,32 +768,8 @@ async fn live_attach_prompt_cancel_chain_is_processed_iteratively() {
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
-    let control_backlog = {
-        let active_attach = handler.active_attach.lock().await;
-        active_attach
-            .by_pid
-            .get(&requester_pid)
-            .expect("attached client exists")
-            .control_backlog
-            .clone()
-    };
-    let control_drain = tokio::spawn(async move {
-        let mut control_rx = control_rx;
-        while let Some(control) = control_rx.recv().await {
-            if matches!(
-                control,
-                crate::pane_io::AttachControl::Refresh
-                    | crate::pane_io::AttachControl::Switch(_)
-                    | crate::pane_io::AttachControl::InteractiveInput
-            ) {
-                let _ = control_backlog.fetch_update(
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                    |value| value.checked_sub(1),
-                );
-            }
-        }
-    });
+    let control_drain =
+        spawn_accounted_attach_control_drain(&handler, requester_pid, control_rx).await;
     let mut input = b"\x02:\x1b".repeat(PROMPT_CANCEL_CHAIN_REPETITIONS);
     input.extend_from_slice(b"\x02X");
 

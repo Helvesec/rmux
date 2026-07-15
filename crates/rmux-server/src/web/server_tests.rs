@@ -1,6 +1,6 @@
 use super::http::{path_from_target, HttpRequest};
 use super::pre_auth::PreAuthQueue;
-use super::{is_fd_exhaustion, serve_connection, should_continue_accept_loop};
+use super::{is_fd_exhaustion, serve_admitted_connection, should_continue_accept_loop};
 use crate::handler::RequestHandler;
 use crate::web::protocol::{AUTH_FRAME_TIMEOUT, WEB_SHARE_PROTOCOL_VERSION};
 use crate::web::SecretHashForCrypto;
@@ -86,46 +86,41 @@ async fn non_get_head_methods_return_405() {
 }
 
 #[tokio::test]
-async fn pre_auth_queue_rejects_new_entries_when_full() {
-    let queue = PreAuthQueue::new(1);
-    let first = queue.try_register().expect("first pre-auth slot");
-
-    assert!(
-        queue.try_register().is_none(),
-        "full pre-auth queue rejects a new slot"
-    );
-    assert_eq!(queue.pending_count(), 1);
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    assert_eq!(queue.pending_count(), 1);
-    drop(first);
-    assert_eq!(queue.pending_count(), 0);
-}
-
-#[tokio::test]
-async fn pre_auth_full_queue_keeps_the_oldest_idle_connection() {
+async fn pre_auth_full_queue_replaces_the_oldest_idle_connection() {
     let handler = Arc::new(RequestHandler::new());
     let queue = PreAuthQueue::new(1);
     let (mut first_client, first_task) = raw_connection(Arc::clone(&handler), queue.clone()).await;
     wait_for_pending_pre_auth(&queue, 1).await;
 
-    let mut second_client = rejected_raw_connection(handler, queue).await;
-    let mut byte = [0u8; 1];
-    let read = timeout(Duration::from_secs(1), second_client.read(&mut byte))
+    let (mut second_client, second_task) = raw_peer_connection(handler, queue.clone())
         .await
-        .expect("newest connection should be closed")
-        .expect("read newest connection");
+        .expect("a new request replaces the oldest unproved connection");
+    let mut byte = [0u8; 1];
+    let read = timeout(Duration::from_secs(1), first_client.read(&mut byte))
+        .await
+        .expect("oldest connection should be cancelled")
+        .expect("read oldest connection");
     assert_eq!(read, 0);
+    first_task
+        .await
+        .expect("oldest connection task joins")
+        .expect("load-shed connection exits cleanly");
+    assert_eq!(queue.pending_count(), 1);
 
-    first_client
+    second_client
         .write_all(b"GET / HTTP/1.1\r\nHost: local\r\n\r\n")
         .await
         .expect("write request");
-    let response = read_http_response(&mut first_client).await;
+    let response = read_http_response(&mut second_client).await;
     assert!(response.starts_with("HTTP/1.1 404 Not Found"));
 
     drop(first_client);
     drop(second_client);
-    let _ = first_task.await.expect("first connection task joins");
+    second_task
+        .await
+        .expect("replacement connection task joins")
+        .expect("replacement request succeeds");
+    assert_eq!(queue.pending_count(), 0);
 }
 
 #[tokio::test]
@@ -134,32 +129,45 @@ async fn incomplete_loopback_tunnel_peers_do_not_starve_complete_requests() {
     let queue = PreAuthQueue::with_per_ip_capacity(8, 4);
     let mut idle_clients = Vec::new();
     let mut idle_tasks = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..8 {
         let (client, task) = raw_peer_connection(Arc::clone(&handler), queue.clone())
             .await
             .expect("loopback abuse connection fits within the global queue");
         idle_clients.push(client);
         idle_tasks.push(task);
     }
-    wait_for_pending_pre_auth(&queue, 4).await;
+    wait_for_pending_pre_auth(&queue, 8).await;
 
-    for viewer in 0..3 {
-        let (mut client, task) = raw_peer_connection(Arc::clone(&handler), queue.clone())
-            .await
-            .unwrap_or_else(|| panic!("tunnel viewer {viewer} was starved by idle peers"));
-        client
-            .write_all(b"GET / HTTP/1.1\r\nHost: local\r\n\r\n")
-            .await
-            .expect("write complete viewer request");
-        let response = read_http_response(&mut client).await;
-        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
-        drop(client);
-        task.await
-            .expect("complete viewer task joins")
-            .expect("complete viewer request succeeds");
-    }
-    assert_eq!(queue.pending_count(), 4);
+    let (mut viewer, viewer_task) = raw_peer_connection(Arc::clone(&handler), queue.clone())
+        .await
+        .expect("a complete tunnel viewer replaces the oldest idle peer");
+    let mut oldest = idle_clients.remove(0);
+    let mut byte = [0u8; 1];
+    let read = timeout(Duration::from_secs(1), oldest.read(&mut byte))
+        .await
+        .expect("oldest loopback peer should be cancelled")
+        .expect("read oldest loopback peer");
+    assert_eq!(read, 0);
+    idle_tasks
+        .remove(0)
+        .await
+        .expect("oldest loopback task joins")
+        .expect("oldest loopback task exits cleanly");
 
+    viewer
+        .write_all(b"GET / HTTP/1.1\r\nHost: local\r\n\r\n")
+        .await
+        .expect("write complete viewer request");
+    let response = read_http_response(&mut viewer).await;
+    assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+    drop(viewer);
+    viewer_task
+        .await
+        .expect("complete viewer task joins")
+        .expect("complete viewer request succeeds");
+    assert_eq!(queue.pending_count(), 7);
+
+    drop(oldest);
     drop(idle_clients);
     for task in idle_tasks {
         let _ = task.await.expect("idle connection task joins");
@@ -186,6 +194,13 @@ async fn auth_frame_timeout_releases_pre_auth_slot() {
     let challenge = read_server_frame(&mut stream).await;
     assert_eq!(challenge.opcode, OPCODE_TEXT);
     assert_eq!(queue.pending_count(), 1);
+    assert!(
+        queue
+            .admit_peer("127.0.0.1".parse().expect("loopback address"))
+            .await
+            .is_none(),
+        "a connection that proved a non-enumerable token is not evicted"
+    );
 
     timeout(AUTH_FRAME_TIMEOUT + Duration::from_secs(2), task)
         .await
@@ -1513,11 +1528,11 @@ async fn response_for(request: impl AsRef<[u8]>) -> String {
     let mut client = client.expect("client connects");
     let (server, _) = server.expect("server accepts");
     let pre_auth = PreAuthQueue::new(16);
-    let pre_auth_guard = pre_auth.try_register().expect("pre-auth slot");
-    let task = tokio::spawn(serve_connection(
+    let pre_auth_admission = pre_auth.try_register().expect("pre-auth slot");
+    let task = tokio::spawn(serve_admitted_connection(
         server,
         Arc::new(RequestHandler::new()),
-        pre_auth_guard,
+        pre_auth_admission,
     ));
 
     client
@@ -1854,8 +1869,12 @@ async fn raw_connection(
     let (client, server) = tokio::join!(client, server);
     let client = client.expect("client connects");
     let (server, _) = server.expect("server accepts");
-    let pre_auth_guard = pre_auth.try_register().expect("pre-auth slot");
-    let task = tokio::spawn(serve_connection(server, handler, pre_auth_guard));
+    let pre_auth_admission = pre_auth.try_register().expect("pre-auth slot");
+    let task = tokio::spawn(serve_admitted_connection(
+        server,
+        handler,
+        pre_auth_admission,
+    ));
     (client, task)
 }
 
@@ -1872,31 +1891,13 @@ async fn raw_peer_connection(
     let (client, server) = tokio::join!(client, server);
     let client = client.expect("client connects");
     let (server, peer_addr) = server.expect("server accepts");
-    let pre_auth_guard = pre_auth.try_register_peer(peer_addr.ip())?;
-    let task = tokio::spawn(serve_connection(server, handler, pre_auth_guard));
+    let pre_auth_admission = pre_auth.admit_peer(peer_addr.ip()).await?;
+    let task = tokio::spawn(serve_admitted_connection(
+        server,
+        handler,
+        pre_auth_admission,
+    ));
     Some((client, task))
-}
-
-async fn rejected_raw_connection(
-    handler: Arc<RequestHandler>,
-    pre_auth: PreAuthQueue,
-) -> TcpStream {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind test listener");
-    let addr = listener.local_addr().expect("listener addr");
-    let client = TcpStream::connect(addr);
-    let server = listener.accept();
-    let (client, server) = tokio::join!(client, server);
-    let client = client.expect("client connects");
-    let (server, _) = server.expect("server accepts");
-    assert!(
-        pre_auth.try_register().is_none(),
-        "full pre-auth queue rejects connection"
-    );
-    drop(handler);
-    drop(server);
-    client
 }
 
 async fn wait_for_pending_pre_auth(queue: &PreAuthQueue, expected: usize) {

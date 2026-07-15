@@ -2132,7 +2132,10 @@ mod tests {
         );
         assert!(matches!(
             control_rx.try_recv(),
-            Ok(AttachControl::Switch(target)) if target.session_name == beta
+            Ok(AttachControl::Switch(target))
+                if target
+                    .with_target(|target| target.session_name == beta)
+                    .unwrap_or(false)
         ));
         let state = handler.state.lock().await;
         assert_eq!(
@@ -2220,7 +2223,7 @@ mod tests {
             })
         );
         let switched_target = match switching_client_rx.try_recv() {
-            Ok(AttachControl::Switch(target)) => target,
+            Ok(AttachControl::Switch(target)) => target.into_target(),
             other => panic!("expected one switch target, got {other:?}"),
         };
         assert_eq!(

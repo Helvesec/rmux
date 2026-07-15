@@ -353,6 +353,16 @@ fn rc_package_manager_urls_use_rc_tag_but_stable_asset_version() {
 }
 
 #[test]
+fn windows_installer_uses_stable_package_names_for_rc_tags() {
+    let installer = include_str!("../scripts/install-windows.ps1");
+
+    assert!(installer.contains("$packageVersion = $semver -replace '-.*$', ''"));
+    assert!(installer.contains("$archive = \"rmux-$packageVersion-$platform.zip\""));
+    assert!(installer.contains("Join-Path $tmp \"rmux-$packageVersion-$platform\""));
+    assert!(!installer.contains("$archive = \"rmux-$semver-$platform.zip\""));
+}
+
+#[test]
 fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
     let release = include_str!("../.github/workflows/release.yml");
     let ci = include_str!("../.github/workflows/ci.yml");
@@ -396,9 +406,7 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
     assert!(release.contains("release_args+=(--prerelease)"));
     assert!(release.contains("--verify-tag"));
     assert!(release.contains("--target \"$SOURCE_GIT_SHA\""));
-    assert!(release.contains(
-        "group: release-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}"
-    ));
+    assert!(release.contains("group: rmux-release"));
     assert!(release.contains("cancel-in-progress: false"));
     let release_asset_step = release
         .split("- name: Create or update release")
@@ -457,6 +465,7 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
 #[test]
 fn release_publication_waits_for_native_and_package_validations() {
     let release = include_str!("../.github/workflows/release.yml");
+    assert!(release.contains("concurrency:\n  group: rmux-release\n  cancel-in-progress: false"));
 
     let build = release
         .split("\n  build:\n")
@@ -493,6 +502,47 @@ fn release_publication_waits_for_native_and_package_validations() {
     assert!(prepare.contains("- source-gates\n      - build\n      - platform-gates\n      - snap"));
     assert!(prepare.contains("--draft"));
     assert!(prepare.contains("gh release upload"));
+    let current_assets = prepare
+        .find("sha256sum --check --strict SHA256SUMS")
+        .expect("current release asset validation");
+    let retained_history = prepare
+        .find("scripts/retain-linux-package-history.py")
+        .expect("authenticated Linux package history import");
+    let repository_base_capture = prepare
+        .find("git -C target/package-repository-history rev-parse --verify 'HEAD^{commit}'")
+        .expect("package repository base capture");
+    let repository_generation = prepare
+        .find("- name: Generate Linux package repositories")
+        .expect("Linux repository generation");
+    assert!(current_assets < retained_history);
+    assert!(repository_base_capture < retained_history);
+    assert!(retained_history < repository_generation);
+    let retention_step = &prepare[retained_history..repository_generation];
+    assert!(retention_step.contains("target/package-repository-inputs"));
+    assert!(retention_step.contains("--staging-dir target/package-repository-inputs"));
+    assert!(!retention_step.contains("--assets-dir release-assets"));
+    for required_architecture in [
+        "--apt-architecture amd64",
+        "--apt-architecture arm64",
+        "--rpm-architecture x86_64",
+        "--rpm-architecture aarch64",
+    ] {
+        assert!(retention_step.contains(required_architecture));
+    }
+    let repository_step = &prepare[repository_generation..];
+    assert_eq!(
+        repository_step
+            .matches("--input-dir target/package-repository-inputs")
+            .count(),
+        2,
+        "both repository generators must consume isolated N/N-1 staging"
+    );
+    assert!(repository_step.contains("PACKAGE_REPOSITORY_BASE"));
+    assert!(!repository_step.contains("--input-dir release-assets"));
+    for generated_architecture in ["--architecture amd64", "--architecture arm64"] {
+        assert!(repository_step.contains(generated_architecture));
+    }
+    assert!(repository_step.contains("--rpm-signing-version \"$PACKAGE_VERSION\""));
     for public_mutation in ["--draft=false", "git push", "choco push", "action-publish"] {
         assert!(
             !prepare.contains(public_mutation),
@@ -573,6 +623,30 @@ fn release_publication_waits_for_native_and_package_validations() {
         .expect("bounded Linux repository publication job");
     assert!(linux_publish.contains("- publish"));
     assert!(linux_publish.contains("git push"));
+    let repository_validation = linux_publish
+        .find("sha256sum --check --strict SHA256SUMS")
+        .expect("downloaded repository validation");
+    let repository_base_guard = linux_publish
+        .find("scripts/verify-package-repository-base.sh")
+        .expect("package repository compare-and-swap guard");
+    let repository_replace = linux_publish
+        .find("rm -rf \"$work/debian\" \"$work/rpm\"")
+        .expect("package repository replacement");
+    let repository_stage = linux_publish
+        .find("git add _headers index.html debian rpm")
+        .expect("atomic repository staging");
+    let repository_commit = linux_publish
+        .find("git commit -m")
+        .expect("atomic repository commit");
+    let repository_push = linux_publish
+        .find("git push")
+        .expect("atomic repository push");
+    assert!(repository_validation < repository_stage);
+    assert!(repository_validation < repository_base_guard);
+    assert!(repository_base_guard < repository_replace);
+    assert!(repository_stage < repository_commit);
+    assert!(repository_commit < repository_push);
+    assert!(!linux_publish.contains("git push --force"));
 
     let snap_publish = release
         .split("\n  publish-snap:\n")
@@ -689,6 +763,19 @@ fn windows_package_reuses_the_exact_ctrl_tested_release_binaries() {
 #[test]
 fn windows_installer_transactions_complete_package_and_preserves_failed_rollback() {
     let installer = include_str!("../scripts/install-windows.ps1");
+    let lock = installer
+        .split_once("function Enter-InstallTransactionLock")
+        .map(|(_, lock)| lock)
+        .and_then(|lock| lock.split_once("function Exit-InstallTransactionLock"))
+        .map(|(lock, _)| lock)
+        .expect("bounded installer transaction-lock acquisition");
+    assert!(lock.contains("[System.IO.FileMode]::OpenOrCreate"));
+    assert!(lock.contains("[System.IO.FileShare]::None"));
+    assert!(lock.contains("[System.IO.IOException]"));
+    assert!(lock.contains("$_.Exception.HResult -band 0xFFFF"));
+    assert!(lock.contains("AddSeconds(30)"));
+    assert!(lock.contains("Start-Sleep -Milliseconds 50"));
+
     let transaction = installer
         .split_once("function Install-PackageFileSet")
         .map(|(_, transaction)| transaction)
@@ -753,6 +840,14 @@ fn windows_installer_transactions_complete_package_and_preserves_failed_rollback
     let commit = package_install
         .find("Install-PackageFileSet $installPlan $destination $Verify")
         .expect("one package transaction installs the complete plan");
+    let lock_enter = package_install
+        .find("$installLock = Enter-InstallTransactionLock $installRoot")
+        .expect("package transaction acquires the destination-scoped lock");
+    let lock_exit = package_install
+        .find("Exit-InstallTransactionLock $installLock")
+        .expect("package transaction releases the destination-scoped lock");
+    assert!(lock_enter < commit && commit < lock_exit);
+    assert!(package_install[lock_enter..lock_exit].contains("} finally {"));
     assert!(share_plan < commit && root_plan < commit);
     assert!(!package_install.contains("Copy-Tree"));
     assert!(transaction.contains("Invoke-InstallCheckpoint \"after-copy-package\""));
@@ -1006,6 +1101,13 @@ fn rpm_repository_publishes_both_package_and_repodata_key_urls() {
     fs::create_dir_all(&tools).expect("create fake tool directory");
     fs::create_dir_all(&input).expect("create RPM input directory");
     fs::write(input.join("rmux-0.9.0-1.x86_64.rpm"), b"rpm").expect("write fake RPM");
+    fs::write(input.join("rmux-0.8.0-1.x86_64.rpm"), b"historical-rpm")
+        .expect("write retained RPM");
+    fs::write(
+        input.join("rmux-0.9.0-legacy.x86_64.rpm"),
+        b"legacy-historical-rpm",
+    )
+    .expect("write legacy-named retained RPM");
 
     let createrepo = tools.join("createrepo_c");
     fs::write(
@@ -1015,8 +1117,19 @@ fn rpm_repository_publishes_both_package_and_repodata_key_urls() {
     .expect("write fake createrepo");
     make_executable(&createrepo);
     let rpmsign = tools.join("rpmsign");
-    fs::write(&rpmsign, "#!/bin/sh\nexit 0\n").expect("write fake rpmsign");
+    fs::write(
+        &rpmsign,
+        "#!/bin/sh\nset -eu\nlast=\nfor arg in \"$@\"; do last=$arg; done\nprintf '%s\\n' \"${last##*/}\" >> \"$RPM_SIGN_LOG\"\nprintf '%s' signed >> \"$last\"\n",
+    )
+    .expect("write fake rpmsign");
     make_executable(&rpmsign);
+    let rpm = tools.join("rpm");
+    fs::write(
+        &rpm,
+        "#!/bin/sh\nset -eu\nlast=\nfor arg in \"$@\"; do last=$arg; done\ncase \"${last##*/}\" in\n  rmux-0.9.0-legacy.*) printf 'rmux\\t0.8.0' ;;\n  rmux-0.9.0-*) printf 'rmux\\t0.9.0' ;;\n  rmux-0.8.0-*) printf 'rmux\\t0.8.0' ;;\n  *) exit 92 ;;\nesac\n",
+    )
+    .expect("write fake rpm query");
+    make_executable(&rpm);
     let gpg = tools.join("gpg");
     fs::write(
         &gpg,
@@ -1044,10 +1157,13 @@ fn rpm_repository_publishes_both_package_and_repodata_key_urls() {
             "https://packages.example/rpm/repodata.asc",
             "--rpm-signing-key",
             "package-key",
+            "--rpm-signing-version",
+            "0.9.0",
             "--repo-signing-key",
             "repository-key",
         ])
-        .env("PATH", path)
+        .env("RPM_SIGN_LOG", root.join("rpm-sign.log"))
+        .env("PATH", &path)
         .current_dir(repo_root())
         .output()
         .expect("run RPM repository generator");
@@ -1058,6 +1174,46 @@ fn rpm_repository_publishes_both_package_and_repodata_key_urls() {
     ));
     assert!(config.contains("gpgcheck=1"));
     assert!(config.contains("repo_gpgcheck=1"));
+    assert_eq!(
+        fs::read(output.join("rmux-0.8.0-1.x86_64.rpm")).expect("read retained RPM"),
+        b"historical-rpm",
+        "a retained package served from an immutable URL must stay byte-identical"
+    );
+    assert_eq!(
+        fs::read(output.join("rmux-0.9.0-legacy.x86_64.rpm"))
+            .expect("read legacy-named retained RPM"),
+        b"legacy-historical-rpm",
+        "signing selection must use authenticated RPM metadata, not a legacy filename"
+    );
+    assert_eq!(
+        fs::read(output.join("rmux-0.9.0-1.x86_64.rpm")).expect("read current RPM"),
+        b"rpmsigned"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("rpm-sign.log")).expect("read RPM signing log"),
+        "rmux-0.9.0-1.x86_64.rpm\n"
+    );
+
+    let rejected_output = root.join("rejected-output");
+    let rejected = Command::new(repo_root().join("scripts/generate-rpm-repository.sh"))
+        .args(["--input-dir"])
+        .arg(&input)
+        .args(["--output-dir"])
+        .arg(&rejected_output)
+        .args([
+            "--rpm-signing-key",
+            "package-key",
+            "--rpm-signing-version",
+            "0.9.1",
+        ])
+        .env("RPM_SIGN_LOG", root.join("rejected-rpm-sign.log"))
+        .env("PATH", &path)
+        .current_dir(repo_root())
+        .output()
+        .expect("run RPM repository generator without a current package");
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("no RPM metadata matched current version 0.9.1"));
+    assert!(!root.join("rejected-rpm-sign.log").exists());
     fs::remove_dir_all(root).expect("remove temp directory");
 }
 
@@ -1087,6 +1243,298 @@ fn rpm_repository_rejects_reusing_the_package_signing_key() {
     assert!(!result.status.success());
     assert!(stderr(&result).contains("signing keys must be distinct"));
     fs::remove_dir_all(root).expect("remove temp directory");
+}
+
+#[test]
+#[cfg(unix)]
+fn linux_repository_history_is_authenticated_before_retention() {
+    let root = temp_dir("linux-package-history");
+    let tools = root.join("tools");
+    let repository = root.join("repository");
+    let release_assets = root.join("release-assets");
+    let staging = root.join("staging");
+    let apt_suite = repository.join("debian/dists/stable");
+    let apt_index = apt_suite.join("main/binary-amd64/Packages");
+    let apt_pool = repository.join("debian/pool/main/r/rmux");
+    let rpm_repository = repository.join("rpm");
+    for directory in [
+        &tools,
+        &release_assets,
+        &staging,
+        &apt_pool,
+        &rpm_repository,
+    ] {
+        fs::create_dir_all(directory).expect("create package-history fixture directory");
+    }
+    fs::create_dir_all(apt_index.parent().expect("APT index parent"))
+        .expect("create APT index directory");
+
+    let older_apt_package = apt_pool.join("rmux_0.7.0_amd64.deb");
+    fs::write(&older_apt_package, b"deb-070").expect("write older Debian package");
+    let apt_package = apt_pool.join("rmux_0.8.0_amd64.deb");
+    fs::write(&apt_package, b"deb-080").expect("write predecessor Debian package");
+    let packages = concat!(
+        "Package: rmux\n",
+        "Version: 0.7.0\n",
+        "Architecture: amd64\n",
+        "Filename: pool/main/r/rmux/rmux_0.7.0_amd64.deb\n",
+        "Size: 7\n",
+        "SHA256: 755414877800f72c0580c901cfcc5d38ea19b1ba2c8997f3164e46cec0a169f7\n",
+        "\n",
+        "Package: rmux\n",
+        "Version: 0.8.0\n",
+        "Architecture: amd64\n",
+        "Filename: pool/main/r/rmux/rmux_0.8.0_amd64.deb\n",
+        "Size: 7\n",
+        "SHA256: 76366e852f2efac474a52363e451aadaed5d6cbece8ab61a67f184e670f3e93d\n",
+        "\n"
+    );
+    fs::write(&apt_index, packages).expect("write signed APT index fixture");
+    fs::write(
+        apt_suite.join("Release"),
+        concat!(
+            "Origin: RMUX\n",
+            "SHA256:\n",
+            " 6764250dd5a01cfff3e7c7a022831339f4b3b736141ef9d56ef166ba5f123d9b 358 main/binary-amd64/Packages\n"
+        ),
+    )
+    .expect("write APT Release fixture");
+    fs::write(apt_suite.join("Release.gpg"), b"signature").expect("write APT signature fixture");
+    fs::write(
+        rpm_repository.join("rmux-0.7.0-1.x86_64.rpm"),
+        b"older-signed-rpm",
+    )
+    .expect("write older RPM fixture");
+    let predecessor_rpm = rpm_repository.join("rmux-0.8.0-1.x86_64.rpm");
+    fs::write(&predecessor_rpm, b"signed-rpm").expect("write retained RPM fixture");
+    let outside_matrix_rpm = rpm_repository.join("rmux-0.8.0-1.i686.rpm");
+    fs::write(&outside_matrix_rpm, b"signed-rpm-other-architecture")
+        .expect("write RPM fixture for an architecture outside the release matrix");
+    fs::write(release_assets.join("rmux_0.9.0_amd64.deb"), b"current-deb")
+        .expect("write current Debian package");
+    fs::write(
+        release_assets.join("rmux-0.9.0-1.x86_64.rpm"),
+        b"current-rpm",
+    )
+    .expect("write current RPM package");
+    for current in ["rmux_0.9.0_amd64.deb", "rmux-0.9.0-1.x86_64.rpm"] {
+        fs::copy(release_assets.join(current), staging.join(current))
+            .expect("stage current release package");
+    }
+
+    let apt_fingerprint = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let rpm_fingerprint = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    let alternate_rpm_fingerprint = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    let rpm_subkey_fingerprint = "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+    let gpg = tools.join("gpg");
+    fs::write(
+        &gpg,
+        format!(
+            "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *\" --with-colons --fingerprint apt-key \"*)\n    printf 'pub:::::::::\\nfpr:::::::::{apt_fingerprint}:\\n'\n    ;;\n  *\" --with-colons --fingerprint rpm-key \"*)\n    printf 'pub:::::::::\\nfpr:::::::::{rpm_fingerprint}:\\nsub:::::::::\\nfpr:::::::::{rpm_subkey_fingerprint}:\\n'\n    if [ \"${{FAKE_AMBIGUOUS_RPM_SELECTOR:-0}}\" = 1 ]; then\n      printf 'pub:::::::::\\nfpr:::::::::{alternate_rpm_fingerprint}:\\n'\n    fi\n    ;;\n  *\" --status-fd 1 --verify \"*)\n    printf '[GNUPG:] VALIDSIG {apt_fingerprint} 2026 0 0 0 0 0 0 0 {apt_fingerprint}\\n'\n    ;;\n  *\" --armor --export {rpm_fingerprint} \"*) printf '%s\\n' 'PUBLIC KEY' ;;\n  *) exit 91 ;;\nesac\n"
+        ),
+    )
+    .expect("write fake gpg");
+    make_executable(&gpg);
+    let rpmkeys = tools.join("rpmkeys");
+    fs::write(
+        &rpmkeys,
+        "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *\" --import \"*) exit 0 ;;\n  *\" --checksig \"*)\n    if [ \"${FAKE_RPM_DIGEST_ONLY:-0}\" = 1 ]; then\n      printf '%s\\n' 'package.rpm: digests OK'\n    else\n      printf '%s\\n' 'package.rpm: digests signatures OK'\n    fi\n    exit 0\n    ;;\n  *) exit 92 ;;\nesac\n",
+    )
+    .expect("write fake rpmkeys");
+    make_executable(&rpmkeys);
+    let rpm = tools.join("rpm");
+    fs::write(
+        &rpm,
+        "#!/bin/sh\nset -eu\n[ \"$1\" = -qp ]\ncase \" $* \" in *0.7.0*) version=0.7.0 ;; *0.8.0*) version=0.8.0 ;; *) exit 93 ;; esac\ncase \" $* \" in *i686*) architecture=i686 ;; *) architecture=x86_64 ;; esac\nprintf 'rmux\\n%s\\n%s\\n' \"$version\" \"$architecture\"\n",
+    )
+    .expect("write fake rpm");
+    make_executable(&rpm);
+
+    let path = format!(
+        "{}:{}",
+        tools.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run_retention = |current_version: &str,
+                         apt_architecture: &str,
+                         rpm_architecture: &str,
+                         digest_only: bool,
+                         ambiguous_rpm_selector: bool| {
+        Command::new(repo_root().join("scripts/retain-linux-package-history.py"))
+            .args(["--repository-dir"])
+            .arg(&repository)
+            .args(["--staging-dir"])
+            .arg(&staging)
+            .args([
+                "--apt-signing-key",
+                "apt-key",
+                "--rpm-signing-key",
+                "rpm-key",
+                "--current-version",
+                current_version,
+                "--apt-architecture",
+                apt_architecture,
+                "--rpm-architecture",
+                rpm_architecture,
+            ])
+            .env("FAKE_RPM_DIGEST_ONLY", if digest_only { "1" } else { "0" })
+            .env(
+                "FAKE_AMBIGUOUS_RPM_SELECTOR",
+                if ambiguous_rpm_selector { "1" } else { "0" },
+            )
+            .env("PATH", &path)
+            .current_dir(repo_root())
+            .output()
+            .expect("run package-history retention")
+    };
+
+    let accepted = run_retention("0.9.0", "amd64", "x86_64", false, false);
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+    for retained in [
+        "rmux_0.8.0_amd64.deb",
+        "rmux-0.8.0-1.x86_64.rpm",
+        "rmux_0.9.0_amd64.deb",
+        "rmux-0.9.0-1.x86_64.rpm",
+    ] {
+        assert!(staging.join(retained).is_file(), "missing {retained}");
+    }
+    for pruned in [
+        "rmux_0.7.0_amd64.deb",
+        "rmux-0.7.0-1.x86_64.rpm",
+        "rmux-0.8.0-1.i686.rpm",
+    ] {
+        assert!(
+            !staging.join(pruned).exists(),
+            "N-2 package was retained: {pruned}"
+        );
+    }
+    assert_eq!(
+        fs::read(release_assets.join("rmux_0.9.0_amd64.deb"))
+            .expect("read current Debian release asset"),
+        b"current-deb"
+    );
+    assert_eq!(
+        fs::read(release_assets.join("rmux-0.9.0-1.x86_64.rpm"))
+            .expect("read current RPM release asset"),
+        b"current-rpm"
+    );
+    assert_eq!(
+        fs::read_dir(&release_assets)
+            .expect("read release assets")
+            .count(),
+        2,
+        "retention must not add N-1 to canonical release assets"
+    );
+
+    let rejected_rc = run_retention("0.9.0-rc.1", "amd64", "x86_64", false, false);
+    assert!(!rejected_rc.status.success());
+    assert!(stderr(&rejected_rc).contains("stable MAJOR.MINOR.PATCH"));
+
+    let rejected_missing_arch = run_retention("0.9.0", "arm64", "x86_64", false, false);
+    assert!(!rejected_missing_arch.status.success());
+    assert!(stderr(&rejected_missing_arch).contains("lacks architecture(s): arm64"));
+
+    let rejected_digest_only = run_retention("0.9.0", "amd64", "x86_64", true, false);
+    assert!(!rejected_digest_only.status.success());
+    assert!(stderr(&rejected_digest_only).contains("not authenticated by the configured key"));
+
+    let rejected_ambiguous_selector = run_retention("0.9.0", "amd64", "x86_64", false, true);
+    assert!(!rejected_ambiguous_selector.status.success());
+    assert!(stderr(&rejected_ambiguous_selector)
+        .contains("RPM signing key selector must resolve to exactly one primary key"));
+
+    fs::write(staging.join("rmux_0.8.0_amd64.deb"), b"different")
+        .expect("replace retained package with divergent bytes");
+    let rejected_collision = run_retention("0.9.0", "amd64", "x86_64", false, false);
+    assert!(!rejected_collision.status.success());
+    assert!(stderr(&rejected_collision).contains("collides with different release asset"));
+    fs::copy(&apt_package, staging.join("rmux_0.8.0_amd64.deb"))
+        .expect("restore retained package in staging");
+
+    fs::remove_file(&predecessor_rpm).expect("remove RPM predecessor");
+    fs::remove_file(&outside_matrix_rpm).expect("remove outside-matrix RPM predecessor");
+    let rejected_divergence = run_retention("0.9.0", "amd64", "x86_64", false, false);
+    assert!(!rejected_divergence.status.success());
+    assert!(stderr(&rejected_divergence).contains("disagree on the latest stable predecessor"));
+    fs::write(&predecessor_rpm, b"signed-rpm").expect("restore RPM predecessor");
+    fs::write(&outside_matrix_rpm, b"signed-rpm-other-architecture")
+        .expect("restore outside-matrix RPM predecessor");
+
+    let rejected_downgrade = run_retention("0.7.0", "amd64", "x86_64", false, false);
+    assert!(!rejected_downgrade.status.success());
+    assert!(stderr(&rejected_downgrade).contains("refusing to replace newer APT release"));
+
+    fs::remove_file(staging.join("rmux_0.8.0_amd64.deb"))
+        .expect("remove accepted retained package");
+    fs::write(&apt_package, b"tampered").expect("tamper retained Debian package");
+    let rejected = run_retention("0.9.0", "amd64", "x86_64", false, false);
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("signed index checksum"));
+    assert!(!staging.join("rmux_0.8.0_amd64.deb").exists());
+
+    fs::remove_dir_all(root).expect("remove package-history fixture");
+}
+
+#[test]
+#[cfg(unix)]
+fn package_repository_base_guard_rejects_a_stale_snapshot() {
+    let root = temp_dir("package-repository-base");
+    let repository = root.join("repository");
+    fs::create_dir_all(&repository).expect("create package repository fixture");
+
+    let git = |arguments: &[&str]| {
+        Command::new("git")
+            .args(arguments)
+            .current_dir(&repository)
+            .output()
+            .expect("run git for package repository fixture")
+    };
+    for arguments in [
+        &["init", "-q"][..],
+        &["config", "user.name", "RMUX Release Test"][..],
+        &["config", "user.email", "release-test@example.invalid"][..],
+    ] {
+        let result = git(arguments);
+        assert!(result.status.success(), "{}", stderr(&result));
+    }
+
+    fs::write(repository.join("state"), b"first").expect("write first repository state");
+    for arguments in [&["add", "state"][..], &["commit", "-q", "-m", "first"][..]] {
+        let result = git(arguments);
+        assert!(result.status.success(), "{}", stderr(&result));
+    }
+    let first_head = stdout(&git(&["rev-parse", "HEAD"])).trim().to_owned();
+
+    fs::write(repository.join("state"), b"second").expect("write advanced repository state");
+    let result = git(&["commit", "-q", "-am", "second"]);
+    assert!(result.status.success(), "{}", stderr(&result));
+    let second_head = stdout(&git(&["rev-parse", "HEAD"])).trim().to_owned();
+    assert_ne!(first_head, second_head);
+
+    let repository_arg = repository.to_string_lossy().into_owned();
+    let rejected = run(
+        "scripts/verify-package-repository-base.sh",
+        &[&repository_arg, &first_head],
+    );
+    assert!(!rejected.status.success());
+    assert!(stderr(&rejected).contains("advanced after release preparation"));
+    assert_eq!(
+        stdout(&git(&["rev-parse", "HEAD"])).trim(),
+        second_head,
+        "a failed compare-and-swap guard must not mutate the repository"
+    );
+    assert_eq!(
+        fs::read(repository.join("state")).expect("read advanced repository state"),
+        b"second"
+    );
+
+    let accepted = run(
+        "scripts/verify-package-repository-base.sh",
+        &[&repository_arg, &second_head],
+    );
+    assert!(accepted.status.success(), "{}", stderr(&accepted));
+
+    fs::remove_dir_all(root).expect("remove package repository fixture");
 }
 
 #[cfg(unix)]

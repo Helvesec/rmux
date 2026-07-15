@@ -28,6 +28,8 @@ pub struct ChildCommand {
     pub(crate) clear_env: bool,
     pub(crate) current_dir: Option<PathBuf>,
     pub(crate) size: Option<TerminalSize>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) allow_explicit_job_breakaway: bool,
 }
 
 impl ChildCommand {
@@ -43,6 +45,7 @@ impl ChildCommand {
             clear_env: false,
             current_dir: None,
             size: None,
+            allow_explicit_job_breakaway: false,
         }
     }
 
@@ -107,6 +110,16 @@ impl ChildCommand {
     #[must_use]
     pub fn size(mut self, size: TerminalSize) -> Self {
         self.size = Some(size);
+        self
+    }
+
+    /// Allows Windows descendants that explicitly request job breakaway to
+    /// outlive this PTY child while ordinary descendants remain job-scoped.
+    ///
+    /// This is a no-op on non-Windows platforms.
+    #[must_use]
+    pub fn allow_explicit_job_breakaway(mut self) -> Self {
+        self.allow_explicit_job_breakaway = true;
         self
     }
 

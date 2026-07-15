@@ -664,6 +664,7 @@ pub(crate) fn spawn_pane_process(
     validate_process_command(command)?;
     let mut command = spawn_command(profile, command)
         .size(size)
+        .allow_explicit_job_breakaway()
         .clear_env()
         .current_dir(profile.cwd());
 

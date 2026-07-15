@@ -506,6 +506,7 @@ async fn session_identity_refresh_keeps_the_underlying_menu_hidden_by_a_prompt()
     while let Ok(control) = control_rx.try_recv() {
         match control {
             AttachControl::Switch(target) => {
+                let target = target.into_target();
                 let rendered = String::from_utf8_lossy(&target.render_frame);
                 saw_prompt |= rendered.contains("Prompt");
             }

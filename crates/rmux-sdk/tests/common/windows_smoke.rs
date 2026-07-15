@@ -53,6 +53,29 @@ impl Harness {
         })
     }
 
+    pub async fn start_via_cmd(label: &str, session_name: &SessionName) -> TestResult<Self> {
+        let pipe_name = unique_pipe_name(label)?;
+        let daemon_binary = rmux_binary()?.to_path_buf();
+        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let rmux = builder(&pipe_name).build();
+        let run = rmux
+            .cmd(["new-session", "-d", "-s", session_name.as_str()])
+            .await?;
+        if run.exit != Some(0) {
+            return Err(format!(
+                "cold-start command exited {:?}: {}",
+                run.exit,
+                String::from_utf8_lossy(&run.stderr)
+            )
+            .into());
+        }
+        Ok(Self {
+            pipe_name,
+            rmux: Some(rmux),
+            armed: true,
+        })
+    }
+
     pub async fn start_with_default_config_environment(
         label: &str,
         appdata: &Path,

@@ -23,12 +23,6 @@ where
     match seq.next_element::<T>() {
         Ok(Some(value)) => Ok(value),
         Ok(None) => Ok(T::default()),
-        Err(error) if is_truncated_compat_sequence(&error) => Ok(T::default()),
         Err(error) => Err(error),
     }
-}
-
-fn is_truncated_compat_sequence(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("UnexpectedEof") || message.contains("unexpected end of file")
 }

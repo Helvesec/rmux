@@ -7,6 +7,7 @@ fn respawn_refresh_target(
     let AttachControl::Switch(target) = control else {
         panic!("expected linked alias switch refresh, got {control:?}");
     };
+    let target = target.into_target();
     assert_eq!(&target.session_name, expected_session);
     *target
 }

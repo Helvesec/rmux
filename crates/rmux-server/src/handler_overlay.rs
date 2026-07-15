@@ -44,6 +44,8 @@ use menu::MenuOverlayItem;
 #[path = "handler_overlay/mouse.rs"]
 mod mouse;
 use mouse::is_mouse_prefix;
+#[path = "handler_overlay/popup_io.rs"]
+mod popup_io;
 #[path = "handler_overlay/popup_job.rs"]
 mod popup_job;
 #[path = "handler_overlay/scrollable.rs"]

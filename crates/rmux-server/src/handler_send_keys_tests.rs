@@ -96,6 +96,30 @@ async fn create_send_keys_test_session(
     assert!(matches!(created, Response::NewSession(_)));
 }
 
+async fn spawn_accounted_attach_control_drain(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    mut control_rx: mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+) -> tokio::task::JoinHandle<()> {
+    let control_backlog = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached client exists")
+            .control_backlog
+            .clone()
+    };
+    tokio::spawn(async move {
+        while let Some(control) = control_rx.recv().await {
+            crate::pane_io::release_attach_control_backlog(
+                &control_backlog,
+                control.received_backlog_units(),
+            );
+        }
+    })
+}
+
 // A pane command that stays alive but emits nothing to the transcript, so a
 // test that asserts on rendered content is not racing the real login shell's
 // prompt (cmd.exe prints `C:\Users\...`, bash prints `PS1`) into the same

@@ -325,7 +325,7 @@ async fn no_detached_uses_one_destroy_snapshot_for_control_and_attach() {
     assert_control_switched_to(&drain_control_events(&mut control_events), &gamma);
     let attach_target = std::iter::from_fn(|| attach_events.try_recv().ok()).find_map(|event| {
         if let AttachControl::Switch(target) = event {
-            Some(target)
+            Some(target.into_target())
         } else {
             None
         }

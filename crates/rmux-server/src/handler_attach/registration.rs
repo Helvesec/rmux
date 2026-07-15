@@ -1,7 +1,6 @@
 use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-#[cfg(test)]
 use std::sync::Arc;
 
 use rmux_core::LifecycleEvent;
@@ -14,7 +13,7 @@ use crate::handler::RequestHandler;
 use crate::mouse::ClientMouseState;
 #[cfg(test)]
 use crate::outer_terminal::OuterTerminalContext;
-use crate::pane_io::AttachControl;
+use crate::pane_io::{AttachControl, AttachControlSender};
 #[cfg(test)]
 use crate::server_access::current_owner_uid;
 
@@ -134,6 +133,13 @@ impl RequestHandler {
         active_attach.next_id += 1;
         let size_sequence = active_attach.next_size_sequence;
         active_attach.next_size_sequence = active_attach.next_size_sequence.saturating_add(1);
+        let control_backlog = registration.control_backlog;
+        let control_tx = AttachControlSender::new(
+            registration.control_tx,
+            Arc::clone(&control_backlog),
+            super::ATTACH_CONTROL_BACKLOG_LIMIT,
+            Arc::clone(&registration.closing),
+        );
         if let Some(mut previous) = active_attach.by_pid.insert(
             requester_pid,
             ActiveAttach {
@@ -146,8 +152,8 @@ impl RequestHandler {
                 pan_window: None,
                 pan_ox: 0,
                 pan_oy: 0,
-                control_tx: registration.control_tx,
-                control_backlog: registration.control_backlog,
+                control_tx,
+                control_backlog,
                 render_stream: registration.render_stream,
                 render_refresh_pending: false,
                 uid: registration.uid,

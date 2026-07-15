@@ -1,12 +1,13 @@
 use std::collections::VecDeque;
 use std::future::pending;
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 use rmux_core::{events::OutputCursorItem, TerminalPassthrough};
 use rmux_proto::AttachMessage;
 use tokio::sync::mpsc;
 
+use super::attach_control::{release_attach_control_backlog, AttachControl, QueuedAttachTarget};
 use super::attach_transport::AttachTransport;
 use super::exit_log::AttachExitReason;
 use super::passthrough::render_passthroughs;
@@ -18,7 +19,7 @@ use super::persistent_overlay::{
     switch_requires_screen_clear, take_pending_persistent_overlay_for_state,
     update_persistent_overlay_cache,
 };
-use super::types::{AttachControl, AttachTarget, OpenAttachTarget, OverlayFrame};
+use super::types::{AttachTarget, OpenAttachTarget, OverlayFrame};
 use super::wire::{
     emit_attach_bytes, emit_attach_message, emit_attach_stop, emit_detached_attach_stop,
     emit_render_frame, open_attach_target,
@@ -106,7 +107,7 @@ pub(super) async fn recv_attach_control(
         Some(control_rx) => {
             let control = control_rx.recv().await;
             if let Some(control) = control.as_ref() {
-                decrement_control_backlog_by(control_backlog, control.received_backlog_units());
+                release_attach_control_backlog(control_backlog, control.received_backlog_units());
             }
             control
         }
@@ -114,31 +115,22 @@ pub(super) async fn recv_attach_control(
     }
 }
 
-fn decrement_control_backlog_by(control_backlog: &AtomicUsize, units: usize) {
-    if units == 0 {
-        return;
-    }
-    let _ = control_backlog.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-        value.checked_sub(units)
-    });
-}
-
 pub(super) fn try_recv_attach_control(
     control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
     control_backlog: &AtomicUsize,
 ) -> Result<AttachControl, mpsc::error::TryRecvError> {
     let control = control_rx.try_recv()?;
-    decrement_control_backlog_by(control_backlog, control.received_backlog_units());
+    release_attach_control_backlog(control_backlog, control.received_backlog_units());
     Ok(control)
 }
 
 pub(super) fn coalesce_render_switches(
-    mut target: Box<AttachTarget>,
+    target: QueuedAttachTarget,
     deferred_controls: &mut VecDeque<AttachControl>,
     mut control_rx: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
     control_backlog: &AtomicUsize,
 ) -> (Box<AttachTarget>, u64) {
-    let mut switch_count = 1_u64;
+    let (mut target, mut switch_count) = target.into_target_with_count();
     if !target.is_coalescible_render_refresh() {
         return (target, switch_count);
     }
@@ -150,8 +142,9 @@ pub(super) fn coalesce_render_switches(
         let Some(AttachControl::Switch(next_target)) = deferred_controls.pop_front() else {
             unreachable!("front was checked as a coalescible switch");
         };
+        let (next_target, next_switch_count) = next_target.into_target_with_count();
         target = next_target;
-        switch_count = switch_count.saturating_add(1);
+        switch_count = switch_count.saturating_add(next_switch_count);
     }
 
     let Some(control_rx) = control_rx.as_mut() else {
@@ -162,8 +155,9 @@ pub(super) fn coalesce_render_switches(
             Ok(AttachControl::Switch(next_target))
                 if next_target.is_coalescible_render_refresh() =>
             {
+                let (next_target, next_switch_count) = next_target.into_target_with_count();
                 target = next_target;
-                switch_count = switch_count.saturating_add(1);
+                switch_count = switch_count.saturating_add(next_switch_count);
             }
             Ok(control) => {
                 deferred_controls.push_back(control);

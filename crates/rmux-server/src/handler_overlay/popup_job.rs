@@ -14,19 +14,16 @@ use rmux_pty::Signal;
 use rmux_pty::{PtyChild, PtyIo, TerminalSize as PtyTerminalSize};
 #[cfg(unix)]
 use tokio::io::unix::AsyncFd;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 use crate::terminal::{parse_environment_assignments, TerminalProfile};
 
 use super::super::{attach_support::ActiveAttachIdentity, RequestHandler};
-
-#[cfg(not(test))]
-// Leave room for a large paste on a loaded ConPTY while still bounding a
-// permanently blocked synchronous WriteFile.
-const POPUP_IO_RECEIPT_TIMEOUT: Duration = Duration::from_secs(8);
+pub(super) use super::popup_io::PopupIoReceipt;
 #[cfg(test)]
-const POPUP_IO_RECEIPT_TIMEOUT: Duration = Duration::from_millis(100);
+use super::popup_io::POPUP_IO_QUEUE_CAPACITY;
+use super::popup_io::{PopupIoOperation, PopupIoQueue};
+
 #[cfg(all(unix, not(test)))]
 const POPUP_TERMINATE_GRACE: Duration = Duration::from_millis(250);
 #[cfg(all(unix, test))]
@@ -85,9 +82,7 @@ impl PopupSurface {
 }
 
 #[derive(Debug, Clone)]
-pub(in super::super) struct PopupJob {
-    reader: Arc<PtyIo>,
-    io_queue: PopupIoQueue,
+struct PopupProcessControl {
     child: Arc<StdMutex<Option<PtyChild>>>,
     #[cfg(unix)]
     terminating: Arc<AtomicBool>,
@@ -95,17 +90,8 @@ pub(in super::super) struct PopupJob {
     close_child: Arc<StdMutex<Option<PtyChild>>>,
 }
 
-impl PopupJob {
-    pub(super) fn enqueue_write(&self, bytes: &[u8]) -> io::Result<PopupIoReceipt> {
-        self.io_queue
-            .enqueue(PopupIoOperation::Write(bytes.to_vec()))
-    }
-
-    pub(super) fn enqueue_resize(&self, size: TerminalSize) -> io::Result<PopupIoReceipt> {
-        self.io_queue.enqueue(PopupIoOperation::Resize(size))
-    }
-
-    pub(in super::super) fn terminate(&self) {
+impl PopupProcessControl {
+    fn terminate(&self) {
         #[cfg(unix)]
         {
             let child_guard = self.child.lock().expect("popup child");
@@ -147,7 +133,7 @@ impl PopupJob {
     }
 
     #[cfg(test)]
-    pub(in crate::handler) fn child_is_running_for_test(&self) -> bool {
+    fn child_is_running(&self) -> bool {
         #[cfg(unix)]
         if self.terminating.load(Ordering::Acquire) {
             return true;
@@ -158,23 +144,65 @@ impl PopupJob {
             .as_mut()
             .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
     }
+}
+
+#[derive(Debug)]
+struct PopupProcessLifetime {
+    control: PopupProcessControl,
+}
+
+impl Drop for PopupProcessLifetime {
+    fn drop(&mut self) {
+        self.control.terminate();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(in super::super) struct PopupJob {
+    reader: Arc<PtyIo>,
+    io_queue: PopupIoQueue,
+    process: Arc<PopupProcessLifetime>,
+}
+
+impl PopupJob {
+    pub(super) fn enqueue_write(&self, bytes: &[u8]) -> io::Result<PopupIoReceipt> {
+        self.io_queue
+            .enqueue(PopupIoOperation::Write(bytes.to_vec()))
+    }
+
+    pub(super) fn enqueue_resize(&self, size: TerminalSize) -> io::Result<PopupIoReceipt> {
+        self.io_queue.enqueue(PopupIoOperation::Resize(size))
+    }
+
+    pub(in super::super) fn terminate(&self) {
+        // Cancelling the queue drains every pending receipt before terminating
+        // the child. The platform teardown then interrupts the one synchronous
+        // PTY call that may already be running on a blocking worker.
+        self.io_queue.cancel();
+    }
+
+    #[cfg(test)]
+    pub(in crate::handler) fn child_is_running_for_test(&self) -> bool {
+        self.process.control.child_is_running()
+    }
 
     #[cfg(test)]
     pub(in crate::handler) fn with_test_writer<F>(&self, writer: F) -> Self
     where
         F: Fn(Vec<u8>) -> io::Result<()> + Send + Sync + 'static,
     {
+        let process = Arc::clone(&self.process);
+        let cancellation_process = process.control.clone();
         Self {
             reader: Arc::clone(&self.reader),
-            io_queue: PopupIoQueue::spawn(move |operation| match operation {
-                PopupIoOperation::Write(bytes) => writer(bytes),
-                PopupIoOperation::Resize(_) => Ok(()),
-            }),
-            child: Arc::clone(&self.child),
-            #[cfg(unix)]
-            terminating: Arc::clone(&self.terminating),
-            #[cfg(windows)]
-            close_child: Arc::clone(&self.close_child),
+            io_queue: PopupIoQueue::spawn_with_cancel(
+                move |operation| match operation {
+                    PopupIoOperation::Write(bytes) => writer(bytes),
+                    PopupIoOperation::Resize(_) => Ok(()),
+                },
+                move || cancellation_process.terminate(),
+            ),
+            process,
         }
     }
 
@@ -183,17 +211,18 @@ impl PopupJob {
     where
         F: Fn(TerminalSize) -> io::Result<()> + Send + Sync + 'static,
     {
+        let process = Arc::clone(&self.process);
+        let cancellation_process = process.control.clone();
         Self {
             reader: Arc::clone(&self.reader),
-            io_queue: PopupIoQueue::spawn(move |operation| match operation {
-                PopupIoOperation::Write(_) => Ok(()),
-                PopupIoOperation::Resize(size) => resize(size),
-            }),
-            child: Arc::clone(&self.child),
-            #[cfg(unix)]
-            terminating: Arc::clone(&self.terminating),
-            #[cfg(windows)]
-            close_child: Arc::clone(&self.close_child),
+            io_queue: PopupIoQueue::spawn_with_cancel(
+                move |operation| match operation {
+                    PopupIoOperation::Write(_) => Ok(()),
+                    PopupIoOperation::Resize(size) => resize(size),
+                },
+                move || cancellation_process.terminate(),
+            ),
+            process,
         }
     }
 }
@@ -222,93 +251,6 @@ fn signal_popup_process_group(child: Option<&PtyChild>, signal: Signal) {
 fn signal_popup_child(child: &Arc<StdMutex<Option<PtyChild>>>, signal: Signal) {
     let child_guard = child.lock().expect("popup child");
     signal_popup_process_group(child_guard.as_ref(), signal);
-}
-
-#[derive(Debug)]
-enum PopupIoOperation {
-    Write(Vec<u8>),
-    Resize(TerminalSize),
-}
-
-#[derive(Debug)]
-struct PopupIoRequest {
-    operation: PopupIoOperation,
-    result_tx: oneshot::Sender<io::Result<()>>,
-}
-
-#[derive(Debug)]
-pub(super) struct PopupIoReceipt {
-    result_rx: oneshot::Receiver<io::Result<()>>,
-}
-
-impl PopupIoReceipt {
-    pub(super) async fn wait(self) -> io::Result<()> {
-        match timeout(POPUP_IO_RECEIPT_TIMEOUT, self.result_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "popup I/O worker stopped before replying",
-            )),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "popup I/O worker did not reply before the deadline",
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PopupIoQueue {
-    request_tx: mpsc::UnboundedSender<PopupIoRequest>,
-}
-
-impl PopupIoQueue {
-    fn for_writer(writer: PtyIo) -> Self {
-        let writer = Arc::new(writer);
-        Self::spawn(move |operation| match operation {
-            PopupIoOperation::Write(bytes) => writer.write_all(&bytes),
-            PopupIoOperation::Resize(size) => writer
-                .resize(PtyTerminalSize::new(size.cols.max(1), size.rows.max(1)))
-                .map_err(io::Error::other),
-        })
-    }
-
-    fn spawn<F>(execute: F) -> Self
-    where
-        F: Fn(PopupIoOperation) -> io::Result<()> + Send + Sync + 'static,
-    {
-        // Enqueue runs while active-attach state is linearized, so it must not
-        // await capacity or block that mutex. Production callers immediately
-        // await their receipt after unlocking; the backlog is therefore
-        // bounded by concurrent ingress paths, not by input byte rate.
-        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<PopupIoRequest>();
-        let execute = Arc::new(execute);
-        tokio::spawn(async move {
-            while let Some(request) = request_rx.recv().await {
-                let execute = Arc::clone(&execute);
-                let result = tokio::task::spawn_blocking(move || (execute)(request.operation))
-                    .await
-                    .unwrap_or_else(|error| {
-                        Err(io::Error::other(format!(
-                            "popup I/O worker failed: {error}"
-                        )))
-                    });
-                let _ = request.result_tx.send(result);
-            }
-        });
-        Self { request_tx }
-    }
-
-    fn enqueue(&self, operation: PopupIoOperation) -> io::Result<PopupIoReceipt> {
-        let (result_tx, result_rx) = oneshot::channel();
-        self.request_tx
-            .send(PopupIoRequest {
-                operation,
-                result_tx,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "popup I/O worker stopped"))?;
-        Ok(PopupIoReceipt { result_rx })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,16 +301,32 @@ pub(super) fn spawn_popup_job(
     // synchronous ConPTY and Unix readiness waits never occupy a Tokio runtime
     // thread. The reader endpoint is cloned before the worker can accept input,
     // so setup never waits behind a blocked write.
-    let io_queue = PopupIoQueue::for_writer(writer_fd);
+    let process_control = PopupProcessControl {
+        child: Arc::new(StdMutex::new(Some(child))),
+        #[cfg(unix)]
+        terminating: Arc::new(AtomicBool::new(false)),
+        #[cfg(windows)]
+        close_child: Arc::new(StdMutex::new(Some(close_child))),
+    };
+    let writer = Arc::new(writer_fd);
+    let cancellation_process = process_control.clone();
+    let io_queue = PopupIoQueue::spawn_with_cancel(
+        move |operation| match operation {
+            PopupIoOperation::Write(bytes) => writer.write_all(&bytes),
+            PopupIoOperation::Resize(size) => writer
+                .resize(PtyTerminalSize::new(size.cols.max(1), size.rows.max(1)))
+                .map_err(io::Error::other),
+        },
+        move || cancellation_process.terminate(),
+    );
+    let process = Arc::new(PopupProcessLifetime {
+        control: process_control,
+    });
     Ok((
         PopupJob {
             reader: Arc::new(reader),
             io_queue,
-            child: Arc::new(StdMutex::new(Some(child))),
-            #[cfg(unix)]
-            terminating: Arc::new(AtomicBool::new(false)),
-            #[cfg(windows)]
-            close_child: Arc::new(StdMutex::new(Some(close_child))),
+            process,
         },
         Vec::new(),
     ))
@@ -395,13 +353,18 @@ impl RequestHandler {
         popup_id: u64,
         job: PopupJob,
     ) {
+        // The overlay owns the PopupJob lifetime. The waiter keeps only the
+        // process handles it needs, so dropping an overlay without an explicit
+        // teardown still terminates the process and stops the I/O queue.
+        let process = job.process.control.clone();
+        drop(job);
         let handler = self.clone();
         tokio::spawn(async move {
             loop {
                 let status = {
-                    let mut child_guard = job.child.lock().expect("popup child");
+                    let mut child_guard = process.child.lock().expect("popup child");
                     #[cfg(unix)]
-                    if job.terminating.load(Ordering::Acquire) {
+                    if process.terminating.load(Ordering::Acquire) {
                         drop(child_guard);
                         sleep(Duration::from_millis(50)).await;
                         continue;
@@ -414,8 +377,11 @@ impl RequestHandler {
                             #[cfg(windows)]
                             {
                                 let child = child_guard.take();
-                                let close_child =
-                                    job.close_child.lock().expect("popup close child").take();
+                                let close_child = process
+                                    .close_child
+                                    .lock()
+                                    .expect("popup close child")
+                                    .take();
                                 spawn_popup_windows_teardown(child, close_child);
                             }
                             #[cfg(unix)]

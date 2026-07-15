@@ -16,7 +16,7 @@ use crate::client_flags::ClientFlags;
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
 use crate::mouse::ClientMouseState;
 use crate::outer_terminal::OuterTerminalContext;
-use crate::pane_io::AttachControl;
+use crate::pane_io::{AttachControl, AttachControlSender};
 
 #[derive(Debug, Default)]
 pub(in crate::handler) struct ActiveAttachState {
@@ -38,7 +38,7 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) pan_window: Option<u32>,
     pub(in crate::handler) pan_ox: u32,
     pub(in crate::handler) pan_oy: u32,
-    pub(in crate::handler) control_tx: mpsc::UnboundedSender<AttachControl>,
+    pub(in crate::handler) control_tx: AttachControlSender,
     pub(in crate::handler) control_backlog: Arc<AtomicUsize>,
     pub(in crate::handler) render_stream: bool,
     pub(in crate::handler) render_refresh_pending: bool,

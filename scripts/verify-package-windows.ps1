@@ -454,6 +454,104 @@ function AssertArchiveInstallerTransaction([string]$InstallScript, [string]$Pack
             Fail "install.ps1 did not commit the complete valid package"
         }
 
+        # Hold the destination lock from this process, then prove that a real
+        # installer process reaches lock contention before mutating any package
+        # file and completes only after the lock is released.
+        $concurrentRoot = Join-Path $Root "concurrent-rmux"
+        $concurrentBin = Join-Path $concurrentRoot "bin"
+        $concurrentLockPath = Join-Path $concurrentRoot ".rmux-install.lock"
+        $concurrentWaitEventName = "Local\rmux-installer-test-$PID-$([guid]::NewGuid().ToString('N'))"
+        $concurrentWaitEvent = [System.Threading.EventWaitHandle]::new(
+            $false,
+            [System.Threading.EventResetMode]::ManualReset,
+            $concurrentWaitEventName
+        )
+        New-Item -ItemType Directory -Force -Path $concurrentRoot | Out-Null
+        $heldInstallLock = [System.IO.File]::Open(
+            $concurrentLockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $concurrentInstaller = $null
+        $concurrentFailure = $null
+        try {
+            $previousWaitEvent = $env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT
+            try {
+                $env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT = $concurrentWaitEventName
+                $concurrentInstaller = Start-Process `
+                    -FilePath $powerShell `
+                    -ArgumentList @(
+                        "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", "`"$InstallScript`"",
+                        "-InstallDir", "`"$concurrentBin`"",
+                        "-NoVerify"
+                    ) `
+                    -PassThru
+            } finally {
+                if ($null -eq $previousWaitEvent) {
+                    Remove-Item Env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT -ErrorAction SilentlyContinue
+                } else {
+                    $env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT = $previousWaitEvent
+                }
+            }
+
+            if (-not $concurrentWaitEvent.WaitOne(10000)) {
+                throw "contending installer did not report destination-lock contention"
+            }
+            if ($concurrentInstaller.HasExited) {
+                throw "contending installer exited before the held transaction lock was released"
+            }
+
+            foreach ($unexpected in @(
+                (Join-Path $concurrentBin "rmux.exe"),
+                (Join-Path $concurrentBin "rmux-daemon.exe"),
+                (Join-Path $concurrentRoot "libexec\rmux\rmux.exe"),
+                (Join-Path $concurrentRoot "README.md")
+            )) {
+                if (Test-Path -LiteralPath $unexpected) {
+                    throw "contending installer mutated the package before acquiring its transaction lock: $unexpected"
+                }
+            }
+        } catch {
+            $concurrentFailure = $_.Exception.Message
+        } finally {
+            $heldInstallLock.Dispose()
+            $concurrentWaitEvent.Dispose()
+        }
+
+        if ($null -ne $concurrentFailure) {
+            if ($null -ne $concurrentInstaller -and -not $concurrentInstaller.HasExited) {
+                $concurrentInstaller.Kill()
+                $concurrentInstaller.WaitForExit()
+            }
+            Fail $concurrentFailure
+        }
+        if (-not $concurrentInstaller.WaitForExit(15000)) {
+            $concurrentInstaller.Kill()
+            $concurrentInstaller.WaitForExit()
+            Fail "contending installer did not finish after the transaction lock was released"
+        }
+        $concurrentInstaller.WaitForExit()
+        $concurrentInstaller.Refresh()
+        if ($concurrentInstaller.ExitCode -ne 0) {
+            Fail "contending installer exited with $($concurrentInstaller.ExitCode) after the transaction lock was released"
+        }
+        $concurrentInstaller.Dispose()
+        if ((Sha256File (Join-Path $concurrentBin "rmux.exe")) -ne
+                (Sha256File (Join-Path $PackageRoot "rmux.exe")) -or
+            (Sha256File (Join-Path $concurrentBin "rmux-daemon.exe")) -ne
+                (Sha256File (Join-Path $PackageRoot "rmux-daemon.exe")) -or
+            (Sha256File (Join-Path $concurrentRoot "libexec\rmux\rmux.exe")) -ne
+                (Sha256File $packageHelper) -or
+            (Sha256File (Join-Path $concurrentRoot "README.md")) -ne
+                (Sha256File $packageReadme)) {
+            Fail "serialized installer did not commit the complete valid package"
+        }
+        if (Test-Path -LiteralPath $concurrentLockPath) {
+            Fail "serialized installer left its transaction lock marker behind"
+        }
+
         $nonLeafRoot = Join-Path $Root "non-leaf-rmux"
         $nonLeafBin = Join-Path $nonLeafRoot "bin"
         $nonLeafHelper = Join-Path $nonLeafRoot "libexec\rmux\rmux.exe"

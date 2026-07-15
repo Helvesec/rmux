@@ -73,6 +73,7 @@ fn normalize_short_option_token(
     }
 
     let mut parts = Vec::new();
+    let mut seen_boolean_flags = Vec::new();
     let mut chars = flags.char_indices().peekable();
     while let Some((_, flag)) = chars.next() {
         if spec.takes_value(flag) {
@@ -85,7 +86,10 @@ fn normalize_short_option_token(
             return Some((parts, true));
         }
         if spec.is_boolean(flag) {
-            parts.push(format!("-{flag}"));
+            if !seen_boolean_flags.contains(&flag) {
+                seen_boolean_flags.push(flag);
+                parts.push(format!("-{flag}"));
+            }
             continue;
         }
         return None;
@@ -280,6 +284,16 @@ mod tests {
         assert_eq!(
             normalize_compact_short_options("resize-pane", args(&["-D5", "-Z"])),
             args(&["-D5", "-Z"])
+        );
+    }
+
+    #[test]
+    fn repeated_boolean_cluster_is_deduplicated_before_expansion() {
+        let repeated = format!("-{}", "JT".repeat(512 * 1024));
+
+        assert_eq!(
+            normalize_compact_short_options("show-messages", vec![repeated]),
+            args(&["-J", "-T"])
         );
     }
 }

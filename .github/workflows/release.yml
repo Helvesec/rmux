@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+  group: rmux-release
   cancel-in-progress: false
 
 env:
@@ -630,6 +630,8 @@ jobs:
       RELEASE_VERSION: ${{ needs.source-gates.outputs.release_version }}
       IS_PRERELEASE: ${{ needs.source-gates.outputs.is_prerelease }}
       SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
+      RMUX_PACKAGE_REPO: Helvesec/rmux-packages
+      RMUX_PACKAGE_REPO_BRANCH: main
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -813,6 +815,47 @@ jobs:
           path: release-assets/SHA256SUMS
           if-no-files-found: error
 
+      - name: Authenticate retained Linux package history
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+        shell: bash
+        env:
+          RMUX_APT_GPG_KEY: ${{ secrets.RMUX_APT_GPG_KEY }}
+          RMUX_RPM_GPG_KEY: ${{ secrets.RMUX_RPM_GPG_KEY }}
+        run: |
+          : "${RMUX_APT_GPG_KEY:?missing RMUX_APT_GPG_KEY}"
+          : "${RMUX_RPM_GPG_KEY:?missing RMUX_RPM_GPG_KEY}"
+          : "${RMUX_PACKAGE_REPO:?missing RMUX_PACKAGE_REPO}"
+          : "${RMUX_PACKAGE_REPO_BRANCH:?missing RMUX_PACKAGE_REPO_BRANCH}"
+          (
+            cd release-assets
+            sha256sum --check --strict SHA256SUMS
+          )
+          rm -rf target/package-repository-inputs
+          mkdir -p target/package-repository-inputs
+          shopt -s nullglob
+          current_packages=(release-assets/*.deb release-assets/*.rpm)
+          if (( ${#current_packages[@]} == 0 )); then
+            echo "No current Linux packages found in release assets" >&2
+            exit 1
+          fi
+          cp -- "${current_packages[@]}" target/package-repository-inputs/
+          rm -rf target/package-repository-history
+          git clone --depth 1 --branch "$RMUX_PACKAGE_REPO_BRANCH" \
+            "https://github.com/${RMUX_PACKAGE_REPO}.git" \
+            target/package-repository-history
+          git -C target/package-repository-history rev-parse --verify 'HEAD^{commit}' \
+            > target/PACKAGE_REPOSITORY_BASE
+          scripts/retain-linux-package-history.py \
+            --repository-dir target/package-repository-history \
+            --staging-dir target/package-repository-inputs \
+            --apt-signing-key "$RMUX_APT_GPG_KEY" \
+            --rpm-signing-key "$RMUX_RPM_GPG_KEY" \
+            --current-version "$PACKAGE_VERSION" \
+            --apt-architecture amd64 \
+            --apt-architecture arm64 \
+            --rpm-architecture x86_64 \
+            --rpm-architecture aarch64
+
       - name: Generate Linux package repositories
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
         shell: bash
@@ -826,7 +869,7 @@ jobs:
           : "${RMUX_RPM_REPO_GPG_KEY:?missing RMUX_RPM_REPO_GPG_KEY}"
           mkdir -p target/package-repositories
           scripts/generate-apt-repository.sh \
-            --input-dir release-assets \
+            --input-dir target/package-repository-inputs \
             --output-dir target/package-repositories/debian \
             --suite stable \
             --component main \
@@ -834,12 +877,13 @@ jobs:
             --architecture arm64 \
             --signing-key "$RMUX_APT_GPG_KEY"
           scripts/generate-rpm-repository.sh \
-            --input-dir release-assets \
+            --input-dir target/package-repository-inputs \
             --output-dir target/package-repositories/rpm \
             --baseurl https://packages.rmux.io/rpm \
             --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
             --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \
             --rpm-signing-key "$RMUX_RPM_GPG_KEY" \
+            --rpm-signing-version "$PACKAGE_VERSION" \
             --repo-signing-key "$RMUX_RPM_REPO_GPG_KEY"
           gpg --armor --export "$RMUX_APT_GPG_KEY" > target/package-repositories/debian/rmux.asc
           gpg --armor --export "$RMUX_RPM_GPG_KEY" > target/package-repositories/rpm/RPM-GPG-KEY-rmux
@@ -857,6 +901,13 @@ jobs:
           test -f target/package-repositories/rpm/rmux.repo
           grep -qx 'gpgcheck=1' target/package-repositories/rpm/rmux.repo
           grep -qx 'repo_gpgcheck=1' target/package-repositories/rpm/rmux.repo
+          cp target/PACKAGE_REPOSITORY_BASE target/package-repositories/PACKAGE_REPOSITORY_BASE
+          (
+            cd target/package-repositories
+            find debian rpm PACKAGE_REPOSITORY_BASE -type f -print0 | LC_ALL=C sort -z | \
+              xargs -0 sha256sum > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
@@ -1249,11 +1300,19 @@ jobs:
 
           test -d package-repositories/debian
           test -d package-repositories/rpm
+          test -s package-repositories/PACKAGE_REPOSITORY_BASE
+          test -s package-repositories/SHA256SUMS
+          (
+            cd package-repositories
+            sha256sum --check --strict SHA256SUMS
+          )
 
           work="$(mktemp -d)"
           trap 'rm -rf "$work"' EXIT
           package_repo_url="https://x-access-token:${RMUX_PACKAGE_REPO_TOKEN}@github.com/${RMUX_PACKAGE_REPO}.git"
           git clone --depth 1 --branch "$RMUX_PACKAGE_REPO_BRANCH" "$package_repo_url" "$work"
+          expected_base="$(tr -d '\r\n' < package-repositories/PACKAGE_REPOSITORY_BASE)"
+          scripts/verify-package-repository-base.sh "$work" "$expected_base"
 
           rm -rf "$work/debian" "$work/rpm"
           cp -a package-repositories/debian "$work/debian"

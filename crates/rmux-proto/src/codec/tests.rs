@@ -828,6 +828,74 @@ fn decode_frame_rejects_truncated_payloads() {
 }
 
 #[test]
+fn current_wire_request_rejects_semantically_truncated_payload() {
+    let request = Request::NewWindow(Box::new(NewWindowRequest {
+        target: SessionName::new("alpha").expect("valid session"),
+        name: Some("logs".to_owned()),
+        detached: true,
+        start_directory: None,
+        environment: None,
+        command: None,
+        process_command: None,
+        target_window_index: None,
+        insert_at_target: false,
+    }));
+    let full_frame = encode_frame(&request).expect("current request encodes");
+    assert_eq!(
+        decode_frame::<Request>(&full_frame).expect("current request decodes"),
+        request
+    );
+
+    let mut payload = bincode::serialize(&request).expect("current request payload serializes");
+    payload.pop().expect("request payload has a trailing field");
+    let mut truncated_frame = test_frame_header(payload.len() as u32);
+    truncated_frame.extend_from_slice(&payload);
+
+    assert!(matches!(
+        decode_frame::<Request>(&truncated_frame),
+        Err(crate::RmuxError::Decode(_))
+    ));
+
+    let mut decoder = FrameDecoder::new();
+    decoder.push_bytes(&truncated_frame);
+    assert!(matches!(
+        decoder.next_frame::<Request>(),
+        Err(crate::RmuxError::Decode(_))
+    ));
+    assert!(decoder.remaining_bytes().is_empty());
+}
+
+#[test]
+fn current_wire_response_rejects_semantically_truncated_payload() {
+    let response = crate::Response::RunShell(crate::RunShellResponse::background());
+    let full_frame = encode_frame(&response).expect("current response encodes");
+    assert_eq!(
+        decode_frame::<crate::Response>(&full_frame).expect("current response decodes"),
+        response
+    );
+
+    let mut payload = bincode::serialize(&response).expect("current response payload serializes");
+    payload
+        .pop()
+        .expect("response payload has a trailing field");
+    let mut truncated_frame = test_frame_header(payload.len() as u32);
+    truncated_frame.extend_from_slice(&payload);
+
+    assert!(matches!(
+        decode_frame::<crate::Response>(&truncated_frame),
+        Err(crate::RmuxError::Decode(_))
+    ));
+
+    let mut decoder = FrameDecoder::new();
+    decoder.push_bytes(&truncated_frame);
+    assert!(matches!(
+        decoder.next_frame::<crate::Response>(),
+        Err(crate::RmuxError::Decode(_))
+    ));
+    assert!(decoder.remaining_bytes().is_empty());
+}
+
+#[test]
 fn decode_frame_rejects_trailing_bytes() {
     let request = Request::HasSession(HasSessionRequest {
         target: SessionName::new("alpha").expect("valid session"),

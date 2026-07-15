@@ -18,6 +18,9 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::renderer;
 use crate::terminal::TerminalProfile;
 
+// 64 × 128 KiB = 8 MiB shared by every queued attach-control payload. Small
+// controls consume one unit so the message count is bounded by the same limit.
+// Saturation permits only one additional fixed-size, accounted Detach sentinel.
 pub(super) const ATTACH_CONTROL_BACKLOG_LIMIT: usize = 64;
 
 #[derive(Default)]
@@ -509,10 +512,19 @@ impl RequestHandler {
             }
             if !active.render_refresh_pending {
                 active.render_refresh_pending = true;
-                if active.control_tx.send(AttachControl::Refresh).is_err() {
+                if let Err(error) = active.control_tx.send(AttachControl::Refresh) {
+                    if error.is_full() {
+                        active.closing.store(true, Ordering::SeqCst);
+                    }
                     active_attach.remove_attached_client(attach_pid);
                     self.bump_active_attach_epoch();
-                    return Err(attached_client_required(command_name));
+                    return if error.is_full() {
+                        Err(rmux_proto::RmuxError::Server(
+                            "attached client is not draining updates".to_owned(),
+                        ))
+                    } else {
+                        Err(attached_client_required(command_name))
+                    };
                 }
             }
             if let Some(selection) = target_selection.as_ref() {
@@ -547,32 +559,19 @@ impl RequestHandler {
         if is_switch {
             active.render_generation = active.render_generation.saturating_add(1);
         }
-        let tracked_control = matches!(command, AttachControl::Switch(_) | AttachControl::Refresh);
-        if tracked_control
-            && active.control_backlog.load(Ordering::Acquire) >= ATTACH_CONTROL_BACKLOG_LIMIT
-        {
-            let _ = active.control_tx.send(AttachControl::Detach);
-            active.closing.store(true, Ordering::SeqCst);
-            active_attach.remove_attached_client(attach_pid);
-            self.bump_active_attach_epoch();
-            return Err(rmux_proto::RmuxError::Server(
-                "attached client is not draining updates".to_owned(),
-            ));
-        }
-        if tracked_control {
-            active.control_backlog.fetch_add(1, Ordering::AcqRel);
-        }
-        if active.control_tx.send(command).is_err() {
-            if tracked_control {
-                let _ = active.control_backlog.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |value| value.checked_sub(1),
-                );
+        if let Err(error) = active.control_tx.send(command) {
+            if error.is_full() {
+                active.closing.store(true, Ordering::SeqCst);
             }
             active_attach.remove_attached_client(attach_pid);
             self.bump_active_attach_epoch();
-            return Err(attached_client_required(command_name));
+            return if error.is_full() {
+                Err(rmux_proto::RmuxError::Server(
+                    "attached client is not draining updates".to_owned(),
+                ))
+            } else {
+                Err(attached_client_required(command_name))
+            };
         }
         if let Some(selection) = target_selection.as_ref() {
             selection
@@ -1344,7 +1343,8 @@ mod tests {
         assert!(error.to_string().contains("not draining updates"));
         assert_eq!(
             control_backlog.load(Ordering::Acquire),
-            ATTACH_CONTROL_BACKLOG_LIMIT
+            ATTACH_CONTROL_BACKLOG_LIMIT + 1,
+            "the bounded queue includes one accounted terminal detach sentinel"
         );
         assert!(!handler.active_attach.lock().await.by_pid.contains_key(&77));
     }
@@ -1413,7 +1413,12 @@ mod tests {
             .await
             .expect("render-stream refresh substitution should be accepted");
 
-        assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Refresh)));
+        let refresh = control_rx.try_recv().expect("refresh control is queued");
+        assert!(matches!(refresh, AttachControl::Refresh));
+        crate::pane_io::release_attach_control_backlog(
+            &control_backlog,
+            refresh.received_backlog_units(),
+        );
         assert_eq!(control_backlog.load(Ordering::Acquire), 0);
         let active_attach = handler.active_attach.lock().await;
         let active = active_attach.by_pid.get(&77).expect("attach is active");
@@ -1769,6 +1774,8 @@ mod tests {
     fn session_switch_resets_stale_interactive_overlay_state() {
         let session_name = SessionName::new("alpha").expect("valid session name");
         let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let control_backlog = Arc::new(AtomicUsize::new(0));
+        let closing = Arc::new(AtomicBool::new(false));
         let persistent_overlay_epoch = Arc::new(AtomicU64::new(7));
         let uid = current_owner_uid();
         let mut active = ActiveAttach {
@@ -1781,15 +1788,20 @@ mod tests {
             pan_window: Some(2),
             pan_ox: 3,
             pan_oy: 4,
-            control_tx,
-            control_backlog: Arc::new(AtomicUsize::new(0)),
+            control_tx: crate::pane_io::AttachControlSender::new(
+                control_tx,
+                Arc::clone(&control_backlog),
+                ATTACH_CONTROL_BACKLOG_LIMIT,
+                Arc::clone(&closing),
+            ),
+            control_backlog,
             render_stream: true,
             render_refresh_pending: false,
             uid,
             user: UserIdentity::Uid(uid),
             can_write: true,
             suspended: false,
-            closing: Arc::new(AtomicBool::new(false)),
+            closing,
             emit_detached_on_finish: false,
             terminal_context: OuterTerminalContext::default(),
             client_size: TerminalSize { cols: 80, rows: 24 },

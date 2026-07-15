@@ -228,6 +228,8 @@ impl RequestHandler {
                         .by_pid
                         .get_mut(&attach_pid)
                         .expect("validated attached identity remains present");
+                    // The bounded sender turns this over-limit send into the
+                    // single accounted terminal Detach sentinel.
                     let _ = active.control_tx.send(AttachControl::Detach);
                     active.closing.store(true, Ordering::SeqCst);
                     active_attach
@@ -336,34 +338,26 @@ impl RequestHandler {
             } else {
                 AttachControl::switch(target)
             };
-            let delivery_failed = {
+            let delivery_error = {
                 let active = active_attach
                     .by_pid
                     .get_mut(&attach_pid)
                     .expect("validated attached identity remains present");
-                active.control_backlog.fetch_add(1, Ordering::AcqRel);
-                let delivery_failed = active.control_tx.send(command).is_err();
-                if delivery_failed {
-                    let _ = active.control_backlog.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |value| value.checked_sub(1),
-                    );
-                }
-                delivery_failed
+                active.control_tx.send(command).err()
             };
-            if delivery_failed {
+            if let Some(delivery_error) = delivery_error {
                 let removed = active_attach
                     .remove_attached_client(attach_pid)
                     .expect("failed attached delivery removes the validated identity");
                 removed.closing.store(true, Ordering::SeqCst);
                 self.bump_active_attach_epoch();
                 snapshot.restore(&mut state);
-                let error = rollback_switch_runtime(
-                    &mut state,
-                    &window_target,
-                    crate::handler_support::attached_client_required("switch-client"),
-                );
+                let delivery_error = if delivery_error.is_full() {
+                    RmuxError::Server("attached client is not draining updates".to_owned())
+                } else {
+                    crate::handler_support::attached_client_required("switch-client")
+                };
+                let error = rollback_switch_runtime(&mut state, &window_target, delivery_error);
                 drop(active_attach);
                 drop(state);
                 terminate_overlay_job(removed.overlay);

@@ -1885,6 +1885,15 @@ async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_li
     };
     let mut control_rx = register_clipboard_attach(&handler, 310, &session).await;
     drain_attach_controls_until_idle(&mut control_rx).await;
+    let control_backlog = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&310)
+            .expect("attach is registered")
+            .control_backlog
+            .clone()
+    };
     let callback = handler.pane_alert_callback();
 
     for _ in 0..=ATTACH_CONTROL_BACKLOG_LIMIT {
@@ -1894,6 +1903,10 @@ async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_li
     let mut writes = 0;
     let mut detaches = 0;
     while let Ok(control) = control_rx.try_recv() {
+        crate::pane_io::release_attach_control_backlog(
+            &control_backlog,
+            control.received_backlog_units(),
+        );
         match control {
             AttachControl::ClipboardWrite { .. } => writes += 1,
             AttachControl::Detach => detaches += 1,
@@ -1902,6 +1915,7 @@ async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_li
     }
     assert_eq!(writes, ATTACH_CONTROL_BACKLOG_LIMIT);
     assert_eq!(detaches, 1);
+    assert_eq!(control_backlog.load(Ordering::Acquire), 0);
     timeout(Duration::from_secs(2), async {
         loop {
             if !handler.active_attach.lock().await.by_pid.contains_key(&310) {
@@ -2094,6 +2108,10 @@ async fn inactive_pane_osc52_backlog_is_bounded_by_encoded_bytes() {
     let mut writes = 0;
     let mut detaches = 0;
     while let Ok(control) = control_rx.try_recv() {
+        crate::pane_io::release_attach_control_backlog(
+            &control_backlog,
+            control.received_backlog_units(),
+        );
         match control {
             AttachControl::ClipboardWrite { .. } => writes += 1,
             AttachControl::Detach => detaches += 1,
@@ -2320,6 +2338,7 @@ async fn pane_mouse_mode_alert_refreshes_the_active_attached_pane() {
     let AttachControl::Switch(target) = control else {
         panic!("expected active mouse-mode switch refresh, got {control:?}");
     };
+    let target = target.into_target();
     let start = target.outer_terminal.attach_start_sequence();
     assert!(
         start

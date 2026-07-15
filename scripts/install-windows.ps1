@@ -92,6 +92,66 @@ function Invoke-InstallCheckpoint([string]$Name) {
     }
 }
 
+function Enter-InstallTransactionLock([string]$InstallRoot) {
+    New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
+    $lockPath = Join-Path $InstallRoot ".rmux-install.lock"
+    $deadline = [System.DateTime]::UtcNow.AddSeconds(30)
+    $reportedWait = $false
+
+    while ($true) {
+        try {
+            $stream = [System.IO.File]::Open(
+                $lockPath,
+                [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            return [pscustomobject]@{
+                Path = $lockPath
+                Stream = $stream
+            }
+        } catch [System.IO.IOException] {
+            $win32Error = $_.Exception.HResult -band 0xFFFF
+            if ($win32Error -ne 32 -and $win32Error -ne 33) {
+                throw
+            }
+            if ([System.DateTime]::UtcNow -ge $deadline) {
+                throw "timed out waiting for another rmux installation to finish"
+            }
+            if (-not $reportedWait) {
+                if (-not [string]::IsNullOrWhiteSpace($env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT)) {
+                    try {
+                        $waitEvent = [System.Threading.EventWaitHandle]::OpenExisting(
+                            $env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT
+                        )
+                        try {
+                            $null = $waitEvent.Set()
+                        } finally {
+                            $waitEvent.Dispose()
+                        }
+                    } catch {
+                        # Test-only observer disappeared; lock behavior is unchanged.
+                    }
+                }
+                Write-Host "Another rmux installation is updating this destination; waiting up to 30 seconds."
+                $reportedWait = $true
+            }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
+function Exit-InstallTransactionLock([object]$Lock) {
+    try {
+        $Lock.Stream.Dispose()
+    } finally {
+        # A waiter may acquire the same file between Dispose and Remove-Item.
+        # FileShare.None makes that cleanup race safe: deletion then fails and
+        # the new owner removes the marker after releasing its own handle.
+        Remove-Item -Force -LiteralPath $Lock.Path -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-PackageFileSet(
     [object[]]$Plan,
     [string]$VerifyBinary,
@@ -285,10 +345,23 @@ function Install-PackageRoot([string]$PackageRoot, [string]$DestinationBin, [boo
     }
 
     $destination = Join-Path $installBin "rmux.exe"
+    $installLock = $null
+    $installError = $null
     try {
+        # Serialize the complete backup/copy/verify/rollback interval. Without
+        # this lock, a failing installer could restore the snapshot it took
+        # before a concurrent installer committed a newer package.
+        $installLock = Enter-InstallTransactionLock $installRoot
         Install-PackageFileSet $installPlan $destination $Verify
     } catch {
-        Fail $_.Exception.Message
+        $installError = $_.Exception.Message
+    } finally {
+        if ($null -ne $installLock) {
+            Exit-InstallTransactionLock $installLock
+        }
+    }
+    if ($null -ne $installError) {
+        Fail $installError
     }
 
     Write-Host "Installed rmux to $destination"
@@ -322,8 +395,9 @@ if ($Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$') {
 }
 
 $semver = $Version -replace '^v', ''
+$packageVersion = $semver -replace '-.*$', ''
 $platform = "windows-x86_64"
-$archive = "rmux-$semver-$platform.zip"
+$archive = "rmux-$packageVersion-$platform.zip"
 $baseUrl = "https://github.com/$Repository/releases/download/$Version"
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("rmux-install-" + [System.Guid]::NewGuid().ToString("N"))
 
@@ -350,7 +424,7 @@ try {
     }
 
     Expand-Archive -Force -LiteralPath $zipPath -DestinationPath $tmp
-    $packageRoot = Join-Path $tmp "rmux-$semver-$platform"
+    $packageRoot = Join-Path $tmp "rmux-$packageVersion-$platform"
     if (-not (Test-PackageRoot $packageRoot)) {
         Fail "required rmux package layout not found in archive"
     }

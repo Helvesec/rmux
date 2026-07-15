@@ -60,9 +60,8 @@ fn default_shell_pane_status() -> String {
 
 fn take_render_frame(control: AttachControl) -> String {
     match control {
-        AttachControl::Switch(target) => {
-            String::from_utf8(target.render_frame).expect("render frame must be utf-8")
-        }
+        AttachControl::Switch(target) => String::from_utf8(target.into_target().render_frame)
+            .expect("render frame must be utf-8"),
         AttachControl::Detach => panic!("expected a switch refresh"),
         AttachControl::Exited => panic!("expected a switch refresh"),
         AttachControl::DetachKill => panic!("expected a switch refresh"),
@@ -80,7 +79,7 @@ fn take_render_frame(control: AttachControl) -> String {
 
 fn take_switch_target(control: AttachControl) -> crate::pane_io::AttachTarget {
     match control {
-        AttachControl::Switch(target) => *target,
+        AttachControl::Switch(target) => *target.into_target(),
         other => panic!("expected a switch refresh, got {other:?}"),
     }
 }
@@ -258,8 +257,8 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
     assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Detach)));
     assert_eq!(
         control_backlog.load(Ordering::Acquire),
-        super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT,
-        "refresh should not enqueue another tracked frame once the backlog is saturated"
+        super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT + 1,
+        "saturation should enqueue only one accounted terminal detach sentinel"
     );
 }
 

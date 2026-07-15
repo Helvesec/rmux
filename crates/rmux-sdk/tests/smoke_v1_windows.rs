@@ -24,6 +24,28 @@ mod windows {
     const MARKER: &str = "RMUX_SDK_SMOKE_V1_WINDOWS_OK";
 
     #[tokio::test]
+    async fn sdk_cmd_can_cold_start_an_independent_windows_daemon() -> TestResult {
+        let _lock = LIVE_DAEMON_LOCK.lock().await;
+        let session_name = session_name("sdkwincmdcold");
+        let harness = Harness::start_via_cmd("cmdcold", &session_name).await?;
+        let pipe_name = harness.pipe_name().to_owned();
+
+        assert!(
+            harness
+                .rmux()
+                .list_sessions()
+                .await?
+                .iter()
+                .any(|session| session == &session_name),
+            "the command-started daemon must retain the requested session"
+        );
+
+        harness.finish().await?;
+        wait_for_daemon_unavailable(&pipe_name).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn sdk_autostart_loads_default_config_from_the_exact_windows_caller_cwd() -> TestResult {
         let _lock = LIVE_DAEMON_LOCK.lock().await;
         let root = windows_config_root()?;

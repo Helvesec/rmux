@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 
 use rmux_proto::OptionName;
 
-use super::super::attach_support::{ActiveAttachIdentity, ATTACH_CONTROL_BACKLOG_LIMIT};
+use super::super::attach_support::ActiveAttachIdentity;
 use super::super::RequestHandler;
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::{AttachControl, PaneAlertEvent};
@@ -103,23 +103,16 @@ impl RequestHandler {
             if payload.is_empty() {
                 continue;
             }
-            let Some(control) = AttachControl::try_clipboard_write(
-                payload,
-                active.control_backlog.clone(),
-                ATTACH_CONTROL_BACKLOG_LIMIT,
-            ) else {
-                let _ = active.control_tx.send(AttachControl::Detach);
+            let control = AttachControl::ClipboardWrite {
+                bytes: payload,
+                reservation: None,
+            };
+            if active.control_tx.send(control).is_err() {
                 active.closing.store(true, Ordering::SeqCst);
                 // Leave the registration in place until the common attach
                 // cleanup owns it. That path terminates overlays, drops key
                 // table references, reconciles size, and applies
                 // destroy-unattached exactly once.
-                active.emit_detached_on_finish = true;
-                disconnected.push(active.identity(*attach_pid));
-                continue;
-            };
-            if active.control_tx.send(control).is_err() {
-                active.closing.store(true, Ordering::SeqCst);
                 active.emit_detached_on_finish = true;
                 disconnected.push(active.identity(*attach_pid));
             }

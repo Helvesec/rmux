@@ -885,7 +885,7 @@ mod tests {
             Request::ControlMode(ControlModeRequest {
                 mode: ControlMode::Plain,
                 client_terminal: ClientTerminalContext::default(),
-                initial_command_count: (control::MAX_INITIAL_CONTROL_COMMANDS + 1) as u32,
+                initial_command_count: (rmux_proto::MAX_INITIAL_CONTROL_COMMANDS + 1) as u32,
             }),
         )
         .await?;

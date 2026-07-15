@@ -41,7 +41,8 @@ async fn recv_switch_frame(control_rx: &mut mpsc::UnboundedReceiver<AttachContro
             .expect("prompt refresh timeout")
             .expect("attached refresh");
         if let AttachControl::Switch(target) = control {
-            return String::from_utf8(target.render_frame).expect("render frame is utf-8");
+            return String::from_utf8(target.into_target().render_frame)
+                .expect("render frame is utf-8");
         }
     }
 }

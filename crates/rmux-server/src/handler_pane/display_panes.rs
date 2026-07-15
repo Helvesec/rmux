@@ -23,7 +23,7 @@ use crate::handler_support::attached_client_required;
 use crate::key_table::{
     decode_attached_key, matches_prefix_key, session_option_key, AttachedKeyDecode,
 };
-use crate::pane_io::{AttachControl, OverlayFrame};
+use crate::pane_io::{AttachControl, AttachControlSender, OverlayFrame};
 use crate::pane_terminals::session_not_found;
 use crate::renderer;
 
@@ -905,14 +905,14 @@ fn display_panes_client_error(error: RmuxError) -> RmuxError {
 enum DisplayPanesAction {
     Clear {
         attach_pid: u32,
-        control_tx: tokio::sync::mpsc::UnboundedSender<AttachControl>,
+        control_tx: AttachControlSender,
         render_generation: u64,
         overlay_generation: u64,
         fallback_clear_frame: Vec<u8>,
     },
     Execute {
         attach_pid: u32,
-        control_tx: tokio::sync::mpsc::UnboundedSender<AttachControl>,
+        control_tx: AttachControlSender,
         render_generation: u64,
         overlay_generation: u64,
         fallback_clear_frame: Vec<u8>,

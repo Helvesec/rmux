@@ -7,13 +7,18 @@ use std::error::Error;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(windows)]
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
+#[cfg(windows)]
+use std::thread;
 #[cfg(windows)]
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+use rmux_pty::{ChildCommand, SpawnedPty, TerminalSize};
 
 #[cfg(windows)]
 #[path = "../../../tests/support/windows_cargo_build.rs"]
@@ -52,15 +57,14 @@ fn status_interval_refreshes_attached_status_bar_windows() -> TestResult {
     let output = attach.wait_with_timeout(STEP_TIMEOUT)?;
     if !output.status.success() {
         return Err(format!(
-            "attach exited with {:?}\nstdout:\n{}\nstderr:\n{}",
+            "attach exited with {:?}\noutput:\n{}",
             output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&output.output)
         )
         .into());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&output.output);
     let ticks = extract_tick_seconds(&stdout);
     if ticks.len() < 2 {
         return Err(format!(
@@ -113,17 +117,13 @@ impl CliHarness {
     }
 
     fn spawn_attach(&self, target: &str) -> TestResult<AttachChild> {
-        let child = Command::new(rmux_binary()?)
-            .arg("-L")
-            .arg(&self.label)
-            .arg("attach-session")
-            .arg("-t")
-            .arg(target)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+        let spawned = ChildCommand::new(rmux_binary()?)
+            .args(["-L", &self.label, "attach-session", "-t", target])
+            .size(TerminalSize::new(100, 30))
             .spawn()?;
-        Ok(AttachChild { child: Some(child) })
+        Ok(AttachChild {
+            spawned: Some(spawned),
+        })
     }
 
     fn disarm(&mut self) {
@@ -153,37 +153,76 @@ impl Drop for CliHarness {
 
 #[cfg(windows)]
 struct AttachChild {
-    child: Option<Child>,
+    spawned: Option<SpawnedPty>,
+}
+
+#[cfg(windows)]
+struct AttachOutput {
+    status: ExitStatus,
+    output: Vec<u8>,
 }
 
 #[cfg(windows)]
 impl AttachChild {
-    fn wait_with_timeout(mut self, timeout: Duration) -> TestResult<Output> {
+    fn wait_with_timeout(mut self, timeout: Duration) -> TestResult<AttachOutput> {
         let deadline = Instant::now() + timeout;
-        let mut child = self.child.take().expect("child is present");
+        let mut spawned = self.spawned.take().expect("spawned attach is present");
+        let output_receiver = spawn_output_reader(spawned.master().try_clone_io()?);
         while Instant::now() < deadline {
-            if child.try_wait()?.is_some() {
-                return Ok(child.wait_with_output()?);
+            if let Some(status) = spawned.child_mut().try_wait()? {
+                spawned.child().close_pseudoconsole();
+                let output = receive_output(output_receiver)?;
+                return Ok(AttachOutput { status, output });
             }
-            std::thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(50));
         }
 
-        let _ = child.kill();
-        let output = child.wait_with_output()?;
+        let _ = spawned.child().terminate_forcefully();
+        let _ = spawned.child_mut().wait();
+        spawned.child().close_pseudoconsole();
+        let output = receive_output(output_receiver).unwrap_or_default();
         Err(format!(
-            "attach process did not exit before timeout\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "attach process did not exit before timeout\noutput:\n{}",
+            String::from_utf8_lossy(&output)
         )
         .into())
     }
 }
 
 #[cfg(windows)]
+fn spawn_output_reader(io: rmux_pty::PtyIo) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let result = loop {
+            match io.read(&mut buffer) {
+                Ok(0) => break Ok(output),
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break Ok(output),
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+#[cfg(windows)]
+fn receive_output(receiver: mpsc::Receiver<std::io::Result<Vec<u8>>>) -> TestResult<Vec<u8>> {
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("ConPTY output reader did not finish: {error}"))?
+        .map_err(Into::into)
+}
+
+#[cfg(windows)]
 impl Drop for AttachChild {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
+        if let Some(spawned) = self.spawned.as_mut() {
+            let _ = spawned.child().terminate_forcefully();
+            let _ = spawned.child_mut().wait();
+            spawned.child().close_pseudoconsole();
         }
     }
 }

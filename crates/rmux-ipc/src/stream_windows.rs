@@ -14,24 +14,23 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf,
-    TokenIntegrityLevel, TokenUser, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, RevertToSelf, TokenUser, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_CREATE_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
     FILE_GENERIC_WRITE, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Pipes::{
-    GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, ImpersonateNamedPipeClient,
-    PeekNamedPipe, WaitNamedPipeW,
+    GetNamedPipeClientProcessId, ImpersonateNamedPipeClient, PeekNamedPipe, WaitNamedPipeW,
 };
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
 use super::PeerIdentity;
 use crate::LocalEndpoint;
+
+#[path = "server_identity_windows.rs"]
+mod server_identity;
+use server_identity::validate_named_pipe_server_identity;
 
 const RMUX_NAMED_PIPE_CLIENT_ACCESS: u32 =
     FILE_GENERIC_READ | (FILE_GENERIC_WRITE & !FILE_CREATE_PIPE_INSTANCE);
@@ -384,114 +383,6 @@ fn peer_identity_from_handle(handle: HANDLE) -> io::Result<PeerIdentity> {
     })
 }
 
-fn validate_named_pipe_server_identity(client: &NamedPipeClient) -> io::Result<()> {
-    let server_pid = named_pipe_server_pid(client)?;
-    let expected = current_process_security_identity()?;
-    validate_named_pipe_server_identity_from_source(server_pid, &expected, || {
-        process_security_identity(server_pid)
-    })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct WindowsSecurityIdentity {
-    user: UserIdentity,
-    integrity_rid: u32,
-}
-
-fn validate_named_pipe_server_identity_from_source<ProcessIdentity>(
-    server_pid: u32,
-    expected: &WindowsSecurityIdentity,
-    process_identity: ProcessIdentity,
-) -> io::Result<()>
-where
-    ProcessIdentity: FnOnce() -> io::Result<WindowsSecurityIdentity>,
-{
-    let actual = process_identity().map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "named-pipe server pid {server_pid} process token identity and integrity \
-                 could not be verified: {error}"
-            ),
-        )
-    })?;
-    compare_named_pipe_server_identity(server_pid, &actual, expected)
-}
-
-fn compare_named_pipe_server_identity(
-    server_pid: u32,
-    actual: &WindowsSecurityIdentity,
-    expected: &WindowsSecurityIdentity,
-) -> io::Result<()> {
-    if actual == expected {
-        return Ok(());
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!(
-            "named-pipe server pid {server_pid} process token is {actual:?}; \
-             expected current user and exact integrity {expected:?}"
-        ),
-    ))
-}
-
-fn named_pipe_server_pid(client: &NamedPipeClient) -> io::Result<u32> {
-    let mut pid = 0;
-    let ok = unsafe {
-        // SAFETY: client is a connected named-pipe client handle and pid is a valid out pointer.
-        GetNamedPipeServerProcessId(client.as_raw_handle() as HANDLE, &mut pid)
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(pid)
-}
-
-fn process_security_identity(pid: u32) -> io::Result<WindowsSecurityIdentity> {
-    let process = open_process_for_token_query(pid)?;
-    let token = process_token(process.get())?;
-    token_security_identity(token.get())
-}
-
-fn current_process_security_identity() -> io::Result<WindowsSecurityIdentity> {
-    let token = process_token(unsafe {
-        // SAFETY: GetCurrentProcess returns a valid pseudo-handle for this process.
-        GetCurrentProcess()
-    })?;
-    token_security_identity(token.get())
-}
-
-fn process_token(process: HANDLE) -> io::Result<OwnedHandle> {
-    let mut token = null_mut();
-    let ok = unsafe {
-        // SAFETY: process is a live process handle and token is a valid out pointer.
-        OpenProcessToken(process, TOKEN_QUERY, &mut token)
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(OwnedHandle(token))
-}
-
-fn token_security_identity(token: HANDLE) -> io::Result<WindowsSecurityIdentity> {
-    Ok(WindowsSecurityIdentity {
-        user: token_user_identity(token)?,
-        integrity_rid: token_integrity_rid(token)?,
-    })
-}
-
-fn open_process_for_token_query(pid: u32) -> io::Result<OwnedHandle> {
-    let handle = unsafe {
-        // SAFETY: OpenProcess validates the pid and returns either a handle or null.
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-    };
-    if handle.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(OwnedHandle(handle))
-}
-
 fn named_pipe_client_pid(handle: HANDLE) -> io::Result<u32> {
     let mut pid = 0;
     let ok = unsafe {
@@ -559,71 +450,6 @@ fn token_user_identity(token: HANDLE) -> io::Result<UserIdentity> {
         buffer.assume_init_header()
     };
     sid_to_identity(token_user.User.Sid)
-}
-
-fn token_integrity_rid(token: HANDLE) -> io::Result<u32> {
-    let mut needed = 0_u32;
-    unsafe {
-        // SAFETY: This first call intentionally requests the required byte count.
-        GetTokenInformation(token, TokenIntegrityLevel, null_mut(), 0, &mut needed);
-    }
-    if needed == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mut buffer = TokenInformationBuffer::<TOKEN_MANDATORY_LABEL>::new(needed)?;
-    let buffer_len = buffer.byte_len();
-    let ok = unsafe {
-        // SAFETY: buffer is writable for the aligned byte count allocated above.
-        GetTokenInformation(
-            token,
-            TokenIntegrityLevel,
-            buffer.as_mut_ptr(),
-            buffer_len,
-            &mut needed,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let mandatory_label = unsafe {
-        // SAFETY: A successful TokenIntegrityLevel query initializes
-        // TOKEN_MANDATORY_LABEL and its SID remains backed by `buffer`.
-        buffer.assume_init_header()
-    };
-    integrity_rid_from_sid(mandatory_label.Label.Sid)
-}
-
-fn integrity_rid_from_sid(sid: *mut core::ffi::c_void) -> io::Result<u32> {
-    if sid.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Windows returned a null integrity SID",
-        ));
-    }
-    let count_ptr = unsafe {
-        // SAFETY: sid comes from a successfully queried TOKEN_MANDATORY_LABEL.
-        GetSidSubAuthorityCount(sid)
-    };
-    if count_ptr.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let count = unsafe { *count_ptr };
-    if count == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Windows integrity SID has no subauthorities",
-        ));
-    }
-    let rid_ptr = unsafe {
-        // SAFETY: count is non-zero and the final subauthority index is valid.
-        GetSidSubAuthority(sid, u32::from(count - 1))
-    };
-    if rid_ptr.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { *rid_ptr })
 }
 
 fn sid_to_identity(sid: *mut core::ffi::c_void) -> io::Result<UserIdentity> {
@@ -705,13 +531,6 @@ mod tests {
     use std::sync::mpsc;
     use tokio::net::windows::named_pipe::ServerOptions;
 
-    fn identity(user: &str, integrity_rid: u32) -> WindowsSecurityIdentity {
-        WindowsSecurityIdentity {
-            user: UserIdentity::Sid(user.into()),
-            integrity_rid,
-        }
-    }
-
     #[tokio::test]
     async fn peer_identity_query_owns_handle_after_accept_future_drop() -> io::Result<()> {
         let endpoint = endpoint_for_label(format!("peer-identity-cancel-{}", std::process::id()))?;
@@ -742,61 +561,5 @@ mod tests {
         let peer = query.await.map_err(io::Error::other)??;
         assert_eq!(peer.pid, std::process::id());
         Ok(())
-    }
-
-    #[test]
-    fn server_identity_accepts_matching_user_and_exact_integrity() {
-        let expected = identity("S-1-5-21-1000", 0x3000);
-
-        validate_named_pipe_server_identity_from_source(42, &expected, || Ok(expected.clone()))
-            .expect("matching user and integrity should be accepted");
-    }
-
-    #[test]
-    fn server_identity_rejects_same_user_at_lower_integrity() {
-        let expected = identity("S-1-5-21-1000", 0x3000);
-        let error = validate_named_pipe_server_identity_from_source(42, &expected, || {
-            Ok(identity("S-1-5-21-1000", 0x2000))
-        })
-        .expect_err("same-user lower-integrity server must be rejected");
-
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("exact integrity"));
-    }
-
-    #[test]
-    fn server_identity_rejects_different_user_at_matching_integrity() {
-        let expected = identity("S-1-5-21-1000", 0x2000);
-        let error = validate_named_pipe_server_identity_from_source(42, &expected, || {
-            Ok(identity("S-1-5-21-2000", 0x2000))
-        })
-        .expect_err("different-user server must be rejected");
-
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("S-1-5-21-2000"));
-    }
-
-    #[test]
-    fn server_identity_fails_closed_when_process_token_is_unverifiable() {
-        let expected = identity("S-1-5-21-1000", 0x2000);
-        let error = validate_named_pipe_server_identity_from_source(42, &expected, || {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "OpenProcess denied",
-            ))
-        })
-        .expect_err("unverifiable server identity must be rejected");
-
-        let message = error.to_string();
-        assert!(message.contains("identity and integrity could not be verified"));
-        assert!(message.contains("OpenProcess denied"));
-    }
-
-    #[test]
-    fn current_process_identity_matches_pid_token_lookup() {
-        let current = current_process_security_identity().expect("current process token");
-        let by_pid = process_security_identity(std::process::id()).expect("process token by pid");
-
-        assert_eq!(by_pid, current);
     }
 }

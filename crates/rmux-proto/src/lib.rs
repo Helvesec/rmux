@@ -47,7 +47,7 @@ pub use control::{
     format_output_line, format_pause_line, octal_escape, ClientTerminalContext, ControlGuardKind,
     ControlMode, ControlModeRequest, ControlModeResponse, CONTROL_BUFFER_HIGH, CONTROL_BUFFER_LOW,
     CONTROL_CONTROL_END, CONTROL_CONTROL_START, CONTROL_MAXIMUM_AGE_MS, CONTROL_STDIN_EOF_MARKER,
-    CONTROL_WRITE_MINIMUM,
+    CONTROL_WRITE_MINIMUM, MAX_INITIAL_CONTROL_COMMANDS,
 };
 pub use envelope::{RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION};
 pub use error::{

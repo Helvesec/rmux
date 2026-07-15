@@ -822,7 +822,7 @@ fn list_commands_is_client_local_and_supports_formatting() -> Result<(), Box<dyn
     assert_eq!(split_signature.status.code(), Some(0));
     assert_eq!(
         stdout(&split_signature),
-        "split-window (splitw) [-bdefhIklPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane][shell-command]\n"
+        "split-window (splitw) [-bdefhIklPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane] [shell-command [argument ...]]\n"
     );
     assert!(stderr(&split_signature).is_empty());
 

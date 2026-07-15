@@ -2212,7 +2212,8 @@ async fn wait_for_switch_frame_containing(
             }
         };
         if let AttachControl::Switch(target) = control {
-            let frame = String::from_utf8(target.render_frame).expect("render frame is utf-8");
+            let frame = String::from_utf8(target.into_target().render_frame)
+                .expect("render frame is utf-8");
             if frame.contains(expected) {
                 return frame;
             }
@@ -2252,6 +2253,7 @@ async fn wait_for_attach_output_containing(
         };
         match control {
             AttachControl::Switch(target) => {
+                let target = target.into_target();
                 seen.push_str(&String::from_utf8_lossy(&target.render_frame));
             }
             AttachControl::Overlay(frame) => {

@@ -112,6 +112,12 @@ pub enum ConsoleWindowBehavior {
     Suppress,
 }
 
+#[derive(Clone, Copy)]
+enum JobBreakawayBehavior {
+    Disallow,
+    AllowExplicit,
+}
+
 /// A clonable termination handle for a spawned process tree.
 #[derive(Clone)]
 pub struct ProcessTreeController {
@@ -180,14 +186,35 @@ impl ProcessTreeChild {
         Self::spawn_with_console_window(command, ConsoleWindowBehavior::Inherit)
     }
 
+    /// Spawns a process tree while allowing descendants that explicitly ask
+    /// Windows for job breakaway to outlive the tree.
+    ///
+    /// On non-Windows targets this is identical to [`Self::spawn`]. Ordinary
+    /// descendants remain isolated and are still terminated with the tree.
+    pub fn spawn_allowing_explicit_job_breakaway(command: &mut Command) -> io::Result<Self> {
+        Self::spawn_with_options(
+            command,
+            ConsoleWindowBehavior::Inherit,
+            JobBreakawayBehavior::AllowExplicit,
+        )
+    }
+
     /// Spawns `command` with descendant isolation and the requested Windows
     /// console-window behavior.
     pub fn spawn_with_console_window(
         command: &mut Command,
         console_window: ConsoleWindowBehavior,
     ) -> io::Result<Self> {
+        Self::spawn_with_options(command, console_window, JobBreakawayBehavior::Disallow)
+    }
+
+    fn spawn_with_options(
+        command: &mut Command,
+        console_window: ConsoleWindowBehavior,
+        job_breakaway: JobBreakawayBehavior,
+    ) -> io::Result<Self> {
         #[cfg(not(windows))]
-        let _ = console_window;
+        let _ = (console_window, job_breakaway);
 
         #[cfg(all(
             unix,
@@ -216,7 +243,13 @@ impl ProcessTreeChild {
         {
             command.creation_flags(windows_creation_flags(console_window));
             let mut child = command.spawn()?;
-            let job = match ProcessJob::for_child(&child) {
+            let job = match job_breakaway {
+                JobBreakawayBehavior::Disallow => ProcessJob::for_child(&child),
+                JobBreakawayBehavior::AllowExplicit => {
+                    ProcessJob::for_child_allowing_breakaway(&child)
+                }
+            };
+            let job = match job {
                 Ok(job) => Arc::new(job),
                 Err(error) => {
                     let _ = child.kill();

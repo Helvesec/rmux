@@ -74,8 +74,19 @@ impl RequestHandler {
         generation: u64,
         state: ForegroundStateDto,
     ) -> Option<(u64, ForegroundStateDto)> {
-        self.lock_foreground_state_cache()
-            .insert(pane_id, (generation, state))
+        let mut cache = self.lock_foreground_state_cache();
+        match cache.entry(pane_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((generation, state));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry)
+                if generation >= entry.get().0 =>
+            {
+                Some(entry.insert((generation, state)))
+            }
+            std::collections::hash_map::Entry::Occupied(_) => None,
+        }
     }
 
     fn remove_foreground_state_cache(&self, pane_id: PaneId) {
@@ -841,6 +852,61 @@ mod tests {
             .expect("newer baseline should survive stale seed");
 
         assert_eq!(previous, (5, new_state));
+    }
+
+    #[test]
+    fn stale_foreground_replace_does_not_overwrite_newer_generation() {
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(9);
+        let stale_state = foreground_state(10, "cmd", "C:/stale");
+        let current_state = foreground_state(11, "cmd", "C:/current");
+
+        handler.seed_foreground_state_cache(pane_id, 5, current_state.clone());
+        let previous = handler.replace_foreground_state_cache(pane_id, 4, stale_state);
+
+        assert_eq!(previous, None);
+        assert_eq!(
+            handler.lock_foreground_state_cache().get(&pane_id).cloned(),
+            Some((5, current_state))
+        );
+    }
+
+    #[test]
+    fn same_generation_foreground_replace_updates_cache() {
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(10);
+        let old_state = foreground_state(10, "cmd", "C:/old");
+        let next_state = foreground_state(10, "cmd", "C:/next");
+
+        handler.seed_foreground_state_cache(pane_id, 5, old_state.clone());
+        let previous = handler.replace_foreground_state_cache(pane_id, 5, next_state.clone());
+
+        assert_eq!(previous, Some((5, old_state)));
+        assert_eq!(
+            handler.lock_foreground_state_cache().get(&pane_id).cloned(),
+            Some((5, next_state))
+        );
+    }
+
+    #[test]
+    fn newer_generation_foreground_replace_advances_cache_without_transition() {
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(11);
+        let old_state = foreground_state(10, "cmd", "C:/old");
+        let next_state = foreground_state(11, "cmd", "C:/next");
+
+        handler.seed_foreground_state_cache(pane_id, 5, old_state.clone());
+        let previous = handler.replace_foreground_state_cache(pane_id, 6, next_state.clone());
+
+        assert_eq!(previous, Some((5, old_state)));
+        assert_eq!(
+            foreground_change_from_previous(previous, 6, &next_state),
+            None
+        );
+        assert_eq!(
+            handler.lock_foreground_state_cache().get(&pane_id).cloned(),
+            Some((6, next_state))
+        );
     }
 
     #[test]

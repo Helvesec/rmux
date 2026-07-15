@@ -77,10 +77,14 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
             let AttachControl::Switch(target) = control else {
                 return false;
             };
-            let start = target.outer_terminal.attach_start_sequence();
-            mouse_tracking_enables
-                .iter()
-                .all(|enable| !start.windows(enable.len()).any(|window| window == *enable))
+            target
+                .with_target(|target| {
+                    let start = target.outer_terminal.attach_start_sequence();
+                    mouse_tracking_enables
+                        .iter()
+                        .all(|enable| !start.windows(enable.len()).any(|window| window == *enable))
+                })
+                .unwrap_or(false)
         })
         .await,
     );

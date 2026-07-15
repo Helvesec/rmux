@@ -4,9 +4,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rmux_sdk::bootstrap::discovery::SDK_DAEMON_BINARY_ENV;
-use rmux_sdk::Rmux;
+use rmux_sdk::{Rmux, RmuxError};
 
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -40,10 +41,45 @@ async fn cmd_injects_resolved_unix_endpoint_and_preserves_process_output() {
     );
 }
 
+#[tokio::test]
+async fn cmd_applies_the_facade_operation_timeout_to_the_child_tree() {
+    let _lock = ENV_LOCK.lock().await;
+    let root = TestRoot::new("sdk-cmd-timeout");
+    let fake_rmux = root.path().join("fake-rmux.sh");
+    write_fake_rmux(&fake_rmux);
+    let _binary = EnvGuard::set(SDK_DAEMON_BINARY_ENV, fake_rmux.as_os_str());
+
+    let socket = root.path().join("daemon.sock");
+    let rmux = Rmux::builder()
+        .unix_socket(&socket)
+        .default_timeout(Duration::from_millis(100))
+        .build();
+    let started_at = Instant::now();
+    let error = rmux
+        .cmd(["hang"])
+        .await
+        .expect_err("blocking fake rmux exceeds the facade operation timeout");
+
+    match error {
+        RmuxError::Transport {
+            operation, source, ..
+        } => {
+            assert_eq!(operation, "run rmux command");
+            assert_eq!(source.kind(), std::io::ErrorKind::TimedOut);
+        }
+        error => panic!("expected command transport timeout, got {error:?}"),
+    }
+    assert!(
+        started_at.elapsed() < Duration::from_secs(3),
+        "public SDK command timeout should stay bounded: {:?}",
+        started_at.elapsed()
+    );
+}
+
 fn write_fake_rmux(path: &Path) {
     fs::write(
         path,
-        "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\nprintf 'stderr-line\\n' >&2\nexit 7\n",
+        "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\nprintf 'stderr-line\\n' >&2\nif [ \"${1-}\" = \"-S\" ]; then shift 2; fi\nif [ \"${1-}\" = \"hang\" ]; then sleep 30; fi\nexit 7\n",
     )
     .expect("write fake rmux");
     let mut permissions = fs::metadata(path).expect("fake metadata").permissions();

@@ -33,8 +33,8 @@ use super::{
     install_live_attach_input_validation_pause, is_predictable_local_echo, pane_output_channel,
     pane_output_channel_with_limits, pending_attach_exit_output_batch,
     predictable_local_echo_prefix_len, process_attach_data_payload, process_socket_messages,
-    should_emit_overlay, sync_pending_escape_flush_with_escape_time, AttachControl, AttachTarget,
-    LiveAttachInputContext, OverlayFrame, PredictedEcho,
+    should_emit_overlay, sync_pending_escape_flush_with_escape_time, AttachControl,
+    AttachControlSender, AttachTarget, LiveAttachInputContext, OverlayFrame, PredictedEcho,
 };
 use crate::daemon::ShutdownHandle;
 use crate::handler::RequestHandler;
@@ -615,7 +615,7 @@ async fn current_attach_target(
     let target = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             match control_rx.recv().await {
-                Some(AttachControl::Switch(target)) => break *target,
+                Some(AttachControl::Switch(target)) => break *target.into_target(),
                 Some(_) => continue,
                 None => panic!("attach control channel closed before initial target"),
             }
@@ -2011,7 +2011,7 @@ fn render_only_switches_coalesce_before_reliable_controls() {
 
     let control_backlog = AtomicUsize::new(0);
     let (coalesced, switch_count) = coalesce_render_switches(
-        Box::new(first),
+        super::attach_control::QueuedAttachTarget::Direct(Box::new(first)),
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,
@@ -2022,6 +2022,44 @@ fn render_only_switches_coalesce_before_reliable_controls() {
     assert!(matches!(
         deferred_controls.pop_front(),
         Some(AttachControl::Detach)
+    ));
+}
+
+#[test]
+fn sender_side_switch_coalescing_preserves_render_generation_count() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let control_backlog = Arc::new(AtomicUsize::new(0));
+    let sender = AttachControlSender::new(
+        control_tx,
+        Arc::clone(&control_backlog),
+        8,
+        Arc::new(AtomicBool::new(false)),
+    );
+    for frame in [b"first".as_slice(), b"second", b"third"] {
+        sender
+            .send(AttachControl::switch(test_render_only_attach_target(
+                &alpha, frame,
+            )))
+            .expect("coalesced switch fits");
+    }
+
+    let AttachControl::Switch(target) = control_rx.try_recv().expect("one coalesced switch") else {
+        panic!("expected a coalesced switch");
+    };
+    let (target, switch_count) = coalesce_render_switches(
+        target,
+        &mut VecDeque::new(),
+        Some(&mut control_rx),
+        &control_backlog,
+    );
+
+    assert_eq!(target.render_frame, b"third");
+    assert_eq!(switch_count, 3);
+    assert_eq!(control_backlog.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        control_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
     ));
 }
 
@@ -2042,7 +2080,7 @@ fn render_only_switch_coalescing_preserves_deferred_control_order() {
 
     let control_backlog = AtomicUsize::new(0);
     let (coalesced, switch_count) = coalesce_render_switches(
-        Box::new(first),
+        super::attach_control::QueuedAttachTarget::Direct(Box::new(first)),
         &mut deferred_controls,
         Some(&mut control_rx),
         &control_backlog,

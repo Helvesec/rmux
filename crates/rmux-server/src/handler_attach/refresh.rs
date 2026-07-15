@@ -566,40 +566,20 @@ pub(super) fn enqueue_tracked_render_control(
         command,
         AttachControl::Refresh | AttachControl::Switch(_)
     ));
-    if active.control_backlog.load(Ordering::Acquire) >= super::ATTACH_CONTROL_BACKLOG_LIMIT {
-        let _ = active.control_tx.send(AttachControl::Detach);
-        active.closing.store(true, Ordering::SeqCst);
-        return false;
-    }
-    active.control_backlog.fetch_add(1, Ordering::AcqRel);
-    if active.control_tx.send(command).is_err() {
-        let _ = active
-            .control_backlog
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_sub(1)
-            });
+    if let Err(error) = active.control_tx.send(command) {
+        if error.is_full() {
+            active.closing.store(true, Ordering::SeqCst);
+        }
         return false;
     }
     true
 }
 
 fn enqueue_tracked_interactive_input_control(active: &mut ActiveAttach) -> bool {
-    if active.control_backlog.load(Ordering::Acquire) >= super::ATTACH_CONTROL_BACKLOG_LIMIT {
-        let _ = active.control_tx.send(AttachControl::Detach);
-        active.closing.store(true, Ordering::SeqCst);
-        return false;
-    }
-    active.control_backlog.fetch_add(1, Ordering::AcqRel);
-    if active
-        .control_tx
-        .send(AttachControl::InteractiveInput)
-        .is_err()
-    {
-        let _ = active
-            .control_backlog
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                value.checked_sub(1)
-            });
+    if let Err(error) = active.control_tx.send(AttachControl::InteractiveInput) {
+        if error.is_full() {
+            active.closing.store(true, Ordering::SeqCst);
+        }
         return false;
     }
     true

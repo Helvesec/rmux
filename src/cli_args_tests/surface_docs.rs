@@ -197,7 +197,7 @@ fn split_window_percentage_is_public_and_value_taking_everywhere() {
             "split-window",
             Some("splitw"),
         ),
-        "split-window (splitw) [-bdefhIklPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane][shell-command]"
+        "split-window (splitw) [-bdefhIklPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane] [shell-command [argument ...]]"
     );
 }
 

@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::process::Command as ProcessCommand;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::builder::RmuxBuilder;
 use super::owned_session::OwnedSessionBuilder;
@@ -20,6 +20,8 @@ use rmux_proto::{
     CAPABILITY_HANDSHAKE, RMUX_WIRE_VERSION,
 };
 
+#[path = "rmux/command_process.rs"]
+mod command_process;
 #[path = "rmux/connect.rs"]
 mod connect;
 
@@ -288,19 +290,23 @@ impl Rmux {
     /// represented by typed Rust methods. The SDK injects `-S <endpoint>` before
     /// caller arguments, so the spawned binary talks to the same daemon the
     /// facade would use for normal operations. The command is executed directly
-    /// without a shell. Non-zero exits are returned in [`CommandRun`] rather
-    /// than converted into [`RmuxError`].
+    /// without a shell. The facade's resolved operation timeout covers process
+    /// spawn, execution, and output collection; expiration terminates the
+    /// command's process tree. Non-zero exits are returned in [`CommandRun`]
+    /// rather than converted into [`RmuxError`].
     pub async fn cmd<I, S>(&self, args: I) -> Result<CommandRun>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         let endpoint = self.resolved_endpoint()?;
+        let timeout = self.resolved_timeout(None);
+        let started_at = Instant::now();
         let args = args
             .into_iter()
             .map(|arg| arg.as_ref().to_owned())
             .collect::<Vec<OsString>>();
-        tokio::task::spawn_blocking(move || run_binary_command(endpoint, args))
+        tokio::task::spawn_blocking(move || run_binary_command(endpoint, args, timeout, started_at))
             .await
             .map_err(|error| {
                 RmuxError::transport(
@@ -455,12 +461,16 @@ fn pane_not_found(session_name: &SessionName, pane_id: PaneId) -> RmuxError {
     ))
 }
 
-fn run_binary_command(endpoint: RmuxEndpoint, args: Vec<OsString>) -> Result<CommandRun> {
+fn run_binary_command(
+    endpoint: RmuxEndpoint,
+    args: Vec<OsString>,
+    timeout: Option<Duration>,
+    started_at: Instant,
+) -> Result<CommandRun> {
     let mut command = ProcessCommand::new(connect::daemon_binary());
     append_endpoint_args(&mut command, endpoint);
     command.args(args);
-    let output = command
-        .output()
+    let output = command_process::run_with_timeout(&mut command, timeout, started_at)
         .map_err(|error| RmuxError::transport("run rmux command", error))?;
 
     Ok(CommandRun {

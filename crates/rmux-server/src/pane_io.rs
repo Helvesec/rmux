@@ -125,6 +125,7 @@ async fn pause_after_live_attach_input_validation(
     pause.reached.notify_one();
     pause.release.notified().await;
 }
+mod attach_control;
 mod attach_output_batch;
 mod attach_transport;
 mod control;
@@ -141,6 +142,10 @@ mod wire;
 
 #[cfg(any(unix, windows))]
 use crate::renderer::{PaneRenderDelta, PaneRenderDeltaFrame};
+#[cfg(test)]
+pub(crate) use attach_control::release_attach_control_backlog;
+#[cfg_attr(windows, allow(unused_imports))]
+pub(crate) use attach_control::{AttachControl, AttachControlSender};
 #[cfg(any(unix, windows))]
 use attach_output_batch::{
     collect_attach_output_batch, collect_attach_output_batch_metadata, AttachOutputBatch,
@@ -190,9 +195,9 @@ pub(crate) use types::pane_output_channel_with_limits;
 pub(crate) use types::LiveAttachInputContext;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
-    pane_output_channel, AttachControl, AttachSessionUpgrade, AttachTarget, HandleOutcome,
-    OverlayFrame, PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent,
-    PaneOutputReceiver, PaneOutputSender,
+    pane_output_channel, AttachSessionUpgrade, AttachTarget, HandleOutcome, OverlayFrame,
+    PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent, PaneOutputReceiver,
+    PaneOutputSender,
 };
 #[cfg(any(unix, windows))]
 use wire::{
@@ -201,6 +206,18 @@ use wire::{
     emit_render_frame, invalid_attach_message, open_attach_target, read_socket_bytes,
     recv_pane_output_optional, try_read_socket_bytes,
 };
+
+#[cfg(any(unix, windows))]
+struct AttachControlBacklogCleanup(Arc<AtomicUsize>);
+
+#[cfg(any(unix, windows))]
+impl Drop for AttachControlBacklogCleanup {
+    fn drop(&mut self) {
+        // The receiver and all deferred controls are dropped before this
+        // guard, so no retained queue allocation remains to be accounted.
+        self.0.store(0, Ordering::Release);
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(any(unix, windows))]
@@ -216,6 +233,9 @@ pub(crate) async fn forward_attach(
     live_input: LiveAttachInputContext,
     render_stream: bool,
 ) -> io::Result<()> {
+    // Declare the guard before receiver/deferred-control locals so it runs
+    // after their destructors on every normal, error, or cancellation exit.
+    let _control_backlog_cleanup = AttachControlBacklogCleanup(Arc::clone(&control_backlog));
     let stream = stream.into();
     let mut decoder = AttachFrameDecoder::new();
     let mut pending_input = Vec::new();

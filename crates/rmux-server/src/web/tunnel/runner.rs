@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::io::{self, BufRead, Read};
+use std::io;
 use std::net::SocketAddr;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{
@@ -18,12 +18,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info};
 
+use super::output;
 use super::preset::{ProcessOutput, TunnelPreset};
 use crate::web::origin::validate_public_base_url;
 use crate::web::settings::WebShareSettings;
 use crate::web::tunnel::TunnelInfo;
 
-const LINE_CHANNEL_CAPACITY: usize = 64;
 const ERROR_LINE_LIMIT: usize = 8;
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const TUNNEL_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -87,14 +87,14 @@ pub(super) async fn start(
         .map_err(|error| spawn_error(&preset, &program, error))?;
     let stdout = child.child_mut().stdout.take().expect("stdout is piped");
     let stderr = child.child_mut().stderr.take().expect("stderr is piped");
-    let (line_tx, line_rx) = mpsc::channel(LINE_CHANNEL_CAPACITY);
-    spawn_line_reader(
+    let (line_tx, line_rx) = output::channel();
+    output::spawn_reader(
         "rmux-tunnel-stdout",
         stdout,
         line_tx.clone(),
         ProcessOutput::Stdout,
     );
-    spawn_line_reader("rmux-tunnel-stderr", stderr, line_tx, ProcessOutput::Stderr);
+    output::spawn_reader("rmux-tunnel-stderr", stderr, line_tx, ProcessOutput::Stderr);
 
     let (stop_tx, stop_rx) = oneshot::channel();
     let (exit_tx, exit_rx) = oneshot::channel();
@@ -353,19 +353,6 @@ async fn wait_for_url(
         .map_err(|_| tunnel_error(preset, "timed out waiting for a public URL", &last_lines))?
 }
 
-fn spawn_line_reader<R>(
-    name: &'static str,
-    reader: R,
-    tx: mpsc::Sender<(ProcessOutput, String)>,
-    source: ProcessOutput,
-) where
-    R: Read + Send + 'static,
-{
-    let _ = thread::Builder::new().name(name.to_owned()).spawn(move || {
-        read_lines(source, reader, tx);
-    });
-}
-
 fn spawn_output_drain(
     provider: String,
     mut lines: mpsc::Receiver<(ProcessOutput, String)>,
@@ -380,25 +367,6 @@ fn spawn_output_drain(
             );
         }
     })
-}
-
-fn read_lines<R>(source: ProcessOutput, reader: R, tx: mpsc::Sender<(ProcessOutput, String)>)
-where
-    R: Read,
-{
-    for line in io::BufReader::new(reader).lines() {
-        match line {
-            Ok(line) => {
-                if tx.blocking_send((source, line)).is_err() {
-                    return;
-                }
-            }
-            Err(error) => {
-                debug!("web-share tunnel output read failed: {error}");
-                return;
-            }
-        }
-    }
 }
 
 fn remember_line(lines: &mut VecDeque<String>, line: &str) {

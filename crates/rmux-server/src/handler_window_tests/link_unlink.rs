@@ -53,9 +53,10 @@ async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver
         .await
         .expect("attached group peer must be refreshed after link-window")
         .expect("attached group peer control channel remains open");
-    let AttachControl::Switch(mut target) = control else {
+    let AttachControl::Switch(target) = control else {
         panic!("expected attached group peer switch, got {control:?}");
     };
+    let mut target = target.into_target();
     assert_eq!(target.session_name, peer);
 
     let output = {
@@ -393,9 +394,10 @@ async fn unlink_window_via_group_peer_refreshes_exact_family_and_removes_exact_t
         .await
         .expect("non-syntactic owner attach must be refreshed after unlink-window")
         .expect("owner attach control channel remains open");
-    let AttachControl::Switch(mut target) = control else {
+    let AttachControl::Switch(target) = control else {
         panic!("expected refreshed owner switch, got {control:?}");
     };
+    let mut target = target.into_target();
     assert_eq!(target.session_name, owner);
 
     let output = {

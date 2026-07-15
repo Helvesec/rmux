@@ -46,5 +46,6 @@ async fn swap_pane_refreshes_attached_non_syntactic_group_peer() {
     let AttachControl::Switch(target) = control else {
         panic!("expected peer switch refresh, got {control:?}");
     };
+    let target = target.into_target();
     assert_eq!(target.session_name, peer);
 }

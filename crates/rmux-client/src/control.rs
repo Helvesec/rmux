@@ -9,7 +9,7 @@ use rmux_ipc::BlockingLocalStream;
 use rmux_proto::CONTROL_STDIN_EOF_MARKER;
 use rmux_proto::{
     ClientTerminalContext, ControlMode, ControlModeRequest, Request, Response, CONTROL_CONTROL_END,
-    CONTROL_CONTROL_START,
+    CONTROL_CONTROL_START, MAX_INITIAL_CONTROL_COMMANDS,
 };
 #[cfg(any(test, windows))]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -40,6 +40,14 @@ impl Connection {
         client_terminal: ClientTerminalContext,
         initial_commands: &[String],
     ) -> Result<ControlTransition, ClientError> {
+        if initial_commands.len() > MAX_INITIAL_CONTROL_COMMANDS {
+            return Err(ClientError::Protocol(rmux_proto::RmuxError::Server(
+                format!(
+                    "too many initial control-mode commands: {} (maximum {MAX_INITIAL_CONTROL_COMMANDS})",
+                    initial_commands.len()
+                ),
+            )));
+        }
         let initial_command_count = u32::try_from(initial_commands.len()).map_err(|_| {
             ClientError::Protocol(rmux_proto::RmuxError::Server(
                 "too many initial control-mode commands".to_owned(),
@@ -384,14 +392,44 @@ where
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::io::{Cursor, Write};
+    use std::io::{Cursor, Read, Write};
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use rmux_proto::{ControlMode, ControlModeResponse};
+    use rmux_proto::{
+        ClientTerminalContext, ControlMode, ControlModeResponse, MAX_INITIAL_CONTROL_COMMANDS,
+    };
 
     use super::drive_control_mode_with_stdio;
-    use crate::connection::ControlModeUpgrade;
+    use crate::connection::{Connection, ControlModeUpgrade};
+
+    #[test]
+    fn excessive_initial_commands_are_rejected_before_any_stream_write() {
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        let connection = Connection::new(client).expect("client connection");
+        let commands = vec![String::new(); MAX_INITIAL_CONTROL_COMMANDS + 1];
+
+        let error = connection
+            .begin_control_mode_with_initial_commands(
+                ControlMode::Plain,
+                ClientTerminalContext::default(),
+                &commands,
+            )
+            .expect_err("oversized command batch must fail locally");
+
+        assert!(
+            error
+                .to_string()
+                .contains("too many initial control-mode commands"),
+            "unexpected error: {error}"
+        );
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            server.read(&mut byte).expect("read closed client stream"),
+            0,
+            "client must not write a partial upgrade before rejecting the batch"
+        );
+    }
 
     #[test]
     fn control_control_mode_wraps_output_with_dcs_sequences() {

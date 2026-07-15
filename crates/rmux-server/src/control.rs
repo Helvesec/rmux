@@ -13,7 +13,7 @@ use rmux_ipc::LocalStream;
 use rmux_proto::CONTROL_STDIN_EOF_MARKER;
 #[cfg(any(unix, windows))]
 use rmux_proto::{format_exit_line, format_guard_line, ControlGuardKind};
-use rmux_proto::{ControlMode, RmuxError, SessionName};
+use rmux_proto::{ControlMode, RmuxError, SessionName, MAX_INITIAL_CONTROL_COMMANDS};
 #[cfg(any(unix, windows))]
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(unix, windows))]
@@ -68,9 +68,6 @@ const MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL_PANE_EVENT_CAPACITY: usize = 256;
 #[cfg(any(unix, windows))]
 pub(crate) const CONTROL_SERVER_EVENT_CAPACITY: usize = 256;
-#[cfg(any(unix, windows))]
-pub(crate) const MAX_INITIAL_CONTROL_COMMANDS: usize = 1024;
-
 pub(crate) fn validate_initial_control_command_count(count: usize) -> Result<(), RmuxError> {
     if count <= MAX_INITIAL_CONTROL_COMMANDS {
         return Ok(());

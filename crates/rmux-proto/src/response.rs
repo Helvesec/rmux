@@ -790,14 +790,8 @@ where
     match seq.next_element::<T>() {
         Ok(Some(value)) => Ok(value),
         Ok(None) => Ok(T::default()),
-        Err(error) if is_truncated_compat_sequence(&error) => Ok(T::default()),
         Err(error) => Err(error),
     }
-}
-
-fn is_truncated_compat_sequence(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("UnexpectedEof") || message.contains("unexpected end of file")
 }
 
 /// Response payload for `if-shell`.
@@ -1039,34 +1033,24 @@ mod tests {
     }
 
     #[test]
-    fn run_shell_response_deserializes_old_payloads_with_no_exit_status() {
+    fn run_shell_response_rejects_old_unversioned_payload() {
         let bytes = bincode::serialize(&OldRunShellResponse { output: None })
             .expect("old run-shell response serializes");
 
-        let decoded: RunShellResponse =
-            bincode::deserialize(&bytes).expect("new run-shell response decodes old payload");
-
-        assert_eq!(decoded.command_output(), None);
-        assert_eq!(decoded.exit_status(), None);
+        bincode::deserialize::<RunShellResponse>(&bytes)
+            .expect_err("current response rejects old payload without a matching wire version");
     }
 
     #[test]
-    fn source_file_response_deserializes_old_payloads_with_empty_stderr() {
+    fn source_file_response_rejects_old_unversioned_payload() {
         let bytes = bincode::serialize(&OldSourceFileResponse {
             output: Some(CommandOutput::from_stdout(b"parsed\n".to_vec())),
             exit_status: Some(1),
         })
         .expect("old source-file response serializes");
 
-        let decoded: SourceFileResponse =
-            bincode::deserialize(&bytes).expect("new source-file response decodes old payload");
-
-        assert_eq!(
-            decoded.command_output(),
-            Some(&CommandOutput::from_stdout(b"parsed\n".to_vec()))
-        );
-        assert_eq!(decoded.exit_status(), Some(1));
-        assert!(decoded.stderr().is_empty());
+        bincode::deserialize::<SourceFileResponse>(&bytes)
+            .expect_err("current response rejects old payload without a matching wire version");
     }
 
     #[test]
