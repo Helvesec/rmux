@@ -51,6 +51,23 @@ where
     CommandParser::new().parse_arguments(arguments)
 }
 
+/// Returns whether an argv token has the parse-time `name=value` form.
+///
+/// The identifier grammar is deliberately ASCII and matches tmux's command
+/// parser: a letter or underscore followed by letters, digits, or underscores.
+#[must_use]
+pub fn is_parse_time_assignment(argument: &str) -> bool {
+    let Some((name, _)) = argument.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
 /// Looks up a frozen tmux command using exact alias then unique name prefix.
 pub fn lookup_command(name: &str) -> Result<&'static CommandEntry, CommandParseError> {
     lookup_command_at(name, 0, &[])
@@ -587,6 +604,35 @@ impl CommandParser {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        self.parse_arguments_inner(arguments, false)
+    }
+
+    /// Parses an argv-style command vector for RMUX's internal runtime bridge.
+    ///
+    /// Unlike [`Self::parse_arguments`], this recognizes one leading
+    /// `name=value` assignment in each command group. The direct argv parser
+    /// deliberately keeps tmux's behavior; only the server-owned alias bridge
+    /// opts into assignment classification.
+    pub fn parse_arguments_with_assignments<I, S>(
+        &self,
+        arguments: I,
+    ) -> Result<ParsedCommands, CommandParseError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.parse_arguments_inner(arguments, true)
+    }
+
+    fn parse_arguments_inner<I, S>(
+        &self,
+        arguments: I,
+        classify_assignments: bool,
+    ) -> Result<ParsedCommands, CommandParseError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let arguments = arguments
             .into_iter()
             .map(|argument| argument.as_ref().to_owned())
@@ -600,6 +646,7 @@ impl CommandParser {
 
         let mut commands = ParsedCommands::with_grouping(CommandGrouping::ByLine);
         let mut current = Vec::new();
+        let mut group_has_assignment = false;
 
         for argument in arguments {
             let mut value = argument;
@@ -616,10 +663,22 @@ impl CommandParser {
             }
 
             if !ends_command || !value.is_empty() {
-                current.push(CommandArgument::String(value));
+                if classify_assignments
+                    && current.is_empty()
+                    && !group_has_assignment
+                    && is_parse_time_assignment(&value)
+                {
+                    commands.push_assignment(EnvironmentAssignment::from_equals(value, false));
+                    group_has_assignment = true;
+                } else {
+                    current.push(CommandArgument::String(value));
+                }
             }
             if ends_command && !current.is_empty() {
                 commands.push_command(command_from_arguments(std::mem::take(&mut current), 1)?);
+            }
+            if ends_command {
+                group_has_assignment = false;
             }
         }
 

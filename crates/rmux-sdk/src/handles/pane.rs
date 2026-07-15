@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use crate::events::streams::{PaneLineStream, PaneOutputStart, PaneOutputStream};
 use crate::handles::split::SplitDirection;
-use crate::transport::TransportClient;
+use crate::transport::{OperationDeadline, TransportClient};
 use crate::{
     CollectedPaneOutput, InfoSnapshot, PaneId, PaneRef, PaneRenderStream, PaneSnapshot,
     PaneTextMatch, ProcessSpec, Result, RmuxEndpoint, RmuxError, TerminalSizeSpec,
@@ -154,6 +154,9 @@ impl Pane {
         default_timeout: Option<Duration>,
         transport: TransportClient,
     ) -> Self {
+        let transport = transport.with_default_timeout(
+            crate::bootstrap::discovery::resolve_timeout(None, default_timeout),
+        );
         Self {
             target,
             stable_id: None,
@@ -170,6 +173,9 @@ impl Pane {
         default_timeout: Option<Duration>,
         transport: TransportClient,
     ) -> Self {
+        let transport = transport.with_default_timeout(
+            crate::bootstrap::discovery::resolve_timeout(None, default_timeout),
+        );
         Self {
             target,
             stable_id: Some(pane_id),
@@ -200,6 +206,37 @@ impl Pane {
 
     pub(crate) const fn transport(&self) -> &TransportClient {
         &self.transport
+    }
+
+    pub(crate) fn begin_operation_handle(&self) -> Self {
+        let mut pane = self.clone();
+        pane.transport = pane.transport.begin_operation();
+        pane
+    }
+
+    pub(crate) fn begin_operation_handle_with_timeout(
+        &self,
+        per_operation_timeout: Option<Duration>,
+    ) -> Self {
+        if self.transport.operation_deadline().is_some() {
+            return self.clone();
+        }
+        let timeout = crate::bootstrap::discovery::resolve_timeout(
+            per_operation_timeout,
+            self.default_timeout,
+        );
+        let mut pane = self.clone();
+        pane.transport = pane
+            .transport
+            .with_default_timeout(timeout)
+            .begin_operation();
+        pane
+    }
+
+    pub(crate) fn with_operation_deadline(&self, deadline: OperationDeadline) -> Self {
+        let mut pane = self.clone();
+        pane.transport = pane.transport.with_operation_deadline(deadline);
+        pane
     }
 
     pub(crate) fn proto_target_ref(&self) -> rmux_proto::PaneTargetRef {
@@ -275,19 +312,20 @@ impl Pane {
         &self,
         start: PaneOutputStart,
     ) -> Result<PaneOutputStream> {
-        let target = self.required_resolved_proto_target_ref().await?;
-        crate::capabilities::require(&self.transport, &[rmux_proto::CAPABILITY_SDK_PANE_BY_ID])
+        let pane = self.begin_operation_handle();
+        let target = pane.required_resolved_proto_target_ref().await?;
+        crate::capabilities::require(&pane.transport, &[rmux_proto::CAPABILITY_SDK_PANE_BY_ID])
             .await?;
-        match PaneOutputStream::open(self.transport.clone(), target.clone(), start).await {
+        match PaneOutputStream::open(pane.transport.clone(), target.clone(), start).await {
             Ok(stream) => Ok(stream),
-            Err(error) if self.is_stable_id() && is_stale_pane_id_target_error(&error, &target) => {
-                let pane_id = self
+            Err(error) if pane.is_stable_id() && is_stale_pane_id_target_error(&error, &target) => {
+                let pane_id = pane
                     .stable_id
                     .expect("stable-id retry is guarded by is_stable_id");
-                let retry_target = self.resolved_proto_target_ref().await?.ok_or_else(|| {
-                    RmuxError::pane_not_found(self.target.session_name.clone(), pane_id)
+                let retry_target = pane.resolved_proto_target_ref().await?.ok_or_else(|| {
+                    RmuxError::pane_not_found(pane.target.session_name.clone(), pane_id)
                 })?;
-                PaneOutputStream::open(self.transport.clone(), retry_target, start).await
+                PaneOutputStream::open(pane.transport.clone(), retry_target, start).await
             }
             Err(error) => Err(error),
         }
@@ -355,13 +393,14 @@ impl Pane {
     /// Returns `Ok(None)` (rather than an error) for a stale slot, mirroring
     /// the [`Window`](super::Window)-handle stale-slot semantics.
     pub async fn id(&self) -> Result<Option<PaneId>> {
-        if let Some(pane_id) = self.stable_id {
+        let pane = self.begin_operation_handle();
+        if let Some(pane_id) = pane.stable_id {
             let current =
-                current_pane_ref_for_id(&self.transport, &self.target.session_name, pane_id)
+                current_pane_ref_for_id(&pane.transport, &pane.target.session_name, pane_id)
                     .await?;
             return Ok(current.map(|_| pane_id));
         }
-        Ok(current_pane_entry(&self.transport, &self.target)
+        Ok(current_pane_entry(&pane.transport, &pane.target)
             .await?
             .map(|entry| entry.pane_id))
     }
@@ -383,17 +422,18 @@ impl Pane {
     /// snapshot when the window or pane is gone, or an empty snapshot
     /// when the session itself is gone.
     pub async fn info(&self) -> Result<InfoSnapshot> {
-        match self.stable_id {
+        let pane = self.begin_operation_handle();
+        match pane.stable_id {
             Some(pane_id) => {
                 let Some(target) =
-                    current_pane_ref_for_id(&self.transport, &self.target.session_name, pane_id)
+                    current_pane_ref_for_id(&pane.transport, &pane.target.session_name, pane_id)
                         .await?
                 else {
                     return Ok(InfoSnapshot::default());
                 };
-                pane_info_snapshot(&self.transport, &target).await
+                pane_info_snapshot(&pane.transport, &target).await
             }
-            None => pane_info_snapshot(&self.transport, &self.target).await,
+            None => pane_info_snapshot(&pane.transport, &pane.target).await,
         }
     }
 
@@ -413,7 +453,7 @@ impl Pane {
     /// snapshot whose revision is `0`, distinct from any prior live
     /// revision.
     pub async fn snapshot(&self) -> Result<PaneSnapshot> {
-        pane_snapshot(self).await
+        pane_snapshot(&self.begin_operation_handle()).await
     }
 
     /// Starts a daemon `capture-pane` request builder.
@@ -428,7 +468,7 @@ impl Pane {
     /// [`PaneSnapshot::visible_lines`]. It does not inspect raw output bytes
     /// and does not use any daemon/core regex search surface.
     pub async fn find_text(&self, text: impl AsRef<str>) -> Result<Option<PaneTextMatch>> {
-        crate::extract::find_text(self, text.as_ref().to_owned()).await
+        crate::extract::find_text(&self.begin_operation_handle(), text.as_ref().to_owned()).await
     }
 
     /// Captures a fresh snapshot and returns every literal rendered-text
@@ -436,7 +476,8 @@ impl Pane {
     ///
     /// See [`Self::find_text`] for rendered-text and coordinate semantics.
     pub async fn find_text_all(&self, text: impl AsRef<str>) -> Result<Vec<PaneTextMatch>> {
-        crate::extract::find_text_all(self, text.as_ref().to_owned()).await
+        crate::extract::find_text_all(&self.begin_operation_handle(), text.as_ref().to_owned())
+            .await
     }
 
     /// Sends literal UTF-8 text bytes to this pane through the daemon.
@@ -446,7 +487,7 @@ impl Pane {
     /// [`send_key`](Self::send_key) when a tmux key token such as `Enter`
     /// should be interpreted as a key press.
     pub async fn send_text(&self, text: impl AsRef<str>) -> Result<()> {
-        send_text(self, text.as_ref()).await
+        send_text(&self.begin_operation_handle(), text.as_ref()).await
     }
 
     /// Sends one tmux-compatible key token to this pane through the daemon.
@@ -455,7 +496,7 @@ impl Pane {
     /// names such as `Enter` are encoded as keys, while ordinary text tokens
     /// are forwarded as their bytes by the server.
     pub async fn send_key(&self, key: impl Into<String>) -> Result<()> {
-        send_key(self, key.into()).await
+        send_key(&self.begin_operation_handle(), key.into()).await
     }
 
     /// Requests an absolute pane size through the daemon.
@@ -465,7 +506,7 @@ impl Pane {
     /// linked panes, borders, and neighboring panes can constrain the final
     /// geometry. No pane identity is cached by this handle.
     pub async fn resize(&self, size: TerminalSizeSpec) -> Result<()> {
-        resize_to_size(self, size).await
+        resize_to_size(&self.begin_operation_handle(), size).await
     }
 
     /// Sets this pane's UX title label.
@@ -474,12 +515,12 @@ impl Pane {
     /// identity; use [`Self::id`] and [`Session::pane_by_id`](super::Session::pane_by_id)
     /// for stable addressing.
     pub async fn set_title(&self, title: impl Into<String>) -> Result<()> {
-        set_title(self, title.into()).await
+        set_title(&self.begin_operation_handle(), title.into()).await
     }
 
     /// Returns this pane's current UX title label when the pane still exists.
     pub async fn title(&self) -> Result<Option<String>> {
-        get_title(self).await
+        get_title(&self.begin_operation_handle()).await
     }
 
     /// Sets a pane-local option and returns the exact mutation outcome.
@@ -488,17 +529,17 @@ impl Pane {
         name: impl Into<String>,
         value: impl Into<String>,
     ) -> Result<PaneOptionMutation> {
-        set_option(self, name.into(), value.into()).await
+        set_option(&self.begin_operation_handle(), name.into(), value.into()).await
     }
 
     /// Returns the exact pane-local explicit value for an option.
     pub async fn option(&self, name: impl Into<String>) -> Result<Option<String>> {
-        get_option(self, name.into()).await
+        get_option(&self.begin_operation_handle(), name.into()).await
     }
 
     /// Removes a pane-local explicit option and returns the exact mutation outcome.
     pub async fn unset_option(&self, name: impl Into<String>) -> Result<PaneOptionMutation> {
-        unset_option(self, name.into()).await
+        unset_option(&self.begin_operation_handle(), name.into()).await
     }
 
     /// Returns best-effort foreground process state for this pane.
@@ -508,7 +549,7 @@ impl Pane {
     /// [`Pane::foreground_state_with_revision`] to order a snapshot against a
     /// [`Pane::state_events`] stream.
     pub async fn foreground_state(&self) -> Result<Option<ForegroundState>> {
-        foreground::foreground_state(self)
+        foreground::foreground_state(&self.begin_operation_handle())
             .await
             .map(|state| state.map(|(_, _, foreground)| foreground))
     }
@@ -519,7 +560,7 @@ impl Pane {
     pub async fn foreground_state_with_revision(
         &self,
     ) -> Result<Option<(PaneId, u64, ForegroundState)>> {
-        foreground::foreground_state(self).await
+        foreground::foreground_state(&self.begin_operation_handle()).await
     }
 
     /// Opens a long-poll stream of pane title, option, close, and optional foreground events.
@@ -527,7 +568,7 @@ impl Pane {
         &self,
         options: PaneStateEventsOptions,
     ) -> Result<PaneStateEventStream> {
-        state_events::PaneStateEventStream::open(self, options).await
+        state_events::PaneStateEventStream::open(&self.begin_operation_handle(), options).await
     }
 
     /// Consumes this handle and kills the addressed pane through the daemon.
@@ -537,7 +578,7 @@ impl Pane {
     /// inert; this consuming method is the SDK operation that explicitly
     /// closes the pane slot and its process.
     pub async fn close(self) -> Result<PaneCloseOutcome> {
-        close_pane(self).await
+        close_pane(self.begin_operation_handle()).await
     }
 
     /// Consumes this handle without sending any daemon request.
@@ -561,13 +602,14 @@ impl Pane {
     /// issuing the split request. Unlike input, snapshot, waits, and streams,
     /// split is therefore not yet an atomic daemon-side by-id operation.
     pub async fn split(&self, direction: SplitDirection) -> Result<Self> {
-        let target = self.current_target().await?;
-        let new_target = split_pane(&self.transport, &target, direction).await?;
+        let pane = self.begin_operation_handle();
+        let target = pane.current_target().await?;
+        let new_target = split_pane(&pane.transport, &target, direction).await?;
         Ok(Self::new(
             new_target,
-            self.endpoint.clone(),
-            self.default_timeout,
-            self.transport.clone(),
+            pane.endpoint.clone(),
+            pane.default_timeout,
+            pane.transport,
         ))
     }
 
@@ -594,7 +636,7 @@ impl Pane {
     /// scrollback, and retained output before exposing output from the fresh
     /// lifecycle generation.
     pub async fn respawn(&self, options: PaneRespawnOptions) -> Result<PaneRef> {
-        respawn_pane(self, options).await
+        respawn_pane(&self.begin_operation_handle(), options).await
     }
 
     /// Starts a structured respawn builder for this pane.

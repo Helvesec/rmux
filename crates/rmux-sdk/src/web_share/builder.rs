@@ -254,13 +254,17 @@ impl<'a> WebShareBuilder<'a> {
     }
 
     async fn run(mut self) -> Result<WebShareHandle> {
-        require_web_share(self.transport).await?;
-        if let Some(pane) = self.pane {
+        let operation_pane = self.pane.map(Pane::begin_operation_handle);
+        let transport = operation_pane.as_ref().map_or_else(
+            || self.transport.begin_operation(),
+            |pane| pane.transport().clone(),
+        );
+        require_web_share(&transport).await?;
+        if let Some(pane) = operation_pane {
             self.scope = WebShareScope::Pane(pane.required_resolved_proto_target_ref().await?);
         }
         let controls = self.operator && matches!(&self.scope, WebShareScope::Session(_));
-        let response = self
-            .transport
+        let response = transport
             .request(Request::WebShare(Box::new(WebShareRequest::Create(
                 CreateWebShareRequest {
                     scope: self.scope,
@@ -288,9 +292,7 @@ impl<'a> WebShareBuilder<'a> {
             .await?;
         match response {
             Response::WebShare(response) => match *response {
-                WebShareResponse::Created(created) => {
-                    Ok(WebShareHandle::new(self.transport.clone(), created))
-                }
+                WebShareResponse::Created(created) => Ok(WebShareHandle::new(transport, created)),
                 other => Err(unexpected_response(
                     "web-share create",
                     Response::WebShare(Box::new(other)),

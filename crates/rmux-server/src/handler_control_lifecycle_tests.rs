@@ -92,6 +92,10 @@ async fn rename_session_commits_control_identity_before_a_concurrent_kill() {
     assert!(matches!(
         events.try_recv(),
         Ok(ControlServerEvent::SessionChanged(Some(ref session_name)))
+            | Ok(ControlServerEvent::SessionChangedAt {
+                ref session_name,
+                ..
+            })
             if session_name == &alpha
     ));
     let pause = handler.install_rename_session_control_commit_pause(alpha.clone());
@@ -204,7 +208,9 @@ fn assert_control_switched_to(events: &[ControlServerEvent], expected: &SessionN
     assert!(
         events.iter().any(|event| matches!(
             event,
-            ControlServerEvent::SessionChanged(Some(session_name)) if session_name == expected
+            ControlServerEvent::SessionChanged(Some(session_name))
+                | ControlServerEvent::SessionChangedAt { session_name, .. }
+                if session_name == expected
         )),
         "control client must switch to {expected}, got {events:?}"
     );

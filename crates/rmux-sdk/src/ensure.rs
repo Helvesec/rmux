@@ -12,7 +12,8 @@ mod redaction;
 use crate::handles::{session, Rmux, Session};
 use crate::transport::TransportClient;
 use crate::{
-    ProcessCommandSpec, ProcessSpec, Result, RmuxError, SessionId, SessionName, TerminalSizeSpec,
+    ProcessCommandSpec, ProcessSpec, Result, RmuxEndpoint, RmuxError, SessionId, SessionName,
+    TerminalSizeSpec,
 };
 use redaction::redact_environment_error;
 use rmux_proto::{NewSessionExtRequest, Request, Response};
@@ -405,16 +406,13 @@ async fn ensure_session(rmux: &Rmux, builder: EnsureSession) -> Result<Session> 
 }
 
 pub(crate) async fn create_owned_session(
-    rmux: &Rmux,
     builder: EnsureSession,
     required_capabilities: &[&str],
+    endpoint: RmuxEndpoint,
+    default_timeout: Option<Duration>,
+    transport: TransportClient,
 ) -> Result<(Session, SessionId)> {
     debug_assert_eq!(builder.policy, EnsureSessionPolicy::CreateOnly);
-    let endpoint = rmux.resolved_endpoint()?;
-    let timeout = builder.resolved_timeout(rmux);
-    let transport = rmux
-        .connect_resolved_transport_for_operation(&endpoint, timeout)
-        .await?;
     if !required_capabilities.is_empty() {
         crate::capabilities::require(&transport, required_capabilities).await?;
     }
@@ -443,7 +441,7 @@ pub(crate) async fn create_owned_session(
     let session = Session::new(
         response.session_name,
         endpoint,
-        rmux.configured_default_timeout(),
+        default_timeout,
         transport,
         true,
         builder.creation_tags,
@@ -452,15 +450,10 @@ pub(crate) async fn create_owned_session(
 }
 
 pub(crate) async fn preflight_owned_session_capabilities(
-    rmux: &Rmux,
+    transport: &TransportClient,
     required_capabilities: &[&str],
 ) -> Result<()> {
-    let endpoint = rmux.resolved_endpoint()?;
-    let timeout = rmux.resolved_timeout(None);
-    let transport = rmux
-        .connect_resolved_transport_for_operation(&endpoint, timeout)
-        .await?;
-    crate::capabilities::require(&transport, required_capabilities).await
+    crate::capabilities::require(transport, required_capabilities).await
 }
 
 fn parse_owned_session_id(stdout: &[u8]) -> Result<SessionId> {

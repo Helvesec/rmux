@@ -496,6 +496,59 @@ fn windows_package_reuses_the_exact_ctrl_tested_release_binaries() {
 }
 
 #[test]
+fn windows_installer_preserves_backup_only_when_rollback_fails() {
+    let installer = include_str!("../scripts/install-windows.ps1");
+    let transaction = installer
+        .split_once("function Install-BinarySet")
+        .map(|(_, transaction)| transaction)
+        .and_then(|transaction| transaction.split_once("function Test-PackageRoot"))
+        .map(|(transaction, _)| transaction)
+        .expect("bounded Install-BinarySet function");
+
+    let initial_state = transaction
+        .find("$preserveTransactionBackup = $false")
+        .expect("backup cleanup is enabled by default");
+    let transaction_body = transaction.find("try {").expect("transaction body");
+    assert!(initial_state < transaction_body);
+
+    let rollback_failure = transaction
+        .split_once("if ($rollbackErrors.Count -gt 0)")
+        .map(|(_, failure)| failure)
+        .and_then(|failure| failure.split_once("previous binaries restored"))
+        .map(|(failure, _)| failure)
+        .expect("bounded rollback-failure branch");
+    assert!(rollback_failure.contains("$preserveTransactionBackup = $true"));
+    assert!(rollback_failure.contains("recovery backup preserved at"));
+    assert!(rollback_failure.contains("Stop running rmux processes"));
+    assert!(rollback_failure.contains("restore"));
+
+    let cleanup = transaction
+        .rsplit_once("} finally {")
+        .map(|(_, cleanup)| cleanup)
+        .expect("transaction cleanup");
+    let cleanup_guard = cleanup
+        .find("if (-not $preserveTransactionBackup)")
+        .expect("cleanup guard");
+    let remove_backup = cleanup
+        .find("Remove-Item -Recurse -Force")
+        .expect("backup cleanup");
+    assert!(cleanup_guard < remove_backup);
+
+    assert_eq!(
+        transaction
+            .matches("$preserveTransactionBackup = $false")
+            .count(),
+        1,
+        "normal success and a successful rollback must retain the default cleanup state"
+    );
+    assert_eq!(
+        transaction.matches("$preserveTransactionBackup = $true").count(),
+        1,
+        "only a failed rollback may retain the backup; normal success and a successful rollback must still clean it up"
+    );
+}
+
+#[test]
 fn perf_current_and_darwin_baseline_validation_fail_closed_on_identity_drift() {
     let bench = include_str!("../scripts/perf-bench.sh");
     let baseline_generator = include_str!("../scripts/perf-baseline.sh");

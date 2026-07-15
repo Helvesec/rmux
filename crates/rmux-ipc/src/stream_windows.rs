@@ -1,11 +1,11 @@
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle as OwnedWindowsHandle};
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rmux_os::identity::UserIdentity;
+use rmux_os::identity::{TokenInformationBuffer, UserIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
 use windows_sys::Win32::Foundation::{
@@ -103,13 +103,23 @@ impl BlockingLocalStream {
 
 impl PeerIdentity {
     pub(crate) async fn from_windows_pipe(stream: &LocalStream) -> io::Result<Self> {
-        let handle = stream.as_raw_handle() as isize;
-        tokio::task::spawn_blocking(move || peer_identity_from_handle(handle as HANDLE))
-            .await
-            .map_err(|error| {
-                io::Error::other(format!("Windows peer identity task failed: {error}"))
-            })?
+        spawn_peer_identity_query(stream, |handle| {
+            peer_identity_from_handle(handle.as_raw_handle() as HANDLE)
+        })?
+        .await
+        .map_err(|error| io::Error::other(format!("Windows peer identity task failed: {error}")))?
     }
+}
+
+fn spawn_peer_identity_query<Query>(
+    stream: &LocalStream,
+    query: Query,
+) -> io::Result<tokio::task::JoinHandle<io::Result<PeerIdentity>>>
+where
+    Query: FnOnce(OwnedWindowsHandle) -> io::Result<PeerIdentity> + Send + 'static,
+{
+    let handle = stream.as_handle().try_clone_to_owned()?;
+    Ok(tokio::task::spawn_blocking(move || query(handle)))
 }
 
 /// Connects a blocking client stream to a local endpoint.
@@ -527,14 +537,15 @@ fn token_user_identity(token: HANDLE) -> io::Result<UserIdentity> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut buffer = vec![0_u8; usize::try_from(needed).map_err(|_| io::ErrorKind::InvalidData)?];
+    let mut buffer = TokenInformationBuffer::<TOKEN_USER>::new(needed)?;
+    let buffer_len = buffer.byte_len();
     let ok = unsafe {
-        // SAFETY: buffer is writable for the byte count reported by Windows.
+        // SAFETY: buffer is writable for the aligned byte count allocated above.
         GetTokenInformation(
             token,
             TokenUser,
-            buffer.as_mut_ptr().cast(),
-            needed,
+            buffer.as_mut_ptr(),
+            buffer_len,
             &mut needed,
         )
     };
@@ -543,8 +554,9 @@ fn token_user_identity(token: HANDLE) -> io::Result<UserIdentity> {
     }
 
     let token_user = unsafe {
-        // SAFETY: A successful TokenUser query initializes TOKEN_USER at the buffer start.
-        &*(buffer.as_ptr().cast::<TOKEN_USER>())
+        // SAFETY: A successful TokenUser query initializes a valid TOKEN_USER
+        // header and its SID remains backed by `buffer` for this call.
+        buffer.assume_init_header()
     };
     sid_to_identity(token_user.User.Sid)
 }
@@ -559,14 +571,15 @@ fn token_integrity_rid(token: HANDLE) -> io::Result<u32> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut buffer = vec![0_u8; usize::try_from(needed).map_err(|_| io::ErrorKind::InvalidData)?];
+    let mut buffer = TokenInformationBuffer::<TOKEN_MANDATORY_LABEL>::new(needed)?;
+    let buffer_len = buffer.byte_len();
     let ok = unsafe {
-        // SAFETY: buffer is writable for the byte count reported by Windows.
+        // SAFETY: buffer is writable for the aligned byte count allocated above.
         GetTokenInformation(
             token,
             TokenIntegrityLevel,
-            buffer.as_mut_ptr().cast(),
-            needed,
+            buffer.as_mut_ptr(),
+            buffer_len,
             &mut needed,
         )
     };
@@ -576,8 +589,8 @@ fn token_integrity_rid(token: HANDLE) -> io::Result<u32> {
 
     let mandatory_label = unsafe {
         // SAFETY: A successful TokenIntegrityLevel query initializes
-        // TOKEN_MANDATORY_LABEL at the buffer start.
-        &*(buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())
+        // TOKEN_MANDATORY_LABEL and its SID remains backed by `buffer`.
+        buffer.assume_init_header()
     };
     integrity_rid_from_sid(mandatory_label.Label.Sid)
 }
@@ -688,12 +701,47 @@ impl Drop for RevertGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::endpoint_for_label;
+    use std::sync::mpsc;
+    use tokio::net::windows::named_pipe::ServerOptions;
 
     fn identity(user: &str, integrity_rid: u32) -> WindowsSecurityIdentity {
         WindowsSecurityIdentity {
             user: UserIdentity::Sid(user.into()),
             integrity_rid,
         }
+    }
+
+    #[tokio::test]
+    async fn peer_identity_query_owns_handle_after_accept_future_drop() -> io::Result<()> {
+        let endpoint = endpoint_for_label(format!("peer-identity-cancel-{}", std::process::id()))?;
+        let server = ServerOptions::new().create(endpoint.as_pipe_name())?;
+        let _client = connect_windows_pipe(endpoint.as_pipe_name()).await?;
+        server.connect().await?;
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let query = spawn_peer_identity_query(&server, move |handle| {
+            entered_tx
+                .send(())
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(io::Error::other)?;
+            peer_identity_from_handle(handle.as_raw_handle() as HANDLE)
+        })?;
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(io::Error::other)?;
+        // Dropping the stream models cancellation of `LocalListener::accept`
+        // after its blocking identity worker has started.
+        drop(server);
+        release_tx.send(()).map_err(io::Error::other)?;
+
+        let peer = query.await.map_err(io::Error::other)??;
+        assert_eq!(peer.pid, std::process::id());
+        Ok(())
     }
 
     #[test]

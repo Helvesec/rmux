@@ -207,6 +207,11 @@
   recorded in
   [ledger entry C-D54](docs/compat/tmux-3.7-divergences.md) and backed by
   [control EOF tests](crates/rmux-server/src/control/tests.rs).
+- Starts control-mode subscriptions for an existing session at the pane output
+  cursor captured by `attach-session`, `new-session -A`, or `switch-client`, so
+  historical pane output is not replayed while output from a newly created
+  session remains available. This matches tmux 3.7b and is backed by
+  [control CLI tests](tests/cli_surface.rs).
 - Bounds every retained attached-input family: ambiguous keyboard prefixes use
   `escape-time`, recognized streaming paste/OSC/APC bodies use an eight-second
   idle budget, malformed or oversized SGR mouse frames are consumed within a

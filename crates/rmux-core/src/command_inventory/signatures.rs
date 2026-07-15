@@ -213,7 +213,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("source-file", "(source) [-Fnqv] [-t target-pane] path ..."),
     (
         "split-window",
-        "(splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]",
+        "(splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane][shell-command]",
     ),
     ("start-server", "(start) "),
     ("suspend-client", "(suspendc) [-t target-client]"),

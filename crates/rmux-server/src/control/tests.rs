@@ -26,8 +26,8 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::server_access::current_owner_uid;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
-    ControlMode, Request, Response, RmuxError, SessionName, ShowBufferRequest, WaitForMode,
-    WaitForRequest, WaitForResponse,
+    ControlMode, KillSessionRequest, NewSessionRequest, Request, Response, RmuxError, SessionName,
+    ShowBufferRequest, WaitForMode, WaitForRequest, WaitForResponse,
 };
 
 const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1639,6 +1639,159 @@ async fn immediate_socket_eof_preserves_fast_attach_query_payloads_and_guards() 
     assert!(
         rendered.ends_with("%exit\n"),
         "EOF remains the final control record: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn control_control_eof_reconciles_ready_session_change_before_exit() {
+    // tmux 3.7b keeps `-CC new-session` attached after terminal EOF and
+    // delivers pane output before `%exit`. Hold the RMUX transport in its EOF
+    // path until both the attach command result and SessionChangedAt are ready
+    // so the biased-select ordering is deterministic.
+    let handler = Arc::new(RequestHandler::new());
+    let requester_pid = 42_430;
+    let session_name =
+        SessionName::new("control-control-eof-session-race").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let pane_output = handler
+        .control_session_panes(&session_name)
+        .await
+        .expect("session pane output is available")
+        .into_iter()
+        .next()
+        .expect("initial pane has an output sender")
+        .1;
+
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 1,
+                mode: ControlMode::ControlControl,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::clone(&closing),
+        )
+        .await;
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    let attach_pause = handler.install_created_session_control_attach_pause(session_name.clone());
+    let eof_pause = install_control_eof_queue_lease_pause(identity);
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let _requester_access_guard = handler.begin_detached_requester_access(requester_pid, true);
+    let handler_for_control = Arc::clone(&handler);
+    let command =
+        format!("new-session -A -s {session_name} ; set-buffer -b control-cc-race-ready done\n");
+    let control_task = tokio::spawn(async move {
+        let result = forward_control_identity(
+            server_stream,
+            Arc::clone(&handler_for_control),
+            identity,
+            ControlUpgradeInput::with_mode(command.into_bytes(), 1, ControlMode::ControlControl),
+            shutdown_rx,
+            event_rx,
+            ControlLifecycle {
+                closing,
+                shutdown_handle,
+            },
+        )
+        .await;
+        handler_for_control
+            .finish_control(requester_pid, control_id)
+            .await;
+        result
+    });
+
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, attach_pause.reached.notified())
+        .await
+        .expect("attach command reaches the pre-commit pause");
+    client_stream
+        .shutdown()
+        .await
+        .expect("client write half closes");
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, eof_pause.reached.notified())
+        .await
+        .expect("forward loop observes EOF while attach is active");
+
+    attach_pause.release.notify_one();
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, async {
+        loop {
+            let ready = handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some("control-cc-race-ready".to_owned()),
+                }))
+                .await
+                .command_output()
+                .is_some_and(|output| output.stdout() == b"done");
+            if ready {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("attach command completes while the forward loop remains paused");
+    pane_output.send(b"CONTROL_CC_RACE_LIVE".to_vec());
+    eof_pause.release.notify_one();
+
+    let mut rendered = Vec::new();
+    let saw_live_output = tokio::time::timeout(CONTROL_TEST_TIMEOUT, async {
+        let mut read_buffer = [0_u8; 1024];
+        loop {
+            let bytes_read = client_stream
+                .read(&mut read_buffer)
+                .await
+                .expect("control output read succeeds");
+            if bytes_read == 0 {
+                return false;
+            }
+            rendered.extend_from_slice(&read_buffer[..bytes_read]);
+            if rendered
+                .windows(b"CONTROL_CC_RACE_LIVE".len())
+                .any(|window| window == b"CONTROL_CC_RACE_LIVE")
+            {
+                return true;
+            }
+        }
+    })
+    .await
+    .expect("control client produces live output or closes before timeout");
+    assert!(
+        saw_live_output,
+        "ready SessionChangedAt must be reconciled before EOF exit: {:?}",
+        String::from_utf8_lossy(&rendered)
+    );
+
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: session_name,
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+    assert!(
+        String::from_utf8_lossy(&rendered).contains("%exit"),
+        "session teardown terminates the control client: {:?}",
+        String::from_utf8_lossy(&rendered)
     );
 }
 

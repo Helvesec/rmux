@@ -53,6 +53,8 @@ const POLL_TIMEOUT: Timespec = Timespec {
     tv_nsec: 100_000_000,
 };
 const RENDER_MAX_PENDING: Duration = Duration::from_millis(8);
+const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TERMINATION_OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Runs the attach loop using the process stdin/stdout streams.
 pub fn attach_terminal(stream: UnixStream) -> std::result::Result<(), ClientError> {
@@ -148,8 +150,12 @@ where
         termination_signals_enabled: true,
     };
     let result = drive_attach_with_terminal_state(attach_state, input, output);
-    if result.is_err() && !screen_tracker.was_stopped() {
-        let _ = raw_terminal.restore_attach_terminal_state();
+    if result.is_err() {
+        if termination::was_requested() {
+            let _ = raw_terminal.restore_after_termination();
+        } else if !screen_tracker.was_stopped() {
+            let _ = raw_terminal.restore_attach_terminal_state();
+        }
     }
     let _ = raw_terminal.flush_pending_input();
     drop(raw_terminal);
@@ -317,6 +323,7 @@ where
         &locked,
         &action_screen_tracker,
         event_rx,
+        state.termination_signals_enabled,
     );
     locked.close();
     closed.store(true, Ordering::SeqCst);
@@ -452,7 +459,7 @@ where
 fn output_loop_with_termination<Output>(
     mut stream: UnixStream,
     initial_bytes: Vec<u8>,
-    mut output: Output,
+    output: Output,
     closed: Arc<AtomicBool>,
     locked: Arc<AttachLockState>,
     screen_tracker: AttachScreenTracker,
@@ -462,6 +469,7 @@ fn output_loop_with_termination<Output>(
 where
     Output: Write,
 {
+    let mut output = termination::TerminationAwareWriter::new(output, termination_signals_enabled);
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&initial_bytes);
     let mut read_buffer = [0_u8; READ_BUFFER_SIZE];
@@ -714,7 +722,7 @@ fn read_attach_stream(
 
     loop {
         if termination::was_requested() {
-            return Err(attach_termination_error());
+            return Err(termination::interruption_error());
         }
         let mut fds = [PollFd::new(
             &*stream,
@@ -727,7 +735,7 @@ fn read_attach_stream(
             Err(error) => return Err(error.into()),
         }
         if termination::was_requested() {
-            return Err(attach_termination_error());
+            return Err(termination::interruption_error());
         }
         if fds[0].revents().is_empty() {
             continue;
@@ -740,16 +748,9 @@ fn fail_if_attach_termination_requested(
     termination_signals_enabled: bool,
 ) -> std::result::Result<(), ClientError> {
     if termination_signals_enabled && termination::was_requested() {
-        return Err(ClientError::Io(attach_termination_error()));
+        return Err(ClientError::Io(termination::interruption_error()));
     }
     Ok(())
-}
-
-fn attach_termination_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Interrupted,
-        "attach interrupted by a termination signal",
-    )
 }
 
 fn handle_attach_data_payload<Output>(
@@ -807,9 +808,34 @@ fn wait_for_output_thread(
     locked: &Arc<AttachLockState>,
     screen_tracker: &AttachScreenTracker,
     event_rx: mpsc::Receiver<ClientAttachEvent>,
+    termination_signals_enabled: bool,
 ) -> std::result::Result<std::result::Result<(), ClientError>, ClientError> {
-    while let Ok(ClientAttachEvent::Action(action)) = event_rx.recv() {
-        handle_attach_action(raw_terminal, lock_stream, locked, screen_tracker, action)?;
+    if termination_signals_enabled {
+        loop {
+            if termination::was_requested() {
+                wait_for_backpressured_output_shutdown(&output_thread, raw_terminal, &event_rx);
+                return Err(ClientError::Io(termination::interruption_error()));
+            }
+            match event_rx.recv_timeout(TERMINATION_POLL_INTERVAL) {
+                Ok(ClientAttachEvent::Action(action)) => {
+                    handle_attach_action(
+                        raw_terminal,
+                        lock_stream,
+                        locked,
+                        screen_tracker,
+                        action,
+                    )?;
+                }
+                Ok(ClientAttachEvent::OutputDone) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    } else {
+        while let Ok(ClientAttachEvent::Action(action)) = event_rx.recv() {
+            handle_attach_action(raw_terminal, lock_stream, locked, screen_tracker, action)?;
+        }
     }
 
     while let Ok(event) = event_rx.try_recv() {
@@ -822,6 +848,28 @@ fn wait_for_output_thread(
     }
 
     join_attach_thread(output_thread)
+}
+
+fn wait_for_backpressured_output_shutdown(
+    output_thread: &thread::JoinHandle<std::result::Result<(), ClientError>>,
+    raw_terminal: Option<&RawTerminal>,
+    event_rx: &mpsc::Receiver<ClientAttachEvent>,
+) {
+    termination::interrupt_thread(output_thread);
+    let _nonblocking_output =
+        raw_terminal.and_then(|raw_terminal| raw_terminal.interrupt_output_writer().ok());
+    let deadline = Instant::now() + TERMINATION_OUTPUT_SHUTDOWN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match event_rx.recv_timeout(remaining) {
+            Ok(ClientAttachEvent::OutputDone) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(ClientAttachEvent::Action(_)) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+        }
+    }
 }
 
 fn send_attach_action(

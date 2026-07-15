@@ -353,7 +353,7 @@ mod tests {
         let scoped = chunks
             .iter()
             .filter(|chunk| chunk.kind == OutputWriteKind::ScopedVtInput)
-            .map(|chunk| chunk.bytes.as_slice())
+            .flat_map(|chunk| chunk.bytes.iter().copied())
             .collect::<Vec<_>>();
 
         for expected in [
@@ -367,7 +367,9 @@ mod tests {
             b"\x1b[?2031l".as_slice(),
         ] {
             assert!(
-                scoped.contains(&expected),
+                scoped
+                    .windows(expected.len())
+                    .any(|window| window == expected),
                 "missing scoped reset: {expected:?}"
             );
         }

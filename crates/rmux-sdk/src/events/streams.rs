@@ -271,6 +271,9 @@ impl PaneOutputStream {
             response => return Err(unexpected_response("subscribe-pane-output", response)),
         };
 
+        // Stream polling is a sequence of independent operations. Do not
+        // retain the already-consumed setup deadline in the returned stream.
+        let transport = transport.reusable();
         let unsubscribe =
             Request::UnsubscribePaneOutput(UnsubscribePaneOutputRequest { subscription_id });
         let drop_guard = DropGuard::best_effort(transport.clone(), unsubscribe);

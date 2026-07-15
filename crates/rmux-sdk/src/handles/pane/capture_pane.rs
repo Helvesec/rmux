@@ -180,13 +180,13 @@ impl<'a> PaneCaptureBuilder<'a> {
     }
 
     async fn run(self) -> Result<PaneCapture> {
-        let target = self.pane.required_resolved_proto_target_ref().await?;
+        let pane = self.pane.begin_operation_handle();
+        let target = pane.required_resolved_proto_target_ref().await?;
         let pane_id = target
             .pane_id()
             .expect("resolved SDK pane capture targets are id-based");
         let print = self.buffer_name.is_none();
-        match self
-            .pane
+        match pane
             .transport()
             .request(Request::CapturePaneTargetAction(Box::new(
                 CapturePaneTargetActionRequest {

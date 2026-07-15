@@ -8,7 +8,7 @@ use std::thread;
 
 use rmux_ipc::BlockingLocalStream;
 use rmux_proto::{encode_attach_message, AttachMessage, TerminalSize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
 use crate::ClientError;
@@ -244,7 +244,7 @@ where
     let (input_tx, input_rx) = mpsc::channel(ATTACH_INPUT_QUEUE_CAPACITY);
     let lock_state = Arc::new(AttachLockState::default());
     let input_lock_state = Arc::clone(&lock_state);
-    let input_thread = thread::spawn(move || input_loop(input, input_tx, input_lock_state));
+    let (input_thread, input_completion_rx) = spawn_input_worker(input, input_tx, input_lock_state);
     let (action_tx, action_rx) = std_mpsc::channel();
     let (action_completion_tx, action_completion_rx) = mpsc::unbounded_channel();
     let action_lock_state = Arc::clone(&lock_state);
@@ -268,6 +268,7 @@ where
                 Arc::clone(&lock_state),
                 windows_console_key_enabled,
             )
+            .with_input_completion(input_completion_rx)
             .with_error_cleanup(error_cleanup),
         )
         .await
@@ -275,7 +276,10 @@ where
 
     lock_state.close();
     let input_result = match input_join_policy {
-        InputJoinPolicy::JoinOnClose => join_attach_thread(input_thread)?,
+        InputJoinPolicy::JoinOnClose => {
+            join_attach_thread(input_thread)?;
+            Ok(())
+        }
         InputJoinPolicy::DetachOnClose => Ok(()),
     };
     let action_result = join_attach_thread(action_thread)?;
@@ -283,6 +287,25 @@ where
     output_result?;
     action_result?;
     input_result
+}
+
+fn spawn_input_worker<Input>(
+    input: Input,
+    input_tx: mpsc::Sender<input::AttachInput>,
+    lock_state: Arc<AttachLockState>,
+) -> (
+    thread::JoinHandle<()>,
+    oneshot::Receiver<std::result::Result<(), ClientError>>,
+)
+where
+    Input: Read + AsRawHandle + Send + 'static,
+{
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let worker = thread::spawn(move || {
+        let result = input_loop(input, input_tx, lock_state);
+        let _ = completion_tx.send(result);
+    });
+    (worker, completion_rx)
 }
 
 fn action_loop<Actions>(
@@ -473,9 +496,9 @@ fn closed_resize_rx() -> mpsc::UnboundedReceiver<TerminalSize> {
     resize_rx
 }
 
-fn join_attach_thread(
-    thread: thread::JoinHandle<std::result::Result<(), ClientError>>,
-) -> std::result::Result<std::result::Result<(), ClientError>, ClientError> {
+fn join_attach_thread<Output>(
+    thread: thread::JoinHandle<Output>,
+) -> std::result::Result<Output, ClientError> {
     thread
         .join()
         .map_err(|_| ClientError::Io(io::Error::other("attach thread panicked")))
@@ -484,15 +507,32 @@ fn join_attach_thread(
 #[cfg(test)]
 mod tests {
     use std::fs::File;
-    use std::io::{self, Write};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::io::{self, Read, Write};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::sync::Arc;
 
     use tokio::sync::mpsc;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Pipes::CreatePipe;
 
-    use super::{input_join_policy, input_loop, AttachLockState, InputJoinPolicy};
+    use super::{
+        input_join_policy, input_loop, join_attach_thread, spawn_input_worker, AttachLockState,
+        ClientError, InputJoinPolicy,
+    };
+
+    struct InvalidHandleInput;
+
+    impl Read for InvalidHandleInput {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            panic!("an invalid wait handle must fail before attempting a read")
+        }
+    }
+
+    impl AsRawHandle for InvalidHandleInput {
+        fn as_raw_handle(&self) -> RawHandle {
+            1_usize as RawHandle
+        }
+    }
 
     #[test]
     fn pipe_stdin_handles_are_detached_on_attach_close() {
@@ -526,6 +566,22 @@ mod tests {
         assert_eq!(
             input_join_policy(console_like),
             InputJoinPolicy::DetachOnClose
+        );
+    }
+
+    #[test]
+    fn input_worker_publishes_wait_failure_before_exiting() {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let lock_state = Arc::new(AttachLockState::default());
+        let (worker, completion_rx) = spawn_input_worker(InvalidHandleInput, input_tx, lock_state);
+
+        let completion = completion_rx
+            .blocking_recv()
+            .expect("input worker must publish its result");
+        join_attach_thread(worker).expect("input worker must not panic");
+        assert!(
+            matches!(completion, Err(ClientError::Io(_))),
+            "invalid wait handle must surface as an input I/O error: {completion:?}"
         );
     }
 

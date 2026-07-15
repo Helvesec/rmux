@@ -1914,6 +1914,10 @@ mod tests {
         assert!(matches!(
             control_rx.try_recv(),
             Ok(ControlServerEvent::SessionChanged(Some(ref session_name)))
+                | Ok(ControlServerEvent::SessionChangedAt {
+                    ref session_name,
+                    ..
+                })
                 if session_name == &alpha
         ));
         let pause = install_switch_target_identity_pause(beta.clone());
@@ -2489,6 +2493,10 @@ mod tests {
         assert!(matches!(
             old_rx.try_recv(),
             Ok(ControlServerEvent::SessionChanged(Some(ref session_name)))
+                | Ok(ControlServerEvent::SessionChangedAt {
+                    ref session_name,
+                    ..
+                })
                 if session_name == &alpha
         ));
         let pause = install_switch_target_identity_pause(beta.clone());
@@ -2537,6 +2545,10 @@ mod tests {
         assert!(matches!(
             replacement_rx.try_recv(),
             Ok(ControlServerEvent::SessionChanged(Some(ref session_name)))
+                | Ok(ControlServerEvent::SessionChangedAt {
+                    ref session_name,
+                    ..
+                })
                 if session_name == &alpha
         ));
         pause.release.notify_one();
@@ -2602,6 +2614,10 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv(),
             Ok(ControlServerEvent::SessionChanged(Some(ref session_name)))
+                | Ok(ControlServerEvent::SessionChangedAt {
+                    ref session_name,
+                    ..
+                })
                 if session_name == &alpha
         ));
 

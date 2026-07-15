@@ -483,7 +483,7 @@ impl RequestHandler {
                         }
                     }
                     if self
-                        .prepare_created_session_control_attach(
+                        .prepare_existing_session_control_attach(
                             requester_pid,
                             &session_name,
                             session_id,

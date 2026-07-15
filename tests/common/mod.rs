@@ -27,8 +27,8 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::termios::{tcgetattr, tcgetwinsize, tcsetattr, OptionalActions, SpecialCodeIndex};
 
 pub(crate) use attach::{
-    drain_attach_output, drain_attach_output_bytes, read_until_contains, read_until_contains_all,
-    AttachedSession,
+    assert_termios_eq, drain_attach_output, drain_attach_output_bytes, prepare_canonical_termios,
+    read_until_contains, read_until_contains_all, AttachedSession,
 };
 pub(crate) use cli::{
     acquire_empty_socket_path_lock, assert_clap_failure, assert_success, stderr, stdout,

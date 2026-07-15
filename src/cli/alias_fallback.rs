@@ -4,7 +4,7 @@ use std::path::Path;
 use rmux_client::{connect, resolve_socket_path, resolve_tmux_compatible_socket_path, Connection};
 use rmux_core::{
     command_inventory::{has_tmux_command_candidate, RMUX_EXTENSION_COMMANDS},
-    command_parser::CommandParser,
+    command_parser::{is_parse_time_assignment, CommandParser},
 };
 use rmux_proto::OptionScopeSelector;
 
@@ -144,10 +144,31 @@ pub(super) fn runtime_command_resolution_after_startup(
 /// used by later groups before the complete queue is parsed.
 pub(super) fn first_cold_start_command(args: &[OsString]) -> Option<Command> {
     let (_, invocation) = prepare_runtime_command_invocation(args)?;
-    let first_group = invocation.groups.first()?;
+    let first_group = first_raw_command_group(&invocation.arguments);
+    let assignment_count = usize::from(
+        first_group
+            .first()
+            .is_some_and(|argument| is_parse_time_assignment(argument)),
+    );
+    let first_group = first_group.get(assignment_count..)?;
+    if first_group.is_empty() {
+        return None;
+    }
     let first_args =
         std::iter::once(OsString::from("rmux")).chain(first_group.iter().map(OsString::from));
     parse(first_args).ok()?.command
+}
+
+fn first_raw_command_group(arguments: &[String]) -> &[String] {
+    let end = arguments
+        .iter()
+        .position(|argument| {
+            argument
+                .strip_suffix(';')
+                .is_some_and(|base| !base.ends_with('\\'))
+        })
+        .map_or(arguments.len(), |index| index + 1);
+    &arguments[..end]
 }
 
 fn prepare_runtime_command_invocation(
@@ -292,20 +313,6 @@ fn alias_lookup_command_name(group: &[String]) -> Option<&str> {
     } else {
         Some(first)
     }
-}
-
-// Keep this in lockstep with rmux-core's argv assignment grammar: an ASCII
-// identifier followed by `=`, with the remainder belonging to the value.
-fn is_parse_time_assignment(argument: &str) -> bool {
-    let Some((name, _)) = argument.split_once('=') else {
-        return false;
-    };
-    let mut characters = name.chars();
-    let Some(first) = characters.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == '_')
-        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 fn normalize_alias_fallback_error(error: ExitFailure) -> ExitFailure {
@@ -466,6 +473,45 @@ mod tests {
 
         let invalid_first = args(&["rmux", "not-a-command", ";", "new-session", "-d"]);
         assert!(first_cold_start_command(&invalid_first).is_none());
+    }
+
+    #[test]
+    fn cold_start_probe_accepts_parse_time_assignment_before_first_command() {
+        let invocation = args(&[
+            "rmux",
+            "FOO=x",
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            ";",
+            "runtime-alias",
+        ]);
+
+        assert!(matches!(
+            first_cold_start_command(&invocation),
+            Some(Command::NewSession(_))
+        ));
+    }
+
+    #[test]
+    fn cold_start_probe_preserves_escaped_semicolon_arguments() {
+        let invocation = args(&[
+            "rmux",
+            "FOO=x",
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "shell\\;",
+            ";",
+            "runtime-alias",
+        ]);
+
+        let Some(Command::NewSession(command)) = first_cold_start_command(&invocation) else {
+            panic!("first command should remain new-session");
+        };
+        assert_eq!(command.command, ["shell;"]);
     }
 
     #[test]

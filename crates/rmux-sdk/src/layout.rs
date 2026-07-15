@@ -220,11 +220,17 @@ async fn apply_grid_inner(
 ) -> Result<PaneSet> {
     let capacity = validate_grid(builder.columns, builder.rows)?;
     validate_pane_count(builder.panes.len(), capacity)?;
+    let session = builder.session.begin_operation_handle();
+    let deadline = session
+        .operation_deadline()
+        .expect("operation session always carries a deadline scope");
 
-    let window = builder.session.window(builder.window_index);
+    let window = session
+        .window(builder.window_index)
+        .with_operation_deadline(deadline);
     let mut existing = window.panes().await?;
     if existing.len() != 1 && builder.replace_existing_panes {
-        close_extra_panes(builder.session, &existing).await?;
+        close_extra_panes(&session, &existing).await?;
         existing = window.panes().await?;
     }
     if existing.len() != 1 {
@@ -237,13 +243,13 @@ async fn apply_grid_inner(
     }
 
     let root_target = &existing[0].target;
-    let root = builder
-        .session
-        .pane(root_target.window_index, root_target.pane_index);
+    let root = session
+        .pane(root_target.window_index, root_target.pane_index)
+        .with_operation_deadline(deadline);
     let mut panes = vec![None; builder.panes.len()];
 
     let root_pane = configure_existing_root(
-        builder.session,
+        &session,
         root,
         &builder.panes[0],
         builder.replace_existing_root_process,
@@ -259,7 +265,7 @@ async fn apply_grid_inner(
         let spec_index = row * builder.columns;
         let anchor = row_anchors[row - 1].clone();
         let pane = split_new_pane(
-            builder.session,
+            &session,
             &anchor,
             SplitDirection::Down,
             &builder.panes[spec_index],
@@ -281,7 +287,7 @@ async fn apply_grid_inner(
             .skip(row_start + 1)
         {
             let pane = split_new_pane(
-                builder.session,
+                &session,
                 &previous,
                 SplitDirection::Right,
                 &builder.panes[spec_index],
@@ -293,7 +299,7 @@ async fn apply_grid_inner(
         }
     }
 
-    spread_window(builder.session, builder.window_index).await?;
+    spread_window(&session, builder.window_index).await?;
     Ok(PaneSet::new(
         panes
             .into_iter()
@@ -309,8 +315,16 @@ async fn rollback_created_panes(mut panes: Vec<Pane>) {
 }
 
 async fn close_extra_panes(session: &Session, panes: &[crate::WindowPane]) -> Result<()> {
+    let deadline = session
+        .operation_deadline()
+        .expect("layout cleanup runs inside an operation scope");
     for pane in panes.iter().skip(1).rev() {
-        session.pane_by_id(pane.id).await?.close().await?;
+        session
+            .pane_by_id(pane.id)
+            .await?
+            .with_operation_deadline(deadline)
+            .close()
+            .await?;
     }
     Ok(())
 }
@@ -363,6 +377,10 @@ async fn split_new_pane(
     direction: SplitDirection,
     spec: &LayoutPaneSpec,
 ) -> Result<Pane> {
+    let deadline = session
+        .operation_deadline()
+        .expect("layout split runs inside an operation scope");
+    let anchor = anchor.with_operation_deadline(deadline);
     let mut split = anchor.split_with(direction);
     if let Some(cwd) = spec.cwd.clone() {
         split = split.cwd(cwd);
@@ -385,7 +403,11 @@ async fn split_new_pane(
 }
 
 async fn stable_pane(session: &Session, pane: &Pane) -> Result<Pane> {
+    let deadline = session
+        .operation_deadline()
+        .expect("layout identity lookup runs inside an operation scope");
     let pane_id = pane
+        .with_operation_deadline(deadline)
         .id()
         .await?
         .ok_or_else(|| layout_error("created pane vanished before its id could be read"))?;
@@ -448,3 +470,7 @@ fn layout_error(message: impl Into<String>) -> RmuxError {
         message.into()
     )))
 }
+
+#[cfg(test)]
+#[path = "layout_tests.rs"]
+mod tests;

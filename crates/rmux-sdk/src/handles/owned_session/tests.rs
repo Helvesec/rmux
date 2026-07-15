@@ -365,6 +365,43 @@ async fn owner_exit_retains_stable_wire_address_for_renew_and_release() {
 }
 
 #[tokio::test]
+async fn owner_exit_marks_the_lease_lost_when_a_renewal_never_answers() {
+    let (builder, mut daemon, session_name) =
+        start_owned_builder(CleanupPolicy::KillOnOwnerExit).await;
+    answer_new_session(&mut daemon, session_name).await;
+    answer_lease_identity_handshake(&mut daemon, current_capabilities()).await;
+    assert!(matches!(
+        daemon.read_request().await,
+        Request::CreateSessionLease(_)
+    ));
+    daemon
+        .write_response(Response::CreateSessionLease(CreateSessionLeaseResponse {
+            token: 11,
+            ttl_millis: 600,
+        }))
+        .await;
+
+    let owned = builder
+        .await
+        .expect("builder task joins")
+        .expect("leased owner builds");
+    let mut state = owned
+        .lease_state_receiver()
+        .expect("owner-exit exposes lease state");
+    assert!(matches!(
+        daemon.read_request().await,
+        Request::RenewSessionLease(_)
+    ));
+
+    tokio::time::timeout(Duration::from_secs(2), state.changed())
+        .await
+        .expect("silent renewal must be bounded by the lease TTL")
+        .expect("owned lease state sender remains live");
+    assert_eq!(*state.borrow(), LeaseState::Lost);
+    assert!(owned.lease_lost());
+}
+
+#[tokio::test]
 async fn owner_exit_rejects_legacy_identity_addressing_before_mutation() {
     let mut capabilities = SUPPORTED_CAPABILITIES
         .iter()
@@ -422,6 +459,124 @@ async fn owner_exit_rolls_back_created_session_when_lease_creation_fails() {
         error.to_string().contains("injected lease rejection"),
         "rollback must preserve the source error: {error}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn owned_session_builder_shares_one_deadline_through_lease_creation() {
+    let (client_stream, server_stream) = tokio::io::duplex(8192);
+    let rmux = Rmux::from_connected_transport(
+        crate::RmuxEndpoint::UnixSocket("/unused/rmux.sock".into()),
+        Some(Duration::from_millis(100)),
+        TransportClient::spawn(client_stream).into_fixture_transport(),
+    );
+    let builder = tokio::spawn(async move {
+        rmux.owned_session(SessionName::new("deadline-owner").expect("valid session name"))
+            .cleanup_policy(CleanupPolicy::KillOnOwnerExit)
+            .lease_ttl(Duration::from_millis(600))
+            .await
+    });
+    let mut daemon = FakeDaemon::new(server_stream);
+
+    assert!(matches!(daemon.read_request().await, Request::Handshake(_)));
+    tokio::time::advance(Duration::from_millis(30)).await;
+    daemon
+        .write_response(Response::Handshake(HandshakeResponse {
+            wire_version: RMUX_WIRE_VERSION,
+            capabilities: current_capabilities(),
+        }))
+        .await;
+
+    answer_new_session(
+        &mut daemon,
+        SessionName::new("deadline-owner").expect("valid session name"),
+    )
+    .await;
+    tokio::time::advance(Duration::from_millis(30)).await;
+
+    let Request::Handshake(handshake) = daemon.read_request().await else {
+        panic!("lease setup must negotiate stable identity addressing");
+    };
+    assert!(handshake
+        .required_capabilities
+        .iter()
+        .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2));
+    daemon
+        .write_response(Response::Handshake(HandshakeResponse {
+            wire_version: RMUX_WIRE_VERSION,
+            capabilities: current_capabilities(),
+        }))
+        .await;
+    tokio::time::advance(Duration::from_millis(30)).await;
+
+    assert!(matches!(
+        daemon.read_request().await,
+        Request::CreateSessionLease(_)
+    ));
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let error = builder
+        .await
+        .expect("owned-session builder task must not panic")
+        .expect_err("lease response after the shared deadline must time out");
+    assert!(
+        contains_transport_timeout(&error),
+        "expected operation timeout, got {error:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn creation_rollback_gets_a_fresh_deadline_after_the_public_operation_expires() {
+    let (client_stream, server_stream) = tokio::io::duplex(8192);
+    let timeout = Duration::from_millis(100);
+    let transport = TransportClient::spawn(client_stream)
+        .with_default_timeout(Some(timeout))
+        .with_operation_deadline(crate::transport::OperationDeadline::from_timeout(Some(
+            timeout,
+        )));
+    let mut daemon = FakeDaemon::new(server_stream);
+    tokio::time::advance(timeout).await;
+
+    let rollback_transport = transport.clone();
+    let rollback = tokio::spawn(async move {
+        let mut guard = DropGuard::best_effort(
+            rollback_transport.reusable(),
+            session_identity_kill_request(SessionId::new(42)),
+        );
+        rollback_owned_session_creation(
+            SessionId::new(42),
+            RmuxError::protocol(rmux_proto::RmuxError::Server(
+                "injected lease timeout".to_owned(),
+            )),
+            &mut guard,
+            &rollback_transport,
+        )
+        .await
+    });
+
+    let request = tokio::time::timeout(Duration::from_millis(10), daemon.read_request())
+        .await
+        .expect("rollback must send KillSession despite the expired public deadline");
+    let Request::KillSession(request) = request else {
+        panic!("rollback must send a stable-identity KillSession request");
+    };
+    assert_eq!(request.target.as_str(), "$42");
+    daemon
+        .write_response(Response::KillSession(KillSessionResponse { existed: true }))
+        .await;
+
+    let error = rollback.await.expect("rollback task joins");
+    assert!(
+        matches!(error, RmuxError::Protocol { .. }),
+        "successful rollback must preserve only the source error: {error:?}"
+    );
+    assert!(error.to_string().contains("injected lease timeout"));
+}
+
+fn contains_transport_timeout(error: &RmuxError) -> bool {
+    match error {
+        RmuxError::Transport { source, .. } => source.kind() == std::io::ErrorKind::TimedOut,
+        RmuxError::Collect { source } => source.errors().iter().any(contains_transport_timeout),
+        _ => false,
+    }
 }
 
 async fn start_owned_builder(
@@ -511,8 +666,11 @@ fn current_capabilities() -> Vec<String> {
 }
 
 async fn answer_lease_identity_handshake(daemon: &mut FakeDaemon, capabilities: Vec<String>) {
-    let Request::Handshake(handshake) = daemon.read_request().await else {
-        panic!("owned-session lease must negotiate identity addressing on its connection");
+    let request = daemon.read_request().await;
+    let Request::Handshake(handshake) = request else {
+        panic!(
+            "owned-session lease must negotiate identity addressing on its connection, got {request:?}"
+        );
     };
     assert!(handshake
         .required_capabilities

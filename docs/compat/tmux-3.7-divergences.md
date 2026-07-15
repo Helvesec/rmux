@@ -245,22 +245,6 @@ and fail-closed, but does not expose the flags through help, completions, or
 Inventory impact: the public command surface must not advertise these flags
 until parser, runtime, and oracle-backed behavior land together.
 
-### C-D43: control-mode attach replays initial pane backlog
-
-tmux 3.7b does not replay existing pane backlog as `%output` during the
-measured control-mode attach. RMUX emits the pane's current backlog as initial
-`%output`, which is useful for RMUX control clients that expect an immediate
-snapshot.
-
-Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records
-`tmux -C -L r4 -f /dev/null attach -t w` after sending `printf old` producing
-`%begin`, `%end`, `%session-changed $0 w`, `%exit` and no `%output`. The same
-RMUX control attach emits `%output %0 ... printf old ... old ...` before
-`%exit`.
-
-Inventory impact: control-mode compatibility claims must exclude initial
-backlog replay until RMUX either removes it or adds a negotiated mode.
-
 ### C-D44: shutdown hook run-shell delivery is best effort
 
 tmux 3.7b drains more shutdown-time `run-shell` hook markers before server exit.

@@ -1,5 +1,5 @@
 use super::{LexToken, Lexer};
-use crate::command_parser::CommandParseError;
+use crate::command_parser::{is_parse_time_assignment, CommandParseError};
 
 impl<'a> Lexer<'a> {
     pub(super) fn read_token(&mut self, ch: char) -> Result<String, CommandParseError> {
@@ -400,16 +400,8 @@ enum QuoteState {
 }
 
 pub(super) fn classify_word(word: String) -> LexToken {
-    if word.contains('=') && word.chars().next().is_some_and(|ch| is_var_char(ch, true)) {
-        let mut chars = word.chars().skip(1);
-        for ch in &mut chars {
-            if ch == '=' {
-                return LexToken::Equals(word);
-            }
-            if !is_var_char(ch, false) {
-                break;
-            }
-        }
+    if is_parse_time_assignment(&word) {
+        return LexToken::Equals(word);
     }
 
     LexToken::Token(word)

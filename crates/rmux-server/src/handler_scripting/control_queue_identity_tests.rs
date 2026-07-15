@@ -500,7 +500,11 @@ async fn control_queue_new_session_rejects_same_name_replacement_before_attach()
     }
     while let Ok(event) = control_events.try_recv() {
         match event {
-            ControlServerEvent::SessionChanged(Some(changed_session)) => {
+            ControlServerEvent::SessionChanged(Some(changed_session))
+            | ControlServerEvent::SessionChangedAt {
+                session_name: changed_session,
+                ..
+            } => {
                 assert_ne!(
                     changed_session, session_name,
                     "replacement must stay unbound"
@@ -613,7 +617,11 @@ async fn control_queue_new_session_attach_existing_rejects_same_name_replacement
     }
     while let Ok(event) = control_events.try_recv() {
         match event {
-            ControlServerEvent::SessionChanged(Some(changed_session)) => {
+            ControlServerEvent::SessionChanged(Some(changed_session))
+            | ControlServerEvent::SessionChangedAt {
+                session_name: changed_session,
+                ..
+            } => {
                 assert_ne!(
                     changed_session, session_name,
                     "replacement must stay unbound"
@@ -724,7 +732,11 @@ async fn control_queue_new_session_attach_existing_binds_captured_identity() {
     let mut saw_window_add = false;
     while let Ok(event) = control_events.try_recv() {
         match event {
-            ControlServerEvent::SessionChanged(Some(changed_session)) => {
+            ControlServerEvent::SessionChanged(Some(changed_session))
+            | ControlServerEvent::SessionChangedAt {
+                session_name: changed_session,
+                ..
+            } => {
                 saw_session_changed |= changed_session == session_name;
             }
             ControlServerEvent::Notification(line) => {
@@ -739,7 +751,10 @@ async fn control_queue_new_session_attach_existing_binds_captured_identity() {
         saw_session_changed,
         "control binding event must be delivered"
     );
-    assert!(saw_window_add, "selected window must be announced");
+    assert!(
+        !saw_window_add,
+        "an existing session's window must not be announced as newly added"
+    );
 }
 
 async fn create_session(handler: &RequestHandler, session_name: SessionName) {

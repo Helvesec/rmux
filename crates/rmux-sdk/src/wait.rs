@@ -330,9 +330,19 @@ where
     if remaining.is_zero() {
         return Err(wait_timeout_error(operation, timeout));
     }
-    tokio::time::timeout(remaining, future)
-        .await
-        .map_err(|_| wait_timeout_error(operation, timeout))?
+    match tokio::time::timeout(remaining, future).await {
+        Ok(Err(RmuxError::Transport { source, .. }))
+            if source.kind() == io::ErrorKind::TimedOut =>
+        {
+            // The transport shares this wait's absolute deadline, so its
+            // request timer may win the race against the outer wait timer.
+            // Keep the original typed I/O cause while exposing the stable
+            // public wait operation instead of an internal RPC label.
+            Err(RmuxError::transport(operation, source))
+        }
+        Ok(result) => result,
+        Err(_) => Err(wait_timeout_error(operation, timeout)),
+    }
 }
 
 pub(crate) async fn snapshot_with_wait_deadline(

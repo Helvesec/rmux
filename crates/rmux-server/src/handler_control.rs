@@ -92,6 +92,39 @@ pub(crate) struct ControlClientIdentity {
     control_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlOutputStart {
+    Current,
+    Oldest,
+}
+
+struct ControlSessionUpdate<'a> {
+    target_selection: Option<SwitchTargetSelection>,
+    client_environment: Option<&'a HashMap<String, String>>,
+    output_start: ControlOutputStart,
+}
+
+impl<'a> ControlSessionUpdate<'a> {
+    fn existing(
+        target_selection: Option<SwitchTargetSelection>,
+        client_environment: Option<&'a HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            target_selection,
+            client_environment,
+            output_start: ControlOutputStart::Current,
+        }
+    }
+
+    fn created() -> Self {
+        Self {
+            target_selection: None,
+            client_environment: None,
+            output_start: ControlOutputStart::Oldest,
+        }
+    }
+}
+
 impl ControlClientIdentity {
     pub(crate) const fn new(requester_pid: u32, control_id: u64) -> Self {
         Self {
@@ -770,8 +803,7 @@ impl RequestHandler {
             next_session_name,
             None,
             None,
-            None,
-            None,
+            ControlSessionUpdate::existing(None, None),
         )
         .await
     }
@@ -788,8 +820,7 @@ impl RequestHandler {
             Some(next_session_name),
             Some(expected_session_id),
             None,
-            None,
-            None,
+            ControlSessionUpdate::existing(None, None),
         )
         .await
     }
@@ -808,8 +839,24 @@ impl RequestHandler {
             Some(next_session_name),
             Some(expected_session_id),
             Some(expected_control_id),
-            target_selection,
-            client_environment,
+            ControlSessionUpdate::existing(target_selection, client_environment),
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn set_created_control_session_for_client_identity(
+        &self,
+        requester_pid: u32,
+        expected_control_id: u64,
+        next_session_name: rmux_proto::SessionName,
+        expected_session_id: SessionId,
+    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
+        self.set_control_session_with_expected_identity(
+            requester_pid,
+            Some(next_session_name),
+            Some(expected_session_id),
+            Some(expected_control_id),
+            ControlSessionUpdate::created(),
         )
         .await
     }
@@ -827,6 +874,7 @@ impl RequestHandler {
             .session_by_id(target_session_id)?
             .name()
             .clone();
+        let pane_sequences = current_pane_output_sequences(&state, &target_session_name).ok()?;
         let mut active_control = self.active_control.lock().await;
         let active = active_control
             .by_pid
@@ -840,6 +888,7 @@ impl RequestHandler {
             active,
             Some(target_session_name.clone()),
             Some(target_session_id),
+            Some(pane_sequences),
         );
         if !delivered {
             active_control.by_pid.remove(&requester_pid);
@@ -859,9 +908,13 @@ impl RequestHandler {
         next_session_name: Option<rmux_proto::SessionName>,
         expected_session_id: Option<SessionId>,
         expected_control_id: Option<u64>,
-        target_selection: Option<SwitchTargetSelection>,
-        client_environment: Option<&HashMap<String, String>>,
+        update: ControlSessionUpdate<'_>,
     ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
+        let ControlSessionUpdate {
+            target_selection,
+            client_environment,
+            output_start,
+        } = update;
         let exact_client_identity = expected_control_id.is_some();
         let command_name = if exact_client_identity {
             "switch-client"
@@ -897,6 +950,13 @@ impl RequestHandler {
             }
             None => None,
         };
+        let pane_sequences = match output_start {
+            ControlOutputStart::Current => next_session_name
+                .as_ref()
+                .map(|session_name| current_pane_output_sequences(&state, session_name))
+                .transpose()?,
+            ControlOutputStart::Oldest => None,
+        };
         let mut active_control = self.active_control.lock().await;
         let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
             return Err(attached_client_required(command_name));
@@ -914,8 +974,12 @@ impl RequestHandler {
                 .expect("a switch target selection carries a stable session identity");
             selection.validate_for_session_identity(&state, session_name, session_id)?;
         }
-        let (previous, delivered) =
-            update_control_session(active, next_session_name.clone(), next_session_id);
+        let (previous, delivered) = update_control_session(
+            active,
+            next_session_name.clone(),
+            next_session_id,
+            pane_sequences,
+        );
         if !delivered {
             active_control.by_pid.remove(&requester_pid);
             return Err(attached_client_required(command_name));
@@ -949,6 +1013,37 @@ impl RequestHandler {
         session_name: &rmux_proto::SessionName,
         expected_session_id: Option<SessionId>,
     ) -> Result<bool, rmux_proto::RmuxError> {
+        self.attach_control_session_for_queue_with_output_start(
+            identity,
+            session_name,
+            expected_session_id,
+            false,
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn attach_created_control_session_for_queue(
+        &self,
+        identity: ControlClientIdentity,
+        session_name: &rmux_proto::SessionName,
+        expected_session_id: Option<SessionId>,
+    ) -> Result<bool, rmux_proto::RmuxError> {
+        self.attach_control_session_for_queue_with_output_start(
+            identity,
+            session_name,
+            expected_session_id,
+            true,
+        )
+        .await
+    }
+
+    async fn attach_control_session_for_queue_with_output_start(
+        &self,
+        identity: ControlClientIdentity,
+        session_name: &rmux_proto::SessionName,
+        expected_session_id: Option<SessionId>,
+        replay_from_oldest: bool,
+    ) -> Result<bool, rmux_proto::RmuxError> {
         let mut state = self.state.lock().await;
         let mut active_control = self.active_control.lock().await;
         Self::validate_control_queue_identity_locked(
@@ -979,12 +1074,24 @@ impl RequestHandler {
             return Ok(false);
         }
 
+        let pane_sequences = if replay_from_oldest {
+            None
+        } else {
+            Some(current_pane_output_sequences(&state, session_name)?)
+        };
+
         let delivered = {
             let active = active_control
                 .by_pid
                 .get_mut(&identity.requester_pid())
                 .expect("validated control client remains registered while locked");
-            update_control_session(active, Some(session_name.clone()), Some(session_id)).1
+            update_control_session(
+                active,
+                Some(session_name.clone()),
+                Some(session_id),
+                pane_sequences,
+            )
+            .1
         };
         if !delivered {
             active_control.by_pid.remove(&identity.requester_pid());
@@ -1341,6 +1448,7 @@ fn update_control_session(
     active: &mut ActiveControl,
     next_session_name: Option<rmux_proto::SessionName>,
     next_session_id: Option<SessionId>,
+    pane_sequences: Option<Vec<(u32, u64)>>,
 ) -> (Option<rmux_proto::SessionName>, bool) {
     let previous = active.session_name.clone();
     if let (Some(previous_session), Some(previous_session_id), Some(next_session), Some(next_id)) = (
@@ -1356,11 +1464,31 @@ fn update_control_session(
     }
     active.session_name = next_session_name.clone();
     active.session_id = next_session_id;
-    let delivered = try_send_control_event(
-        active,
-        ControlServerEvent::SessionChanged(next_session_name),
-    );
+    let event = match (next_session_name, pane_sequences) {
+        (Some(session_name), Some(pane_sequences)) => ControlServerEvent::SessionChangedAt {
+            session_name,
+            pane_sequences,
+        },
+        (next_session_name, None) => ControlServerEvent::SessionChanged(next_session_name),
+        (None, Some(_)) => unreachable!("pane cursors require a control session"),
+    };
+    let delivered = try_send_control_event(active, event);
     (previous, delivered)
+}
+
+fn current_pane_output_sequences(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+) -> Result<Vec<(u32, u64)>, rmux_proto::RmuxError> {
+    state.session_pane_outputs(session_name).map(|outputs| {
+        outputs
+            .into_iter()
+            .map(|(pane_id, sender)| {
+                let (sequence, ()) = sender.capture_with_next_sequence(|| ());
+                (pane_id, sequence)
+            })
+            .collect()
+    })
 }
 
 fn deliver_control_notification(

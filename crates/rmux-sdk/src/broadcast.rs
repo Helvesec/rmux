@@ -196,14 +196,18 @@ pub(crate) async fn broadcast(panes: &[Pane], input: Input<'_>) -> Result<Broadc
             successes: Vec::new(),
         });
     }
-    if same_endpoint(panes) {
-        match broadcast_daemon_side(panes, input).await {
+    let panes = panes
+        .iter()
+        .map(Pane::begin_operation_handle)
+        .collect::<Vec<_>>();
+    if same_endpoint(&panes) {
+        match broadcast_daemon_side(&panes, input).await {
             Ok(result) => return Ok(result),
             Err(error) if is_daemon_broadcast_unavailable(&error) => {}
             Err(error) => return Err(error),
         }
     }
-    broadcast_client_side(panes, input).await
+    broadcast_client_side(&panes, input).await
 }
 
 async fn broadcast_daemon_side(panes: &[Pane], input: Input<'_>) -> Result<BroadcastResult> {
@@ -455,15 +459,20 @@ impl fmt::Display for RenderBroadcastFailure<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::time::Duration;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::Instant;
 
     use super::{broadcast, Input};
     use crate::transport::TransportClient;
-    use crate::{Pane, PaneId, PaneRef, RmuxEndpoint, SessionName};
+    use crate::{Pane, PaneId, PaneRef, RmuxEndpoint, RmuxError, SessionName};
     use rmux_proto::{
         encode_frame, CommandOutput, FrameDecoder, HandshakeRequest, HandshakeResponse,
-        ListPanesResponse, PaneInputRequest, PaneTargetRef, Request, Response, SendKeysResponse,
-        CAPABILITY_HANDSHAKE, CAPABILITY_SDK_PANE_BROADCAST, CAPABILITY_SDK_PANE_BY_ID,
+        ListPanesResponse, PaneBroadcastInputResponse, PaneBroadcastInputSuccess, PaneInputRequest,
+        PaneTarget, PaneTargetRef, Request, Response, SendKeysResponse, CAPABILITY_HANDSHAKE,
+        CAPABILITY_SDK_PANE_BROADCAST, CAPABILITY_SDK_PANE_BY_ID,
     };
 
     #[tokio::test]
@@ -562,6 +571,68 @@ mod tests {
         assert_eq!(result.successes()[0].pane_id(), Some(PaneId::new(1)));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn daemon_broadcast_shares_identity_and_delivery_deadline() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let transport = TransportClient::spawn(client_stream);
+        transport
+            .cache_capabilities(vec![
+                CAPABILITY_HANDSHAKE.to_owned(),
+                CAPABILITY_SDK_PANE_BY_ID.to_owned(),
+                CAPABILITY_SDK_PANE_BROADCAST.to_owned(),
+            ])
+            .await;
+        let session_name = SessionName::new("broadcastdeadline").expect("valid session name");
+        let pane = Pane::new(
+            PaneRef::new(session_name.clone(), 0, 0),
+            RmuxEndpoint::Default,
+            Some(Duration::from_millis(50)),
+            transport,
+        );
+        let server = tokio::spawn(async move {
+            assert!(matches!(
+                read_request(&mut server_stream).await,
+                Request::ListPanes(_)
+            ));
+            tokio::time::sleep(Duration::from_millis(35)).await;
+            write_response(
+                &mut server_stream,
+                Response::ListPanes(ListPanesResponse {
+                    output: CommandOutput::from_stdout("0:0:%1\n"),
+                }),
+            )
+            .await;
+
+            assert!(matches!(
+                read_request(&mut server_stream).await,
+                Request::PaneBroadcastInput(_)
+            ));
+            tokio::time::sleep(Duration::from_millis(35)).await;
+            write_response(
+                &mut server_stream,
+                Response::PaneBroadcastInput(PaneBroadcastInputResponse {
+                    key_count: 1,
+                    successes: vec![PaneBroadcastInputSuccess {
+                        target_index: 0,
+                        target: PaneTarget::with_window(session_name, 0, 0),
+                        pane_id: Some(PaneId::new(1)),
+                    }],
+                    failures: Vec::new(),
+                }),
+            )
+            .await;
+        });
+
+        let started = Instant::now();
+        let error = broadcast(&[pane], Input::Text("hello"))
+            .await
+            .expect_err("delivery must use the identity lookup's remaining budget");
+
+        assert_eq!(Instant::now() - started, Duration::from_millis(50));
+        assert_timed_out(error);
+        server.abort();
+    }
+
     async fn read_request(stream: &mut tokio::io::DuplexStream) -> Request {
         let mut decoder = FrameDecoder::new();
         let mut buffer = [0_u8; 256];
@@ -584,5 +655,14 @@ mod tests {
         let frame = encode_frame(&response).expect("response encodes");
         stream.write_all(&frame).await.expect("write response");
         stream.flush().await.expect("flush response");
+    }
+
+    fn assert_timed_out(error: RmuxError) {
+        match error {
+            RmuxError::Transport { source, .. } => {
+                assert_eq!(source.kind(), io::ErrorKind::TimedOut);
+            }
+            error => panic!("expected transport timeout, got {error:?}"),
+        }
     }
 }

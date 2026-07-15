@@ -2,7 +2,9 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rmux_proto::{encode_frame, FrameDecoder, Request, Response, SdkWaitId, SdkWaitOwnerId};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -10,10 +12,14 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{Result, RmuxError};
 
+mod cancellation;
+mod deadline;
 mod failure;
 mod pending;
 mod state;
 
+use cancellation::OrderedResponseGuard;
+pub(crate) use deadline::OperationDeadline;
 use failure::TransportFailure;
 pub(crate) use pending::PendingResponse;
 use pending::{PendingCall, PendingResponseAction};
@@ -28,7 +34,12 @@ const TRANSPORT_SHUTDOWN_OPERATION: &str = "shut down rmux SDK transport";
 #[derive(Clone)]
 pub(crate) struct TransportClient {
     commands: mpsc::Sender<ActorMessage>,
+    actor: tokio::task::AbortHandle,
     state: Arc<TransportState>,
+    default_timeout: Option<Duration>,
+    operation_deadline: Option<OperationDeadline>,
+    #[cfg(test)]
+    fixture_transport: bool,
 }
 
 impl TransportClient {
@@ -38,8 +49,60 @@ impl TransportClient {
     {
         let (commands, receiver) = mpsc::channel(ACTOR_QUEUE_CAPACITY);
         let state = Arc::new(TransportState::default());
-        tokio::spawn(run_actor(stream, receiver, state.clone()));
-        Self { commands, state }
+        let actor = tokio::spawn(run_actor(stream, receiver, state.clone())).abort_handle();
+        Self {
+            commands,
+            actor,
+            state,
+            default_timeout: None,
+            operation_deadline: None,
+            #[cfg(test)]
+            fixture_transport: false,
+        }
+    }
+
+    /// Returns a reusable client whose individual requests use `timeout`.
+    /// Any prior operation scope is deliberately cleared.
+    pub(crate) fn with_default_timeout(&self, timeout: Option<Duration>) -> Self {
+        let mut client = self.clone();
+        client.default_timeout = timeout;
+        client.operation_deadline = None;
+        client
+    }
+
+    /// Clears an operation scope while preserving the reusable timeout.
+    pub(crate) fn reusable(&self) -> Self {
+        self.with_default_timeout(self.default_timeout)
+    }
+
+    /// Returns a clone scoped to one already-started public operation.
+    pub(crate) fn with_operation_deadline(&self, deadline: OperationDeadline) -> Self {
+        let mut client = self.clone();
+        client.operation_deadline = Some(deadline);
+        client
+    }
+
+    /// Starts a fresh operation from this reusable client's configured default.
+    pub(crate) fn begin_operation(&self) -> Self {
+        self.operation_deadline.map_or_else(
+            || self.with_operation_deadline(OperationDeadline::from_timeout(self.default_timeout)),
+            |_| self.clone(),
+        )
+    }
+
+    pub(crate) const fn operation_deadline(&self) -> Option<OperationDeadline> {
+        self.operation_deadline
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_fixture_transport(mut self) -> Self {
+        self.fixture_transport = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn is_fixture_transport(&self) -> bool {
+        self.fixture_transport
     }
 
     pub(crate) async fn request(&self, request: Request) -> Result<Response> {
@@ -49,16 +112,24 @@ impl TransportClient {
         }
 
         let (reply, response) = oneshot::channel();
-        self.commands
-            .send(ActorMessage::Request {
-                request,
-                operation: operation.clone(),
-                reply,
-            })
-            .await
-            .map_err(|_| self.closed_error(&operation))?;
+        let mut cancellation = OrderedResponseGuard::new(self);
+        let result = self
+            .run_with_deadline(&operation, async {
+                self.commands
+                    .send(ActorMessage::Request {
+                        request,
+                        operation: operation.clone(),
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| self.closed_error(&operation))?;
+                cancellation.arm();
 
-        response.await.map_err(|_| self.closed_error(&operation))?
+                response.await.map_err(|_| self.closed_error(&operation))?
+            })
+            .await;
+        cancellation.disarm();
+        result
     }
 
     pub(crate) async fn armed_request(&self, request: Request) -> Result<PendingResponse> {
@@ -73,23 +144,37 @@ impl TransportClient {
             TransportFailure::invalid_data("armed transport requests must be SDK wait requests")
                 .to_error(&operation)
         })?;
-        self.commands
-            .send(ActorMessage::ArmedRequest {
-                request,
-                operation: operation.clone(),
-                reply,
-                armed,
-                wait_id,
+        // The operation deadline covers dispatch through the daemon's armed
+        // acknowledgement. The returned wait owns its separate match timeout.
+        let mut cancellation = OrderedResponseGuard::new(self);
+        let armed_result = self
+            .run_with_deadline(&operation, async {
+                self.commands
+                    .send(ActorMessage::ArmedRequest {
+                        request,
+                        operation: operation.clone(),
+                        reply,
+                        armed,
+                        wait_id,
+                    })
+                    .await
+                    .map_err(|_| self.closed_error(&operation))?;
+                cancellation.arm();
+
+                armed_response
+                    .await
+                    .map_err(|_| self.closed_error(&operation))?
+                    .map_err(|failure| failure.to_error(&operation))
             })
-            .await
-            .map_err(|_| self.closed_error(&operation))?;
+            .await;
 
-        armed_response
-            .await
-            .map_err(|_| self.closed_error(&operation))?
-            .map_err(|failure| failure.to_error(&operation))?;
-
-        Ok(PendingResponse::new(operation, response))
+        match armed_result {
+            Ok(()) => Ok(PendingResponse::new(operation, response, cancellation)),
+            Err(error) => {
+                cancellation.disarm();
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn shutdown(&self) -> Result<()> {
@@ -101,14 +186,22 @@ impl TransportClient {
         }
 
         let (reply, response) = oneshot::channel();
-        self.commands
-            .send(ActorMessage::Shutdown { reply })
-            .await
-            .map_err(|_| self.closed_error(TRANSPORT_SHUTDOWN_OPERATION))?;
+        let mut cancellation = OrderedResponseGuard::new(self);
+        let result = self
+            .run_with_deadline(TRANSPORT_SHUTDOWN_OPERATION, async {
+                self.commands
+                    .send(ActorMessage::Shutdown { reply })
+                    .await
+                    .map_err(|_| self.closed_error(TRANSPORT_SHUTDOWN_OPERATION))?;
+                cancellation.arm();
 
-        response
-            .await
-            .map_err(|_| self.closed_error(TRANSPORT_SHUTDOWN_OPERATION))?
+                response
+                    .await
+                    .map_err(|_| self.closed_error(TRANSPORT_SHUTDOWN_OPERATION))?
+            })
+            .await;
+        cancellation.disarm();
+        result
     }
 
     /// Immediately tears down a dedicated transport without waiting for any
@@ -117,7 +210,7 @@ impl TransportClient {
         if self.state.terminal_failure().is_some() {
             return;
         }
-        let _ = self.commands.try_send(ActorMessage::Abort);
+        self.abort_with(TransportFailure::actor_closed());
     }
 
     fn try_send_best_effort(&self, request: Request) {
@@ -149,6 +242,33 @@ impl TransportClient {
             .terminal_failure()
             .unwrap_or_else(TransportFailure::actor_closed)
             .to_error(operation)
+    }
+
+    async fn run_with_deadline<F, T>(&self, operation: &str, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let deadline = self
+            .operation_deadline
+            .unwrap_or_else(|| OperationDeadline::from_timeout(self.default_timeout));
+        let Some(remaining) = deadline.remaining_timeout() else {
+            return future.await;
+        };
+
+        match tokio::time::timeout(remaining, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                let requested = deadline.requested_timeout().unwrap_or(remaining);
+                let failure = TransportFailure::timed_out(requested);
+                self.abort_with(failure.clone());
+                Err(failure.to_error(operation))
+            }
+        }
+    }
+
+    fn abort_with(&self, failure: TransportFailure) {
+        self.state.set_terminal_failure(failure.clone());
+        self.actor.abort();
     }
 }
 
@@ -230,7 +350,6 @@ enum ActorMessage {
     Shutdown {
         reply: oneshot::Sender<Result<()>>,
     },
-    Abort,
 }
 
 enum ActorEvent {
@@ -247,6 +366,10 @@ where
     let (events, mut event_receiver) = mpsc::channel(ACTOR_QUEUE_CAPACITY * 2);
     let command_task = tokio::spawn(forward_commands(commands, events.clone()));
     let read_task = tokio::spawn(forward_responses(reader, events));
+    let _child_tasks = ActorChildTasks {
+        command: command_task,
+        reader: read_task,
+    };
     let mut pending = VecDeque::new();
     let mut commands_closed = false;
     let mut shutdown_reply = None;
@@ -334,13 +457,6 @@ where
                             }
                         }
                     }
-                    ActorMessage::Abort => {
-                        let failure = TransportFailure::actor_closed();
-                        let _ = writer.shutdown().await;
-                        fail_shutdown(&mut shutdown_reply, &failure);
-                        fail_transport(&mut pending, &state, failure);
-                        break;
-                    }
                 }
             }
             ActorEvent::CommandsClosed => {
@@ -387,9 +503,18 @@ where
             break;
         }
     }
+}
 
-    command_task.abort();
-    read_task.abort();
+struct ActorChildTasks {
+    command: tokio::task::JoinHandle<()>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ActorChildTasks {
+    fn drop(&mut self) {
+        self.command.abort();
+        self.reader.abort();
+    }
 }
 
 fn reject_command_after_shutdown(message: ActorMessage) {
@@ -415,7 +540,6 @@ fn reject_command_after_shutdown(message: ActorMessage) {
             let failure = TransportFailure::actor_closed();
             let _ = reply.send(Err(failure.to_error(TRANSPORT_SHUTDOWN_OPERATION)));
         }
-        ActorMessage::Abort => {}
     }
 }
 

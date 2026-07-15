@@ -2,16 +2,22 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rmux_proto::AttachShellCommand;
+use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
 use rustix::process::{kill_process, Pid, Signal};
 use rustix::termios::{
     tcflush, tcgetattr, tcsetattr, OptionalActions, QueueSelector, SpecialCodeIndex, Termios,
 };
 
 use super::terminal_cleanup::fallback_attach_stop_sequence;
+
+const TERMINATION_OUTPUT_RETRY: Duration = Duration::from_millis(100);
+const TERMINATION_OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 pub(super) fn current_process_pid() -> io::Result<Pid> {
     let raw = i32::try_from(std::process::id())
@@ -174,10 +180,69 @@ impl RawTerminal {
         Ok(())
     }
 
+    pub(super) fn restore_after_termination(&self) -> Result<()> {
+        self.restore()?;
+        let _flags = self.interrupt_output_writer()?;
+        let mut terminal = File::from(self.fd.as_fd().try_clone_to_owned()?);
+        write_cleanup_with_deadline(
+            &mut terminal,
+            &fallback_attach_stop_sequence(&std::env::var("TERM").unwrap_or_default()),
+        )
+        .map_err(AttachError::Io)
+    }
+
+    pub(super) fn interrupt_output_writer(&self) -> Result<FileStatusFlagsGuard<'_>> {
+        let flags = FileStatusFlagsGuard::set_nonblocking(self.fd.as_fd())?;
+        tcflush(&self.fd, QueueSelector::OFlush)?;
+        Ok(flags)
+    }
+
     pub(super) fn flush_pending_input(&self) -> Result<()> {
         tcflush(&self.fd, QueueSelector::IFlush)?;
         Ok(())
     }
+}
+
+pub(super) struct FileStatusFlagsGuard<'fd> {
+    fd: BorrowedFd<'fd>,
+    original: OFlags,
+}
+
+impl<'fd> FileStatusFlagsGuard<'fd> {
+    fn set_nonblocking(fd: BorrowedFd<'fd>) -> Result<Self> {
+        let original = fcntl_getfl(fd).map_err(io::Error::from)?;
+        fcntl_setfl(fd, original | OFlags::NONBLOCK).map_err(io::Error::from)?;
+        Ok(Self { fd, original })
+    }
+}
+
+impl Drop for FileStatusFlagsGuard<'_> {
+    fn drop(&mut self) {
+        let _ = fcntl_setfl(self.fd, self.original);
+    }
+}
+
+fn write_cleanup_with_deadline(output: &mut File, mut bytes: &[u8]) -> io::Result<()> {
+    let deadline = Instant::now() + TERMINATION_OUTPUT_RETRY;
+    while !bytes.is_empty() {
+        match output.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write terminal cleanup after attach termination",
+                ))
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(TERMINATION_OUTPUT_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    output.flush()
 }
 
 impl Drop for RawTerminal {

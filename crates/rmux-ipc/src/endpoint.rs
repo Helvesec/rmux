@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 
 #[cfg(windows)]
-use rmux_os::identity::{IdentityResolver, UserIdentity};
+use rmux_os::identity::{IdentityResolver, TokenInformationBuffer, UserIdentity};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
@@ -489,14 +489,15 @@ pub(crate) fn current_integrity_label() -> io::Result<&'static str> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut buffer = vec![0_u8; usize::try_from(needed).map_err(|_| io::ErrorKind::InvalidData)?];
+    let mut buffer = TokenInformationBuffer::<TOKEN_MANDATORY_LABEL>::new(needed)?;
+    let buffer_len = buffer.byte_len();
     let ok = unsafe {
-        // SAFETY: buffer is writable for the reported byte count and token is valid.
+        // SAFETY: buffer is writable for the aligned byte count allocated above.
         GetTokenInformation(
             token.get(),
             TokenIntegrityLevel,
-            buffer.as_mut_ptr().cast(),
-            needed,
+            buffer.as_mut_ptr(),
+            buffer_len,
             &mut needed,
         )
     };
@@ -505,8 +506,9 @@ pub(crate) fn current_integrity_label() -> io::Result<&'static str> {
     }
 
     let mandatory_label = unsafe {
-        // SAFETY: TokenIntegrityLevel initializes TOKEN_MANDATORY_LABEL at the buffer start.
-        &*(buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())
+        // SAFETY: A successful TokenIntegrityLevel query initializes the
+        // header and its SID remains backed by `buffer` for this call.
+        buffer.assume_init_header()
     };
     integrity_label_from_sid(mandatory_label.Label.Sid)
 }

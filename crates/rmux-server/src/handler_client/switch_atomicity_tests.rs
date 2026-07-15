@@ -759,7 +759,8 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
         .expect("initial control session set succeeds");
     assert!(matches!(
         event_rx.try_recv(),
-        Ok(ControlServerEvent::SessionChanged(Some(_)))
+        Ok(ControlServerEvent::SessionChanged(Some(_))
+            | ControlServerEvent::SessionChangedAt { .. })
     ));
     drop(event_rx);
 

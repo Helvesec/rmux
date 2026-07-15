@@ -51,8 +51,9 @@ pub struct PaneRenderStream {
 
 impl PaneRenderStream {
     pub(crate) async fn open(pane: Pane) -> Result<Self> {
-        let output = pane.output_stream().await?;
-        let baseline = pane.snapshot().await?;
+        let operation_pane = pane.begin_operation_handle();
+        let output = operation_pane.output_stream().await?;
+        let baseline = operation_pane.snapshot().await?;
         Ok(Self {
             pane,
             output,

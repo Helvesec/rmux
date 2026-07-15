@@ -7,9 +7,9 @@ use super::super::RequestHandler;
 
 #[cfg(test)]
 #[derive(Debug, Default)]
-pub(in crate::handler) struct CreatedSessionControlAttachPause {
-    pub(in crate::handler) reached: tokio::sync::Notify,
-    pub(in crate::handler) release: tokio::sync::Notify,
+pub(crate) struct CreatedSessionControlAttachPause {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -22,7 +22,7 @@ static CREATED_SESSION_CONTROL_ATTACH_PAUSES: std::sync::Mutex<
 
 impl RequestHandler {
     #[cfg(test)]
-    pub(in crate::handler) fn install_created_session_control_attach_pause(
+    pub(crate) fn install_created_session_control_attach_pause(
         &self,
         session_name: SessionName,
     ) -> std::sync::Arc<CreatedSessionControlAttachPause> {

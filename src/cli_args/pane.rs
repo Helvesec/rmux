@@ -452,7 +452,7 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) start_directory: Option<PathBuf>,
     #[arg(short = 'l', allow_hyphen_values = true, group = "size_spec")]
     pub(crate) size: Option<String>,
-    #[arg(short = 'p', hide = true, allow_hyphen_values = true)]
+    #[arg(short = 'p', allow_hyphen_values = true)]
     pub(crate) percentage: Option<String>,
     #[arg(short = 'F', allow_hyphen_values = true)]
     pub(crate) format: Option<String>,

@@ -1,4 +1,5 @@
 use std::io;
+use std::time::Duration;
 
 use rmux_proto::Response;
 
@@ -70,6 +71,23 @@ impl TransportFailure {
         Self {
             kind: io::ErrorKind::BrokenPipe,
             message: "rmux transport actor is closed".to_owned(),
+            protocol_error: None,
+        }
+    }
+
+    pub(super) fn cancelled_ordered_request() -> Self {
+        Self {
+            kind: io::ErrorKind::BrokenPipe,
+            message: "rmux SDK request was cancelled while its ordered response was pending"
+                .to_owned(),
+            protocol_error: None,
+        }
+    }
+
+    pub(super) fn timed_out(timeout: Duration) -> Self {
+        Self {
+            kind: io::ErrorKind::TimedOut,
+            message: format!("rmux SDK operation timed out after {timeout:?}"),
             protocol_error: None,
         }
     }

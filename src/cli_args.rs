@@ -30,8 +30,9 @@ mod config;
 #[cfg(test)]
 pub(crate) use config::build_scope;
 pub(crate) use config::{
-    SetEnvironmentArgs, SetHookArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs,
-    ShowHooksArgs, ShowOptionsArgs, ShowOptionsCommandKind,
+    SetEnvironmentArgs, SetHookArgs, SetOptionArgs, SetOptionCommandKind, SetWindowOptionArgs,
+    ShowEnvironmentArgs, ShowHooksArgs, ShowOptionsArgs, ShowOptionsCommandKind,
+    ShowWindowOptionsArgs,
 };
 #[path = "cli_args/control.rs"]
 mod control;
@@ -244,8 +245,14 @@ where
     normalized.push(binary);
 
     let mut passthrough = false;
+    let mut preserve_hyphen_value = false;
     for argument in args {
         if passthrough {
+            normalized.push(argument);
+            continue;
+        }
+        if preserve_hyphen_value {
+            preserve_hyphen_value = false;
             normalized.push(argument);
             continue;
         }
@@ -260,6 +267,11 @@ where
         }
         if !value.starts_with('-') || value == "-" {
             passthrough = true;
+            normalized.push(argument);
+            continue;
+        }
+        if matches!(value, "-L" | "-S" | "-T") {
+            preserve_hyphen_value = true;
             normalized.push(argument);
             continue;
         }

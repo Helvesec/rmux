@@ -483,6 +483,10 @@ async fn exit_empty_shutdown_waits_for_last_session_control_cleanup() {
     assert!(matches!(
         event_rx.try_recv(),
         Ok(crate::control::ControlServerEvent::SessionChanged(Some(ref session_name)))
+            | Ok(crate::control::ControlServerEvent::SessionChangedAt {
+                ref session_name,
+                ..
+            })
             if session_name == &alpha
     ));
 

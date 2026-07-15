@@ -57,6 +57,7 @@ mod subscriptions;
 #[cfg(any(unix, windows))]
 use subscriptions::{
     drain_ready_pane_events, handle_pane_event, refresh_subscriptions, PaneEvent, PaneSubscription,
+    PaneSubscriptionStart,
 };
 
 #[cfg(any(unix, windows))]
@@ -116,6 +117,10 @@ impl ControlClientFlags {
 #[derive(Debug, Clone)]
 pub(crate) enum ControlServerEvent {
     SessionChanged(Option<SessionName>),
+    SessionChangedAt {
+        session_name: SessionName,
+        pane_sequences: Vec<(u32, u64)>,
+    },
     Refresh,
     Notification(String),
     Exit(Option<String>),
@@ -289,6 +294,7 @@ async fn forward_control_inner(
         session_name.as_ref(),
         &mut subscriptions,
         pane_event_tx.clone(),
+        PaneSubscriptionStart::Now,
     )
     .await;
     while let Ok(event) = server_events.try_recv() {
@@ -312,6 +318,8 @@ async fn forward_control_inner(
 
     loop {
         if current_command.is_none() {
+            let reconcile_ready_control_attach =
+                input_closed && mode.is_control_control() && session_name.is_none();
             let mut event_context = ServerEventContext {
                 handler: &handler,
                 requester_pid,
@@ -327,6 +335,24 @@ async fn forward_control_inner(
             };
             if flush_deferred_server_events(&mut event_context).await? {
                 return Ok(());
+            }
+            if reconcile_ready_control_attach {
+                // A successful attach publishes its session-change event before
+                // the command task returns. When EOF and both futures are ready,
+                // the biased select below deliberately observes command
+                // completion first. Reconcile the bounded snapshot of events
+                // that were already published before treating a still-unbound
+                // -CC client as terminal. New arrivals are left to the select,
+                // so a continuous producer cannot starve EOF.
+                let ready_server_event_count = server_events.len();
+                for _ in 0..ready_server_event_count {
+                    let Ok(event) = server_events.try_recv() else {
+                        break;
+                    };
+                    if handle_server_event(event, &mut event_context, false).await? {
+                        return Ok(());
+                    }
+                }
             }
         }
         if lifecycle.closing.load(Ordering::SeqCst) && current_command.is_none() {
@@ -942,7 +968,7 @@ async fn handle_server_event(
     match event {
         ControlServerEvent::SessionChanged(next_session) => {
             if command_active {
-                context.deferred.defer_session_change(next_session);
+                context.deferred.defer_session_change(next_session, None);
                 return Ok(false);
             }
             *context.session_name = next_session;
@@ -951,6 +977,27 @@ async fn handle_server_event(
                 context.session_name.as_ref(),
                 context.subscriptions,
                 context.pane_event_tx.clone(),
+                PaneSubscriptionStart::Oldest,
+            )
+            .await;
+        }
+        ControlServerEvent::SessionChangedAt {
+            session_name: next_session,
+            pane_sequences,
+        } => {
+            if command_active {
+                context
+                    .deferred
+                    .defer_session_change(Some(next_session), Some(pane_sequences));
+                return Ok(false);
+            }
+            *context.session_name = Some(next_session);
+            refresh_subscriptions(
+                context.handler,
+                context.session_name.as_ref(),
+                context.subscriptions,
+                context.pane_event_tx.clone(),
+                PaneSubscriptionStart::Sequences(&pane_sequences),
             )
             .await;
         }
@@ -960,6 +1007,7 @@ async fn handle_server_event(
                 context.session_name.as_ref(),
                 context.subscriptions,
                 context.pane_event_tx.clone(),
+                PaneSubscriptionStart::Oldest,
             )
             .await;
         }
@@ -1029,14 +1077,20 @@ async fn flush_deferred_server_events(context: &mut ServerEventContext<'_>) -> i
         }
     }
 
-    if let Some(next_session) = context.deferred.session_change.take() {
-        if handle_server_event(
-            ControlServerEvent::SessionChanged(next_session),
-            context,
-            false,
-        )
-        .await?
-        {
+    if let Some(DeferredSessionChange {
+        session_name,
+        pane_sequences,
+    }) = context.deferred.session_change.take()
+    {
+        let event = match (session_name, pane_sequences) {
+            (Some(session_name), Some(pane_sequences)) => ControlServerEvent::SessionChangedAt {
+                session_name,
+                pane_sequences,
+            },
+            (next_session, None) => ControlServerEvent::SessionChanged(next_session),
+            (None, Some(_)) => unreachable!("pane cursors require a control session"),
+        };
+        if handle_server_event(event, context, false).await? {
             return Ok(true);
         }
     }
@@ -1068,8 +1122,15 @@ struct ServerEventContext<'a> {
 struct DeferredServerEvents {
     notifications: VecDeque<String>,
     notification_bytes: usize,
-    session_change: Option<Option<SessionName>>,
+    session_change: Option<DeferredSessionChange>,
     exit_reason: Option<Option<String>>,
+}
+
+#[derive(Debug)]
+#[cfg(any(unix, windows))]
+struct DeferredSessionChange {
+    session_name: Option<SessionName>,
+    pane_sequences: Option<Vec<(u32, u64)>>,
 }
 
 #[cfg(any(unix, windows))]
@@ -1097,11 +1158,18 @@ impl DeferredServerEvents {
         Some(line)
     }
 
-    fn defer_session_change(&mut self, next_session: Option<SessionName>) {
+    fn defer_session_change(
+        &mut self,
+        next_session: Option<SessionName>,
+        pane_sequences: Option<Vec<(u32, u64)>>,
+    ) {
         if self.exit_reason.is_some() {
             return;
         }
-        self.session_change = Some(next_session);
+        self.session_change = Some(DeferredSessionChange {
+            session_name: next_session,
+            pane_sequences,
+        });
     }
 }
 

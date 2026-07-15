@@ -200,6 +200,19 @@ async fn copy_mode_search_prompt_bounds_unterminated_sgr_mouse_without_pane_leak
         !recovered,
         "search prompt escape must not be forwarded to pane IO"
     );
+    assert_eq!(
+        pending_input, b"\x1b",
+        "a lone Escape remains ambiguous with a fragmented terminal response until escape-time"
+    );
+    let recovered = handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("escape-time should resolve the retained Escape after the bounded discard");
+    assert!(
+        !recovered,
+        "the resolved search prompt Escape must not be forwarded to pane IO"
+    );
+    assert!(pending_input.is_empty());
     assert!(
         handler
             .attached_prompt_render(requester_pid)

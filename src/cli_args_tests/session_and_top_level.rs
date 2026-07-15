@@ -167,6 +167,48 @@ fn top_level_accepts_attached_socket_name_before_the_command() {
 }
 
 #[test]
+fn top_level_preserves_separate_hyphen_prefixed_values() {
+    let cli = parse_args(&[
+        "-L",
+        "-socket",
+        "-S",
+        "-path",
+        "-T",
+        "-feature",
+        "list-sessions",
+    ])
+    .unwrap();
+
+    assert_eq!(cli.socket_name(), Some(std::ffi::OsStr::new("-socket")));
+    assert_eq!(cli.socket_path(), Some(std::path::Path::new("-path")));
+    assert_eq!(cli.terminal_features(), &["-feature".to_owned()]);
+    assert!(matches!(
+        cli.command.expect("parsed command"),
+        super::super::Command::ListSessions(_)
+    ));
+
+    let scan = super::super::scan_top_level_command(
+        &[
+            "-L",
+            "-socket",
+            "-S",
+            "-path",
+            "-T",
+            "-feature",
+            "list-sessions",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>(),
+    )
+    .expect("extension scan preserves the same value boundaries");
+    assert_eq!(scan.socket_name, Some(OsString::from("-socket")));
+    assert_eq!(scan.socket_path, Some(OsString::from("-path")));
+    assert_eq!(scan.terminal_features, ["-feature"]);
+    assert_eq!(scan.command, [OsString::from("list-sessions")]);
+}
+
+#[test]
 fn top_level_empty_socket_path_is_preserved_as_explicit_selection() {
     let cli = parse_args(&["-S", "", "list-sessions"]).unwrap();
 

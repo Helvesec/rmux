@@ -4,10 +4,82 @@ use super::info::{
 };
 use super::snapshot::{cell_from_wire, snapshot_from_response};
 use super::target::{is_already_closed_error, is_already_closed_pane_id_error, TargetSelector};
+use crate::transport::{OperationDeadline, TransportClient};
 use crate::{
-    PaneAttributes, PaneColor, PaneId, PaneProcessState, PaneRef, RmuxError, TerminalSizeSpec,
+    PaneAttributes, PaneColor, PaneId, PaneProcessState, PaneRef, RmuxEndpoint, RmuxError,
+    TerminalSizeSpec,
 };
-use rmux_proto::{PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse};
+use rmux_proto::{
+    encode_frame, FrameDecoder, HasSessionRequest, HasSessionResponse, PaneSnapshotCell,
+    PaneSnapshotCursor, PaneSnapshotResponse, Request, Response, SessionName,
+};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::test(start_paused = true)]
+async fn returned_pane_clears_the_deadline_of_its_creation_operation() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(client_stream).with_operation_deadline(
+        OperationDeadline::from_timeout(Some(Duration::from_millis(50))),
+    );
+    let session_name = SessionName::new("alpha").expect("valid session");
+    let pane = super::Pane::new(
+        PaneRef::new(session_name.clone(), 0, 0),
+        RmuxEndpoint::Default,
+        Some(Duration::from_millis(50)),
+        transport,
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+
+    let mut request = tokio::spawn(async move {
+        pane.transport()
+            .begin_operation()
+            .request(Request::HasSession(HasSessionRequest {
+                target: session_name,
+            }))
+            .await
+    });
+    tokio::select! {
+        result = &mut request => panic!("returned pane retained an expired deadline: {result:?}"),
+        wire_request = read_transport_request(&mut server_stream) => {
+            assert!(matches!(wire_request, Request::HasSession(_)));
+        }
+    }
+    write_transport_response(
+        &mut server_stream,
+        &Response::HasSession(HasSessionResponse { exists: true }),
+    )
+    .await;
+    assert_eq!(
+        request
+            .await
+            .expect("pane request task must not panic")
+            .expect("returned pane starts a fresh operation"),
+        Response::HasSession(HasSessionResponse { exists: true })
+    );
+}
+
+async fn read_transport_request(stream: &mut tokio::io::DuplexStream) -> Request {
+    let mut decoder = FrameDecoder::new();
+    let mut buffer = [0_u8; 256];
+    loop {
+        if let Some(request) = decoder
+            .next_frame::<Request>()
+            .expect("request frame decodes")
+        {
+            return request;
+        }
+        let read = stream.read(&mut buffer).await.expect("read request");
+        assert_ne!(read, 0, "client closed before request");
+        decoder.push_bytes(&buffer[..read]);
+    }
+}
+
+async fn write_transport_response(stream: &mut tokio::io::DuplexStream, response: &Response) {
+    let frame = encode_frame(response).expect("response encodes");
+    stream.write_all(&frame).await.expect("write response");
+    stream.flush().await.expect("flush response");
+}
 
 fn details_with(history_bytes: u64) -> LiveDetails {
     LiveDetails {

@@ -39,6 +39,7 @@ impl WebShareHandle {
         transport: TransportClient,
         created: rmux_proto::WebShareCreatedResponse,
     ) -> Self {
+        let transport = transport.reusable();
         Self {
             transport,
             id: created.share_id,
@@ -151,7 +152,8 @@ impl WebShareHandle {
 
     /// Fetches redacted live metadata for this share.
     pub async fn summary(&self) -> Result<WebShareSummary> {
-        lookup_summary(&self.transport, &self.id).await
+        let transport = self.transport.begin_operation();
+        lookup_summary(&transport, &self.id).await
     }
 
     /// Returns the current number of spectator clients.
@@ -166,7 +168,8 @@ impl WebShareHandle {
 
     /// Stops this share on the daemon.
     pub async fn stop(self) -> Result<()> {
-        stop_web_share(&self.transport, &self.id).await.map(|_| ())
+        let transport = self.transport.begin_operation();
+        stop_web_share(&transport, &self.id).await.map(|_| ())
     }
 }
 
@@ -179,7 +182,10 @@ pub struct WebShareLookup {
 
 impl WebShareLookup {
     pub(crate) fn new(transport: TransportClient, summary: WebShareSummary) -> Self {
-        Self { transport, summary }
+        Self {
+            transport: transport.reusable(),
+            summary,
+        }
     }
 
     /// Returns the opaque share id.
@@ -226,12 +232,14 @@ impl WebShareLookup {
 
     /// Fetches fresh redacted metadata for this share.
     pub async fn summary(&self) -> Result<WebShareSummary> {
-        lookup_summary(&self.transport, &self.summary.id).await
+        let transport = self.transport.begin_operation();
+        lookup_summary(&transport, &self.summary.id).await
     }
 
     /// Stops this share on the daemon.
     pub async fn stop(self) -> Result<()> {
-        stop_web_share(&self.transport, &self.summary.id)
+        let transport = self.transport.begin_operation();
+        stop_web_share(&transport, &self.summary.id)
             .await
             .map(|_| ())
     }

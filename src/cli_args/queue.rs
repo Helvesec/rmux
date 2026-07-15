@@ -472,8 +472,16 @@ fn parse_set_option_args(
         "set-window-option" => SetOptionCommandKind::SetWindowOption,
         _ => unreachable!("unexpected set-option command name"),
     };
-    let mut args = parse_command_args::<SetOptionArgs>(command_name, arguments)?;
-    apply_set_option_scope(&mut args, explicit_scope);
+    let mut args = match kind {
+        SetOptionCommandKind::SetOption => {
+            let mut args = parse_command_args::<SetOptionArgs>(command_name, arguments)?;
+            apply_set_option_scope(&mut args, explicit_scope);
+            args
+        }
+        SetOptionCommandKind::SetWindowOption => {
+            parse_command_args::<SetWindowOptionArgs>(command_name, arguments)?.into()
+        }
+    };
     if trailing_literal_separator {
         if args.value.is_some() {
             return Err(set_option_too_many_arguments(command_name));
@@ -632,13 +640,13 @@ fn parse_show_options_args(
     command_name: &'static str,
     arguments: Vec<String>,
 ) -> Result<ShowOptionsArgs, clap::Error> {
-    let kind = match command_name {
-        "show-options" => ShowOptionsCommandKind::ShowOptions,
-        "show-window-options" => ShowOptionsCommandKind::ShowWindowOptions,
+    match command_name {
+        "show-options" => parse_command_args::<ShowOptionsArgs>(command_name, arguments),
+        "show-window-options" => {
+            parse_command_args::<ShowWindowOptionsArgs>(command_name, arguments).map(Into::into)
+        }
         _ => unreachable!("unexpected show-options command name"),
-    };
-    let args = parse_command_args::<ShowOptionsArgs>(command_name, arguments)?;
-    args.validate(kind)
+    }
 }
 
 fn parse_set_buffer_args(arguments: Vec<String>) -> Result<SetBufferArgs, clap::Error> {

@@ -864,6 +864,51 @@ fn command_alias_reparse_sees_parse_time_assignments() {
 }
 
 #[test]
+fn runtime_argv_assignment_feeds_alias_without_changing_direct_argv_parsing() {
+    let parser = CommandParser::new()
+        .with_command_alias("say=display-message \"$FOO\"")
+        .unwrap();
+
+    assert!(parser.parse_arguments(["FOO=bar", "say"]).is_err());
+
+    let commands = parser
+        .parse_arguments_with_assignments(["FOO=bar", "say"])
+        .expect("runtime argv assignment should feed alias expansion");
+    assert_eq!(commands.assignments()[0].name(), "FOO");
+    assert_eq!(commands.assignments()[0].value(), "bar");
+    assert_eq!(commands.commands()[0].name(), "display-message");
+    assert_eq!(
+        commands.commands()[0].arguments()[0].as_string(),
+        Some("bar")
+    );
+
+    let terminated_assignment = parser
+        .parse_arguments_with_assignments(["FOO=group;", "say"])
+        .expect("assignment-only group should feed the following alias");
+    assert_eq!(
+        terminated_assignment.commands()[0].arguments()[0].as_string(),
+        Some("group")
+    );
+
+    let literal_semicolon = parser
+        .parse_arguments_with_assignments(["FOO=value\\;", "say"])
+        .expect("escaped semicolon should remain in the assignment value");
+    assert_eq!(literal_semicolon.assignments()[0].value(), "value;");
+    assert_eq!(
+        literal_semicolon.commands()[0].arguments()[0].as_string(),
+        Some("value;")
+    );
+
+    assert_eq!(
+        parser
+            .parse_arguments_with_assignments(["1FOO=bar", "say"])
+            .unwrap_err()
+            .to_string(),
+        "unknown command: 1FOO=bar"
+    );
+}
+
+#[test]
 fn built_in_command_aliases_resolve_choose_window_and_choose_session() {
     let choose_window = CommandParser::new()
         .parse("choose-window")

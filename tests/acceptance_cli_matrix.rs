@@ -284,6 +284,39 @@ fn cold_start_config_alias_applies_to_later_command_group() -> Result<(), Box<dy
 }
 
 #[test]
+fn cold_start_assignment_before_builtin_preserves_later_config_alias() -> Result<(), Box<dyn Error>>
+{
+    let harness = AcceptanceHarness::new("cold-start-assignment-later-alias")?;
+    let config = harness.tmpdir().join("cold-start-alias.conf");
+    fs::write(
+        &config,
+        "set-option -s command-alias[20] 'probe=display-message -p \"$FOO\"'\n",
+    )?;
+
+    let output = harness.run([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("FOO=x"),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("hold"),
+        OsStr::new(";"),
+        OsStr::new("probe"),
+    ])?;
+
+    assert_success(&output)?;
+    assert_eq!(String::from_utf8(output.stdout)?, "x\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        harness.stdout(["show-environment", "-g", "FOO"])?,
+        "FOO=x\n"
+    );
+    harness.success(["has-session", "-t", "hold"])?;
+    Ok(())
+}
+
+#[test]
 fn cold_start_later_alias_respects_no_start_server() -> Result<(), Box<dyn Error>> {
     let harness = AcceptanceHarness::new("cold-start-later-alias-no-server")?;
     let config = harness.tmpdir().join("cold-start-alias.conf");

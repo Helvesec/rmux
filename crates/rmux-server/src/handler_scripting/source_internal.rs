@@ -58,7 +58,7 @@ impl RequestHandler {
         let parser = command_parser_from_state(&state)
             .with_exact_commands(RMUX_EXTENSION_COMMANDS)
             .with_max_command_bytes(SOURCE_FILE_MAX_COMMAND_BYTES);
-        let parsed = match parser.parse_arguments(&arguments) {
+        let parsed = match parser.parse_arguments_with_assignments(&arguments) {
             Ok(parsed) => parsed,
             Err(error) => return server_error(error.message()),
         };

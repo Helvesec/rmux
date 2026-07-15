@@ -38,7 +38,7 @@ use super::{
     PaneLagNotice, PaneLineItem, PaneLineStream, PaneOutputChunk, PaneOutputStart,
     PaneOutputStream, PaneRecentOutput as SdkRecentOutput,
 };
-use crate::transport::TransportClient;
+use crate::transport::{OperationDeadline, TransportClient};
 use crate::{PaneId, PaneRef, Result};
 use rmux_proto::{
     encode_frame, ErrorResponse, FrameDecoder, PaneOutputCursor, PaneOutputCursorRequest,
@@ -334,6 +334,58 @@ async fn open_output_stream(
     });
     drive_subscribe_response(server, &proto_target, proto_start).await;
     subscribe.await.expect("subscribe task").expect("opens")
+}
+
+#[tokio::test(start_paused = true)]
+async fn output_stream_does_not_retain_its_expired_open_deadline() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(8192);
+    let target = alpha_target();
+    let proto_target = target.to_proto();
+    let transport = TransportClient::spawn(client_stream).with_operation_deadline(
+        OperationDeadline::from_timeout(Some(Duration::from_millis(50))),
+    );
+    let subscribe = tokio::spawn(async move {
+        PaneOutputStream::open(
+            transport,
+            rmux_proto::PaneTargetRef::slot(target.into()),
+            PaneOutputStart::Now,
+        )
+        .await
+    });
+    drive_subscribe_response(
+        &mut server_stream,
+        &proto_target,
+        PaneOutputSubscriptionStart::Now,
+    )
+    .await;
+    let mut stream = subscribe
+        .await
+        .expect("subscribe task must not panic")
+        .expect("stream opens");
+
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let mut poll = tokio::spawn(async move { stream.poll_once().await });
+    tokio::select! {
+        result = &mut poll => panic!("stream retained an expired open deadline: {result:?}"),
+        request = read_request(&mut server_stream) => {
+            assert!(matches!(request, Request::PaneOutputCursor(_)));
+        }
+    }
+    write_response(
+        &mut server_stream,
+        &Response::PaneOutputCursor(PaneOutputCursorResponse {
+            subscription_id: subscription_id(),
+            cursor: cursor_zero(),
+            events: Vec::new(),
+            limited: false,
+        }),
+    )
+    .await;
+    assert!(poll
+        .await
+        .expect("poll task must not panic")
+        .expect("poll starts a fresh operation")
+        .is_empty());
 }
 
 #[tokio::test]

@@ -110,14 +110,15 @@ impl<'a> NewWindowBuilder<'a> {
     }
 
     async fn run(self) -> Result<Window> {
+        let transport = self.session.transport().begin_operation();
         let process_command = proto_process_command(self.process_command)?;
         crate::capabilities::require_process_command_if_present(
-            self.session.transport(),
+            &transport,
             process_command.as_ref(),
         )
         .await?;
         let target = create_window(
-            self.session.transport(),
+            &transport,
             self.session.name().clone(),
             NewWindowConfig {
                 name: self.name,
@@ -135,7 +136,7 @@ impl<'a> NewWindowBuilder<'a> {
             target,
             self.session.endpoint().clone(),
             self.session.configured_default_timeout(),
-            self.session.transport().clone(),
+            transport,
         ))
     }
 }

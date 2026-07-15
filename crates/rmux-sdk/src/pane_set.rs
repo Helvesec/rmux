@@ -69,7 +69,7 @@ impl PaneSet {
     /// Call [`PaneSetBatch::is_success`] when the caller requires every pane
     /// to succeed.
     pub async fn snapshot_all(&self) -> PaneSetBatch<PaneSnapshot> {
-        run_all(self.panes.clone(), |pane| async move {
+        run_all(operation_panes(&self.panes, None), |pane| async move {
             let target = pane.target().clone();
             let pane_id = pane.id().await.ok().flatten();
             let result = pane.snapshot().await;
@@ -83,7 +83,7 @@ impl PaneSet {
     /// Stale panes use the ordinary [`Pane::close`] idempotent semantics and
     /// return [`PaneCloseOutcome::AlreadyClosed`] as a success.
     pub async fn close_all(self) -> PaneSetBatch<PaneCloseOutcome> {
-        close_all_in_order(self.panes).await
+        close_all_in_order(operation_panes(&self.panes, None)).await
     }
 
     /// Starts an all-panes visible-text expectation builder.
@@ -407,26 +407,27 @@ impl<'a> PaneSetVisibleTextWait<'a> {
     }
 
     async fn run(self) -> PaneSetVisibleTextOutcome {
+        let panes = operation_panes(self.panes, self.timeout);
         match self.mode {
             ExpectMode::All => {
                 let matcher = self.matcher;
                 let timeout = self.timeout;
                 let poll_interval = self.poll_interval;
                 PaneSetVisibleTextOutcome::All(
-                    run_all(self.panes.to_vec(), move |pane| {
+                    run_all(panes, move |pane| {
                         let matcher = matcher.clone();
                         wait_visible_text_for_pane(pane, matcher, timeout, poll_interval)
                     })
                     .await,
                 )
             }
-            ExpectMode::Any => PaneSetVisibleTextOutcome::Any(self.run_any().await),
+            ExpectMode::Any => PaneSetVisibleTextOutcome::Any(self.run_any(panes).await),
         }
     }
 
-    async fn run_any(self) -> PaneSetAny<PaneSnapshot> {
+    async fn run_any(self, panes: Vec<Pane>) -> PaneSetAny<PaneSnapshot> {
         let mut tasks = JoinSet::new();
-        for pane in self.panes.iter().cloned() {
+        for pane in panes {
             let matcher = self.matcher.clone();
             let timeout = self.timeout;
             let poll_interval = self.poll_interval;
@@ -461,6 +462,17 @@ impl<'a> PaneSetVisibleTextWait<'a> {
         PaneSetAny::failure(failures)
     }
 }
+
+fn operation_panes(panes: &[Pane], timeout: Option<Duration>) -> Vec<Pane> {
+    panes
+        .iter()
+        .map(|pane| pane.begin_operation_handle_with_timeout(timeout))
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "pane_set_tests.rs"]
+mod tests;
 
 impl<'a> IntoFuture for PaneSetVisibleTextWait<'a> {
     type Output = PaneSetVisibleTextOutcome;

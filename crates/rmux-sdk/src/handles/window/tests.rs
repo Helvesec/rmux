@@ -1,9 +1,11 @@
 use super::*;
+use crate::transport::OperationDeadline;
 use rmux_proto::{
     encode_frame, FrameDecoder, RenameWindowResponse, ResizeWindowResponse, SelectLayoutResponse,
     SelectWindowResponse, WindowTarget,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::Duration;
 
 fn alpha() -> rmux_proto::SessionName {
     rmux_proto::SessionName::new("alpha").expect("valid session")
@@ -37,6 +39,41 @@ async fn write_response(stream: &mut tokio::io::DuplexStream, response: Response
     let frame = encode_frame(&response).expect("response encodes");
     stream.write_all(&frame).await.expect("write response");
     stream.flush().await.expect("flush response");
+}
+
+#[tokio::test(start_paused = true)]
+async fn returned_window_clears_the_deadline_of_its_creation_operation() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(client_stream).with_operation_deadline(
+        OperationDeadline::from_timeout(Some(Duration::from_millis(50))),
+    );
+    let window = Window::new(
+        target(),
+        RmuxEndpoint::Default,
+        Some(Duration::from_millis(50)),
+        transport,
+    );
+    tokio::time::advance(Duration::from_millis(100)).await;
+
+    let select = tokio::spawn(async move { window.select().await });
+    let proto_target = WindowTarget::with_window(alpha(), 2);
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        Request::SelectWindow(SelectWindowRequest {
+            target: proto_target.clone(),
+        })
+    );
+    write_response(
+        &mut server_stream,
+        Response::SelectWindow(SelectWindowResponse {
+            target: proto_target,
+        }),
+    )
+    .await;
+    select
+        .await
+        .expect("window request task must not panic")
+        .expect("returned window starts a fresh operation");
 }
 
 #[tokio::test]

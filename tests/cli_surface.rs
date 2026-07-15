@@ -801,7 +801,7 @@ fn list_commands_is_client_local_and_supports_formatting() -> Result<(), Box<dyn
     assert_eq!(split_signature.status.code(), Some(0));
     assert_eq!(
         stdout(&split_signature),
-        "split-window (splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]\n"
+        "split-window (splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane][shell-command]\n"
     );
     assert!(stderr(&split_signature).is_empty());
 
@@ -1822,6 +1822,108 @@ fn control_control_eof_waits_for_new_session_output() -> Result<(), Box<dyn Erro
     );
     assert!(rendered.contains("%exit"), "rendered={rendered:?}");
     assert!(rendered.ends_with(CONTROL_CONTROL_END));
+    Ok(())
+}
+
+#[test]
+fn control_attach_existing_starts_at_current_pane_output_cursor() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("control-existing-output-cursor")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "printf EXISTING-BACKLOG",
+        "Enter",
+    ])?);
+
+    let deadline = Instant::now() + ATTACH_TIMEOUT;
+    loop {
+        let captured = harness.run(&["capture-pane", "-p", "-t", "alpha:0.0"])?;
+        assert_eq!(captured.status.code(), Some(0));
+        assert!(
+            stderr(&captured).is_empty(),
+            "capture stderr={:?}",
+            stderr(&captured)
+        );
+        if stdout(&captured).contains("EXISTING-BACKLOG") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("existing pane output was not captured before control attach".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    for command in [
+        vec!["-C", "attach-session", "-t", "alpha"],
+        vec!["-C", "new-session", "-A", "-s", "alpha"],
+    ] {
+        let output = harness.run(&command)?;
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+        let rendered = stdout(&output);
+        assert!(
+            rendered.contains("%session-changed"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            !rendered.contains("EXISTING-BACKLOG"),
+            "plain control attach replayed historical output: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("%window-add"),
+            "attaching an existing session must not announce its old window as new: {rendered:?}"
+        );
+    }
+
+    let mut child = harness
+        .base_command()
+        .args(["-CC", "attach-session", "-t", "alpha"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("control stdout");
+    let stderr = child.stderr.take().expect("control stderr");
+    let (stdout_buffer, stdout_thread) = spawn_pipe_collector(stdout);
+    let (_stderr_buffer, stderr_thread) = spawn_pipe_collector(stderr);
+    wait_for_output_condition(
+        &stdout_buffer,
+        ATTACH_TIMEOUT,
+        "control-control existing session attach",
+        |rendered| rendered.contains("%session-changed"),
+    )?;
+    assert!(
+        !String::from_utf8_lossy(&stdout_buffer.lock().expect("control stdout buffer lock"))
+            .contains("EXISTING-BACKLOG"),
+        "control-control attach replayed historical output"
+    );
+
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "printf LIVE-AFTER-ATTACH",
+        "Enter",
+    ])?);
+    wait_for_output_condition(
+        &stdout_buffer,
+        ATTACH_TIMEOUT,
+        "live pane output after control attach",
+        |rendered| rendered.contains("LIVE-AFTER-ATTACH"),
+    )?;
+    assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
+
+    let status = child.wait()?;
+    let rendered = String::from_utf8(read_pipe_output(stdout_thread, "stdout")?)?;
+    let stderr = String::from_utf8(read_pipe_output(stderr_thread, "stderr")?)?;
+    assert_eq!(status.code(), Some(0));
+    assert!(stderr.is_empty(), "stderr={stderr:?}");
+    assert!(!rendered.contains("EXISTING-BACKLOG"), "{rendered:?}");
+    assert!(rendered.contains("LIVE-AFTER-ATTACH"), "{rendered:?}");
+    assert!(rendered.ends_with(CONTROL_CONTROL_END), "{rendered:?}");
     Ok(())
 }
 

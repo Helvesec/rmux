@@ -14,7 +14,7 @@ use rmux_proto::{
     AttachedWindowsConsoleKey, RmuxError, TerminalSize,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
@@ -108,6 +108,7 @@ where
 {
     let AttachAsyncChannels {
         mut input_rx,
+        mut input_completion_rx,
         mut resize_rx,
         action_tx,
         mut action_completion_rx,
@@ -130,6 +131,13 @@ where
 
     let attach_result = async {
         loop {
+        // The worker publishes completion only after dropping its input sender.
+        // A fatal completion invalidates any still-buffered keystrokes, so poll
+        // it before processing input instead of letting `select!` choose the
+        // outcome nondeterministically. Normal EOF still drains the channel.
+        if let Some(completion) = take_ready_input_worker_completion(&mut input_completion_rx) {
+            completion?;
+        }
         output.flush_pending()?;
         drain_attach_messages(
             &mut decoder,
@@ -159,6 +167,9 @@ where
                 output.check_failure()?;
             }
             _ = std::future::ready(()), if pending_repeated_input.is_some() => {
+                if let Some(completion) = take_ready_input_worker_completion(&mut input_completion_rx) {
+                    completion?;
+                }
                 if locked.is_locked() {
                     pending_repeated_input = None;
                     continue;
@@ -177,6 +188,9 @@ where
                 }
             }
             input = input_rx.recv(), if input_open && pending_repeated_input.is_none() => {
+                if let Some(completion) = take_ready_input_worker_completion(&mut input_completion_rx) {
+                    completion?;
+                }
                 let Some(input) = input else {
                     input_open = false;
                     continue;
@@ -193,6 +207,20 @@ where
                         windows_console_key_enabled,
                     )
                     .await?;
+                }
+            }
+            completion = await_input_worker_completion(&mut input_completion_rx), if input_completion_rx.is_some() => {
+                input_completion_rx = None;
+                match completion {
+                    Ok(Ok(())) => {
+                        // `input_loop` drops its sender before publishing normal
+                        // completion. Keep receiving until `input_rx` has drained
+                        // any final queued input and reports closure itself.
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(input_worker_stopped_error());
+                    }
                 }
             }
             size = resize_rx.recv(), if resize_open => {
@@ -328,6 +356,33 @@ where
         (_, _, Err(error)) | (_, Err(error), Ok(())) => Err(error),
         (result, Ok(()), Ok(())) => result,
     }
+}
+
+fn take_ready_input_worker_completion(
+    completion_rx: &mut Option<oneshot::Receiver<std::result::Result<(), ClientError>>>,
+) -> Option<std::result::Result<(), ClientError>> {
+    let completion = match completion_rx.as_mut()?.try_recv() {
+        Ok(completion) => completion,
+        Err(oneshot::error::TryRecvError::Empty) => return None,
+        Err(oneshot::error::TryRecvError::Closed) => Err(input_worker_stopped_error()),
+    };
+    *completion_rx = None;
+    Some(completion)
+}
+
+fn input_worker_stopped_error() -> ClientError {
+    ClientError::Io(io::Error::other(
+        "attach input worker stopped before reporting completion",
+    ))
+}
+
+async fn await_input_worker_completion(
+    completion_rx: &mut Option<oneshot::Receiver<std::result::Result<(), ClientError>>>,
+) -> std::result::Result<std::result::Result<(), ClientError>, oneshot::error::RecvError> {
+    completion_rx
+        .as_mut()
+        .expect("guarded attach input completion receiver remains present")
+        .await
 }
 
 async fn write_attach_input_once<Writer>(
@@ -1192,6 +1247,7 @@ impl Drop for AttachOutputQueue {
 
 pub(super) struct AttachAsyncChannels {
     input_rx: mpsc::Receiver<super::input::AttachInput>,
+    input_completion_rx: Option<oneshot::Receiver<std::result::Result<(), ClientError>>>,
     resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
     action_tx: std_mpsc::Sender<AttachAction>,
     action_completion_rx:
@@ -1214,6 +1270,7 @@ impl AttachAsyncChannels {
     ) -> Self {
         Self {
             input_rx,
+            input_completion_rx: None,
             resize_rx,
             action_tx,
             action_completion_rx,
@@ -1221,6 +1278,14 @@ impl AttachAsyncChannels {
             windows_console_key_enabled,
             error_cleanup: None,
         }
+    }
+
+    pub(super) fn with_input_completion(
+        mut self,
+        completion_rx: oneshot::Receiver<std::result::Result<(), ClientError>>,
+    ) -> Self {
+        self.input_completion_rx = Some(completion_rx);
+        self
     }
 
     pub(super) fn with_error_cleanup(mut self, error_cleanup: Option<Vec<u8>>) -> Self {

@@ -256,6 +256,11 @@ impl Locator {
         &self.pane
     }
 
+    pub(crate) fn begin_operation_handle(mut self) -> Self {
+        self.pane = self.pane.begin_operation_handle_with_timeout(self.timeout);
+        self
+    }
+
     fn combine(self, other: Self, combiner: LocatorCombiner) -> Self {
         let invalid_reason = if self.pane.target() != other.pane.target()
             || self.pane.endpoint() != other.pane.endpoint()
@@ -447,6 +452,7 @@ impl IntoFuture for LocatorAssertion {
 }
 
 async fn wait_for_locator_state(locator: Locator, state: LocatorState) -> Result<PaneSnapshot> {
+    let locator = locator.begin_operation_handle();
     wait_until(
         locator,
         move |matches, _snapshot| match state {
@@ -459,6 +465,7 @@ async fn wait_for_locator_state(locator: Locator, state: LocatorState) -> Result
 }
 
 async fn wait_for_assertion(locator: Locator, kind: LocatorAssertionKind) -> Result<PaneSnapshot> {
+    let locator = locator.begin_operation_handle();
     let description = assertion_description(&kind);
     let timeout = locator
         .timeout
@@ -607,3 +614,7 @@ async fn sleep_until_next_poll(deadline: Option<Instant>, poll_interval: Duratio
         tokio::time::sleep(poll_interval.min(deadline - now)).await;
     }
 }
+
+#[cfg(test)]
+#[path = "locator_tests.rs"]
+mod tests;

@@ -107,6 +107,7 @@ function Install-BinarySet([object[]]$Plan, [bool]$Verify) {
     $transactionRoot = Join-Path ([System.IO.Path]::GetTempPath()) `
         ("rmux-install-backup-" + [System.Guid]::NewGuid().ToString("N"))
     $backups = @()
+    $preserveTransactionBackup = $false
     New-Item -ItemType Directory -Path $transactionRoot | Out-Null
 
     try {
@@ -163,11 +164,27 @@ function Install-BinarySet([object[]]$Plan, [bool]$Verify) {
         }
 
         if ($rollbackErrors.Count -gt 0) {
-            throw "binary install failed: $installError; rollback also failed: $($rollbackErrors -join '; ')"
+            $preserveTransactionBackup = $true
+            $recoveryActions = @()
+            foreach ($record in $backups) {
+                if ($record.Existed) {
+                    $recoveryActions += "restore '$($record.Backup)' to '$($record.Destination)'"
+                } else {
+                    $recoveryActions += "remove newly created '$($record.Destination)' if it exists"
+                }
+            }
+            $recovery = $recoveryActions -join "; "
+            $errorMessage = "binary install failed: $installError; "
+            $errorMessage += "rollback also failed: $($rollbackErrors -join '; '); "
+            $errorMessage += "recovery backup preserved at '$transactionRoot'. "
+            $errorMessage += "Stop running rmux processes, inspect the affected files, then manually $recovery"
+            throw $errorMessage
         }
         throw "binary install failed; previous binaries restored: $installError"
     } finally {
-        Remove-Item -Recurse -Force -LiteralPath $transactionRoot -ErrorAction SilentlyContinue
+        if (-not $preserveTransactionBackup) {
+            Remove-Item -Recurse -Force -LiteralPath $transactionRoot -ErrorAction SilentlyContinue
+        }
     }
 }
 

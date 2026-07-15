@@ -409,7 +409,9 @@ mod tests {
         let split_window =
             command_short_option_spec("split-window").expect("split-window signature");
         assert!(split_window.takes_value('e'));
+        assert!(split_window.takes_value('p'));
         assert!(!split_window.is_boolean('e'));
+        assert!(!split_window.is_boolean('p'));
         assert!(command_short_option_spec("not-a-command").is_none());
     }
 

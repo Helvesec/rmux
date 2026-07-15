@@ -501,7 +501,7 @@ fn process_command_windows_cmd_hint(command: &ProcessCommand) -> Option<bool> {
 
 #[cfg(windows)]
 fn shell_text_windows_cmd_hint(command: &str) -> Option<bool> {
-    let head = command.trim_start().split_whitespace().next()?;
+    let head = windows_shell_command_head(command)?;
     let name = windows_command_name(head);
     if is_windows_cmd_name(name) {
         Some(true)
@@ -513,6 +513,19 @@ fn shell_text_windows_cmd_hint(command: &str) -> Option<bool> {
     } else {
         None
     }
+}
+
+#[cfg(windows)]
+fn windows_shell_command_head(command: &str) -> Option<&str> {
+    let command = command.trim_start();
+    let quote = command.as_bytes().first().copied()?;
+    if matches!(quote, b'"' | b'\'') {
+        let quoted = &command[1..];
+        let end = quoted.as_bytes().iter().position(|byte| *byte == quote)?;
+        return Some(&quoted[..end]);
+    }
+    let end = command.find(char::is_whitespace).unwrap_or(command.len());
+    Some(&command[..end])
 }
 
 #[cfg(windows)]
@@ -1195,9 +1208,23 @@ mod windows_tests {
         );
         assert_eq!(
             super::process_command_windows_cmd_hint(&ProcessCommand::Shell(
+                r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile"#.to_owned()
+            )),
+            Some(false),
+            "a quoted PowerShell path must remain one command token"
+        );
+        assert_eq!(
+            super::process_command_windows_cmd_hint(&ProcessCommand::Shell(
                 "cmd.exe /D /Q /K".to_owned()
             )),
             Some(true)
+        );
+        assert_eq!(
+            super::process_command_windows_cmd_hint(&ProcessCommand::Shell(
+                r#""C:\Windows\System32\cmd.exe" /D /Q /K"#.to_owned()
+            )),
+            Some(true),
+            "a quoted cmd path must retain physical Ctrl-D semantics"
         );
         assert_eq!(
             super::process_command_windows_cmd_hint(&ProcessCommand::Argv(vec![

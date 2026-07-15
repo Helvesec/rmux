@@ -4,19 +4,26 @@ use std::task::{Context, Poll};
 use rmux_proto::{Response, SdkWaitId};
 use tokio::sync::oneshot;
 
+use super::cancellation::OrderedResponseGuard;
 use super::failure::TransportFailure;
 use crate::Result;
 
 pub(crate) struct PendingResponse {
     operation: String,
     response: oneshot::Receiver<Result<Response>>,
+    cancellation: OrderedResponseGuard,
 }
 
 impl PendingResponse {
-    pub(super) fn new(operation: String, response: oneshot::Receiver<Result<Response>>) -> Self {
+    pub(super) fn new(
+        operation: String,
+        response: oneshot::Receiver<Result<Response>>,
+        cancellation: OrderedResponseGuard,
+    ) -> Self {
         Self {
             operation,
             response,
+            cancellation,
         }
     }
 }
@@ -25,13 +32,13 @@ impl std::future::Future for PendingResponse {
     type Output = Result<Response>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.response).poll(cx) {
-            Poll::Ready(Ok(result)) => Poll::Ready(result),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(
-                TransportFailure::actor_closed().to_error(&self.operation)
-            )),
-            Poll::Pending => Poll::Pending,
-        }
+        let result = match Pin::new(&mut self.response).poll(cx) {
+            Poll::Ready(Ok(result)) => result,
+            Poll::Ready(Err(_)) => Err(TransportFailure::actor_closed().to_error(&self.operation)),
+            Poll::Pending => return Poll::Pending,
+        };
+        self.cancellation.disarm();
+        Poll::Ready(result)
     }
 }
 

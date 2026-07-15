@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
@@ -16,7 +17,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 
-use super::{allocate_bounded_atomic_id, mix_sdk_wait_owner_id, DropGuard, TransportClient};
+use super::{
+    allocate_bounded_atomic_id, mix_sdk_wait_owner_id, ActorMessage, DropGuard, OperationDeadline,
+    TransportClient, TransportState,
+};
 use crate::RmuxError;
 
 fn alpha() -> SessionName {
@@ -206,6 +210,253 @@ async fn join_request(handle: JoinHandle<crate::Result<Response>>) -> crate::Res
     handle.await.expect("request task must not panic")
 }
 
+async fn assert_cancelled_transport_rejects_follow_up(client: &TransportClient) {
+    let result = timeout(
+        Duration::from_secs(1),
+        client.request(list_sessions_request()),
+    )
+    .await
+    .expect("a cancelled ordered request must not leave the following RPC pending");
+
+    assert_transport_message(
+        result,
+        io::ErrorKind::BrokenPipe,
+        "cancelled while its ordered response was pending",
+    );
+}
+
+#[tokio::test]
+async fn dropping_request_before_send_succeeds_keeps_transport_usable() {
+    let (commands, mut command_receiver) = tokio::sync::mpsc::channel(1);
+    assert!(
+        commands
+            .try_send(ActorMessage::BestEffort {
+                request: has_session_request(),
+            })
+            .is_ok(),
+        "fixture command queue must start full"
+    );
+    let actor_task = tokio::spawn(std::future::pending::<()>());
+    let client = TransportClient {
+        commands,
+        actor: actor_task.abort_handle(),
+        state: Arc::new(TransportState::default()),
+        default_timeout: None,
+        operation_deadline: None,
+        fixture_transport: false,
+    };
+
+    let mut request = Box::pin(client.request(list_sessions_request()));
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(
+        request.as_mut().poll(&mut context).is_pending(),
+        "request must wait while the actor command queue is full"
+    );
+    drop(request);
+
+    assert!(
+        client.state.terminal_failure().is_none(),
+        "cancellation before a successful send must leave the transport healthy"
+    );
+    assert!(matches!(
+        command_receiver.recv().await,
+        Some(ActorMessage::BestEffort {
+            request: Request::HasSession(_),
+        })
+    ));
+
+    client.try_send_best_effort(list_sessions_request());
+    assert!(matches!(
+        command_receiver.recv().await,
+        Some(ActorMessage::BestEffort {
+            request: Request::ListSessions(_),
+        })
+    ));
+
+    actor_task.abort();
+    assert!(actor_task
+        .await
+        .expect_err("fixture actor must be cancelled")
+        .is_cancelled());
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_sent_request_invalidates_the_ordered_transport() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream);
+    let request = spawn_request(&client, has_session_request());
+
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        has_session_request()
+    );
+    request.abort();
+    assert!(
+        request
+            .await
+            .expect_err("request task must be cancelled")
+            .is_cancelled(),
+        "request task must report external cancellation"
+    );
+
+    assert_cancelled_transport_rejects_follow_up(&client).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_sent_armed_request_invalidates_the_ordered_transport() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream);
+    let wait_id = SdkWaitId::new(42);
+    let client_for_wait = client.clone();
+    let arm = tokio::spawn(async move {
+        client_for_wait
+            .armed_request(sdk_wait_request(wait_id))
+            .await
+    });
+
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        sdk_wait_request(wait_id)
+    );
+    arm.abort();
+    assert!(
+        matches!(arm.await, Err(error) if error.is_cancelled()),
+        "armed task must report external cancellation"
+    );
+
+    assert_cancelled_transport_rejects_follow_up(&client).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_pending_armed_response_invalidates_the_ordered_transport() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream);
+    let wait_id = SdkWaitId::new(42);
+    let client_for_wait = client.clone();
+    let arm = tokio::spawn(async move {
+        client_for_wait
+            .armed_request(sdk_wait_request(wait_id))
+            .await
+    });
+
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        sdk_wait_request(wait_id)
+    );
+    write_response(
+        &mut server_stream,
+        &Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(wait_id)),
+    )
+    .await;
+    let pending = arm
+        .await
+        .expect("armed task must not panic")
+        .expect("daemon armed ack succeeds");
+
+    drop(pending);
+
+    assert_cancelled_transport_rejects_follow_up(&client).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn operation_timeout_invalidates_the_ordered_transport() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let reusable = TransportClient::spawn(client_stream);
+    let client = reusable.with_operation_deadline(OperationDeadline::from_timeout(Some(
+        Duration::from_millis(50),
+    )));
+
+    let request = spawn_request(&client, has_session_request());
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        has_session_request()
+    );
+    let following = spawn_request(&reusable, list_sessions_request());
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        list_sessions_request()
+    );
+    tokio::time::advance(Duration::from_millis(50)).await;
+
+    assert_transport_kind(join_request(request).await, io::ErrorKind::TimedOut);
+    assert_transport_kind(join_request(following).await, io::ErrorKind::TimedOut);
+    assert_transport_kind(
+        reusable.request(list_sessions_request()).await,
+        io::ErrorKind::TimedOut,
+    );
+
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        server_stream
+            .read(&mut byte)
+            .await
+            .expect("timed-out client closes its peer"),
+        0,
+        "a timed-out FIFO transport must close before a late response can be reassigned"
+    );
+    let late_response = encode_frame(&has_session_response(false)).expect("late response encodes");
+    assert!(
+        server_stream.write_all(&late_response).await.is_err(),
+        "the peer must reject a late response after the timed-out FIFO transport closes"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn operation_deadline_is_shared_across_sequential_requests() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream).with_operation_deadline(
+        OperationDeadline::from_timeout(Some(Duration::from_millis(100))),
+    );
+
+    let first = spawn_request(&client, has_session_request());
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        has_session_request()
+    );
+    tokio::time::advance(Duration::from_millis(60)).await;
+    write_response(&mut server_stream, &has_session_response(false)).await;
+    assert_eq!(
+        join_request(first).await.expect("first response succeeds"),
+        has_session_response(false)
+    );
+
+    let second = spawn_request(&client, list_sessions_request());
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        list_sessions_request()
+    );
+    tokio::time::advance(Duration::from_millis(40)).await;
+    assert_transport_kind(join_request(second).await, io::ErrorKind::TimedOut);
+}
+
+#[tokio::test(start_paused = true)]
+async fn duration_max_operation_deadline_is_unbounded() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream)
+        .with_operation_deadline(OperationDeadline::from_timeout(Some(Duration::MAX)));
+
+    let request = spawn_request(&client, has_session_request());
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        has_session_request()
+    );
+    tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+    assert!(
+        !request.is_finished(),
+        "Duration::MAX must not arm the transport deadline"
+    );
+    write_response(&mut server_stream, &has_session_response(true)).await;
+    assert_eq!(
+        join_request(request)
+            .await
+            .expect("unbounded response succeeds"),
+        has_session_response(true)
+    );
+}
+
 #[tokio::test]
 async fn armed_request_waits_for_daemon_armed_ack_and_keeps_final_pending() {
     let (client_stream, mut server_stream) = tokio::io::duplex(4096);
@@ -250,6 +501,44 @@ async fn armed_request_waits_for_daemon_armed_ack_and_keeps_final_pending() {
     .await;
     assert_eq!(
         pending.await.expect("final wait response succeeds"),
+        sdk_wait_response(wait_id, SdkWaitOutcome::Matched)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn armed_request_deadline_ends_at_the_armed_ack() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream).with_operation_deadline(
+        OperationDeadline::from_timeout(Some(Duration::from_millis(50))),
+    );
+    let wait_id = SdkWaitId::new(42);
+    let arm = tokio::spawn(async move { client.armed_request(sdk_wait_request(wait_id)).await });
+
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        sdk_wait_request(wait_id)
+    );
+    tokio::time::advance(Duration::from_millis(40)).await;
+    write_response(
+        &mut server_stream,
+        &Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(wait_id)),
+    )
+    .await;
+    let pending = arm
+        .await
+        .expect("armed task must not panic")
+        .expect("armed ack arrives within the operation deadline");
+
+    tokio::time::advance(Duration::from_millis(20)).await;
+    write_response(
+        &mut server_stream,
+        &sdk_wait_response(wait_id, SdkWaitOutcome::Matched),
+    )
+    .await;
+    assert_eq!(
+        pending
+            .await
+            .expect("final wait uses the ArmedWait timeout, not the expired arm deadline"),
         sdk_wait_response(wait_id, SdkWaitOutcome::Matched)
     );
 }
@@ -536,6 +825,34 @@ async fn unsolicited_response_without_pending_request_closes_transport() {
         io::ErrorKind::InvalidData,
         "sent unsolicited `has-session` response",
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_sent_shutdown_invalidates_the_transport() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream);
+    let client_for_shutdown = client.clone();
+    let shutdown = tokio::spawn(async move { client_for_shutdown.shutdown().await });
+
+    let mut buffer = [0_u8; 1];
+    assert_eq!(
+        server_stream
+            .read(&mut buffer)
+            .await
+            .expect("read client write-side eof"),
+        0,
+        "shutdown command must reach the actor before cancellation"
+    );
+    shutdown.abort();
+    assert!(
+        shutdown
+            .await
+            .expect_err("shutdown task must be cancelled")
+            .is_cancelled(),
+        "shutdown task must report external cancellation"
+    );
+
+    assert_cancelled_transport_rejects_follow_up(&client).await;
 }
 
 #[tokio::test]

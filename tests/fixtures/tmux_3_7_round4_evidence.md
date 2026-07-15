@@ -50,12 +50,14 @@ In a `remain-on-exit` session with a dead `true` pane, tmux
 `display-message -p -t w:1.0 '#{pane_current_command}'` printed `true`. RMUX
 exited 0 and printed `bash`.
 
-## C-D43 control-mode attach backlog
+## Resolved C-D43 control-mode attach cursor
 
 After sending `printf old`, `tmux -C -L r4 -f /dev/null attach -t w` produced
 the control-mode begin/end/session-changed/exit sequence and no `%output`.
-The same RMUX attach emitted initial `%output` for the current backlog before
-`%exit`.
+RMUX now captures each existing pane's current output sequence at the attach
+boundary and likewise emits no historical `%output`; output produced after the
+attach remains live. A newly created session deliberately starts from its
+oldest retained cursor so startup output cannot race its first subscription.
 
 ## C-D44 shutdown hook run-shell delivery
 

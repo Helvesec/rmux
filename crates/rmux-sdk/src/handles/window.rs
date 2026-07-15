@@ -4,7 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::handles::session::unexpected_response;
-use crate::transport::TransportClient;
+use crate::transport::{OperationDeadline, TransportClient};
 use crate::{
     InfoSnapshot, PaneId, PaneInfo, PaneProcessState, PaneRef, Result, RmuxEndpoint, RmuxError,
     SessionId, SessionInfo, TerminalSizeSpec, WindowId, WindowInfo, WindowRef,
@@ -73,6 +73,9 @@ impl Window {
         default_timeout: Option<Duration>,
         transport: TransportClient,
     ) -> Self {
+        let transport = transport.with_default_timeout(
+            crate::bootstrap::discovery::resolve_timeout(None, default_timeout),
+        );
         Self {
             target,
             endpoint,
@@ -99,12 +102,20 @@ impl Window {
         self.default_timeout
     }
 
+    pub(crate) fn with_operation_deadline(&self, deadline: OperationDeadline) -> Self {
+        let mut window = self.clone();
+        window.transport = window.transport.with_operation_deadline(deadline);
+        window
+    }
+
     /// Returns the stable daemon window identity for this slot, when it is
     /// currently listed.
     pub async fn id(&self) -> Result<Option<WindowId>> {
-        Ok(current_window_entry(&self.transport, &self.target)
-            .await?
-            .map(|entry| entry.id))
+        Ok(
+            current_window_entry(&self.transport.begin_operation(), &self.target)
+                .await?
+                .map(|entry| entry.id),
+        )
     }
 
     /// Checks whether this exact window slot is currently listed by the daemon.
@@ -114,7 +125,7 @@ impl Window {
 
     /// Lists panes currently visible through this window slot.
     pub async fn panes(&self) -> Result<Vec<WindowPane>> {
-        list_window_panes_or_empty(&self.transport, &self.target).await
+        list_window_panes_or_empty(&self.transport.begin_operation(), &self.target).await
     }
 
     /// Returns a sticky info snapshot for this window and its listed panes.
@@ -124,29 +135,35 @@ impl Window {
     /// been closed, the returned snapshot contains only the still-observable
     /// session metadata, or is empty when the session is gone.
     pub async fn info(&self) -> Result<InfoSnapshot> {
-        window_info_snapshot(&self.transport, &self.target).await
+        window_info_snapshot(&self.transport.begin_operation(), &self.target).await
     }
 
     /// Selects this window in its session.
     pub async fn select(&self) -> Result<()> {
-        select_window(&self.transport, &self.target).await
+        select_window(&self.transport.begin_operation(), &self.target).await
     }
 
     /// Renames this window.
     pub async fn rename(&self, name: impl Into<String>) -> Result<()> {
-        rename_window(&self.transport, &self.target, name.into()).await
+        rename_window(&self.transport.begin_operation(), &self.target, name.into()).await
     }
 
     /// Requests an absolute size for this window.
     ///
     /// Passing `None` for one dimension leaves that dimension to the daemon.
     pub async fn resize(&self, width: Option<u16>, height: Option<u16>) -> Result<()> {
-        resize_window(&self.transport, &self.target, width, height).await
+        resize_window(
+            &self.transport.begin_operation(),
+            &self.target,
+            width,
+            height,
+        )
+        .await
     }
 
     /// Applies a named layout to this window.
     pub async fn select_layout(&self, layout: LayoutName) -> Result<()> {
-        select_window_layout(&self.transport, &self.target, layout).await
+        select_window_layout(&self.transport.begin_operation(), &self.target, layout).await
     }
 
     /// Consumes this handle and kills the addressed window through the daemon.
@@ -157,7 +174,7 @@ impl Window {
     /// errors, such as attempting to kill the only window in a session, are
     /// returned.
     pub async fn close(self) -> Result<WindowCloseOutcome> {
-        close_window(&self.transport, self.target).await
+        close_window(&self.transport.begin_operation(), self.target).await
     }
 }
 

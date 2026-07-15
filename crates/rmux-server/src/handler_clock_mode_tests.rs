@@ -201,7 +201,11 @@ fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> V
     loop {
         match rx.try_recv() {
             Ok(ControlServerEvent::Notification(line)) => lines.push(line),
-            Ok(ControlServerEvent::SessionChanged(_) | ControlServerEvent::Refresh) => {}
+            Ok(
+                ControlServerEvent::SessionChanged(_)
+                | ControlServerEvent::SessionChangedAt { .. }
+                | ControlServerEvent::Refresh,
+            ) => {}
             Ok(ControlServerEvent::Exit(reason)) => {
                 panic!("unexpected control exit: {reason:?}");
             }

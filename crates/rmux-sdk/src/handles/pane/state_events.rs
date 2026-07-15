@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use crate::handles::connect_transport_to_endpoint;
 use crate::handles::session::unexpected_response;
-use crate::transport::TransportClient;
+use crate::transport::{OperationDeadline, TransportClient};
 use crate::{Pane, PaneId, Result, RmuxError};
 use rmux_proto::{
     PaneOptionEntry as ProtoPaneOptionEntry, PaneStateCursorRequest, PaneStateEventDto,
@@ -145,7 +145,15 @@ impl PaneStateEventStream {
             return Err(stale_slot_error(pane.target()));
         };
         let timeout = crate::wait::resolved_wait_timeout(pane.configured_default_timeout());
-        let cursor_transport = connect_transport_to_endpoint(pane.endpoint(), timeout).await?;
+        let deadline = pane
+            .transport()
+            .operation_deadline()
+            .unwrap_or_else(|| OperationDeadline::from_timeout(timeout));
+        let cursor_transport =
+            connect_transport_to_endpoint(pane.endpoint(), deadline.remaining_timeout())
+                .await?
+                .with_default_timeout(timeout)
+                .with_operation_deadline(deadline);
         Self::open_with_cursor_transport_and_target(pane, options, cursor_transport, target).await
     }
 
@@ -208,7 +216,9 @@ impl PaneStateEventStream {
         pending.push_back(snapshot_event(response.pane_id, response.snapshot));
 
         Ok(Self {
-            cursor_transport,
+            // Cursor requests intentionally long-poll while the stream is
+            // idle. Only setup uses the public operation deadline.
+            cursor_transport: cursor_transport.with_default_timeout(None),
             subscription_id: response.subscription_id,
             pane_id: response.pane_id,
             next_revision: 0,

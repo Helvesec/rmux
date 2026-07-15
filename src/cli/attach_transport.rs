@@ -45,9 +45,7 @@ pub(super) fn begin_queued_attach(
     connection: Connection,
     request: AttachSessionExt2Request,
 ) -> Result<QueuedAttachSessionResult, ExitFailure> {
-    if !std::io::stdin().is_terminal() {
-        return Err(ExitFailure::new(1, "open terminal failed: not a terminal"));
-    }
+    require_attach_terminal()?;
     let (transition, capabilities) = begin_attach(connection, request)?;
     match transition {
         AttachTransition::Upgraded(upgrade) => Ok(QueuedAttachSessionResult::Detached(Box::new(
@@ -102,6 +100,7 @@ pub(super) fn attach_with_connection(
     connection: Connection,
     request: AttachSessionExt2Request,
 ) -> Result<i32, ExitFailure> {
+    require_attach_terminal()?;
     let (transition, capabilities) = begin_attach(connection, request)?;
     match transition {
         AttachTransition::Upgraded(upgrade) => run_attach_upgrade(upgrade, capabilities),
@@ -109,6 +108,14 @@ pub(super) fn attach_with_connection(
             expect_command_success(response, "attach-session")?;
             Ok(0)
         }
+    }
+}
+
+fn require_attach_terminal() -> Result<(), ExitFailure> {
+    if std::io::stdin().is_terminal() {
+        Ok(())
+    } else {
+        Err(ExitFailure::new(1, "open terminal failed: not a terminal"))
     }
 }
 

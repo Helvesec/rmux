@@ -35,7 +35,7 @@ impl RequestHandler {
     ) -> bool {
         if let Some(identity) = current_control_queue_identity(requester_pid) {
             let attached = match self
-                .attach_control_session_for_queue(identity, session_name, Some(session_id))
+                .attach_created_control_session_for_queue(identity, session_name, Some(session_id))
                 .await
             {
                 Ok(attached) => attached,
@@ -69,13 +69,11 @@ impl RequestHandler {
             ControlClientIdentity::new(requester_pid, active.id)
         };
         if self
-            .set_control_session_for_client_identity(
+            .set_created_control_session_for_client_identity(
                 requester_pid,
                 control_identity.control_id(),
                 session_name.clone(),
                 session_id,
-                None,
-                None,
             )
             .await
             .is_err()
@@ -93,6 +91,42 @@ impl RequestHandler {
             .await;
         }
         true
+    }
+
+    pub(in crate::handler) async fn prepare_existing_session_control_attach(
+        &self,
+        requester_pid: u32,
+        session_name: &SessionName,
+        session_id: SessionId,
+    ) -> bool {
+        if let Some(identity) = current_control_queue_identity(requester_pid) {
+            return self
+                .attach_control_session_for_queue(identity, session_name, Some(session_id))
+                .await
+                .unwrap_or(false);
+        }
+
+        let control_identity = {
+            let active_control = self.active_control.lock().await;
+            let Some(active) = active_control
+                .by_pid
+                .get(&requester_pid)
+                .filter(|active| !active.closing.load(std::sync::atomic::Ordering::SeqCst))
+            else {
+                return false;
+            };
+            ControlClientIdentity::new(requester_pid, active.id)
+        };
+        self.set_control_session_for_client_identity(
+            requester_pid,
+            control_identity.control_id(),
+            session_name.clone(),
+            session_id,
+            None,
+            None,
+        )
+        .await
+        .is_ok()
     }
 
     async fn created_session_window_id(
