@@ -134,7 +134,8 @@ pub struct PaneOptionMutation {
 ///
 /// The handle deliberately exposes no `current_revision()` accessor.
 /// Revision values are only observable through
-/// [`PaneSnapshot::revision`] on a freshly captured snapshot, or through
+/// [`PaneSnapshot::revision`](crate::PaneSnapshot::revision) on a freshly
+/// captured snapshot, or through
 /// the revision-carrying [`PaneEvent`](crate::PaneEvent) variants emitted
 /// over a control-mode subscription.
 #[derive(Clone)]

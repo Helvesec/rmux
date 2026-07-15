@@ -13,7 +13,7 @@ use rmux_ipc::LocalStream;
 use rmux_proto::CONTROL_STDIN_EOF_MARKER;
 #[cfg(any(unix, windows))]
 use rmux_proto::{format_exit_line, format_guard_line, ControlGuardKind};
-use rmux_proto::{ControlMode, SessionName};
+use rmux_proto::{ControlMode, RmuxError, SessionName};
 #[cfg(any(unix, windows))]
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(unix, windows))]
@@ -69,7 +69,16 @@ const CONTROL_PANE_EVENT_CAPACITY: usize = 256;
 #[cfg(any(unix, windows))]
 pub(crate) const CONTROL_SERVER_EVENT_CAPACITY: usize = 256;
 #[cfg(any(unix, windows))]
-const MAX_INITIAL_CONTROL_COMMANDS: usize = 1024;
+pub(crate) const MAX_INITIAL_CONTROL_COMMANDS: usize = 1024;
+
+pub(crate) fn validate_initial_control_command_count(count: usize) -> Result<(), RmuxError> {
+    if count <= MAX_INITIAL_CONTROL_COMMANDS {
+        return Ok(());
+    }
+    Err(RmuxError::Server(format!(
+        "too many initial control-mode commands: {count} (maximum {MAX_INITIAL_CONTROL_COMMANDS})"
+    )))
+}
 #[cfg(any(unix, windows))]
 const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
 #[cfg(any(unix, windows))]
@@ -213,14 +222,8 @@ async fn forward_control_inner(
         initial_command_count,
         mode,
     } = upgrade_input;
-    if initial_command_count > MAX_INITIAL_CONTROL_COMMANDS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "too many initial control-mode commands: {initial_command_count} (maximum {MAX_INITIAL_CONTROL_COMMANDS})"
-            ),
-        ));
-    }
+    validate_initial_control_command_count(initial_command_count)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let (pane_event_tx, mut pane_event_rx) = mpsc::channel(CONTROL_PANE_EVENT_CAPACITY);
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     let mut input_buffer = Vec::new();

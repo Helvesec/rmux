@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 
 use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
-use rmux_os::process_tree::ProcessTreeChild;
+use rmux_os::process_tree::{ConsoleWindowBehavior, ProcessTreeChild};
 use rmux_proto::{RmuxError, SessionName};
 use rmux_pty::PtyMaster;
 use tokio::sync::{mpsc, watch};
@@ -285,7 +285,11 @@ impl ActivePanePipe {
         for (name, value) in profile.environment() {
             child.env(name, value);
         }
-        let mut child = ProcessTreeChild::spawn(&mut child).map_err(|error| {
+        let mut child = ProcessTreeChild::spawn_with_console_window(
+            &mut child,
+            ConsoleWindowBehavior::Suppress,
+        )
+        .map_err(|error| {
             RmuxError::Server(format!("failed to spawn pipe-pane command: {error}"))
         })?;
         let process_group = Arc::new(PipeChildProcessGroup::from_controller(child.controller()));

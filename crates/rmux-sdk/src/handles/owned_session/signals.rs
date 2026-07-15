@@ -20,7 +20,14 @@ enum SignalHandlerPhase {
     Idle,
     Armed,
     Firing,
+    Finished,
     Disarmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalHandlerDropAction {
+    CancelListener,
+    KeepCleanup,
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +58,11 @@ impl SignalHandlerState {
             SignalHandlerPhase::Firing => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
                 "owned-session signal cleanup is already in progress".to_owned(),
             ))),
+            SignalHandlerPhase::Finished => {
+                Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                    "owned-session signal cleanup has already finished".to_owned(),
+                )))
+            }
         }
     }
 
@@ -63,6 +75,13 @@ impl SignalHandlerState {
         true
     }
 
+    fn finish_cleanup(&self) {
+        let mut phase = self.lock_phase();
+        if *phase == SignalHandlerPhase::Firing {
+            *phase = SignalHandlerPhase::Finished;
+        }
+    }
+
     fn rollback_install(&self) {
         let mut phase = self.lock_phase();
         if *phase == SignalHandlerPhase::Armed {
@@ -70,13 +89,17 @@ impl SignalHandlerState {
         }
     }
 
-    fn release_guard(&self) {
+    fn release_guard(&self) -> SignalHandlerDropAction {
         let mut phase = self.lock_phase();
-        if matches!(
-            *phase,
-            SignalHandlerPhase::Armed | SignalHandlerPhase::Disarmed
-        ) {
-            *phase = SignalHandlerPhase::Idle;
+        match *phase {
+            SignalHandlerPhase::Idle => SignalHandlerDropAction::CancelListener,
+            SignalHandlerPhase::Armed | SignalHandlerPhase::Disarmed => {
+                *phase = SignalHandlerPhase::Idle;
+                SignalHandlerDropAction::CancelListener
+            }
+            SignalHandlerPhase::Firing | SignalHandlerPhase::Finished => {
+                SignalHandlerDropAction::KeepCleanup
+            }
         }
     }
 
@@ -158,7 +181,7 @@ fn install_tokio_signal_handlers(
     let task = runtime.spawn(async move {
         wait_for_default_shutdown_signal().await;
         if cleanup_state.try_begin_cleanup() {
-            let _ = transport.request(cleanup_request).await;
+            run_signal_cleanup(transport, cleanup_request, cleanup_state).await;
         }
     });
 
@@ -186,9 +209,11 @@ fn install_unix_signal_handlers(
         .name("rmux-sdk-owned-signals".to_owned())
         .spawn(move || {
             if signals.forever().next().is_some() && cleanup_state.try_begin_cleanup() {
-                runtime.spawn(async move {
-                    let _ = transport.request(cleanup_request).await;
-                });
+                runtime.spawn(run_signal_cleanup(
+                    transport,
+                    cleanup_request,
+                    cleanup_state,
+                ));
             }
         })
         .map_err(|source| RmuxError::Transport {
@@ -201,6 +226,16 @@ fn install_unix_signal_handlers(
         thread: Some(thread),
         state,
     })
+}
+
+#[cfg(any(unix, windows))]
+async fn run_signal_cleanup(
+    transport: TransportClient,
+    cleanup_request: Request,
+    state: Arc<SignalHandlerState>,
+) {
+    let _ = transport.request(cleanup_request).await;
+    state.finish_cleanup();
 }
 
 #[cfg(any(unix, windows))]
@@ -226,12 +261,14 @@ pub struct OwnedSessionSignalHandlers {
 }
 
 impl OwnedSessionSignalHandlers {
-    /// Stops listening for process signals without killing the session.
+    /// Stops listening for process signals without starting cleanup.
+    /// Cleanup that already started is allowed to finish.
     pub fn abort(self) {}
 }
 
 impl Drop for OwnedSessionSignalHandlers {
     fn drop(&mut self) {
+        let drop_action = self.state.release_guard();
         #[cfg(unix)]
         {
             self.signal_handle.close();
@@ -240,8 +277,11 @@ impl Drop for OwnedSessionSignalHandlers {
             }
         }
         #[cfg(windows)]
-        self.task.abort();
-        self.state.release_guard();
+        if drop_action == SignalHandlerDropAction::CancelListener {
+            self.task.abort();
+        }
+        #[cfg(not(windows))]
+        let _ = drop_action;
     }
 }
 
@@ -338,5 +378,106 @@ impl ShutdownSignalWaiters {
         for task in self.tasks {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    #[cfg(any(unix, windows))]
+    use std::sync::Arc;
+
+    #[cfg(any(unix, windows))]
+    use super::run_signal_cleanup;
+    use super::{SignalHandlerDropAction, SignalHandlerState};
+    #[cfg(any(unix, windows))]
+    use crate::transport::TransportClient;
+
+    #[test]
+    fn armed_signal_guard_releases_the_installation_reservation_on_drop() {
+        let state = SignalHandlerState::default();
+        state
+            .reserve_install()
+            .expect("first install reserves state");
+
+        assert_eq!(
+            state.release_guard(),
+            SignalHandlerDropAction::CancelListener
+        );
+
+        state
+            .reserve_install()
+            .expect("dropping an armed guard must permit a later installation");
+    }
+
+    #[test]
+    fn in_flight_cleanup_survives_guard_drop_and_stays_fail_closed() {
+        let state = SignalHandlerState::default();
+        state
+            .reserve_install()
+            .expect("first install reserves state");
+        assert!(state.try_begin_cleanup(), "signal begins cleanup once");
+
+        assert_eq!(state.release_guard(), SignalHandlerDropAction::KeepCleanup);
+        assert!(
+            state.reserve_install().is_err(),
+            "guard drop must not make an in-flight cleanup installable again"
+        );
+        let error = state
+            .disarm_for_ownership_release()
+            .expect_err("canceled or in-flight cleanup must block ownership release");
+        assert!(
+            error.to_string().contains("already in progress"),
+            "unexpected ownership-release error: {error}"
+        );
+    }
+
+    #[test]
+    fn finished_cleanup_remains_terminal_after_guard_drop() {
+        let state = SignalHandlerState::default();
+        state
+            .reserve_install()
+            .expect("first install reserves state");
+        assert!(state.try_begin_cleanup(), "signal begins cleanup once");
+        state.finish_cleanup();
+
+        assert_eq!(state.release_guard(), SignalHandlerDropAction::KeepCleanup);
+        assert!(
+            state.reserve_install().is_err(),
+            "completed signal cleanup must not allow another installation"
+        );
+        let error = state
+            .disarm_for_ownership_release()
+            .expect_err("completed signal cleanup must block ownership release");
+        assert!(
+            error.to_string().contains("already finished"),
+            "unexpected ownership-release error: {error}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn completed_cleanup_request_marks_the_state_terminal() {
+        let (client_stream, server_stream) = tokio::io::duplex(1024);
+        drop(server_stream);
+        let state = Arc::new(SignalHandlerState::default());
+        state
+            .reserve_install()
+            .expect("first install reserves state");
+        assert!(state.try_begin_cleanup(), "signal begins cleanup once");
+
+        run_signal_cleanup(
+            TransportClient::spawn(client_stream),
+            super::super::session_identity_kill_request(crate::SessionId::new(42)),
+            Arc::clone(&state),
+        )
+        .await;
+
+        let error = state
+            .disarm_for_ownership_release()
+            .expect_err("a completed cleanup request must block ownership release");
+        assert!(
+            error.to_string().contains("already finished"),
+            "unexpected ownership-release error: {error}"
+        );
     }
 }

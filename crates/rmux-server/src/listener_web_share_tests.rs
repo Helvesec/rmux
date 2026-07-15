@@ -6,15 +6,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rmux_ipc::{LocalStream, PeerIdentity};
 use rmux_proto::{
-    encode_frame, CreateWebShareRequest, ListWebSharesRequest, NewSessionRequest, Request,
-    Response, SessionName, TerminalSize, WebShareRequest, WebShareScope,
+    encode_frame, CreateWebShareRequest, FrameDecoder, ListWebSharesRequest, NewSessionRequest,
+    Request, Response, SessionName, TerminalSize, WebShareRequest, WebShareScope,
 };
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
 
-use super::{run_connection_with_cleanup, UndeliveredWebShareGuard};
+use super::run_connection_with_cleanup;
 use crate::daemon::ShutdownHandle;
-use crate::handler::RequestHandler;
+use crate::handler::{RequestHandler, UndeliveredWebShareGuard};
 
 #[tokio::test]
 async fn client_disconnect_cancels_web_share_tunnel_start() -> io::Result<()> {
@@ -86,7 +86,7 @@ async fn undelivered_web_share_response_is_rolled_back() {
     let response = handler
         .handle(create_web_share_request(session_name, None))
         .await;
-    let guard = UndeliveredWebShareGuard::for_response(Arc::clone(&handler), &response)
+    let guard = UndeliveredWebShareGuard::for_response(&handler, &response)
         .expect("create response arms rollback");
 
     drop(guard);
@@ -101,6 +101,77 @@ async fn undelivered_web_share_response_is_rolled_back() {
         Response::WebShare(response)
             if matches!(response.as_ref(), rmux_proto::WebShareResponse::List(list) if list.shares.is_empty())
     ));
+}
+
+#[tokio::test]
+async fn disconnect_after_share_creation_before_hooks_rolls_back() -> io::Result<()> {
+    let handler = Arc::new(RequestHandler::new());
+    handler.mark_web_listener_available();
+    let session_name = create_session(&handler, "disconnect-after-create").await;
+    let pause = handler.install_web_share_delivery_pause();
+    let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+
+    write_test_request(&mut client, create_web_share_request(session_name, None)).await?;
+    tokio::time::timeout(Duration::from_secs(2), pause.wait_until_reached())
+        .await
+        .expect("web-share dispatch reached guarded pre-hook interval");
+    assert_eq!(list_web_shares(&handler).await.len(), 1);
+
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), connection_task)
+        .await
+        .expect("disconnected connection stopped")
+        .expect("connection task joined")?;
+
+    assert!(list_web_shares(&handler).await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn delivered_share_disarms_pre_hook_rollback() -> io::Result<()> {
+    let handler = Arc::new(RequestHandler::new());
+    handler.mark_web_listener_available();
+    let session_name = create_session(&handler, "delivered-after-hooks").await;
+    let pause = handler.install_web_share_delivery_pause();
+    let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+
+    write_test_request(&mut client, create_web_share_request(session_name, None)).await?;
+    tokio::time::timeout(Duration::from_secs(2), pause.wait_until_reached())
+        .await
+        .expect("web-share dispatch reached guarded pre-hook interval");
+    pause.release();
+    let response = tokio::time::timeout(Duration::from_secs(2), read_test_response(&mut client))
+        .await
+        .expect("web-share response was delivered")?;
+    assert!(matches!(
+        response,
+        Response::WebShare(response)
+            if matches!(response.as_ref(), rmux_proto::WebShareResponse::Created(_))
+    ));
+    assert_eq!(list_web_shares(&handler).await.len(), 1);
+
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(2), connection_task)
+        .await
+        .expect("delivered connection stopped")
+        .expect("connection task joined")?;
+    assert_eq!(list_web_shares(&handler).await.len(), 1);
+    Ok(())
+}
+
+async fn list_web_shares(handler: &RequestHandler) -> Vec<rmux_proto::WebShareSummary> {
+    let response = handler
+        .handle(Request::WebShare(Box::new(WebShareRequest::List(
+            ListWebSharesRequest,
+        ))))
+        .await;
+    let Response::WebShare(response) = response else {
+        panic!("expected web-share list response");
+    };
+    let rmux_proto::WebShareResponse::List(list) = response.as_ref() else {
+        panic!("expected web-share list payload");
+    };
+    list.shares.clone()
 }
 
 async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
@@ -174,6 +245,25 @@ fn spawn_test_connection(
 async fn write_test_request(stream: &mut LocalStream, request: Request) -> io::Result<()> {
     let frame = encode_frame(&request).map_err(io::Error::other)?;
     stream.write_all(&frame).await
+}
+
+async fn read_test_response(stream: &mut LocalStream) -> io::Result<Response> {
+    let mut decoder = FrameDecoder::new();
+    let mut buffer = [0_u8; 512];
+
+    loop {
+        if let Some(response) = decoder.next_frame::<Response>().map_err(io::Error::other)? {
+            return Ok(response);
+        }
+        let bytes_read = stream.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "server closed before response frame",
+            ));
+        }
+        decoder.push_bytes(&buffer[..bytes_read]);
+    }
 }
 
 async fn wait_for_pid_marker(path: &Path) -> i32 {

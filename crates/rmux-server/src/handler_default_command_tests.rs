@@ -42,24 +42,8 @@ fn unique_temp_path(label: &str) -> PathBuf {
     ))
 }
 
-#[cfg(windows)]
 fn expected_spawn_cwd(path: &Path) -> PathBuf {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let rendered = canonical.display().to_string();
-    let normalized = if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else {
-        rendered
-            .strip_prefix(r"\\?\")
-            .unwrap_or(&rendered)
-            .to_owned()
-    };
-    PathBuf::from(normalized)
-}
-
-#[cfg(unix)]
-fn expected_spawn_cwd(path: &Path) -> PathBuf {
-    path.to_path_buf()
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 async fn create_session(handler: &RequestHandler, session: &SessionName) {

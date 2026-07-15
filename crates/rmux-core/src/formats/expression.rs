@@ -12,7 +12,6 @@ where
     let Some(operator) = modifier.argv.first().map(String::as_str) else {
         return String::new();
     };
-    let float_precision = expression_float_precision(modifier);
     let Some((left, right)) = format_choose(state, body, variables) else {
         return String::new();
     };
@@ -23,16 +22,20 @@ where
             .unwrap_or_default();
     }
 
-    if let Some(precision) = float_precision {
-        let Some(value) = numeric_operation(operator, &left, &right) else {
-            return String::new();
-        };
-        format_float_value(value, precision)
-    } else {
-        let Some(value) = integer_operation(operator, &left, &right) else {
-            return String::new();
-        };
-        value
+    match expression_float_precision(modifier) {
+        ExpressionFloatPrecision::Valid(precision) => {
+            let Some(value) = numeric_operation(operator, &left, &right) else {
+                return String::new();
+            };
+            format_float_value(value, precision)
+        }
+        ExpressionFloatPrecision::Invalid => String::new(),
+        ExpressionFloatPrecision::Disabled => {
+            let Some(value) = integer_operation(operator, &left, &right) else {
+                return String::new();
+            };
+            value
+        }
     }
 }
 
@@ -157,18 +160,41 @@ fn is_comparison_operator(operator: &str) -> bool {
     matches!(operator, "==" | "!=" | ">" | ">=" | "<" | "<=")
 }
 
-fn expression_float_precision(modifier: &FormatModifier) -> Option<usize> {
+const MIN_EXPRESSION_FLOAT_PRECISION: i64 = -100;
+const MAX_EXPRESSION_FLOAT_PRECISION: i64 = 100;
+const DEFAULT_NEGATIVE_FLOAT_PRECISION: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpressionFloatPrecision {
+    Disabled,
+    Valid(usize),
+    Invalid,
+}
+
+fn expression_float_precision(modifier: &FormatModifier) -> ExpressionFloatPrecision {
     let options = modifier.argv.get(1).map(String::as_str).unwrap_or_default();
     if !options.contains('f') {
-        return None;
+        return ExpressionFloatPrecision::Disabled;
     }
-    Some(
-        modifier
-            .argv
-            .get(2)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(2),
-    )
+    let Some(raw_precision) = modifier.argv.get(2) else {
+        return ExpressionFloatPrecision::Valid(2);
+    };
+    if raw_precision.is_empty() {
+        return ExpressionFloatPrecision::Valid(2);
+    }
+    let Ok(precision) = raw_precision.parse::<i64>() else {
+        return ExpressionFloatPrecision::Invalid;
+    };
+    if precision < MIN_EXPRESSION_FLOAT_PRECISION {
+        return ExpressionFloatPrecision::Invalid;
+    }
+    if precision < 0 {
+        return ExpressionFloatPrecision::Valid(DEFAULT_NEGATIVE_FLOAT_PRECISION);
+    }
+    if precision > MAX_EXPRESSION_FLOAT_PRECISION {
+        return ExpressionFloatPrecision::Invalid;
+    }
+    ExpressionFloatPrecision::Valid(precision as usize)
 }
 
 fn bool_string(value: bool) -> String {

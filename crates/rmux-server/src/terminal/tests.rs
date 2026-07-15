@@ -213,8 +213,13 @@ fn terminal_profile_uses_client_shell_when_default_shell_is_unset() {
     let environment = EnvironmentStore::new();
     let options = OptionStore::new();
     let session_name = SessionName::new("alpha").expect("valid session name");
+    let client_shell = std::env::current_exe().expect("test executable path");
+    let client_shell_value = client_shell
+        .to_str()
+        .expect("test executable path is UTF-8")
+        .to_owned();
     let spawn_environment = HashMap::from([
-        ("SHELL".to_owned(), "/usr/bin/fish".to_owned()),
+        ("SHELL".to_owned(), client_shell_value.clone()),
         ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
     ]);
 
@@ -232,8 +237,11 @@ fn terminal_profile_uses_client_shell_when_default_shell_is_unset() {
     )
     .expect("profile");
 
-    assert_eq!(profile.shell(), Path::new("/usr/bin/fish"));
-    assert_eq!(profile.environment_value("SHELL"), Some("/usr/bin/fish"));
+    assert_eq!(profile.shell(), client_shell);
+    assert_eq!(
+        profile.environment_value("SHELL"),
+        Some(client_shell_value.as_str())
+    );
 }
 
 #[test]
@@ -506,7 +514,7 @@ fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
         .set(
             ScopeSelector::Global,
             OptionName::DefaultShell,
-            "/bin/bash".to_owned(),
+            default_shell_string(),
             SetOptionMode::Replace,
         )
         .expect("default-shell succeeds");
@@ -540,7 +548,7 @@ fn terminal_profile_initial_pane_title_uses_host_short() {
         .set(
             ScopeSelector::Global,
             OptionName::DefaultShell,
-            "/bin/bash".to_owned(),
+            default_shell_string(),
             SetOptionMode::Replace,
         )
         .expect("default-shell succeeds");
@@ -578,7 +586,7 @@ fn terminal_profile_falls_back_to_shell_name_without_term_program() {
         .set(
             ScopeSelector::Global,
             OptionName::DefaultShell,
-            "/bin/bash".to_owned(),
+            default_shell_string(),
             SetOptionMode::Replace,
         )
         .expect("default-shell succeeds");
@@ -597,7 +605,8 @@ fn terminal_profile_falls_back_to_shell_name_without_term_program() {
     )
     .expect("profile");
 
-    assert_eq!(profile.default_window_name().as_deref(), Some("bash"));
+    let shell_name = default_shell_name();
+    assert_eq!(profile.default_window_name().as_deref(), Some(&*shell_name));
 }
 
 #[test]
@@ -610,7 +619,7 @@ fn terminal_profile_ignores_non_rmux_term_program_for_default_window_name() {
         .set(
             ScopeSelector::Global,
             OptionName::DefaultShell,
-            "/bin/bash".to_owned(),
+            default_shell_string(),
             SetOptionMode::Replace,
         )
         .expect("default-shell succeeds");
@@ -629,7 +638,8 @@ fn terminal_profile_ignores_non_rmux_term_program_for_default_window_name() {
     )
     .expect("profile");
 
-    assert_eq!(profile.default_window_name().as_deref(), Some("bash"));
+    let shell_name = default_shell_name();
+    assert_eq!(profile.default_window_name().as_deref(), Some(&*shell_name));
 }
 
 #[test]
@@ -642,7 +652,7 @@ fn terminal_profile_runtime_window_name_tracks_spawned_command_shape() {
         .set(
             ScopeSelector::Global,
             OptionName::DefaultShell,
-            "/bin/bash".to_owned(),
+            default_shell_string(),
             SetOptionMode::Replace,
         )
         .expect("default-shell succeeds");
@@ -661,7 +671,11 @@ fn terminal_profile_runtime_window_name_tracks_spawned_command_shape() {
     )
     .expect("profile");
 
-    assert_eq!(profile.runtime_window_name(None).as_deref(), Some("bash"));
+    let shell_name = default_shell_name();
+    assert_eq!(
+        profile.runtime_window_name(None).as_deref(),
+        Some(&*shell_name)
+    );
     assert_eq!(
         profile
             .runtime_window_name(Some(&rmux_proto::ProcessCommand::Shell(
@@ -1109,6 +1123,16 @@ fn default_shell_string() -> String {
     {
         std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned())
     }
+}
+
+fn default_shell_name() -> String {
+    let shell = default_shell_string();
+    Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.trim_start_matches('-').to_owned())
+        .filter(|name| !name.is_empty())
+        .expect("test default shell has a file name")
 }
 
 fn hook_write_command(path: &Path, text: &str) -> String {

@@ -234,6 +234,8 @@ async fn serve_connection(
                 };
                 let cancel_on_peer_disconnect = request_cancels_on_peer_disconnect(&request);
                 debug!("dispatching {}", request.command_name());
+                #[cfg(feature = "web")]
+                let mut undelivered_web_share;
                 let mut outcome = match request {
                     Request::SdkWaitForOutput(request) => {
                         let prepared = handler
@@ -274,11 +276,31 @@ async fn serve_connection(
                         continue;
                     }
                     request => {
+                        #[cfg(feature = "web")]
+                        let dispatch = handler.dispatch_for_connection_with_web_share_guard(
+                            requester.pid,
+                            connection_id,
+                            request,
+                        );
+                        #[cfg(not(feature = "web"))]
+                        let dispatch = handler.dispatch_for_connection(
+                            requester.pid,
+                            connection_id,
+                            request,
+                        );
                         tokio::select! {
                             outcome = with_session_lease_create_addressing(
                                 session_lease_create_addressing,
-                                handler.dispatch_for_connection(requester.pid, connection_id, request),
-                            ) => outcome,
+                                dispatch,
+                            ) => {
+                                #[cfg(feature = "web")]
+                                {
+                                    undelivered_web_share = outcome.1;
+                                    outcome.0
+                                }
+                                #[cfg(not(feature = "web"))]
+                                outcome
+                            },
                             result = shutdown.changed() => {
                                 if result.is_ok() {
                                     debug!("closing client connection during shutdown");
@@ -308,6 +330,14 @@ async fn serve_connection(
                     .then(|| handler.begin_attach_forwarder());
                 let pending_control = if let Some(control_upgrade) = outcome.control.take() {
                     let initial_command_count = control_upgrade.initial_command_count as usize;
+                    if let Err(error) =
+                        control::validate_initial_control_command_count(initial_command_count)
+                    {
+                        conn.write_response(&Response::Error(ErrorResponse { error }))
+                            .await?;
+                        drop(detached_request_guard.take());
+                        continue;
+                    }
                     let control_mode = control_upgrade.mode;
                     let (server_event_tx, server_event_rx) =
                         tokio::sync::mpsc::channel::<ControlServerEvent>(
@@ -348,12 +378,6 @@ async fn serve_connection(
                 } else {
                     None
                 };
-
-                #[cfg(feature = "web")]
-                let mut undelivered_web_share = UndeliveredWebShareGuard::for_response(
-                    Arc::clone(&handler),
-                    &outcome.response,
-                );
 
                 let response_result = match (legacy_kill_server_wire, &outcome.response) {
                     (Some(wire_version), Response::KillServer(_)) => {
@@ -599,41 +623,6 @@ impl Drop for ConnectionCleanupGuard {
     }
 }
 
-#[cfg(feature = "web")]
-struct UndeliveredWebShareGuard {
-    handler: Arc<RequestHandler>,
-    share_id: Option<String>,
-}
-
-#[cfg(feature = "web")]
-impl UndeliveredWebShareGuard {
-    fn for_response(handler: Arc<RequestHandler>, response: &Response) -> Option<Self> {
-        let Response::WebShare(response) = response else {
-            return None;
-        };
-        let rmux_proto::WebShareResponse::Created(created) = response.as_ref() else {
-            return None;
-        };
-        Some(Self {
-            handler,
-            share_id: Some(created.share_id.clone()),
-        })
-    }
-
-    fn disarm(&mut self) {
-        self.share_id = None;
-    }
-}
-
-#[cfg(feature = "web")]
-impl Drop for UndeliveredWebShareGuard {
-    fn drop(&mut self) {
-        if let Some(share_id) = self.share_id.take() {
-            self.handler.discard_undelivered_web_share(&share_id);
-        }
-    }
-}
-
 fn request_enables_sdk_wait_armed_ack(request: &Request) -> bool {
     matches!(
         request,
@@ -837,13 +826,13 @@ mod tests {
     use super::*;
     use crate::server_access::AccessMode;
     use rmux_proto::{
-        decode_frame, AttachSessionRequest, CancelSdkWaitResponse, CreateSessionLeaseRequest,
-        DaemonStatusRequest, ErrorResponse, HandshakeRequest, HasSessionRequest,
-        ListSessionsRequest, NewSessionRequest, PaneOutputSubscriptionStart, PaneTarget,
-        RenameSessionRequest, RmuxError, SdkWaitForOutputRequest, SdkWaitForOutputResponse,
-        SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest,
-        ShutdownIfIdleResponse, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse,
-        RMUX_WIRE_VERSION,
+        decode_frame, AttachSessionRequest, CancelSdkWaitResponse, ClientTerminalContext,
+        ControlMode, ControlModeRequest, CreateSessionLeaseRequest, DaemonStatusRequest,
+        ErrorResponse, HandshakeRequest, HasSessionRequest, ListSessionsRequest, NewSessionRequest,
+        PaneOutputSubscriptionStart, PaneTarget, RenameSessionRequest, RmuxError,
+        SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome,
+        SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest, ShutdownIfIdleResponse, TerminalSize,
+        WaitForMode, WaitForRequest, WaitForResponse, RMUX_WIRE_VERSION,
     };
 
     #[test]
@@ -882,6 +871,38 @@ mod tests {
         drain_connection_tasks_for_shutdown(&mut tasks).await;
         assert!(tasks.is_empty());
         drop(client);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn excessive_initial_control_commands_are_rejected_before_upgrade_ack() -> io::Result<()>
+    {
+        let handler = Arc::new(RequestHandler::new());
+        let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+
+        write_test_request(
+            &mut client,
+            Request::ControlMode(ControlModeRequest {
+                mode: ControlMode::Plain,
+                client_terminal: ClientTerminalContext::default(),
+                initial_command_count: (control::MAX_INITIAL_CONTROL_COMMANDS + 1) as u32,
+            }),
+        )
+        .await?;
+
+        let response = read_test_response(&mut client).await?;
+        assert!(
+            matches!(
+                &response,
+                Response::Error(ErrorResponse {
+                    error: RmuxError::Server(message),
+                }) if message.contains("too many initial control-mode commands")
+            ),
+            "the detached response must reject the command count before upgrading: {response:?}"
+        );
+
+        drop(client);
+        connection_task.await.expect("connection task")?;
         Ok(())
     }
 

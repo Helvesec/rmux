@@ -1790,6 +1790,7 @@ mod tests {
             can_write: true,
             suspended: false,
             closing: Arc::new(AtomicBool::new(false)),
+            emit_detached_on_finish: false,
             terminal_context: OuterTerminalContext::default(),
             client_size: TerminalSize { cols: 80, rows: 24 },
             client_pixels: None,

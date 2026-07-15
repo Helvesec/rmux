@@ -24,10 +24,8 @@ const DEAD_PANE_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 enum PaneExitPlan {
     Ignore,
     KeepDead {
-        runtime_session_name: rmux_proto::SessionName,
-        target: PaneTarget,
         prepare_dead: bool,
-        pane_event: super::super::QueuedLifecycleEvent,
+        output_generation: u64,
     },
     RemovePane {
         runtime_session_name: rmux_proto::SessionName,
@@ -80,16 +78,17 @@ impl ExitedPaneOutput {
         Self { receiver, sender }
     }
 
-    async fn ensure_eof(&mut self, generation: Option<u64>, output_eof_published: bool) {
+    async fn ensure_eof(&mut self, generation: Option<u64>, output_eof_published: bool) -> bool {
         if output_eof_published {
-            return;
+            return true;
         }
         if wait_for_pane_output_eof(self.receiver.take()).await {
-            return;
+            return true;
         }
         if let Some(sender) = self.sender.as_ref() {
             let _ = sender.send_for_generation(generation, Vec::new());
         }
+        false
     }
 
     fn sender(&self) -> Option<PaneOutputSender> {
@@ -137,7 +136,7 @@ impl RequestHandler {
         if !event.output_eof_published() {
             self.notify_pane_exit_output_drain_started();
         }
-        output
+        let output_eof_observed = output
             .ensure_eof(event.generation, event.output_eof_published())
             .await;
         self.flush_pending_pane_alert_for_exit(event.pane_id, event.generation)
@@ -176,22 +175,10 @@ impl RequestHandler {
 
                 if let Some(metadata) = metadata {
                     if should_keep_dead_pane(&state, &target, metadata) {
-                        let (pane_id, window_id, window_name) =
-                            pane_lifecycle_identifiers(&state, &target, event.pane_id);
-                        let pane_event = prepare_lifecycle_event(
-                            &mut state,
-                            &LifecycleEvent::PaneDied {
-                                target: target.clone(),
-                                pane_id: Some(pane_id),
-                                window_id,
-                                window_name,
-                            },
-                        );
                         Some(PaneExitPlan::KeepDead {
-                            runtime_session_name,
-                            target,
                             prepare_dead: !was_dead,
-                            pane_event,
+                            output_generation: state
+                                .pane_output_generation(&runtime_session_name, event.pane_id),
                         })
                     } else {
                         let Some(session) = state.sessions.session(target.session_name()) else {
@@ -433,39 +420,37 @@ impl RequestHandler {
         match plan {
             PaneExitPlan::Ignore => {}
             PaneExitPlan::KeepDead {
-                runtime_session_name,
-                target,
                 prepare_dead,
-                pane_event,
+                output_generation,
             } => {
-                if prepare_dead {
-                    self.prepare_kept_dead_pane_transcript(
-                        &runtime_session_name,
-                        event.pane_id,
-                        &target,
-                        event.output_eof_published(),
+                let Some((target, pane_event)) = self
+                    .commit_kept_dead_pane(
+                        &event,
+                        output_generation,
+                        prepare_dead,
+                        output_eof_observed,
                     )
-                    .await;
-                }
-                self.record_pane_state_change(
-                    event.pane_id,
-                    event.generation,
-                    PaneStateChange::Closed {
-                        reason: PaneStateClosedReason::DiedKept,
-                    },
-                );
+                    .await
+                else {
+                    return;
+                };
                 self.emit_prepared(pane_event).await;
                 let session_names = if self.attached_count(target.session_name()).await == 0 {
                     let mut state = self.state.lock().await;
-                    match apply_dead_pane_automatic_window_name(&mut state, &target) {
+                    let Some((_, current_target)) =
+                        current_kept_dead_pane(&state, &event, output_generation)
+                    else {
+                        return;
+                    };
+                    match apply_dead_pane_automatic_window_name(&mut state, &current_target) {
                         Ok(session_names) => session_names,
                         Err(error) => {
                             warn!(
-                                session = %target.session_name(),
-                                pane_index = target.pane_index(),
+                                session = %current_target.session_name(),
+                                pane_index = current_target.pane_index(),
                                 "failed to update dead pane automatic window name: {error}"
                             );
-                            vec![target.session_name().clone()]
+                            vec![current_target.session_name().clone()]
                         }
                     }
                 } else {
@@ -640,32 +625,23 @@ impl RequestHandler {
         self.drain_exited_pane_output_subscriptions(key).await;
     }
 
-    async fn prepare_kept_dead_pane_transcript(
+    async fn commit_kept_dead_pane(
         &self,
-        runtime_session_name: &rmux_proto::SessionName,
-        pane_id: rmux_core::PaneId,
-        target: &PaneTarget,
-        output_eof_published: bool,
-    ) {
-        let (retry_strip, output_rx) = {
-            let mut state = self.state.lock().await;
-            let output_rx = state.subscribe_runtime_pane_output(runtime_session_name, pane_id);
-            let stripped = match state.strip_attached_submitted_line(runtime_session_name, pane_id)
-            {
-                Ok(stripped) => stripped,
-                Err(error) => {
-                    warn!(
-                        session = %runtime_session_name,
-                        pane_id = pane_id.as_u32(),
-                        "failed to strip attached submitted line for dead pane: {error}"
-                    );
-                    false
-                }
-            };
-            (!stripped, output_rx)
+        event: &PaneExitEvent,
+        output_generation: u64,
+        prepare_dead: bool,
+        output_eof_observed: bool,
+    ) -> Option<(PaneTarget, super::super::QueuedLifecycleEvent)> {
+        let output_rx = if prepare_dead && !output_eof_observed {
+            let state = self.state.lock().await;
+            let (runtime_session_name, _) =
+                current_kept_dead_pane(&state, event, output_generation)?;
+            state.subscribe_runtime_pane_output(&runtime_session_name, event.pane_id)
+        } else {
+            None
         };
 
-        if retry_strip && !output_eof_published {
+        if output_rx.is_some() {
             // On Windows the child-exit watcher can beat the ConPTY reader.
             // Wait for the reader's EOF marker so a final echoed command can be
             // stripped before the dead-pane message is appended.
@@ -673,24 +649,65 @@ impl RequestHandler {
         }
 
         let mut state = self.state.lock().await;
-        if retry_strip {
-            if let Err(error) = state.strip_attached_submitted_line(runtime_session_name, pane_id) {
+        let (runtime_session_name, target) =
+            current_kept_dead_pane(&state, event, output_generation)?;
+        if prepare_dead {
+            if let Err(error) =
+                state.strip_attached_submitted_line(&runtime_session_name, event.pane_id)
+            {
                 warn!(
                     session = %runtime_session_name,
-                    pane_id = pane_id.as_u32(),
-                    "failed to retry attached submitted line strip for dead pane: {error}"
+                    pane_id = event.pane_id.as_u32(),
+                    "failed to strip attached submitted line for dead pane: {error}"
+                );
+            }
+            if let Err(error) =
+                append_remain_on_exit_message(&mut state, &runtime_session_name, &target)
+            {
+                warn!(
+                    session = %runtime_session_name,
+                    pane_id = event.pane_id.as_u32(),
+                    "failed to append remain-on-exit message: {error}"
                 );
             }
         }
-        if let Err(error) = append_remain_on_exit_message(&mut state, runtime_session_name, target)
-        {
-            warn!(
-                session = %runtime_session_name,
-                pane_id = pane_id.as_u32(),
-                "failed to append remain-on-exit message: {error}"
-            );
-        }
+
+        let (pane_id, window_id, window_name) =
+            pane_lifecycle_identifiers(&state, &target, event.pane_id);
+        let pane_event = prepare_lifecycle_event(
+            &mut state,
+            &LifecycleEvent::PaneDied {
+                target: target.clone(),
+                pane_id: Some(pane_id),
+                window_id,
+                window_name,
+            },
+        );
+        self.record_pane_state_change(
+            event.pane_id,
+            Some(output_generation),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::DiedKept,
+            },
+        );
+        Some((target, pane_event))
     }
+}
+
+fn current_kept_dead_pane(
+    state: &HandlerState,
+    event: &PaneExitEvent,
+    output_generation: u64,
+) -> Option<(rmux_proto::SessionName, PaneTarget)> {
+    let runtime_session_name = state.resolve_pane_event_runtime_session(
+        &event.session_name,
+        event.pane_id,
+        Some(output_generation),
+    )?;
+    let target = state.pane_target_for_runtime_pane(&runtime_session_name, event.pane_id)?;
+    state
+        .pane_is_dead(target.session_name(), event.pane_id)
+        .then_some((runtime_session_name, target))
 }
 
 async fn wait_for_pane_output_eof(output_rx: Option<PaneOutputReceiver>) -> bool {

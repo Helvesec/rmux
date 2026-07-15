@@ -72,6 +72,46 @@ fn live_signal_guard_is_disarmed_by_preserve_without_killing_the_session() {
 }
 
 #[cfg(any(unix, windows))]
+#[test]
+fn detach_rejects_ownership_release_after_signal_cleanup_starts() {
+    let (runtime, owned, _daemon, state) = signal_install_fixture("detach-during-signal-cleanup");
+    let guard = runtime
+        .block_on(async { owned.install_default_signal_handlers() })
+        .expect("signal handlers install inside a Tokio runtime");
+    assert!(state.try_begin_cleanup(), "signal begins cleanup once");
+
+    drop(guard);
+
+    let error = runtime
+        .block_on(owned.detach_owned())
+        .expect_err("detach must not release ownership after signal cleanup starts");
+    assert!(
+        error.to_string().contains("already in progress"),
+        "unexpected detach error: {error}"
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn preserve_rejects_ownership_release_after_signal_cleanup_starts() {
+    let (runtime, owned, _daemon, state) = signal_install_fixture("preserve-during-signal-cleanup");
+    let guard = runtime
+        .block_on(async { owned.install_default_signal_handlers() })
+        .expect("signal handlers install inside a Tokio runtime");
+    assert!(state.try_begin_cleanup(), "signal begins cleanup once");
+
+    drop(guard);
+
+    let error = runtime
+        .block_on(owned.preserve())
+        .expect_err("preserve must not release ownership after signal cleanup starts");
+    assert!(
+        error.to_string().contains("already in progress"),
+        "unexpected preserve error: {error}"
+    );
+}
+
+#[cfg(any(unix, windows))]
 fn signal_install_fixture(
     name: &str,
 ) -> (

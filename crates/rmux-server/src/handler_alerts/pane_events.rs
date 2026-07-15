@@ -88,7 +88,17 @@ impl RequestHandler {
                     PaneStateChange::TitleChanged { old, new },
                 );
             }
-            handler.try_relay_visible_inactive_pane_clipboard(&event);
+            let disconnected = handler.try_relay_visible_inactive_pane_clipboard(&event);
+            if !disconnected.is_empty() {
+                let cleanup_handler = handler.clone();
+                runtime.spawn(async move {
+                    for identity in disconnected {
+                        cleanup_handler
+                            .finish_attach(identity.attach_pid(), identity.attach_id())
+                            .await;
+                    }
+                });
+            }
             let should_spawn = {
                 let mut pending_alerts = pending_alerts
                     .lock()
@@ -117,7 +127,10 @@ impl RequestHandler {
 
     #[cfg(test)]
     pub(in crate::handler) async fn handle_pane_alert_event(&self, event: PaneAlertEvent) {
-        self.try_relay_visible_inactive_pane_clipboard(&event);
+        for identity in self.try_relay_visible_inactive_pane_clipboard(&event) {
+            self.finish_attach(identity.attach_pid(), identity.attach_id())
+                .await;
+        }
         for session_name in self
             .handle_pane_alert_events_deferred_refresh(vec![event])
             .await

@@ -1,10 +1,11 @@
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant;
 
-use super::{broadcast, Input};
+use super::{broadcast, client_broadcast_initial_batch_size, Input, OwnedInput};
 use crate::transport::TransportClient;
 use crate::{Pane, PaneId, PaneRef, RmuxEndpoint, RmuxError, SessionName};
 use rmux_proto::{
@@ -13,6 +14,24 @@ use rmux_proto::{
     PaneTarget, PaneTargetRef, Request, Response, SendKeysResponse, CAPABILITY_HANDSHAKE,
     CAPABILITY_SDK_PANE_BROADCAST, CAPABILITY_SDK_PANE_BY_ID,
 };
+
+#[test]
+fn cloned_fallback_text_shares_its_allocation() {
+    let original = OwnedInput::from(Input::Text("large literal"));
+    let cloned = original.clone();
+
+    let (OwnedInput::Text(original), OwnedInput::Text(cloned)) = (original, cloned) else {
+        panic!("text input must remain text");
+    };
+    assert!(Arc::ptr_eq(&original, &cloned));
+}
+
+#[test]
+fn fallback_broadcast_bounds_concurrent_payload_materialization() {
+    assert_eq!(client_broadcast_initial_batch_size(0), 0);
+    assert_eq!(client_broadcast_initial_batch_size(3), 3);
+    assert_eq!(client_broadcast_initial_batch_size(128), 8);
+}
 
 #[tokio::test]
 async fn broadcast_falls_back_to_client_fanout_when_daemon_batch_is_unsupported() {

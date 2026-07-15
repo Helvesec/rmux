@@ -335,6 +335,36 @@ fn expression_arithmetic_float_option_renders_two_decimals() {
 }
 
 #[test]
+fn expression_float_precision_is_bounded_like_tmux_3_7b() {
+    let precision_100 = render_template("#{e|+|f|100:1,2}", &StaticWindowValues);
+    assert_eq!(precision_100.len(), 102);
+    assert!(precision_100.starts_with("3."));
+    assert!(precision_100[2..].bytes().all(|byte| byte == b'0'));
+
+    assert_eq!(render_template("#{e|+|f|101:1,2}", &StaticWindowValues), "");
+    assert_eq!(
+        render_template("#{e|+|f|999999999999999999999:1,2}", &StaticWindowValues),
+        ""
+    );
+    assert_eq!(
+        render_template("#{e|+|f|invalid:1,2}", &StaticWindowValues),
+        ""
+    );
+    assert_eq!(
+        render_template("#{e|+|f|-1:1,2}", &StaticWindowValues),
+        "3.000000"
+    );
+    assert_eq!(
+        render_template("#{e|+|f|-100:1,2}", &StaticWindowValues),
+        "3.000000"
+    );
+    assert_eq!(
+        render_template("#{e|+|f|-101:1,2}", &StaticWindowValues),
+        ""
+    );
+}
+
+#[test]
 fn expression_numeric_comparisons() {
     assert_eq!(render_template("#{e|==|:2,2}", &StaticWindowValues), "1");
     assert_eq!(render_template("#{e|!=|:2,3}", &StaticWindowValues), "1");

@@ -236,6 +236,149 @@ async fn natural_exit_journals_closed_before_the_removed_pane_becomes_observable
 }
 
 #[tokio::test]
+async fn kept_exit_interposed_by_respawn_cannot_touch_the_new_generation() {
+    let handler = Arc::new(RequestHandler::new());
+    let session = create_session(&handler, "a01-kept-exit-respawn").await;
+    handler.wait_for_initial_panes_for_test().await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("initial pane exists")
+    };
+    for (name, value) in [
+        ("remain-on-exit", "on"),
+        ("remain-on-exit-format", "STALE_EXIT_MARKER"),
+    ] {
+        let response = handler
+            .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+                target: PaneTargetRef::slot(target.clone()),
+                name: name.to_owned(),
+                value: Some(value.to_owned()),
+                mode: SetOptionMode::Replace,
+                unset: false,
+            }))
+            .await;
+        assert!(
+            matches!(response, Response::PaneOptionSet(_)),
+            "{response:?}"
+        );
+    }
+
+    let exited_generation = {
+        let mut state = handler.state.lock().await;
+        let generation = state.pane_output_generation_for_target(&target, pane_id);
+        state
+            .mark_pane_dead_without_exit_details(&target)
+            .expect("mark initial generation dead");
+        generation
+    };
+    let mut lifecycle_events = handler.subscribe_lifecycle_events();
+    while lifecycle_events.try_recv().is_ok() {}
+    let pause = handler.install_pane_exit_commit_pause();
+    let exit_handler = Arc::clone(&handler);
+    let exit_session = session.clone();
+    let exiting = tokio::spawn(async move {
+        exit_handler
+            .handle_pane_exit_event(PaneExitEvent::eof_published(
+                exit_session,
+                pane_id,
+                Some(exited_generation),
+            ))
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("kept exit reaches post-plan pause");
+
+    let respawned = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: Some(vec![crate::test_shell::stdin_discard_command()]),
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(respawned, Response::RespawnPane(_)),
+        "{respawned:?}"
+    );
+    let (current_generation, replacement_output_sequence) = {
+        let mut state = handler.state.lock().await;
+        let generation = state.pane_output_generation_for_target(&target, pane_id);
+        state
+            .append_bytes_to_runtime_pane_transcript(&session, pane_id, b"NEW_GENERATION_MARKER")
+            .expect("append marker to replacement transcript");
+        let output_sequence = state
+            .pane_output_sequence(&session, pane_id)
+            .expect("replacement output sequence exists");
+        (generation, output_sequence)
+    };
+    assert_ne!(current_generation, exited_generation);
+    let (subscription_id, subscription_revision, subscribed_pane_id) =
+        subscribe(&handler, 1004, target.clone(), true).await;
+    assert_eq!(subscribed_pane_id, pane_id);
+
+    pause.release.notify_one();
+    exiting.await.expect("stale kept-exit task joins");
+
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.pane_output_generation_for_target(&target, pane_id),
+            current_generation,
+            "stale exit must not replace or rewind the replacement generation"
+        );
+        assert_eq!(
+            state.pane_output_sequence(&session, pane_id),
+            Some(replacement_output_sequence),
+            "stale exit must not append its remain-on-exit marker to the replacement transcript"
+        );
+        assert!(!state.pane_is_dead(&session, pane_id));
+    }
+
+    let changed = handler
+        .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+            target: PaneTargetRef::slot(target),
+            name: "@new-generation".to_owned(),
+            value: Some("open".to_owned()),
+            mode: SetOptionMode::Replace,
+            unset: false,
+        }))
+        .await;
+    assert!(matches!(changed, Response::PaneOptionSet(_)), "{changed:?}");
+    match read_cursor(&handler, 1004, subscription_id, subscription_revision).await {
+        Response::PaneStateCursor(response) => assert!(matches!(
+            response.events.as_slice(),
+            [PaneStateEventDto::OptionSet {
+                name, new_value, ..
+            }] if name == "@new-generation" && new_value == "open"
+        )),
+        response => panic!("replacement subscription was closed by stale exit: {response:?}"),
+    }
+
+    while let Ok(event) = lifecycle_events.try_recv() {
+        assert!(
+            !matches!(
+                event.event,
+                LifecycleEvent::PaneDied {
+                    pane_id: Some(event_pane_id),
+                    ..
+                } if event_pane_id == pane_id.as_u32()
+            ),
+            "stale exit emitted PaneDied for the replacement generation"
+        );
+    }
+}
+
+#[tokio::test]
 async fn move_window_k_journals_the_destination_removed_at_commit_for_two_connections() {
     let handler = Arc::new(RequestHandler::new());
     let source = create_session(&handler, "a01-move-source").await;

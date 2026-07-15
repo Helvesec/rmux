@@ -49,18 +49,22 @@ pub(super) struct LeaseDeadline {
 }
 
 impl LeaseDeadline {
-    pub(super) fn from_now(ttl: Duration) -> Self {
+    pub(super) fn from_now(ttl: Duration) -> Option<Self> {
         let now = Instant::now();
-        Self {
+        Some(Self {
             renewed_at: now,
-            expires_at: now + ttl,
-        }
+            expires_at: now.checked_add(ttl)?,
+        })
     }
 
-    pub(super) fn renew_from_now(&mut self, ttl: Duration) {
+    pub(super) fn renew_from_now(&mut self, ttl: Duration) -> bool {
         let now = Instant::now();
+        let Some(expires_at) = now.checked_add(ttl) else {
+            return false;
+        };
         self.renewed_at = now;
-        self.expires_at = now + ttl;
+        self.expires_at = expires_at;
+        true
     }
 
     pub(super) fn preserve_budget_across_reaper_pause(&mut self, wake: ReaperWake) {

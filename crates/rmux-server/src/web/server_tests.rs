@@ -129,6 +129,45 @@ async fn pre_auth_full_queue_keeps_the_oldest_idle_connection() {
 }
 
 #[tokio::test]
+async fn incomplete_loopback_tunnel_peers_do_not_starve_complete_requests() {
+    let handler = Arc::new(RequestHandler::new());
+    let queue = PreAuthQueue::with_per_ip_capacity(8, 4);
+    let mut idle_clients = Vec::new();
+    let mut idle_tasks = Vec::new();
+    for _ in 0..4 {
+        let (client, task) = raw_peer_connection(Arc::clone(&handler), queue.clone())
+            .await
+            .expect("loopback abuse connection fits within the global queue");
+        idle_clients.push(client);
+        idle_tasks.push(task);
+    }
+    wait_for_pending_pre_auth(&queue, 4).await;
+
+    for viewer in 0..3 {
+        let (mut client, task) = raw_peer_connection(Arc::clone(&handler), queue.clone())
+            .await
+            .unwrap_or_else(|| panic!("tunnel viewer {viewer} was starved by idle peers"));
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: local\r\n\r\n")
+            .await
+            .expect("write complete viewer request");
+        let response = read_http_response(&mut client).await;
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+        drop(client);
+        task.await
+            .expect("complete viewer task joins")
+            .expect("complete viewer request succeeds");
+    }
+    assert_eq!(queue.pending_count(), 4);
+
+    drop(idle_clients);
+    for task in idle_tasks {
+        let _ = task.await.expect("idle connection task joins");
+    }
+    assert_eq!(queue.pending_count(), 0);
+}
+
+#[tokio::test]
 async fn auth_frame_timeout_releases_pre_auth_slot() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-auth-timeout").await;
@@ -1818,6 +1857,24 @@ async fn raw_connection(
     let pre_auth_guard = pre_auth.try_register().expect("pre-auth slot");
     let task = tokio::spawn(serve_connection(server, handler, pre_auth_guard));
     (client, task)
+}
+
+async fn raw_peer_connection(
+    handler: Arc<RequestHandler>,
+    pre_auth: PreAuthQueue,
+) -> Option<(TcpStream, tokio::task::JoinHandle<io::Result<()>>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("listener addr");
+    let client = TcpStream::connect(addr);
+    let server = listener.accept();
+    let (client, server) = tokio::join!(client, server);
+    let client = client.expect("client connects");
+    let (server, peer_addr) = server.expect("server accepts");
+    let pre_auth_guard = pre_auth.try_register_peer(peer_addr.ip())?;
+    let task = tokio::spawn(serve_connection(server, handler, pre_auth_guard));
+    Some((client, task))
 }
 
 async fn rejected_raw_connection(

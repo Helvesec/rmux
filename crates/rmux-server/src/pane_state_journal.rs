@@ -87,6 +87,7 @@ struct PaneStateSubscription {
     closed: bool,
     closed_revision: Option<u64>,
     closed_reason: Option<PaneStateClosedReason>,
+    evicted_state_revision_before_close: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -254,6 +255,20 @@ impl PaneStateJournal {
             .entry((record.pane_id, record.generation))
             .or_default()
             .record(record);
+        if matches!(record.change, PaneStateChange::Closed { .. }) {
+            return;
+        }
+        for subscription in self.subscriptions.values_mut() {
+            if subscription
+                .closed_revision
+                .is_some_and(|closed_revision| record.revision < closed_revision)
+                && record_matches_subscription(record, subscription)
+            {
+                subscription.evicted_state_revision_before_close = subscription
+                    .evicted_state_revision_before_close
+                    .max(record.revision);
+            }
+        }
     }
 
     fn prune_evicted_revision_key(&mut self, key: PaneGeneration) {
@@ -356,6 +371,7 @@ impl PaneStateJournal {
                 closed: false,
                 closed_revision: None,
                 closed_reason: None,
+                evicted_state_revision_before_close: 0,
             },
         );
         increment_count(&mut self.subscription_counts, pane_id);
@@ -435,11 +451,15 @@ impl PaneStateJournal {
         reason: PaneStateClosedReason,
         revision: u64,
     ) {
+        let evicted_revisions = &self.evicted_revisions;
         for subscription in self.subscriptions.values_mut() {
             if subscription.pane_id == pane_id
                 && subscription.closed
                 && subscription.closed_revision.is_none()
             {
+                subscription.evicted_state_revision_before_close =
+                    evicted_revisions_for_subscription(evicted_revisions, subscription)
+                        .max_matching_state_change(subscription.include);
                 subscription.closed_revision = Some(revision);
                 subscription.closed_reason = Some(reason);
             }
@@ -611,17 +631,11 @@ impl PaneStateJournal {
         subscription: &PaneStateSubscription,
         after_revision: u64,
     ) -> Option<PaneStateRead> {
-        let evicted_revision = self
-            .evicted_revisions_for(subscription)
-            .max_matching_state_change(subscription.include);
         // The terminal Closed record is synthesized by read_after even after
-        // eviction, so only evictions strictly before the close require a
-        // snapshot rebase; gating on evicted post-close revisions would
-        // re-trigger Lag forever once the cursor parks at closed_revision - 1.
-        let evicted_revision = match subscription.closed_revision {
-            Some(closed_revision) => evicted_revision.min(closed_revision.saturating_sub(1)),
-            None => evicted_revision,
-        };
+        // eviction. Track matching state evictions that actually happened
+        // before that terminal record: clamping a later eviction to
+        // `closed_revision - 1` fabricates history that never existed.
+        let evicted_revision = subscription.evicted_state_revision_before_close;
         if evicted_revision == 0 || after_revision >= evicted_revision {
             return None;
         }
@@ -686,21 +700,26 @@ impl PaneStateJournal {
         &self,
         subscription: &PaneStateSubscription,
     ) -> EvictedPaneStateRevisions {
-        match subscription.generation {
-            Some(generation) => self
-                .evicted_revisions
-                .get(&(subscription.pane_id, Some(generation)))
-                .copied()
-                .unwrap_or_default(),
-            None => self
-                .evicted_revisions
-                .iter()
-                .filter(|((pane_id, _), _)| *pane_id == subscription.pane_id)
-                .fold(
-                    EvictedPaneStateRevisions::default(),
-                    |combined, (_, next)| combined.merge(*next),
-                ),
-        }
+        evicted_revisions_for_subscription(&self.evicted_revisions, subscription)
+    }
+}
+
+fn evicted_revisions_for_subscription(
+    evicted_revisions: &HashMap<PaneGeneration, EvictedPaneStateRevisions>,
+    subscription: &PaneStateSubscription,
+) -> EvictedPaneStateRevisions {
+    match subscription.generation {
+        Some(generation) => evicted_revisions
+            .get(&(subscription.pane_id, Some(generation)))
+            .copied()
+            .unwrap_or_default(),
+        None => evicted_revisions
+            .iter()
+            .filter(|((pane_id, _), _)| *pane_id == subscription.pane_id)
+            .fold(
+                EvictedPaneStateRevisions::default(),
+                |combined, (_, next)| combined.merge(*next),
+            ),
     }
 }
 
@@ -1493,6 +1512,80 @@ mod tests {
             PaneStateChange::TitleChanged {
                 old: "a".to_owned(),
                 new: "b".to_owned(),
+            },
+        );
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::DiedKept,
+                ..
+            }] if *revision == closed_revision
+        ));
+    }
+
+    #[test]
+    fn post_close_eviction_does_not_fabricate_pre_close_lag() {
+        let mut journal = PaneStateJournal::new(1);
+        let subscription = journal
+            .subscribe_at_generation(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: false,
+                    options: true,
+                    foreground: false,
+                },
+                Some(1),
+            )
+            .expect("subscription within limits");
+
+        journal.push(
+            pane_id(2),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".to_owned(),
+                new: "b".to_owned(),
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::DiedKept,
+            },
+        );
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::DiedKept,
+            closed_revision,
+        );
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::OptionSet {
+                name: "@post-close".to_owned(),
+                old: None,
+                new: "ignored".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(2),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "b".to_owned(),
+                new: "c".to_owned(),
             },
         );
 

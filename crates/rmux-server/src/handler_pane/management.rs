@@ -1,6 +1,7 @@
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    ErrorResponse, HookName, Response, ScopeSelector, SessionId, Target, WindowTarget,
+    ErrorResponse, HookName, PaneId, Response, RmuxError, ScopeSelector, SessionId, Target,
+    WindowTarget,
 };
 
 use super::super::{
@@ -17,6 +18,7 @@ use super::pane_split_effects::{apply_split_window_effects, split_window_effects
 
 pub(in crate::handler) struct SplitWindowParts {
     pub(in crate::handler) target: rmux_proto::SplitWindowTarget,
+    pub(in crate::handler) expected_pane_id: Option<PaneId>,
     pub(in crate::handler) direction: rmux_proto::SplitDirection,
     pub(in crate::handler) before: bool,
     pub(in crate::handler) environment_overrides: Option<Vec<String>>,
@@ -48,6 +50,7 @@ impl RequestHandler {
             requester_pid,
             SplitWindowParts {
                 target: request.target,
+                expected_pane_id: None,
                 direction: request.direction,
                 before: request.before,
                 environment_overrides: request.environment,
@@ -75,6 +78,7 @@ impl RequestHandler {
             requester_pid,
             SplitWindowParts {
                 target: request.target,
+                expected_pane_id: None,
                 direction: request.direction,
                 before: request.before,
                 environment_overrides: request.environment,
@@ -100,6 +104,7 @@ impl RequestHandler {
     ) -> Response {
         let SplitWindowParts {
             target,
+            expected_pane_id,
             direction,
             before,
             environment_overrides,
@@ -137,6 +142,11 @@ impl RequestHandler {
             let mut state = self.state.lock().await;
             if let Err(error) =
                 super::super::require_expected_session_identity(&state, &session_name)
+            {
+                return Response::Error(ErrorResponse { error });
+            }
+            if let Err(error) =
+                require_expected_split_pane_identity(&state, &target, expected_pane_id)
             {
                 return Response::Error(ErrorResponse { error });
             }
@@ -449,6 +459,33 @@ impl RequestHandler {
                     active.mode_tree_state_id,
                 ));
         }
+    }
+}
+
+fn require_expected_split_pane_identity(
+    state: &HandlerState,
+    target: &rmux_proto::SplitWindowTarget,
+    expected_pane_id: Option<PaneId>,
+) -> Result<(), RmuxError> {
+    let Some(expected_pane_id) = expected_pane_id else {
+        return Ok(());
+    };
+    let rmux_proto::SplitWindowTarget::Pane(target) = target else {
+        return Err(RmuxError::Server(
+            "stable pane split resolved to a non-pane target".to_owned(),
+        ));
+    };
+    let resolved = state
+        .sessions
+        .resolve_pane(&Target::Pane(target.clone()))
+        .is_ok_and(|pane| pane.id() == expected_pane_id);
+    if resolved {
+        Ok(())
+    } else {
+        Err(RmuxError::pane_not_found(
+            target.session_name().clone(),
+            expected_pane_id,
+        ))
     }
 }
 

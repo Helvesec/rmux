@@ -48,6 +48,38 @@ pub(crate) use stream::{
     WebPaneStream, WebSessionAttachEvent, WebSessionAttachReader, WebSessionStream, WebShareStream,
 };
 
+pub(crate) struct UndeliveredWebShareGuard {
+    registry: Arc<crate::web::WebShareRegistry>,
+    share_id: Option<String>,
+}
+
+impl UndeliveredWebShareGuard {
+    pub(crate) fn for_response(handler: &RequestHandler, response: &Response) -> Option<Self> {
+        let Response::WebShare(response) = response else {
+            return None;
+        };
+        let rmux_proto::WebShareResponse::Created(created) = response.as_ref() else {
+            return None;
+        };
+        Some(Self {
+            registry: Arc::clone(&handler.web_shares),
+            share_id: Some(created.share_id.clone()),
+        })
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.share_id = None;
+    }
+}
+
+impl Drop for UndeliveredWebShareGuard {
+    fn drop(&mut self) {
+        if let Some(share_id) = self.share_id.take() {
+            self.registry.discard_undelivered(&share_id);
+        }
+    }
+}
+
 impl RequestHandler {
     #[cfg(test)]
     pub(crate) fn new_with_web_authentication_limits(
@@ -166,10 +198,6 @@ impl RequestHandler {
             Ok(response) => Response::WebShare(Box::new(response)),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
-    }
-
-    pub(crate) fn discard_undelivered_web_share(&self, share_id: &str) {
-        self.web_shares.discard_undelivered(share_id);
     }
 
     #[cfg(test)]

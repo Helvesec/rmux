@@ -97,8 +97,8 @@ pub(crate) use web_support::TestWebSessionView;
 pub(crate) use web_support::WebSessionPaneView;
 #[cfg(all(any(unix, windows), feature = "web"))]
 pub(crate) use web_support::{
-    WebPaneSnapshot, WebPaneStream, WebSessionAttachEvent, WebSessionPaneFrame, WebSessionSnapshot,
-    WebSessionStream, WebShareStream,
+    UndeliveredWebShareGuard, WebPaneSnapshot, WebPaneStream, WebSessionAttachEvent,
+    WebSessionPaneFrame, WebSessionSnapshot, WebSessionStream, WebShareStream,
 };
 #[path = "handler_window.rs"]
 mod window_support;

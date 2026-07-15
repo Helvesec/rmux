@@ -47,6 +47,8 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) can_write: bool,
     pub(in crate::handler) suspended: bool,
     pub(in crate::handler) closing: Arc<AtomicBool>,
+    /// The server initiated this close without first emitting `client-detached`.
+    pub(in crate::handler) emit_detached_on_finish: bool,
     pub(in crate::handler) terminal_context: OuterTerminalContext,
     pub(in crate::handler) client_size: TerminalSize,
     pub(in crate::handler) client_pixels: Option<TerminalPixels>,

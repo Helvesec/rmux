@@ -5,15 +5,18 @@ use std::sync::atomic::Ordering;
 
 use rmux_proto::OptionName;
 
-use super::super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT;
+use super::super::attach_support::{ActiveAttachIdentity, ATTACH_CONTROL_BACKLOG_LIMIT};
 use super::super::RequestHandler;
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::{AttachControl, PaneAlertEvent};
 
 impl RequestHandler {
-    pub(super) fn try_relay_visible_inactive_pane_clipboard(&self, event: &PaneAlertEvent) {
+    pub(super) fn try_relay_visible_inactive_pane_clipboard(
+        &self,
+        event: &PaneAlertEvent,
+    ) -> Vec<ActiveAttachIdentity> {
         if event.clipboard_writes.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // Pane readers invoke this while publishing the OSC 52 event. Never
@@ -24,25 +27,25 @@ impl RequestHandler {
         // active_attach order, so a following switch is ordered after the
         // clipboard write in the same FIFO.
         let Ok(state) = self.state.try_lock() else {
-            return;
+            return Vec::new();
         };
         if !matches!(
             state.options.resolve(None, OptionName::SetClipboard),
             Some("on")
         ) {
-            return;
+            return Vec::new();
         }
         let Some(runtime_session_name) = state.resolve_pane_event_runtime_session(
             &event.session_name,
             event.pane_id,
             event.generation,
         ) else {
-            return;
+            return Vec::new();
         };
         let Some(pane_target) =
             state.pane_target_for_runtime_pane(&runtime_session_name, event.pane_id)
         else {
-            return;
+            return Vec::new();
         };
         let Some(source_window_id) = state
             .sessions
@@ -50,7 +53,7 @@ impl RequestHandler {
             .and_then(|session| session.window_at(pane_target.window_index()))
             .map(rmux_core::Window::id)
         else {
-            return;
+            return Vec::new();
         };
         let visible_inactive_sessions = state
             .window_linked_current_sessions_list(
@@ -66,14 +69,14 @@ impl RequestHandler {
             })
             .collect::<HashSet<_>>();
         if visible_inactive_sessions.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let Ok(mut active_attach) = self.active_attach.try_lock() else {
-            return;
+            return Vec::new();
         };
         let mut disconnected = Vec::new();
-        for (attach_pid, active) in &active_attach.by_pid {
+        for (attach_pid, active) in &mut active_attach.by_pid {
             if active.suspended
                 || active.closing.load(Ordering::SeqCst)
                 || !visible_inactive_sessions.contains(&active.session_id)
@@ -107,18 +110,23 @@ impl RequestHandler {
             ) else {
                 let _ = active.control_tx.send(AttachControl::Detach);
                 active.closing.store(true, Ordering::SeqCst);
-                disconnected.push(*attach_pid);
+                // Leave the registration in place until the common attach
+                // cleanup owns it. That path terminates overlays, drops key
+                // table references, reconciles size, and applies
+                // destroy-unattached exactly once.
+                active.emit_detached_on_finish = true;
+                disconnected.push(active.identity(*attach_pid));
                 continue;
             };
             if active.control_tx.send(control).is_err() {
-                disconnected.push(*attach_pid);
+                active.closing.store(true, Ordering::SeqCst);
+                active.emit_detached_on_finish = true;
+                disconnected.push(active.identity(*attach_pid));
             }
-        }
-        for attach_pid in disconnected.iter().copied() {
-            active_attach.remove_attached_client(attach_pid);
         }
         if !disconnected.is_empty() {
             self.bump_active_attach_epoch();
         }
+        disconnected
     }
 }

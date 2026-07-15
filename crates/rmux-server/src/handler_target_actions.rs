@@ -1,12 +1,88 @@
 use rmux_proto::{
-    CapturePaneRequest, ErrorResponse, ResizePaneRequest, Response, RmuxError, SplitWindowTarget,
-    Target,
+    CapturePaneRequest, ErrorResponse, PaneId, ResizePaneRequest, Response, RmuxError,
+    SplitWindowTarget, Target,
 };
 
 use super::{
     pane_support::{SplitWindowParts, SplitWindowResponseMode},
     RequestHandler,
 };
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct SplitTargetResolutionPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static SPLIT_TARGET_RESOLUTION_PAUSE: std::sync::Mutex<
+    Option<(
+        rmux_proto::SessionName,
+        PaneId,
+        std::sync::Arc<SplitTargetResolutionPause>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(in crate::handler) fn install_split_target_resolution_pause(
+    session_name: rmux_proto::SessionName,
+    pane_id: PaneId,
+) -> std::sync::Arc<SplitTargetResolutionPause> {
+    let pause = std::sync::Arc::new(SplitTargetResolutionPause::default());
+    *SPLIT_TARGET_RESOLUTION_PAUSE
+        .lock()
+        .expect("split target resolution pause lock") =
+        Some((session_name, pane_id, pause.clone()));
+    pause
+}
+
+#[cfg(test)]
+async fn pause_after_split_target_resolution(
+    target: &SplitWindowTarget,
+    expected_pane_id: Option<PaneId>,
+) {
+    let target_session = match target {
+        SplitWindowTarget::Session(session_name) => session_name,
+        SplitWindowTarget::Pane(target) => target.session_name(),
+    };
+    let pause = {
+        let mut installed = SPLIT_TARGET_RESOLUTION_PAUSE
+            .lock()
+            .expect("split target resolution pause lock");
+        let matches_pane = installed
+            .as_ref()
+            .is_some_and(|(session_name, pane_id, _)| {
+                session_name == target_session && Some(*pane_id) == expected_pane_id
+            });
+        matches_pane.then(|| {
+            installed
+                .take()
+                .expect("matching split target resolution pause remains installed")
+                .2
+        })
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
+
+#[cfg(not(test))]
+async fn pause_after_split_target_resolution(
+    _target: &SplitWindowTarget,
+    _expected_pane_id: Option<PaneId>,
+) {
+}
+
+fn stable_pane_id_target(target: Option<&str>) -> Option<PaneId> {
+    target?
+        .strip_prefix('%')?
+        .parse::<u32>()
+        .ok()
+        .map(PaneId::new)
+}
 
 impl RequestHandler {
     pub(in crate::handler) async fn handle_split_window_target_action(
@@ -41,6 +117,7 @@ impl RequestHandler {
         request: rmux_proto::SplitWindowTargetActionRequest,
         response_mode: SplitWindowResponseMode,
     ) -> Response {
+        let expected_pane_id = stable_pane_id_target(request.target.as_deref());
         let target = match self
             .resolve_target_for_requester(
                 requester_pid,
@@ -64,11 +141,13 @@ impl RequestHandler {
             }
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
+        pause_after_split_target_resolution(&target, expected_pane_id).await;
 
         self.handle_split_window_parts(
             requester_pid,
             SplitWindowParts {
                 target,
+                expected_pane_id,
                 direction: request.direction,
                 before: request.before,
                 environment_overrides: request.environment,

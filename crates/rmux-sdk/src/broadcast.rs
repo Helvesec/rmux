@@ -7,11 +7,14 @@
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use tokio::task::JoinSet;
 
 use crate::{Pane, PaneId, PaneRef, Result, RmuxError};
 use rmux_proto::{PaneBroadcastInputRequest, Request, Response, CAPABILITY_SDK_PANE_BROADCAST};
+
+const CLIENT_BROADCAST_MAX_IN_FLIGHT: usize = 8;
 
 /// Input that can be broadcast to many panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,14 +42,14 @@ impl<'a> Input<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OwnedInput {
-    Text(String),
+    Text(Arc<str>),
     Key(String),
 }
 
 impl From<Input<'_>> for OwnedInput {
     fn from(value: Input<'_>) -> Self {
         match value {
-            Input::Text(value) => Self::Text(value.to_owned()),
+            Input::Text(value) => Self::Text(Arc::from(value)),
             Input::Key(value) => Self::Key(value.to_owned()),
         }
     }
@@ -362,7 +365,11 @@ fn partial_broadcast(
 async fn broadcast_client_side(panes: &[Pane], input: Input<'_>) -> Result<BroadcastResult> {
     let input = OwnedInput::from(input);
     let mut tasks = JoinSet::new();
-    for (index, pane) in panes.iter().cloned().enumerate() {
+    let mut pending = panes.iter().cloned().enumerate();
+    for (index, pane) in pending
+        .by_ref()
+        .take(client_broadcast_initial_batch_size(panes.len()))
+    {
         let input = input.clone();
         tasks.spawn(async move { (index, send_one(pane, input).await) });
     }
@@ -376,6 +383,10 @@ async fn broadcast_client_side(panes: &[Pane], input: Input<'_>) -> Result<Broad
             )
         })?;
         outcomes.push((index, outcome));
+        if let Some((index, pane)) = pending.next() {
+            let input = input.clone();
+            tasks.spawn(async move { (index, send_one(pane, input).await) });
+        }
     }
     outcomes.sort_by_key(|(index, _)| *index);
 
@@ -394,6 +405,14 @@ async fn broadcast_client_side(panes: &[Pane], input: Input<'_>) -> Result<Broad
         Err(RmuxError::partial_broadcast(PartialBroadcastFailure::new(
             successes, failures,
         )))
+    }
+}
+
+const fn client_broadcast_initial_batch_size(pane_count: usize) -> usize {
+    if pane_count < CLIENT_BROADCAST_MAX_IN_FLIGHT {
+        pane_count
+    } else {
+        CLIENT_BROADCAST_MAX_IN_FLIGHT
     }
 }
 

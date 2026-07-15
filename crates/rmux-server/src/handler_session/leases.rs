@@ -90,6 +90,7 @@ impl SessionLeaseStore {
         session_id: SessionId,
         ttl: Duration,
     ) -> Result<u64, RmuxError> {
+        let deadline = LeaseDeadline::from_now(ttl).ok_or_else(lease_ttl_range_error)?;
         let token = self
             .next_token
             .checked_add(1)
@@ -101,7 +102,7 @@ impl SessionLeaseStore {
                 token,
                 wire_session_name,
                 current_session_name,
-                deadline: LeaseDeadline::from_now(ttl),
+                deadline,
             },
         );
         Ok(token)
@@ -113,16 +114,18 @@ impl SessionLeaseStore {
         wire_session_name: &SessionName,
         token: u64,
         ttl: Duration,
-    ) -> bool {
+    ) -> Result<bool, RmuxError> {
         let Some(session_id) = self.live_session_id(sessions, wire_session_name, token) else {
-            return false;
+            return Ok(false);
         };
         let ownership = self
             .ownerships
             .get_mut(&session_id)
             .expect("validated lease ownership must remain present");
-        ownership.deadline.renew_from_now(ttl);
-        true
+        if !ownership.deadline.renew_from_now(ttl) {
+            return Err(lease_ttl_range_error());
+        }
+        Ok(true)
     }
 
     fn release(
@@ -312,11 +315,15 @@ impl RequestHandler {
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
         let state = self.state.lock().await;
-        let renewed = self
+        let renewed = match self
             .session_leases
             .lock()
             .expect("session lease mutex must not be poisoned")
-            .renew(&state.sessions, &request.session_name, request.token, ttl);
+            .renew(&state.sessions, &request.session_name, request.token, ttl)
+        {
+            Ok(renewed) => renewed,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
         drop(state);
         if !renewed {
             return Response::Error(ErrorResponse {
@@ -434,7 +441,15 @@ fn duration_from_millis(ttl_millis: u64) -> Result<Duration, RmuxError> {
             rmux_proto::MIN_SESSION_LEASE_TTL_MILLIS
         )));
     }
-    Ok(Duration::from_millis(ttl_millis))
+    let ttl = Duration::from_millis(ttl_millis);
+    if Instant::now().checked_add(ttl).is_none() {
+        return Err(lease_ttl_range_error());
+    }
+    Ok(ttl)
+}
+
+fn lease_ttl_range_error() -> RmuxError {
+    RmuxError::Server("session lease ttl exceeds the platform deadline range".to_owned())
 }
 
 fn resolve_session_lease_create_target(
@@ -463,6 +478,58 @@ fn lease_lost_error(session_name: &SessionName) -> RmuxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_ttl_range_validation_matches_the_platform_deadline() {
+        let oversized = Duration::from_millis(u64::MAX);
+        let platform_accepts = Instant::now().checked_add(oversized).is_some();
+        let validated = duration_from_millis(u64::MAX);
+
+        assert_eq!(
+            validated.is_ok(),
+            platform_accepts,
+            "wire ttl validation must match the platform Instant range"
+        );
+    }
+
+    #[test]
+    fn lease_store_rejects_overflow_without_poisoning_create_or_renew() {
+        let mut leases = SessionLeaseStore::default();
+        let mut sessions = rmux_core::SessionStore::new();
+        let (session_name, session_id) = create_session(&mut sessions, "bounded");
+        let oversized = Duration::MAX;
+
+        let create_error = leases
+            .create_lease(
+                session_name.clone(),
+                session_name.clone(),
+                session_id,
+                oversized,
+            )
+            .expect_err("overflowing create must fail");
+        assert!(create_error
+            .to_string()
+            .contains("exceeds the platform deadline range"));
+
+        let valid_ttl = Duration::from_secs(30);
+        let token = leases
+            .create_lease(
+                session_name.clone(),
+                session_name.clone(),
+                session_id,
+                valid_ttl,
+            )
+            .expect("valid create still succeeds");
+        let renew_error = leases
+            .renew(&sessions, &session_name, token, oversized)
+            .expect_err("overflowing renewal must fail");
+        assert!(renew_error
+            .to_string()
+            .contains("exceeds the platform deadline range"));
+        assert!(leases
+            .renew(&sessions, &session_name, token, valid_ttl)
+            .expect("valid renewal still succeeds"));
+    }
 
     fn create_session(
         sessions: &mut rmux_core::SessionStore,
@@ -508,8 +575,12 @@ mod tests {
             )
             .expect("new lease token");
 
-        assert!(!leases.renew(&sessions, &session_name, old_token, ttl));
-        assert!(leases.renew(&sessions, &session_name, new_token, ttl));
+        assert!(!leases
+            .renew(&sessions, &session_name, old_token, ttl)
+            .expect("valid ttl"));
+        assert!(leases
+            .renew(&sessions, &session_name, new_token, ttl)
+            .expect("valid ttl"));
         assert_eq!(
             leases
                 .ownerships
@@ -560,8 +631,12 @@ mod tests {
             .rename_session(&old_name, new_name.clone())
             .expect("session rename succeeds");
         assert!(leases.rename_session(&old_name, new_name.clone(), session_id));
-        assert!(leases.renew(&sessions, &old_name, token, ttl));
-        assert!(!leases.renew(&sessions, &new_name, token, ttl));
+        assert!(leases
+            .renew(&sessions, &old_name, token, ttl)
+            .expect("valid ttl"));
+        assert!(!leases
+            .renew(&sessions, &new_name, token, ttl)
+            .expect("valid ttl"));
         assert_eq!(
             leases.ownerships.get(&session_id).map(|ownership| {
                 (
@@ -593,10 +668,14 @@ mod tests {
             .create_lease(wire_name.clone(), wire_name.clone(), homonym_id, ttl)
             .expect("homonym lease token");
 
-        assert!(leases.renew(&sessions, &wire_name, original_token, ttl));
+        assert!(leases
+            .renew(&sessions, &wire_name, original_token, ttl)
+            .expect("valid ttl"));
         assert!(!leases.release(&sessions, &wire_name, u64::MAX));
         assert!(leases.release(&sessions, &wire_name, original_token));
-        assert!(leases.renew(&sessions, &wire_name, homonym_token, ttl));
+        assert!(leases
+            .renew(&sessions, &wire_name, homonym_token, ttl)
+            .expect("valid ttl"));
         assert!(leases.ownerships.contains_key(&homonym_id));
         assert!(!leases.ownerships.contains_key(&original_id));
     }
@@ -630,9 +709,13 @@ mod tests {
             )
             .expect("new lease token");
 
-        assert!(!leases.renew(&sessions, &session_name, old_token, ttl));
+        assert!(!leases
+            .renew(&sessions, &session_name, old_token, ttl)
+            .expect("valid ttl"));
         assert!(!leases.release(&sessions, &session_name, old_token));
-        assert!(leases.renew(&sessions, &session_name, new_token, ttl));
+        assert!(leases
+            .renew(&sessions, &session_name, new_token, ttl)
+            .expect("valid ttl"));
         assert!(leases.ownerships.contains_key(&new_session_id));
     }
 

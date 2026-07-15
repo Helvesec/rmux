@@ -7,7 +7,19 @@ use std::process::{Child, Command, ExitStatus};
 use std::os::unix::process::CommandExt as _;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt as _;
-#[cfg(windows)]
+#[cfg(any(
+    windows,
+    all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    )
+))]
 use std::sync::Arc;
 
 #[cfg(unix)]
@@ -24,7 +36,7 @@ use rustix::process::Pid;
 ))]
 use rustix::process::{waitid, WaitId, WaitIdOptions};
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
 #[cfg(windows)]
 use crate::process::ProcessJob;
@@ -33,6 +45,28 @@ use crate::process::ProcessJob;
 mod terminal;
 #[cfg(unix)]
 pub use terminal::ForegroundTerminalGuard;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+mod unix_controller;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+use unix_controller::UnixProcessGroup;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -50,15 +84,48 @@ pub struct ProcessTreeChild {
     armed: bool,
     #[cfg(unix)]
     process_group: i32,
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    ))]
+    process_group_control: Arc<UnixProcessGroup>,
     #[cfg(windows)]
     job: Arc<ProcessJob>,
+}
+
+/// Controls whether a spawned process tree may create a console window.
+///
+/// This setting only changes process creation on Windows. Other platforms
+/// ignore it because they do not have the corresponding console-window flag.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConsoleWindowBehavior {
+    /// Preserve the normal console-window behavior of the child command.
+    #[default]
+    Inherit,
+    /// Suppress creation of a console window for a background helper.
+    Suppress,
 }
 
 /// A clonable termination handle for a spawned process tree.
 #[derive(Clone)]
 pub struct ProcessTreeController {
-    #[cfg(unix)]
-    process_group: i32,
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    ))]
+    process_group: Arc<UnixProcessGroup>,
     #[cfg(windows)]
     job: Arc<ProcessJob>,
 }
@@ -77,21 +144,7 @@ impl ProcessTreeController {
             ))
         ))]
         {
-            let result = unsafe {
-                // SAFETY: The negative value targets the process group created
-                // by ProcessTreeChild before user code began executing.
-                libc::kill(-self.process_group, libc::SIGKILL)
-            };
-            if result == 0 {
-                Ok(())
-            } else {
-                let error = io::Error::last_os_error();
-                if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) {
-                    Ok(())
-                } else {
-                    Err(error)
-                }
-            }
+            self.process_group.terminate()
         }
 
         #[cfg(all(
@@ -124,6 +177,18 @@ impl ProcessTreeChild {
     /// Spawns `command` with descendant isolation established before user code
     /// can create another process.
     pub fn spawn(command: &mut Command) -> io::Result<Self> {
+        Self::spawn_with_console_window(command, ConsoleWindowBehavior::Inherit)
+    }
+
+    /// Spawns `command` with descendant isolation and the requested Windows
+    /// console-window behavior.
+    pub fn spawn_with_console_window(
+        command: &mut Command,
+        console_window: ConsoleWindowBehavior,
+    ) -> io::Result<Self> {
+        #[cfg(not(windows))]
+        let _ = console_window;
+
         #[cfg(all(
             unix,
             not(any(
@@ -143,12 +208,13 @@ impl ProcessTreeChild {
                 child,
                 armed: true,
                 process_group,
+                process_group_control: Arc::new(UnixProcessGroup::new(process_group)),
             })
         }
 
         #[cfg(windows)]
         {
-            command.creation_flags(CREATE_SUSPENDED);
+            command.creation_flags(windows_creation_flags(console_window));
             let mut child = command.spawn()?;
             let job = match ProcessJob::for_child(&child) {
                 Ok(job) => Arc::new(job),
@@ -206,8 +272,17 @@ impl ProcessTreeChild {
     #[must_use]
     pub fn controller(&self) -> ProcessTreeController {
         ProcessTreeController {
-            #[cfg(unix)]
-            process_group: self.process_group,
+            #[cfg(all(
+                unix,
+                not(any(
+                    target_os = "cygwin",
+                    target_os = "horizon",
+                    target_os = "openbsd",
+                    target_os = "redox",
+                    target_os = "wasi"
+                ))
+            ))]
+            process_group: Arc::clone(&self.process_group_control),
             #[cfg(windows)]
             job: Arc::clone(&self.job),
         }
@@ -417,11 +492,67 @@ impl ProcessTreeChild {
     /// Waits for the direct child and disarms tree cleanup after normal
     /// completion.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "cygwin",
+                target_os = "horizon",
+                target_os = "openbsd",
+                target_os = "redox",
+                target_os = "wasi"
+            ))
+        ))]
+        let status = if let Some(status) = self.process_group_control.try_reap(&mut self.child)? {
+            status
+        } else {
+            let pid = Pid::from_raw(self.process_group)
+                .ok_or_else(|| io::Error::other("child process id is zero"))?;
+            let _ = waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+            )?;
+            self.process_group_control.reap_exited(&mut self.child)?
+        };
+
+        #[cfg(not(all(
+            unix,
+            not(any(
+                target_os = "cygwin",
+                target_os = "horizon",
+                target_os = "openbsd",
+                target_os = "redox",
+                target_os = "wasi"
+            ))
+        )))]
         let status = self.child.wait()?;
         #[cfg(windows)]
         self.job.disarm_kill_on_close()?;
         self.armed = false;
         Ok(status)
+    }
+}
+
+#[cfg(windows)]
+const fn windows_creation_flags(console_window: ConsoleWindowBehavior) -> u32 {
+    match console_window {
+        ConsoleWindowBehavior::Inherit => CREATE_SUSPENDED,
+        ConsoleWindowBehavior::Suppress => CREATE_SUSPENDED | CREATE_NO_WINDOW,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_tree_creation_flags_preserve_console_window_policy() {
+        let inherited = windows_creation_flags(ConsoleWindowBehavior::Inherit);
+        assert_eq!(inherited & CREATE_SUSPENDED, CREATE_SUSPENDED);
+        assert_eq!(inherited & CREATE_NO_WINDOW, 0);
+
+        let suppressed = windows_creation_flags(ConsoleWindowBehavior::Suppress);
+        assert_eq!(suppressed & CREATE_SUSPENDED, CREATE_SUSPENDED);
+        assert_eq!(suppressed & CREATE_NO_WINDOW, CREATE_NO_WINDOW);
     }
 }
 
@@ -432,6 +563,31 @@ impl Drop for ProcessTreeChild {
         }
         let _ = self.terminate();
         let _ = self.child.kill();
+
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "cygwin",
+                target_os = "horizon",
+                target_os = "openbsd",
+                target_os = "redox",
+                target_os = "wasi"
+            ))
+        ))]
+        if self.wait().is_err() {
+            self.process_group_control.disarm();
+        }
+
+        #[cfg(not(all(
+            unix,
+            not(any(
+                target_os = "cygwin",
+                target_os = "horizon",
+                target_os = "openbsd",
+                target_os = "redox",
+                target_os = "wasi"
+            ))
+        )))]
         let _ = self.child.wait();
         self.armed = false;
     }

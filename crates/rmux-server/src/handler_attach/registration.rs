@@ -155,6 +155,7 @@ impl RequestHandler {
                 can_write: registration.can_write,
                 suspended: false,
                 closing: registration.closing,
+                emit_detached_on_finish: false,
                 terminal_context: registration.terminal_context,
                 client_size,
                 client_pixels: None,
@@ -229,7 +230,8 @@ impl RequestHandler {
                 active_attach
                     .remove_attached_client(requester_pid)
                     .map(|active| {
-                        let emit_detached = !active.closing.load(Ordering::SeqCst);
+                        let emit_detached = active.emit_detached_on_finish
+                            || !active.closing.load(Ordering::SeqCst);
                         (
                             Some((active.session_name, active.session_id)),
                             active.key_table_name,

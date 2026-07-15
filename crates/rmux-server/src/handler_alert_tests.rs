@@ -722,6 +722,27 @@ async fn drain_attach_controls_until_quiet(
     }
 }
 
+async fn recv_client_detached_for(
+    events: &mut broadcast::Receiver<QueuedLifecycleEvent>,
+    attach_pid: u32,
+) -> rmux_core::LifecycleEvent {
+    loop {
+        let event = events
+            .recv()
+            .await
+            .expect("lifecycle event channel remains open");
+        if matches!(
+            &event.event,
+            rmux_core::LifecycleEvent::ClientDetached {
+                client_name: Some(client_name),
+                ..
+            } if client_name == &attach_pid.to_string()
+        ) {
+            return event.event;
+        }
+    }
+}
+
 async fn register_clipboard_attach(
     handler: &RequestHandler,
     attach_pid: u32,
@@ -1881,10 +1902,156 @@ async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_li
     }
     assert_eq!(writes, ATTACH_CONTROL_BACKLOG_LIMIT);
     assert_eq!(detaches, 1);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if !handler.active_attach.lock().await.by_pid.contains_key(&310) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the bounded relay must finish cleaning up a non-draining client");
+}
+
+#[tokio::test]
+async fn inactive_pane_osc52_backlog_disconnect_runs_attach_cleanup_once() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "osc52-backlog-cleanup").await;
+    split_quiet_window(&handler, &session).await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let inactive_pane_id = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&session).expect("session exists");
+        let active = session.active_pane_id();
+        session
+            .window_at(0)
+            .expect("window exists")
+            .panes()
+            .iter()
+            .find_map(|pane| (Some(pane.id()) != active).then_some(pane.id()))
+            .expect("inactive pane exists")
+    };
+    let attach_pid = 312;
+    let mut control_rx = register_clipboard_attach(&handler, attach_pid, &session).await;
+    drain_attach_controls_until_idle(&mut control_rx).await;
+    handler
+        .set_attached_key_table_for_test(attach_pid, Some("osc52-cleanup".to_owned()))
+        .await
+        .expect("test key table installs");
+    let (attach_id, control_backlog) = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("attach remains registered");
+        (active.id, Arc::clone(&active.control_backlog))
+    };
+    {
+        let mut state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .key_bindings
+                .table("osc52-cleanup")
+                .expect("test key table exists")
+                .references(),
+            1
+        );
+        state
+            .options
+            .set(
+                ScopeSelector::Session(session.clone()),
+                OptionName::DestroyUnattached,
+                "on".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("destroy-unattached option is valid");
+    }
+    control_backlog.store(ATTACH_CONTROL_BACKLOG_LIMIT, Ordering::Release);
+    let mut events = handler.subscribe_lifecycle_events();
+
+    handler
+        .handle_pane_alert_event(clipboard_alert(session.clone(), inactive_pane_id))
+        .await;
+
+    assert!(!handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .contains_key(&attach_pid));
+    {
+        let state = handler.state.lock().await;
+        assert!(state.key_bindings.table("osc52-cleanup").is_none());
+        assert!(state.sessions.session(&session).is_none());
+    }
+    let detached = timeout(
+        Duration::from_secs(2),
+        recv_client_detached_for(&mut events, attach_pid),
+    )
+    .await
+    .expect("clipboard backlog cleanup emits client-detached");
+    assert!(matches!(
+        detached,
+        rmux_core::LifecycleEvent::ClientDetached { session_name, .. }
+            if session_name == session
+    ));
+
+    handler.finish_attach(attach_pid, attach_id).await;
     assert!(
-        !handler.active_attach.lock().await.by_pid.contains_key(&310),
-        "the bounded relay must remove a client that does not drain clipboard writes"
+        timeout(
+            Duration::from_millis(100),
+            recv_client_detached_for(&mut events, attach_pid),
+        )
+        .await
+        .is_err(),
+        "a late forwarder finish must not repeat cleanup lifecycle"
     );
+}
+
+#[tokio::test]
+async fn inactive_pane_osc52_closed_channel_still_finishes_attach_cleanup() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "osc52-send-cleanup").await;
+    split_quiet_window(&handler, &session).await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let inactive_pane_id = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&session).expect("session exists");
+        let active = session.active_pane_id();
+        session
+            .window_at(0)
+            .expect("window exists")
+            .panes()
+            .iter()
+            .find_map(|pane| (Some(pane.id()) != active).then_some(pane.id()))
+            .expect("inactive pane exists")
+    };
+    let attach_pid = 313;
+    let control_rx = register_clipboard_attach(&handler, attach_pid, &session).await;
+    drop(control_rx);
+    let mut events = handler.subscribe_lifecycle_events();
+
+    handler
+        .handle_pane_alert_event(clipboard_alert(session.clone(), inactive_pane_id))
+        .await;
+
+    assert!(!handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .contains_key(&attach_pid));
+    assert!(matches!(
+        timeout(
+            Duration::from_secs(2),
+            recv_client_detached_for(&mut events, attach_pid),
+        )
+        .await
+        .expect("closed control channel cleanup emits client-detached"),
+        rmux_core::LifecycleEvent::ClientDetached { session_name, .. }
+            if session_name == session
+    ));
 }
 
 #[tokio::test]
