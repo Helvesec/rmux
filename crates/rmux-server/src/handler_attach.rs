@@ -84,6 +84,8 @@ mod refresh_identity;
 mod registration;
 #[path = "handler_attach/resize_policy.rs"]
 mod resize_policy;
+#[path = "handler_attach/session_destroy.rs"]
+mod session_destroy;
 #[path = "handler_attach/state.rs"]
 mod state;
 #[path = "handler_attach/switch_commit.rs"]
@@ -93,6 +95,7 @@ pub(crate) use crate::client_flags::ClientFlags;
 pub(in crate::handler) use resize_policy::{
     surviving_attached_resize_targets, AttachedWindowSizePolicy,
 };
+pub(in crate::handler) use session_destroy::SessionDetachOnDestroy;
 pub(super) use state::{
     ActiveAttach, ActiveAttachState, DisplayPanesClientState, DisplayPanesLabel,
 };
@@ -289,6 +292,7 @@ impl RequestHandler {
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn send_attach_control_for_client_and_session_identity(
         &self,
         attach_pid: u32,
@@ -637,36 +641,21 @@ impl RequestHandler {
             || next_session_id.is_some_and(|session_id| session_id != active.session_id))
     }
 
-    pub(super) async fn exit_attached_session_identity(
-        &self,
-        session_name: &rmux_proto::SessionName,
-        session_id: rmux_proto::SessionId,
-    ) {
-        self.close_attached_session(session_name, session_id, || AttachControl::Exited)
-            .await;
-    }
-
-    async fn close_attached_session<F>(
-        &self,
-        session_name: &rmux_proto::SessionName,
-        session_id: rmux_proto::SessionId,
-        mut control: F,
-    ) where
+    async fn close_attached_session<F>(&self, session_id: rmux_proto::SessionId, mut control: F)
+    where
         F: FnMut() -> AttachControl,
     {
         let mut overlay_jobs = Vec::new();
         let mut removed_pids = Vec::new();
         let mut active_attach = self.active_attach.lock().await;
         for active in active_attach.by_pid.values_mut() {
-            if active.last_session.as_ref() == Some(session_name)
-                && active.last_session_id == Some(session_id)
-            {
+            if active.last_session_id == Some(session_id) {
                 active.last_session = None;
                 active.last_session_id = None;
             }
         }
         active_attach.by_pid.retain(|pid, active| {
-            if &active.session_name != session_name || active.session_id != session_id {
+            if active.session_id != session_id {
                 return true;
             }
 
@@ -1307,7 +1296,7 @@ mod tests {
     use super::{
         attach_target_for_session, install_attach_control_identity_pause,
         reset_interactive_attach_state_for_session_switch, ActiveAttach, AttachRegistration,
-        RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
+        RequestHandler, SessionDetachOnDestroy, ATTACH_CONTROL_BACKLOG_LIMIT,
     };
     use crate::client_flags::ClientFlags;
     use crate::handler::scripting_support::QueueExecutionContext;
@@ -1875,7 +1864,11 @@ mod tests {
             .session_id = new_session_id;
 
         handler
-            .exit_attached_session_identity(&session_name, old_session_id)
+            .exit_attached_session_identity(
+                &session_name,
+                old_session_id,
+                SessionDetachOnDestroy::Detach,
+            )
             .await;
 
         assert!(matches!(old_rx.try_recv(), Ok(AttachControl::Exited)));

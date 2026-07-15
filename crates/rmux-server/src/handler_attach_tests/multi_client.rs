@@ -1120,6 +1120,264 @@ async fn kill_session_clears_attached_last_session_references() {
     );
 }
 
+#[tokio::test]
+async fn kill_session_detach_on_destroy_off_switches_every_attached_client() {
+    let handler = RequestHandler::new();
+    let gamma = session_name("destroy-switch-gamma");
+    let beta = session_name("destroy-switch-beta");
+    let alpha = session_name("destroy-switch-alpha");
+    for session in [gamma.clone(), beta.clone(), alpha.clone()] {
+        create_session_with_size(&handler, session, TerminalSize { cols: 80, rows: 24 }).await;
+    }
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::DetachOnDestroy,
+            value: "off".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+
+    let (_, mut first_rx) = register_sized_attach(
+        &handler,
+        91_801,
+        &alpha,
+        TerminalSize { cols: 90, rows: 30 },
+    )
+    .await;
+    let (_, mut second_rx) = register_sized_attach(
+        &handler,
+        91_802,
+        &alpha,
+        TerminalSize {
+            cols: 100,
+            rows: 35,
+        },
+    )
+    .await;
+    while first_rx.try_recv().is_ok() {}
+    while second_rx.try_recv().is_ok() {}
+
+    let response = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: alpha.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+
+    for (receiver, label) in [(&mut first_rx, "first"), (&mut second_rx, "second")] {
+        let target = recv_switch_target(receiver, label).await;
+        assert_eq!(target.session_name, beta);
+    }
+    let active_attach = handler.active_attach.lock().await;
+    for attach_pid in [91_801, 91_802] {
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("destroy switch preserves attached client");
+        assert_eq!(active.session_name, beta);
+        assert_ne!(active.session_id, rmux_proto::SessionId::new(0));
+        assert!(!active.closing.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn no_detach_on_destroy_client_flag_overrides_default_detach() {
+    let handler = RequestHandler::new();
+    let beta = session_name("destroy-flag-beta");
+    let alpha = session_name("destroy-flag-alpha");
+    for session in [beta.clone(), alpha.clone()] {
+        create_session_with_size(&handler, session, TerminalSize { cols: 80, rows: 24 }).await;
+    }
+    let (_, mut control_rx) = register_sized_attach_with_flags(
+        &handler,
+        91_803,
+        &alpha,
+        TerminalSize { cols: 90, rows: 30 },
+        super::super::attach_support::ClientFlags::NO_DETACH_ON_DESTROY,
+    )
+    .await;
+    while control_rx.try_recv().is_ok() {}
+
+    let response = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: alpha,
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    let target = recv_switch_target(&mut control_rx, "no-detach client flag").await;
+    assert_eq!(target.session_name, beta);
+}
+
+#[tokio::test]
+async fn destroy_switch_target_name_reuse_fails_closed() {
+    let handler = RequestHandler::new();
+    let gamma = session_name("destroy-reuse-gamma");
+    let beta = session_name("destroy-reuse-beta");
+    let alpha = session_name("destroy-reuse-alpha");
+    for session in [gamma, beta.clone(), alpha.clone()] {
+        create_session_with_size(&handler, session, TerminalSize { cols: 80, rows: 24 }).await;
+    }
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::DetachOnDestroy,
+            value: "off".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    let (_, mut control_rx) = register_sized_attach(
+        &handler,
+        91_804,
+        &alpha,
+        TerminalSize { cols: 90, rows: 30 },
+    )
+    .await;
+    while control_rx.try_recv().is_ok() {}
+
+    let original_beta_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&beta)
+        .expect("original beta exists")
+        .id();
+    let pause = handler.install_attached_size_selection_pause();
+    let kill_handler = handler.clone();
+    let kill_alpha = tokio::spawn(async move {
+        kill_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: alpha,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await
+    });
+    pause.reached.notified().await;
+
+    let response = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: beta.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    create_session_with_size(&handler, beta.clone(), TerminalSize { cols: 80, rows: 24 }).await;
+    let replacement_beta_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&beta)
+        .expect("replacement beta exists")
+        .id();
+    assert_ne!(replacement_beta_id, original_beta_id);
+
+    pause.release.notify_one();
+    let response = kill_alpha.await.expect("kill alpha task joins");
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    assert!(matches!(
+        recv_attach_control(&mut control_rx, "stale destroy target fallback").await,
+        AttachControl::Exited
+    ));
+    assert!(!handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .contains_key(&91_804));
+}
+
+#[tokio::test]
+async fn concurrent_manual_switch_wins_over_destroy_switch() {
+    let handler = RequestHandler::new();
+    let gamma = session_name("destroy-race-gamma");
+    let beta = session_name("destroy-race-beta");
+    let alpha = session_name("destroy-race-alpha");
+    for session in [gamma.clone(), beta, alpha.clone()] {
+        create_session_with_size(&handler, session, TerminalSize { cols: 80, rows: 24 }).await;
+    }
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::DetachOnDestroy,
+            value: "off".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    let (_, mut control_rx) = register_sized_attach(
+        &handler,
+        91_805,
+        &alpha,
+        TerminalSize { cols: 90, rows: 30 },
+    )
+    .await;
+    while control_rx.try_recv().is_ok() {}
+
+    let pause = handler.install_attached_size_selection_pause();
+    let kill_handler = handler.clone();
+    let kill_alpha = tokio::spawn(async move {
+        kill_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: alpha,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await
+    });
+    pause.reached.notified().await;
+
+    let switched = handler
+        .dispatch(
+            91_805,
+            Request::SwitchClientExt2(Box::new(SwitchClientExt2Request {
+                target: Some(gamma.clone()),
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: false,
+                toggle_read_only: false,
+                flags: None,
+                sort_order: None,
+                skip_environment_update: false,
+            })),
+        )
+        .await
+        .response;
+    assert!(
+        matches!(switched, Response::SwitchClient(_)),
+        "{switched:?}"
+    );
+    let target = recv_switch_target(&mut control_rx, "manual switch during destroy").await;
+    assert_eq!(target.session_name, gamma);
+
+    pause.release.notify_one();
+    let response = kill_alpha.await.expect("kill alpha task joins");
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    assert!(matches!(control_rx.try_recv(), Err(TryRecvError::Empty)));
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&91_805)
+        .expect("manual switch preserves attached client");
+    assert_eq!(active.session_name, gamma);
+    assert!(!active.closing.load(Ordering::SeqCst));
+}
+
 async fn create_session_with_size(
     handler: &RequestHandler,
     session: SessionName,

@@ -19,6 +19,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_HTTP_MULTIPLEXING: "false"
   CARGO_TERM_COLOR: always
@@ -773,7 +777,17 @@ jobs:
           tag="$RELEASE_REF"
           scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
           scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$tag" "$SOURCE_GIT_SHA"
-          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if release_is_draft="$(
+            gh release view "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft 2>/dev/null
+          )"; then
+            if [ "$release_is_draft" != "true" ]; then
+              echo "Refusing to replace assets on published release $tag" >&2
+              exit 1
+            fi
+          else
             release_args=(
               "$tag"
               --repo "$GITHUB_REPOSITORY"
@@ -804,6 +818,15 @@ jobs:
           fi
           scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
           scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$tag" "$SOURCE_GIT_SHA"
+          test "$(
+            gh release view "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft
+          )" = "true" || {
+            echo "Refusing to replace assets on published release $tag" >&2
+            exit 1
+          }
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "${assets[@]}" --clobber
           scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
           scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$tag" "$SOURCE_GIT_SHA"

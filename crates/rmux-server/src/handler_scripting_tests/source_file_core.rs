@@ -2,6 +2,37 @@ use super::*;
 use crate::pane_io::AttachControl;
 
 #[tokio::test]
+async fn compact_short_options_execute_from_source_file() {
+    let handler = RequestHandler::new();
+    let root = temp_root("compact-server-flags");
+    write_config(
+        &root.join("compact.conf"),
+        "show-messages -JT\nset-buffer -b compact-source ok\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["compact.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+
+    assert!(matches!(response, Response::SourceFile(_)), "{response:?}");
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("compact-source".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("source command after compact flags should execute")
+            .stdout(),
+        b"ok"
+    );
+    fs::remove_dir_all(root).expect("remove compact source root");
+}
+
+#[tokio::test]
 async fn source_file_command_bounds_matches_across_separate_paths() {
     let handler = RequestHandler::new();
     let root = temp_root("aggregate-path-count");

@@ -18,10 +18,13 @@ pub(super) struct AttachStdout<W> {
 }
 
 impl<W> AttachStdout<W> {
-    pub(super) fn new(fallback: W) -> Self {
+    /// Builds the attach writer after `RawTerminal` has taken ownership of the
+    /// standard console modes. The standard output handle is borrowed; only a
+    /// separately opened `CONOUT$` fallback owns and restores its mode.
+    pub(super) fn for_managed_terminal(fallback: W) -> Self {
         Self {
             fallback,
-            console: Utf16ConsoleWriter::stdout(),
+            console: Utf16ConsoleWriter::stdout_borrowing_managed_mode(),
         }
     }
 }
@@ -52,10 +55,16 @@ where
 struct Utf16ConsoleWriter {
     handle: HANDLE,
     _owned_handle: Option<File>,
-    original_mode: u32,
+    mode_ownership: OutputModeOwnership,
     pending_utf8: Vec<u8>,
     vt_mode_scanner: VtModeScanner,
     vt_input_passthrough: Option<ScopedVtInputPassthrough>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputModeOwnership {
+    Borrowed,
+    Restore(u32),
 }
 
 // SAFETY: the writer stores only process console-handle metadata and is moved
@@ -64,10 +73,12 @@ struct Utf16ConsoleWriter {
 unsafe impl Send for Utf16ConsoleWriter {}
 
 impl Utf16ConsoleWriter {
-    fn stdout() -> Option<Self> {
-        std_output_handle()
-            .and_then(|handle| Self::from_handle(handle, None))
-            .or_else(Self::from_conout)
+    fn stdout_borrowing_managed_mode() -> Option<Self> {
+        select_output_console(
+            std_output_handle(),
+            Self::from_borrowed_handle,
+            Self::from_conout,
+        )
     }
 
     fn from_conout() -> Option<Self> {
@@ -76,19 +87,36 @@ impl Utf16ConsoleWriter {
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             return None;
         }
-        Self::from_handle(handle, Some(file))
+        let original_mode = configure_output_console(handle).ok()?;
+        Some(Self::from_handle(
+            handle,
+            Some(file),
+            OutputModeOwnership::Restore(original_mode),
+        ))
     }
 
-    fn from_handle(handle: HANDLE, owned_handle: Option<File>) -> Option<Self> {
-        let mode = configure_output_console(handle).ok()?;
-        Some(Self {
+    fn from_borrowed_handle(handle: HANDLE) -> Option<Self> {
+        probe_output_console(handle).ok()?;
+        Some(Self::from_handle(
+            handle,
+            None,
+            OutputModeOwnership::Borrowed,
+        ))
+    }
+
+    fn from_handle(
+        handle: HANDLE,
+        owned_handle: Option<File>,
+        mode_ownership: OutputModeOwnership,
+    ) -> Self {
+        Self {
             handle,
             _owned_handle: owned_handle,
-            original_mode: mode,
+            mode_ownership,
             pending_utf8: Vec::new(),
             vt_mode_scanner: VtModeScanner::default(),
             vt_input_passthrough: ScopedVtInputPassthrough::for_output(handle),
-        })
+        }
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -149,13 +177,40 @@ impl Utf16ConsoleWriter {
     }
 }
 
+fn select_output_console<T>(
+    stdout_handle: Option<HANDLE>,
+    from_stdout: impl FnOnce(HANDLE) -> Option<T>,
+    from_absent_stdout: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    match stdout_handle {
+        Some(handle) => from_stdout(handle),
+        None => from_absent_stdout(),
+    }
+}
+
 impl Drop for Utf16ConsoleWriter {
     fn drop(&mut self) {
         if let Some(pending) = self.vt_mode_scanner.finish() {
             let _ = self.write_chunk(&pending);
         }
-        let _ = restore_output_console(self.handle, self.original_mode);
+        if let OutputModeOwnership::Restore(mode) = self.mode_ownership {
+            let _ = restore_output_console(self.handle, mode);
+        }
     }
+}
+
+fn probe_output_console(handle: HANDLE) -> io::Result<()> {
+    ATTACH_CONSOLE_IO.synchronized(|| {
+        let mut mode = 0;
+        let ok = unsafe {
+            // SAFETY: handle is borrowed and mode points to writable storage.
+            GetConsoleMode(handle, &mut mode)
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })?
 }
 
 fn configure_output_console(handle: HANDLE) -> io::Result<u32> {
@@ -218,8 +273,48 @@ fn writable_utf8_prefix_len(bytes: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::super::terminal_cleanup::fallback_attach_stop_sequence;
-    use super::{writable_utf8_prefix_len, OutputWriteKind, Utf16ConsoleWriter, VtModeScanner};
+    use super::{
+        select_output_console, writable_utf8_prefix_len, OutputModeOwnership, OutputWriteKind,
+        Utf16ConsoleWriter, VtModeScanner,
+    };
+
+    #[test]
+    fn valid_redirected_stdout_never_falls_through_to_conout() {
+        let conout_attempted = Cell::new(false);
+        let result = select_output_console(
+            Some(1_usize as windows_sys::Win32::Foundation::HANDLE),
+            |_| None::<()>,
+            || {
+                conout_attempted.set(true);
+                Some(())
+            },
+        );
+
+        assert!(result.is_none());
+        assert!(
+            !conout_attempted.get(),
+            "a valid redirected stdout must remain on the fallback writer"
+        );
+    }
+
+    #[test]
+    fn absent_stdout_may_open_conout() {
+        let conout_attempted = Cell::new(false);
+        let result = select_output_console(
+            None,
+            |_| None::<&str>,
+            || {
+                conout_attempted.set(true);
+                Some("conout")
+            },
+        );
+
+        assert_eq!(result, Some("conout"));
+        assert!(conout_attempted.get());
+    }
 
     #[test]
     fn utf8_prefix_waits_for_split_codepoint() {
@@ -240,7 +335,7 @@ mod tests {
         let mut writer = Utf16ConsoleWriter {
             handle: std::ptr::null_mut(),
             _owned_handle: None,
-            original_mode: 0,
+            mode_ownership: OutputModeOwnership::Borrowed,
             pending_utf8: glyph[..1].to_vec(),
             vt_mode_scanner: VtModeScanner::default(),
             vt_input_passthrough: None,

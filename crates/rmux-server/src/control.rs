@@ -9,11 +9,11 @@ use crate::handler::{
 };
 #[cfg(any(unix, windows))]
 use rmux_ipc::LocalStream;
-use rmux_proto::SessionName;
 #[cfg(windows)]
 use rmux_proto::CONTROL_STDIN_EOF_MARKER;
 #[cfg(any(unix, windows))]
 use rmux_proto::{format_exit_line, format_guard_line, ControlGuardKind};
+use rmux_proto::{ControlMode, SessionName};
 #[cfg(any(unix, windows))]
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(unix, windows))]
@@ -143,14 +143,25 @@ pub(crate) struct ControlLifecycle {
 pub(crate) struct ControlUpgradeInput {
     buffered_bytes: Vec<u8>,
     initial_command_count: usize,
+    mode: ControlMode,
 }
 
 #[cfg(any(unix, windows))]
 impl ControlUpgradeInput {
+    #[cfg(test)]
     pub(crate) fn new(buffered_bytes: Vec<u8>, initial_command_count: usize) -> Self {
+        Self::with_mode(buffered_bytes, initial_command_count, ControlMode::Plain)
+    }
+
+    pub(crate) fn with_mode(
+        buffered_bytes: Vec<u8>,
+        initial_command_count: usize,
+        mode: ControlMode,
+    ) -> Self {
         Self {
             buffered_bytes,
             initial_command_count,
+            mode,
         }
     }
 }
@@ -195,6 +206,7 @@ async fn forward_control_inner(
     let ControlUpgradeInput {
         buffered_bytes: initial_socket_bytes,
         initial_command_count,
+        mode,
     } = upgrade_input;
     if initial_command_count > MAX_INITIAL_CONTROL_COMMANDS {
         return Err(io::Error::new(
@@ -323,7 +335,11 @@ async fn forward_control_inner(
                 .await?;
             return Ok(());
         }
-        if input_closed && current_command.is_none() && queued_lines.is_empty() {
+        if input_closed
+            && current_command.is_none()
+            && queued_lines.is_empty()
+            && !control_control_waits_for_attached_session(mode, session_name.as_ref())
+        {
             // Any incomplete line remaining in input_buffer after EOF is
             // discarded, matching tmux's `evbuffer_readln` semantics. EOF
             // itself is promoted to a bare `%exit\n` so the control-mode
@@ -443,7 +459,11 @@ async fn forward_control_inner(
                 }
             }
         }
-        if input_closed && current_command.is_none() && queued_lines.is_empty() {
+        if input_closed
+            && current_command.is_none()
+            && queued_lines.is_empty()
+            && !control_control_waits_for_attached_session(mode, session_name.as_ref())
+        {
             output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
             flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
                 .await?;
@@ -575,7 +595,7 @@ async fn forward_control_inner(
                 }
             }
             _ = wait_for_control_eof_transition(&mut eof_transition),
-                if input_closed && current_command.is_some() =>
+                if input_closed && current_command.is_some() && !mode.is_control_control() =>
             {
                 // The transport can close as soon as the active guard has
                 // been terminated, but every complete frame accepted before
@@ -657,6 +677,14 @@ async fn forward_control_inner(
             }
         }
     }
+}
+
+#[cfg(any(unix, windows))]
+fn control_control_waits_for_attached_session(
+    mode: ControlMode,
+    session_name: Option<&SessionName>,
+) -> bool {
+    mode.is_control_control() && session_name.is_some()
 }
 
 #[cfg(any(unix, windows))]

@@ -5,7 +5,8 @@ use rmux_proto::{
 };
 
 use super::super::{
-    defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event_if_enabled,
+    attach_support::SessionDetachOnDestroy, defer_lifecycle_event,
+    prepare_deferred_lifecycle_event, prepare_lifecycle_event_if_enabled,
     scripting_support::format_context_for_target, DeferredLifecycleEvent,
     PaneOutputSubscriptionKeySnapshot, QueuedLifecycleEvent, RequestHandler,
 };
@@ -20,13 +21,23 @@ struct PaneTransferEffects {
     refresh_sessions: Vec<SessionName>,
     hook_snapshot: HookStore,
     unlinked_windows: Vec<DeferredLifecycleEvent>,
-    closed_sessions: Vec<(SessionName, SessionId, DeferredLifecycleEvent)>,
+    closed_sessions: Vec<(
+        SessionName,
+        SessionId,
+        SessionDetachOnDestroy,
+        DeferredLifecycleEvent,
+    )>,
 }
 
 struct PreparedPaneTransferEffects {
     refresh_sessions: Vec<SessionName>,
     unlinked_windows: Vec<QueuedLifecycleEvent>,
-    closed_sessions: Vec<(SessionName, SessionId, QueuedLifecycleEvent)>,
+    closed_sessions: Vec<(
+        SessionName,
+        SessionId,
+        SessionDetachOnDestroy,
+        QueuedLifecycleEvent,
+    )>,
 }
 
 #[derive(Clone, Copy)]
@@ -112,6 +123,7 @@ impl PaneTransferEffects {
                 Some((
                     session_name.clone(),
                     SessionId::new(session_id),
+                    SessionDetachOnDestroy::capture(state, session_name),
                     defer_lifecycle_event(state, &event),
                 ))
             })
@@ -157,11 +169,12 @@ impl PaneTransferEffects {
             .collect();
         let closed_sessions = closed_sessions
             .into_iter()
-            .filter(|(session_name, _, _)| removed_sessions.contains(session_name))
-            .map(|(session_name, session_id, event)| {
+            .filter(|(session_name, _, _, _)| removed_sessions.contains(session_name))
+            .map(|(session_name, session_id, detach_on_destroy, event)| {
                 (
                     session_name,
                     session_id,
+                    detach_on_destroy,
                     prepare_deferred_lifecycle_event(state, &mut hook_snapshot, event),
                 )
             })
@@ -533,21 +546,38 @@ impl RequestHandler {
         removed_sessions: &[SessionName],
         target_session_name: &SessionName,
     ) {
-        let removed_identities = effects
+        let removed_attached_identities = effects
             .closed_sessions
+            .iter()
+            .map(|(session_name, session_id, detach_on_destroy, _)| {
+                (session_name.clone(), *session_id, *detach_on_destroy)
+            })
+            .collect::<Vec<_>>();
+        let removed_identities = removed_attached_identities
             .iter()
             .map(|(session_name, session_id, _)| (session_name.clone(), *session_id))
             .collect::<Vec<_>>();
-        for (session_name, session_id, event) in effects.closed_sessions {
+        let mut prepared_attached_switches = std::collections::HashMap::new();
+        for (session_name, session_id, detach_on_destroy) in &removed_attached_identities {
+            let prepared = self
+                .rehome_control_session_identity(session_name, *session_id, *detach_on_destroy)
+                .await;
+            prepared_attached_switches.insert(*session_id, prepared);
+        }
+        for (session_name, session_id, _, event) in effects.closed_sessions {
             self.prune_web_session(Some((session_name, session_id)));
             self.emit_prepared(event).await;
         }
         self.remove_session_leases(&removed_identities);
-        for (session_name, session_id) in &removed_identities {
-            self.exit_attached_session_identity(session_name, *session_id)
-                .await;
-            self.cancel_session_silence_timers(session_name).await;
-            self.refresh_control_session(session_name).await;
+        for (session_name, session_id, detach_on_destroy) in removed_attached_identities {
+            if let Some(prepared) = prepared_attached_switches.remove(&session_id) {
+                self.exit_prepared_attached_session_identity(prepared).await;
+            } else {
+                self.exit_attached_session_identity(&session_name, session_id, detach_on_destroy)
+                    .await;
+            }
+            self.cancel_session_silence_timers(&session_name).await;
+            self.refresh_control_session(&session_name).await;
         }
         for session_name in &effects.refresh_sessions {
             if !removed_sessions.contains(session_name) {

@@ -18,6 +18,7 @@ use crate::pane_io::AttachControl;
 use crate::pane_terminals::{session_not_found, SessionTransferSnapshot};
 
 pub(in crate::handler) struct AttachedSwitchCommitRequest {
+    pub(in crate::handler) expected_current_session_id: Option<SessionId>,
     pub(in crate::handler) session_name: SessionName,
     pub(in crate::handler) session_id: SessionId,
     pub(in crate::handler) target_selection: Option<SwitchTargetSelection>,
@@ -129,7 +130,11 @@ impl RequestHandler {
             let mut state = self.state.lock().await;
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach.by_pid.get(&attach_pid).filter(|active| {
-                active.id == expected_attach_id && !active.closing.load(Ordering::SeqCst)
+                active.id == expected_attach_id
+                    && request
+                        .expected_current_session_id
+                        .is_none_or(|session_id| active.session_id == session_id)
+                    && !active.closing.load(Ordering::SeqCst)
             });
             let Some(active) = active else {
                 return Err(crate::handler_support::attached_client_required(

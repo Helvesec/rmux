@@ -1791,6 +1791,41 @@ fn control_mode_argv_command_uses_initial_flags_zero_frame() -> Result<(), Box<d
 }
 
 #[test]
+fn control_control_eof_waits_for_new_session_output() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("control-control-new-session-eof")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &[
+            "-CC",
+            "new-session",
+            "-A",
+            "-s",
+            "alpha",
+            "--",
+            "sh",
+            "-c",
+            "sleep 0.2; printf control-eof-child; sleep 0.1",
+        ],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    let rendered = stdout(&output);
+    assert!(rendered.starts_with(CONTROL_CONTROL_START));
+    assert!(
+        rendered.contains("%output %") && rendered.contains("control-eof-child"),
+        "control-control EOF must not overtake the created pane's output: {rendered:?}"
+    );
+    assert!(rendered.contains("%exit"), "rendered={rendered:?}");
+    assert!(rendered.ends_with(CONTROL_CONTROL_END));
+    Ok(())
+}
+
+#[test]
 fn control_stdin_queue_routes_named_inventory_start_server_and_new_window_flags(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("control-queue-inventory-new-window")?;

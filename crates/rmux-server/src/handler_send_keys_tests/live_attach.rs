@@ -1850,6 +1850,133 @@ async fn live_attach_named_key_table_dispatches_before_rerouted_plain_tail() {
 }
 
 #[tokio::test]
+async fn live_attach_prefix_precedes_a_transient_key_table() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("prefix-precedes-transient-live");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let bound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "named-live".to_owned(),
+            key: "C-b".to_owned(),
+            note: Some("must lose to live prefix input".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "set-buffer".to_owned(),
+                "-b".to_owned(),
+                "wrong-live-table-hit".to_owned(),
+                "yes".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(bound, Response::BindKey(_)), "{bound:?}");
+    let switched = handler
+        .handle(Request::SwitchClientExt(SwitchClientExtRequest {
+            target: None,
+            key_table: Some("named-live".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(switched, Response::SwitchClient(_)),
+        "{switched:?}"
+    );
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02")
+        .await
+        .expect("live prefix input from a transient table");
+
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .expect("attached client should remain registered");
+    assert_eq!(active.key_table_name.as_deref(), Some("prefix"));
+    drop(active_attach);
+
+    let wrong_table_hit = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("wrong-live-table-hit".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(wrong_table_hit, Response::Error(_)),
+        "the live transient table's prefix-key binding must not execute"
+    );
+}
+
+#[tokio::test]
+async fn live_attach_key_table_off_keeps_prefix_disabled() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("key-table-off-live");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    for (option, value) in [(OptionName::Prefix, "None"), (OptionName::KeyTable, "off")] {
+        let configured = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(alpha.clone()),
+                option,
+                value: value.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(
+            matches!(configured, Response::SetOption(_)),
+            "{configured:?}"
+        );
+    }
+
+    let bound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "off".to_owned(),
+            key: "C-b".to_owned(),
+            note: Some("disabled-prefix table binding".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "set-buffer".to_owned(),
+                "-b".to_owned(),
+                "off-table-hit".to_owned(),
+                "yes".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(bound, Response::BindKey(_)), "{bound:?}");
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02")
+        .await
+        .expect("disabled-prefix table input");
+
+    let shown = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("off-table-hit".to_owned()),
+        }))
+        .await;
+    let Response::ShowBuffer(shown) = shown else {
+        panic!("expected off-table binding to execute, got {shown:?}");
+    };
+    assert_eq!(shown.command_output().stdout(), b"yes");
+
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .expect("attached client should remain registered");
+    assert_eq!(active.key_table_name, None);
+}
+
+#[tokio::test]
 async fn live_attach_nul_dispatches_c_at_alias_binding() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

@@ -180,6 +180,14 @@ impl HandlerState {
     }
 
     #[cfg(windows)]
+    pub(crate) fn pane_start_process_command_for_id(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<&ProcessCommand> {
+        self.pane_lifecycle.get(&pane_id)?.process_command.as_ref()
+    }
+
+    #[cfg(windows)]
     pub(in crate::pane_terminals) fn record_pane_lifecycle_starting(
         &mut self,
         spawn: PaneLifecycleSpawn,

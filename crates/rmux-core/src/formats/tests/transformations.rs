@@ -17,6 +17,27 @@ fn truncation_with_marker() {
 }
 
 #[test]
+fn styled_format_width_truncation_and_padding_ignore_inline_clauses() {
+    let context = FormatContext::new()
+        .with_named_value("left", "#[fg=red]AB#[fg=blue]CDEF")
+        .with_named_value("right", "#[fg=red]AB#[fg=blue]CDEF");
+
+    assert_eq!(render_template("#{w:left}", &context), "6");
+    assert_eq!(
+        render_template("#{=/4:left}", &context),
+        "#[fg=red]AB#[fg=blue]CD"
+    );
+    assert_eq!(
+        render_template("#{=-3:right}", &context),
+        "#[fg=red]#[fg=blue]DEF"
+    );
+    assert_eq!(
+        render_template("#{p8:left}", &context),
+        "#[fg=red]AB#[fg=blue]CDEF  "
+    );
+}
+
+#[test]
 fn negative_modifier_bounds_do_not_overflow() {
     assert_eq!(signed_i32_abs_usize(i32::MIN), 2_147_483_648);
     assert_eq!(

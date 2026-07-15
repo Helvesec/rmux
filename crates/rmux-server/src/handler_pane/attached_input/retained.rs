@@ -2,7 +2,7 @@ use std::io;
 
 use rmux_proto::DEFAULT_MAX_FRAME_LENGTH;
 
-const MAX_RETAINED_ATTACHED_CONTROL_INPUT: usize = DEFAULT_MAX_FRAME_LENGTH;
+pub(super) const MAX_RETAINED_ATTACHED_CONTROL_INPUT: usize = DEFAULT_MAX_FRAME_LENGTH;
 
 // Mouse, key, and prompt decoders only need a short prefix to decide whether
 // an escape sequence is complete. Keeping an arbitrarily long CSI prefix

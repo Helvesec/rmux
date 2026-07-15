@@ -5,19 +5,17 @@ use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rmux_os::identity::{IdentityResolver, UserIdentity};
+use rmux_os::identity::UserIdentity;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA,
     ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT,
-};
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
-    GetTokenInformation, RevertToSelf, TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    TOKEN_QUERY, TOKEN_USER,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, RevertToSelf,
+    TokenIntegrityLevel, TokenUser, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_CREATE_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
@@ -28,7 +26,7 @@ use windows_sys::Win32::System::Pipes::{
     PeekNamedPipe, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
+    GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
@@ -49,8 +47,8 @@ pub type WindowsPipeClient = NamedPipeClient;
 
 /// Blocking local byte stream used by the CLI.
 pub struct BlockingLocalStream {
-    inner: NamedPipeClient,
-    runtime: tokio::runtime::Runtime,
+    inner: Option<NamedPipeClient>,
+    runtime: Option<tokio::runtime::Runtime>,
     timeouts: Mutex<IoTimeouts>,
 }
 
@@ -69,8 +67,16 @@ impl std::fmt::Debug for BlockingLocalStream {
 impl BlockingLocalStream {
     /// Consumes the blocking wrapper and returns its Tokio pipe client plus
     /// the runtime that owns its I/O driver.
-    pub fn into_async_parts(self) -> (NamedPipeClient, tokio::runtime::Runtime) {
-        (self.inner, self.runtime)
+    pub fn into_async_parts(mut self) -> (NamedPipeClient, tokio::runtime::Runtime) {
+        let inner = self
+            .inner
+            .take()
+            .expect("blocking named-pipe stream must own its client");
+        let runtime = self
+            .runtime
+            .take()
+            .expect("blocking named-pipe stream must own its runtime");
+        (inner, runtime)
     }
 
     /// Returns the current read timeout for detached RPC reads.
@@ -125,8 +131,8 @@ pub fn connect_blocking(
         match runtime.block_on(connect_windows_pipe(&pipe_name)) {
             Ok(inner) => {
                 return Ok(BlockingLocalStream {
-                    inner,
-                    runtime,
+                    inner: Some(inner),
+                    runtime: Some(runtime),
                     timeouts: Mutex::new(IoTimeouts::default()),
                 });
             }
@@ -213,7 +219,8 @@ fn connect_retryable(error: &io::Error) -> bool {
 }
 
 /// Opens a Tokio named-pipe client with RMUX's restricted access rights and
-/// verifies that the server belongs to the current Windows user.
+/// verifies that the server belongs to the current Windows user at the exact
+/// same mandatory integrity level.
 ///
 /// Callers should use this boundary instead of Tokio's unrestricted
 /// `ClientOptions::open` so every asynchronous RMUX client applies the same
@@ -256,37 +263,73 @@ fn open_named_pipe_client_handle(pipe_name: &std::ffi::OsStr) -> io::Result<Name
 
 impl Read for BlockingLocalStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.read_timeout()? {
-            Some(timeout) => self.runtime.block_on(async {
-                tokio::time::timeout(timeout, self.inner.read(buf))
+        let timeout = self.read_timeout()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("blocking named-pipe stream must own its runtime");
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("blocking named-pipe stream must own its client");
+        match timeout {
+            Some(timeout) => runtime.block_on(async {
+                tokio::time::timeout(timeout, inner.read(buf))
                     .await
                     .map_err(|_| timeout_error("read", timeout))?
             }),
-            None => self.runtime.block_on(self.inner.read(buf)),
+            None => runtime.block_on(inner.read(buf)),
         }
     }
 }
 
 impl Write for BlockingLocalStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.write_timeout() {
-            Some(timeout) => self.runtime.block_on(async {
-                tokio::time::timeout(timeout, self.inner.write(buf))
+        let timeout = self.write_timeout();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("blocking named-pipe stream must own its runtime");
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("blocking named-pipe stream must own its client");
+        match timeout {
+            Some(timeout) => runtime.block_on(async {
+                tokio::time::timeout(timeout, inner.write(buf))
                     .await
                     .map_err(|_| timeout_error("write", timeout))?
             }),
-            None => self.runtime.block_on(self.inner.write(buf)),
+            None => runtime.block_on(inner.write(buf)),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self.write_timeout() {
-            Some(timeout) => self.runtime.block_on(async {
-                tokio::time::timeout(timeout, self.inner.flush())
+        let timeout = self.write_timeout();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("blocking named-pipe stream must own its runtime");
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("blocking named-pipe stream must own its client");
+        match timeout {
+            Some(timeout) => runtime.block_on(async {
+                tokio::time::timeout(timeout, inner.flush())
                     .await
                     .map_err(|_| timeout_error("flush", timeout))?
             }),
-            None => self.runtime.block_on(self.inner.flush()),
+            None => runtime.block_on(inner.flush()),
+        }
+    }
+}
+
+impl Drop for BlockingLocalStream {
+    fn drop(&mut self) {
+        drop(self.inner.take());
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
         }
     }
 }
@@ -333,70 +376,52 @@ fn peer_identity_from_handle(handle: HANDLE) -> io::Result<PeerIdentity> {
 
 fn validate_named_pipe_server_identity(client: &NamedPipeClient) -> io::Result<()> {
     let server_pid = named_pipe_server_pid(client)?;
-    let expected = IdentityResolver::current()?;
-    validate_named_pipe_server_identity_from_sources(
-        server_pid,
-        &expected,
-        || process_user_identity(server_pid),
-        || named_pipe_owner_identity(client.as_raw_handle() as HANDLE),
-    )
+    let expected = current_process_security_identity()?;
+    validate_named_pipe_server_identity_from_source(server_pid, &expected, || {
+        process_security_identity(server_pid)
+    })
 }
 
-fn validate_named_pipe_server_identity_from_sources<ProcessUser, PipeOwner>(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowsSecurityIdentity {
+    user: UserIdentity,
+    integrity_rid: u32,
+}
+
+fn validate_named_pipe_server_identity_from_source<ProcessIdentity>(
     server_pid: u32,
-    expected: &UserIdentity,
-    process_user: ProcessUser,
-    pipe_owner: PipeOwner,
+    expected: &WindowsSecurityIdentity,
+    process_identity: ProcessIdentity,
 ) -> io::Result<()>
 where
-    ProcessUser: FnOnce() -> io::Result<UserIdentity>,
-    PipeOwner: FnOnce() -> io::Result<UserIdentity>,
+    ProcessIdentity: FnOnce() -> io::Result<WindowsSecurityIdentity>,
 {
-    match process_user() {
-        Ok(actual) => compare_named_pipe_server_identity(
-            server_pid,
-            "process token",
-            actual,
-            expected,
-            None,
-        ),
-        Err(process_error) => match pipe_owner() {
-            Ok(actual) => compare_named_pipe_server_identity(
-                server_pid,
-                "pipe owner",
-                actual,
-                expected,
-                Some(process_error),
+    let actual = process_identity().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "named-pipe server pid {server_pid} process token identity and integrity \
+                 could not be verified: {error}"
             ),
-            Err(owner_error) => Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "named-pipe server pid {server_pid} identity could not be verified: \
-                     process token query failed: {process_error}; pipe owner query failed: {owner_error}"
-                ),
-            )),
-        },
-    }
+        )
+    })?;
+    compare_named_pipe_server_identity(server_pid, &actual, expected)
 }
 
 fn compare_named_pipe_server_identity(
     server_pid: u32,
-    source: &str,
-    actual: UserIdentity,
-    expected: &UserIdentity,
-    fallback_reason: Option<io::Error>,
+    actual: &WindowsSecurityIdentity,
+    expected: &WindowsSecurityIdentity,
 ) -> io::Result<()> {
-    if &actual == expected {
+    if actual == expected {
         return Ok(());
     }
 
-    let reason = fallback_reason
-        .map(|error| format!(" after process token query failed: {error}"))
-        .unwrap_or_default();
     Err(io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
-            "named-pipe server pid {server_pid} {source}{reason} is owned by {actual:?}; expected {expected:?}"
+            "named-pipe server pid {server_pid} process token is {actual:?}; \
+             expected current user and exact integrity {expected:?}"
         ),
     ))
 }
@@ -413,49 +438,37 @@ fn named_pipe_server_pid(client: &NamedPipeClient) -> io::Result<u32> {
     Ok(pid)
 }
 
-fn process_user_identity(pid: u32) -> io::Result<UserIdentity> {
+fn process_security_identity(pid: u32) -> io::Result<WindowsSecurityIdentity> {
     let process = open_process_for_token_query(pid)?;
+    let token = process_token(process.get())?;
+    token_security_identity(token.get())
+}
+
+fn current_process_security_identity() -> io::Result<WindowsSecurityIdentity> {
+    let token = process_token(unsafe {
+        // SAFETY: GetCurrentProcess returns a valid pseudo-handle for this process.
+        GetCurrentProcess()
+    })?;
+    token_security_identity(token.get())
+}
+
+fn process_token(process: HANDLE) -> io::Result<OwnedHandle> {
     let mut token = null_mut();
     let ok = unsafe {
         // SAFETY: process is a live process handle and token is a valid out pointer.
-        OpenProcessToken(process.get(), TOKEN_QUERY, &mut token)
+        OpenProcessToken(process, TOKEN_QUERY, &mut token)
     };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let token = OwnedHandle(token);
-    token_user_identity(token.get())
+    Ok(OwnedHandle(token))
 }
 
-fn named_pipe_owner_identity(handle: HANDLE) -> io::Result<UserIdentity> {
-    let mut owner = null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-    let status = unsafe {
-        // SAFETY: handle is a connected named-pipe client handle. GetSecurityInfo
-        // initializes `owner` to point inside `descriptor`, which is freed below.
-        GetSecurityInfo(
-            handle,
-            SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            &mut owner,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            &mut descriptor,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status as i32));
-    }
-    let _descriptor = LocalSecurityDescriptor(descriptor);
-    if owner.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Windows returned a null named-pipe owner SID",
-        ));
-    }
-
-    sid_to_identity(owner)
+fn token_security_identity(token: HANDLE) -> io::Result<WindowsSecurityIdentity> {
+    Ok(WindowsSecurityIdentity {
+        user: token_user_identity(token)?,
+        integrity_rid: token_integrity_rid(token)?,
+    })
 }
 
 fn open_process_for_token_query(pid: u32) -> io::Result<OwnedHandle> {
@@ -536,6 +549,70 @@ fn token_user_identity(token: HANDLE) -> io::Result<UserIdentity> {
     sid_to_identity(token_user.User.Sid)
 }
 
+fn token_integrity_rid(token: HANDLE) -> io::Result<u32> {
+    let mut needed = 0_u32;
+    unsafe {
+        // SAFETY: This first call intentionally requests the required byte count.
+        GetTokenInformation(token, TokenIntegrityLevel, null_mut(), 0, &mut needed);
+    }
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut buffer = vec![0_u8; usize::try_from(needed).map_err(|_| io::ErrorKind::InvalidData)?];
+    let ok = unsafe {
+        // SAFETY: buffer is writable for the byte count reported by Windows.
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mandatory_label = unsafe {
+        // SAFETY: A successful TokenIntegrityLevel query initializes
+        // TOKEN_MANDATORY_LABEL at the buffer start.
+        &*(buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())
+    };
+    integrity_rid_from_sid(mandatory_label.Label.Sid)
+}
+
+fn integrity_rid_from_sid(sid: *mut core::ffi::c_void) -> io::Result<u32> {
+    if sid.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows returned a null integrity SID",
+        ));
+    }
+    let count_ptr = unsafe {
+        // SAFETY: sid comes from a successfully queried TOKEN_MANDATORY_LABEL.
+        GetSidSubAuthorityCount(sid)
+    };
+    if count_ptr.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let count = unsafe { *count_ptr };
+    if count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Windows integrity SID has no subauthorities",
+        ));
+    }
+    let rid_ptr = unsafe {
+        // SAFETY: count is non-zero and the final subauthority index is valid.
+        GetSidSubAuthority(sid, u32::from(count - 1))
+    };
+    if rid_ptr.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { *rid_ptr })
+}
+
 fn sid_to_identity(sid: *mut core::ffi::c_void) -> io::Result<UserIdentity> {
     let mut sid_string = null_mut();
     let ok = unsafe {
@@ -585,19 +662,6 @@ impl OwnedHandle {
     }
 }
 
-struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
-
-impl Drop for LocalSecurityDescriptor {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                // SAFETY: descriptor came from GetSecurityInfo.
-                LocalFree(self.0.cast());
-            }
-        }
-    }
-}
-
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -625,84 +689,66 @@ impl Drop for RevertGuard {
 mod tests {
     use super::*;
 
-    fn sid(value: &str) -> UserIdentity {
-        UserIdentity::Sid(value.into())
+    fn identity(user: &str, integrity_rid: u32) -> WindowsSecurityIdentity {
+        WindowsSecurityIdentity {
+            user: UserIdentity::Sid(user.into()),
+            integrity_rid,
+        }
     }
 
     #[test]
-    fn server_identity_accepts_matching_process_token() {
-        let expected = sid("S-1-5-21-1000");
+    fn server_identity_accepts_matching_user_and_exact_integrity() {
+        let expected = identity("S-1-5-21-1000", 0x3000);
 
-        validate_named_pipe_server_identity_from_sources(
-            42,
-            &expected,
-            || Ok(expected.clone()),
-            || panic!("pipe owner fallback should not be used when the process token is readable"),
-        )
-        .expect("matching process token should be accepted");
+        validate_named_pipe_server_identity_from_source(42, &expected, || Ok(expected.clone()))
+            .expect("matching user and integrity should be accepted");
     }
 
     #[test]
-    fn server_identity_falls_back_to_matching_pipe_owner() {
-        let expected = sid("S-1-5-21-1000");
-
-        validate_named_pipe_server_identity_from_sources(
-            42,
-            &expected,
-            || {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "OpenProcess denied",
-                ))
-            },
-            || Ok(expected.clone()),
-        )
-        .expect("matching pipe owner should verify the server when process token lookup is denied");
-    }
-
-    #[test]
-    fn server_identity_rejects_mismatched_pipe_owner_after_process_denial() {
-        let expected = sid("S-1-5-21-1000");
-        let error = validate_named_pipe_server_identity_from_sources(
-            42,
-            &expected,
-            || {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "OpenProcess denied",
-                ))
-            },
-            || Ok(sid("S-1-5-21-2000")),
-        )
-        .expect_err("mismatched pipe owner must be rejected");
+    fn server_identity_rejects_same_user_at_lower_integrity() {
+        let expected = identity("S-1-5-21-1000", 0x3000);
+        let error = validate_named_pipe_server_identity_from_source(42, &expected, || {
+            Ok(identity("S-1-5-21-1000", 0x2000))
+        })
+        .expect_err("same-user lower-integrity server must be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("pipe owner"));
+        assert!(error.to_string().contains("exact integrity"));
     }
 
     #[test]
-    fn server_identity_reports_both_query_failures() {
-        let expected = sid("S-1-5-21-1000");
-        let error = validate_named_pipe_server_identity_from_sources(
-            42,
-            &expected,
-            || {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "OpenProcess denied",
-                ))
-            },
-            || {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "GetSecurityInfo denied",
-                ))
-            },
-        )
+    fn server_identity_rejects_different_user_at_matching_integrity() {
+        let expected = identity("S-1-5-21-1000", 0x2000);
+        let error = validate_named_pipe_server_identity_from_source(42, &expected, || {
+            Ok(identity("S-1-5-21-2000", 0x2000))
+        })
+        .expect_err("different-user server must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("S-1-5-21-2000"));
+    }
+
+    #[test]
+    fn server_identity_fails_closed_when_process_token_is_unverifiable() {
+        let expected = identity("S-1-5-21-1000", 0x2000);
+        let error = validate_named_pipe_server_identity_from_source(42, &expected, || {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "OpenProcess denied",
+            ))
+        })
         .expect_err("unverifiable server identity must be rejected");
 
         let message = error.to_string();
-        assert!(message.contains("process token query failed"));
-        assert!(message.contains("pipe owner query failed"));
+        assert!(message.contains("identity and integrity could not be verified"));
+        assert!(message.contains("OpenProcess denied"));
+    }
+
+    #[test]
+    fn current_process_identity_matches_pid_token_lookup() {
+        let current = current_process_security_identity().expect("current process token");
+        let by_pid = process_security_identity(std::process::id()).expect("process token by pid");
+
+        assert_eq!(by_pid, current);
     }
 }

@@ -110,6 +110,31 @@ fn rendered_pane_line_truncates_to_pane_width_without_counting_sgr() {
 }
 
 #[test]
+fn rendered_pane_line_closes_hyperlink_when_visible_text_is_clipped() {
+    let utf8 = Utf8Config::default();
+    let close = "\u{1b}]8;;\u{1b}\\";
+
+    for (line, expected) in [
+        (
+            "\u{1b}]8;id=ascii;https://example.test\u{1b}\\AB\u{1b}]8;;\u{1b}\\",
+            format!("\u{1b}]8;id=ascii;https://example.test\u{1b}\\A{close}"),
+        ),
+        (
+            "\u{1b}]8;;https://example.test\u{7}表B\u{1b}]8;;\u{7}",
+            format!("\u{1b}]8;;https://example.test\u{7}表{close}"),
+        ),
+    ] {
+        let clipped = String::from_utf8(super::truncate_rendered_pane_line(
+            line.as_bytes(),
+            if line.contains('表') { 2 } else { 1 },
+            &utf8,
+        ))
+        .expect("rendered pane line is utf-8");
+        assert_eq!(clipped, expected);
+    }
+}
+
+#[test]
 fn rendered_pane_line_keeps_composed_cells_at_pane_width() {
     let utf8 = Utf8Config::default();
 
@@ -1081,6 +1106,125 @@ fn status_format_expands_shell_job_introduced_by_status_left() {
 
     let frame = render_until_contains(&session, &options, &marker);
     assert!(frame.contains(&format!("X{marker}Y")), "{frame}");
+}
+
+#[test]
+fn status_right_inline_styles_do_not_consume_length_budget() {
+    let size = TerminalSize { cols: 20, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    for (option, value) in [
+        (OptionName::StatusLeft, ""),
+        (
+            OptionName::StatusRight,
+            "#[fg=#{?session_attached,green,red},bold]CLOCK-DATE-HOST",
+        ),
+        (OptionName::StatusRightLength, "10"),
+        (OptionName::WindowStatusFormat, ""),
+        (OptionName::WindowStatusCurrentFormat, ""),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let screen = screen_with(&render(&session, &options), size);
+    let status = visible_line_text(&screen, 2, usize::from(size.cols));
+
+    assert_eq!(status, "          CLOCK-DATE", "{status:?}");
+}
+
+#[test]
+fn explicit_status_format_width_modifier_ignores_inline_styles() {
+    let size = TerminalSize { cols: 20, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    for (option, value) in [
+        (
+            OptionName::StatusFormat,
+            "#[align=right]#{T;=/10:status-right}",
+        ),
+        (OptionName::StatusRight, "#[fg=green]CLOCK-DATE-HOST"),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let screen = screen_with(&render(&session, &options), size);
+    let status = visible_line_text(&screen, 2, usize::from(size.cols));
+
+    assert_eq!(status, "          CLOCK-DATE", "{status:?}");
+}
+
+#[test]
+fn status_left_inline_styles_preserve_unicode_cell_truncation() {
+    let size = TerminalSize { cols: 12, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    for (option, value) in [
+        (OptionName::StatusLeft, "#[fg=red]表A#[bold]👋🏽B"),
+        (OptionName::StatusLeftLength, "5"),
+        (OptionName::StatusRight, ""),
+        (OptionName::WindowStatusFormat, ""),
+        (OptionName::WindowStatusCurrentFormat, ""),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let screen = screen_with(&render(&session, &options), size);
+    let status = visible_line_text(&screen, 2, usize::from(size.cols));
+
+    // Screen visitors expose each wide glyph's continuation cell as a space.
+    assert_eq!(status, "表 A👋🏽        ", "{status:?}");
+}
+
+#[test]
+fn status_component_limit_keeps_a_zwj_grapheme_whole_product_divergence() {
+    let size = TerminalSize { cols: 8, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    for (option, value) in [
+        (OptionName::StatusLeft, "#[fg=red]👩\u{200d}💻A"),
+        (OptionName::StatusLeftLength, "2"),
+        (OptionName::StatusRight, ""),
+        (OptionName::WindowStatusFormat, ""),
+        (OptionName::WindowStatusCurrentFormat, ""),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let frame = render(&session, &options);
+    let frame = String::from_utf8(frame).expect("status frame is utf-8");
+    assert!(
+        frame.contains("👩\u{200d}💻"),
+        "the ZWJ grapheme must survive the formatted frame"
+    );
+    assert!(!frame.contains("👩\u{200d}💻A"), "{frame:?}");
 }
 
 #[test]

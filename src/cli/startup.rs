@@ -3,7 +3,7 @@ use std::path::Path;
 use rmux_client::AutoStartConfig;
 use rmux_server::{DaemonConfig, ServerDaemon};
 
-use crate::cli_args::{Cli, Command, ConfigFileSelection, StartServerArgs};
+use crate::cli_args::{Cli, Command, ConfigFileSelection, StartServerArgs, TopLevelCommandScan};
 use crate::server_runtime::build_daemon_runtime;
 
 use super::ExitFailure;
@@ -65,9 +65,27 @@ pub(super) enum ServerStartupConfig {
 }
 
 pub(super) fn startup_config_from_cli(cli: &Cli) -> StartupConfig {
+    startup_config_from_selection(cli.config_file_selection(), cli.command.as_ref())
+}
+
+pub(super) fn startup_config_from_top_level_scan(
+    scan: &TopLevelCommandScan,
+    first_command: &Command,
+) -> StartupConfig {
+    let selection = match scan.config_files.as_slice() {
+        [] => ConfigFileSelection::Default,
+        files => ConfigFileSelection::Custom(files),
+    };
+    startup_config_from_selection(selection, Some(first_command))
+}
+
+fn startup_config_from_selection(
+    selection: ConfigFileSelection<'_>,
+    command: Option<&Command>,
+) -> StartupConfig {
     let cwd = std::env::current_dir().ok();
-    let web = start_server_web_args(cli.command.as_ref());
-    let mut config = match cli.config_file_selection() {
+    let web = start_server_web_args(command);
+    let mut config = match selection {
         ConfigFileSelection::Default => {
             let quiet = true;
             StartupConfig {

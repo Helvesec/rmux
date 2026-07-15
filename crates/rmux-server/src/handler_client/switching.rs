@@ -1025,6 +1025,7 @@ impl RequestHandler {
                         attach_pid,
                         attach_id,
                         AttachedSwitchCommitRequest {
+                            expected_current_session_id: None,
                             session_name: session_name.clone(),
                             session_id,
                             target_selection,

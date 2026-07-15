@@ -540,11 +540,12 @@ pub(in crate::handler) fn effective_client_terminal_context(
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "sync");
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "bpaste");
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "mouse");
-        // Clipboard (OSC 52): Windows Terminal handles it natively and any other
-        // VT outer ignores it, so advertise it for every Windows attach. Without
-        // an Ms template the daemon cannot forward a pane's OSC 52 to the outer
-        // under `set-clipboard on` (issue #91); the on-only relay gate keeps the
-        // `external` default from letting untrusted output drive the clipboard.
+        // Clipboard (OSC 52): advertise it for every Windows attach so an Ms
+        // template exists and the daemon can emit pane writes under
+        // `set-clipboard on` (issue #91). System clipboard delivery remains
+        // host-dependent because older ConPTY paths may consume the sequence and
+        // an outer may ignore it. The on-only gate keeps the `external` default
+        // from letting untrusted output drive the clipboard.
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "clipboard");
     }
     if client_environment_is_windows_terminal(client_environment) {

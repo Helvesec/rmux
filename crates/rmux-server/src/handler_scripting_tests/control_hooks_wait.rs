@@ -292,6 +292,23 @@ async fn hook_string_mode_newlines_share_one_abort_group() {
 }
 
 #[tokio::test]
+async fn compact_short_options_execute_through_builtin_alias_in_hook() {
+    let handler = RequestHandler::new();
+
+    let result = with_hook_execution(Vec::new(), async {
+        handler
+            .execute_hook_command(std::process::id(), "server-info")
+            .await
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "builtin compact alias should execute: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn wait_for_signal_wakes_current_waiters_and_latches_one_future_wait() {
     let handler = Arc::new(RequestHandler::new());
     let first_waiter = {

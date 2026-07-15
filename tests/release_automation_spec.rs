@@ -344,6 +344,26 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
     assert!(release.contains("release_args+=(--prerelease)"));
     assert!(release.contains("--verify-tag"));
     assert!(release.contains("--target \"$SOURCE_GIT_SHA\""));
+    assert!(release.contains(
+        "group: release-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}"
+    ));
+    assert!(release.contains("cancel-in-progress: false"));
+    let release_asset_step = release
+        .split("- name: Create or update release")
+        .nth(1)
+        .expect("release asset upload step")
+        .split("- name: Deploy Linux package repositories")
+        .next()
+        .expect("bounded release asset upload step");
+    assert_eq!(release_asset_step.matches("--json isDraft").count(), 2);
+    let final_draft_guard = release_asset_step
+        .rfind("--json isDraft")
+        .expect("final draft guard");
+    let asset_upload = release_asset_step
+        .find("gh release upload")
+        .expect("GitHub release asset upload");
+    assert!(final_draft_guard < asset_upload);
+    assert!(release_asset_step.contains("Refusing to replace assets on published release $tag"));
     assert!(
         release.matches("scripts/verify-release-ref.sh").count() >= 6,
         "release ref must be revalidated before and after mutable publication boundaries"

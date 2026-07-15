@@ -1,9 +1,7 @@
 use rmux_proto::request::Request;
-#[cfg(all(any(unix, windows), feature = "web"))]
-use rmux_proto::CAPABILITY_WEB_SHARE;
 use rmux_proto::{
-    ControlModeResponse, ErrorResponse, HandshakeResponse, Response, RmuxError,
-    SUPPORTED_CAPABILITIES,
+    capabilities_for_features, ControlModeResponse, ErrorResponse, HandshakeResponse, Response,
+    RmuxError,
 };
 #[cfg(test)]
 use tokio::sync::broadcast;
@@ -770,16 +768,7 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
 }
 
 fn supported_capabilities() -> Vec<&'static str> {
-    #[cfg(all(any(unix, windows), feature = "web"))]
-    {
-        let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        capabilities.push(CAPABILITY_WEB_SHARE);
-        capabilities
-    }
-    #[cfg(not(all(any(unix, windows), feature = "web")))]
-    {
-        SUPPORTED_CAPABILITIES.to_vec()
-    }
+    capabilities_for_features(cfg!(all(any(unix, windows), feature = "web")))
 }
 
 #[cfg(all(test, windows))]

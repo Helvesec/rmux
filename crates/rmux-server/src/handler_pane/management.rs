@@ -4,7 +4,7 @@ use rmux_proto::{
 };
 
 use super::super::{
-    client_environment_snapshot, client_spawn_environment,
+    attach_support::SessionDetachOnDestroy, client_environment_snapshot, client_spawn_environment,
     scripting_support::render_start_directory_template, RequestHandler,
 };
 use crate::hook_runtime::PendingInlineHookFormat;
@@ -237,11 +237,13 @@ impl RequestHandler {
             lifecycle_events,
             affected_sessions,
             destroyed_sessions,
+            destroyed_attached_sessions,
             removed_subscription_keys,
             removed_pane_ids,
             after_hook_target,
         ) = {
             let mut state = self.state.lock().await;
+            let detach_on_destroy = SessionDetachOnDestroy::capture_all(&state);
             let hook_batch =
                 KillPaneLifecycleBatch::capture(&state, &request.target, request.kill_all_except);
             let removed_subscription_keys = state
@@ -259,6 +261,16 @@ impl RequestHandler {
                     let mut affected_sessions = result.affected_sessions.clone();
                     state.expand_with_active_window_linked_session_families(&mut affected_sessions);
                     let destroyed_sessions = result.destroyed_sessions.clone();
+                    let destroyed_attached_sessions = destroyed_sessions
+                        .iter()
+                        .filter_map(|(session_name, session_id)| {
+                            let session_id = SessionId::new(*session_id);
+                            detach_on_destroy
+                                .get(&session_id)
+                                .copied()
+                                .map(|policy| (session_name.clone(), session_id, policy))
+                        })
+                        .collect::<Vec<_>>();
                     let lifecycle_events =
                         hook_batch.prepare_committed(&mut state, &destroyed_sessions);
                     let after_hook_target =
@@ -277,6 +289,7 @@ impl RequestHandler {
                         lifecycle_events,
                         affected_sessions,
                         destroyed_sessions,
+                        destroyed_attached_sessions,
                         removed_subscription_keys,
                         result.removed_pane_ids,
                         after_hook_target,
@@ -284,6 +297,7 @@ impl RequestHandler {
                 }
                 Err(error) => (
                     Response::Error(ErrorResponse { error }),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -319,6 +333,15 @@ impl RequestHandler {
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
         }
+        let mut prepared_attached_switches = std::collections::HashMap::new();
+        if matches!(response, Response::KillPane(_)) {
+            for (session_name, session_id, detach_on_destroy) in &destroyed_attached_sessions {
+                let prepared = self
+                    .rehome_control_session_identity(session_name, *session_id, *detach_on_destroy)
+                    .await;
+                prepared_attached_switches.insert(*session_id, prepared);
+            }
+        }
         for event in lifecycle_events {
             self.emit_prepared(event).await;
         }
@@ -336,16 +359,19 @@ impl RequestHandler {
                 })
                 .collect::<Vec<_>>();
             self.remove_session_leases(&destroyed_identities);
-            for affected_session in &affected_sessions {
-                if let Some((_, session_id)) = destroyed_identities
-                    .iter()
-                    .find(|(session_name, _)| session_name == affected_session)
-                {
-                    self.exit_attached_session_identity(affected_session, *session_id)
-                        .await;
-                    self.cancel_session_silence_timers(affected_session).await;
-                    self.refresh_control_session(affected_session).await;
+            for (session_name, session_id, detach_on_destroy) in destroyed_attached_sessions {
+                if let Some(prepared) = prepared_attached_switches.remove(&session_id) {
+                    self.exit_prepared_attached_session_identity(prepared).await;
+                } else {
+                    self.exit_attached_session_identity(
+                        &session_name,
+                        session_id,
+                        detach_on_destroy,
+                    )
+                    .await;
                 }
+                self.cancel_session_silence_timers(&session_name).await;
+                self.refresh_control_session(&session_name).await;
             }
             for affected_session in affected_sessions {
                 if destroyed_names.contains(&affected_session) {

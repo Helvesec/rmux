@@ -19,6 +19,9 @@ mod action;
 mod console_coordination;
 #[path = "attach_windows/console_input_read.rs"]
 mod console_input_read;
+#[cfg(test)]
+#[path = "attach_windows/console_mode_ownership_tests.rs"]
+mod console_mode_ownership_tests;
 #[path = "attach_windows/input.rs"]
 mod input;
 #[path = "attach_windows/metrics.rs"]
@@ -72,11 +75,13 @@ pub fn attach_terminal_with_initial_bytes_and_windows_console_key(
     windows_console_key_enabled: bool,
 ) -> std::result::Result<(), ClientError> {
     let input = io::stdin();
-    let output = output::AttachStdout::new(io::stdout());
+    let raw_terminal = RawTerminal::enter().map_err(ClientError::from)?;
+    let output = output::AttachStdout::for_managed_terminal(io::stdout());
 
-    attach_with_stdio(
+    attach_with_stdio_and_raw_terminal(
         stream,
         initial_bytes,
+        raw_terminal,
         input,
         output,
         windows_console_key_enabled,
@@ -112,6 +117,28 @@ where
     Output: Write + Send + 'static,
 {
     let raw_terminal = RawTerminal::enter().map_err(ClientError::from)?;
+    attach_with_stdio_and_raw_terminal(
+        stream,
+        initial_bytes,
+        raw_terminal,
+        input,
+        output,
+        windows_console_key_enabled,
+    )
+}
+
+fn attach_with_stdio_and_raw_terminal<Input, Output>(
+    stream: BlockingLocalStream,
+    initial_bytes: Vec<u8>,
+    raw_terminal: RawTerminal,
+    input: Input,
+    output: Output,
+    windows_console_key_enabled: bool,
+) -> std::result::Result<(), ClientError>
+where
+    Input: Read + AsRawHandle + Send + 'static,
+    Output: Write + Send + 'static,
+{
     let _ = raw_terminal.flush_pending_input();
     let screen_tracker = AttachScreenTracker::default();
     drive_attach_stream_with_terminal_state(

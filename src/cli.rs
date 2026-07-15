@@ -105,7 +105,10 @@ use shell_startup::run_shell_startup;
 use shell_startup::{same_file_identity_for_paths, usable_shell_path};
 #[cfg(test)]
 use startup::ServerStartupConfig;
-use startup::{run_foreground_server, startup_config_from_cli, StartupOptions};
+use startup::{
+    run_foreground_server, startup_config_from_cli, startup_config_from_top_level_scan,
+    StartupOptions,
+};
 use target_resolution::{
     list_session_names, resolve_current_pane_target, resolve_current_session_target,
     resolve_existing_window_target_or_current, resolve_pane_target_or_current,
@@ -168,6 +171,7 @@ where
         return Ok(*exit_code);
     }
     let parsed_cli = parse_with_runtime_resolution(&args, runtime_resolution.as_ref());
+    let mut startup_connection = None;
     let mut cli = match parsed_cli {
         Ok(cli) => cli,
         Err(error) if runtime_resolution.is_some() => {
@@ -177,6 +181,18 @@ where
                 return Err(control_mode_parse_failure(error, control_mode));
             }
             return Err(ExitFailure::from_clap(error));
+        }
+        Err(error) if error.kind() == clap::error::ErrorKind::InvalidSubcommand => {
+            match parse_cold_alias_queue_after_startup(&args, error)? {
+                ColdAliasParseOutcome::NotApplicable(error) => {
+                    return parse_failure_or_absent_server(&args, error);
+                }
+                ColdAliasParseOutcome::Parsed(cold_cli, connection) => {
+                    startup_connection = Some(connection);
+                    *cold_cli
+                }
+                ColdAliasParseOutcome::Dispatched(exit_code) => return Ok(exit_code),
+            }
         }
         Err(error) => return parse_failure_or_absent_server(&args, error),
     };
@@ -201,8 +217,8 @@ where
     // definitions from `-f`. Resolve the original argv only after that config
     // is ready, while retaining the startup connection so the empty daemon
     // cannot exit between alias resolution and typed dispatch.
-    let mut startup_connection = None;
-    if runtime_resolution.is_none()
+    if startup_connection.is_none()
+        && runtime_resolution.is_none()
         && cli.control_mode == 0
         && !cli.no_fork
         && !cli.no_start_server
@@ -265,6 +281,65 @@ where
         .map_err(|error| error.with_socket_context(&socket_path));
     drop(startup_connection);
     result
+}
+
+enum ColdAliasParseOutcome {
+    NotApplicable(clap::Error),
+    Parsed(Box<Cli>, Connection),
+    Dispatched(i32),
+}
+
+fn parse_cold_alias_queue_after_startup(
+    args: &[OsString],
+    original_error: clap::Error,
+) -> Result<ColdAliasParseOutcome, ExitFailure> {
+    let Ok(scan) = scan_top_level_command(args.get(1..).unwrap_or(&[])) else {
+        return Ok(ColdAliasParseOutcome::NotApplicable(original_error));
+    };
+    if scan.control_mode != 0
+        || scan.no_fork
+        || scan.no_start_server
+        || scan.shell_command.is_some()
+    {
+        return Ok(ColdAliasParseOutcome::NotApplicable(original_error));
+    }
+    let Some(first_command) = alias_fallback::first_cold_start_command(args) else {
+        return Ok(ColdAliasParseOutcome::NotApplicable(original_error));
+    };
+    if !command_has_start_server_flag(&first_command) {
+        return Ok(ColdAliasParseOutcome::NotApplicable(original_error));
+    }
+
+    let socket_path = if invoked_as_tmux(args) {
+        resolve_tmux_compatible_socket_path(
+            scan.socket_name.as_deref(),
+            scan.socket_path.as_deref().map(Path::new),
+        )
+    } else {
+        resolve_socket_path(
+            scan.socket_name.as_deref(),
+            scan.socket_path.as_deref().map(Path::new),
+        )
+    }
+    .map_err(ExitFailure::from_client)?;
+    let startup_config = startup_config_from_top_level_scan(&scan, &first_command);
+    let mut connection = ensure_server_running_with_config(&socket_path, startup_config.auto_start)
+        .map_err(ExitFailure::from_auto_start)
+        .map_err(|error| error.with_socket_context(&socket_path))?;
+    let resolution = alias_fallback::runtime_command_resolution_after_startup(
+        args,
+        &socket_path,
+        &mut connection,
+    )?;
+    let Some(resolution) = resolution else {
+        return Err(ExitFailure::from_clap(original_error));
+    };
+    if let alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(exit_code) = resolution {
+        return Ok(ColdAliasParseOutcome::Dispatched(exit_code));
+    }
+    let cli =
+        parse_with_runtime_resolution(args, Some(&resolution)).map_err(ExitFailure::from_clap)?;
+    Ok(ColdAliasParseOutcome::Parsed(Box::new(cli), connection))
 }
 
 fn parse_with_runtime_resolution(

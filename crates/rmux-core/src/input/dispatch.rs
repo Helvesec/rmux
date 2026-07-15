@@ -11,6 +11,8 @@ use super::sgr;
 use super::tables;
 use super::{InputEndType, InputParser, OscColourSlot, INPUT_LAST};
 
+const XTVERSION_REPLY: &str = concat!("\x1bP>|rmux ", env!("CARGO_PKG_VERSION"), "\x1b\\");
+
 // ─── C0 dispatch ───────────────────────────────────────────────────
 
 pub(crate) fn dispatch_c0<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
@@ -454,9 +456,7 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         CsiCommand::Xda => {
             let n = parser.param_list.get(0, 0, 0);
             if n == 0 {
-                let version = env!("CARGO_PKG_VERSION");
-                let reply = format!("\x1bP>|tmux {version}\x1b\\");
-                parser.reply(&reply);
+                parser.reply(XTVERSION_REPLY);
             }
         }
         CsiCommand::Winops => dispatch_winops(parser, writer),

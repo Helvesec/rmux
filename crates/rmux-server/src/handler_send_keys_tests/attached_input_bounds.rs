@@ -37,19 +37,22 @@ async fn create_attached_live_session(
 }
 
 #[tokio::test]
-async fn live_attach_unterminated_bracketed_paste_is_bounded_without_pane_leak() {
+async fn live_attach_over_limit_bracketed_paste_streams_without_disconnect() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
     let _control_rx = create_attached_live_session(&handler, &alpha, requester_pid).await;
 
-    #[cfg(windows)]
-    let capture_target = {
-        let target = PaneTarget::new(alpha.clone(), 0);
-        let state = handler.state.lock().await;
-        state.start_pane_input_capture_for_test(&target);
-        target
-    };
+    let body = vec![b'a'; DEFAULT_MAX_FRAME_LENGTH + 64];
+    let mut expected = body.clone();
+    expected.push(b'!');
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "over-limit-bracketed-paste",
+        expected.len(),
+    )
+    .await;
 
     let mut pending_input = Vec::new();
     handler
@@ -58,23 +61,27 @@ async fn live_attach_unterminated_bracketed_paste_is_bounded_without_pane_leak()
         .expect("bracketed paste start is retained");
     assert_eq!(pending_input, b"\x1b[200~");
 
-    let overflow = vec![b'a'; DEFAULT_MAX_FRAME_LENGTH - pending_input.len() + 1];
-    let err = handler
-        .handle_attached_live_input(requester_pid, &mut pending_input, &overflow)
+    let first_body_len = DEFAULT_MAX_FRAME_LENGTH - pending_input.len() + 1;
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, &body[..first_body_len])
         .await
-        .expect_err("unterminated bracketed paste should be bounded");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    assert!(err.to_string().contains("live bracketed paste"));
-    assert!(pending_input.is_empty());
+        .expect("over-limit paste segment is forwarded without killing attach");
+    assert_eq!(pending_input, b"\x1b[200~");
 
-    #[cfg(windows)]
-    {
-        let state = handler.state.lock().await;
-        assert_eq!(
-            state.pane_input_capture_for_test(&capture_target),
-            Some(Vec::new())
-        );
-    }
+    let mut final_chunk = body[first_body_len..].to_vec();
+    final_chunk.extend_from_slice(b"\x1b[201~");
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, &final_chunk)
+        .await
+        .expect("closing paste segment completes");
+    assert!(pending_input.is_empty());
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"!")
+        .await
+        .expect("ordinary input continues after the large paste");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
 }
 
 #[tokio::test]

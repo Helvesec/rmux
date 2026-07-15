@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use rmux_proto::{
-    MoveWindowRequest, MoveWindowResponse, MoveWindowTarget, OptionName, RmuxError,
-    RotateWindowDirection, RotateWindowResponse, SessionName, SwapWindowResponse, WindowTarget,
+    MoveWindowRequest, MoveWindowResponse, MoveWindowTarget, RmuxError, RotateWindowDirection,
+    RotateWindowResponse, SessionName, SwapWindowResponse, WindowTarget,
 };
 
 use super::{
@@ -132,16 +132,15 @@ impl HandlerState {
         )
     }
 
-    fn first_available_window_index(&self, session_name: &SessionName) -> Result<u32, RmuxError> {
+    pub(in crate::pane_terminals) fn first_available_window_index(
+        &self,
+        session_name: &SessionName,
+    ) -> Result<u32, RmuxError> {
         let session = self
             .sessions
             .session(session_name)
             .ok_or_else(|| session_not_found(session_name))?;
-        let base_index = self
-            .options
-            .resolve(Some(session_name), OptionName::BaseIndex)
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
+        let base_index = self.session_base_index(session_name);
         let mut index = base_index;
         loop {
             if session.window_at(index).is_none() {

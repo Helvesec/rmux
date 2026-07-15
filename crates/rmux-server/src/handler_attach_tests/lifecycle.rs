@@ -198,6 +198,49 @@ async fn attached_exit_on_last_pane_closes_the_session_and_client() {
     wait_for_session_removed(&handler, &alpha).await;
 }
 
+#[tokio::test]
+async fn attached_last_pane_exit_honors_detach_on_destroy_off() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let beta = session_name("pane-exit-destroy-beta");
+    let alpha = session_name("pane-exit-destroy-alpha");
+    create_quiet_session(&handler, &beta).await;
+    let mut control_rx = create_exit_attached_session(&handler, requester_pid, &alpha).await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::DetachOnDestroy,
+            value: "off".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    prepare_exit_prompt(&handler, &target).await;
+    drain_attach_controls(&mut control_rx);
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, ATTACHED_EXIT_INPUT)
+        .await
+        .expect("attached exit input");
+
+    let switched = recv_matching_attach_control(
+        &mut control_rx,
+        "last-pane detach-on-destroy switch",
+        |control| matches!(control, AttachControl::Switch(_)),
+    )
+    .await;
+    assert_eq!(take_switch_target(switched).session_name, beta);
+    wait_for_session_removed(&handler, &alpha).await;
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .expect("pane-exit switch preserves attached client");
+    assert_eq!(active.session_name, beta);
+    assert!(!active.closing.load(Ordering::SeqCst));
+}
+
 #[cfg(any(unix, windows))]
 async fn create_exit_attached_session(
     handler: &RequestHandler,

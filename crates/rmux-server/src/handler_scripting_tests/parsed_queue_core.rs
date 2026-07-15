@@ -294,6 +294,71 @@ async fn read_only_control_allows_list_panes_all_observation() {
 }
 
 #[tokio::test]
+async fn compact_short_options_execute_in_control_queue() {
+    let handler = RequestHandler::new();
+    let requester_pid = 42_005;
+    let _control_events = register_control_client(&handler, requester_pid, true).await;
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name("alpha"),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let commands = handler
+        .parse_control_commands("run-shell -Ctalpha:0.0 'set-buffer -b compact-control ok'")
+        .await
+        .expect("control command parses");
+    let result = handler
+        .execute_control_commands(requester_pid, commands)
+        .await;
+
+    assert_eq!(result.error, None, "compact control command should execute");
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("compact-control".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("compact control buffer")
+            .stdout(),
+        b"ok"
+    );
+}
+
+#[tokio::test]
+async fn compact_short_options_execute_in_detached_queue() {
+    let handler = RequestHandler::new();
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name("alpha"),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let commands = CommandParser::new()
+        .parse("capture-pane -epJtalpha:0.0")
+        .expect("detached queue command parses");
+
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), commands)
+        .await
+        .expect("compact detached queue command should execute");
+
+    assert!(!output.stdout().is_empty());
+}
+
+#[tokio::test]
 async fn parsed_queue_lock_client_defaults_to_current_client() {
     let handler = RequestHandler::new();
     let alpha = SessionName::new("alpha").expect("valid session name");

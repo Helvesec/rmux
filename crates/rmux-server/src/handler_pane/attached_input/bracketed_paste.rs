@@ -1,6 +1,33 @@
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
+/// Takes a bounded body segment from an incomplete bracketed paste while
+/// retaining the opener and any possible split closing delimiter. The caller
+/// can forward the returned bytes through the paste path and continue parsing
+/// later chunks without retaining an unbounded clipboard payload.
+pub(super) fn take_incomplete_bracketed_paste_segment(
+    input: &mut Vec<u8>,
+    maximum: usize,
+) -> Option<Vec<u8>> {
+    if input.len() <= maximum || !input.starts_with(BRACKETED_PASTE_START) {
+        return None;
+    }
+
+    let delimiter_tail = longest_proper_suffix(input, BRACKETED_PASTE_END).unwrap_or(0);
+    let utf8_tail = incomplete_utf8_suffix_len(input);
+    let tail_len = delimiter_tail.max(utf8_tail);
+    let body_end = input.len().saturating_sub(tail_len);
+    if body_end <= BRACKETED_PASTE_START.len() {
+        return None;
+    }
+
+    let body = input[BRACKETED_PASTE_START.len()..body_end].to_vec();
+    let tail = input[body_end..].to_vec();
+    input.truncate(BRACKETED_PASTE_START.len());
+    input.extend_from_slice(&tail);
+    Some(body)
+}
+
 pub(super) fn encode_bracketed_paste_for_mode(body: &[u8], bracketed: bool) -> Vec<u8> {
     if !bracketed {
         return body.to_vec();
@@ -164,6 +191,40 @@ fn longest_partial_marker_suffix(input: &[u8]) -> Option<usize> {
     longest
 }
 
+fn longest_proper_suffix(input: &[u8], marker: &[u8]) -> Option<usize> {
+    (1..marker.len())
+        .rev()
+        .find(|&prefix_len| input.ends_with(&marker[..prefix_len]))
+}
+
+fn incomplete_utf8_suffix_len(input: &[u8]) -> usize {
+    let mut continuation_len = 0_usize;
+    for &byte in input.iter().rev().take(3) {
+        if byte & 0b1100_0000 == 0b1000_0000 {
+            continuation_len += 1;
+        } else {
+            break;
+        }
+    }
+
+    let lead_at = input.len().saturating_sub(continuation_len + 1);
+    let Some(&lead) = input.get(lead_at) else {
+        return 0;
+    };
+    let expected = match lead {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return 0,
+    };
+    let present = continuation_len + 1;
+    if present < expected {
+        present
+    } else {
+        0
+    }
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -176,8 +237,8 @@ mod tests {
         decode_bracketed_paste, decode_bracketed_paste_after_append,
         encode_bracketed_paste_for_mode, neutralize_timed_out_bracketed_paste,
         strip_bracketed_paste_markers, strip_bracketed_paste_markers_after_append,
-        strip_bracketed_paste_markers_after_append_inner, BracketedPasteDecode,
-        BRACKETED_PASTE_START,
+        strip_bracketed_paste_markers_after_append_inner, take_incomplete_bracketed_paste_segment,
+        BracketedPasteDecode, BRACKETED_PASTE_START,
     };
 
     #[test]
@@ -212,6 +273,28 @@ mod tests {
             decode_bracketed_paste(b"\x1b["),
             BracketedPasteDecode::NotPaste
         );
+    }
+
+    #[test]
+    fn overflowing_incomplete_paste_keeps_only_opener_and_split_close() {
+        let mut input = b"\x1b[200~body-body\x1b[20".to_vec();
+
+        let body = take_incomplete_bracketed_paste_segment(&mut input, 8)
+            .expect("over-limit incomplete paste yields a bounded segment");
+
+        assert_eq!(body, b"body-body");
+        assert_eq!(input, b"\x1b[200~\x1b[20");
+    }
+
+    #[test]
+    fn overflowing_incomplete_paste_never_splits_a_utf8_scalar() {
+        let mut input = b"\x1b[200~body\xe2\x82".to_vec();
+
+        let body = take_incomplete_bracketed_paste_segment(&mut input, 8)
+            .expect("over-limit incomplete paste yields a bounded segment");
+
+        assert_eq!(body, b"body");
+        assert_eq!(input, b"\x1b[200~\xe2\x82");
     }
 
     #[test]

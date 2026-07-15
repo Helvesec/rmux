@@ -432,11 +432,7 @@ impl RequestHandler {
         };
 
         let resolved_path = resolve_buffer_path(&request.path, request.cwd.as_deref());
-        let save_result = if request.append {
-            append_buffer_to_path(&resolved_path, &content)
-        } else {
-            save_buffer_to_path(&resolved_path, &content)
-        };
+        let save_result = write_buffer_file(resolved_path, content, request.append).await;
         match save_result {
             Ok(()) => Response::SaveBuffer(SaveBufferResponse { buffer_name }),
             Err(error) => Response::Error(ErrorResponse {
@@ -632,6 +628,18 @@ async fn read_buffer_file(path: PathBuf) -> io::Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || fs::read(path))
         .await
         .map_err(|error| io::Error::other(format!("buffer file reader failed: {error}")))?
+}
+
+async fn write_buffer_file(path: PathBuf, content: Vec<u8>, append: bool) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        if append {
+            append_buffer_to_path(&path, &content)
+        } else {
+            save_buffer_to_path(&path, &content)
+        }
+    })
+    .await
+    .map_err(|error| io::Error::other(format!("buffer file writer failed: {error}")))?
 }
 
 fn resolve_buffer_path(path: &str, cwd: Option<&Path>) -> PathBuf {

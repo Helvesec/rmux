@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::OnceLock;
 
 use crate::command_parser::{CommandEntry, COMMAND_TABLE};
 use crate::formats::{render_template, FormatContext};
@@ -10,6 +11,133 @@ use crate::formats::{render_template, FormatContext};
 mod signatures;
 
 use signatures::LIST_COMMAND_SIGNATURES;
+
+/// Typed short-option metadata derived from the public command signature.
+///
+/// This keeps non-Clap command paths on the same option boundary rules as the
+/// command inventory instead of maintaining a second per-command flag table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandShortOptionSpec {
+    boolean_flags: String,
+    value_flags: String,
+}
+
+impl CommandShortOptionSpec {
+    fn from_usage(usage: &str) -> Self {
+        let mut spec = Self::default();
+        let mut remaining = usage;
+
+        while let Some(group_start) = remaining.find('[') {
+            let after_start = &remaining[group_start + 1..];
+            let Some(group_end) = after_start.find(']') else {
+                break;
+            };
+            spec.add_usage_group(&after_start[..group_end]);
+            remaining = &after_start[group_end + 1..];
+        }
+
+        spec
+    }
+
+    /// Returns whether `flag` is a boolean short option for the command.
+    #[must_use]
+    pub fn is_boolean(&self, flag: char) -> bool {
+        self.boolean_flags.contains(flag)
+    }
+
+    /// Returns whether `flag` consumes a value for the command.
+    #[must_use]
+    pub fn takes_value(&self, flag: char) -> bool {
+        self.value_flags.contains(flag)
+    }
+
+    fn add_boolean(&mut self, flag: char) {
+        if flag.is_ascii() && !self.value_flags.contains(flag) && !self.boolean_flags.contains(flag)
+        {
+            self.boolean_flags.push(flag);
+        }
+    }
+
+    fn add_value(&mut self, flag: char) {
+        if flag.is_ascii() && !self.value_flags.contains(flag) {
+            // tmux 3.7b advertises split-window's -e in both the compact
+            // boolean group and the explicit `-e environment` group.  The
+            // value-taking spelling is the only safe boundary for compact
+            // normalization, so an explicit value group wins.
+            self.boolean_flags.retain(|candidate| candidate != flag);
+            self.value_flags.push(flag);
+        }
+    }
+
+    fn add_usage_group(&mut self, group: &str) {
+        let group = group.trim();
+        if !group.starts_with('-') || group.starts_with("--") {
+            return;
+        }
+
+        let alternatives = group.split('|').collect::<Vec<_>>();
+        if alternatives.len() > 1
+            && alternatives
+                .iter()
+                .all(|alternative| single_short_flag(alternative.trim()).is_some())
+        {
+            for alternative in alternatives {
+                self.add_boolean(
+                    single_short_flag(alternative.trim())
+                        .expect("validated short-option alternative"),
+                );
+            }
+            return;
+        }
+
+        let mut words = group.split_ascii_whitespace();
+        let Some(option) = words.next() else {
+            return;
+        };
+        let Some(flags) = option.strip_prefix('-') else {
+            return;
+        };
+        if flags.is_empty() || flags.starts_with('-') {
+            return;
+        }
+
+        if words.next().is_some() {
+            if let Some(flag) = single_short_flag(option) {
+                self.add_value(flag);
+            }
+            return;
+        }
+
+        for flag in flags.chars() {
+            self.add_boolean(flag);
+        }
+    }
+}
+
+/// Returns typed short-option metadata for a public command.
+///
+/// Metadata is derived from the same frozen signature rendered by
+/// `list-commands`, including adjacent option groups and tmux's `-L|-S|-U`
+/// spelling for mutually exclusive boolean flags.
+#[must_use]
+pub fn command_short_option_spec(command_name: &str) -> Option<&'static CommandShortOptionSpec> {
+    static SPECS: OnceLock<Vec<(&'static str, CommandShortOptionSpec)>> = OnceLock::new();
+    SPECS
+        .get_or_init(|| {
+            LIST_COMMAND_SIGNATURES
+                .iter()
+                .map(|(name, usage)| (*name, CommandShortOptionSpec::from_usage(usage)))
+                .collect()
+        })
+        .iter()
+        .find_map(|(name, spec)| (*name == command_name).then_some(spec))
+}
+
+fn single_short_flag(option: &str) -> Option<char> {
+    let mut flags = option.strip_prefix('-')?.chars();
+    let flag = flags.next()?;
+    (flags.next().is_none() && flag.is_ascii()).then_some(flag)
+}
 
 /// Exact-only RMUX command extensions shared by client parsing and internal
 /// server canonicalization. They never participate in tmux prefix matching.
@@ -248,6 +376,54 @@ mod tests {
                 .map(|entry| entry.name)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn short_option_specs_derive_boolean_and_value_boundaries_from_inventory() {
+        let capture = command_short_option_spec("capture-pane").expect("capture-pane signature");
+        for flag in ['a', 'e', 'J', 'p', 'q'] {
+            assert!(capture.is_boolean(flag), "capture-pane -{flag}");
+        }
+        for flag in ['b', 'E', 'S', 't'] {
+            assert!(capture.takes_value(flag), "capture-pane -{flag}");
+        }
+
+        let run_shell = command_short_option_spec("run-shell").expect("run-shell signature");
+        for flag in ['b', 'C', 'E'] {
+            assert!(run_shell.is_boolean(flag), "run-shell -{flag}");
+        }
+        for flag in ['c', 'd', 't'] {
+            assert!(run_shell.takes_value(flag), "run-shell -{flag}");
+        }
+
+        let wait_for = command_short_option_spec("wait-for").expect("wait-for signature");
+        for flag in ['L', 'S', 'U'] {
+            assert!(wait_for.is_boolean(flag), "wait-for -{flag}");
+        }
+
+        let list_clients =
+            command_short_option_spec("list-clients").expect("list-clients signature");
+        assert!(list_clients.takes_value('O'));
+        assert!(list_clients.takes_value('t'));
+
+        let split_window =
+            command_short_option_spec("split-window").expect("split-window signature");
+        assert!(split_window.takes_value('e'));
+        assert!(!split_window.is_boolean('e'));
+        assert!(command_short_option_spec("not-a-command").is_none());
+    }
+
+    #[test]
+    fn short_option_inventory_has_unambiguous_value_boundaries() {
+        for (command_name, _) in LIST_COMMAND_SIGNATURES {
+            let spec = command_short_option_spec(command_name).expect("inventory command spec");
+            for flag in spec.boolean_flags.chars() {
+                assert!(
+                    !spec.value_flags.contains(flag),
+                    "{command_name} -{flag} is advertised as both boolean and value-taking"
+                );
+            }
+        }
     }
 
     #[test]

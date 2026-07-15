@@ -1565,6 +1565,82 @@ async fn choose_tree_identity_guard_fixture(
 }
 
 #[tokio::test]
+async fn choose_tree_session_switch_resizes_the_target_for_the_attached_client() {
+    let handler = RequestHandler::new();
+    let host = SessionName::new("choose-tree-resize-host").expect("valid session");
+    let target = SessionName::new("choose-tree-resize-target").expect("valid session");
+    create_mode_tree_test_session(&handler, &host).await;
+    create_mode_tree_test_session(&handler, &target).await;
+    let target_session_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&target)
+        .expect("target session exists")
+        .id();
+
+    let attach_pid = std::process::id().saturating_add(654);
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let attach_id = handler
+        .register_attach(attach_pid, host.clone(), control_tx)
+        .await;
+    let client_size = TerminalSize {
+        cols: 120,
+        rows: 40,
+    };
+    handler
+        .handle_attached_resize(attach_pid, client_size)
+        .await
+        .expect("attached client resize succeeds");
+    while control_rx.try_recv().is_ok() {}
+
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree", "-s"])
+        .expect("choose-tree parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            attach_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("choose-tree opens");
+    let action_identity = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("choose-tree host remains attached");
+        assert_eq!(active.id, attach_id);
+        ModeTreeActionIdentity::new(attach_pid, active.id, active.mode_tree_state_id)
+    };
+
+    handler
+        .apply_choose_tree_default_target(
+            action_identity,
+            ChooseTreeTarget {
+                session_name: target.clone(),
+                session_id: target_session_id,
+                window_index: None,
+                window_id: None,
+                window_occurrence_id: None,
+                pane_index: None,
+                pane_id: None,
+            },
+        )
+        .await
+        .expect("choose-tree switches sessions");
+
+    let state = handler.state.lock().await;
+    let target_session = state.sessions.session(&target).expect("target survives");
+    assert_eq!(target_session.window().size(), client_size);
+}
+
+#[tokio::test]
 async fn choose_tree_stale_mode_tree_generation_cannot_select_or_dismiss() {
     let (handler, attach_pid, stale_identity, target, mut control_rx) =
         choose_tree_identity_guard_fixture("choose-tree-stale-host-state", 652).await;
@@ -1676,7 +1752,7 @@ async fn choose_tree_closing_host_cannot_select_or_dismiss() {
 }
 
 #[tokio::test]
-async fn choose_tree_default_switch_rejects_a_reconnected_host_at_the_send_lock() {
+async fn choose_tree_default_switch_rejects_a_reconnected_host_at_the_commit_lock() {
     let handler = RequestHandler::new();
     let host = SessionName::new("choose-tree-host-generation-alpha").expect("valid session");
     let target = SessionName::new("choose-tree-host-generation-beta").expect("valid session");
@@ -1720,8 +1796,7 @@ async fn choose_tree_default_switch_rejects_a_reconnected_host_at_the_send_lock(
         ModeTreeActionIdentity::new(attach_pid, active.id, active.mode_tree_state_id)
     };
 
-    let pause =
-        super::super::super::attach_support::install_attach_control_identity_pause(attach_pid);
+    let pause = handler.install_attached_size_selection_pause();
     let switch_handler = handler.clone();
     let switch_target = target.clone();
     let switch = tokio::spawn(async move {

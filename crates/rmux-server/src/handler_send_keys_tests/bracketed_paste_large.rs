@@ -89,6 +89,62 @@ async fn live_attach_one_mebibyte_bracketed_paste_has_bounded_work() {
     capture.assert_contents(&handler, &body).await;
 }
 
+#[tokio::test]
+async fn live_attach_over_limit_bracketed_mode_uses_bounded_envelopes_product_divergence() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("over-limit-bracketed-mode");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?2004h")
+            .expect("pane enables bracketed paste mode");
+    }
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let body = vec![b'p'; DEFAULT_MAX_FRAME_LENGTH + 64];
+    let first_body_len = DEFAULT_MAX_FRAME_LENGTH - b"\x1b[200~".len() + 1;
+    let mut expected = Vec::with_capacity(body.len() + 24);
+    expected.extend_from_slice(b"\x1b[200~");
+    expected.extend_from_slice(&body[..first_body_len]);
+    expected.extend_from_slice(b"\x1b[201~");
+    expected.extend_from_slice(b"\x1b[200~");
+    expected.extend_from_slice(&body[first_body_len..]);
+    expected.extend_from_slice(b"\x1b[201~");
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "over-limit-bracketed-mode",
+        expected.len(),
+    )
+    .await;
+
+    let mut pending_input = Vec::new();
+    let mut first = b"\x1b[200~".to_vec();
+    first.extend_from_slice(&body[..first_body_len]);
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, &first)
+        .await
+        .expect("first bounded envelope forwards");
+    assert_eq!(pending_input, b"\x1b[200~");
+
+    let mut final_chunk = body[first_body_len..].to_vec();
+    final_chunk.extend_from_slice(b"\x1b[201~");
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, &final_chunk)
+        .await
+        .expect("final bounded envelope forwards");
+    assert!(pending_input.is_empty());
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
+}
+
 fn bracketed_paste_body(bytes: &[u8]) -> &[u8] {
     &bytes[b"\x1b[200~".len()..bytes.len() - b"\x1b[201~".len()]
 }

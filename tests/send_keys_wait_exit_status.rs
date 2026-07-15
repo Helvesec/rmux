@@ -3,6 +3,8 @@
 mod common;
 
 use std::error::Error;
+use std::process::Stdio;
+use std::time::Duration;
 
 use common::{assert_success, stderr, stdout, CliHarness};
 use serde_json::Value;
@@ -138,6 +140,119 @@ fn send_keys_wait_pane_exit_preserves_process_outcomes() -> Result<(), Box<dyn E
         stderr(&timed_out)
     );
 
+    Ok(())
+}
+
+#[test]
+fn send_keys_pane_exit_wait_follows_session_identity_across_rename() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("send-keys-wait-exit-rename")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    create_shell_session(&harness, "alpha", true)?;
+    let mut command = harness.base_command();
+    let mut wait_child = command
+        .args([
+            "send-keys",
+            "-t",
+            "alpha:0.0",
+            "--wait-pane-exit",
+            "--timeout",
+            "5s",
+            "--",
+            "printf WAIT_EXIT_%s STARTED; sleep 1; exit 7",
+            "Enter",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    assert_success(&harness.run(&[
+        "wait-pane",
+        "-t",
+        "alpha:0.0",
+        "--text",
+        "WAIT_EXIT_STARTED",
+        "--timeout",
+        "3s",
+    ])?);
+    assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_child.try_wait()?.is_none(),
+        "pane-exit wait must remain armed after the target session is renamed"
+    );
+
+    let output = wait_child.wait_with_output()?;
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "pane-exit status must survive a session rename\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn send_keys_pane_exit_wait_rejects_old_session_name_aba() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("send-keys-wait-exit-rename-aba")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    create_shell_session(&harness, "alpha", true)?;
+    let mut command = harness.base_command();
+    let mut wait_child = command
+        .args([
+            "send-keys",
+            "-t",
+            "alpha:0.0",
+            "--wait-pane-exit",
+            "--timeout",
+            "5s",
+            "--",
+            "printf ABA_EXIT_%s STARTED; read marker; exit 7",
+            "Enter",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    assert_success(&harness.run(&[
+        "wait-pane",
+        "-t",
+        "alpha:0.0",
+        "--text",
+        "ABA_EXIT_STARTED",
+        "--timeout",
+        "3s",
+    ])?);
+    assert_success(&harness.run(&[
+        "rename-session",
+        "-t",
+        "alpha",
+        "beta",
+        ";",
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+    ])?);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_child.try_wait()?.is_none(),
+        "pane-exit wait must not bind to a replacement session using the old name"
+    );
+
+    assert_success(&harness.run(&["send-keys", "-t", "beta:0.0", "release", "Enter"])?);
+    let output = wait_child.wait_with_output()?;
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "pane-exit wait lost the original process outcome after name reuse\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
     Ok(())
 }
 

@@ -119,7 +119,7 @@ use client_environment::{
 use list::{sort_list_sessions, ListSessionSnapshot};
 use options::resolve_session_creation_options;
 
-use super::attach_support::surviving_attached_resize_targets;
+use super::attach_support::{surviving_attached_resize_targets, SessionDetachOnDestroy};
 #[cfg(windows)]
 use super::pane_support::format_references_pane_pid;
 use super::scripting_support::format_context_for_target;
@@ -1071,7 +1071,6 @@ impl RequestHandler {
             crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Interrupt => {
                 rmux_pty::send_windows_console_interrupt(pane_pid)
             }
-            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Noop => Ok(()),
         })
     }
 
@@ -1208,6 +1207,7 @@ impl RequestHandler {
             queued_lifecycle_events,
             removed_pane_ids,
             removed_sessions,
+            removed_attached_sessions,
             resize_window_ids,
             subscriptions_removed,
         ) = {
@@ -1262,6 +1262,7 @@ impl RequestHandler {
             let mut queued_events = Vec::new();
             let mut removed_pane_ids = Vec::new();
             let mut removed_sessions: Vec<(SessionName, SessionId)> = Vec::new();
+            let mut removed_attached_sessions = Vec::new();
             let mut removed_window_ids = Vec::new();
             let mut response_error = None;
 
@@ -1296,6 +1297,7 @@ impl RequestHandler {
                 }
                 let current_runtime_owner = state.sessions.runtime_owner(session_name);
                 let next_runtime_owner = state.sessions.runtime_owner_transfer_target(session_name);
+                let detach_on_destroy = SessionDetachOnDestroy::capture(&state, session_name);
 
                 match state.sessions.remove_session(session_name) {
                     Ok(removed_session) => {
@@ -1307,6 +1309,11 @@ impl RequestHandler {
                         );
                         removed_pane_ids.extend(session_pane_ids(&removed_session));
                         removed_sessions.push((session_name.clone(), removed_session.id()));
+                        removed_attached_sessions.push((
+                            session_name.clone(),
+                            removed_session.id(),
+                            detach_on_destroy,
+                        ));
                         queued_events.push(prepare_lifecycle_event(
                             &mut state,
                             &LifecycleEvent::SessionClosed {
@@ -1368,6 +1375,7 @@ impl RequestHandler {
                 queued_events,
                 removed_pane_ids,
                 removed_sessions,
+                removed_attached_sessions,
                 removed_window_ids,
                 subscriptions_removed,
             )
@@ -1377,9 +1385,15 @@ impl RequestHandler {
             let _ = self.request_shutdown_if_pending();
         }
 
-        for (removed_session_name, removed_session_id) in &removed_sessions {
-            self.exit_attached_session_identity(removed_session_name, *removed_session_id)
-                .await;
+        for (removed_session_name, removed_session_id, detach_on_destroy) in
+            removed_attached_sessions
+        {
+            self.exit_attached_session_identity(
+                &removed_session_name,
+                removed_session_id,
+                detach_on_destroy,
+            )
+            .await;
         }
 
         #[cfg(test)]

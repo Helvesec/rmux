@@ -1,6 +1,98 @@
 use std::collections::VecDeque;
 
+use rmux_core::command_inventory::{command_short_option_spec, CommandShortOptionSpec};
 use rmux_proto::RmuxError;
+
+pub(super) fn normalize_compact_short_options(
+    command_name: &str,
+    arguments: Vec<String>,
+) -> Vec<String> {
+    let Some(spec) = command_short_option_spec(command_name) else {
+        return arguments;
+    };
+
+    let mut normalized = Vec::with_capacity(arguments.len());
+    let mut parsing_options = true;
+    let mut expects_value = false;
+
+    for argument in arguments {
+        if !parsing_options {
+            normalized.push(argument);
+            continue;
+        }
+        if expects_value {
+            normalized.push(argument);
+            expects_value = false;
+            continue;
+        }
+        if argument == "--" {
+            normalized.push(argument);
+            parsing_options = false;
+            continue;
+        }
+        if argument == "-" || !argument.starts_with('-') || argument.starts_with("--") {
+            parsing_options = false;
+            normalized.push(argument);
+            continue;
+        }
+        let mut short_flags = argument[1..].chars();
+        if let (Some(flag), None) = (short_flags.next(), short_flags.next()) {
+            expects_value = spec.takes_value(flag);
+            if !expects_value && !spec.is_boolean(flag) {
+                parsing_options = false;
+            }
+            normalized.push(argument);
+            continue;
+        }
+
+        let Some((parts, needs_next_value)) = normalize_short_option_token(&argument, spec) else {
+            if argument[1..]
+                .chars()
+                .next()
+                .is_some_and(|flag| !spec.is_boolean(flag) && !spec.takes_value(flag))
+            {
+                parsing_options = false;
+            }
+            normalized.push(argument);
+            continue;
+        };
+        normalized.extend(parts);
+        expects_value = needs_next_value;
+    }
+
+    normalized
+}
+
+fn normalize_short_option_token(
+    argument: &str,
+    spec: &CommandShortOptionSpec,
+) -> Option<(Vec<String>, bool)> {
+    let flags = argument.strip_prefix('-')?;
+    if flags.is_empty() || flags.starts_with('-') {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    let mut chars = flags.char_indices().peekable();
+    while let Some((_, flag)) = chars.next() {
+        if spec.takes_value(flag) {
+            parts.push(format!("-{flag}"));
+            let value_start = chars.peek().map_or(flags.len(), |(index, _)| *index);
+            if value_start < flags.len() {
+                parts.push(flags[value_start..].to_owned());
+                return Some((parts, false));
+            }
+            return Some((parts, true));
+        }
+        if spec.is_boolean(flag) {
+            parts.push(format!("-{flag}"));
+            continue;
+        }
+        return None;
+    }
+
+    Some((parts, false))
+}
 
 pub(super) fn rebuild_shell_command(command_parts: Vec<String>) -> String {
     if command_parts.len() == 1 {
@@ -142,5 +234,52 @@ impl CommandTokens {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_compact_short_options;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn compact_short_options_stop_at_value_and_positional_boundaries() {
+        assert_eq!(
+            normalize_compact_short_options(
+                "run-shell",
+                args(&["-Ctalpha:0.0", "display-message -p ok", "-JT"]),
+            ),
+            args(&["-C", "-t", "alpha:0.0", "display-message -p ok", "-JT",])
+        );
+        assert_eq!(
+            normalize_compact_short_options(
+                "run-shell",
+                args(&["-c", "-hyphenated-directory", "printf", "-JT"]),
+            ),
+            args(&["-c", "-hyphenated-directory", "printf", "-JT"])
+        );
+        assert_eq!(
+            normalize_compact_short_options("run-shell", args(&["--", "-JT"])),
+            args(&["--", "-JT"])
+        );
+    }
+
+    #[test]
+    fn compact_short_options_leave_unknown_or_optional_value_forms_to_command_parser() {
+        assert_eq!(
+            normalize_compact_short_options("show-messages", args(&["-JX"])),
+            args(&["-JX"])
+        );
+        assert_eq!(
+            normalize_compact_short_options("run-shell", args(&["-x", "-bE"])),
+            args(&["-x", "-bE"])
+        );
+        assert_eq!(
+            normalize_compact_short_options("resize-pane", args(&["-D5", "-Z"])),
+            args(&["-D5", "-Z"])
+        );
     }
 }

@@ -8,13 +8,14 @@ use tokio::sync::{mpsc, watch};
 
 use super::subscriptions::{handle_pane_event, PaneEvent};
 use super::{
-    append_control_input, arm_control_eof_transition, drain_control_command_after_eof,
-    drain_control_queue_after_eof, ensure_control_newline, extract_complete_control_lines,
-    forward_control as forward_control_identity, install_control_eof_queue_lease_pause,
-    wait_for_control_eof_transition, ActiveControlCommand, ControlCommandResult, ControlLifecycle,
-    ControlModeUpgrade, ControlOutputQueue, ControlQueueEofCancellation, ControlServerEvent,
-    ControlUpgradeInput, EofDrainContext, CONTROL_EOF_GRACE, CONTROL_SERVER_EVENT_CAPACITY,
-    MAX_CONTROL_LINE_BYTES, MAX_QUEUED_CONTROL_LINES,
+    append_control_input, arm_control_eof_transition, control_control_waits_for_attached_session,
+    drain_control_command_after_eof, drain_control_queue_after_eof, ensure_control_newline,
+    extract_complete_control_lines, forward_control as forward_control_identity,
+    install_control_eof_queue_lease_pause, wait_for_control_eof_transition, ActiveControlCommand,
+    ControlCommandResult, ControlLifecycle, ControlModeUpgrade, ControlOutputQueue,
+    ControlQueueEofCancellation, ControlServerEvent, ControlUpgradeInput, EofDrainContext,
+    CONTROL_EOF_GRACE, CONTROL_SERVER_EVENT_CAPACITY, MAX_CONTROL_LINE_BYTES,
+    MAX_QUEUED_CONTROL_LINES,
 };
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
@@ -25,11 +26,29 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::server_access::current_owner_uid;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
-    ControlMode, Request, Response, RmuxError, ShowBufferRequest, WaitForMode, WaitForRequest,
-    WaitForResponse,
+    ControlMode, Request, Response, RmuxError, SessionName, ShowBufferRequest, WaitForMode,
+    WaitForRequest, WaitForResponse,
 };
 
 const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[test]
+fn only_control_control_eof_waits_for_an_attached_session() {
+    let session_name = SessionName::new("control-eof-session").expect("valid session name");
+
+    assert!(!control_control_waits_for_attached_session(
+        ControlMode::Plain,
+        Some(&session_name),
+    ));
+    assert!(!control_control_waits_for_attached_session(
+        ControlMode::ControlControl,
+        None,
+    ));
+    assert!(control_control_waits_for_attached_session(
+        ControlMode::ControlControl,
+        Some(&session_name),
+    ));
+}
 
 #[tokio::test]
 async fn persistent_eof_deadline_is_global_and_not_rearmed() {

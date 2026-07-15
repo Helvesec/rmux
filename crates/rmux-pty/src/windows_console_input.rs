@@ -11,9 +11,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::{
     AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, GetConsoleMode, SetConsoleCtrlHandler,
-    WriteConsoleInputW, COORD, CTRL_C_EVENT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-    FROM_LEFT_1ST_BUTTON_PRESSED, INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD,
-    KEY_EVENT_RECORD_0, MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_MOVED,
+    WriteConsoleInputW, COORD, CTRL_C_EVENT, ENABLE_PROCESSED_INPUT, FROM_LEFT_1ST_BUTTON_PRESSED,
+    INPUT_RECORD, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, MOUSE_EVENT,
+    MOUSE_EVENT_RECORD, MOUSE_MOVED,
 };
 
 use crate::ProcessId;
@@ -178,6 +178,36 @@ pub fn write_windows_console_key(
     write_windows_console_key_to_attached_console(key)
 }
 
+/// Writes one atomic batch of Windows console key press/release pairs into a
+/// ConPTY child console.
+///
+/// Keeping the records in one `WriteConsoleInputW` call is useful when the
+/// consumer intentionally classifies a console-input batch as a unit. Cooked
+/// Ctrl-D events receive the same suppression policy as the single-key API.
+pub fn write_windows_console_key_batch(
+    process_id: ProcessId,
+    keys: &[WindowsConsoleKeyEvent],
+) -> io::Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let _guard = CONSOLE_ATTACH_LOCK
+        .lock()
+        .map_err(|_| io::Error::other("Windows console attach lock poisoned"))?;
+    let _attachment = attach_to_process_console(process_id)?;
+    let handle = open_console_input()?;
+    let handle = handle.as_raw_handle() as HANDLE;
+    let mut records = Vec::with_capacity(keys.len().saturating_mul(2));
+    for key in keys {
+        trace_windows_key_injection(process_id, *key);
+        if should_suppress_cooked_ctrl_d(handle, *key)? {
+            continue;
+        }
+        records.extend(key_event_records(*key));
+    }
+    write_windows_console_records_to_handle(handle, &records)
+}
+
 /// Writes a left-button mouse drag into a ConPTY child console.
 ///
 /// Coordinates are zero-based console-cell positions. This mirrors a real
@@ -329,6 +359,16 @@ fn write_windows_console_key_to_handle(
     key: WindowsConsoleKeyEvent,
 ) -> io::Result<()> {
     let records = key_event_records(key);
+    write_windows_console_records_to_handle(handle, &records)
+}
+
+fn write_windows_console_records_to_handle(
+    handle: HANDLE,
+    records: &[INPUT_RECORD],
+) -> io::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
     let mut written = 0_u32;
     let ok = unsafe {
         // SAFETY: `handle` is the input handle of the currently attached console,
@@ -382,16 +422,23 @@ fn write_windows_console_mouse_drag_to_handle(
 }
 
 fn should_suppress_cooked_ctrl_d(handle: HANDLE, key: WindowsConsoleKeyEvent) -> io::Result<bool> {
-    if key.virtual_key_code != b'D' as u16 || key.control_key_state & LEFT_CTRL_PRESSED == 0 {
-        return Ok(false);
-    }
-    if key.virtual_scan_code != 0 {
+    if key.virtual_key_code != b'D' as u16
+        || key.control_key_state & LEFT_CTRL_PRESSED == 0
+        || key.virtual_scan_code != 0
+    {
         return Ok(false);
     }
     let mode = console_input_mode(handle)?;
-    let suppress = mode & (ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT) != 0;
+    let suppress = should_suppress_typed_ctrl_d_for_mode(mode, key);
     trace_windows_ctrl_d_mode(mode, suppress);
     Ok(suppress)
+}
+
+const fn should_suppress_typed_ctrl_d_for_mode(mode: u32, key: WindowsConsoleKeyEvent) -> bool {
+    key.virtual_key_code == b'D' as u16
+        && key.control_key_state & LEFT_CTRL_PRESSED != 0
+        && key.virtual_scan_code == 0
+        && mode & ENABLE_PROCESSED_INPUT != 0
 }
 
 fn console_input_mode(handle: HANDLE) -> io::Result<u32> {
@@ -587,6 +634,7 @@ fn last_os_error() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Console::ENABLE_LINE_INPUT;
 
     #[test]
     fn ctrl_d_eot_is_suppressible_cooked_event_without_scan_code() {
@@ -606,5 +654,22 @@ mod tests {
         assert_eq!(key.virtual_scan_code, 0x20);
         assert_eq!(key.unicode_char, 0x04);
         assert_eq!(key.control_key_state & LEFT_CTRL_PRESSED, LEFT_CTRL_PRESSED);
+    }
+
+    #[test]
+    fn typed_ctrl_d_is_suppressed_only_in_processed_input_mode() {
+        let typed = WindowsConsoleKeyEvent::ctrl_d_eot();
+        assert!(should_suppress_typed_ctrl_d_for_mode(
+            ENABLE_PROCESSED_INPUT,
+            typed
+        ));
+        assert!(!should_suppress_typed_ctrl_d_for_mode(
+            ENABLE_LINE_INPUT,
+            typed
+        ));
+        assert!(!should_suppress_typed_ctrl_d_for_mode(
+            ENABLE_PROCESSED_INPUT,
+            WindowsConsoleKeyEvent::ctrl_d()
+        ));
     }
 }

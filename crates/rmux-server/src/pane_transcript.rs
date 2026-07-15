@@ -897,6 +897,19 @@ mod tests {
     }
 
     #[test]
+    fn append_bytes_reports_rmux_xtversion_identity() {
+        let mut transcript = transcript(40, 4, 10);
+        let result = transcript.append_bytes_with_effects(b"\x1b[>q");
+        let version = env!("CARGO_PKG_VERSION");
+
+        assert_eq!(
+            result.replies,
+            format!("\x1bP>|rmux {version}\x1b\\").into_bytes()
+        );
+        assert!(transcript.append_bytes_with_effects(b"").replies.is_empty());
+    }
+
+    #[test]
     fn append_bytes_does_not_advertise_kitty_keyboard_support() {
         let mut transcript = transcript(40, 4, 10);
 

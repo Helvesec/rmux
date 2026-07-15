@@ -17,6 +17,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 
+use crate::nested::{detect_parent, ClientContextParent};
+
 use super::console_coordination::{ConsoleIoCoordinator, ATTACH_CONSOLE_IO};
 use super::console_input_read::{
     read_console_input_batch_with, ConsoleInputApi, ConsoleInputRead, Win32ConsoleInput,
@@ -30,6 +32,8 @@ const HIGH_SURROGATE_START: u16 = 0xd800;
 const HIGH_SURROGATE_END: u16 = 0xdbff;
 const LOW_SURROGATE_START: u16 = 0xdc00;
 const LOW_SURROGATE_END: u16 = 0xdfff;
+const MAX_TMUX_SGR_MOUSE_BUTTON: u16 = u8::MAX as u16;
+const MAX_TMUX_SGR_MOUSE_FRAME_BYTES: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AttachInput {
@@ -98,6 +102,9 @@ pub(super) struct ConsoleInputReader {
     /// hostile `\x1b[201~` spanning two batches cannot slip through per-batch
     /// stripping. Only ever populated while `paste_open` is true.
     paste_carryover: Vec<u8>,
+    /// Whether a real outer tmux may deliver SGR mouse frames as Win32 key
+    /// records. This exception is intentionally unavailable outside tmux.
+    tmux_parent_sgr_mouse: bool,
 }
 
 impl ConsoleInputReader {
@@ -117,6 +124,7 @@ impl ConsoleInputReader {
             last_mouse_button_state: 0,
             paste_open: false,
             paste_carryover: Vec::new(),
+            tmux_parent_sgr_mouse: parent_allows_sgr_mouse_key_batches(detect_parent()),
         })
     }
 
@@ -165,6 +173,17 @@ impl ConsoleInputReader {
             }
         }
 
+        if self.tmux_parent_sgr_mouse {
+            if let Some(inputs) = encode_drained_tmux_sgr_mouse_batch(
+                &events,
+                drained,
+                self.paste_open,
+                &mut self.pending_high_surrogate,
+            ) {
+                return Ok(inputs);
+            }
+        }
+
         // A paste is injected into the console input buffer as one atomic burst,
         // so a single ReadConsoleInputW returns every pasted character at once
         // while interactive typing delivers one key per call. That burst is the
@@ -182,6 +201,116 @@ impl ConsoleInputReader {
             &mut self.last_mouse_button_state,
         ))
     }
+}
+
+const fn parent_allows_sgr_mouse_key_batches(parent: ClientContextParent) -> bool {
+    matches!(parent, ClientContextParent::Tmux)
+}
+
+/// Restores the one input shape an outer tmux can make authoritative on older
+/// Windows hosts: a completely drained batch containing only complete SGR
+/// mouse frames. Real bracketed paste includes its `ESC[200~`/`ESC[201~`
+/// delimiters and therefore cannot match this grammar. Ordinary text, mixed
+/// input, fragments, malformed fields, and multi-batch input all remain on the
+/// fail-closed paste path.
+///
+/// Win32 record mode cannot distinguish an unbracketed clipboard containing
+/// exactly one valid SGR frame from the same frame relayed by tmux. Limiting the
+/// exception to an inherited tmux context, a drained batch, and this bounded
+/// grammar keeps that unavoidable ambiguity narrower than the reported path.
+fn encode_drained_tmux_sgr_mouse_batch(
+    events: &[BatchEvent],
+    drained: bool,
+    paste_open: bool,
+    pending_high_surrogate: &mut Option<u16>,
+) -> Option<Vec<AttachInput>> {
+    if !drained || paste_open || pending_high_surrogate.is_some() || events.is_empty() {
+        return None;
+    }
+
+    let mut candidate = Vec::new();
+    let mut candidate_surrogate = *pending_high_surrogate;
+    for event in events {
+        let BatchEvent::Key(key) = event else {
+            return None;
+        };
+        if key.key_down && !is_paste_text(key) && !is_pure_modifier_key_down(key) {
+            return None;
+        }
+        candidate.extend_from_slice(&encode_key_event(*key, &mut candidate_surrogate));
+    }
+    if !is_complete_bounded_sgr_mouse_run(&candidate) {
+        return None;
+    }
+
+    *pending_high_surrogate = candidate_surrogate;
+    Some(vec![AttachInput::bytes(candidate)])
+}
+
+fn is_complete_bounded_sgr_mouse_run(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let Some(frame_len) = bounded_sgr_mouse_frame_len(&bytes[cursor..]) else {
+            return false;
+        };
+        cursor += frame_len;
+    }
+    true
+}
+
+fn bounded_sgr_mouse_frame_len(bytes: &[u8]) -> Option<usize> {
+    if !bytes.starts_with(b"\x1b[<") {
+        return None;
+    }
+
+    let (button, button_end) = parse_bounded_sgr_decimal(bytes, 3, b';')?;
+    if button > MAX_TMUX_SGR_MOUSE_BUTTON {
+        return None;
+    }
+    let (x, x_end) = parse_bounded_sgr_decimal(bytes, button_end + 1, b';')?;
+    let (y, y_end) = parse_bounded_sgr_decimal_with_final(bytes, x_end + 1)?;
+    if x == 0 || y == 0 {
+        return None;
+    }
+    let frame_len = y_end + 1;
+    (frame_len <= MAX_TMUX_SGR_MOUSE_FRAME_BYTES).then_some(frame_len)
+}
+
+fn parse_bounded_sgr_decimal(bytes: &[u8], start: usize, terminator: u8) -> Option<(u16, usize)> {
+    parse_bounded_sgr_decimal_until(bytes, start, |byte| byte == terminator)
+}
+
+fn parse_bounded_sgr_decimal_with_final(bytes: &[u8], start: usize) -> Option<(u16, usize)> {
+    parse_bounded_sgr_decimal_until(bytes, start, |byte| matches!(byte, b'M' | b'm'))
+}
+
+fn parse_bounded_sgr_decimal_until(
+    bytes: &[u8],
+    start: usize,
+    is_terminator: impl Fn(u8) -> bool,
+) -> Option<(u16, usize)> {
+    let mut cursor = start;
+    let mut value = 0_u16;
+    let mut has_digit = false;
+    while let Some(byte) = bytes.get(cursor).copied() {
+        if is_terminator(byte) {
+            return has_digit.then_some((value, cursor));
+        }
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        has_digit = true;
+        value = value.checked_mul(10)?.checked_add(u16::from(byte - b'0'))?;
+        cursor += 1;
+        if cursor.saturating_sub(start) >= MAX_TMUX_SGR_MOUSE_FRAME_BYTES {
+            return None;
+        }
+    }
+    None
 }
 
 enum BatchEvent {
@@ -988,11 +1117,13 @@ mod tests {
     use super::super::console_coordination::ConsoleIoCoordinator;
     use super::super::console_input_read::ConsoleInputApi;
     use super::{
-        attach_input_chunks, encode_input_batch, encode_key_event, encode_mouse_event,
-        strip_embedded_paste_markers, windows_console_key_for_event, AttachInput, BatchEvent,
-        ConsoleInputReader, ConsoleKeyEvent, ATTACH_INPUT_CHUNK_LIMIT, BRACKETED_PASTE_END,
-        BRACKETED_PASTE_START,
+        attach_input_chunks, encode_drained_tmux_sgr_mouse_batch, encode_input_batch,
+        encode_key_event, encode_mouse_event, is_complete_bounded_sgr_mouse_run,
+        parent_allows_sgr_mouse_key_batches, strip_embedded_paste_markers,
+        windows_console_key_for_event, AttachInput, BatchEvent, ConsoleInputReader,
+        ConsoleKeyEvent, ATTACH_INPUT_CHUNK_LIMIT, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
     };
+    use crate::nested::ClientContextParent;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Console::{
         FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED, INPUT_RECORD, INPUT_RECORD_0,
@@ -1167,6 +1298,7 @@ mod tests {
             last_mouse_button_state: 0,
             paste_open: false,
             paste_carryover: Vec::new(),
+            tmux_parent_sgr_mouse: false,
         }
     }
 
@@ -1244,6 +1376,102 @@ mod tests {
                 FakeConsoleCall::EventCount,
             ]
         );
+    }
+
+    #[test]
+    fn only_a_tmux_parent_enables_the_sgr_mouse_exception() {
+        assert!(parent_allows_sgr_mouse_key_batches(
+            ClientContextParent::Tmux
+        ));
+        assert!(!parent_allows_sgr_mouse_key_batches(
+            ClientContextParent::Rmux
+        ));
+        assert!(!parent_allows_sgr_mouse_key_batches(
+            ClientContextParent::None
+        ));
+    }
+
+    #[test]
+    fn drained_tmux_sgr_mouse_batches_are_forwarded_live() {
+        for sequence in [
+            b"\x1b[<0;10;5M".as_slice(),
+            b"\x1b[<0;10;5M\x1b[<32;11;5M\x1b[<0;11;5m".as_slice(),
+            b"\x1b[<255;65535;65535M".as_slice(),
+        ] {
+            let inputs = encode_drained_tmux_sgr_mouse_batch(
+                &key_event_batch(sequence),
+                true,
+                false,
+                &mut None,
+            )
+            .expect("strict, drained tmux SGR batch");
+            assert_eq!(batch_bytes(&inputs), sequence);
+        }
+    }
+
+    #[test]
+    fn tmux_sgr_mouse_exception_rejects_every_ambiguous_shape() {
+        let cases = [
+            b"\x1b[200~\x1b[<0;10;5M\x1b[201~".as_slice(),
+            b"text\x1b[<0;10;5M".as_slice(),
+            b"\x1b[<0;10;5Mtext".as_slice(),
+            b"\x1b[<0;10;5".as_slice(),
+            b"\x1b[<0;10;5X".as_slice(),
+            b"\x1b[<a;10;5M".as_slice(),
+            b"\x1b[<;10;5M".as_slice(),
+            b"\x1b[<0;;5M".as_slice(),
+            b"\x1b[<0;10;M".as_slice(),
+            b"\x1b[<256;10;5M".as_slice(),
+            b"\x1b[<0;0;5M".as_slice(),
+            b"\x1b[<0;10;0M".as_slice(),
+            b"\x1b[<0;65536;5M".as_slice(),
+            b"\x1b[<0;10;65536M".as_slice(),
+        ];
+        for bytes in cases {
+            assert!(
+                !is_complete_bounded_sgr_mouse_run(bytes),
+                "ambiguous input must not become live: {bytes:?}"
+            );
+        }
+
+        let valid = key_event_batch(b"\x1b[<0;10;5M");
+        assert!(encode_drained_tmux_sgr_mouse_batch(&valid, false, false, &mut None).is_none());
+        assert!(encode_drained_tmux_sgr_mouse_batch(&valid, true, true, &mut None).is_none());
+        let mut pending_surrogate = Some(0xd83d);
+        assert!(
+            encode_drained_tmux_sgr_mouse_batch(&valid, true, false, &mut pending_surrogate,)
+                .is_none()
+        );
+        assert_eq!(pending_surrogate, Some(0xd83d));
+
+        let mut mixed = valid;
+        mixed.push(BatchEvent::Mouse(mouse_event(0, 0, 0, 1, 1)));
+        assert!(encode_drained_tmux_sgr_mouse_batch(&mixed, true, false, &mut None).is_none());
+    }
+
+    #[test]
+    fn non_tmux_reader_keeps_sgr_key_batches_fail_closed() {
+        let sequence = b"\x1b[<0;10;5M";
+        let api = FakeConsoleInput::new(sequence.iter().copied().map(console_key_input_record));
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("fake console batch");
+        assert_eq!(batch_bytes(&inputs), bracketed_text(sequence));
+    }
+
+    #[test]
+    fn tmux_reader_forwards_only_the_strict_drained_sgr_batch() {
+        let sequence = b"\x1b[<0;10;5M";
+        let api = FakeConsoleInput::new(sequence.iter().copied().map(console_key_input_record));
+        let coordinator = ConsoleIoCoordinator::new();
+        let mut reader = fake_console_reader();
+        reader.tmux_parent_sgr_mouse = true;
+        let inputs = reader
+            .read_key_inputs_with(&coordinator, &api)
+            .expect("fake console batch");
+        assert_eq!(batch_bytes(&inputs), sequence);
     }
 
     #[test]

@@ -94,6 +94,21 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION,
 ];
 
+/// Builds the capability inventory for a binary with the supplied optional
+/// features enabled.
+///
+/// The protocol baseline stays feature-independent, while binaries compiled
+/// with browser sharing must advertise that optional capability consistently
+/// from both their local inventory and daemon handshake.
+#[must_use]
+pub fn capabilities_for_features(web_share: bool) -> Vec<&'static str> {
+    let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
+    if web_share {
+        capabilities.push(CAPABILITY_WEB_SHARE);
+    }
+    capabilities
+}
+
 /// Client-to-server version and capability negotiation request.
 ///
 /// The detached frame envelope remains mandatory and exact-versioned. These
@@ -193,11 +208,11 @@ impl HandshakeResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
+        capabilities_for_features, HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
         CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
         CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_HANDSHAKE,
         CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY, CAPABILITY_SDK_SESSION_LEASE_BY_ID,
-        CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2, CAPABILITY_SDK_WAITS_ARMED,
+        CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2, CAPABILITY_SDK_WAITS_ARMED, CAPABILITY_WEB_SHARE,
     };
     use crate::{RmuxError, RMUX_WIRE_VERSION};
 
@@ -256,6 +271,12 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| capability == CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY));
+    }
+
+    #[test]
+    fn optional_web_capability_follows_the_compiled_feature() {
+        assert!(!capabilities_for_features(false).contains(&CAPABILITY_WEB_SHARE));
+        assert!(capabilities_for_features(true).contains(&CAPABILITY_WEB_SHARE));
     }
 
     #[test]

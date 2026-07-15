@@ -4,6 +4,8 @@ use tokio::time::Instant;
 
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const KITTY_GRAPHICS_APC_START: &[u8] = b"\x1b_G";
+const ESCAPE_TERMINAL_STRING_LEADERS: &[u8] = b"]PX^_";
+const C1_TERMINAL_STRING_LEADERS: &[u8] = &[0x90, 0x98, 0x9d, 0x9e, 0x9f];
 /// Once a variable-length terminal control has an unambiguous opener, it is
 /// no longer governed by the keyboard `escape-time`. Network and PTY reads
 /// can legitimately pause much longer than that (10 ms by default), so use a
@@ -55,6 +57,10 @@ fn pending_escape_kind(input: &[u8]) -> Option<PendingEscapeKind> {
         return Some(PendingEscapeKind::Ambiguous);
     }
 
+    if is_unterminated_generic_terminal_string(input) {
+        return Some(PendingEscapeKind::Streaming);
+    }
+
     None
 }
 
@@ -63,13 +69,33 @@ fn pending_escape_kind(input: &[u8]) -> Option<PendingEscapeKind> {
 /// return `Partial`; complete bracketed-paste/APC/OSC openers are classified as
 /// streaming above instead.
 fn is_ambiguous_escape_prefix(input: &[u8]) -> bool {
-    matches!(input, b"\x1b" | b"\x1bO" | b"\x1b_" | b"\x1b\x1b")
+    matches!(input, b"\x1b" | b"\x1bO" | b"\x1b\x1b")
+        || is_ambiguous_terminal_string_leader(input)
         || is_unterminated_csi_prefix(input)
         || is_partial_x10_mouse(input)
         || is_partial_bracketed_paste_start(input)
         || is_partial_kitty_apc_start(input)
         || is_partial_consumed_osc_prefix(input)
         || is_partial_meta_utf8(input)
+}
+
+/// The two-byte 7-bit forms are also ordinary Meta keys, so they keep the
+/// keyboard escape deadline until a body byte makes the terminal string
+/// unambiguous. A bare C1 leader gets the same short initial budget; once its
+/// body starts it is promoted to the streaming idle budget below.
+fn is_ambiguous_terminal_string_leader(input: &[u8]) -> bool {
+    matches!(input, [b'\x1b', leader] if ESCAPE_TERMINAL_STRING_LEADERS.contains(leader))
+        || matches!(input, [leader] if C1_TERMINAL_STRING_LEADERS.contains(leader))
+}
+
+/// Modal input keeps incomplete DCS, SOS, OSC, PM, and APC strings opaque so
+/// terminal responses cannot be interpreted as prompt/menu keys. Keep the
+/// scheduler aligned with both their 7-bit (`ESC` + leader) and C1 forms:
+/// after at least one body byte, an abandoned string must have a bounded idle
+/// deadline instead of retaining every later keystroke forever.
+fn is_unterminated_generic_terminal_string(input: &[u8]) -> bool {
+    matches!(input, [b'\x1b', leader, ..] if ESCAPE_TERMINAL_STRING_LEADERS.contains(leader))
+        || matches!(input, [leader, ..] if C1_TERMINAL_STRING_LEADERS.contains(leader) && input.len() > 1)
 }
 
 fn is_unterminated_csi_prefix(input: &[u8]) -> bool {
@@ -240,8 +266,17 @@ mod tests {
             b"\x1b".as_slice(),
             b"\x1b[".as_slice(),
             b"\x1bO".as_slice(),
+            b"\x1bP".as_slice(),
+            b"\x1bX".as_slice(),
+            b"\x1b]".as_slice(),
+            b"\x1b^".as_slice(),
             b"\x1b_".as_slice(),
             b"\x1b\x1b".as_slice(),
+            b"\x90".as_slice(),
+            b"\x98".as_slice(),
+            b"\x9d".as_slice(),
+            b"\x9e".as_slice(),
+            b"\x9f".as_slice(),
             b"\x1b[20".as_slice(),
             b"\x1b[12;".as_slice(),
             b"\x1b[<".as_slice(),
@@ -333,7 +368,36 @@ mod tests {
     }
 
     #[test]
-    fn recognized_meta_control_openers_promote_to_streaming_deadline() {
+    fn every_modal_terminal_string_body_gets_a_bounded_streaming_deadline() {
+        for input in [
+            b"\x1bPbody".as_slice(),
+            b"\x1bXbody".as_slice(),
+            b"\x1b]777;body".as_slice(),
+            b"\x1b^body".as_slice(),
+            b"\x1b_Qbody".as_slice(),
+            b"\x90body".as_slice(),
+            b"\x98body".as_slice(),
+            b"\x9dbody".as_slice(),
+            b"\x9ebody".as_slice(),
+            b"\x9fbody".as_slice(),
+        ] {
+            let mut flush = PendingEscapeFlush::default();
+            let before = Instant::now();
+            flush.sync(input, Duration::from_millis(10));
+            let deadline = flush.deadline().expect("terminal string body must arm");
+            assert!(
+                deadline >= before + RETAINED_CONTROL_IDLE_TIMEOUT,
+                "{input:?} must use the bounded streaming idle budget"
+            );
+            assert!(
+                deadline <= Instant::now() + RETAINED_CONTROL_IDLE_TIMEOUT,
+                "{input:?} must not be retained indefinitely"
+            );
+        }
+    }
+
+    #[test]
+    fn recognized_terminal_control_openers_promote_to_streaming_deadline() {
         for (prefix, control_like, grown) in [
             (
                 b"\x1b]".as_slice(),
@@ -344,6 +408,16 @@ mod tests {
                 b"\x1b_".as_slice(),
                 b"\x1b_G".as_slice(),
                 b"\x1b_Gi=7;AAAA".as_slice(),
+            ),
+            (
+                b"\x1bP".as_slice(),
+                b"\x1bPq".as_slice(),
+                b"\x1bPquery".as_slice(),
+            ),
+            (
+                b"\x90".as_slice(),
+                b"\x90q".as_slice(),
+                b"\x90query".as_slice(),
             ),
         ] {
             let mut flush = PendingEscapeFlush::default();

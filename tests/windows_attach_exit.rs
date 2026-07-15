@@ -879,6 +879,53 @@ fn windows_send_keys_ctrl_d_releases_cmd_timeout() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn windows_send_keys_ctrl_d_releases_cmd_wrapped_shell_command() -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-send-ctrl-d-shell-timeout");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "ctrldshelltimeout",
+            "timeout.exe /T 10000",
+        ],
+    )?;
+    thread::sleep(Duration::from_millis(500));
+    run_rmux(
+        &binary,
+        &label,
+        ["send-keys", "-t", "ctrldshelltimeout:0.0", "C-d"],
+    )?;
+
+    let deadline = Instant::now() + EXIT_TIMEOUT;
+    loop {
+        let status = Command::new(&binary)
+            .arg("-L")
+            .arg(&label)
+            .args(["has-session", "-t", "ctrldshelltimeout"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "send-keys C-d did not release a shell command wrapped by cmd.exe"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn windows_send_keys_ctrl_d_does_not_release_pwsh_timeout() -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
     if !pwsh_available() {
@@ -1620,6 +1667,136 @@ fn windows_attach_ctrl_c_preserves_raw_console_character_when_processed_input_is
     terminate_spawned(&mut attach);
     assert_raw_ctrl_c_character_observed("attached raw Ctrl-C", returned, &output);
 
+    Ok(())
+}
+
+#[test]
+fn windows_attach_ctrl_d_preserves_raw_console_character_when_processed_input_is_off(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() {
+        eprintln!("skipping raw Ctrl-D attach probe because pwsh.exe is unavailable");
+        return Ok(());
+    }
+
+    let label = unique_label("win-attach-raw-ctrl-d");
+    let script = write_raw_console_probe_script(&label)?;
+
+    let mut direct = ChildCommand::new("pwsh.exe")
+        .args(["-NoLogo", "-NoProfile", "-File"])
+        .arg(&script)
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    wait_for_needle_or_error(&mut direct, b"RAW_READY", RAW_CONSOLE_PROBE_READY_TIMEOUT)?;
+    write_windows_console_key(direct.child().pid(), WindowsConsoleKeyEvent::ctrl_d())?;
+    let (direct_received, direct_output) =
+        wait_for_needle_or_terminate(&mut direct, b"CHAR_0004", EXIT_LATENCY_TIMEOUT)?;
+    terminate_spawned(&mut direct);
+    assert!(
+        direct_received,
+        "direct ConPTY raw PowerShell did not receive Ctrl-D: {}",
+        escaped_output(&direct_output)
+    );
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+    let command = format!("pwsh.exe -NoLogo -NoProfile -File {}", script.display());
+    run_rmux(
+        &binary,
+        &label,
+        ["new-session", "-d", "-s", "rawctrld", command.as_str()],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+
+    let mut attach = ChildCommand::new(&binary)
+        .args(["-L", &label, "attach-session", "-t", "rawctrld"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let io = attach.master().try_clone_io()?;
+    wait_for_needle_or_error(&mut attach, b"RAW_READY", RAW_CONSOLE_PROBE_READY_TIMEOUT)?;
+    write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_d())?;
+    let (rmux_received, rmux_output) = capture_until_contains(
+        &binary,
+        &label,
+        "rawctrld:0.0",
+        b"CHAR_0004",
+        EXIT_LATENCY_TIMEOUT,
+    )?;
+
+    io.write_all(b"x")?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "rawctrld:0.0",
+        b"CHAR_0078",
+        EXIT_LATENCY_TIMEOUT,
+    )?;
+    terminate_spawned(&mut attach);
+    let _ = fs::remove_file(&script);
+
+    assert!(
+        rmux_received,
+        "attached raw PowerShell did not receive Ctrl-D: {}",
+        escaped_output(&rmux_output)
+    );
+    Ok(())
+}
+
+#[test]
+fn windows_send_keys_ctrl_d_preserves_raw_console_character_when_processed_input_is_off(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() {
+        eprintln!("skipping raw Ctrl-D send-keys probe because pwsh.exe is unavailable");
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-send-raw-ctrl-d");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+    let script = write_raw_console_probe_script(&label)?;
+    let command = format!("pwsh.exe -NoLogo -NoProfile -File {}", script.display());
+
+    run_rmux(
+        &binary,
+        &label,
+        ["new-session", "-d", "-s", "rawsendd", command.as_str()],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "rawsendd:0.0",
+        b"RAW_READY",
+        RAW_CONSOLE_PROBE_READY_TIMEOUT,
+    )?;
+
+    run_rmux(
+        &binary,
+        &label,
+        ["send-keys", "-t", "rawsendd:0.0", "C-d", "x"],
+    )?;
+    let (ctrl_d_received, output) = capture_until_contains(
+        &binary,
+        &label,
+        "rawsendd:0.0",
+        b"CHAR_0004",
+        EXIT_LATENCY_TIMEOUT,
+    )?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "rawsendd:0.0",
+        b"CHAR_0078",
+        EXIT_LATENCY_TIMEOUT,
+    )?;
+    let _ = fs::remove_file(&script);
+
+    assert!(
+        ctrl_d_received,
+        "send-keys did not deliver Ctrl-D to raw PowerShell: {}",
+        escaped_output(&output)
+    );
     Ok(())
 }
 

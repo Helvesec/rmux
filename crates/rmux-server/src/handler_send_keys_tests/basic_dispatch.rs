@@ -843,6 +843,99 @@ async fn switch_client_t_sets_custom_key_table_for_next_k_dispatch() {
 }
 
 #[tokio::test]
+async fn send_keys_k_prefix_precedes_a_transient_key_table() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("prefix-precedes-transient-k");
+    let requester_pid = std::process::id();
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let bound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "my-table".to_owned(),
+            key: "C-b".to_owned(),
+            note: Some("must lose to the prefix key".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "set-buffer".to_owned(),
+                "-b".to_owned(),
+                "wrong-table-hit".to_owned(),
+                "yes".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(bound, Response::BindKey(_)));
+
+    let switched = handler
+        .handle(Request::SwitchClientExt(SwitchClientExtRequest {
+            target: None,
+            key_table: Some("my-table".to_owned()),
+        }))
+        .await;
+    assert!(matches!(switched, Response::SwitchClient(_)));
+
+    let dispatched = handler
+        .handle(Request::SendKeysExt(SendKeysExtRequest {
+            target: Some(PaneTarget::new(alpha, 0)),
+            keys: vec!["C-b".to_owned()],
+            expand_formats: false,
+            hex: false,
+            literal: false,
+            dispatch_key_table: true,
+            copy_mode_command: false,
+            forward_mouse_event: false,
+            reset_terminal: false,
+            repeat_count: None,
+        }))
+        .await;
+    assert_eq!(
+        dispatched,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+
+    // tmux 3.7b reports `prefix|1` here and does not execute a C-b binding
+    // from the transient table: the configured prefix key takes precedence.
+    let clients = handler
+        .handle(Request::ListClients(Box::new(
+            rmux_proto::ListClientsRequest {
+                format: Some("#{client_key_table}|#{client_prefix}".to_owned()),
+                target_session: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            },
+        )))
+        .await;
+    let Response::ListClients(clients) = clients else {
+        panic!("expected list-clients response");
+    };
+    assert_eq!(clients.output.stdout(), b"prefix|1\n");
+
+    let wrong_table_hit = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("wrong-table-hit".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(wrong_table_hit, Response::Error(_)),
+        "the transient table's prefix-key binding must not execute"
+    );
+}
+
+#[tokio::test]
 async fn send_keys_k_uses_copy_mode_bindings_until_copy_mode_exits() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

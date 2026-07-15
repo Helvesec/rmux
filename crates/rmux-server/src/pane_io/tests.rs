@@ -704,6 +704,16 @@ impl PendingEscapeSchedulerFixture {
             .expect("write attach input");
     }
 
+    async fn activate_prompt(&self) {
+        let prompt = CommandParser::new()
+            .parse_one_group("command-prompt -b -p retained-control")
+            .expect("command prompt parses");
+        self.handler
+            .execute_parsed_commands_for_test(std::process::id(), prompt)
+            .await
+            .expect("background prompt starts");
+    }
+
     async fn wait_for_capture(&self, matches: impl Fn(&[u8]) -> bool, label: &str) -> Vec<u8> {
         let result = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -738,6 +748,51 @@ impl PendingEscapeSchedulerFixture {
         self.shutdown.send(()).expect("request attach shutdown");
         assert!(self.task.await.expect("attach task join").is_ok());
     }
+
+    async fn detach(mut self) {
+        self.send(AttachMessage::Data(b"\x02d".to_vec())).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut self.task)
+            .await
+            .expect("prefix-d must detach after retained input expires")
+            .expect("attach task join");
+        assert!(result.is_ok(), "attach exits cleanly after prefix-d");
+    }
+}
+
+#[tokio::test]
+async fn modal_dcs_leader_expires_and_restores_prefix_detach() {
+    let mut fixture = PendingEscapeSchedulerFixture::start("modal-dcs-deadline").await;
+    fixture.activate_prompt().await;
+    fixture.send(AttachMessage::Data(b"\x1bP".to_vec())).await;
+
+    // ESC P is both Meta-P and the 7-bit DCS leader. It must use the
+    // configured keyboard escape-time rather than stay opaque forever.
+    fixture
+        .wait_for_capture(
+            |captured| captured == b"P",
+            "DCS remainder after prompt cancellation",
+        )
+        .await;
+    fixture.detach().await;
+}
+
+#[tokio::test]
+async fn modal_c1_dcs_leader_expires_and_releases_later_input() {
+    let mut fixture = PendingEscapeSchedulerFixture::start("modal-c1-dcs-deadline").await;
+    fixture.activate_prompt().await;
+    fixture
+        .send(AttachMessage::Keystroke(AttachedKeystroke::new(vec![0x90])))
+        .await;
+
+    // A lone C1 DCS leader is not a Meta key, but it is still incomplete and
+    // must be bounded. Once flushed, a later Escape can reach and close the
+    // prompt instead of being absorbed into the abandoned DCS body.
+    fixture
+        .wait_for_capture(|captured| captured == [0x90], "timed-out C1 DCS leader")
+        .await;
+    fixture.send(AttachMessage::Data(b"\x1b".to_vec())).await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    fixture.detach().await;
 }
 
 async fn assert_fragmented_meta_control_promotes_to_streaming_deadline(

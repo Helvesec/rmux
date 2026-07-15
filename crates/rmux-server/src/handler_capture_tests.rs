@@ -529,6 +529,66 @@ async fn save_buffer_writes_server_file() {
     let _ = std::fs::remove_file(path);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn save_buffer_waiting_on_fifo_does_not_block_other_requests() {
+    for append in [false, true] {
+        let handler = RequestHandler::new();
+        let path = temp_path(if append {
+            "save-append-fifo"
+        } else {
+            "save-overwrite-fifo"
+        });
+        let output = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .output()
+            .expect("run mkfifo");
+        assert!(
+            output.status.success(),
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        handler
+            .handle(Request::SetBuffer(Box::new(set_buffer_request(
+                "saved",
+                b"fifo data",
+            ))))
+            .await;
+
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            std::fs::read(reader_path).expect("read fifo")
+        });
+        let save_handler = handler.clone();
+        let save_path = path.clone();
+        let save = tokio::spawn(async move {
+            let mut request = save_buffer_request(&save_path, None, "saved");
+            request.append = append;
+            save_handler.handle(Request::SaveBuffer(request)).await
+        });
+
+        let concurrent_response = tokio::time::timeout(Duration::from_millis(500), async {
+            tokio::task::yield_now().await;
+            handler
+                .handle(Request::ListBuffers(ListBuffersRequest::default()))
+                .await
+        })
+        .await
+        .expect("a blocked FIFO write must not stall unrelated daemon requests");
+        assert!(matches!(concurrent_response, Response::ListBuffers(_)));
+
+        let save_response = save.await.expect("save-buffer task should finish");
+        assert!(matches!(save_response, Response::SaveBuffer(_)));
+        assert_eq!(
+            reader.join().expect("FIFO reader should finish"),
+            b"fifo data"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 #[tokio::test]
 async fn save_buffer_resolves_relative_path_against_request_cwd() {
     let handler = RequestHandler::new();

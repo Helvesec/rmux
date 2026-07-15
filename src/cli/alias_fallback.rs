@@ -8,7 +8,9 @@ use rmux_core::{
 };
 use rmux_proto::OptionScopeSelector;
 
-use crate::cli_args::{scan_top_level_command, RuntimeCommandGroup, TopLevelCommandScan};
+use crate::cli_args::{
+    parse, scan_top_level_command, Command, RuntimeCommandGroup, TopLevelCommandScan,
+};
 use crate::cli_response::expect_command_output;
 use crate::command_alias_snapshot::{decode_command_alias_definitions, definition_matches_name};
 use crate::runtime_command_expansion::{
@@ -136,6 +138,16 @@ pub(super) fn runtime_command_resolution_after_startup(
         return Ok(None);
     };
     resolve_runtime_command_with_connection(connection, socket_path, invocation)
+}
+
+/// Parses only the first argv command group so a cold daemon can load aliases
+/// used by later groups before the complete queue is parsed.
+pub(super) fn first_cold_start_command(args: &[OsString]) -> Option<Command> {
+    let (_, invocation) = prepare_runtime_command_invocation(args)?;
+    let first_group = invocation.groups.first()?;
+    let first_args =
+        std::iter::once(OsString::from("rmux")).chain(first_group.iter().map(OsString::from));
+    parse(first_args).ok()?.command
 }
 
 fn prepare_runtime_command_invocation(
@@ -434,6 +446,26 @@ mod tests {
             vec!["display-message".to_owned()],
             vec!["kill-server".to_owned()],
         ]));
+    }
+
+    #[test]
+    fn cold_start_probe_parses_only_the_first_command_group() {
+        let invocation = args(&[
+            "rmux",
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            ";",
+            "runtime-alias",
+        ]);
+        assert!(matches!(
+            first_cold_start_command(&invocation),
+            Some(Command::NewSession(_))
+        ));
+
+        let invalid_first = args(&["rmux", "not-a-command", ";", "new-session", "-d"]);
+        assert!(first_cold_start_command(&invalid_first).is_none());
     }
 
     #[test]

@@ -122,13 +122,20 @@ impl HandlerState {
 
     pub(crate) fn break_pane(
         &mut self,
-        request: BreakPaneRequest,
+        mut request: BreakPaneRequest,
     ) -> Result<BreakPaneResponse, RmuxError> {
         let explicit_name = request.name.is_some();
         let destination_session_name = request.target.as_ref().map_or_else(
             || request.source.session_name().clone(),
             |target| target.session_name().clone(),
         );
+        if request.target.is_none() && !(request.after || request.before) {
+            let destination_index = self.first_available_window_index(&destination_session_name)?;
+            request.target = Some(WindowTarget::with_window(
+                destination_session_name.clone(),
+                destination_index,
+            ));
+        }
         let shares_grouped_window_state = sessions_share_grouped_window_state(
             &self.sessions,
             request.source.session_name(),

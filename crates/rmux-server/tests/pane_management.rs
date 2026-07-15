@@ -11,10 +11,10 @@ use common::{
     PTY_TEST_LOCK,
 };
 use rmux_proto::{
-    KillPaneRequest, LayoutName, ListPanesRequest, NewSessionRequest, NewWindowRequest, PaneTarget,
-    Request, ResizePaneAdjustment, Response, SelectLayoutRequest, SelectLayoutTarget,
-    SelectPaneRequest, SelectWindowRequest, SessionName, SplitWindowRequest, SplitWindowTarget,
-    TerminalSize, WindowTarget,
+    HasSessionRequest, KillPaneRequest, LayoutName, ListPanesRequest, NewSessionExtRequest,
+    NewSessionRequest, NewWindowRequest, PaneTarget, ProcessCommand, Request, ResizePaneAdjustment,
+    Response, SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest, SelectWindowRequest,
+    SessionName, SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
 };
 
 #[tokio::test]
@@ -559,5 +559,71 @@ async fn killing_the_last_pane_in_the_only_window_removes_the_session_over_the_s
     drop(client);
     wait_for_socket_removal(&socket_path).await?;
     drop(handle);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pty_eof_before_child_exit_eventually_removes_the_session() -> Result<(), Box<dyn Error>> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let harness = TestHarness::new("pty-eof-before-child-exit");
+    let socket_path = harness.socket_path().to_path_buf();
+    let handle = start_server(&harness).await?;
+    let mut client = ClientConnection::connect(&socket_path).await?;
+
+    let keeper = client
+        .send_request(&Request::NewSession(NewSessionRequest {
+            session_name: session_name("keeper"),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await?;
+    assert!(matches!(keeper, Response::NewSession(_)));
+
+    let delayed = session_name("delayed-exit");
+    let created = client
+        .send_request(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(delayed.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: Some(ProcessCommand::Argv(vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "printf x; exec sleep 1 </dev/null >/dev/null 2>&1".to_owned(),
+            ])),
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await?;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let response = client
+            .send_request(&Request::HasSession(HasSessionRequest {
+                target: delayed.clone(),
+            }))
+            .await?;
+        if response == Response::HasSession(rmux_proto::HasSessionResponse { exists: false }) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("session survived after its PTY closed and child exited".into());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    handle.shutdown().await?;
     Ok(())
 }

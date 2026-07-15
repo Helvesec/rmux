@@ -1,13 +1,17 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use super::pane_group_transfer_tests::create_grouped_session;
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::pane_io::AttachControl;
 use rmux_core::{command_parser::CommandParser, LifecycleEvent};
 use rmux_proto::{
-    ClientTerminalContext, ControlMode, KillSessionRequest, KillWindowRequest, NewSessionRequest,
-    NewWindowRequest, OptionName, RenameSessionRequest, Request, Response, ScopeSelector,
-    SessionName, SetOptionMode, TerminalSize, WaitForMode, WaitForRequest, WindowTarget,
+    ClientTerminalContext, ControlMode, JoinPaneRequest, KillPaneRequest, KillSessionRequest,
+    KillWindowRequest, MoveWindowRequest, MoveWindowTarget, NewSessionRequest, NewWindowRequest,
+    OptionName, PaneKillRequest, PaneTarget, PaneTargetRef, RenameSessionRequest, Request,
+    Response, ScopeSelector, SessionName, SetOptionMode, SplitDirection, TerminalSize, WaitForMode,
+    WaitForRequest, WindowTarget,
 };
 use tokio::sync::mpsc;
 
@@ -193,6 +197,296 @@ fn assert_has_no_exit(events: &[ControlServerEvent]) {
             .any(|event| matches!(event, ControlServerEvent::Exit(_))),
         "control client must stay open, got {events:?}"
     );
+}
+
+fn assert_control_switched_to(events: &[ControlServerEvent], expected: &SessionName) {
+    assert_has_no_exit(events);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ControlServerEvent::SessionChanged(Some(session_name)) if session_name == expected
+        )),
+        "control client must switch to {expected}, got {events:?}"
+    );
+}
+
+async fn set_detach_on_destroy(handler: &RequestHandler, session_name: &SessionName, value: &str) {
+    handler
+        .state
+        .lock()
+        .await
+        .options
+        .set(
+            ScopeSelector::Session(session_name.clone()),
+            OptionName::DetachOnDestroy,
+            value.to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("detach-on-destroy value is valid");
+}
+
+#[tokio::test]
+async fn control_destroy_switch_honors_each_detach_on_destroy_policy() {
+    for (case_index, policy, occupied, expected) in [
+        (0_u32, "off", None, "z"),
+        (1, "no-detached", Some("z"), "a"),
+        (2, "previous", None, "a"),
+        (3, "next", None, "z"),
+    ] {
+        let handler = RequestHandler::new();
+        let alpha = session_name(&format!("a-{case_index}"));
+        let middle = session_name(&format!("m-{case_index}"));
+        let zulu = session_name(&format!("z-{case_index}"));
+        for session_name in [&alpha, &zulu, &middle] {
+            new_session(&handler, session_name).await;
+        }
+        set_detach_on_destroy(&handler, &middle, policy).await;
+        let subject_pid = 43_000 + case_index * 2;
+        let mut subject_events =
+            register_control_session(&handler, subject_pid, middle.clone()).await;
+        let _ = drain_control_events(&mut subject_events);
+        let mut occupied_events = match occupied {
+            Some("z") => {
+                Some(register_control_session(&handler, subject_pid + 1, zulu.clone()).await)
+            }
+            Some(other) => panic!("unexpected occupied-session marker {other}"),
+            None => None,
+        };
+        if let Some(events) = occupied_events.as_mut() {
+            let _ = drain_control_events(events);
+        }
+
+        let response = dispatch_as(
+            &handler,
+            subject_pid,
+            Request::KillSession(KillSessionRequest {
+                target: middle,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }),
+        )
+        .await;
+        assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+
+        let expected = match expected {
+            "a" => &alpha,
+            "z" => &zulu,
+            other => panic!("unexpected target marker {other}"),
+        };
+        assert_control_switched_to(&drain_control_events(&mut subject_events), expected);
+        let active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get(&subject_pid)
+            .expect("destroy switch preserves control client");
+        assert_eq!(active.session_name.as_ref(), Some(expected));
+        assert!(!active.closing.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn no_detached_uses_one_destroy_snapshot_for_control_and_attach() {
+    let handler = RequestHandler::new();
+    let source = session_name("dual-destroy-source");
+    let beta = session_name("dual-destroy-beta");
+    let gamma = session_name("dual-destroy-gamma");
+    for session_name in [&source, &beta, &gamma] {
+        new_session(&handler, session_name).await;
+    }
+    set_detach_on_destroy(&handler, &source, "no-detached").await;
+
+    let control_pid = 43_050;
+    let mut control_events = register_control_session(&handler, control_pid, source.clone()).await;
+    let _ = drain_control_events(&mut control_events);
+    let attach_pid = 43_051;
+    let (attach_tx, mut attach_events) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, source.clone(), attach_tx)
+        .await;
+
+    let response = dispatch_as(
+        &handler,
+        control_pid,
+        Request::KillPane(KillPaneRequest {
+            target: PaneTarget::with_window(source, 0, 0),
+            kill_all_except: false,
+        }),
+    )
+    .await;
+    assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+    assert_control_switched_to(&drain_control_events(&mut control_events), &gamma);
+    let attach_target = std::iter::from_fn(|| attach_events.try_recv().ok()).find_map(|event| {
+        if let AttachControl::Switch(target) = event {
+            Some(target)
+        } else {
+            None
+        }
+    });
+    assert_eq!(
+        attach_target.as_ref().map(|target| &target.session_name),
+        Some(&gamma),
+        "control and interactive clients must use the same pre-destroy detached target"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    assert_eq!(
+        active_attach
+            .by_pid
+            .get(&attach_pid)
+            .map(|active| &active.session_name),
+        Some(&gamma)
+    );
+}
+
+#[tokio::test]
+async fn pane_kill_entry_paths_rehome_control_before_session_closed() {
+    for by_id in [false, true] {
+        let handler = RequestHandler::new();
+        let suffix = if by_id { "by-id" } else { "target" };
+        let survivor = session_name(&format!("pane-destroy-survivor-{suffix}"));
+        let destroyed = session_name(&format!("pane-destroy-source-{suffix}"));
+        new_session(&handler, &survivor).await;
+        new_session(&handler, &destroyed).await;
+        set_detach_on_destroy(&handler, &destroyed, "off").await;
+        let requester_pid = if by_id { 43_101 } else { 43_100 };
+        let mut events = register_control_session(&handler, requester_pid, destroyed.clone()).await;
+        let _ = drain_control_events(&mut events);
+        let pane_id = handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&destroyed)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .expect("initial pane exists")
+            .id();
+        let request = if by_id {
+            Request::PaneKill(PaneKillRequest {
+                target: PaneTargetRef::by_id(destroyed, pane_id),
+                kill_all_except: false,
+            })
+        } else {
+            Request::KillPane(KillPaneRequest {
+                target: PaneTarget::with_window(destroyed, 0, 0),
+                kill_all_except: false,
+            })
+        };
+
+        let response = dispatch_as(&handler, requester_pid, request).await;
+        assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+        assert_control_switched_to(&drain_control_events(&mut events), &survivor);
+    }
+}
+
+#[tokio::test]
+async fn pane_transfer_rehomes_control_before_source_session_closed() {
+    let handler = RequestHandler::new();
+    let destination = session_name("control-join-destination");
+    let source = session_name("control-join-source");
+    new_session(&handler, &destination).await;
+    new_session(&handler, &source).await;
+    set_detach_on_destroy(&handler, &source, "off").await;
+    let requester_pid = 43_200;
+    let mut events = register_control_session(&handler, requester_pid, source.clone()).await;
+    let _ = drain_control_events(&mut events);
+
+    let response = dispatch_as(
+        &handler,
+        requester_pid,
+        Request::JoinPane(JoinPaneRequest {
+            source: PaneTarget::with_window(source.clone(), 0, 0),
+            target: PaneTarget::with_window(destination.clone(), 0, 0),
+            direction: SplitDirection::Vertical,
+            detached: true,
+            before: false,
+            full_size: false,
+            size: None,
+        }),
+    )
+    .await;
+    assert!(matches!(response, Response::JoinPane(_)), "{response:?}");
+    assert!(handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&source)
+        .is_none());
+    assert_control_switched_to(&drain_control_events(&mut events), &destination);
+}
+
+#[tokio::test]
+async fn move_window_rehomes_control_before_source_session_closed() {
+    let handler = RequestHandler::new();
+    let destination = session_name("control-move-window-destination");
+    let source = session_name("control-move-window-source");
+    new_session(&handler, &destination).await;
+    new_session(&handler, &source).await;
+    set_detach_on_destroy(&handler, &source, "off").await;
+    let requester_pid = 43_201;
+    let mut events = register_control_session(&handler, requester_pid, source.clone()).await;
+    let _ = drain_control_events(&mut events);
+
+    let response = dispatch_as(
+        &handler,
+        requester_pid,
+        Request::MoveWindow(MoveWindowRequest {
+            source: Some(WindowTarget::with_window(source.clone(), 0)),
+            target: MoveWindowTarget::Window(WindowTarget::with_window(destination.clone(), 1)),
+            renumber: false,
+            kill_destination: false,
+            detached: true,
+            after: false,
+            before: false,
+        }),
+    )
+    .await;
+    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
+    assert!(handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&source)
+        .is_none());
+    assert_control_switched_to(&drain_control_events(&mut events), &destination);
+}
+
+#[tokio::test]
+async fn kill_group_rehomes_controls_from_every_destroyed_alias() {
+    let handler = RequestHandler::new();
+    let survivor = session_name("control-group-survivor");
+    let owner = session_name("control-group-owner");
+    new_session(&handler, &survivor).await;
+    new_session(&handler, &owner).await;
+    let peer = create_grouped_session(&handler, "control-group-peer", &owner).await;
+    set_detach_on_destroy(&handler, &owner, "off").await;
+    set_detach_on_destroy(&handler, &peer, "off").await;
+    let mut owner_events = register_control_session(&handler, 43_300, owner.clone()).await;
+    let mut peer_events = register_control_session(&handler, 43_301, peer.clone()).await;
+    let _ = drain_control_events(&mut owner_events);
+    let _ = drain_control_events(&mut peer_events);
+
+    let response = dispatch_as(
+        &handler,
+        43_300,
+        Request::KillSession(KillSessionRequest {
+            target: owner.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: true,
+        }),
+    )
+    .await;
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    let state = handler.state.lock().await;
+    assert!(state.sessions.session(&owner).is_none());
+    assert!(state.sessions.session(&peer).is_none());
+    drop(state);
+    assert_control_switched_to(&drain_control_events(&mut owner_events), &survivor);
+    assert_control_switched_to(&drain_control_events(&mut peer_events), &survivor);
 }
 
 #[tokio::test]

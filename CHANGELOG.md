@@ -14,9 +14,19 @@
   pinned end to end (a real child process carrying the environment) by
   [display-message requester tests](crates/rmux-server/src/handler_display_message_tests.rs).
 - Executes every command of a root mouse binding sequence
-  (`select-pane -t = \; run-shell ...`) from a live attach, including the
-  `run-shell` tail, backed by
+  (`select-pane -t = \; run-shell ...`), including the `run-shell` tail, once a
+  decoded mouse event reaches the live-attach dispatcher, backed by
   [mouse binding sequence tests](crates/rmux-server/src/handler_send_keys_tests/live_attach.rs).
+  For the issue #96 outer-tmux input shape on Windows, a client whose inherited
+  parent is tmux now forwards a fully drained batch made exclusively of complete,
+  bounded SGR mouse frames instead of classifying it as pasted text. A native
+  Windows 10 build 19045 test injects that batch atomically through a real attach
+  and observes the live mouse-binding sentinel in
+  [the nested-mouse regression](tests/windows_nested_mouse_issue96.rs). Mixed,
+  fragmented, malformed, bracketed-paste, non-tmux, and multi-batch input remains
+  fail-closed. This does not claim that Windows 10 ConPTY now propagates mouse
+  DECSET for RMUX-in-RMUX nesting: a separate native probe still received no SGR
+  `KEY_EVENT` data because the enable did not reach the outer pane.
   Note that `run-shell` executes in the daemon's working directory, so
   relative redirection targets land there.
 - Adds `Pane::foreground_state_with_revision` to the Rust SDK so best-effort
@@ -38,9 +48,11 @@
   [format oracle tests](tests/formats.rs),
   [target/format matrix tests](tests/acceptance_target_format_matrix.rs), and
   [CLI matrix tests](tests/acceptance_cli_matrix.rs).
-- Matches tmux 3.7b source-file and startup config edge cases including CRLF,
-  BOM, nested includes, gpakosz/oh-my-tmux corpus handling, and parse-only
-  modes, backed by
+- Handles source-file and startup config edge cases including BOM, nested
+  includes, gpakosz/oh-my-tmux corpus handling, and parse-only modes. RMUX
+  deliberately normalizes CRLF and lone CR to LF before lexing, including
+  inside quoted text; this is a portability behavior rather than byte-identical
+  tmux 3.7b parity. Backed by
   [source-file oracle tests](tests/unix_source_file_tmux_oracle.rs) and
   [source/config matrix tests](tests/acceptance_source_config_matrix.rs).
 - Matches tmux 3.7b hook lifecycle, status rendering, root mouse bindings,
@@ -104,17 +116,20 @@
   (10 s), reached only when the addressed pane genuinely never registers.
   Backed by
   [the deferred-pane session-scope test](tests/windows_terminal_matrix.rs).
-- Delivers OSC 52 clipboard writes from panes to the outer terminal on Windows:
-  under `set-clipboard on` an application's OSC 52 write now reaches the outer
-  terminal's clipboard and is stored in a paste buffer (kept for a detached
-  client, shown in `list-buffers`, and firing the pane-set-clipboard hook after
-  the buffer is stored so the hook can read the new content via
-  `#{buffer_sample}`), while the `external` default and `off` create nothing so
-  untrusted pane output cannot drive the clipboard — matching tmux's on-only
-  gate on application clipboard writes; `set-buffer -w` also reaches the outer
-  clipboard on Windows now. This advertises the clipboard (OSC 52) capability
-  for every Windows attach. Two behaviour changes ship on every platform so the
-  daemon matches the tmux 3.7b oracle exactly: under the `external` default a
+- Emits OSC 52 clipboard writes from panes toward the outer terminal on
+  Windows: under `set-clipboard on` an application's write is sent through the
+  attach path and stored in a paste buffer (kept for a detached client, shown
+  in `list-buffers`, and firing the pane-set-clipboard hook after the buffer is
+  stored so the hook can read the new content via `#{buffer_sample}`), while
+  the `external` default and `off` create nothing so untrusted pane output
+  cannot drive the clipboard — matching tmux's on-only gate on application
+  clipboard writes. `set-buffer -w` uses the same outbound OSC 52 path. RMUX
+  advertises that capability for every Windows attach, but effective system
+  clipboard delivery is host-dependent: Windows 10 build 19045 and other
+  pre-22621 ConPTY paths can consume OSC 52 before the outer terminal sees it.
+  Neither path is therefore claimed to update the system clipboard on every
+  Windows host. Two behaviour changes ship on every platform so the daemon
+  matches the tmux 3.7b oracle exactly: under the `external` default a
   pane's OSC 52 write no longer reaches the outer clipboard on Unix (tmux drops
   external pane-origin OSC 52 writes; use `set -g set-clipboard on` to restore
   forwarding to the outer and start creating paste buffers), and malformed or
@@ -181,8 +196,10 @@
   the server gone, and an `attach-session` that is final or has no terminal
   tail still performs the normal terminal attach instead of being dropped,
   backed by [queued attach flow tests](tests/cli_attach_flow.rs).
-- Closes control-mode output immediately with `%exit` on input EOF while
-  retaining the requester's identity and permissions long enough to finish
+- Closes plain `-C` control-mode output immediately with `%exit` on input EOF
+  while `-CC` keeps an attached session alive through its final pane output,
+  matching tmux 3.7b control-control lifecycle semantics. Plain control mode
+  retains the requester's identity and permissions long enough to finish
   already accepted finite automation. Frames that would wait indefinitely are
   cancelled, shutdown still wins, and a replacement client with the same PID
   cannot overtake the detached drain. tmux 3.7b instead drops later queued
@@ -218,18 +235,21 @@
 - Kept native Windows daemon upgrade, shell launch, queued quoting, input, Ctrl,
   mouse, and package smokes in the release gate so Windows regressions remain
   review-blocking.
-- Integrated the 0.8.1 Windows attach hardening into the 0.9.0 line, including
-  PowerShell profile-preserving shell startup, startup render recovery, lossless
-  attach overflow handling, and detached control delivery under terminal
-  backpressure.
+- Integrated post-0.8.0 Windows attach hardening, first released in 0.9.0,
+  including PowerShell profile-preserving shell startup, startup render
+  recovery, lossless attach overflow handling, and detached control delivery
+  under terminal backpressure.
 - Documented the detached RPC 0.9.0 wire policy as exact-versioned and added
   fuzz coverage for the detached frame decoder.
 - Bumped the detached RPC frame envelope from wire version 3 to 5 across the
   0.9.0 SDK pane-state/pane-option boundary (wire 4) and explicit initial
   control-command framing boundary (wire 5), while retaining the wire-4
-  compatibility fixture ledger. This is a hard cut: clients and SDKs must use
-  the matching 0.9.0 daemon, and an already-running older server must be
-  restarted during upgrade.
+  compatibility fixture ledger. This is a hard cut for ordinary RPCs: clients
+  and SDKs must use the matching 0.9.0 daemon; an
+  already-running older server must be
+  restarted during upgrade. As a shutdown-recovery exception, the listener
+  accepts only the published wire 1–3 zero-sized `kill-server` frames; no other
+  legacy request bypasses the exact-version decoder.
 - Locked SDK armed waits behind capabilities, including the Windows 250ms
   post-ACK settle and the documented best-effort cancellation transport.
 

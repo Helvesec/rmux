@@ -28,6 +28,13 @@ use crate::pane_io;
 use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
 
+mod legacy_shutdown;
+
+use legacy_shutdown::{
+    encode_legacy_kill_server_response, inspect_legacy_kill_server_frame, LegacyKillServerFrame,
+    PublishedLegacyWireVersion,
+};
+
 const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 const DETACHED_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -190,9 +197,11 @@ async fn serve_connection(
     loop {
         tokio::select! {
             request = conn.read_request() => {
-                let Some(request) = request? else {
+                let Some(incoming_request) = request? else {
                     return Ok(());
                 };
+                let legacy_kill_server_wire = incoming_request.legacy_kill_server_wire;
+                let request = incoming_request.request;
                 let Some(access_mode) = handler.access_mode_for_peer(&requester) else {
                     conn.write_response(&Response::Error(ErrorResponse {
                         error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),
@@ -299,6 +308,7 @@ async fn serve_connection(
                     .then(|| handler.begin_attach_forwarder());
                 let pending_control = if let Some(control_upgrade) = outcome.control.take() {
                     let initial_command_count = control_upgrade.initial_command_count as usize;
+                    let control_mode = control_upgrade.mode;
                     let (server_event_tx, server_event_rx) =
                         tokio::sync::mpsc::channel::<ControlServerEvent>(
                             control::CONTROL_SERVER_EVENT_CAPACITY,
@@ -330,6 +340,7 @@ async fn serve_connection(
                     };
                     Some((
                         initial_command_count,
+                        control_mode,
                         server_event_rx,
                         closing,
                         control_id,
@@ -338,8 +349,14 @@ async fn serve_connection(
                     None
                 };
 
-                if let Err(error) = conn.write_response(&outcome.response).await {
-                    if let Some((_, _, _, control_id)) = pending_control.as_ref() {
+                let response_result = match (legacy_kill_server_wire, &outcome.response) {
+                    (Some(wire_version), Response::KillServer(_)) => {
+                        conn.write_legacy_kill_server_response(wire_version).await
+                    }
+                    _ => conn.write_response(&outcome.response).await,
+                };
+                if let Err(error) = response_result {
+                    if let Some((_, _, _, _, control_id)) = pending_control.as_ref() {
                         handler.finish_control(requester.pid, *control_id).await;
                     }
                     drop(detached_request_guard.take());
@@ -423,6 +440,7 @@ async fn serve_connection(
                 }
                 if let Some((
                     initial_command_count,
+                    control_mode,
                     server_event_rx,
                     closing,
                     control_id,
@@ -435,7 +453,11 @@ async fn serve_connection(
                         stream,
                         Arc::clone(&handler),
                         ControlClientIdentity::new(requester.pid, control_id),
-                        ControlUpgradeInput::new(buffered_bytes, initial_command_count),
+                        ControlUpgradeInput::with_mode(
+                            buffered_bytes,
+                            initial_command_count,
+                            control_mode,
+                        ),
                         shutdown,
                         server_event_rx,
                         ControlLifecycle {
@@ -654,6 +676,27 @@ struct Connection {
     read_buffer: [u8; 8192],
 }
 
+struct IncomingRequest {
+    request: Request,
+    legacy_kill_server_wire: Option<PublishedLegacyWireVersion>,
+}
+
+impl IncomingRequest {
+    fn current(request: Request) -> Self {
+        Self {
+            request,
+            legacy_kill_server_wire: None,
+        }
+    }
+
+    fn legacy_kill_server(wire_version: PublishedLegacyWireVersion) -> Self {
+        Self {
+            request: Request::KillServer(rmux_proto::KillServerRequest),
+            legacy_kill_server_wire: Some(wire_version),
+        }
+    }
+}
+
 impl Connection {
     fn new(stream: LocalStream) -> Self {
         Self {
@@ -663,15 +706,24 @@ impl Connection {
         }
     }
 
-    async fn read_request(&mut self) -> io::Result<Option<Request>> {
+    async fn read_request(&mut self) -> io::Result<Option<IncomingRequest>> {
         loop {
-            match self.decoder.next_frame::<Request>() {
-                Ok(Some(request)) => return Ok(Some(request)),
-                Ok(None) => {}
-                Err(error) => {
-                    let response = Response::Error(ErrorResponse { error });
-                    self.write_response(&response).await?;
-                    return Ok(None);
+            match inspect_legacy_kill_server_frame(self.decoder.remaining_bytes()) {
+                LegacyKillServerFrame::Complete(wire_version) => {
+                    self.decoder = FrameDecoder::new();
+                    return Ok(Some(IncomingRequest::legacy_kill_server(wire_version)));
+                }
+                LegacyKillServerFrame::Incomplete => {}
+                LegacyKillServerFrame::NotLegacyKillServer => {
+                    match self.decoder.next_frame::<Request>() {
+                        Ok(Some(request)) => return Ok(Some(IncomingRequest::current(request))),
+                        Ok(None) => {}
+                        Err(error) => {
+                            let response = Response::Error(ErrorResponse { error });
+                            self.write_response(&response).await?;
+                            return Ok(None);
+                        }
+                    }
                 }
             }
 
@@ -686,9 +738,21 @@ impl Connection {
 
     async fn write_response(&mut self, response: &Response) -> io::Result<()> {
         let frame = encode_response_frame(response).map_err(io::Error::other)?;
+        self.write_frame(&frame).await
+    }
+
+    async fn write_legacy_kill_server_response(
+        &mut self,
+        wire_version: PublishedLegacyWireVersion,
+    ) -> io::Result<()> {
+        let frame = encode_legacy_kill_server_response(wire_version);
+        self.write_frame(&frame).await
+    }
+
+    async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         tokio::time::timeout(
             DETACHED_RESPONSE_WRITE_TIMEOUT,
-            self.stream.write_all(&frame),
+            self.stream.write_all(frame),
         )
         .await
         .map_err(|_| {
@@ -1169,6 +1233,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn published_legacy_kill_server_frames_dispatch_and_ack_shutdown() -> io::Result<()> {
+        for wire_version in 1..=3 {
+            let handler = Arc::new(RequestHandler::new());
+            let (server, mut client) = LocalStream::pair()?;
+            let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(());
+            let (shutdown_handle, shutdown_request_rx) = ShutdownHandle::new();
+            handler.install_shutdown_handle(shutdown_handle.clone());
+            let requester = PeerIdentity {
+                pid: std::process::id(),
+                uid: rmux_os::identity::real_user_id(),
+                user: rmux_os::identity::UserIdentity::Uid(rmux_os::identity::real_user_id()),
+            };
+            let connection_id = handler.allocate_connection_id();
+            let connection_handler = Arc::clone(&handler);
+            let connection_task = tokio::spawn(async move {
+                run_connection_with_cleanup(
+                    server,
+                    requester,
+                    connection_handler,
+                    connection_id,
+                    connection_shutdown_rx,
+                    shutdown_handle,
+                )
+                .await
+            });
+
+            let frame = raw_legacy_kill_server_frame(wire_version);
+            for byte in frame {
+                client.write_all(&[byte]).await?;
+                tokio::task::yield_now().await;
+            }
+
+            let mut response = [0_u8; 10];
+            client.read_exact(&mut response).await?;
+            assert_eq!(response[0], rmux_proto::RMUX_FRAME_MAGIC);
+            assert_eq!(response[1], wire_version);
+            assert_eq!(&response[2..6], &4_u32.to_le_bytes());
+            assert_eq!(&response[6..], &63_u32.to_le_bytes());
+
+            tokio::time::timeout(Duration::from_secs(2), shutdown_request_rx)
+                .await
+                .expect("legacy kill-server should request daemon shutdown")
+                .expect("shutdown receiver should complete cleanly");
+            drop(client);
+            let _ = connection_shutdown_tx.send(());
+            connection_task.await.expect("connection task")?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_envelope_exception_rejects_non_kill_and_unpublished_frames() -> io::Result<()> {
+        let mut other_request = raw_legacy_kill_server_frame(3);
+        other_request[6..10].copy_from_slice(&71_u32.to_le_bytes());
+
+        let mut trailing_payload = raw_legacy_kill_server_frame(3);
+        trailing_payload[2..6].copy_from_slice(&5_u32.to_le_bytes());
+        trailing_payload.push(0);
+
+        let unpublished_wire = raw_legacy_kill_server_frame(4);
+
+        for frame in [other_request, trailing_payload, unpublished_wire] {
+            let (server, mut client) = LocalStream::pair()?;
+            let mut connection = Connection::new(server);
+            let read_task = tokio::spawn(async move { connection.read_request().await });
+            client.write_all(&frame).await?;
+
+            let response = read_test_response(&mut client).await?;
+            assert!(matches!(
+                response,
+                Response::Error(ErrorResponse {
+                    error: RmuxError::UnsupportedWireVersion { .. },
+                })
+            ));
+            assert!(read_task.await.expect("read task")?.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn read_request_sends_framed_error_for_unsupported_wire_version() -> io::Result<()> {
         let (server, mut client) = LocalStream::pair()?;
         let mut connection = Connection::new(server);
@@ -1234,7 +1378,13 @@ mod tests {
         let request = tokio::time::timeout(Duration::from_secs(5), connection.read_request())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read_request timed out"))??;
-        assert!(matches!(request, Some(Request::AttachSession(_))));
+        assert!(matches!(
+            request,
+            Some(IncomingRequest {
+                request: Request::AttachSession(_),
+                legacy_kill_server_wire: None,
+            })
+        ));
         let (mut stream, buffered_bytes) = connection.into_raw_parts();
         let mut stream_remainder = Vec::new();
         stream.read_to_end(&mut stream_remainder).await?;
@@ -1369,6 +1519,13 @@ mod tests {
             channel: channel.to_owned(),
             mode,
         })
+    }
+
+    fn raw_legacy_kill_server_frame(wire_version: u8) -> Vec<u8> {
+        let mut frame = vec![rmux_proto::RMUX_FRAME_MAGIC, wire_version];
+        frame.extend_from_slice(&4_u32.to_le_bytes());
+        frame.extend_from_slice(&72_u32.to_le_bytes());
+        frame
     }
 
     async fn write_test_request(stream: &mut LocalStream, request: Request) -> io::Result<()> {

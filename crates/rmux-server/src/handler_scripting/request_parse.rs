@@ -53,7 +53,7 @@ use super::session_parse::{
 };
 use super::shell_parse::{parse_if_shell, parse_run_shell, parse_wait_for};
 use super::targets::resolve_queue_target_arguments;
-use super::tokens::CommandTokens;
+use super::tokens::{normalize_compact_short_options, CommandTokens};
 use super::window_parse::{
     parse_kill_window, parse_link_window, parse_move_window, parse_new_window, parse_rename_window,
     parse_resize_window, parse_respawn_window, parse_rotate_window, parse_swap_window,
@@ -113,6 +113,7 @@ pub(super) fn parse_queue_invocation(
     let command_name = command.name().to_owned();
     if matches!(command_name.as_str(), "bind-key" | "set-hook") {
         let arguments = command_arguments_with_blocks_as_strings(command.arguments());
+        let arguments = normalize_compact_short_options(&command_name, arguments);
         let arguments = if command_name == "set-hook" {
             resolve_queue_target_arguments(&command_name, arguments, sessions, find_context)?
         } else {
@@ -133,6 +134,7 @@ pub(super) fn parse_queue_invocation(
         "display-menu" | "menu" | "display-popup" | "popup"
     ) {
         let arguments = command_arguments_with_blocks_as_strings(command.arguments());
+        let arguments = normalize_compact_short_options(&command_name, arguments);
         let arguments =
             resolve_queue_target_arguments(&command_name, arguments, sessions, find_context)?;
         if let Some(command) =
@@ -141,12 +143,12 @@ pub(super) fn parse_queue_invocation(
             return Ok(QueueInvocation::Overlay(command));
         }
     }
-    let arguments = resolve_queue_target_arguments(
+    let arguments = normalize_compact_short_options(
         &command_name,
         command_arguments_as_strings(&command_name, command.arguments())?,
-        sessions,
-        find_context,
-    )?;
+    );
+    let arguments =
+        resolve_queue_target_arguments(&command_name, arguments, sessions, find_context)?;
     let arguments = tmux_precedence::normalize_tmux_precedence(&command_name, arguments);
     if matches!(command_name.as_str(), "set-option" | "set-window-option") {
         let force_window = command_name == "set-window-option";
@@ -205,6 +207,7 @@ pub(crate) fn parse_request_from_parts(
     options: &OptionStore,
     find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
+    let arguments = normalize_compact_short_options(&command_name, arguments);
     let arguments = tmux_precedence::normalize_tmux_precedence(&command_name, arguments);
     let args = CommandTokens::new(arguments);
     match command_name.as_str() {
@@ -312,14 +315,22 @@ fn parse_no_argument_request(args: CommandTokens, command: &str) -> Result<Reque
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmux_proto::{PaneTarget, ScopeSelector, SetEnvironmentMode};
+    use rmux_proto::{PaneTarget, ScopeSelector, SessionName, SetEnvironmentMode, TerminalSize};
 
     fn parse_request(command: &str, args: &[&str]) -> Request {
+        parse_request_with_sessions(command, args, &SessionStore::default())
+    }
+
+    fn parse_request_with_sessions(
+        command: &str,
+        args: &[&str],
+        sessions: &SessionStore,
+    ) -> Request {
         parse_request_from_parts(
             command.to_owned(),
             args.iter().map(|arg| (*arg).to_owned()).collect(),
             None,
-            &SessionStore::default(),
+            sessions,
             &OptionStore::default(),
             &TargetFindContext::new(None),
         )
@@ -367,6 +378,77 @@ mod tests {
         assert_eq!(request.mode, Some(SetEnvironmentMode::Unset));
         assert_eq!(request.name, "AUDIT_VAR");
         assert!(request.value.is_empty());
+    }
+
+    #[test]
+    fn compact_short_options_reach_server_request_parsers_for_boolean_flags() {
+        // Measured against tmux 3.7b on 2026-07-15: `capture-pane -ep`,
+        // `show-messages -JT`, `show-environment -gs`, `attach-session -dr`,
+        // and `rotate-window -DZ` all pass command-option parsing.
+        let mut sessions = SessionStore::new();
+        sessions
+            .create_session(
+                SessionName::new("alpha").expect("valid session name"),
+                TerminalSize { cols: 80, rows: 24 },
+            )
+            .expect("session create succeeds");
+
+        let Request::CapturePane(request) =
+            parse_request_with_sessions("capture-pane", &["-ep", "-t", "alpha:0.0"], &sessions)
+        else {
+            panic!("capture-pane compact flags should parse as CapturePane");
+        };
+        assert!(request.escape_ansi);
+        assert!(request.print);
+
+        let Request::ShowMessages(request) = parse_request("show-messages", &["-JT"]) else {
+            panic!("show-messages compact flags should parse as ShowMessages");
+        };
+        assert!(request.jobs);
+        assert!(request.terminals);
+
+        let Request::ShowEnvironment(request) = parse_request("show-environment", &["-gs", "PATH"])
+        else {
+            panic!("show-environment compact flags should parse as ShowEnvironment");
+        };
+        assert_eq!(request.scope, ScopeSelector::Global);
+        assert!(request.shell_format);
+
+        let Request::AttachSessionExt2(request) = parse_request("attach-session", &["-dr"]) else {
+            panic!("attach-session compact flags should parse as AttachSessionExt2");
+        };
+        assert!(request.detach_other_clients);
+        assert!(request.read_only);
+
+        let Request::RotateWindow(request) =
+            parse_request_with_sessions("rotate-window", &["-DZ", "-t", "alpha:0"], &sessions)
+        else {
+            panic!("rotate-window compact flags should parse as RotateWindow");
+        };
+        assert_eq!(request.direction, rmux_proto::RotateWindowDirection::Down);
+        assert!(request.restore_zoom);
+    }
+
+    #[test]
+    fn compact_short_options_reach_server_request_parsers_for_value_flags() {
+        // Measured against tmux 3.7b on 2026-07-15: run-shell accepts values
+        // attached to both `-c` and `-t`.
+        let Request::RunShell(request) = parse_request(
+            "run-shell",
+            &["-ccompact-dir", "-talpha:0.0", "printf compact"],
+        ) else {
+            panic!("run-shell compact value flags should parse as RunShell");
+        };
+
+        assert_eq!(
+            request.start_directory.as_deref(),
+            Some(std::path::Path::new("compact-dir"))
+        );
+        assert_eq!(
+            request.target.as_ref().map(ToString::to_string).as_deref(),
+            Some("alpha:0.0")
+        );
+        assert_eq!(request.command, "printf compact");
     }
 
     #[test]

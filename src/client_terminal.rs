@@ -35,12 +35,11 @@ fn apply_windows_terminal_features(context: &mut ClientTerminalContext, is_windo
     push_unique_terminal_feature(&mut context.terminal_features, "sync");
     push_unique_terminal_feature(&mut context.terminal_features, "bpaste");
     push_unique_terminal_feature(&mut context.terminal_features, "mouse");
-    // Advertise clipboard (OSC 52) too: Windows Terminal sets the system
-    // clipboard from OSC 52 natively, and any VT outer that does not simply
-    // ignores the sequence. Without it the daemon has no Ms template, so a
-    // pane's OSC 52 under `set-clipboard on` never reaches the outer (issue
-    // #91). Whether inbound OSC 52 is actually relayed still depends on
-    // set-clipboard being `on`, which is enforced daemon-side.
+    // Advertise clipboard (OSC 52) too so the daemon has an Ms template and can
+    // emit a pane's write under `set-clipboard on` (issue #91). Actual system
+    // clipboard delivery remains host-dependent: older ConPTY paths can consume
+    // OSC 52 before the outer terminal sees it, and an outer may ignore it. The
+    // inbound relay still depends on the daemon-side `set-clipboard on` gate.
     push_unique_terminal_feature(&mut context.terminal_features, "clipboard");
     // utf8 stays gated: Windows Terminal is known UTF-8, while other outers
     // are inferred from the console code page / locale elsewhere.

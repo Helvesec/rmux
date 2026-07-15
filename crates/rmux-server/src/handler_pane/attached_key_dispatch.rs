@@ -158,7 +158,9 @@ impl RequestHandler {
             }
 
             let prefix_match = matches_prefix_key(lookup_key, prefix_key, prefix2_key);
-            if table_name == default_table && prefix_match {
+            // tmux gives prefix/prefix2 precedence over every current table.
+            // Keep an already-active prefix table so its send-prefix binding runs.
+            if table_name != PREFIX_TABLE && prefix_match {
                 (
                     default_table,
                     prefix_key,

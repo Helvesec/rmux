@@ -7,7 +7,7 @@ use rmux_proto::{
     MoveWindowRequest, MoveWindowResponse, MoveWindowTarget, SessionId, SessionName, WindowTarget,
 };
 
-use super::super::attach_support::surviving_attached_resize_targets;
+use super::super::attach_support::{surviving_attached_resize_targets, SessionDetachOnDestroy};
 use super::super::{
     defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event,
     prepare_lifecycle_event_if_enabled, DeferredLifecycleEvent, QueuedLifecycleEvent,
@@ -22,7 +22,12 @@ pub(super) struct MoveWindowEffects {
     resize_window_ids: Vec<WindowId>,
     hook_snapshot: HookStore,
     unlinked_candidates: Vec<WindowUnlinkedCandidate>,
-    deferred_closed_sessions: Vec<(SessionName, SessionId, DeferredLifecycleEvent)>,
+    deferred_closed_sessions: Vec<(
+        SessionName,
+        SessionId,
+        SessionDetachOnDestroy,
+        DeferredLifecycleEvent,
+    )>,
 }
 
 pub(super) struct PreparedMoveWindowEffects {
@@ -38,6 +43,7 @@ enum PreparedLifecycleEffect {
     Closed {
         session_name: SessionName,
         session_id: SessionId,
+        detach_on_destroy: SessionDetachOnDestroy,
         event: QueuedLifecycleEvent,
     },
 }
@@ -104,6 +110,7 @@ impl MoveWindowEffects {
                 Some((
                     session_name.clone(),
                     session_id,
+                    SessionDetachOnDestroy::capture(state, session_name),
                     defer_lifecycle_event(state, &event),
                 ))
             })
@@ -180,18 +187,22 @@ impl MoveWindowEffects {
             .collect::<Vec<_>>();
         let mut deferred_closed_by_session = deferred_closed_sessions
             .into_iter()
-            .map(|(session_name, session_id, deferred)| (session_name, (session_id, deferred)))
+            .map(|(session_name, session_id, detach_on_destroy, deferred)| {
+                (session_name, (session_id, detach_on_destroy, deferred))
+            })
             .collect::<HashMap<_, _>>();
         let mut closed_sessions = Vec::new();
         for session_name in ordered_closed_sessions(&removed_sessions, source_session_name.as_ref())
         {
-            let Some((session_id, deferred)) = deferred_closed_by_session.remove(&session_name)
+            let Some((session_id, detach_on_destroy, deferred)) =
+                deferred_closed_by_session.remove(&session_name)
             else {
                 continue;
             };
             closed_sessions.push((
                 session_name,
                 session_id,
+                detach_on_destroy,
                 prepare_deferred_lifecycle_event(state, &mut hook_snapshot, deferred),
             ));
         }
@@ -236,23 +247,35 @@ impl MoveWindowEffects {
 
 impl RequestHandler {
     pub(super) async fn finish_move_window_effects(&self, effects: PreparedMoveWindowEffects) {
-        let removed_identities = effects
+        let removed_attached_identities = effects
             .lifecycle_events
             .iter()
             .filter_map(|effect| match effect {
                 PreparedLifecycleEffect::Closed {
                     session_name,
                     session_id,
+                    detach_on_destroy,
                     ..
-                } => Some((session_name.clone(), *session_id)),
+                } => Some((session_name.clone(), *session_id, *detach_on_destroy)),
                 PreparedLifecycleEffect::Unlinked(_) => None,
             })
+            .collect::<Vec<_>>();
+        let removed_identities = removed_attached_identities
+            .iter()
+            .map(|(session_name, session_id, _)| (session_name.clone(), *session_id))
             .collect::<Vec<_>>();
         let resize_window_ids = effects.resize_window_ids;
         let mut refresh_sessions = effects.refresh_sessions;
         if let Some(event) = effects.linked_event {
             self.pause_before_window_lifecycle_emit().await;
             self.emit_prepared(event).await;
+        }
+        let mut prepared_attached_switches = HashMap::new();
+        for (session_name, session_id, detach_on_destroy) in &removed_attached_identities {
+            let prepared = self
+                .rehome_control_session_identity(session_name, *session_id, *detach_on_destroy)
+                .await;
+            prepared_attached_switches.insert(*session_id, prepared);
         }
         for effect in effects.lifecycle_events {
             match effect {
@@ -262,6 +285,7 @@ impl RequestHandler {
                 PreparedLifecycleEffect::Closed {
                     session_name,
                     session_id,
+                    detach_on_destroy: _,
                     event,
                 } => {
                     self.prune_web_session(Some((session_name, session_id)));
@@ -271,11 +295,15 @@ impl RequestHandler {
         }
 
         self.remove_session_leases(&removed_identities);
-        for (session_name, session_id) in &removed_identities {
-            self.exit_attached_session_identity(session_name, *session_id)
-                .await;
-            self.cancel_session_silence_timers(session_name).await;
-            self.refresh_control_session(session_name).await;
+        for (session_name, session_id, detach_on_destroy) in removed_attached_identities {
+            if let Some(prepared) = prepared_attached_switches.remove(&session_id) {
+                self.exit_prepared_attached_session_identity(prepared).await;
+            } else {
+                self.exit_attached_session_identity(&session_name, session_id, detach_on_destroy)
+                    .await;
+            }
+            self.cancel_session_silence_timers(&session_name).await;
+            self.refresh_control_session(&session_name).await;
         }
         let resize_targets = {
             let state = self.state.lock().await;
@@ -326,7 +354,12 @@ fn ordered_closed_sessions(
 
 fn order_lifecycle_effects(
     mut unlinked: Vec<(SessionName, QueuedLifecycleEvent)>,
-    mut closed: Vec<(SessionName, SessionId, QueuedLifecycleEvent)>,
+    mut closed: Vec<(
+        SessionName,
+        SessionId,
+        SessionDetachOnDestroy,
+        QueuedLifecycleEvent,
+    )>,
     source_session_name: Option<&SessionName>,
     removed_sessions: &[SessionName],
 ) -> Vec<PreparedLifecycleEffect> {
@@ -343,7 +376,7 @@ fn order_lifecycle_effects(
     take_unlinked_effect(&mut unlinked, source_session_name, &mut ordered);
     let other_closed_sessions = closed
         .iter()
-        .map(|(session_name, _, _)| session_name.clone())
+        .map(|(session_name, _, _, _)| session_name.clone())
         .filter(|session_name| session_name != source_session_name)
         .collect::<Vec<_>>();
     for session_name in other_closed_sessions {
@@ -371,13 +404,18 @@ fn take_unlinked_effect(
 }
 
 fn take_closed_effect(
-    events: &mut Vec<(SessionName, SessionId, QueuedLifecycleEvent)>,
+    events: &mut Vec<(
+        SessionName,
+        SessionId,
+        SessionDetachOnDestroy,
+        QueuedLifecycleEvent,
+    )>,
     session_name: &SessionName,
     ordered: &mut Vec<PreparedLifecycleEffect>,
 ) {
     let Some(index) = events
         .iter()
-        .position(|(candidate, _, _)| candidate == session_name)
+        .position(|(candidate, _, _, _)| candidate == session_name)
     else {
         return;
     };
@@ -391,11 +429,17 @@ fn unlinked_effect(
 }
 
 fn closed_effect(
-    (session_name, session_id, event): (SessionName, SessionId, QueuedLifecycleEvent),
+    (session_name, session_id, detach_on_destroy, event): (
+        SessionName,
+        SessionId,
+        SessionDetachOnDestroy,
+        QueuedLifecycleEvent,
+    ),
 ) -> PreparedLifecycleEffect {
     PreparedLifecycleEffect::Closed {
         session_name,
         session_id,
+        detach_on_destroy,
         event,
     }
 }

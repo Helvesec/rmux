@@ -389,7 +389,7 @@ async fn incomplete_palette_like_user_input_resolves_on_escape_timeout() {
 }
 
 #[tokio::test]
-async fn uncorrelated_palette_response_preserves_modal_decoder_bytes() {
+async fn uncorrelated_palette_response_is_discarded_without_disturbing_modal_input() {
     let handler = RequestHandler::new();
     let alpha = session_name("palette-modal-uncorrelated");
     let requester_pid = std::process::id();
@@ -403,26 +403,156 @@ async fn uncorrelated_palette_response_preserves_modal_decoder_bytes() {
     let response = b"\x1b]4;10;rgb:1111/2222/3333\x07";
     let mut input = response.to_vec();
     input.extend_from_slice(b"TAIL");
-    // The established prompt behavior consumes the leading ESC as prompt
-    // cancellation and reroutes every remaining byte. A missing query slot
-    // must not make the OSC splitter consume, rewrite, or reorder that input.
-    let expected = &input[1..];
+    handler
+        .handle_attached_live_input_for_test(requester_pid, &input)
+        .await
+        .expect("uncorrelated response is discarded before prompt decoding");
+    let prompt = handler
+        .attached_prompt_render(requester_pid)
+        .await
+        .expect("prompt remains active");
+    assert_eq!(prompt.input, "TAIL");
+}
+
+#[tokio::test]
+async fn second_fanout_palette_response_cannot_close_an_attached_modal_surface() {
+    for surface in [
+        PaletteModalSurface::Prompt,
+        PaletteModalSurface::ModeTree,
+        PaletteModalSurface::Overlay,
+        PaletteModalSurface::DisplayPanes,
+    ] {
+        let handler = RequestHandler::new();
+        let alpha = session_name(&format!("palette-fanout-{}", surface.name()));
+        let first_pid = std::process::id().saturating_add(10);
+        let second_pid = std::process::id().saturating_add(11);
+        create_send_keys_test_session(&handler, &alpha).await;
+        let mut control_receivers = Vec::new();
+        for pid in [first_pid, second_pid] {
+            let (control_tx, control_rx) = mpsc::unbounded_channel();
+            let _attach_id = handler
+                .register_attach(pid, alpha.clone(), control_tx)
+                .await;
+            control_receivers.push(control_rx);
+        }
+        register_palette_query(&handler, &alpha, b"\x1b]4;7;?\x07").await;
+        activate_surface(&handler, second_pid, surface).await;
+
+        let response = b"\x1b]4;7;rgb:1111/2222/3333\x07";
+        let mut first_pending = Vec::new();
+        handler
+            .handle_attached_live_input(first_pid, &mut first_pending, response)
+            .await
+            .expect("first fanout response consumes the shared query slot");
+        let mut second_pending = Vec::new();
+        handler
+            .handle_attached_live_input(second_pid, &mut second_pending, response)
+            .await
+            .expect("second fanout response is discarded safely");
+        assert!(first_pending.is_empty());
+        assert!(second_pending.is_empty());
+        assert_surface_active(&handler, second_pid, surface).await;
+        drop(control_receivers);
+    }
+}
+
+#[tokio::test]
+async fn pane_bound_terminal_string_stays_opaque_across_modal_fragmentation() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("palette-modal-opaque-dcs");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    register_palette_query(&handler, &alpha, b"\x1b]4;7;?\x07").await;
+    activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
+
+    let response = b"\x1b]4;7;rgb:1111/2222/3333\x07";
+    let mut dcs = b"\x1bP1+rprefix=".to_vec();
+    dcs.extend_from_slice(response);
+    dcs.extend_from_slice(b"suffix\x1b\\");
+    let mut expected = dcs.clone();
+    expected.extend_from_slice(response);
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "palette-modal-opaque-dcs", expected.len())
+            .await;
+
+    let split = dcs.len() - 1;
+    let mut pending = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending, &dcs[..split])
+        .await
+        .expect("partial DCS is retained as one terminal string");
+    assert_eq!(pending, dcs[..split]);
+    assert_surface_active(&handler, requester_pid, PaletteModalSurface::Prompt).await;
+
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending, &dcs[split..])
+        .await
+        .expect("complete DCS bypasses modal key decoding");
+    assert!(pending.is_empty());
+    assert_surface_active(&handler, requester_pid, PaletteModalSurface::Prompt).await;
+
+    // The OSC 4 bytes nested in the DCS must not steal the query token. The
+    // real outer-terminal response still correlates and reaches the pane.
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending, response)
+        .await
+        .expect("real palette response consumes the live query token");
+    assert_surface_active(&handler, requester_pid, PaletteModalSurface::Prompt).await;
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
+}
+
+#[tokio::test]
+async fn pane_bound_terminal_string_stays_opaque_after_modal_transition() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("palette-modal-opaque-reroute");
+    let requester_pid = std::process::id();
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    register_palette_query(&handler, &alpha, b"\x1b]4;9;?\x07").await;
+    activate_surface(&handler, requester_pid, PaletteModalSurface::Prompt).await;
+
+    let response = b"\x1b]4;9;rgb:1111/2222/3333\x07";
+    let mut dcs = b"\x1bP1+rprefix=".to_vec();
+    dcs.extend_from_slice(response);
+    dcs.extend_from_slice(b"suffix\x1b\\");
+    let mut expected = dcs.clone();
+    expected.extend_from_slice(response);
     let capture = RawPaneInputProbe::start(
         &handler,
         &alpha,
-        "palette-modal-uncorrelated",
+        "palette-modal-opaque-reroute",
         expected.len(),
     )
     .await;
 
+    let mut input = vec![b'\x1b'];
+    input.extend_from_slice(&dcs);
+    let mut pending = Vec::new();
     handler
-        .handle_attached_live_input_for_test(requester_pid, &input)
+        .handle_attached_live_input(requester_pid, &mut pending, &input)
         .await
-        .expect("uncorrelated response follows the established prompt path");
-    let active_attach = handler.active_attach.lock().await;
-    assert!(active_attach.by_pid[&requester_pid].prompt.is_none());
-    drop(active_attach);
+        .expect("modal closes before the pane-bound terminal string reroutes");
+    assert!(pending.is_empty());
+    assert!(handler
+        .attached_prompt_render(requester_pid)
+        .await
+        .is_none());
+
+    // The ordinary live-input reroute must preserve the DCS boundary too.
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending, response)
+        .await
+        .expect("nested response did not consume the real query token");
 
     capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, expected).await;
+    capture.assert_contents(&handler, &expected).await;
 }

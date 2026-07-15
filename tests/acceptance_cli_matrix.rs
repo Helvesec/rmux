@@ -257,6 +257,89 @@ fn cold_start_config_alias_respects_no_start_server() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn cold_start_config_alias_applies_to_later_command_group() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("cold-start-later-command-alias")?;
+    let config = harness.tmpdir().join("cold-start-alias.conf");
+    fs::write(
+        &config,
+        "set-option -s command-alias[20] 'probe=display-message -p OK'\n",
+    )?;
+
+    let output = harness.run([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("hold"),
+        OsStr::new(";"),
+        OsStr::new("probe"),
+    ])?;
+
+    assert_success(&output)?;
+    assert_eq!(String::from_utf8(output.stdout)?, "OK\n");
+    assert!(output.stderr.is_empty());
+    harness.success(["has-session", "-t", "hold"])?;
+    Ok(())
+}
+
+#[test]
+fn cold_start_later_alias_respects_no_start_server() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("cold-start-later-alias-no-server")?;
+    let config = harness.tmpdir().join("cold-start-alias.conf");
+    fs::write(
+        &config,
+        "set-option -s command-alias[20] 'probe=display-message -p forbidden'\n",
+    )?;
+
+    let output = harness.run([
+        OsStr::new("-N"),
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("forbidden"),
+        OsStr::new(";"),
+        OsStr::new("probe"),
+    ])?;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!harness
+        .run(["-N", "has-session", "-t", "forbidden"])?
+        .status
+        .success());
+    Ok(())
+}
+
+#[test]
+fn cold_start_unknown_later_command_is_not_partially_dispatched() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("cold-start-unknown-later-command")?;
+    let config = harness.tmpdir().join("cold-start.conf");
+    fs::write(&config, "set-option -g status off\n")?;
+
+    let output = harness.run([
+        OsStr::new("-f"),
+        config.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("must-not-exist"),
+        OsStr::new(";"),
+        OsStr::new("not-a-command"),
+    ])?;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!harness
+        .run(["-N", "has-session", "-t", "must-not-exist"])?
+        .status
+        .success());
+    Ok(())
+}
+
+#[test]
 fn runtime_command_aliases_are_not_expanded_twice() -> Result<(), Box<dyn Error>> {
     let harness = AcceptanceHarness::new("runtime-command-alias-single-expansion")?;
     harness.success(["new-session", "-d", "-s", "alpha"])?;

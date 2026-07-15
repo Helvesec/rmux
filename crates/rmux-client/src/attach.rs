@@ -31,6 +31,8 @@ mod screen;
 mod terminal;
 #[path = "attach/terminal_cleanup.rs"]
 mod terminal_cleanup;
+#[path = "attach/termination.rs"]
+mod termination;
 
 use render_drain::{drain_available_attach_stream, flush_pending_render};
 #[cfg(test)]
@@ -39,6 +41,7 @@ use resize::{terminal_geometry_from_fd, ResizeWatcher, SignalMaskGuard};
 use screen::{AttachScreenTracker, AttachStopDetector, AttachStopGeneration};
 use terminal::current_process_pid;
 pub use terminal::{AttachError, RawTerminal, Result};
+use termination::AttachTerminationGuard;
 
 #[cfg(test)]
 use terminal_cleanup::fallback_attach_stop_sequence;
@@ -131,6 +134,7 @@ where
     Input: Read + AsFd + Send + 'static,
     Output: Write + Send + 'static,
 {
+    let termination_guard = AttachTerminationGuard::install().map_err(ClientError::Io)?;
     let raw_terminal = RawTerminal::from_fd(terminal).map_err(ClientError::from)?;
     let _ = raw_terminal.flush_pending_input();
     let screen_tracker = AttachScreenTracker::default();
@@ -141,6 +145,7 @@ where
         raw_terminal: &raw_terminal,
         screen_tracker: &screen_tracker,
         resize_geometry_enabled,
+        termination_signals_enabled: true,
     };
     let result = drive_attach_with_terminal_state(attach_state, input, output);
     if result.is_err() && !screen_tracker.was_stopped() {
@@ -148,6 +153,7 @@ where
     }
     let _ = raw_terminal.flush_pending_input();
     drop(raw_terminal);
+    termination_guard.finish().map_err(ClientError::Io)?;
     result
 }
 
@@ -158,6 +164,7 @@ struct AttachTerminalState<'a, Terminal> {
     raw_terminal: &'a RawTerminal,
     screen_tracker: &'a AttachScreenTracker,
     resize_geometry_enabled: bool,
+    termination_signals_enabled: bool,
 }
 
 struct AttachStreamState<'a> {
@@ -167,6 +174,7 @@ struct AttachStreamState<'a> {
     screen_tracker: AttachScreenTracker,
     resize_events: mpsc::Receiver<TerminalGeometry>,
     resize_geometry_enabled: bool,
+    termination_signals_enabled: bool,
 }
 
 struct AttachInputReadLease<'a> {
@@ -222,6 +230,7 @@ where
         screen_tracker: state.screen_tracker.clone(),
         resize_events: resize_rx,
         resize_geometry_enabled: state.resize_geometry_enabled,
+        termination_signals_enabled: state.termination_signals_enabled,
     };
     let attach_result = drive_attach_stream_inner(stream_state, input, output);
     drop(resize_watcher);
@@ -247,6 +256,7 @@ where
         screen_tracker: AttachScreenTracker::default(),
         resize_events,
         resize_geometry_enabled: false,
+        termination_signals_enabled: false,
     };
     drive_attach_stream_inner(stream_state, input, output)
 }
@@ -286,7 +296,7 @@ where
     let output_screen_tracker = state.screen_tracker.clone();
     let action_screen_tracker = state.screen_tracker.clone();
     let output_thread = thread::spawn(move || {
-        let result = output_loop(
+        let result = output_loop_with_termination(
             state.stream,
             state.initial_bytes,
             output,
@@ -294,6 +304,7 @@ where
             output_locked,
             output_screen_tracker,
             event_tx.clone(),
+            state.termination_signals_enabled,
         );
         let _ = event_tx.send(ClientAttachEvent::OutputDone);
         result
@@ -412,7 +423,33 @@ where
     }
 }
 
+#[cfg(test)]
 fn output_loop<Output>(
+    stream: UnixStream,
+    initial_bytes: Vec<u8>,
+    output: Output,
+    closed: Arc<AtomicBool>,
+    locked: Arc<AttachLockState>,
+    screen_tracker: AttachScreenTracker,
+    event_tx: mpsc::Sender<ClientAttachEvent>,
+) -> std::result::Result<(), ClientError>
+where
+    Output: Write,
+{
+    output_loop_with_termination(
+        stream,
+        initial_bytes,
+        output,
+        closed,
+        locked,
+        screen_tracker,
+        event_tx,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn output_loop_with_termination<Output>(
     mut stream: UnixStream,
     initial_bytes: Vec<u8>,
     mut output: Output,
@@ -420,6 +457,7 @@ fn output_loop<Output>(
     locked: Arc<AttachLockState>,
     screen_tracker: AttachScreenTracker,
     event_tx: mpsc::Sender<ClientAttachEvent>,
+    termination_signals_enabled: bool,
 ) -> std::result::Result<(), ClientError>
 where
     Output: Write,
@@ -435,6 +473,7 @@ where
     let mut data_scratch = [0_u8; READ_BUFFER_SIZE];
 
     loop {
+        fail_if_attach_termination_requested(termination_signals_enabled)?;
         loop {
             while let Some(bytes) = decoder
                 .next_data_payload_into(&mut data_scratch)
@@ -614,7 +653,9 @@ where
             painted_render_frame = true;
         }
 
-        let bytes_read = match stream.read(&mut read_buffer) {
+        let read_result =
+            read_attach_stream(&mut stream, &mut read_buffer, termination_signals_enabled);
+        let bytes_read = match read_result {
             Ok(0) => {
                 closed.store(true, Ordering::SeqCst);
                 if screen_tracker.was_stopped() {
@@ -660,6 +701,55 @@ where
             decoder.push_bytes(&read_buffer[consumed..bytes_read]);
         }
     }
+}
+
+fn read_attach_stream(
+    stream: &mut UnixStream,
+    read_buffer: &mut [u8],
+    termination_signals_enabled: bool,
+) -> io::Result<usize> {
+    if !termination_signals_enabled {
+        return stream.read(read_buffer);
+    }
+
+    loop {
+        if termination::was_requested() {
+            return Err(attach_termination_error());
+        }
+        let mut fds = [PollFd::new(
+            &*stream,
+            PollFlags::IN | PollFlags::ERR | PollFlags::HUP,
+        )];
+        match poll(&mut fds, Some(&POLL_TIMEOUT)) {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+        if termination::was_requested() {
+            return Err(attach_termination_error());
+        }
+        if fds[0].revents().is_empty() {
+            continue;
+        }
+        return stream.read(read_buffer);
+    }
+}
+
+fn fail_if_attach_termination_requested(
+    termination_signals_enabled: bool,
+) -> std::result::Result<(), ClientError> {
+    if termination_signals_enabled && termination::was_requested() {
+        return Err(ClientError::Io(attach_termination_error()));
+    }
+    Ok(())
+}
+
+fn attach_termination_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "attach interrupted by a termination signal",
+    )
 }
 
 fn handle_attach_data_payload<Output>(

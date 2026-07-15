@@ -187,7 +187,6 @@ pub(crate) enum DeferredInitialPaneConsoleInputAction {
     Key(WindowsConsoleKeyEvent),
     KeyThenInterrupt(WindowsConsoleKeyEvent),
     Interrupt,
-    Noop,
 }
 
 #[cfg(windows)]

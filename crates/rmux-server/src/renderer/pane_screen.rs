@@ -14,6 +14,8 @@ use crate::format_runtime::RuntimeFormatContext;
 
 use super::{cursor_position_bytes, visible_pane_geometry, StatusGeometry};
 
+const OSC8_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
+
 pub(crate) fn render_pane_screen(
     session: &Session,
     options: &OptionStore,
@@ -359,11 +361,14 @@ pub(crate) fn truncate_rendered_pane_line(line: &[u8], width: usize, utf8: &Utf8
 
     let mut output = Vec::with_capacity(line.len().min(width.saturating_mul(4)));
     let mut visible_copied = 0_usize;
+    let mut hyperlink_active = false;
     index = 0;
     while index < line.len() {
         if line[index] == 0x1b {
             let end = ansi_sequence_end(line, index);
-            output.extend_from_slice(&line[index..end]);
+            let sequence = &line[index..end];
+            update_osc8_state(sequence, &mut hyperlink_active);
+            output.extend_from_slice(sequence);
             index = end;
             continue;
         }
@@ -379,6 +384,9 @@ pub(crate) fn truncate_rendered_pane_line(line: &[u8], width: usize, utf8: &Utf8
         visible_copied += ch_len;
         index += ch_len;
     }
+    if hyperlink_active {
+        output.extend_from_slice(OSC8_CLOSE);
+    }
     output
 }
 
@@ -386,10 +394,13 @@ fn truncate_rendered_ascii_pane_line(line: &[u8], width: usize, utf8: &Utf8Confi
     let mut output = Vec::with_capacity(line.len().min(width.saturating_mul(4)));
     let mut used = 0_usize;
     let mut index = 0_usize;
+    let mut hyperlink_active = false;
     while index < line.len() {
         if line[index] == 0x1b {
             let end = ansi_sequence_end(line, index);
-            output.extend_from_slice(&line[index..end]);
+            let sequence = &line[index..end];
+            update_osc8_state(sequence, &mut hyperlink_active);
+            output.extend_from_slice(sequence);
             index = end;
             continue;
         }
@@ -404,7 +415,31 @@ fn truncate_rendered_ascii_pane_line(line: &[u8], width: usize, utf8: &Utf8Confi
         used = used.saturating_add(cell_width);
         index += 1;
     }
+    if hyperlink_active {
+        output.extend_from_slice(OSC8_CLOSE);
+    }
     output
+}
+
+fn update_osc8_state(sequence: &[u8], active: &mut bool) {
+    if !sequence.starts_with(b"\x1b]8;") {
+        return;
+    }
+    let body_end = if sequence.ends_with(b"\x07") {
+        sequence.len().saturating_sub(1)
+    } else if sequence.ends_with(b"\x1b\\") {
+        sequence.len().saturating_sub(2)
+    } else {
+        return;
+    };
+    let Some(separator) = sequence[4..body_end]
+        .iter()
+        .position(|byte| *byte == b';')
+        .map(|offset| offset + 4)
+    else {
+        return;
+    };
+    *active = separator.saturating_add(1) < body_end;
 }
 
 fn ansi_sequence_end(line: &[u8], start: usize) -> usize {

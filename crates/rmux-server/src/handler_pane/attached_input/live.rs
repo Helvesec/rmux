@@ -19,9 +19,16 @@ use super::super::pane_io_encoding::{
 use super::super::pane_prompt_input::{
     decode_utf8_char, is_extended_key_prefix, is_utf8_lead_byte, utf8_expected_len,
 };
-use super::bracketed_paste::{decode_bracketed_paste_after_append, BracketedPasteDecode};
+use super::bracketed_paste::{
+    decode_bracketed_paste_after_append, take_incomplete_bracketed_paste_segment,
+    BracketedPasteDecode,
+};
 use super::kitty_graphics::{decode_kitty_graphics_apc_after_append, KittyGraphicsApcDecode};
-use super::palette_response::{ModalPaletteInput, ModalPaletteInputSegment};
+use super::palette_response::{
+    decode_pane_bound_terminal_string, ModalPaletteInput, ModalPaletteInputSegment,
+    PaneBoundTerminalStringDecode,
+};
+use super::retained::MAX_RETAINED_ATTACHED_CONTROL_INPUT;
 use super::terminal_response::{
     decode_attached_terminal_control_after_append, decode_focus_event, TerminalControlEvent,
     TerminalResponseDecode,
@@ -516,6 +523,13 @@ impl RequestHandler {
                     });
                 }
                 BracketedPasteDecode::Partial => {
+                    if pending_input.len() > MAX_RETAINED_ATTACHED_CONTROL_INPUT {
+                        let _ = self.exit_clock_mode(&target).await.map_err(io_other)?;
+                        return Ok(AttachedLiveInputStep::Reroute {
+                            bytes: std::mem::take(pending_input),
+                            forwarded: false,
+                        });
+                    }
                     retain_partial_attached_control_input(
                         "clock mode bracketed paste",
                         pending_input,
@@ -668,6 +682,16 @@ impl RequestHandler {
                         forwarded_to_pane = true;
                     }
                     pending_input.drain(..offset);
+                    if let Some(segment) = take_incomplete_bracketed_paste_segment(
+                        pending_input,
+                        MAX_RETAINED_ATTACHED_CONTROL_INPUT,
+                    ) {
+                        if !target_in_copy_mode {
+                            self.write_attached_bracketed_paste_for_identity(identity, &segment)
+                                .await?;
+                            forwarded_to_pane = true;
+                        }
+                    }
                     retain_partial_attached_control_input("live bracketed paste", pending_input)?;
                     return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                 }
@@ -823,6 +847,43 @@ impl RequestHandler {
                     return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                 }
                 TerminalResponseDecode::NotResponse => {}
+            }
+            match decode_pane_bound_terminal_string(slice) {
+                PaneBoundTerminalStringDecode::Matched { size } => {
+                    if raw_start < offset {
+                        self.write_attached_bytes_for_identity(
+                            identity,
+                            &pending_input[raw_start..offset],
+                        )
+                        .await?;
+                    }
+                    self.write_attached_target_bytes_for_identity(
+                        identity,
+                        &pending_input[offset..offset + size],
+                    )
+                    .await?;
+                    forwarded_to_pane = true;
+                    offset += size;
+                    raw_start = offset;
+                    continue;
+                }
+                PaneBoundTerminalStringDecode::Partial => {
+                    if raw_start < offset {
+                        self.write_attached_bytes_for_identity(
+                            identity,
+                            &pending_input[raw_start..offset],
+                        )
+                        .await?;
+                        forwarded_to_pane = true;
+                    }
+                    pending_input.drain(..offset);
+                    retain_partial_attached_control_input(
+                        "live pane-bound terminal string",
+                        pending_input,
+                    )?;
+                    return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
+                }
+                PaneBoundTerminalStringDecode::NotString => {}
             }
             if is_mouse_prefix(slice) {
                 if raw_start < offset {
@@ -1141,6 +1202,12 @@ impl RequestHandler {
         while let Some(segment) = segments.pop_front() {
             let bytes = match segment {
                 ModalPaletteInputSegment::Input(bytes) => bytes,
+                ModalPaletteInputSegment::PaneBound(bytes) => {
+                    self.write_attached_target_bytes_for_identity(identity, &bytes)
+                        .await?;
+                    forwarded = true;
+                    continue;
+                }
                 ModalPaletteInputSegment::Response { index, bytes } => {
                     if !self
                         .attached_modal_surface_active_for_identity(identity)
@@ -1159,12 +1226,16 @@ impl RequestHandler {
                         .await?
                     {
                         forwarded = true;
-                        continue;
                     }
-                    // No live query slot exists on the current pane. Preserve
-                    // the prior modal behavior byte-for-byte by passing this
-                    // uncorrelated sequence through the surface's decoder.
-                    bytes
+                    // A syntactically valid OSC 4 response is terminal
+                    // protocol input, never a modal keystroke. Matching
+                    // responses reach the pane above; unsolicited, mismatched,
+                    // or duplicate responses are discarded just as they are
+                    // on the ordinary live-input path. Feeding a duplicate
+                    // through a prompt or mode-tree would let its leading ESC
+                    // close the surface after another attached client had
+                    // already consumed the shared query slot.
+                    continue;
                 }
             };
 

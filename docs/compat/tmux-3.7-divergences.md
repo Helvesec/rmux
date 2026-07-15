@@ -56,20 +56,26 @@ the binary behavior is implemented or explicitly absent from RMUX inventory.
 ### C-D11: detached RPC wire is exact-versioned in 0.9.0
 
 RMUX detached RPC is an RMUX extension rather than a tmux surface. For 0.9.0,
-the frame envelope is a hard-cut compatibility boundary: `FrameDecoder` and
-`decode_frame` accept only `RMUX_WIRE_VERSION`. The handshake min/max fields
-are advisory after the current envelope decodes; required capabilities remain
-mandatory feature gates.
+the ordinary frame envelope is a hard-cut compatibility boundary:
+`FrameDecoder` and `decode_frame` accept only `RMUX_WIRE_VERSION`. The
+handshake min/max fields are advisory after the current envelope decodes;
+required capabilities remain mandatory feature gates. A listener-level
+shutdown-recovery exception recognizes only the exact zero-sized `kill-server`
+frames published on wires 1, 2, and 3 and answers on the same wire. Every other
+legacy request remains owned and rejected by the exact-version decoder.
 
 Test/fixture: `crates/rmux-proto/src/codec/tests.rs` rejects unsupported
 wire versions, `crates/rmux-proto/src/capabilities.rs` locks the advisory
 handshake window and mandatory capabilities, and
 `scripts/fuzz/fuzz_targets/detached_frame_decoder.rs` fuzzes the detached
-frame envelope/decoder.
+frame envelope/decoder. `crates/rmux-server/src/listener/legacy_shutdown.rs`
+pins the allowlist to published wire 1–3 `kill-server` frames and rejects
+trailing bytes, other request tags, and unpublished wire values.
 
 Inventory impact: none for tmux command inventory. SDK and daemon clients must
-not imply cross-version wire compatibility unless the envelope range is
-explicitly widened and covered by fixtures.
+not imply cross-version ordinary RPC compatibility unless the envelope range
+is explicitly widened and covered by fixtures; legacy `kill-server` recovery
+is the sole documented exception.
 
 ### C-D12: SDK armed waits use a second best-effort cancel transport
 
@@ -408,7 +414,20 @@ in one batch are bracketed; a paste larger than one `ReadConsoleInputW` batch
 (32 records, 16 characters) is bracketed across batches using the input-buffer
 drain as the end signal, so a mid-paste buffer drain can split one paste into
 adjacent bracketed regions; and a host that exposes mouse input only as SGR
-`KEY_EVENT` bytes loses those mouse events by deliberate fail-close policy.
+`KEY_EVENT` bytes loses those mouse events by deliberate fail-close policy unless
+the inherited parent is tmux and one fully drained batch consists exclusively of
+complete, bounded SGR mouse frames. That narrow exception fixes the issue #96
+outer-tmux input shape without allowing mixed text, fragments, malformed frames,
+bracketed paste, or multi-batch input through as live keys. Win32 record mode
+cannot distinguish that frame from an unbracketed clipboard whose entire content
+is exactly the same valid SGR report; restricting the exception to an outer-tmux
+context and the strict grammar bounds this unavoidable ambiguity.
+
+This exception is distinct from an RMUX-in-RMUX native Windows 10 build 19045
+probe at `a6c2f32f`, where the nested client received no SGR `KEY_EVENT` data at
+all: the mouse DECSET enable did not reach the outer pane, leaving its `mouse_any`
+and `mouse_sgr` modes unset before input decoding. The tmux-parent exception does
+not claim to repair that older-host ConPTY limitation.
 
 Because this can wrap burst-delivered typed text, the daemon strips
 bracketed-paste markers before feeding input to the command prompt on Windows
@@ -419,40 +438,56 @@ body would leak to the pane's shell.
 Test/fixture: `crates/rmux-client/src/attach_windows/input.rs` unit tests cover
 the multi-character burst, the single-character passthrough, the cross-batch
 continuation, the Control-chord exclusion, and embedded-marker stripping; the
-`tests/windows_prompt_overlay_chain.rs` command-prompt chain covers the prompt
-marker stripping.
+SGR-key allowlist and fail-close cases are pinned in the same file.
+`tests/windows_nested_mouse_issue96.rs` atomically injects the reported key batch
+through a native Windows attach and observes the configured binding sentinel;
+`crates/rmux-server/src/handler_send_keys_tests/live_attach.rs` locks post-decode
+binding sequencing, and `tests/windows_prompt_overlay_chain.rs` covers command
+prompt marker stripping.
 
 Inventory impact: bracketed paste is advertised on Windows, but the detection is
 a documented best-effort heuristic rather than terminal-driven bracketing.
+Root mouse binding chaining is guaranteed after a decoded event reaches the
+dispatcher; the narrow native outer-tmux SGR batch path is tested end to end,
+while RMUX-in-RMUX mouse-mode propagation on older ConPTY remains limited as
+described above.
 
-### C-D52: Windows advertises OSC 52 clipboard; inbound clipboard queries are forwarded
+### C-D52: Windows emits OSC 52 while host clipboard delivery is conditional
 
 On Unix tmux advertises the clipboard (Ms) capability from terminfo. Windows has
 no terminfo, so rmux advertises the clipboard (OSC 52) capability for every
-Windows attach: Windows Terminal sets the system clipboard from OSC 52 natively
-and any other VT outer ignores the sequence. Without it the daemon has no Ms
-template and a pane's OSC 52 under set-clipboard on never reaches the outer
-(issue #91).
+Windows attach and emits writes toward the outer terminal. On supported
+Windows Terminal and ConPTY combinations this can update the system clipboard,
+but delivery is host-dependent: Windows 10 build 19045 and other pre-22621
+ConPTY paths can consume OSC 52 before the outer terminal sees it, and a VT
+outer may ignore the sequence. The capability therefore promises an emission
+path, not a system-clipboard side effect on every Windows host. Without it the
+daemon has no Ms template and cannot emit a pane's OSC 52 under
+`set-clipboard on` (issue #91).
 
 Application clipboard writes stay gated on set-clipboard on exactly as tmux gates
 them (input.c input_osc_52 returns early unless set-clipboard == 2): under the
 `external` default an application's inbound OSC 52 creates no paste buffer and is
-not forwarded, so untrusted pane output cannot drive the system clipboard; under
-`on` the write is stored in a paste buffer (paste_add), forwarded to the outer,
-and fires the pane-set-clipboard hook. tmux's own selections (copy-mode yank and
-`set-buffer -w`) keep forwarding under `on` or `external`, and `set-buffer -w`
-forwards even under `off`, unchanged.
+not emitted, so untrusted pane output cannot drive the system clipboard; under
+`on` the write is stored in a paste buffer (paste_add), sent through the outer
+attach path, and fires the pane-set-clipboard hook. tmux's own selections
+(copy-mode yank and `set-buffer -w`) keep requesting outbound emission under
+`on` or `external`, and `set-buffer -w` does so even under `off`, unchanged.
 
 Residual divergence: an application's inbound OSC 52 query (a request of the form
 ESC ] 52 ; c ; ? ) is handled per set-clipboard: under `on` it is forwarded to
 the outer terminal rather than answered from rmux's paste buffer per
 get-clipboard; under the `external` default and `off` it is dropped entirely
 (neither answered nor forwarded). tmux answers the query from the top buffer
-under the default get-clipboard buffer regardless of set-clipboard; honouring
-get-clipboard (none / buffer / external) for inbound pane queries is not yet
-implemented. Malformed OSC 52 writes and empty payloads are dropped rather than
-forwarded verbatim, matching tmux's validate-then-paste_add ordering. Clipboard
-writes — the subject of issue #91 — match tmux.
+under the default get-clipboard `buffer` value regardless of set-clipboard.
+tmux 3.7b and RMUX accept the get-clipboard choices `off`, `buffer`, `request`,
+and `both`, with `buffer` as the default, but RMUX does not currently consume
+that option when handling inbound pane queries. Changing it therefore does not
+alter the set-clipboard-driven behavior above. Malformed OSC 52 writes and
+empty payloads are dropped rather than forwarded verbatim, matching tmux's
+validate-then-paste_add ordering. The server-side gate and emission for issue
+#91 match the measured tmux behavior; the Windows host's clipboard side effect
+remains conditional.
 
 Test/fixture: outer-terminal gate tests in
 `crates/rmux-server/src/outer_terminal/tests.rs`, client and daemon capability
@@ -461,9 +496,10 @@ tests in `src/client_terminal.rs` and
 tests in `crates/rmux-server/src/pane_io/reader.rs` and
 `crates/rmux-server/src/handler_alert_tests.rs`.
 
-Inventory impact: OSC 52 clipboard writes are advertised and honored on Windows
-under set-clipboard on; inbound clipboard queries remain a forward-to-outer
-approximation pending get-clipboard support.
+Inventory impact: OSC 52 clipboard writes are advertised and emitted on Windows
+under set-clipboard on, but system-clipboard delivery is host-dependent;
+get-clipboard is accepted but currently inert for inbound pane queries, which
+remain a set-clipboard-driven forward-to-outer approximation.
 
 ### C-D53: recognized variable-length controls use a streaming idle budget
 
@@ -535,3 +571,21 @@ all partial delimiter suffixes and fixed-point neutralization.
 Inventory impact: mouse and paste support remain advertised, but malformed
 SGR acceptance and timed-out delimiter bytes are intentionally stricter than
 tmux 3.7b.
+
+### C-D56: source-file normalizes CRLF and lone CR before lexing
+
+tmux 3.7b and RMUX differ when configuration text contains carriage returns.
+In probes measured on 2026-07-14, tmux did not execute a command continued with
+backslash-CRLF and preserved CRLF inside quoted text. RMUX normalizes every CRLF
+and lone CR to LF before lexing, including inside quoted text. This makes
+Windows-saved configuration files and line continuations portable, but it is
+not byte-identical tmux parsing.
+
+Test/fixture: `tests/acceptance_source_config_matrix.rs` locks CRLF config
+acceptance, and
+`crates/rmux-server/src/handler_scripting_tests/source_file_core.rs` locks
+CRLF backslash continuations through source-file dispatch.
+
+Inventory impact: source-file support remains advertised, while CRLF and lone
+CR normalization must be described as an RMUX portability behavior rather than
+tmux 3.7b parity.

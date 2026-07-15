@@ -1279,6 +1279,64 @@ async fn break_pane_print_target_uses_custom_format() {
 }
 
 #[tokio::test]
+async fn break_pane_implicit_destination_starts_at_base_index() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("break-base-index");
+
+    let set_base_index = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::BaseIndex,
+            value: "1".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set_base_index, Response::SetOption(_)));
+    create_session(&handler, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let response = handler
+        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
+            source: PaneTarget::with_window(alpha.clone(), 1, 1),
+            target: None,
+            name: None,
+            detached: true,
+            after: false,
+            before: false,
+            print_target: true,
+            format: Some("#{window_index}.#{pane_index}".to_owned()),
+        })))
+        .await;
+
+    let Response::BreakPane(success) = response else {
+        panic!("expected break-pane response, got {response:?}");
+    };
+    assert_eq!(
+        success
+            .command_output()
+            .expect("break-pane -P output")
+            .stdout(),
+        b"2.0\n"
+    );
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session survives");
+    assert_eq!(
+        session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[tokio::test]
 async fn break_pane_print_target_refreshes_automatic_window_name() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-break-name");

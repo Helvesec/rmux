@@ -1,7 +1,11 @@
 use rmux_core::command_parser::CommandParser;
-use rmux_proto::{Response, RmuxError, SetOptionByNameRequest, SetOptionMode, UnbindKeyRequest};
+use rmux_proto::{
+    PaneTarget, Response, RmuxError, SetOptionByNameRequest, SetOptionMode, TerminalGeometry,
+    UnbindKeyRequest, WindowTarget,
+};
 
-use super::super::attach_support::attach_target_for_session;
+use super::super::attach_support::AttachedSwitchCommitRequest;
+use super::super::client_support::SwitchTargetSelection;
 use super::super::control_support::ManagedClient;
 use super::super::prompt_support::substitute_prompt_template;
 use super::super::scripting_support::QueueExecutionContext;
@@ -14,7 +18,6 @@ use super::mode_tree_selection::selected_items;
 use super::{
     CHOOSE_BUFFER_DEFAULT_TEMPLATE, CHOOSE_CLIENT_DEFAULT_TEMPLATE, CHOOSE_TREE_DEFAULT_TEMPLATE,
 };
-use crate::pane_io::AttachControl;
 use crate::pane_terminals::session_not_found;
 
 impl RequestHandler {
@@ -123,8 +126,8 @@ impl RequestHandler {
             pane_index,
             pane_id,
         } = target;
-        {
-            let mut state = self.state.lock().await;
+        let target_selection = {
+            let state = self.state.lock().await;
             let active_attach = self.active_attach.lock().await;
             if active_attach.by_pid.get(&attach_pid).is_none_or(|active| {
                 active.id != expected_attach_id
@@ -150,12 +153,12 @@ impl RequestHandler {
             }
             let session = state
                 .sessions
-                .session_mut(&session_name)
+                .session(&session_name)
                 .ok_or_else(|| session_not_found(&session_name))?;
             if session.id() != session_id {
                 return Err(RmuxError::SessionNotFound(session_name.to_string()));
             }
-            let selected_pane_index = match (
+            match (
                 window_index,
                 window_id,
                 window_occurrence_id,
@@ -176,7 +179,10 @@ impl RequestHandler {
                             "window identity changed before mode-tree selection",
                         ));
                     }
-                    None
+                    Some(SwitchTargetSelection::Window {
+                        target: WindowTarget::with_window(session_name.clone(), window_index),
+                        window_id,
+                    })
                 }
                 (Some(window_index), Some(window_id), Some(_), Some(_), Some(pane_id)) => {
                     let window = session.window_at(window_index).ok_or_else(|| {
@@ -191,57 +197,38 @@ impl RequestHandler {
                             "window identity changed before mode-tree selection",
                         ));
                     }
-                    Some(
-                        window
-                            .panes()
-                            .iter()
-                            .find(|pane| pane.id() == pane_id)
-                            .map(rmux_core::Pane::index)
-                            .ok_or_else(|| {
-                                RmuxError::invalid_target(
-                                    pane_id.to_string(),
-                                    "pane identity changed before mode-tree selection",
-                                )
-                            })?,
-                    )
+                    let pane_index = window
+                        .panes()
+                        .iter()
+                        .find(|pane| pane.id() == pane_id)
+                        .map(rmux_core::Pane::index)
+                        .ok_or_else(|| {
+                            RmuxError::invalid_target(
+                                pane_id.to_string(),
+                                "pane identity changed before mode-tree selection",
+                            )
+                        })?;
+                    Some(SwitchTargetSelection::Pane {
+                        target: PaneTarget::with_window(
+                            session_name.clone(),
+                            window_index,
+                            pane_index,
+                        ),
+                        window_id,
+                        pane_id,
+                        zoom: true,
+                    })
                 }
                 _ => {
                     return Err(RmuxError::Server(
                         "mode-tree target lost its stable identity".to_owned(),
                     ));
                 }
-            };
-            if let Some(window_index) = window_index {
-                session.select_window(window_index)?;
-                if let Some(pane_index) = selected_pane_index {
-                    session.select_pane_in_window(window_index, pane_index)?;
-                }
             }
-        }
-
-        let current_session = {
-            let active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get(&attach_pid)
-                .filter(|active| {
-                    active.id == expected_attach_id
-                        && active.mode_tree_state_id == action_identity.state_id()
-                        && active.mode_tree.is_some()
-                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-                })
-                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            (active.session_name.clone(), active.session_id)
         };
         let refresh_sessions = self
             .dismiss_mode_tree_for_action_identity(action_identity)
             .await?;
-        if current_session == (session_name.clone(), session_id) {
-            for session_name in refresh_sessions {
-                self.refresh_attached_session(&session_name).await;
-            }
-            return Ok(());
-        }
 
         let attached_count = self
             .attached_count_after_switch(
@@ -252,55 +239,41 @@ impl RequestHandler {
                 },
             )
             .await;
-        let terminal_context = {
-            let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .get(&attach_pid)
-                .filter(|active| {
-                    active.id == expected_attach_id
-                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-                })
-                .map(|active| active.terminal_context.clone())
-                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?
-        };
-        let (target, target_session_id) = {
-            let state = self.state.lock().await;
-            let active_attach = self.active_attach.lock().await;
-            if active_attach.by_pid.get(&attach_pid).is_none_or(|active| {
-                active.id != expected_attach_id
-                    || active.closing.load(std::sync::atomic::Ordering::SeqCst)
-            }) {
-                return Err(crate::handler_support::attached_client_required(
-                    "switch-client",
-                ));
-            }
-            let target_session_id = state
-                .sessions
-                .session(&session_name)
-                .filter(|session| session.id() == session_id)
-                .ok_or_else(|| RmuxError::SessionNotFound(session_name.to_string()))?
-                .id();
-            let target = attach_target_for_session(
-                &state,
-                &session_name,
-                attached_count,
-                &terminal_context,
-                &self.socket_path(),
-            )?;
-            (target, target_session_id)
-        };
-        let _ = self
-            .send_attach_control_for_client_and_session_identity(
+        let Some((terminal_context, client_size, client_pixels, render_stream, client_flags)) =
+            self.terminal_context_and_size_for_attached_client_identity(
                 attach_pid,
                 expected_attach_id,
-                AttachControl::switch(target),
-                session_name.clone(),
-                target_session_id,
-                None,
             )
-            .await?;
-        self.emit_client_session_changed(attach_pid, session_name.clone(), target_session_id)
+            .await
+        else {
+            return Err(crate::handler_support::attached_client_required(
+                "switch-client",
+            ));
+        };
+        // The default choose-tree action is `switch-client -Zt`. Commit it
+        // through the same atomic path so target selection, client-size
+        // reconciliation, PTY rollback, and attach identity move together.
+        self.commit_attached_session_switch(
+            attach_pid,
+            expected_attach_id,
+            AttachedSwitchCommitRequest {
+                expected_current_session_id: None,
+                session_name: session_name.clone(),
+                session_id,
+                target_selection,
+                terminal_context,
+                client_geometry: TerminalGeometry {
+                    size: client_size,
+                    pixels: client_pixels,
+                },
+                client_flags,
+                render_stream,
+                attached_count,
+                client_environment: None,
+            },
+        )
+        .await?;
+        self.emit_client_session_changed(attach_pid, session_name.clone(), session_id)
             .await;
         for refresh in refresh_sessions {
             self.refresh_attached_session(&refresh).await;

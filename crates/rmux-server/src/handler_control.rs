@@ -814,6 +814,45 @@ impl RequestHandler {
         .await
     }
 
+    pub(in crate::handler) async fn switch_control_session_after_destroy(
+        &self,
+        requester_pid: u32,
+        expected_control_id: u64,
+        expected_current_session_id: SessionId,
+        target_session_id: SessionId,
+    ) -> Option<rmux_proto::SessionName> {
+        let mut state = self.state.lock().await;
+        let target_session_name = state
+            .sessions
+            .session_by_id(target_session_id)?
+            .name()
+            .clone();
+        let mut active_control = self.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get_mut(&requester_pid)
+            .filter(|active| {
+                active.id == expected_control_id
+                    && active.session_id == Some(expected_current_session_id)
+                    && !active.closing.load(Ordering::SeqCst)
+            })?;
+        let (_, delivered) = update_control_session(
+            active,
+            Some(target_session_name.clone()),
+            Some(target_session_id),
+        );
+        if !delivered {
+            active_control.by_pid.remove(&requester_pid);
+            return None;
+        }
+        state
+            .sessions
+            .session_mut(&target_session_name)
+            .expect("stable destroy-switch target remains locked")
+            .touch_attached();
+        Some(target_session_name)
+    }
+
     async fn set_control_session_with_expected_identity(
         &self,
         requester_pid: u32,
