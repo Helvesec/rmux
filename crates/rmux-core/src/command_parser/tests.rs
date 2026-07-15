@@ -288,6 +288,34 @@ fn expands_variables_and_tilde_at_tokenization_boundary() {
 }
 
 #[test]
+fn current_user_tilde_prefers_home_and_uses_an_explicit_fallback() {
+    let primary = CommandParser::new()
+        .with_environment_value("HOME", "/primary/home")
+        .with_home_dir("/fallback/home")
+        .parse("display-message ~/config")
+        .expect("HOME-backed tilde parses");
+    assert_eq!(
+        primary.commands()[0].arguments()[0].as_string(),
+        Some("/primary/home/config")
+    );
+
+    let empty_home = CommandParser::new()
+        .with_environment_value("HOME", "")
+        .with_home_dir("/fallback/home")
+        .parse("display-message ~/config")
+        .expect("empty HOME uses the explicit fallback");
+    assert_eq!(
+        empty_home.commands()[0].arguments()[0].as_string(),
+        Some("/fallback/home/config")
+    );
+
+    let missing_home = CommandParser::new()
+        .parse("display-message ~/config")
+        .expect_err("tilde without HOME or a fallback must remain an error");
+    assert_eq!(missing_home.to_string(), "unknown user: ~");
+}
+
+#[test]
 fn preserves_bare_marked_target_at_end_of_command() {
     let commands = CommandParser::new()
         .parse("select-pane -t ~")

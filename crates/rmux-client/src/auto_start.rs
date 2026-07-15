@@ -791,14 +791,7 @@ fn spawn_hidden_daemon_for_polling(
     #[cfg(not(windows))]
     {
         let command = hidden_daemon_command(binary_path, socket_path, config, true);
-        match spawn_hidden_daemon(command) {
-            Ok(()) => Ok(()),
-            Err(error) if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) => {
-                let command = hidden_daemon_command(binary_path, socket_path, config, false);
-                spawn_hidden_daemon(command)
-            }
-            Err(error) => Err(error),
-        }
+        spawn_hidden_daemon(command)
     }
 }
 
@@ -811,21 +804,9 @@ fn spawn_hidden_daemon_for_windows(
     let ready = rmux_os::daemon::StartupReadyEvent::new()?;
     let mut command = hidden_daemon_command(binary_path, socket_path, config, true);
     append_startup_ready_event(&mut command, &ready);
-    match spawn_hidden_daemon(command) {
-        Ok(()) => {
-            let _ = ready.wait(STARTUP_READY_EVENT_TIMEOUT);
-            Ok(())
-        }
-        Err(error) if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) => {
-            let ready = rmux_os::daemon::StartupReadyEvent::new()?;
-            let mut command = hidden_daemon_command(binary_path, socket_path, config, false);
-            append_startup_ready_event(&mut command, &ready);
-            spawn_hidden_daemon(command)?;
-            let _ = ready.wait(STARTUP_READY_EVENT_TIMEOUT);
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    spawn_hidden_daemon(command)?;
+    let _ = ready.wait(STARTUP_READY_EVENT_TIMEOUT);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -843,27 +824,9 @@ fn spawn_hidden_daemon_for_linux(
     let mut command =
         hidden_daemon_command_preserving_fd(binary_path, socket_path, config, true, ready.raw_fd());
     ready.append_hidden_daemon_args(&mut command);
-    match spawn_hidden_daemon(command) {
-        Ok(()) => {
-            ready.wait_for_signal(STARTUP_READY_EVENT_TIMEOUT);
-            Ok(())
-        }
-        Err(error) if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) => {
-            let mut ready = StartupReadyEvent::new()?;
-            let mut command = hidden_daemon_command_preserving_fd(
-                binary_path,
-                socket_path,
-                config,
-                false,
-                ready.raw_fd(),
-            );
-            ready.append_hidden_daemon_args(&mut command);
-            spawn_hidden_daemon(command)?;
-            ready.wait_for_signal(STARTUP_READY_EVENT_TIMEOUT);
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    spawn_hidden_daemon(command)?;
+    ready.wait_for_signal(STARTUP_READY_EVENT_TIMEOUT);
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -958,7 +921,7 @@ fn hidden_daemon_command_base(
 }
 
 fn spawn_hidden_daemon(mut command: Command) -> io::Result<()> {
-    let child = rmux_os::daemon::spawn_hidden_daemon_command(&mut command)?;
+    let child = rmux_os::daemon::spawn_hidden_daemon_command_requiring_job_breakaway(&mut command)?;
     // Intentionally drop without `wait()`: the daemon must outlive the
     // short-lived client process that launched it.
     drop(child);

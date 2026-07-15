@@ -65,6 +65,19 @@ impl<'a> PendingAttachInputState<'a> {
     }
 }
 
+pub(super) fn preserves_live_output(
+    current_target: &OpenAttachTarget,
+    next_target: &AttachTarget,
+) -> bool {
+    next_target.is_coalescible_render_refresh()
+        && current_target
+            .pane_output
+            .as_ref()
+            .is_some_and(|current_output| {
+                current_output.shares_pane_source_with(&next_target.pane_output)
+            })
+}
+
 pub(super) fn should_emit_overlay(
     render_generation: u64,
     current_overlay_generation: &mut u64,
@@ -293,16 +306,7 @@ pub(super) async fn apply_pending_attach_controls(
                     Some(control_rx),
                     control_backlog,
                 );
-                let same_pane_source =
-                    current_target
-                        .pane_output
-                        .as_ref()
-                        .is_some_and(|current_output| {
-                            current_output.shares_pane_source_with(&next_target.pane_output)
-                        });
-                let preserve_live_output =
-                    next_target.is_coalescible_render_refresh() && same_pane_source;
-                let drop_live_output = !preserve_live_output;
+                let drop_live_output = !preserves_live_output(current_target, &next_target);
                 if is_stale_persistent_switch(*persistent_overlay_state_id, next_target.as_ref()) {
                     *render_generation = (*render_generation).saturating_add(switch_count);
                     continue;

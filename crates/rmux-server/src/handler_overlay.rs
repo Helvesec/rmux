@@ -18,6 +18,8 @@ use crate::pane_io::{AttachControl, OverlayFrame};
 mod commands;
 #[path = "handler_overlay/interactions.rs"]
 mod interactions;
+#[path = "handler_overlay/interactions_popup_menu.rs"]
+mod interactions_popup_menu;
 #[path = "handler_overlay/parse.rs"]
 mod parse;
 pub(super) use parse::ParsedOverlayCommand;
@@ -495,6 +497,7 @@ impl RequestHandler {
         }
 
         let mut close_overlay = false;
+        let mut popup_resize = None;
         let (resized_session, resized_session_id, ignores_size, client_size_changed) = {
             let mut active_attach = self.active_attach.lock().await;
             let Some(active) = active_attach.by_pid.get(&attach_pid).filter(|active| {
@@ -560,9 +563,10 @@ impl RequestHandler {
                                 .lock()
                                 .expect("popup surface")
                                 .resize(content_size);
-                            if let Some(job) = &popup.job {
-                                let _ = job.resize(content_size);
-                            }
+                            popup_resize = popup
+                                .job
+                                .as_ref()
+                                .and_then(|job| job.enqueue_resize(content_size).ok());
                             if let Some(menu) = popup.nested_menu.as_mut() {
                                 menu.rect.width = menu.rect.width.min(size.cols);
                                 menu.rect.height = menu.rect.height.min(size.rows);
@@ -582,6 +586,9 @@ impl RequestHandler {
                 client_size_changed,
             )
         };
+        if let Some(receipt) = popup_resize {
+            let _ = receipt.wait().await;
+        }
 
         let size_policy = match expected_identity {
             Some(_) => {

@@ -1,14 +1,15 @@
 use super::{
-    attach_support::{AttachRegistration, ClientFlags},
+    attach_support::{AttachRegistration, ClientFlags, ATTACH_CONTROL_BACKLOG_LIMIT},
     scripting_support::format_context_for_target,
     QueuedLifecycleEvent, RequestHandler,
 };
 use crate::format_runtime::render_runtime_template;
-use crate::outer_terminal::OuterTerminalContext;
-use crate::pane_io::AttachControl;
+use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
+use crate::pane_io::{pane_output_channel, AttachControl, AttachTarget};
 use crate::server_access::current_owner_uid;
 use rmux_core::{
-    AlertFlags, PaneId, WINDOW_ACTIVITY, WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE,
+    AlertFlags, OptionStore, PaneGeometry, PaneId, WINDOW_ACTIVITY, WINLINK_ACTIVITY, WINLINK_BELL,
+    WINLINK_SILENCE,
 };
 #[cfg(unix)]
 use rmux_proto::SendKeysRequest;
@@ -719,6 +720,62 @@ async fn drain_attach_controls_until_quiet(
             Ok(None) | Err(_) => return,
         }
     }
+}
+
+async fn register_clipboard_attach(
+    handler: &RequestHandler,
+    attach_pid: u32,
+    session: &SessionName,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let uid = current_owner_uid();
+    handler
+        .register_attach_with_access(
+            attach_pid,
+            session.clone(),
+            None,
+            AttachRegistration {
+                control_tx,
+                control_backlog: Arc::new(AtomicUsize::new(0)),
+                closing: Arc::new(AtomicBool::new(false)),
+                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
+                terminal_context: OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+                flags: ClientFlags::default(),
+                render_stream: false,
+                uid,
+                user: rmux_os::identity::UserIdentity::Uid(uid),
+                can_write: true,
+                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            },
+        )
+        .await
+        .expect("clipboard attach registration succeeds");
+    control_rx
+}
+
+fn clipboard_alert(session: SessionName, pane_id: PaneId) -> crate::pane_io::PaneAlertEvent {
+    crate::pane_io::PaneAlertEvent {
+        session_name: session,
+        pane_id,
+        bell_count: 0,
+        title_changed: false,
+        title_change: None,
+        clipboard_set: true,
+        clipboard_writes: vec![b"A".to_vec()],
+        mouse_mode_changed: false,
+        queue_activity_alert: false,
+        generation: None,
+    }
+}
+
+fn drain_clipboard_writes(receiver: &mut mpsc::UnboundedReceiver<AttachControl>) -> Vec<Vec<u8>> {
+    let mut writes = Vec::new();
+    while let Ok(control) = receiver.try_recv() {
+        if let AttachControl::Write(bytes) = control {
+            writes.push(bytes);
+        }
+    }
+    writes
 }
 
 #[tokio::test]
@@ -1549,6 +1606,284 @@ async fn inbound_osc52_write_creates_no_buffer_without_set_clipboard_on() {
     assert!(
         state.buffers.show(None).is_err(),
         "external must not create a paste buffer from inbound OSC 52"
+    );
+}
+
+#[tokio::test]
+async fn inactive_visible_pane_osc52_targets_each_attached_client_once() {
+    // Oracle: tmux 3.7b relays an application OSC 52 from a visible inactive
+    // pane to the outer terminal. The active pane's own output ring is not the
+    // only eligible source.
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "osc52-inactive-visible").await;
+    let unrelated = create_quiet_session(&handler, "osc52-inactive-unrelated").await;
+    split_quiet_window(&handler, &session).await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let inactive_pane_id = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&session).expect("session exists");
+        let active = session.active_pane_id();
+        session
+            .window_at(0)
+            .expect("window exists")
+            .panes()
+            .iter()
+            .find_map(|pane| (Some(pane.id()) != active).then_some(pane.id()))
+            .expect("inactive pane exists")
+    };
+
+    let mut first = register_clipboard_attach(&handler, 301, &session).await;
+    let mut second = register_clipboard_attach(&handler, 302, &session).await;
+    let mut other = register_clipboard_attach(&handler, 303, &unrelated).await;
+    drain_attach_controls_until_idle(&mut first).await;
+    drain_attach_controls_until_idle(&mut second).await;
+    drain_attach_controls_until_idle(&mut other).await;
+
+    handler
+        .handle_pane_alert_event(clipboard_alert(session, inactive_pane_id))
+        .await;
+
+    assert_eq!(
+        drain_clipboard_writes(&mut first),
+        vec![b"\x1b]52;;QQ==\x07".to_vec()]
+    );
+    assert_eq!(
+        drain_clipboard_writes(&mut second),
+        vec![b"\x1b]52;;QQ==\x07".to_vec()]
+    );
+    assert!(drain_clipboard_writes(&mut other).is_empty());
+}
+
+#[tokio::test]
+async fn active_pane_osc52_does_not_enqueue_a_second_clipboard_write() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "osc52-active-single-path").await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let active_pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(rmux_core::Session::active_pane_id)
+            .expect("active pane exists")
+    };
+    let mut control_rx = register_clipboard_attach(&handler, 304, &session).await;
+    drain_attach_controls_until_idle(&mut control_rx).await;
+
+    handler
+        .handle_pane_alert_event(clipboard_alert(session, active_pane_id))
+        .await;
+
+    assert!(
+        drain_clipboard_writes(&mut control_rx).is_empty(),
+        "the active pane is forwarded by its output ring, not AttachControl::Write"
+    );
+}
+
+#[tokio::test]
+async fn non_current_window_osc52_is_not_relayed_to_attached_clients() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "osc52-hidden-window").await;
+    let hidden_window = create_quiet_window(&handler, &session).await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(hidden_window.window_index()))
+            .and_then(|window| window.pane(0))
+            .map(rmux_core::Pane::id)
+            .expect("hidden window pane exists")
+    };
+    let mut control_rx = register_clipboard_attach(&handler, 305, &session).await;
+    drain_attach_controls_until_idle(&mut control_rx).await;
+
+    handler
+        .handle_pane_alert_event(clipboard_alert(session, pane_id))
+        .await;
+
+    assert!(drain_clipboard_writes(&mut control_rx).is_empty());
+}
+
+#[tokio::test]
+async fn inactive_pane_osc52_relay_requires_set_clipboard_on() {
+    for (offset, option) in ["external", "off"].into_iter().enumerate() {
+        let handler = RequestHandler::new();
+        let session = create_quiet_session(&handler, &format!("osc52-relay-{option}")).await;
+        split_quiet_window(&handler, &session).await;
+        set_server_option_by_name(&handler, "set-clipboard", option).await;
+        let inactive_pane_id = {
+            let state = handler.state.lock().await;
+            let session = state.sessions.session(&session).expect("session exists");
+            let active = session.active_pane_id();
+            session
+                .window_at(0)
+                .expect("window exists")
+                .panes()
+                .iter()
+                .find_map(|pane| (Some(pane.id()) != active).then_some(pane.id()))
+                .expect("inactive pane exists")
+        };
+        let mut control_rx =
+            register_clipboard_attach(&handler, 306 + offset as u32, &session).await;
+        drain_attach_controls_until_idle(&mut control_rx).await;
+
+        handler
+            .handle_pane_alert_event(clipboard_alert(session, inactive_pane_id))
+            .await;
+
+        assert!(
+            drain_clipboard_writes(&mut control_rx).is_empty(),
+            "set-clipboard {option} must not relay application OSC 52"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inactive_pane_osc52_is_enqueued_before_a_following_session_switch() {
+    let handler = RequestHandler::new();
+    let source = create_quiet_session(&handler, "osc52-switch-source").await;
+    let destination = create_quiet_session(&handler, "osc52-switch-destination").await;
+    split_quiet_window(&handler, &source).await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let inactive_pane_id = {
+        let state = handler.state.lock().await;
+        let source = state.sessions.session(&source).expect("source exists");
+        let active = source.active_pane_id();
+        source
+            .window_at(0)
+            .expect("source window exists")
+            .panes()
+            .iter()
+            .find_map(|pane| (Some(pane.id()) != active).then_some(pane.id()))
+            .expect("inactive pane exists")
+    };
+    let destination_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&destination)
+            .map(rmux_core::Session::id)
+            .expect("destination exists")
+    };
+    let mut control_rx = register_clipboard_attach(&handler, 308, &source).await;
+    drain_attach_controls_until_idle(&mut control_rx).await;
+
+    handler.pane_alert_callback()(clipboard_alert(source, inactive_pane_id));
+    let pane_output = pane_output_channel();
+    let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
+    let target = AttachTarget {
+        session_name: destination.clone(),
+        pane_master: None,
+        pane_output,
+        pane_output_start_sequence,
+        render_frame: b"destination".to_vec(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        raw_passthrough: false,
+        kitty_graphics_passthrough: false,
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+    };
+    handler
+        .send_attach_control_for_session_identity(
+            308,
+            AttachControl::switch(target),
+            "switch-client",
+            destination,
+            destination_id,
+        )
+        .await
+        .expect("following switch succeeds");
+
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(AttachControl::Write(bytes)) if bytes == b"\x1b]52;;QQ==\x07"
+    ));
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(AttachControl::Switch(_))
+    ));
+}
+
+#[tokio::test]
+async fn busy_attach_lock_drops_osc52_relay_without_a_deferred_retry() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "osc52-busy-routing").await;
+    split_quiet_window(&handler, &session).await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let inactive_pane_id = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&session).expect("session exists");
+        let active = session.active_pane_id();
+        session
+            .window_at(0)
+            .expect("window exists")
+            .panes()
+            .iter()
+            .find_map(|pane| (Some(pane.id()) != active).then_some(pane.id()))
+            .expect("inactive pane exists")
+    };
+    let mut control_rx = register_clipboard_attach(&handler, 309, &session).await;
+    drain_attach_controls_until_idle(&mut control_rx).await;
+
+    let active_attach = handler.active_attach.lock().await;
+    handler.pane_alert_callback()(clipboard_alert(session, inactive_pane_id));
+    drop(active_attach);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        drain_clipboard_writes(&mut control_rx).is_empty(),
+        "a failed try_lock must never be retried later against a new visibility state"
+    );
+}
+
+#[tokio::test]
+async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_limit() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "osc52-bounded-backlog").await;
+    split_quiet_window(&handler, &session).await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let inactive_pane_id = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&session).expect("session exists");
+        let active = session.active_pane_id();
+        session
+            .window_at(0)
+            .expect("window exists")
+            .panes()
+            .iter()
+            .find_map(|pane| (Some(pane.id()) != active).then_some(pane.id()))
+            .expect("inactive pane exists")
+    };
+    let mut control_rx = register_clipboard_attach(&handler, 310, &session).await;
+    drain_attach_controls_until_idle(&mut control_rx).await;
+    let callback = handler.pane_alert_callback();
+
+    for _ in 0..=ATTACH_CONTROL_BACKLOG_LIMIT {
+        callback(clipboard_alert(session.clone(), inactive_pane_id));
+    }
+
+    let mut writes = 0;
+    let mut detaches = 0;
+    while let Ok(control) = control_rx.try_recv() {
+        match control {
+            AttachControl::Write(_) => writes += 1,
+            AttachControl::Detach => detaches += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(writes, ATTACH_CONTROL_BACKLOG_LIMIT);
+    assert_eq!(detaches, 1);
+    assert!(
+        !handler.active_attach.lock().await.by_pid.contains_key(&310),
+        "the bounded relay must remove a client that does not drain clipboard writes"
     );
 }
 

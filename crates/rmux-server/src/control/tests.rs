@@ -6,7 +6,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
-use super::subscriptions::{handle_pane_event, PaneEvent};
+use super::subscriptions::{
+    handle_pane_event, refresh_subscriptions, PaneEvent, PaneSubscriptionStart,
+};
 use super::{
     append_control_input, arm_control_eof_transition, control_control_waits_for_attached_session,
     drain_control_command_after_eof, drain_control_queue_after_eof, ensure_control_newline,
@@ -26,8 +28,8 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::server_access::current_owner_uid;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
-    ControlMode, KillSessionRequest, NewSessionRequest, Request, Response, RmuxError, SessionName,
-    ShowBufferRequest, WaitForMode, WaitForRequest, WaitForResponse,
+    ControlMode, KillSessionRequest, NewSessionRequest, Request, Response, RmuxError, SessionId,
+    SessionName, ShowBufferRequest, WaitForMode, WaitForRequest, WaitForResponse,
 };
 
 const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -262,6 +264,76 @@ async fn pane_output_lag_terminates_control_mode_explicitly() {
         .await
         .expect("lag transcript reads");
     assert_eq!(rendered, b"%exit too far behind\n");
+}
+
+#[tokio::test]
+async fn pane_subscriptions_reject_a_recreated_same_name_session() {
+    let handler = RequestHandler::new();
+    let session_name =
+        SessionName::new("control-subscription-identity").expect("valid session name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let replacement_output = handler
+        .control_session_panes(&session_name)
+        .await
+        .expect("replacement session pane output exists")
+        .into_iter()
+        .next()
+        .expect("replacement session has a pane")
+        .1;
+
+    let requester_pid = 42_421;
+    let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    let control_identity = ControlClientIdentity::new(requester_pid, control_id);
+    handler
+        .set_control_subscription_identity_for_test(
+            control_identity,
+            session_name.clone(),
+            SessionId::new(u32::MAX),
+        )
+        .await;
+
+    let (pane_event_tx, mut pane_event_rx) = mpsc::channel(4);
+    let mut subscriptions = std::collections::HashMap::new();
+    refresh_subscriptions(
+        &handler,
+        control_identity,
+        Some(&session_name),
+        &mut subscriptions,
+        pane_event_tx,
+        PaneSubscriptionStart::Now,
+    )
+    .await;
+
+    assert!(
+        subscriptions.is_empty(),
+        "a stale SessionId must not subscribe to a replacement sharing its name"
+    );
+    replacement_output.send(b"WRONG_SESSION_OUTPUT".to_vec());
+    let received = tokio::time::timeout(Duration::from_millis(50), pane_event_rx.recv()).await;
+    assert!(
+        !matches!(received, Ok(Some(_))),
+        "replacement output must not reach the stale control client"
+    );
 }
 
 #[tokio::test]

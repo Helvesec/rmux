@@ -24,6 +24,9 @@ use super::{
     target_for_request_response, target_to_scope, RequestHandler,
 };
 
+#[path = "handler_lifecycle/ordered_wait.rs"]
+mod ordered_wait;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueuedLifecycleEvent {
     pub(in crate::handler) event: LifecycleEvent,
@@ -585,13 +588,12 @@ impl RequestHandler {
             event,
             completion: Some(completion_tx),
         };
-        match self.lifecycle_dispatch.send_if_active(item).await {
-            Ok(true) => {
-                let _ = completion_rx.await;
-            }
-            Ok(false) => {}
-            Err(_) => warn!("lifecycle dispatch queue closed before ordered hook completed"),
-        }
+        ordered_wait::dispatch_without_unbounded_caller_wait(
+            self.lifecycle_dispatch.clone(),
+            item,
+            completion_rx,
+        )
+        .await;
     }
 
     async fn dispatch_lifecycle_item(&self, item: LifecycleDispatchItem) {

@@ -291,6 +291,7 @@ async fn forward_control_inner(
 
     refresh_subscriptions(
         &handler,
+        control_identity,
         session_name.as_ref(),
         &mut subscriptions,
         pane_event_tx.clone(),
@@ -300,6 +301,7 @@ async fn forward_control_inner(
     while let Ok(event) = server_events.try_recv() {
         let mut event_context = ServerEventContext {
             handler: &handler,
+            control_identity,
             requester_pid,
             session_name: &mut session_name,
             subscriptions: &mut subscriptions,
@@ -322,6 +324,7 @@ async fn forward_control_inner(
                 input_closed && mode.is_control_control() && session_name.is_none();
             let mut event_context = ServerEventContext {
                 handler: &handler,
+                control_identity,
                 requester_pid,
                 session_name: &mut session_name,
                 subscriptions: &mut subscriptions,
@@ -676,6 +679,7 @@ async fn forward_control_inner(
             Some(event) = server_events.recv() => {
                 let mut event_context = ServerEventContext {
                     handler: &handler,
+                    control_identity,
                     requester_pid,
                     session_name: &mut session_name,
                     subscriptions: &mut subscriptions,
@@ -974,6 +978,7 @@ async fn handle_server_event(
             *context.session_name = next_session;
             refresh_subscriptions(
                 context.handler,
+                context.control_identity,
                 context.session_name.as_ref(),
                 context.subscriptions,
                 context.pane_event_tx.clone(),
@@ -994,6 +999,7 @@ async fn handle_server_event(
             *context.session_name = Some(next_session);
             refresh_subscriptions(
                 context.handler,
+                context.control_identity,
                 context.session_name.as_ref(),
                 context.subscriptions,
                 context.pane_event_tx.clone(),
@@ -1004,6 +1010,7 @@ async fn handle_server_event(
         ControlServerEvent::Refresh => {
             refresh_subscriptions(
                 context.handler,
+                context.control_identity,
                 context.session_name.as_ref(),
                 context.subscriptions,
                 context.pane_event_tx.clone(),
@@ -1105,6 +1112,7 @@ async fn flush_deferred_server_events(context: &mut ServerEventContext<'_>) -> i
 #[cfg(any(unix, windows))]
 struct ServerEventContext<'a> {
     handler: &'a RequestHandler,
+    control_identity: ControlClientIdentity,
     requester_pid: u32,
     session_name: &'a mut Option<SessionName>,
     subscriptions: &'a mut HashMap<u32, PaneSubscription>,

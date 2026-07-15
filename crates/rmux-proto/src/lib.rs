@@ -83,6 +83,35 @@ pub const INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH: &str = "\0rmux-parse-time-assign
 /// applying the current `command-alias` table a second time.
 pub const INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH: &str = "\0rmux-canonical-command-execution-v1";
 
+/// Prefix for the CLI's internal stable pane-exit probe carried through the
+/// existing `list-panes` format field. OS argument vectors cannot contain NUL,
+/// so a public format cannot collide with this transport-only request.
+pub const INTERNAL_PANE_EXIT_PROBE_PREFIX: &str = "\0rmux-pane-exit-probe-v1:";
+
+/// Encodes stable session and pane identities for an internal pane-exit probe.
+#[must_use]
+pub fn encode_internal_pane_exit_probe(session_id: SessionId, pane_id: PaneId) -> String {
+    format!(
+        "{INTERNAL_PANE_EXIT_PROBE_PREFIX}{}:{}",
+        session_id.as_u32(),
+        pane_id.as_u32()
+    )
+}
+
+/// Decodes stable session and pane identities from an internal pane-exit probe.
+#[must_use]
+pub fn decode_internal_pane_exit_probe(value: &str) -> Option<(SessionId, PaneId)> {
+    let payload = value.strip_prefix(INTERNAL_PANE_EXIT_PROBE_PREFIX)?;
+    let (session_id, pane_id) = payload.split_once(':')?;
+    if pane_id.contains(':') {
+        return None;
+    }
+    Some((
+        SessionId::new(session_id.parse().ok()?),
+        PaneId::new(pane_id.parse().ok()?),
+    ))
+}
+
 /// Serializes an already-tokenized command argv for the internal runtime
 /// canonicalization request.
 pub fn encode_internal_runtime_command_arguments(
@@ -101,3 +130,30 @@ pub fn decode_internal_runtime_command_arguments(
 
 /// Minimum daemon-side TTL accepted for owned-session leases.
 pub const MIN_SESSION_LEASE_TTL_MILLIS: u64 = 500;
+
+#[cfg(test)]
+mod internal_pane_exit_probe_tests {
+    use super::*;
+
+    #[test]
+    fn pane_exit_probe_round_trips_stable_identities() {
+        let encoded = encode_internal_pane_exit_probe(SessionId::new(17), PaneId::new(42));
+
+        assert_eq!(
+            decode_internal_pane_exit_probe(&encoded),
+            Some((SessionId::new(17), PaneId::new(42)))
+        );
+    }
+
+    #[test]
+    fn pane_exit_probe_rejects_public_and_malformed_formats() {
+        for value in [
+            "#{pane_id}",
+            "\0rmux-pane-exit-probe-v1:1",
+            "\0rmux-pane-exit-probe-v1:1:2:3",
+            "\0rmux-pane-exit-probe-v1:session:2",
+        ] {
+            assert_eq!(decode_internal_pane_exit_probe(value), None);
+        }
+    }
+}

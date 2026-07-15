@@ -74,6 +74,11 @@ pub(in crate::handler) struct PopupOverlayState {
 }
 
 impl PopupOverlayState {
+    #[cfg(test)]
+    pub(in crate::handler) fn begin_resize_for_test(&mut self) {
+        self.dragging = PopupDragMode::Resize;
+    }
+
     fn render(&self) -> Vec<u8> {
         let content_lines = self.scrollable_text.as_ref().map_or_else(
             || self.surface.lock().expect("popup surface").lines(),

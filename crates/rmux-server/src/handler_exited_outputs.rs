@@ -5,7 +5,7 @@ use rmux_core::events::PaneOutputSubscriptionKey;
 use rmux_proto::{PaneTarget, SessionId, SessionName};
 
 use crate::pane_io::PaneOutputSender;
-use crate::pane_terminals::HandlerState;
+use crate::pane_terminals::{HandlerState, PaneExitMetadata};
 
 use super::RequestHandler;
 
@@ -36,7 +36,8 @@ impl RetainedExitedPaneIdentities {
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct RetainedExitedPaneOutput {
     pane: PaneOutputSubscriptionKey,
-    output: PaneOutputSender,
+    output: Option<PaneOutputSender>,
+    metadata: PaneExitMetadata,
     expires_at: Instant,
     identities: RetainedExitedPaneIdentities,
 }
@@ -44,7 +45,8 @@ pub(in crate::handler) struct RetainedExitedPaneOutput {
 impl RetainedExitedPaneOutput {
     fn new(
         pane: PaneOutputSubscriptionKey,
-        output: PaneOutputSender,
+        output: Option<PaneOutputSender>,
+        metadata: PaneExitMetadata,
         identities: RetainedExitedPaneIdentities,
         now: Instant,
         ttl: Duration,
@@ -52,6 +54,7 @@ impl RetainedExitedPaneOutput {
         Self {
             pane,
             output,
+            metadata,
             expires_at: now + ttl,
             identities,
         }
@@ -61,8 +64,12 @@ impl RetainedExitedPaneOutput {
         &self.pane
     }
 
-    pub(in crate::handler) fn output(&self) -> &PaneOutputSender {
-        &self.output
+    pub(in crate::handler) fn output(&self) -> Option<&PaneOutputSender> {
+        self.output.as_ref()
+    }
+
+    pub(in crate::handler) const fn metadata(&self) -> PaneExitMetadata {
+        self.metadata
     }
 
     fn is_expired(&self, now: Instant) -> bool {
@@ -76,7 +83,18 @@ pub(in crate::handler) struct RetainedExitedPaneOutputs {
     by_pane: HashMap<PaneOutputSubscriptionKey, (PaneTarget, RetainedExitedPaneOutput)>,
 }
 
+struct RetainedExitedPaneInsert {
+    target: PaneTarget,
+    pane: PaneOutputSubscriptionKey,
+    output: Option<PaneOutputSender>,
+    metadata: PaneExitMetadata,
+    identities: RetainedExitedPaneIdentities,
+    now: Instant,
+    ttl: Duration,
+}
+
 impl RetainedExitedPaneOutputs {
+    #[cfg(test)]
     pub(in crate::handler) fn insert(
         &mut self,
         target: PaneTarget,
@@ -86,8 +104,30 @@ impl RetainedExitedPaneOutputs {
         now: Instant,
         ttl: Duration,
     ) {
+        self.insert_exited(RetainedExitedPaneInsert {
+            target,
+            pane,
+            output: Some(output),
+            metadata: PaneExitMetadata::without_exit_details(),
+            identities,
+            now,
+            ttl,
+        });
+    }
+
+    fn insert_exited(&mut self, insert: RetainedExitedPaneInsert) {
+        let RetainedExitedPaneInsert {
+            target,
+            pane,
+            output,
+            metadata,
+            identities,
+            now,
+            ttl,
+        } = insert;
         self.cleanup_expired(now);
-        let retained = RetainedExitedPaneOutput::new(pane.clone(), output, identities, now, ttl);
+        let retained =
+            RetainedExitedPaneOutput::new(pane.clone(), output, metadata, identities, now, ttl);
         self.insert_entry(target, pane, retained, true);
     }
 
@@ -190,6 +230,17 @@ impl RetainedExitedPaneOutputs {
         self.by_pane.get(pane).cloned()
     }
 
+    pub(in crate::handler) fn get_by_pane_id(
+        &mut self,
+        pane_id: rmux_proto::PaneId,
+        now: Instant,
+    ) -> Option<RetainedExitedPaneOutput> {
+        self.cleanup_expired(now);
+        self.by_pane.values().find_map(|(_target, retained)| {
+            (retained.pane.pane_id() == pane_id).then(|| retained.clone())
+        })
+    }
+
     #[cfg(test)]
     pub(in crate::handler) fn cleanup_pane_if_expired(
         &mut self,
@@ -240,12 +291,31 @@ impl RetainedExitedPaneOutputs {
 }
 
 impl RequestHandler {
+    #[cfg(test)]
     pub(in crate::handler) async fn retain_exited_pane_output(
+        &self,
+        target: PaneTarget,
+        pane: PaneOutputSubscriptionKey,
+        identities: RetainedExitedPaneIdentities,
+        output: PaneOutputSender,
+    ) {
+        self.retain_exited_pane(
+            target,
+            pane,
+            identities,
+            Some(output),
+            PaneExitMetadata::without_exit_details(),
+        )
+        .await;
+    }
+
+    pub(in crate::handler) async fn retain_exited_pane(
         &self,
         mut target: PaneTarget,
         mut pane: PaneOutputSubscriptionKey,
         identities: RetainedExitedPaneIdentities,
-        output: PaneOutputSender,
+        output: Option<PaneOutputSender>,
+        metadata: PaneExitMetadata,
     ) {
         let now = Instant::now();
         // Serialize name normalization and insertion with rename-session. Both
@@ -263,14 +333,15 @@ impl RequestHandler {
         self.retained_exited_outputs
             .lock()
             .expect("retained exited output mutex must not be poisoned")
-            .insert(
+            .insert_exited(RetainedExitedPaneInsert {
                 target,
                 pane,
                 output,
+                metadata,
                 identities,
                 now,
-                EXITED_PANE_OUTPUT_RETENTION_TTL,
-            );
+                ttl: EXITED_PANE_OUTPUT_RETENTION_TTL,
+            });
         drop(state);
         self.watch_retained_exited_pane_output();
     }
@@ -307,6 +378,17 @@ impl RequestHandler {
             .lock()
             .expect("retained exited output mutex must not be poisoned")
             .get_by_pane(pane, now)
+    }
+
+    pub(in crate::handler) fn retained_exited_pane_output_by_id(
+        &self,
+        pane_id: rmux_proto::PaneId,
+        now: Instant,
+    ) -> Option<RetainedExitedPaneOutput> {
+        self.retained_exited_outputs
+            .lock()
+            .expect("retained exited output mutex must not be poisoned")
+            .get_by_pane_id(pane_id, now)
     }
 
     fn watch_retained_exited_pane_output(&self) {
@@ -443,6 +525,38 @@ mod tests {
         assert!(!retained.by_pane.contains_key(&pane));
         assert!(!retained.by_target.contains_key(&target));
         assert!(retained.is_empty(now + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn exit_metadata_is_pane_id_scoped_and_expires_without_an_output_ring() {
+        let mut retained = RetainedExitedPaneOutputs::default();
+        let now = Instant::now();
+        let target = PaneTarget::new(session_name("alpha"), 0);
+        let pane = pane_key(34);
+        let metadata = PaneExitMetadata {
+            status: Some(7),
+            signal: None,
+            time: Some(1),
+        };
+        retained.insert_exited(RetainedExitedPaneInsert {
+            target,
+            pane,
+            output: None,
+            metadata,
+            identities: identities(7, 7),
+            now,
+            ttl: Duration::from_secs(1),
+        });
+
+        let observed = retained
+            .get_by_pane_id(PaneId::new(34), now)
+            .expect("matching globally stable pane id retains exit metadata");
+        assert_eq!(observed.metadata(), metadata);
+        assert!(observed.output().is_none());
+        assert!(retained.get_by_pane_id(PaneId::new(35), now).is_none());
+        assert!(retained
+            .get_by_pane_id(PaneId::new(34), now + Duration::from_secs(2))
+            .is_none());
     }
 
     #[test]

@@ -20,10 +20,16 @@ use crate::pane_terminals::{
 
 #[path = "handler_window/move_window_effects.rs"]
 mod move_window_effects;
+#[path = "handler_window/request_identity.rs"]
+mod request_identity;
 #[path = "handler_window/timer_mutations.rs"]
 mod timer_mutations;
 
 use move_window_effects::MoveWindowEffects;
+use request_identity::{
+    require_expected_link_window_identity, require_expected_move_window_identity,
+    require_expected_swap_window_identity,
+};
 use timer_mutations::{move_window_timer_target_overrides, swap_window_timer_target_overrides};
 
 fn linked_resize_sessions_for_window_change(
@@ -699,6 +705,9 @@ impl RequestHandler {
             subscriptions_removed,
         ) = {
             let mut state = self.state.lock().await;
+            if let Err(error) = require_expected_link_window_identity(&state, &request) {
+                return Response::Error(ErrorResponse { error });
+            }
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
                 &[
@@ -838,6 +847,9 @@ impl RequestHandler {
         self.pause_before_window_lifecycle_mutation().await;
         let (response, removed_destination_pane_ids, effects, subscriptions_removed) = {
             let mut state = self.state.lock().await;
+            if let Err(error) = require_expected_move_window_identity(&state, &request) {
+                return Response::Error(ErrorResponse { error });
+            }
             let mut subscription_roots = request
                 .source
                 .as_ref()
@@ -927,6 +939,9 @@ impl RequestHandler {
             subscriptions_removed,
         ) = {
             let mut state = self.state.lock().await;
+            if let Err(error) = super::require_expected_window_identity(&state, &request.target) {
+                return Response::Error(ErrorResponse { error });
+            }
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
                 std::slice::from_ref(&session_name),
@@ -1040,6 +1055,9 @@ impl RequestHandler {
     ) -> Response {
         let (response, mut refresh_sessions, resize_window_ids) = {
             let mut state = self.state.lock().await;
+            if let Err(error) = require_expected_swap_window_identity(&state, &request) {
+                return Response::Error(ErrorResponse { error });
+            }
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
                 &[
@@ -1236,6 +1254,9 @@ impl RequestHandler {
         let attached_count = self.attached_count(&session_name).await;
         let (response, removed_pane_ids, subscriptions_removed, refresh_sessions) = {
             let mut state = self.state.lock().await;
+            if let Err(error) = super::require_expected_window_identity(&state, &request.target) {
+                return Response::Error(ErrorResponse { error });
+            }
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
                 std::slice::from_ref(&session_name),

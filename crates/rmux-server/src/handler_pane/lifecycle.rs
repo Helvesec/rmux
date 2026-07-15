@@ -47,6 +47,7 @@ enum PaneExitPlan {
         pane_event: super::super::QueuedLifecycleEvent,
         lifecycle_events: Vec<super::super::QueuedLifecycleEvent>,
         output: ExitedPaneOutput,
+        metadata: PaneExitMetadata,
     },
     RemoveSession {
         runtime_session_name: rmux_proto::SessionName,
@@ -59,6 +60,7 @@ enum PaneExitPlan {
         pane_event: super::super::QueuedLifecycleEvent,
         lifecycle_events: Vec<super::super::QueuedLifecycleEvent>,
         output: ExitedPaneOutput,
+        metadata: PaneExitMetadata,
     },
 }
 
@@ -306,6 +308,7 @@ impl RequestHandler {
                                 output: output
                                     .take()
                                     .expect("pane exit output is consumed by one committed plan"),
+                                metadata,
                             })
                         } else {
                             let timer_mutation =
@@ -376,6 +379,7 @@ impl RequestHandler {
                                         output: output.take().expect(
                                             "pane exit output is consumed by one committed plan",
                                         ),
+                                        metadata,
                                     })
                                 }
                                 Err(error) => {
@@ -486,6 +490,7 @@ impl RequestHandler {
                 pane_event,
                 lifecycle_events,
                 output,
+                metadata,
             } => {
                 self.retain_removed_pane_output(
                     &runtime_session_name,
@@ -493,6 +498,7 @@ impl RequestHandler {
                     &target,
                     RetainedExitedPaneIdentities::new(target_session_id, runtime_session_id),
                     &output,
+                    metadata,
                 )
                 .await;
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
@@ -575,6 +581,7 @@ impl RequestHandler {
                 pane_event,
                 lifecycle_events,
                 output,
+                metadata,
             } => {
                 self.retain_removed_pane_output(
                     &runtime_session_name,
@@ -582,6 +589,7 @@ impl RequestHandler {
                     &target,
                     RetainedExitedPaneIdentities::new(session_id, runtime_session_id),
                     &output,
+                    metadata,
                 )
                 .await;
                 self.remove_session_leases(std::slice::from_ref(&(
@@ -611,16 +619,16 @@ impl RequestHandler {
         target: &PaneTarget,
         identities: RetainedExitedPaneIdentities,
         output: &ExitedPaneOutput,
+        metadata: PaneExitMetadata,
     ) {
-        if let Some(sender) = output.sender() {
-            self.retain_exited_pane_output(
-                target.clone(),
-                PaneOutputSubscriptionKey::new(runtime_session_name.clone(), pane_id),
-                identities,
-                sender,
-            )
-            .await;
-        }
+        self.retain_exited_pane(
+            target.clone(),
+            PaneOutputSubscriptionKey::new(runtime_session_name.clone(), pane_id),
+            identities,
+            output.sender(),
+            metadata,
+        )
+        .await;
     }
 
     async fn cleanup_exited_pane_output_subscription(

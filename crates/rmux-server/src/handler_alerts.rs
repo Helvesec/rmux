@@ -11,6 +11,8 @@ use crate::renderer;
 
 #[path = "handler_alerts/automatic_names.rs"]
 mod automatic_names;
+#[path = "handler_alerts/clipboard_relay.rs"]
+mod clipboard_relay;
 #[path = "handler_alerts/pane_alert_coalescer.rs"]
 mod pane_alert_coalescer;
 #[path = "handler_alerts/pane_events.rs"]

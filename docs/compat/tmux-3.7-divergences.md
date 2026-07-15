@@ -518,7 +518,10 @@ closes the transport promptly, but deliberately keeps the authenticated queue
 lease alive to finish finite frames already accepted from that client. It
 cancels selected indefinite waits, stops on explicit exit or shutdown, and
 prevents a same-PID replacement registration from overtaking the old drain.
-No post-EOF reply is written to the closed transport.
+After EOF, one non-rearming global 250 ms grace lets fast replies from already
+accepted frames reach the still-open transport before RMUX switches to the
+detached finite drain. The grace never extends per frame, and no reply is
+written after the transport closes.
 
 Test/fixture: `crates/rmux-server/src/control/tests.rs` names the intentional
 cases `..._product_divergence` and covers finite follow-on work, conditional
@@ -573,3 +576,77 @@ CRLF backslash continuations through source-file dispatch.
 Inventory impact: source-file support remains advertised, while CRLF and lone
 CR normalization must be described as an RMUX portability behavior rather than
 tmux 3.7b parity.
+
+### C-D57: XTVERSION identifies RMUX rather than impersonating tmux
+
+For bare and zero-valued XTVERSION queries, tmux 3.7b reports `tmux 3.7b` in
+the DCS response. RMUX preserves the same response framing and parameter
+handling but reports `rmux 0.9.0`. This can change feature sniffing in a pane,
+but avoids claiming that RMUX is a different terminal implementation.
+
+Test/fixture: `csi_xtversion_reports_rmux_identity_product_divergence` in
+`crates/rmux-core/src/input/tests/csi_modes.rs` records the tmux 3.7b probe and
+locks the RMUX response for bare, zero-valued, and extended queries.
+
+Inventory impact: XTVERSION is supported, but callers must not use its product
+name as a promise of byte-identical tmux behavior.
+
+### C-D58: a trailing bare format hash is preserved literally
+
+tmux 3.7b consumes a final bare `#` during format expansion (`prefix#` renders
+as `prefix`, measured on 2026-07-15). RMUX renders `prefix#` literally. The
+divergence avoids silently deleting an unmatched user character while retaining
+the normal `#{...}` and `##` format forms.
+
+Test/fixture: `trailing_bare_hash_is_literal_product_divergence` in
+`crates/rmux-core/src/formats/tests/transformations.rs` locks the RMUX behavior.
+
+Inventory impact: format expansion is advertised, with unmatched trailing
+hashes treated as literals rather than copied from tmux's lossy edge case.
+
+### C-D59: rejected mutations between grouped aliases are transactional
+
+For relative `move-window` and `link-window` between two aliases of the same
+session group, tmux 3.7b can shift the destination window table before returning
+an error. RMUX returns the error without changing either alias, shared window
+links, options, hooks, or automatic-name state. Copying the partial mutation
+would reproduce an upstream state-corruption bug rather than useful parity.
+
+Test/fixture: `relative_move_between_group_aliases_is_atomic_product_divergence`
+and `relative_link_between_group_aliases_is_atomic_product_divergence` in
+`crates/rmux-server/src/handler_window_tests/relative_group_transactions.rs`
+lock the full before/after state.
+
+Inventory impact: the commands remain advertised; their rejected grouped-alias
+edge case is deliberately atomic.
+
+### C-D60: oversized bracketed paste is split into bounded envelopes
+
+RMUX attach frames have a fixed maximum length. When one bracketed paste exceeds
+that limit, RMUX closes the current bracketed envelope and opens another rather
+than dropping the payload, terminating the attach, or allocating an unbounded
+frame. An application can therefore observe more than one paste transaction for
+an input larger than the wire limit, while receiving every payload byte in
+order.
+
+Test/fixture:
+`live_attach_over_limit_bracketed_mode_uses_bounded_envelopes_product_divergence`
+in `crates/rmux-server/src/handler_send_keys_tests/bracketed_paste_large.rs`
+locks the exact envelope boundary and byte preservation.
+
+Inventory impact: bracketed paste remains supported with a safety boundary for
+inputs larger than one RMUX frame.
+
+### C-D61: status truncation preserves complete grapheme clusters
+
+When a status length limit cuts through a ZWJ emoji, tmux 3.7b can emit only the
+first code point of the cluster (measured on 2026-07-15 with `👩‍💻`). RMUX keeps
+the complete grapheme when it fits the same cell budget and drops the following
+text instead. This prevents malformed or visually split status glyphs.
+
+Test/fixture: `status_component_limit_keeps_a_zwj_grapheme_whole_product_divergence`
+in `crates/rmux-server/src/renderer/tests.rs` locks the complete cluster and the
+truncated suffix.
+
+Inventory impact: status length options remain advertised, with Unicode-safe
+truncation preferred over byte/code-point-identical tmux output.

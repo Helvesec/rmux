@@ -1333,6 +1333,10 @@ mod pane_state_tests;
 mod pane_state_race_tests;
 
 #[cfg(test)]
+#[path = "handler_request_identity_tests.rs"]
+mod request_identity_tests;
+
+#[cfg(test)]
 #[path = "handler_pane_alias_lifecycle_tests.rs"]
 mod pane_alias_lifecycle_tests;
 

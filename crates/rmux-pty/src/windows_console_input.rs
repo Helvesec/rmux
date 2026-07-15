@@ -281,13 +281,12 @@ pub fn send_windows_console_interrupt(process_id: ProcessId) -> io::Result<()> {
 }
 
 fn send_windows_console_interrupt_attached(process_id: ProcessId) -> io::Result<()> {
-    let _ignore_console_control = ConsoleControlIgnoreGuard::install()?;
     trace_windows_console_interrupt(process_id);
     let ok = unsafe {
         // SAFETY: The current process is attached to the target pane console
         // for the duration of this call. `CTRL_C_EVENT` uses process group 0
-        // to match a real terminal Ctrl-C in this console; the ignore guard
-        // prevents RMUX from handling the event while attached.
+        // to match a real terminal Ctrl-C in this console; the attachment's
+        // ignore guard prevents RMUX from handling the event while attached.
         GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0)
     };
     if ok == 0 {
@@ -467,7 +466,7 @@ fn trace_windows_ctrl_d_mode(mode: u32, suppress: bool) {
 
 fn attach_to_process_console(process_id: ProcessId) -> io::Result<ConsoleAttachment> {
     if try_attach_console(process_id.as_u32()) {
-        return Ok(ConsoleAttachment);
+        return ConsoleAttachment::protect_current_process();
     }
     let first_error = last_os_error();
     if first_error.raw_os_error() != Some(ERROR_ACCESS_DENIED as i32) {
@@ -480,7 +479,7 @@ fn attach_to_process_console(process_id: ProcessId) -> io::Result<ConsoleAttachm
         FreeConsole()
     };
     if try_attach_console(process_id.as_u32()) {
-        return Ok(ConsoleAttachment);
+        return ConsoleAttachment::protect_current_process();
     }
     Err(last_os_error())
 }
@@ -581,7 +580,31 @@ fn mouse_input_record(x: i16, y: i16, button_state: u32, event_flags: u32) -> IN
     }
 }
 
-struct ConsoleAttachment;
+struct ConsoleAttachment {
+    // This field is deliberately retained until after `FreeConsole` runs in
+    // `Drop`. Console-control delivery is asynchronous, so removing the ignore
+    // handler while RMUX is still attached creates a window where the pane's
+    // CTRL_C_EVENT can terminate the daemon itself.
+    _ignore_console_control: ConsoleControlIgnoreGuard,
+}
+
+impl ConsoleAttachment {
+    fn protect_current_process() -> io::Result<Self> {
+        match ConsoleControlIgnoreGuard::install() {
+            Ok(ignore_console_control) => Ok(Self {
+                _ignore_console_control: ignore_console_control,
+            }),
+            Err(error) => {
+                let _ = unsafe {
+                    // SAFETY: AttachConsole just succeeded, so this rolls back
+                    // that process-wide attachment before returning the error.
+                    FreeConsole()
+                };
+                Err(error)
+            }
+        }
+    }
+}
 
 impl Drop for ConsoleAttachment {
     fn drop(&mut self) {
@@ -589,6 +612,8 @@ impl Drop for ConsoleAttachment {
             // SAFETY: This releases any console attachment owned by the current process.
             FreeConsole()
         };
+        // Struct fields are dropped after this method returns, so the ignore
+        // guard remains installed through the detach above.
     }
 }
 

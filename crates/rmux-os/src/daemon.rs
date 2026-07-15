@@ -74,11 +74,28 @@ pub fn spawn_hidden_daemon_command(command: &mut Command) -> io::Result<Child> {
     spawn_hidden_daemon_command_impl(command)
 }
 
+/// Spawns a hidden daemon that must escape the launcher's Windows job object.
+///
+/// Callers must first configure the command with job breakaway enabled. Unlike
+/// the legacy fallback policy, this helper performs exactly one spawn attempt.
+/// On Windows, breakaway-related failures explain why RMUX refuses to retry
+/// inside the caller's job object.
+pub fn spawn_hidden_daemon_command_requiring_job_breakaway(
+    command: &mut Command,
+) -> io::Result<Child> {
+    spawn_hidden_daemon_command_requiring_job_breakaway_impl(command)
+}
+
 /// Returns whether a hidden-daemon spawn error should be retried without the
 /// Windows job breakaway flag.
+///
+/// This compatibility helper now always returns `false`: an RMUX daemon must
+/// outlive its short-lived launcher, so starting it inside the launcher's job
+/// object is never a safe fallback.
+#[deprecated(note = "hidden RMUX daemons must require Windows job breakaway")]
 #[must_use]
-pub fn should_retry_hidden_daemon_without_breakaway(error: &io::Error) -> bool {
-    should_retry_hidden_daemon_without_breakaway_impl(error)
+pub const fn should_retry_hidden_daemon_without_breakaway(_error: &io::Error) -> bool {
+    false
 }
 
 /// Writes a single readiness notification to an inherited Linux eventfd.
@@ -446,17 +463,39 @@ fn spawn_hidden_daemon_command_impl(command: &mut Command) -> io::Result<Child> 
 }
 
 #[cfg(windows)]
-fn should_retry_hidden_daemon_without_breakaway_impl(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(code)
-            if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_INVALID_PARAMETER as i32
-    )
+fn spawn_hidden_daemon_command_requiring_job_breakaway_impl(
+    command: &mut Command,
+) -> io::Result<Child> {
+    let _guard = StandardHandleInheritanceGuard::new()?;
+    command.spawn().map_err(hidden_daemon_breakaway_spawn_error)
 }
 
 #[cfg(not(windows))]
-fn should_retry_hidden_daemon_without_breakaway_impl(_error: &io::Error) -> bool {
-    false
+fn spawn_hidden_daemon_command_requiring_job_breakaway_impl(
+    command: &mut Command,
+) -> io::Result<Child> {
+    command.spawn()
+}
+
+#[cfg(windows)]
+fn hidden_daemon_breakaway_spawn_error(error: io::Error) -> io::Error {
+    if !matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_INVALID_PARAMETER as i32
+    ) {
+        return error;
+    }
+
+    io::Error::new(
+        error.kind(),
+        format!(
+            "Windows refused to launch an independent RMUX daemon: {error}. \
+             RMUX will not retry inside the caller's job object because that \
+             would terminate the daemon with the launcher; allow child-process \
+             breakaway in the enclosing job or start RMUX outside that job"
+        ),
+    )
 }
 
 /// Returns the Win32 creation flags used for hidden daemon children.
@@ -562,16 +601,36 @@ mod tests {
     }
 
     #[test]
-    fn hidden_daemon_retry_is_limited_to_breakaway_failures() {
-        assert!(should_retry_hidden_daemon_without_breakaway(
+    #[allow(deprecated)]
+    fn hidden_daemon_retry_without_breakaway_is_always_refused() {
+        assert!(!should_retry_hidden_daemon_without_breakaway(
             &io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)
         ));
-        assert!(should_retry_hidden_daemon_without_breakaway(
+        assert!(!should_retry_hidden_daemon_without_breakaway(
             &io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as i32)
         ));
         assert!(!should_retry_hidden_daemon_without_breakaway(
             &io::Error::from_raw_os_error(2)
         ));
+    }
+
+    #[test]
+    fn breakaway_spawn_failure_explains_the_safe_recovery() {
+        let error = hidden_daemon_breakaway_spawn_error(io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32,
+        ));
+        let message = error.to_string();
+
+        assert!(message.contains("Windows refused to launch an independent RMUX daemon"));
+        assert!(message.contains("will not retry inside the caller's job object"));
+        assert!(message.contains("allow child-process breakaway"));
+    }
+
+    #[test]
+    fn unrelated_spawn_failure_keeps_its_native_error() {
+        let error = hidden_daemon_breakaway_spawn_error(io::Error::from_raw_os_error(2));
+
+        assert_eq!(error.raw_os_error(), Some(2));
     }
 
     #[test]

@@ -24,6 +24,7 @@ const CLIENT_FIELD_SEPARATOR: char = '\u{1f}';
 const CLIENT_ROW_SEPARATOR: char = '\u{1e}';
 const CLIENT_TARGET_FORMAT: &str =
     "#{client_name}\u{1f}#{client_tty}\u{1f}#{client_pid}\u{1f}#{client_session}\u{1f}#{client_control_mode}\u{1e}";
+const PANE_EXIT_TOMBSTONE_HANDOFF_GRACE: Duration = Duration::from_millis(100);
 
 pub(crate) fn run_wait_pane(args: WaitPaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     check_disabled("RMUX_DISABLE_WAIT_PANE", "wait-pane")?;
@@ -352,7 +353,9 @@ fn wait_quiet(
     loop {
         match wait_target::process_state(connection, &mut target)? {
             StableWaitProcessState::Alive => {}
-            StableWaitProcessState::Exited(pane_exit) => {
+            StableWaitProcessState::Exited {
+                status: pane_exit, ..
+            } => {
                 return Ok(WaitCompletion::Matched {
                     pane_exit: Some(pane_exit),
                 });
@@ -384,15 +387,21 @@ fn wait_pane_exit(
     mut target: StableWaitTarget,
     deadline: Instant,
 ) -> Result<WaitCompletion, ExitFailure> {
+    let mut target_gone_since = None;
     loop {
         match wait_target::process_state(connection, &mut target)? {
-            StableWaitProcessState::Alive => {}
-            StableWaitProcessState::Exited(value) => {
-                match wait_pane_output_eof(connection, target.clone(), deadline)? {
-                    PaneOutputEofWait::Reached | PaneOutputEofWait::Unavailable => {}
-                    PaneOutputEofWait::TimedOut => return Ok(WaitCompletion::TimedOut),
-                    PaneOutputEofWait::Lag { missed_events } => {
-                        return Ok(WaitCompletion::Lag { missed_events });
+            StableWaitProcessState::Alive => target_gone_since = None,
+            StableWaitProcessState::Exited {
+                status: value,
+                retained,
+            } => {
+                if !retained {
+                    match wait_pane_output_eof(connection, target.clone(), deadline)? {
+                        PaneOutputEofWait::Reached | PaneOutputEofWait::Unavailable => {}
+                        PaneOutputEofWait::TimedOut => return Ok(WaitCompletion::TimedOut),
+                        PaneOutputEofWait::Lag { missed_events } => {
+                            return Ok(WaitCompletion::Lag { missed_events });
+                        }
                     }
                 }
                 return Ok(WaitCompletion::Matched {
@@ -400,9 +409,12 @@ fn wait_pane_exit(
                 });
             }
             StableWaitProcessState::TargetGone => {
-                return Ok(WaitCompletion::Matched {
-                    pane_exit: Some(PaneExitStatus::stale()),
-                });
+                let gone_since = target_gone_since.get_or_insert_with(Instant::now);
+                if gone_since.elapsed() >= PANE_EXIT_TOMBSTONE_HANDOFF_GRACE {
+                    return Ok(WaitCompletion::Matched {
+                        pane_exit: Some(PaneExitStatus::stale()),
+                    });
+                }
             }
         }
         if Instant::now() >= deadline {

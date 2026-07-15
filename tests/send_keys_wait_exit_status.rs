@@ -102,24 +102,30 @@ fn send_keys_wait_pane_exit_preserves_process_outcomes() -> Result<(), Box<dyn E
     );
     assert!(stderr(&signaled).is_empty());
 
-    create_shell_session(&harness, "unknown", false)?;
-    let unknown = harness.run(&[
-        "send-keys",
-        "-t",
-        "unknown:0.0",
-        "--wait-pane-exit",
-        "--timeout",
-        "5s",
-        "--",
-        "exit 7",
-        "Enter",
-    ])?;
-    assert_eq!(unknown.status.code(), Some(1));
-    assert!(
-        stderr(&unknown).contains("could not determine the pane process exit status"),
-        "a stale pane without retained metadata must fail closed: {}",
-        stderr(&unknown)
-    );
+    for exit_status in [0, 7] {
+        let session = format!("removed-{exit_status}");
+        create_shell_session(&harness, &session, false)?;
+        let command = format!("exit {exit_status}");
+        let removed = harness.run(&[
+            "send-keys",
+            "-t",
+            &format!("{session}:0.0"),
+            "--wait-pane-exit",
+            "--timeout",
+            "5s",
+            "--",
+            &command,
+            "Enter",
+        ])?;
+        assert_eq!(
+            removed.status.code(),
+            Some(exit_status),
+            "a normally removed pane must preserve its process exit status\nstdout:\n{}\nstderr:\n{}",
+            stdout(&removed),
+            stderr(&removed)
+        );
+        assert!(stderr(&removed).is_empty());
+    }
 
     create_shell_session(&harness, "timeout", true)?;
     let timed_out = harness.run(&[
@@ -148,7 +154,8 @@ fn send_keys_pane_exit_wait_follows_session_identity_across_rename() -> Result<(
     let harness = CliHarness::new("send-keys-wait-exit-rename")?;
     let _daemon = harness.start_hidden_daemon()?;
 
-    create_shell_session(&harness, "alpha", true)?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "keeper", "sleep", "30"])?);
+    create_shell_session(&harness, "alpha", false)?;
     let mut command = harness.base_command();
     let mut wait_child = command
         .args([
@@ -187,7 +194,7 @@ fn send_keys_pane_exit_wait_follows_session_identity_across_rename() -> Result<(
     assert_eq!(
         output.status.code(),
         Some(7),
-        "pane-exit status must survive a session rename\nstdout:\n{}\nstderr:\n{}",
+        "removed-pane exit status must survive a session rename\nstdout:\n{}\nstderr:\n{}",
         stdout(&output),
         stderr(&output)
     );

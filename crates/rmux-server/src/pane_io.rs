@@ -150,9 +150,9 @@ pub(crate) use attach_transport::in_process_attach_pair;
 use attach_transport::{AttachTransport, TryAttachRead};
 #[cfg(any(unix, windows))]
 use control::{
-    apply_pending_attach_controls, coalesce_render_switches, recv_attach_control,
-    redraw_after_persistent_overlay_state_advance, should_emit_overlay, switch_attach_target,
-    take_pending_live_passthroughs, PendingAttachAction, PendingAttachExit,
+    apply_pending_attach_controls, coalesce_render_switches, preserves_live_output,
+    recv_attach_control, redraw_after_persistent_overlay_state_advance, should_emit_overlay,
+    switch_attach_target, take_pending_live_passthroughs, PendingAttachAction, PendingAttachExit,
     PendingAttachInputState,
 };
 #[cfg(any(unix, windows))]
@@ -975,7 +975,8 @@ pub(crate) async fn forward_attach(
                                 attach_controls.as_mut(),
                                 &control_backlog,
                             );
-                            let drop_live_output = !next_target.is_coalescible_render_refresh();
+                            let drop_live_output =
+                                !preserves_live_output(&current_target, &next_target);
                             let pending_passthroughs = if drop_live_output {
                                 Vec::new()
                             } else {

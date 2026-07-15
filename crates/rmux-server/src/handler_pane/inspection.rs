@@ -388,6 +388,9 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ListPanesRequest,
     ) -> Response {
+        if let Some(response) = self.handle_internal_pane_exit_probe(&request).await {
+            return response;
+        }
         let attached_count = {
             let active_attach = self.active_attach.lock().await;
             active_attach.attached_count(&request.target)

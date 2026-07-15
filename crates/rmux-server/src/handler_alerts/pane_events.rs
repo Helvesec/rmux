@@ -88,6 +88,7 @@ impl RequestHandler {
                     PaneStateChange::TitleChanged { old, new },
                 );
             }
+            handler.try_relay_visible_inactive_pane_clipboard(&event);
             let should_spawn = {
                 let mut pending_alerts = pending_alerts
                     .lock()
@@ -116,6 +117,7 @@ impl RequestHandler {
 
     #[cfg(test)]
     pub(in crate::handler) async fn handle_pane_alert_event(&self, event: PaneAlertEvent) {
+        self.try_relay_visible_inactive_pane_clipboard(&event);
         for session_name in self
             .handle_pane_alert_events_deferred_refresh(vec![event])
             .await

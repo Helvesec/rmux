@@ -1,6 +1,6 @@
 use rmux_proto::TerminalSize;
 
-use super::popup_job::PopupDragMode;
+use super::popup_job::{PopupDragMode, PopupIoReceipt};
 use super::PopupOverlayState;
 use crate::input_keys::MouseForwardEvent;
 
@@ -13,7 +13,9 @@ const MOUSE_BUTTON_3: u16 = 2;
 #[derive(Debug)]
 pub(super) enum PopupMouseOutcome {
     Ignore,
-    Redraw,
+    Redraw {
+        resize: Option<PopupIoReceipt>,
+    },
     OpenMenu {
         x: u16,
         y: u16,
@@ -39,7 +41,7 @@ pub(super) fn popup_handle_mouse(
     if popup.dragging != PopupDragMode::Off {
         if !mouse_drag(raw.b) {
             popup.dragging = PopupDragMode::Off;
-            return PopupMouseOutcome::Redraw;
+            return PopupMouseOutcome::Redraw { resize: None };
         }
         match popup.dragging {
             PopupDragMode::Move { dx, dy } => {
@@ -47,7 +49,7 @@ pub(super) fn popup_handle_mouse(
                 let next_y = raw.y.saturating_sub(dy);
                 popup.rect.x = next_x.min(client_size.cols.saturating_sub(popup.rect.width));
                 popup.rect.y = next_y.min(client_size.rows.saturating_sub(popup.rect.height));
-                return PopupMouseOutcome::Redraw;
+                return PopupMouseOutcome::Redraw { resize: None };
             }
             PopupDragMode::Resize => {
                 let min_w = if popup.border_lines.visible() { 3 } else { 1 };
@@ -69,10 +71,13 @@ pub(super) fn popup_handle_mouse(
                     .lock()
                     .expect("popup surface")
                     .resize(popup.content_size());
-                if let Some(job) = &popup.job {
-                    let _ = job.resize(popup.content_size());
-                }
-                return PopupMouseOutcome::Redraw;
+                let content_size = popup.content_size();
+                return PopupMouseOutcome::Redraw {
+                    resize: popup
+                        .job
+                        .as_ref()
+                        .and_then(|job| job.enqueue_resize(content_size).ok()),
+                };
             }
             PopupDragMode::Off => {}
         }
@@ -122,11 +127,11 @@ pub(super) fn popup_handle_mouse(
                 dx: raw.lx.saturating_sub(popup.rect.x),
                 dy: raw.ly.saturating_sub(popup.rect.y),
             };
-            return PopupMouseOutcome::Redraw;
+            return PopupMouseOutcome::Redraw { resize: None };
         }
         if mouse_button(raw.lb) == MOUSE_BUTTON_3 && border.is_some() {
             popup.dragging = PopupDragMode::Resize;
-            return PopupMouseOutcome::Redraw;
+            return PopupMouseOutcome::Redraw { resize: None };
         }
     }
 

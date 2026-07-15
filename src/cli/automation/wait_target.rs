@@ -1,7 +1,7 @@
 use rmux_client::Connection;
 use rmux_proto::{
-    PaneId, PaneSnapshotResponse, PaneTarget, PaneTargetRef, ResolveTargetType, Response,
-    SessionId, SessionName, Target,
+    encode_internal_pane_exit_probe, PaneId, PaneSnapshotResponse, PaneTarget, PaneTargetRef,
+    ResolveTargetType, Response, SessionId, SessionName, Target,
 };
 
 use crate::cli_args::TargetSpec;
@@ -88,7 +88,10 @@ impl StableWaitTarget {
 
 pub(super) enum StableWaitProcessState {
     Alive,
-    Exited(PaneExitStatus),
+    Exited {
+        status: PaneExitStatus,
+        retained: bool,
+    },
     TargetGone,
 }
 
@@ -153,7 +156,10 @@ pub(super) fn process_state(
                 match target.refresh_session_name(connection, "wait-pane")? {
                     SessionNameRefresh::Changed => {}
                     SessionNameRefresh::Unchanged => {
-                        return Ok(StableWaitProcessState::Exited(PaneExitStatus::stale()));
+                        return Ok(StableWaitProcessState::Exited {
+                            status: PaneExitStatus::stale(),
+                            retained: false,
+                        });
                     }
                     SessionNameRefresh::Gone(_) => {
                         return Ok(StableWaitProcessState::TargetGone);
@@ -216,7 +222,10 @@ fn query_process_state(
         .list_panes_in_window(
             target.session_name.clone(),
             None,
-            Some("#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\n".to_owned()),
+            Some(encode_internal_pane_exit_probe(
+                target.session_id,
+                target.pane_id,
+            )),
         )
         .map_err(ExitFailure::from_client)?;
     let output = match response {
@@ -233,12 +242,13 @@ fn query_process_state(
         if !dead {
             return Ok(ProcessLookup::State(StableWaitProcessState::Alive));
         }
-        return Ok(ProcessLookup::State(StableWaitProcessState::Exited(
-            PaneExitStatus::known(
+        return Ok(ProcessLookup::State(StableWaitProcessState::Exited {
+            status: PaneExitStatus::known(
                 parse_i32_field(fields.next()),
                 parse_i32_field(fields.next()),
             ),
-        )));
+            retained: fields.next() == Some("1"),
+        }));
     }
     Ok(ProcessLookup::TargetUnavailable)
 }

@@ -1433,44 +1433,6 @@ async fn live_attach_shift_enter_csi_u_survives_extended_key_mode() {
 }
 
 #[tokio::test]
-async fn live_attach_shift_enter_uses_csi_u_after_kitty_keyboard_request() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    let requester_pid = std::process::id();
-
-    create_send_keys_test_session(&handler, &alpha).await;
-
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[>1u")
-            .expect("kitty keyboard request transcript update");
-    }
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
-
-    let expected = b"\x1b[13;2u";
-    let capture = RawPaneInputProbe::start(
-        &handler,
-        &alpha,
-        "live-attach-kitty-shift-enter",
-        expected.len(),
-    )
-    .await;
-
-    handler
-        .handle_attached_live_input_for_test(requester_pid, expected)
-        .await
-        .expect("live attach Kitty S-Enter input");
-
-    capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, expected).await;
-}
-
-#[tokio::test]
 async fn live_attach_standalone_escape_flushes_when_timeout_expires() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

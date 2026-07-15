@@ -106,10 +106,11 @@ impl RequestHandler {
                 Ok(pane_id) => pane_id,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            let generation = state
-                .pane_lifecycle(pane_id)
-                .map(|lifecycle| lifecycle.generation)
-                .unwrap_or_else(|| state.pane_output_generation_for_target(&target, pane_id));
+            // Pane-state producers are driven by pane output and stamp this
+            // generation. Lifecycle generations also advance on exit, so
+            // mixing the two domains would strand subscriptions after a
+            // kept-dead pane is respawned.
+            let generation = state.pane_output_generation_for_target(&target, pane_id);
             loop {
                 let (subscription_id, revision) = {
                     let mut journal = self.lock_pane_state_journal();
@@ -530,13 +531,13 @@ impl RequestHandler {
                     .then(|| info.closed_revision.unwrap_or(revision).saturating_sub(1));
 
                 let snapshot = match pane_target_for_pane_id(&state, info.pane_id) {
-                    Some(_)
+                    Some(target)
                         if info.closed
-                            && info.generation.is_some()
-                            && info.generation
-                                != state
-                                    .pane_lifecycle(info.pane_id)
-                                    .map(|lifecycle| lifecycle.generation) =>
+                            && info.generation.is_some_and(|generation| {
+                                generation
+                                    != state
+                                        .pane_output_generation_for_target(&target, info.pane_id)
+                            }) =>
                     {
                         (
                             PaneStateSnapshot {

@@ -402,23 +402,15 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
                 _ => {}
             }
         }
-        CsiCommand::KittyKeyboardSet | CsiCommand::KittyKeyboardPush => {
-            let flags = parser.param_list.get(0, 0, 0);
-            let apply_mode = parser.param_list.get(1, 1, 1);
-            if flags <= 0 || apply_mode == 3 {
-                writer.mode_clear(mode::MODE_KEYS_KITTY | mode::MODE_KEYS_EXTENDED_2);
-            } else {
-                writer.mode_clear(mode::EXTENDED_KEY_MODES);
-                writer.mode_set(mode::MODE_KEYS_EXTENDED_2 | mode::MODE_KEYS_KITTY);
-            }
-        }
-        CsiCommand::KittyKeyboardPop => {
-            writer.mode_clear(mode::MODE_KEYS_KITTY | mode::MODE_KEYS_EXTENDED_2);
-        }
-        // Do not advertise Kitty keyboard support until every key class is
-        // encoded according to that protocol. Applications may still opt in
-        // explicitly with KittyKeyboardSet or KittyKeyboardPush.
-        CsiCommand::KittyKeyboardQuery => {}
+        // RMUX 0.9 does not implement the complete Kitty keyboard protocol.
+        // Consume every negotiation form without replying or changing the
+        // pane's key mode: accepting Set/Push while ignoring Query advertises
+        // a partial protocol that applications cannot use losslessly, and Pop
+        // must not clear an independently enabled xterm extended-key mode.
+        CsiCommand::KittyKeyboardSet
+        | CsiCommand::KittyKeyboardPush
+        | CsiCommand::KittyKeyboardPop
+        | CsiCommand::KittyKeyboardQuery => {}
         CsiCommand::Modoff => {
             let n = parser.param_list.get(0, 0, 0);
             if n != 4 {

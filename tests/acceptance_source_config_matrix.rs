@@ -499,6 +499,33 @@ fn source_file_uses_current_targets_for_windows_safe_tmux_commands_without_t(
 
 #[test]
 #[cfg(windows)]
+fn source_file_expands_tilde_from_userprofile_when_home_is_absent() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("source-config-win-userprofile")?;
+    let user_profile = harness.tmpdir().join("windows-profile");
+    fs::create_dir_all(&user_profile)?;
+
+    let mut start = harness.command(["new-session", "-d", "-s", "cfg"]);
+    start.env_remove("HOME");
+    start.env("USERPROFILE", &user_profile);
+    let output = start.output()?;
+    assert_success(&output)?;
+
+    let config = harness.tmpdir().join("windows-userprofile-tilde.conf");
+    fs::write(
+        &config,
+        "set-environment -g RMUX_WINDOWS_TILDE ~/config-marker\n",
+    )?;
+    harness.success([OsStr::new("source-file"), config.as_os_str()])?;
+
+    let expected = format!(
+        "RMUX_WINDOWS_TILDE={}/config-marker",
+        user_profile.display()
+    );
+    assert_environment(&harness, &expected)
+}
+
+#[test]
+#[cfg(windows)]
 fn startup_config_unquoted_windows_powershell_default_shell_starts_powershell(
 ) -> Result<(), Box<dyn Error>> {
     let powershell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";

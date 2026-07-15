@@ -8,13 +8,68 @@ use crate::mouse::{layout_for_session, StatusRangeType};
 use crate::pane_io::AttachControl;
 use rmux_proto::request::RefreshClientRequest;
 use rmux_proto::{
-    BindKeyRequest, CapturePaneRequest, NewSessionExtRequest, NewSessionRequest, PaneTarget,
-    Request, Response, ScopeSelector, SessionName, SetOptionMode, Target, TerminalSize,
-    WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
+    BindKeyRequest, CapturePaneRequest, ListSessionsRequest, NewSessionExtRequest,
+    NewSessionRequest, PaneTarget, Request, Response, ScopeSelector, SessionName, SetBufferRequest,
+    SetOptionMode, Target, TerminalSize, WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
 };
 use rmux_proto::{OptionName, SetOptionRequest};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
+
+struct BlockingPopupIoRelease {
+    state: Arc<(StdMutex<bool>, Condvar)>,
+}
+
+impl BlockingPopupIoRelease {
+    fn new() -> Self {
+        let state = Arc::new((StdMutex::new(false), Condvar::new()));
+        let watchdog_state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            let (released, released_cv) = &*watchdog_state;
+            *released.lock().expect("popup I/O watchdog release") = true;
+            released_cv.notify_all();
+        });
+        Self { state }
+    }
+
+    fn callback_state(&self) -> Arc<(StdMutex<bool>, Condvar)> {
+        Arc::clone(&self.state)
+    }
+
+    fn release(&self) {
+        let (released, released_cv) = &*self.state;
+        *released.lock().expect("popup I/O release") = true;
+        released_cv.notify_all();
+    }
+}
+
+impl Drop for BlockingPopupIoRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct PopupJobCleanup {
+    terminate: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl PopupJobCleanup {
+    fn new(terminate: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            terminate: Some(Box::new(terminate)),
+        }
+    }
+}
+
+impl Drop for PopupJobCleanup {
+    fn drop(&mut self) {
+        if let Some(terminate) = self.terminate.take() {
+            terminate();
+        }
+    }
+}
 
 async fn create_attached_session(
     handler: &RequestHandler,
@@ -653,6 +708,68 @@ fn sgr_mouse(button: u16, x: u16, y: u16) -> Vec<u8> {
     .into_bytes()
 }
 
+async fn install_popup_test_writer<F>(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    enable_mouse_forwarding: bool,
+    writer: F,
+) -> (crate::renderer::OverlayRect, PopupJobCleanup)
+where
+    F: Fn(Vec<u8>) -> std::io::Result<()> + Send + Sync + 'static,
+{
+    let mut active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get_mut(&requester_pid)
+        .expect("attached client");
+    let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
+        panic!("expected popup overlay");
+    };
+    let test_job = popup
+        .job
+        .as_ref()
+        .expect("expected job-backed popup")
+        .with_test_writer(writer);
+    let cleanup_job = test_job.clone();
+    let cleanup = PopupJobCleanup::new(move || cleanup_job.terminate());
+    popup.job = Some(test_job);
+    if enable_mouse_forwarding {
+        popup
+            .surface
+            .lock()
+            .expect("popup surface")
+            .append_for_test(b"\x1b[?1000h\x1b[?1006h");
+    }
+    (popup.rect, cleanup)
+}
+
+async fn install_popup_test_resize<F>(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    resize: F,
+) -> (crate::renderer::OverlayRect, PopupJobCleanup)
+where
+    F: Fn(TerminalSize) -> std::io::Result<()> + Send + Sync + 'static,
+{
+    let mut active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get_mut(&requester_pid)
+        .expect("attached client");
+    let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
+        panic!("expected popup overlay");
+    };
+    let test_job = popup
+        .job
+        .as_ref()
+        .expect("expected job-backed popup")
+        .with_test_resize(resize);
+    let cleanup_job = test_job.clone();
+    let cleanup = PopupJobCleanup::new(move || cleanup_job.terminate());
+    popup.job = Some(test_job);
+    (popup.rect, cleanup)
+}
+
 #[tokio::test]
 async fn display_menu_keyboard_navigation_wraps_around_separators() {
     let handler = RequestHandler::new();
@@ -891,6 +1008,403 @@ async fn display_menu_extended_key_partial_is_bounded_without_pane_leak() {
         before_capture,
         "post-rejection menu input must not leak to the pane"
     );
+}
+
+#[tokio::test]
+async fn popup_key_write_does_not_stall_other_server_work() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-blocking-writer");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let writes = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let started_tx = Arc::new(StdMutex::new(Some(started_tx)));
+    let release = BlockingPopupIoRelease::new();
+    let writer_writes = Arc::clone(&writes);
+    let writer_started = Arc::clone(&started_tx);
+    let writer_release = release.callback_state();
+    let (_, _popup_cleanup) =
+        install_popup_test_writer(&handler, requester_pid, false, move |bytes| {
+            writer_writes.lock().expect("recorded writes").push(bytes);
+            if let Some(started_tx) = writer_started.lock().expect("writer start").take() {
+                let _ = started_tx.send(());
+            }
+            let (released, released_cv) = &*writer_release;
+            let mut released = released.lock().expect("writer release");
+            while !*released {
+                released = released_cv.wait(released).expect("writer release wait");
+            }
+            Ok(())
+        })
+        .await;
+
+    let input_handler = handler.clone();
+    let input_task = tokio::spawn(async move {
+        input_handler
+            .handle_attached_live_input_for_test(requester_pid, b"k")
+            .await
+    });
+    let writer_started = timeout(Duration::from_secs(2), started_rx).await;
+    let progress = timeout(
+        Duration::from_millis(500),
+        handler.handle(Request::ListSessions(ListSessionsRequest {
+            format: None,
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })),
+    )
+    .await;
+
+    release.release();
+
+    writer_started
+        .expect("popup writer should receive the key")
+        .expect("popup writer start signal should remain connected");
+    let input_result = timeout(Duration::from_secs(2), input_task)
+        .await
+        .expect("popup key input should finish after writer release")
+        .expect("popup key input task should not panic");
+    input_result.expect("popup key input should succeed");
+    handler
+        .clear_interactive_overlay(requester_pid, true)
+        .await
+        .expect("popup cleanup");
+    assert!(
+        matches!(&progress, Ok(Response::ListSessions(_))),
+        "a blocked popup writer must not prevent unrelated server work: {progress:?}"
+    );
+    assert_eq!(
+        *writes.lock().expect("recorded writes"),
+        vec![b"k".to_vec()]
+    );
+}
+
+#[tokio::test]
+async fn popup_mouse_forward_uses_nonblocking_io_queue() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-mouse-writer");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let writes = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+    let writer_writes = Arc::clone(&writes);
+    let (rect, _popup_cleanup) =
+        install_popup_test_writer(&handler, requester_pid, true, move |bytes| {
+            writer_writes.lock().expect("recorded writes").push(bytes);
+            Ok(())
+        })
+        .await;
+
+    handler
+        .handle_attached_live_input_for_test(
+            requester_pid,
+            &sgr_mouse(0, rect.x.saturating_add(1), rect.y.saturating_add(1)),
+        )
+        .await
+        .expect("popup mouse input");
+
+    let recorded = writes.lock().expect("recorded writes").clone();
+    handler
+        .clear_interactive_overlay(requester_pid, true)
+        .await
+        .expect("popup cleanup");
+    assert_eq!(recorded, vec![b"\x1b[<0;1;1M".to_vec()]);
+}
+
+#[tokio::test]
+async fn popup_menu_paste_uses_nonblocking_io_queue() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-paste-writer");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+    let set_buffer = handler
+        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
+            name: None,
+            content: b"paste-data".to_vec(),
+            append: false,
+            new_name: None,
+            set_clipboard: false,
+            target_client: None,
+        })))
+        .await;
+    assert!(matches!(set_buffer, Response::SetBuffer(_)));
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let writes = Arc::new(StdMutex::new(Vec::<Vec<u8>>::new()));
+    let writer_writes = Arc::clone(&writes);
+    let (rect, _popup_cleanup) =
+        install_popup_test_writer(&handler, requester_pid, false, move |bytes| {
+            writer_writes.lock().expect("recorded writes").push(bytes);
+            Ok(())
+        })
+        .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, &sgr_mouse(2, rect.x, rect.y))
+        .await
+        .expect("open popup menu");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"p")
+        .await
+        .expect("paste from popup menu");
+
+    let recorded = writes.lock().expect("recorded writes").clone();
+    handler
+        .clear_interactive_overlay(requester_pid, true)
+        .await
+        .expect("popup cleanup");
+    assert_eq!(recorded, vec![b"paste-data".to_vec()]);
+}
+
+#[tokio::test]
+async fn popup_attached_resize_releases_attach_lock_while_pty_resize_blocks() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-resize-writer");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let resized = Arc::new(StdMutex::new(Vec::<TerminalSize>::new()));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let started_tx = Arc::new(StdMutex::new(Some(started_tx)));
+    let release = BlockingPopupIoRelease::new();
+    let callback_resized = Arc::clone(&resized);
+    let callback_started = Arc::clone(&started_tx);
+    let callback_release = release.callback_state();
+    let (_, _popup_cleanup) = install_popup_test_resize(&handler, requester_pid, move |size| {
+        callback_resized
+            .lock()
+            .expect("recorded popup resizes")
+            .push(size);
+        if let Some(started_tx) = callback_started.lock().expect("resize start").take() {
+            let _ = started_tx.send(());
+        }
+        let (released, released_cv) = &*callback_release;
+        let mut released = released.lock().expect("resize release");
+        while !*released {
+            released = released_cv.wait(released).expect("resize release wait");
+        }
+        Ok(())
+    })
+    .await;
+
+    let resize_handler = handler.clone();
+    let resize_task = tokio::spawn(async move {
+        resize_handler
+            .handle_attached_resize(requester_pid, TerminalSize { cols: 10, rows: 5 })
+            .await
+    });
+    let resize_started = timeout(Duration::from_secs(2), started_rx).await;
+
+    let attach_lock_progress = timeout(Duration::from_millis(500), async {
+        let _active_attach = handler.active_attach.lock().await;
+    })
+    .await;
+
+    release.release();
+    resize_started
+        .expect("popup PTY resize should start")
+        .expect("popup PTY resize start signal should remain connected");
+    attach_lock_progress
+        .expect("a blocked popup PTY resize must not retain the active-attach lock");
+    timeout(Duration::from_secs(2), resize_task)
+        .await
+        .expect("attached resize should finish after PTY resize release")
+        .expect("attached resize task should not panic")
+        .expect("attached resize should succeed");
+
+    let recorded = resized.lock().expect("recorded popup resizes").clone();
+    handler
+        .clear_interactive_overlay(requester_pid, true)
+        .await
+        .expect("popup cleanup");
+    assert_eq!(recorded, vec![TerminalSize { cols: 8, rows: 3 }]);
+}
+
+#[tokio::test]
+async fn popup_menu_resize_releases_attach_lock_while_pty_resize_blocks() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-menu-resize-writer");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let resized = Arc::new(StdMutex::new(Vec::<TerminalSize>::new()));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let started_tx = Arc::new(StdMutex::new(Some(started_tx)));
+    let release = BlockingPopupIoRelease::new();
+    let callback_resized = Arc::clone(&resized);
+    let callback_started = Arc::clone(&started_tx);
+    let callback_release = release.callback_state();
+    let (rect, _popup_cleanup) = install_popup_test_resize(&handler, requester_pid, move |size| {
+        callback_resized
+            .lock()
+            .expect("recorded popup resizes")
+            .push(size);
+        if let Some(started_tx) = callback_started.lock().expect("resize start").take() {
+            let _ = started_tx.send(());
+        }
+        let (released, released_cv) = &*callback_release;
+        let mut released = released.lock().expect("resize release");
+        while !*released {
+            released = released_cv.wait(released).expect("resize release wait");
+        }
+        Ok(())
+    })
+    .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, &sgr_mouse(2, rect.x, rect.y))
+        .await
+        .expect("open popup menu");
+    let menu_handler = handler.clone();
+    let menu_task = tokio::spawn(async move {
+        menu_handler
+            .handle_attached_live_input_for_test(requester_pid, b"F")
+            .await
+    });
+    let resize_started = timeout(Duration::from_secs(2), started_rx).await;
+    let attach_lock_progress = timeout(Duration::from_millis(500), async {
+        let _active_attach = handler.active_attach.lock().await;
+    })
+    .await;
+    release.release();
+    let menu_result = timeout(Duration::from_secs(2), menu_task).await;
+    let recorded = resized.lock().expect("recorded popup resizes").clone();
+    handler
+        .clear_interactive_overlay(requester_pid, true)
+        .await
+        .expect("popup cleanup");
+
+    resize_started
+        .expect("popup menu PTY resize should start")
+        .expect("popup menu resize start signal should remain connected");
+    attach_lock_progress
+        .expect("blocked popup menu PTY resize must not retain the active-attach lock");
+    menu_result
+        .expect("popup menu resize should finish after release")
+        .expect("popup menu resize task should not panic")
+        .expect("popup menu resize should succeed");
+    assert_eq!(recorded, vec![TerminalSize { cols: 78, rows: 22 }]);
+}
+
+#[tokio::test]
+async fn popup_drag_resize_releases_attach_lock_while_pty_resize_blocks() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-drag-resize-writer");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    let resized = Arc::new(StdMutex::new(Vec::<TerminalSize>::new()));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let started_tx = Arc::new(StdMutex::new(Some(started_tx)));
+    let release = BlockingPopupIoRelease::new();
+    let callback_resized = Arc::clone(&resized);
+    let callback_started = Arc::clone(&started_tx);
+    let callback_release = release.callback_state();
+    let (rect, _popup_cleanup) = install_popup_test_resize(&handler, requester_pid, move |size| {
+        callback_resized
+            .lock()
+            .expect("recorded popup resizes")
+            .push(size);
+        if let Some(started_tx) = callback_started.lock().expect("resize start").take() {
+            let _ = started_tx.send(());
+        }
+        let (released, released_cv) = &*callback_release;
+        let mut released = released.lock().expect("resize release");
+        while !*released {
+            released = released_cv.wait(released).expect("resize release wait");
+        }
+        Ok(())
+    })
+    .await;
+    {
+        let mut active_attach = handler.active_attach.lock().await;
+        let Some(ClientOverlayState::Popup(popup)) = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .and_then(|active| active.overlay.as_mut())
+        else {
+            panic!("expected popup overlay");
+        };
+        popup.begin_resize_for_test();
+    }
+
+    let drag_handler = handler.clone();
+    let drag = sgr_mouse(34, rect.x.saturating_add(10), rect.y.saturating_add(3));
+    let drag_task = tokio::spawn(async move {
+        drag_handler
+            .handle_attached_live_input_for_test(requester_pid, &drag)
+            .await
+    });
+    let resize_started = timeout(Duration::from_secs(2), started_rx).await;
+    let attach_lock_progress = timeout(Duration::from_millis(500), async {
+        let _active_attach = handler.active_attach.lock().await;
+    })
+    .await;
+    release.release();
+    let drag_result = timeout(Duration::from_secs(2), drag_task).await;
+    let recorded = resized.lock().expect("recorded popup resizes").clone();
+    handler
+        .clear_interactive_overlay(requester_pid, true)
+        .await
+        .expect("popup cleanup");
+
+    resize_started
+        .expect("popup drag PTY resize should start")
+        .expect("popup drag resize start signal should remain connected");
+    attach_lock_progress
+        .expect("blocked popup drag PTY resize must not retain the active-attach lock");
+    drag_result
+        .expect("popup drag resize should finish after release")
+        .expect("popup drag resize task should not panic")
+        .expect("popup drag resize should succeed");
+    assert_eq!(recorded, vec![TerminalSize { cols: 9, rows: 2 }]);
 }
 
 #[tokio::test]

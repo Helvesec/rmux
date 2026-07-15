@@ -21,16 +21,7 @@ pub(super) fn spawn_hidden_daemon(
     let candidates = super::hidden_daemon_binary_candidates();
     let mut last_error = None;
     for (index, binary) in candidates.iter().enumerate() {
-        let result =
-            match spawn_hidden_daemon_with_binary(endpoint, binary, caller_cwd, deadline, true) {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) =>
-                {
-                    spawn_hidden_daemon_with_binary(endpoint, binary, caller_cwd, deadline, false)
-                }
-                Err(error) => Err(error),
-            };
+        let result = spawn_hidden_daemon_with_binary(endpoint, binary, caller_cwd, deadline);
         match result {
             Ok(()) => return Ok(()),
             Err(error)
@@ -57,7 +48,6 @@ fn spawn_hidden_daemon_with_binary(
     binary: &OsStr,
     caller_cwd: Option<&Path>,
     deadline: OperationDeadline,
-    allow_job_breakaway: bool,
 ) -> io::Result<()> {
     if matches!(deadline.remaining_timeout(), Some(remaining) if remaining.is_zero()) {
         return Err(io::Error::new(
@@ -70,8 +60,8 @@ fn spawn_hidden_daemon_with_binary(
     let mut command = hidden_daemon_command(binary, endpoint, caller_cwd);
     #[cfg(windows)]
     command.arg("--startup-ready-event").arg(ready.name());
-    rmux_os::daemon::configure_hidden_daemon_command(&mut command, allow_job_breakaway);
-    let child = rmux_os::daemon::spawn_hidden_daemon_command(&mut command)?;
+    rmux_os::daemon::configure_hidden_daemon_command(&mut command, true);
+    let child = rmux_os::daemon::spawn_hidden_daemon_command_requiring_job_breakaway(&mut command)?;
     drop(child);
     #[cfg(windows)]
     {

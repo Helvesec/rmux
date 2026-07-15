@@ -259,26 +259,14 @@ where
                         // Rearm only the stop published by this lock/suspend
                         // prelude. A newer stop belongs to a concurrent detach
                         // or session exit and remains authoritative.
-                        let rearmed = stop_generation.is_some_and(|generation| {
-                            screen_tracker.rearm_if_current(generation)
-                        });
-                        let current_stop_owned_by_pending_resume = screen_tracker
-                            .current_stop_generation()
-                            .is_some_and(|current| {
-                                pending_resume_generations
-                                    .iter()
-                                    .flatten()
-                                    .any(|generation| *generation == current)
-                            });
-                        if !rearmed
-                            && screen_tracker.was_stopped()
-                            && !current_stop_owned_by_pending_resume
-                        {
-                            // A final detach action may follow its stop sequence
-                            // in a separate frame. Keep the attach reader alive
-                            // and input locked until that action or EOF arrives.
-                            continue;
+                        if let Some(generation) = stop_generation {
+                            screen_tracker.rearm_if_current(generation);
                         }
+                        // Always acknowledge the completed resumable action.
+                        // A newer stop remains authoritative because the
+                        // generation-scoped rearm above cannot consume it, but
+                        // it must not strand the server-side attach lock while
+                        // a later detach frame is still in flight.
                         if let Err(error) =
                             write_async_attach_message(&mut writer, AttachMessage::Unlock).await
                         {

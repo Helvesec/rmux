@@ -12,7 +12,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_frame, FrameDecoder, HasSessionRequest, RenameSessionRequest, Request, Response,
+    encode_frame, FrameDecoder, HasSessionRequest, OptionName, RenameSessionRequest, Request,
+    Response, ScopeSelector, SetOptionMode, SetOptionRequest, WindowTarget,
 };
 use rmux_sdk::{
     CleanupPolicy, EnsureSession, LeaseState, PaneCloseOutcome, PaneInfo, PaneProcessState,
@@ -232,6 +233,107 @@ async fn split_with_spawn_keep_alive_keeps_dead_child_pane() -> TestResult {
         Some(3)
     );
     assert_eq!(child.title().await?.as_deref(), Some("short-lived"));
+
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn split_targets_and_returns_the_right_pane_with_nonzero_pane_base_index() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("pane-split-base").await?;
+    let rmux = harness.rmux();
+
+    for (label, stable_source, builder) in [
+        ("slot-simple", false, false),
+        ("slot-builder", false, true),
+        ("stable-simple", true, false),
+        ("stable-builder", true, true),
+    ] {
+        let name = session_name(&format!("sdksplit{label}"));
+        let session = EnsureSession::named(name.clone())
+            .create_only()
+            .ensure(&rmux)
+            .await?;
+        let root = session.pane(0, 0);
+        let root_id = root.id().await?.expect("root pane has a stable id");
+        let sibling = root.split(SplitDirection::Down).await?;
+        let sibling_id = sibling.id().await?.expect("sibling pane has a stable id");
+        root.set_title(format!("root-{label}")).await?;
+        sibling.set_title(format!("sibling-{label}")).await?;
+
+        let response = framed_request(
+            &harness.socket_path,
+            Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(name.clone(), 0)),
+                option: OptionName::PaneBaseIndex,
+                value: "1".to_owned(),
+                mode: SetOptionMode::Replace,
+            }),
+        )
+        .await?;
+        assert!(
+            matches!(response, Response::SetOption(_)),
+            "pane-base-index setup failed for {label}: {response:?}"
+        );
+
+        let source = if stable_source {
+            session.pane_by_id(root_id).await?
+        } else {
+            session.pane(0, 1)
+        };
+        let child_title = format!("child-{label}");
+        let child = if builder {
+            source
+                .split_with(SplitDirection::Right)
+                .title(child_title.clone())
+                .await?
+        } else {
+            let child = source.split(SplitDirection::Right).await?;
+            child.set_title(child_title.clone()).await?;
+            child
+        };
+
+        let child_id = child.id().await?.expect("split child has a stable id");
+        assert_ne!(child_id, root_id, "split returned the root for {label}");
+        assert_ne!(
+            child_id, sibling_id,
+            "split returned the pre-existing sibling for {label}"
+        );
+
+        let stable_root = session.pane_by_id(root_id).await?;
+        let stable_sibling = session.pane_by_id(sibling_id).await?;
+        assert_eq!(
+            stable_root.title().await?.as_deref(),
+            Some(format!("root-{label}").as_str()),
+            "split title mutated the root for {label}"
+        );
+        assert_eq!(
+            stable_sibling.title().await?.as_deref(),
+            Some(format!("sibling-{label}").as_str()),
+            "split title mutated the sibling for {label}"
+        );
+        assert_eq!(
+            child.title().await?.as_deref(),
+            Some(child_title.as_str()),
+            "split child title was not applied to the child for {label}"
+        );
+        let child_info = only_pane_info(&child.info().await?);
+        assert_eq!(
+            child.target().pane_index,
+            child_info.index,
+            "returned target must use the child's visible pane index for {label}"
+        );
+
+        let root_info = only_pane_info(&stable_root.info().await?);
+        let sibling_info = only_pane_info(&stable_sibling.info().await?);
+        assert!(
+            root_info.size.cols < sibling_info.size.cols,
+            "split anchored to the sibling instead of the root for {label}: \
+             root={:?}, sibling={:?}",
+            root_info.size,
+            sibling_info.size
+        );
+    }
 
     harness.finish().await
 }

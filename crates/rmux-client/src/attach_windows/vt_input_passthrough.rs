@@ -9,6 +9,12 @@ use windows_sys::Win32::System::Console::{
 use super::console_coordination::{ConsoleIoCoordinator, ATTACH_CONSOLE_IO};
 use super::windows_version::{current_windows_version, supports_scoped_vt_input, WindowsVersion};
 
+// Keep each WriteConsoleW request comfortably below the console host's
+// internal 64-KiB-class buffers. Large terminal strings (notably OSC 52)
+// otherwise turn one transient console allocation limit into a fatal attach
+// output error.
+const MAX_WRITE_CONSOLE_CODE_UNITS: usize = 16 * 1024;
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ScopedVtInputPassthrough {
     handles: ConsoleHandles<HANDLE>,
@@ -223,8 +229,7 @@ impl ScopedConsoleApi for Win32ConsoleApi {
     fn write_console(&self, handle: Self::Handle, wide: &[u16]) -> Result<(), Self::Error> {
         let mut written = 0;
         while written < wide.len() {
-            let remaining = wide.len() - written;
-            let chunk_len = remaining.min(u32::MAX as usize) as u32;
+            let chunk_len = console_write_chunk_len(&wide[written..]) as u32;
             let mut chars_written = 0;
             let ok = unsafe {
                 // SAFETY: handle is a validated console output handle and the
@@ -247,6 +252,17 @@ impl ScopedConsoleApi for Win32ConsoleApi {
         }
         Ok(())
     }
+}
+
+fn console_write_chunk_len(remaining: &[u16]) -> usize {
+    let mut chunk_len = remaining.len().min(MAX_WRITE_CONSOLE_CODE_UNITS);
+    if chunk_len < remaining.len()
+        && chunk_len > 1
+        && (0xD800..=0xDBFF).contains(&remaining[chunk_len - 1])
+    {
+        chunk_len -= 1;
+    }
+    chunk_len
 }
 
 fn last_win32_failure() -> Win32ConsoleFailure {
@@ -289,12 +305,33 @@ mod tests {
 
     use super::super::windows_version::SCOPED_VT_INPUT_MIN_BUILD;
     use super::{
-        coordinated_scoped_write, eligible_console_handles, scoped_write, ConsoleHandles,
-        ConsoleIoCoordinator, ScopedConsoleApi, ScopedWriteFailure, WindowsVersion,
+        console_write_chunk_len, coordinated_scoped_write, eligible_console_handles, scoped_write,
+        ConsoleHandles, ConsoleIoCoordinator, ScopedConsoleApi, ScopedWriteFailure, WindowsVersion,
+        MAX_WRITE_CONSOLE_CODE_UNITS,
     };
 
     const INPUT: u8 = 1;
     const OUTPUT: u8 = 2;
+
+    #[test]
+    fn console_writes_are_bounded_without_splitting_surrogate_pairs() {
+        let short = vec![b'x' as u16; 32];
+        assert_eq!(console_write_chunk_len(&short), short.len());
+
+        let oversized = vec![b'x' as u16; MAX_WRITE_CONSOLE_CODE_UNITS + 1];
+        assert_eq!(
+            console_write_chunk_len(&oversized),
+            MAX_WRITE_CONSOLE_CODE_UNITS
+        );
+
+        let mut boundary_pair = oversized;
+        boundary_pair[MAX_WRITE_CONSOLE_CODE_UNITS - 1] = 0xD83D;
+        boundary_pair[MAX_WRITE_CONSOLE_CODE_UNITS] = 0xDE00;
+        assert_eq!(
+            console_write_chunk_len(&boundary_pair),
+            MAX_WRITE_CONSOLE_CODE_UNITS - 1
+        );
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Event {

@@ -636,6 +636,26 @@ fn unknown_subcommand_fallback_rejects_source_syntax() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn runtime_alias_fallback_preserves_assignment_before_alias() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("runtime-alias-leading-assignment")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "set-option",
+        "-s",
+        "command-alias[7]",
+        "probe=display-message -p \"$CLI_ALIAS_VALUE\"",
+    ])?);
+
+    let output = harness.run(&["CLI_ALIAS_VALUE=preserved", "probe"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "preserved\n");
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
 fn version_flag_reports_rmux_version_without_server_contact() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("version-flag")?;
     let output = harness.run(&["-V"])?;

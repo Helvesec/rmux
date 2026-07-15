@@ -243,6 +243,15 @@ impl RequestHandler {
             after_hook_target,
         ) = {
             let mut state = self.state.lock().await;
+            let target_window = WindowTarget::with_window(
+                request.target.session_name().clone(),
+                request.target.window_index(),
+            );
+            if let Err(error) =
+                super::super::require_expected_window_identity(&state, &target_window)
+            {
+                return Response::Error(ErrorResponse { error });
+            }
             let detach_on_destroy = SessionDetachOnDestroy::capture_all(&state);
             let hook_batch =
                 KillPaneLifecycleBatch::capture(&state, &request.target, request.kill_all_except);

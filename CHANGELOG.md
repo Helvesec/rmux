@@ -2,8 +2,52 @@
 
 ## 0.9.0
 
+### Security
+
+- Authenticates Windows named-pipe servers by the expected user SID and
+  integrity level on CLI and SDK connections, and compares canonical pipe
+  names without opening them as filesystem paths. A client and daemon running
+  at different integrity levels now fail closed with an actionable error
+  instead of trusting a same-name endpoint (issue #82).
+
 ### Compatibility
 
+- Honors the effective `default-command` for `new-window` and `split-window`
+  across direct, queued, sourced, binding, and SDK entry paths while explicit
+  commands still win (the remaining command-spawn half of issue #59).
+- Inherits the detached caller's working directory for `new-window` and
+  `split-window` when `-c` is absent, while `#{session_path}` remains the
+  session creation directory rather than following the active pane
+  (issues #99 and #100).
+- Keeps SDK split targets stable under nonzero `pane-base-index`: slot handles
+  resolve through visible coordinates and the returned handle is normalized
+  to the new pane's stable id (issue #94).
+- Disables Kitty keyboard negotiation by default, including explicit
+  set/push/pop/query sequences, rather than activating an incomplete encoder;
+  xterm `modifyOtherKeys` behavior remains available (issue #102).
+- Identifies XTVERSION replies as `rmux 0.9.0` instead of impersonating a tmux
+  release while preserving the compatible DCS response framing; this
+  intentional product-identity divergence is recorded as C-D57.
+- Makes `send-keys --wait-pane-exit` report the waited pane's exit outcome,
+  including a pane removed before the caller observes it, instead of returning
+  a false success or losing the retained result after a session rename
+  (issue #57).
+- Reports each attached client's effective key table after prefix and table
+  switches instead of returning the session default, so `list-clients` and
+  formats reflect the table that actually handles the next key.
+- Applies `pane-base-index` consistently to default `list-panes` output and
+  mode-tree pane labels while retaining stable internal pane ids, so a printed
+  pane target can be fed back to the CLI without selecting a different pane
+  (issues #18 and #94).
+- Preserves the resolved target and working directory of queued background
+  shell jobs after the initiating client exits, including sourced and binding
+  entry paths.
+- Aligns compact-flag parsing, command aliases, source-file dispatch, and
+  control-mode errors with the advertised command inventory instead of
+  accepting flags that are later ignored.
+- Preserves Windows PowerShell profile startup and recovers from incomplete
+  tmux-wrapped terminal strings so the reported PowerShell and opencode paths
+  remain live (issues #76 and #77).
 - Enables outer mouse reporting when the active pane's application requests a
   tracking mode (`?1000`/`?1002`/`?1003`), matching tmux: vim or htop over SSH
   now receive mouse events with the `mouse` option off, and the outer enable
@@ -12,7 +56,8 @@
 - Resolves client-less `display-message` targets through the requester's
   `TMUX_PANE`/`RMUX_PANE` environment ahead of any attached client's session,
   pinned end to end (a real child process carrying the environment) by
-  [display-message requester tests](crates/rmux-server/src/handler_display_message_tests.rs).
+  [display-message requester tests](crates/rmux-server/src/handler_display_message_tests.rs)
+  (issue #83).
 - Executes every command of a root mouse binding sequence
   (`select-pane -t = \; run-shell ...`), including the `run-shell` tail, once a
   decoded mouse event reaches the live-attach dispatcher, backed by
@@ -84,7 +129,8 @@
   by
   [selection overlay tests](crates/rmux-core/src/screen/tests.rs),
   [renderer expansion tests](crates/rmux-server/src/renderer/tests.rs), and
-  [attached copy-mode render tests](crates/rmux-server/src/handler_attach_tests/copy_mode_render.rs).
+  [attached copy-mode render tests](crates/rmux-server/src/handler_attach_tests/copy_mode_render.rs)
+  (issue #90).
 - Tracks application-set OSC 10/11/12 colours per pane and round-trips only
   those known values. Queries for an unknown outer-terminal palette remain
   unanswered instead of returning an invented dark theme, recorded in
@@ -166,8 +212,8 @@
   `install.ps1` in the release zip and `scripts/install-windows.ps1` verify
   the release checksum, install the private helper before the public
   dispatcher, and are exercised by the
-  [package verifier](scripts/verify-package-windows.ps1) (contributed by
-  @isacgalvao).
+  [package verifier](scripts/verify-package-windows.ps1) (issue #86,
+  contributed by @isacgalvao).
 - Matches the tmux 3.7b `set-option -U` scope matrix: plain `-U` unsets the
   session copy only, `-pU` the pane copy only, and `-wU` the window copy plus
   the window's pane overrides, replacing the previous RMUX-specific
@@ -230,6 +276,40 @@
 
 ### Reliability
 
+- Relays `set-clipboard on` OSC 52 writes from a visible inactive pane to the
+  outer terminal of each matching attach client without duplicating the active
+  pane's normal output path. Routing is keyed by stable session and window
+  identity, and slow-client control backlogs remain bounded (issue #91).
+- Serializes popup PTY writes and resizes through one FIFO worker outside the
+  async runtime and never waits for blocking PTY I/O while holding attach
+  state. Windows popup exit drops the owning Job Object before closing ConPTY,
+  so a blocked reader cannot strand the server runtime.
+- Isolates live attach output by pane source so a multi-client switch cannot
+  replay terminal passthroughs or render frames from the previous target, and
+  keeps SDK pane-state subscriptions alive across respawn generations.
+- Keeps copy-mode refresh fanout, owned-session lease renewal, Windows attach
+  resume, and output draining ordered across their asynchronous boundaries.
+- Carries stable session/window/pane identities through queued destructive
+  commands and control-mode pane subscriptions, preventing a same-name
+  recreate from receiving or destroying state that belonged to its predecessor.
+- Migrates deferred Windows pane-start records with a renamed session instead
+  of stranding the eventual process under the old name.
+- Bounds the latency-sensitive caller wait for ordered lifecycle hooks while
+  leaving the hook and FIFO completion drain alive; a slow foreground hook no
+  longer freezes every attach client for the full hook timeout.
+- Hardens Windows attach and input recovery: completed lock actions always
+  release their local lock, isolated key records cannot be misclassified as a
+  paste solely because another console event remains queued, the temporary
+  Ctrl-C ignore guard remains alive through console detach, and large
+  `WriteConsoleW` output is emitted in UTF-16-safe bounded chunks.
+- Requires Windows daemon auto-start to escape restrictive job objects instead
+  of silently starting a daemon that dies with its launcher, and reports the
+  unsupported host policy when breakaway is denied.
+- Expands `~` in Windows configuration from nonempty `HOME`, falling back to
+  `USERPROFILE`, while retaining the existing Unix environment policy.
+- Makes Windows archive upgrades transactional: installation is staged and
+  verified before replacement, with the previous working package restored if
+  the swap cannot complete.
 - Hardened Unix socket startup and cleanup, including bare relative `-S` paths,
   daemon churn, exit-empty behavior, and worktree socket hygiene.
 - Added RMUX-native SDK pane option APIs, pane-state event streams, and

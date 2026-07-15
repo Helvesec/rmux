@@ -20,8 +20,8 @@ use tokio::time::Instant;
 use super::attach_output_batch::{collect_attach_output_batch, AttachOutputBatch};
 use super::attach_transport::AttachTransport;
 use super::control::{
-    apply_pending_attach_controls, coalesce_render_switches, PendingAttachAction,
-    PendingAttachInputState,
+    apply_pending_attach_controls, coalesce_render_switches, preserves_live_output,
+    PendingAttachAction, PendingAttachInputState,
 };
 use super::exit_log::AttachExitReason;
 use super::pending_escape::PendingEscapeFlush;
@@ -1959,6 +1959,35 @@ fn test_render_only_attach_target_with_state(
     let mut target = test_attach_target(session_name, render_frame, persistent_overlay_state_id);
     target.pane_master = None;
     target
+}
+
+#[test]
+fn live_output_is_preserved_only_for_coalescible_same_source_refreshes() {
+    let session_name = SessionName::new("live-output-source").expect("valid session name");
+    let shared_output = pane_output_channel();
+    let mut initial =
+        test_attach_target_with_output(&session_name, b"BASE-A", None, shared_output.clone(), true);
+    initial.pane_master = None;
+    let current = open_attach_target(initial, false).expect("open initial target");
+
+    let mut same_source =
+        test_attach_target_with_output(&session_name, b"BASE-B", None, shared_output.clone(), true);
+    same_source.pane_master = None;
+    assert!(preserves_live_output(&current, &same_source));
+
+    let mut different_source =
+        test_attach_target_with_output(&session_name, b"BASE-C", None, pane_output_channel(), true);
+    different_source.pane_master = None;
+    assert!(different_source.is_coalescible_render_refresh());
+    assert!(!preserves_live_output(&current, &different_source));
+
+    let non_coalescible_same_source =
+        test_attach_target_with_output(&session_name, b"BASE-D", None, shared_output, true);
+    assert!(!non_coalescible_same_source.is_coalescible_render_refresh());
+    assert!(!preserves_live_output(
+        &current,
+        &non_coalescible_same_source
+    ));
 }
 
 #[test]

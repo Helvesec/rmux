@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use super::{ControlClientFlags, ControlOutputQueue};
-use crate::handler::RequestHandler;
+use crate::handler::{ControlClientIdentity, RequestHandler};
 
 pub(super) enum PaneSubscriptionStart<'a> {
     Oldest,
@@ -41,6 +41,7 @@ pub(super) struct PaneSubscription {
 
 pub(super) async fn refresh_subscriptions(
     handler: &RequestHandler,
+    control_identity: ControlClientIdentity,
     session_name: Option<&SessionName>,
     subscriptions: &mut HashMap<u32, PaneSubscription>,
     pane_event_tx: mpsc::Sender<PaneEvent>,
@@ -51,7 +52,7 @@ pub(super) async fn refresh_subscriptions(
         return;
     };
     let panes = handler
-        .control_session_panes(session_name)
+        .control_session_panes_for_identity(control_identity, session_name)
         .await
         .unwrap_or_default();
     let desired = panes

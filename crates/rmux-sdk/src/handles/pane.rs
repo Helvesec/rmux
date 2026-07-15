@@ -597,16 +597,15 @@ impl Pane {
     /// `Left` and `Up` map to tmux's `-b` flag — the new pane is inserted
     /// *before* this one on the chosen axis.
     ///
-    /// For handles created by [`Session::pane_by_id`](crate::Session::pane_by_id),
-    /// the SDK resolves the stable pane id to the daemon's current slot before
-    /// issuing the split request. Unlike input, snapshot, waits, and streams,
-    /// split is therefore not yet an atomic daemon-side by-id operation.
+    /// Handles created by [`Session::pane_by_id`](crate::Session::pane_by_id)
+    /// keep their stable `%N` identity through daemon-side target resolution;
+    /// slot handles use their visible tmux target, including `pane-base-index`.
     pub async fn split(&self, direction: SplitDirection) -> Result<Self> {
         let pane = self.begin_operation_handle();
-        let target = pane.current_target().await?;
-        let new_target = split_pane(&pane.transport, &target, direction).await?;
-        Ok(Self::new(
-            new_target,
+        let outcome = split_pane(&pane.transport, pane.split_target_text(), direction).await?;
+        Ok(Self::new_by_id(
+            outcome.target,
+            outcome.pane_id,
             pane.endpoint.clone(),
             pane.default_timeout,
             pane.transport,
@@ -620,9 +619,8 @@ impl Pane {
     /// daemon never creates the new pane with an intermediate default shell
     /// that is immediately replaced.
     ///
-    /// On a stable-id pane handle, this builder has the same targeting
-    /// limitation as [`Self::split`]: the id is resolved to the current slot
-    /// before the split request is sent.
+    /// Stable-id and visible-slot targeting follow the same rules as
+    /// [`Self::split`].
     pub fn split_with(&self, direction: SplitDirection) -> PaneSplitBuilder<'_> {
         PaneSplitBuilder::new(self, direction)
     }
@@ -669,6 +667,13 @@ impl Pane {
         current_pane_ref_for_id(&self.transport, &self.target.session_name, pane_id)
             .await?
             .ok_or_else(|| RmuxError::pane_not_found(self.target.session_name.clone(), pane_id))
+    }
+
+    pub(crate) fn split_target_text(&self) -> String {
+        self.stable_id.map_or_else(
+            || self.target.to_proto().to_string(),
+            |pane_id| pane_id.to_string(),
+        )
     }
 }
 

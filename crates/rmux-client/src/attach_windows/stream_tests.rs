@@ -128,11 +128,11 @@ async fn lock_and_suspend_unlock_paths_rearm_attach_screen(
 }
 
 #[tokio::test]
-async fn lock_completion_preserves_a_concurrent_final_stop(
+async fn lock_completion_unlocks_while_preserving_a_concurrent_final_stop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (client_stream, mut server) = tokio::io::duplex(4096);
     let (reader, writer) = tokio::io::split(client_stream);
-    let (_input_tx, input_rx) = mpsc::channel(1);
+    let (input_tx, input_rx) = mpsc::channel(1);
     let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
     let (completion_tx, completion_rx) = mpsc::unbounded_channel();
@@ -170,13 +170,21 @@ async fn lock_completion_preserves_a_concurrent_final_stop(
     let final_stop = wait_for_stop_generation(&screen_tracker, Some(lock_prelude)).await?;
 
     completion_tx.send(Ok(AttachActionOutcome::Unlock))?;
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Unlock,
+        "a completed lock must always be acknowledged"
+    );
     assert_eq!(screen_tracker.current_stop_generation(), Some(final_stop));
-    let mut frame = [0_u8; 64];
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), server.read(&mut frame))
-            .await
-            .is_err(),
-        "a stale lock completion must keep waiting without sending unlock"
+    input_tx
+        .send(super::super::input::AttachInput::bytes(
+            b"after-lock".to_vec(),
+        ))
+        .await?;
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"after-lock".to_vec())),
+        "a newer stop must not leave the attach input lock wedged"
     );
     assert!(
         !client.is_finished(),

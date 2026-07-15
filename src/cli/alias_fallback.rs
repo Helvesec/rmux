@@ -145,11 +145,10 @@ pub(super) fn runtime_command_resolution_after_startup(
 pub(super) fn first_cold_start_command(args: &[OsString]) -> Option<Command> {
     let (_, invocation) = prepare_runtime_command_invocation(args)?;
     let first_group = first_raw_command_group(&invocation.arguments);
-    let assignment_count = usize::from(
-        first_group
-            .first()
-            .is_some_and(|argument| is_parse_time_assignment(argument)),
-    );
+    let assignment_count = first_group
+        .iter()
+        .take_while(|argument| is_parse_time_assignment(argument))
+        .count();
     let first_group = first_group.get(assignment_count..)?;
     if first_group.is_empty() {
         return None;
@@ -245,6 +244,10 @@ fn resolve_runtime_command_with_connection(
         }
     };
 
+    if queue_has_builtin_after_parse_time_assignment(&groups) {
+        return Ok(Some(RuntimeCommandResolution::LegacyDirect));
+    }
+
     Ok(Some(RuntimeCommandResolution::Canonical(vec![
         RuntimeCommandGroup::Canonical(canonical),
     ])))
@@ -306,13 +309,26 @@ fn queue_uses_server_alias(groups: &[Vec<String>], aliases: &[String]) -> bool {
         })
 }
 
+fn queue_has_builtin_after_parse_time_assignment(groups: &[Vec<String>]) -> bool {
+    groups.iter().any(|group| {
+        let Some(first) = group.first() else {
+            return false;
+        };
+        if !is_parse_time_assignment(first) {
+            return false;
+        }
+        let Some(command_name) = alias_lookup_command_name(group) else {
+            return true;
+        };
+        has_tmux_command_candidate(command_name)
+    })
+}
+
 fn alias_lookup_command_name(group: &[String]) -> Option<&str> {
-    let (first, tail) = group.split_first()?;
-    if is_parse_time_assignment(first) {
-        tail.first().map(String::as_str)
-    } else {
-        Some(first)
-    }
+    group
+        .iter()
+        .find(|argument| !is_parse_time_assignment(argument))
+        .map(String::as_str)
 }
 
 fn normalize_alias_fallback_error(error: ExitFailure) -> ExitFailure {
@@ -480,6 +496,7 @@ mod tests {
         let invocation = args(&[
             "rmux",
             "FOO=x",
+            "BAR=y",
             "new-session",
             "-d",
             "-s",
@@ -540,6 +557,22 @@ mod tests {
         assert!(is_parse_time_assignment("_FOO=x=y"));
         assert!(!is_parse_time_assignment("1FOO=x"));
         assert!(!is_parse_time_assignment("FOO-BAR=x"));
+    }
+
+    #[test]
+    fn builtin_cli_assignments_do_not_enter_the_runtime_source_bridge() {
+        assert!(!queue_has_builtin_after_parse_time_assignment(&[vec![
+            "FOO=x".to_owned(),
+            "probe".to_owned(),
+        ]]));
+        assert!(queue_has_builtin_after_parse_time_assignment(&[vec![
+            "FOO=x".to_owned(),
+            "BAR=y".to_owned(),
+            "display-message".to_owned(),
+        ]]));
+        assert!(queue_has_builtin_after_parse_time_assignment(&[vec![
+            "FOO=x".to_owned(),
+        ]]));
     }
 
     #[test]

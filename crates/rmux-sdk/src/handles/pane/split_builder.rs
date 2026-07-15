@@ -94,18 +94,18 @@ impl<'a> PaneSplitBuilder<'a> {
             });
         }
         let operation_pane = self.pane.begin_operation_handle();
-        let target = operation_pane.current_target().await?;
-        let target = split_pane_with_process(
+        let outcome = split_pane_with_process(
             operation_pane.transport(),
-            &target,
+            operation_pane.split_target_text(),
             self.direction,
             self.process,
             self.cwd,
             self.keep_alive_on_exit,
         )
         .await?;
-        let pane = Pane::new(
-            target,
+        let pane = Pane::new_by_id(
+            outcome.target,
+            outcome.pane_id,
             operation_pane.endpoint().clone(),
             operation_pane.configured_default_timeout(),
             operation_pane.transport().clone(),

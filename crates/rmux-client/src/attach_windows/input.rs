@@ -470,8 +470,7 @@ fn encode_input_batch(
     // when the keys form a paste, prefer the paste and suppress those mouse
     // records rather than turning clipboard bytes into interactive input.
     let paste_text_only = !has_other_key;
-    let is_paste = paste_text_only
-        && (text_downs >= 2 || (*paste_open && text_downs >= 1) || (!drained && text_downs >= 1));
+    let is_paste = paste_text_only && (text_downs >= 2 || (*paste_open && text_downs >= 1));
 
     let mut inputs = Vec::new();
     if is_paste {
@@ -1623,9 +1622,9 @@ mod tests {
     }
 
     #[test]
-    fn sgr_key_event_paste_stays_fail_closed_across_every_console_batch_boundary() {
+    fn sgr_key_event_paste_stays_fail_closed_after_a_multi_key_first_batch() {
         let sequence = b"\x1b[<32;123;45M";
-        for split in 1..sequence.len() {
+        for split in 2..sequence.len() {
             let mut paste_open = false;
             let mut carryover = Vec::new();
             let mut surrogate = None;
@@ -1915,6 +1914,29 @@ mod tests {
             &mut 0,
         );
         assert_eq!(batch_bytes(&inputs), b"x");
+        assert!(!paste_open);
+    }
+
+    #[test]
+    fn undrained_single_character_and_mouse_remain_live() {
+        // `drained` describes every queued console record, including key-up,
+        // focus and mouse records. It cannot turn one otherwise ordinary key
+        // into evidence of a clipboard burst or discard a coalesced click.
+        let events = [
+            BatchEvent::Key(key_event('x' as u16, 'x' as u16, 0)),
+            BatchEvent::Mouse(mouse_event(FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0, 3, 4)),
+        ];
+        let mut paste_open = false;
+        let inputs = encode_input_batch(
+            &events,
+            false,
+            &mut paste_open,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+
+        assert_eq!(batch_bytes(&inputs), b"x\x1b[<0;4;5M");
         assert!(!paste_open);
     }
 

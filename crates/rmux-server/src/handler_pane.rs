@@ -13,6 +13,8 @@ mod pane_by_id;
 mod pane_deferred_wait;
 #[path = "handler_pane/display_panes.rs"]
 mod pane_display_panes;
+#[path = "handler_pane/exit_probe.rs"]
+mod pane_exit_probe;
 #[path = "handler_pane/inspection.rs"]
 mod pane_inspection;
 #[path = "handler_pane/io_encoding.rs"]

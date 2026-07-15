@@ -215,15 +215,19 @@ impl RequestHandler {
             // after the rename transaction.
             let _state = self.state.lock().await;
             match retained_lookup(self, &target_ref, now) {
-                Ok(Some((target, retained))) => {
+                Ok(Some((target, retained))) if retained.output().is_some() => {
+                    let output = retained
+                        .output()
+                        .expect("retained output presence was checked")
+                        .clone();
                     return self.register_pane_output_subscription(
                         connection_id,
                         start,
                         now,
-                        (target, retained.pane().clone(), retained.output().clone()),
+                        (target, retained.pane().clone(), output),
                     );
                 }
-                Ok(None) => {}
+                Ok(Some(_)) | Ok(None) => {}
                 Err(error) => return Response::Error(ErrorResponse { error }),
             }
         }
