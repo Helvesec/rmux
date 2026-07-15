@@ -226,6 +226,7 @@ AssertManifestValue "InstallerType" "zip"
 AssertManifestValue "NestedInstallerType" "portable"
 AssertManifestValue "RelativeFilePath" $expectedRelativePath
 AssertManifestValue "PortableCommandAlias" "rmux"
+AssertManifestValue "ArchiveBinariesDependOnPath" "true"
 AssertManifestLine "Dependencies:"
 AssertManifestLine "PackageDependencies:"
 AssertManifestLine "- PackageIdentifier: Microsoft.VCRedist.2015+.x64"

@@ -168,6 +168,10 @@ impl RequestHandler {
         }
     }
 
+    pub(crate) fn discard_undelivered_web_share(&self, share_id: &str) {
+        self.web_shares.discard_undelivered(share_id);
+    }
+
     #[cfg(test)]
     pub(crate) async fn open_web_share_token_id(
         &self,

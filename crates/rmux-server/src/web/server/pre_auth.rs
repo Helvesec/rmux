@@ -61,13 +61,10 @@ impl PreAuthQueue {
         if state.entries.len() >= self.capacity {
             return None;
         }
-        // Tunnel providers and local reverse proxies connect through loopback,
-        // so counting loopback as one peer would turn the per-IP guard into an
-        // accidental daemon-wide cap. The global queue capacity still bounds
-        // slow local handshakes.
-        let peer_bucket = peer_ip
-            .filter(|peer| !peer.is_loopback())
-            .map(auth_peer_bucket);
+        // A public tunnel also carries unauthenticated peers through loopback.
+        // Apply the same pending-handshake fairness there: established shares
+        // release this guard, so the cap does not limit active viewers.
+        let peer_bucket = peer_ip.map(auth_peer_bucket);
         if let Some(peer_bucket) = peer_bucket {
             let active_for_ip = state
                 .entries
@@ -177,25 +174,39 @@ mod tests {
     }
 
     #[test]
-    fn pre_auth_queue_exempts_loopback_from_per_ip_capacity_but_not_global_capacity() {
-        let queue = PreAuthQueue::with_per_ip_capacity(3, 1);
-        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let first = queue
-            .try_register_peer(loopback)
-            .expect("first loopback connection fits");
-        let second = queue
-            .try_register_peer(loopback)
-            .expect("loopback is not constrained by the per-IP cap");
-        let third = queue
-            .try_register_peer(IpAddr::V6(Ipv6Addr::LOCALHOST))
-            .expect("IPv6 loopback shares the same global capacity");
-
+    fn pre_auth_queue_applies_peer_fairness_to_loopback_tunnels() {
+        let queue = PreAuthQueue::with_per_ip_capacity(5, 2);
+        let ipv4_loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let ipv6_loopback = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let first_v4 = queue
+            .try_register_peer(ipv4_loopback)
+            .expect("first IPv4 loopback handshake fits");
+        let second_v4 = queue
+            .try_register_peer(ipv4_loopback)
+            .expect("second IPv4 loopback handshake fits");
         assert!(
-            queue.try_register_peer(loopback).is_none(),
-            "loopback connections must still respect the global pre-auth cap"
+            queue.try_register_peer(ipv4_loopback).is_none(),
+            "one tunnel peer must not consume the global handshake queue"
         );
 
-        drop((first, second, third));
+        let first_v6 = queue
+            .try_register_peer(ipv6_loopback)
+            .expect("first IPv6 loopback handshake fits");
+        let second_v6 = queue
+            .try_register_peer(ipv6_loopback)
+            .expect("second IPv6 loopback handshake fits");
+        assert!(
+            queue.try_register_peer(ipv6_loopback).is_none(),
+            "IPv6 loopback must receive the same peer fairness"
+        );
+        assert!(
+            queue
+                .try_register_peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 42)))
+                .is_some(),
+            "another peer retains a global slot"
+        );
+
+        drop((first_v4, second_v4, first_v6, second_v6));
         assert_eq!(queue.pending_count(), 0);
     }
 }

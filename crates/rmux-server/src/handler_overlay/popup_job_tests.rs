@@ -1,8 +1,108 @@
 use std::sync::{Arc, Condvar, Mutex};
 
+#[cfg(unix)]
+use rmux_core::{EnvironmentStore, OptionStore};
 use rmux_proto::TerminalSize;
+#[cfg(unix)]
+use rmux_pty::Signal;
 
+#[cfg(unix)]
+use crate::terminal::TerminalProfile;
+
+#[cfg(unix)]
+use super::spawn_popup_job;
 use super::{PopupIoOperation, PopupIoQueue};
+
+#[cfg(unix)]
+#[tokio::test]
+async fn popup_termination_escalates_when_the_job_ignores_hangup() {
+    assert_popup_termination(
+        "trap '' HUP TERM; printf '%s' \"$$\" >\"$RMUX_POPUP_READY\"; while :; do sleep 1; done",
+        "leader",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn popup_termination_kills_resistant_descendant_after_leader_exits() {
+    assert_popup_termination(
+        "sh -c 'trap \"\" HUP TERM; printf \"%s\" \"$$\" >\"$RMUX_POPUP_READY\"; while :; do sleep 1; done' & wait",
+        "descendant",
+    )
+    .await;
+}
+
+#[cfg(unix)]
+async fn assert_popup_termination(command: &str, label: &str) {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after Unix epoch")
+        .as_nanos();
+    let marker = std::env::temp_dir().join(format!(
+        "rmux-popup-termination-{label}-{}-{nonce}.ready",
+        std::process::id(),
+    ));
+    let socket = marker.with_extension("sock");
+    let profile = TerminalProfile::for_run_shell(
+        &EnvironmentStore::new(),
+        &OptionStore::new(),
+        None,
+        None,
+        &socket,
+        false,
+        Some(std::env::temp_dir().as_path()),
+    )
+    .expect("popup terminal profile");
+    let environment = [format!("RMUX_POPUP_READY={}", marker.display())];
+    let (job, _) = spawn_popup_job(
+        TerminalSize { cols: 20, rows: 6 },
+        &profile,
+        Some(command),
+        &environment,
+    )
+    .expect("spawn signal-resistant popup job");
+
+    let mut resistant_pid = None;
+    for _ in 0..100 {
+        resistant_pid = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok());
+        if resistant_pid.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let resistant_pid = resistant_pid.expect("popup command did not reach its ready state");
+    assert!(unix_process_exists(resistant_pid));
+
+    job.terminate();
+    job.terminate();
+    let mut stopped = false;
+    for _ in 0..200 {
+        if !job.child_is_running_for_test() && !unix_process_exists(resistant_pid) {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let child = job.child.lock().expect("popup child").take();
+    if let Some(mut child) = child {
+        if !stopped && child.kill(Signal::KILL).is_err() {
+            let _ = child.kill_session_leader(Signal::KILL);
+        }
+        let _ = child.wait();
+    }
+    let _ = std::fs::remove_file(&marker);
+    assert!(stopped, "popup job survived its bounded termination path");
+}
+
+#[cfg(unix)]
+fn unix_process_exists(pid: i32) -> bool {
+    rustix::process::Pid::from_raw(pid)
+        .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+}
 
 #[tokio::test]
 async fn popup_io_queue_preserves_write_resize_write_enqueue_order() {

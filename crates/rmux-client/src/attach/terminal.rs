@@ -3,10 +3,11 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rmux_os::process_tree::ProcessTreeChild;
 use rmux_proto::AttachShellCommand;
 use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
 use rustix::process::{kill_process, Pid, Signal};
@@ -279,17 +280,29 @@ fn run_shell_command_with_terminal(
     if let Some(cwd) = cwd {
         process.current_dir(cwd);
     }
-    let mut child = process.spawn().map_err(AttachError::Io)?;
-    wait_for_shell_child(&mut child, termination::requested_signal).map_err(AttachError::Io)?;
+    let mut child = ProcessTreeChild::spawn(&mut process).map_err(AttachError::Io)?;
+    let foreground = child.foreground_terminal(fd).map_err(AttachError::Io)?;
+    let wait_result = wait_for_shell_child(&mut child, termination::requested_signal);
+    let restore_result = foreground.restore();
+    if let Err(error) = wait_result {
+        restore_result?;
+        return Err(AttachError::Io(error));
+    }
+    restore_result?;
     Ok(())
 }
 
 fn wait_for_shell_child(
-    child: &mut Child,
+    child: &mut ProcessTreeChild,
     requested_signal: impl Fn() -> Option<i32>,
 ) -> io::Result<()> {
     loop {
-        if child_has_exited(child)? {
+        if child.has_exited()? {
+            child.wait()?;
+            return Ok(());
+        }
+        if child.has_stopped()? {
+            terminate_stopped_shell_tree(child)?;
             return Ok(());
         }
         let Some(signal) = requested_signal() else {
@@ -297,78 +310,86 @@ fn wait_for_shell_child(
             continue;
         };
 
-        forward_signal_to_child(child, signal)?;
-        if wait_for_child_exit_until(child, Instant::now() + SHELL_CHILD_TERMINATION_GRACE)? {
-            return Err(termination::interruption_error());
-        }
+        child.forward_signal(signal).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to forward attach interruption to shell tree: {error}"),
+            )
+        })?;
+        let _ = wait_for_child_exit_until(child, Instant::now() + SHELL_CHILD_TERMINATION_GRACE)?;
 
-        // The shell may trap or ignore the forwarded signal. Bound that grace
-        // period too so terminal restoration and the attach guard can re-raise
-        // the original signal promptly.
-        let _ = child.kill();
+        // Keep the exited Unix group leader waitable until after the force
+        // signal. That prevents its PGID from being recycled while also
+        // terminating descendants that ignored the forwarded signal.
+        child.terminate().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to terminate interrupted shell tree: {error}"),
+            )
+        })?;
         let _ = wait_for_child_exit_until(child, Instant::now() + SHELL_CHILD_TERMINATION_GRACE);
+        child.wait().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to reap interrupted shell tree: {error}"),
+            )
+        })?;
         return Err(termination::interruption_error());
     }
 }
 
-fn child_has_exited(child: &mut Child) -> io::Result<bool> {
-    loop {
-        match child.try_wait() {
-            Ok(status) => return Ok(status.is_some()),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        }
-    }
+fn terminate_stopped_shell_tree(child: &mut ProcessTreeChild) -> io::Result<()> {
+    child.terminate().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to terminate stopped shell tree: {error}"),
+        )
+    })?;
+    child.wait().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to reap stopped shell tree: {error}"),
+        )
+    })?;
+    Ok(())
 }
 
-fn wait_for_child_exit_until(child: &mut Child, deadline: Instant) -> io::Result<bool> {
+fn wait_for_child_exit_until(child: &mut ProcessTreeChild, deadline: Instant) -> io::Result<bool> {
     while Instant::now() < deadline {
-        if child_has_exited(child)? {
+        if child.has_exited()? {
             return Ok(true);
         }
         thread::sleep(SHELL_CHILD_WAIT_INTERVAL);
     }
-    child_has_exited(child)
-}
-
-fn forward_signal_to_child(child: &Child, signal: i32) -> io::Result<()> {
-    let pid = i32::try_from(child.id())
-        .map_err(|_| io::Error::other("shell child process id does not fit in i32"))?;
-    let result = unsafe {
-        // SAFETY: `pid` is the live child owned by the caller and `signal` was
-        // captured from the attach termination handler.
-        libc::kill(pid, signal)
-    };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error)
-    }
+    child.has_exited()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicI32, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use rmux_os::process_tree::ProcessTreeChild;
+
     use super::wait_for_shell_child;
+
+    fn spawn_shell(script: &str) -> ProcessTreeChild {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        ProcessTreeChild::spawn(&mut command).expect("spawn isolated shell child")
+    }
 
     #[test]
     fn shell_child_wait_is_bounded_after_hup_or_term() {
         for signal in [libc::SIGHUP, libc::SIGTERM] {
-            let mut child = Command::new("sh")
-                .args(["-c", "exec sleep 60"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn sleeping shell child");
+            let mut child = spawn_shell("exec sleep 60");
             let requested = Arc::new(AtomicI32::new(0));
             let request_from_thread = Arc::clone(&requested);
             std::thread::spawn(move || {
@@ -383,13 +404,17 @@ mod tests {
             })
             .expect_err("termination must interrupt the shell wait");
 
-            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted,
+                "unexpected shell wait error after signal {signal}: {error}"
+            );
             assert!(
                 started.elapsed() < Duration::from_secs(2),
                 "shell wait should not remain blocked after signal {signal}"
             );
             assert!(
-                child.try_wait().expect("query child status").is_some(),
+                child.has_exited().expect("query child status"),
                 "the interrupted shell child should be reaped"
             );
         }
@@ -397,13 +422,7 @@ mod tests {
 
     #[test]
     fn shell_child_wait_force_kills_a_child_that_ignores_term() {
-        let mut child = Command::new("sh")
-            .args(["-c", "trap '' TERM; exec sleep 60"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn signal-ignoring shell child");
+        let mut child = spawn_shell("trap '' TERM; exec sleep 60");
         std::thread::sleep(Duration::from_millis(40));
 
         let started = Instant::now();
@@ -413,8 +432,137 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(
-            child.try_wait().expect("query child status").is_some(),
+            child.has_exited().expect("query child status"),
             "the force-killed shell child should be reaped"
         );
     }
+
+    #[test]
+    fn shell_child_wait_terminates_signal_ignoring_descendants() {
+        let pid_file = unique_descendant_pid_file();
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sh -c 'trap \"\" TERM; exec sleep 60' & printf '%s' \"$!\" > \"$RMUX_DESCENDANT_PID\"; wait",
+            ])
+            .env("RMUX_DESCENDANT_PID", &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = ProcessTreeChild::spawn(&mut command).expect("spawn shell process tree");
+
+        let descendant_pid = wait_for_descendant_pid(&pid_file);
+        let cleanup = DescendantCleanup {
+            pid: descendant_pid,
+            pid_file,
+        };
+        let error = wait_for_shell_child(&mut child, || Some(libc::SIGTERM))
+            .expect_err("termination must interrupt the complete shell process tree");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_exists(descendant_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_exists(descendant_pid),
+            "signal-ignoring descendant {descendant_pid} survived attach interruption"
+        );
+        drop(cleanup);
+    }
+
+    #[test]
+    fn shell_child_wait_preserves_background_descendants_after_normal_exit() {
+        let pid_file = unique_descendant_pid_file();
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "sleep 60 </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" > \"$RMUX_DESCENDANT_PID\"",
+            ])
+            .env("RMUX_DESCENDANT_PID", &pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = ProcessTreeChild::spawn(&mut command).expect("spawn shell process tree");
+
+        let descendant_pid = wait_for_descendant_pid(&pid_file);
+        let cleanup = DescendantCleanup {
+            pid: descendant_pid,
+            pid_file,
+        };
+        wait_for_shell_child(&mut child, || None).expect("foreground shell should exit normally");
+
+        assert!(
+            process_exists(descendant_pid),
+            "normal shell completion must preserve an intentional background descendant"
+        );
+        drop(cleanup);
+    }
+
+    struct DescendantCleanup {
+        pid: i32,
+        pid_file: PathBuf,
+    }
+
+    impl Drop for DescendantCleanup {
+        fn drop(&mut self) {
+            unsafe {
+                // SAFETY: The test owns the spawned descendant PID and uses a
+                // force signal only as failure-path cleanup.
+                libc::kill(self.pid, libc::SIGKILL);
+            }
+            let _ = std::fs::remove_file(&self.pid_file);
+        }
+    }
+
+    fn unique_descendant_pid_file() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rmux-attach-descendant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ))
+    }
+
+    fn wait_for_descendant_pid(pid_file: &PathBuf) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(pid_file) {
+                if let Ok(pid) = contents.parse() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "shell did not publish its descendant pid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        let result = unsafe {
+            // SAFETY: Signal zero performs an existence check without changing
+            // the target process.
+            libc::kill(pid, 0)
+        };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
 }
+
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+#[path = "terminal_stopped_tests.rs"]
+mod stopped_tests;

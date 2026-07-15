@@ -258,7 +258,7 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
 }
 
 #[tokio::test]
-async fn authenticated_idle_pane_and_session_shares_survive_keepalive_intervals() {
+async fn authenticated_idle_pane_and_session_shares_survive_with_matching_pongs() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-idle-keepalive").await;
     let pane_share = create_share(
@@ -317,6 +317,7 @@ async fn authenticated_idle_pane_and_session_shares_survive_keepalive_intervals(
                 assert_ne!(frame.opcode, OPCODE_CLOSE, "share closed while idle");
                 if frame.opcode == OPCODE_PING {
                     assert_eq!(frame.payload, b"rmux");
+                    write_client_frame(&mut client.stream, OPCODE_PONG, &frame.payload).await;
                     saw_ping = true;
                     break;
                 }
@@ -331,6 +332,77 @@ async fn authenticated_idle_pane_and_session_shares_survive_keepalive_intervals(
     );
     pane.close().await;
     session.close().await;
+}
+
+#[tokio::test]
+async fn authenticated_idle_pane_and_session_shares_close_without_pongs() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_session(&handler, "websocket-idle-pong-timeout").await;
+    let pane_share = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(
+            PaneTarget::new(session_name.clone(), 0).into(),
+        )),
+    )
+    .await;
+    let session_share = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name)),
+    )
+    .await;
+    let mut pane = TestWebSocket::connect(
+        Arc::clone(&handler),
+        &token_from_url(
+            pane_share
+                .spectator_url
+                .as_deref()
+                .expect("pane spectator URL"),
+        ),
+    )
+    .await;
+    let mut session = TestWebSocket::connect(
+        handler,
+        &token_from_url(
+            session_share
+                .spectator_url
+                .as_deref()
+                .expect("session spectator URL"),
+        ),
+    )
+    .await;
+    assert_eq!(pane.read_json().await["scope"], "pane");
+    pane.read_binary_with_prefix(0x10, "pane snapshot").await;
+    assert_eq!(session.read_json().await["scope"], "session");
+    session
+        .read_binary_with_prefix(0x10, "session snapshot")
+        .await;
+
+    pause();
+    for _ in 0..3 {
+        advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        for client in [&mut pane, &mut session] {
+            let mut saw_ping = false;
+            for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
+                let frame = read_server_frame_inner(&mut client.stream)
+                    .await
+                    .expect("read keepalive frame");
+                assert_ne!(frame.opcode, OPCODE_CLOSE, "share closed before timeout");
+                if frame.opcode == OPCODE_PING {
+                    assert_eq!(frame.payload, b"rmux");
+                    saw_ping = true;
+                    break;
+                }
+            }
+            assert!(saw_ping, "idle share did not emit its keepalive ping");
+        }
+    }
+
+    advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    pane.read_close(4009, "pong_timeout").await;
+    session.read_close(4009, "pong_timeout").await;
+    assert!(pane.task.is_finished() && session.task.is_finished());
 }
 
 #[tokio::test]
@@ -1976,5 +2048,6 @@ const OPCODE_TEXT: u8 = 0x1;
 const OPCODE_BINARY: u8 = 0x2;
 const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
+const OPCODE_PONG: u8 = 0xa;
 const TEST_CLIENT_NONCE: &str = "AQIDBAUGBwgJCgsMDQ4PEA";
 const MAX_INTERLEAVED_WEBSOCKET_FRAMES: usize = 32;

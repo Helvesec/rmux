@@ -75,6 +75,29 @@ struct KeyframeCmd {
     epoch: u64,
 }
 
+struct AccountedDataPermit<'a> {
+    permit: Option<mpsc::Permit<'a, DataCmd>>,
+    backlog_bytes: &'a AtomicUsize,
+    len: usize,
+}
+
+impl AccountedDataPermit<'_> {
+    fn send(mut self, command: DataCmd) {
+        self.permit
+            .take()
+            .expect("accounted data permit must remain available")
+            .send(command);
+    }
+}
+
+impl Drop for AccountedDataPermit<'_> {
+    fn drop(&mut self) {
+        if self.permit.is_some() {
+            subtract_backlog(self.backlog_bytes, self.len);
+        }
+    }
+}
+
 impl WebSocketOutbound {
     pub(crate) fn spawn(writer: WebSocketWriter, sealer: FrameSealer) -> Self {
         let (tx, rx) = mpsc::channel(VIEWER_CHANNEL_CAP);
@@ -106,46 +129,30 @@ impl WebSocketOutbound {
 
     pub(crate) fn queue_frame(&self, bytes: Vec<u8>) -> OutboundQueueResult {
         let len = bytes.len();
-        if self.backlog_exceeds(len) {
-            let result = OutboundQueueResult::Backpressure;
-            trace_outbound_queue("frame", len, result, false);
-            return result;
-        }
-        let epoch = self.latest_epoch.load(Ordering::Acquire);
-        let result = match self.tx.try_send(DataCmd::Frame { bytes, epoch }) {
-            Ok(()) => {
-                self.backlog_bytes.fetch_add(len, Ordering::Relaxed);
-                OutboundQueueResult::Queued
+        let permit = match self.reserve_data_slot(len) {
+            Ok(permit) => permit,
+            Err(result) => {
+                trace_outbound_queue("frame", len, result, false);
+                return result;
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => OutboundQueueResult::Closed,
-            Err(mpsc::error::TrySendError::Full(_)) => OutboundQueueResult::Full,
         };
+        let epoch = self.latest_epoch.load(Ordering::Acquire);
+        permit.send(DataCmd::Frame { bytes, epoch });
+        let result = OutboundQueueResult::Queued;
         trace_outbound_queue("frame", len, result, false);
         result
     }
 
     pub(crate) fn queue_snapshot(&self, bytes: Vec<u8>) -> OutboundQueueResult {
         let len = bytes.len();
-        if self.backlog_exceeds(len) {
-            let result = OutboundQueueResult::Backpressure;
-            trace_outbound_queue("snapshot", len, result, false);
-            return result;
-        }
-        let permit = match self.tx.try_reserve() {
+        let permit = match self.reserve_data_slot(len) {
             Ok(permit) => permit,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                let result = OutboundQueueResult::Closed;
-                trace_outbound_queue("snapshot", len, result, false);
-                return result;
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                let result = OutboundQueueResult::Full;
+            Err(result) => {
                 trace_outbound_queue("snapshot", len, result, false);
                 return result;
             }
         };
         let epoch = self.latest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        self.backlog_bytes.fetch_add(len, Ordering::Relaxed);
         permit.send(DataCmd::Snapshot { bytes, epoch });
         let result = OutboundQueueResult::Queued;
         trace_outbound_queue("snapshot", len, result, false);
@@ -233,6 +240,32 @@ impl WebSocketOutbound {
             .load(Ordering::Relaxed)
             .saturating_add(next_len)
             > BACKLOG_BYTES_MAX
+    }
+
+    fn reserve_data_slot(
+        &self,
+        len: usize,
+    ) -> Result<AccountedDataPermit<'_>, OutboundQueueResult> {
+        let permit = self.tx.try_reserve().map_err(|error| match error {
+            mpsc::error::TrySendError::Closed(_) => OutboundQueueResult::Closed,
+            mpsc::error::TrySendError::Full(_) => OutboundQueueResult::Full,
+        })?;
+        if self
+            .backlog_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(len)
+                    .filter(|next| *next <= BACKLOG_BYTES_MAX)
+            })
+            .is_err()
+        {
+            return Err(OutboundQueueResult::Backpressure);
+        }
+        Ok(AccountedDataPermit {
+            permit: Some(permit),
+            backlog_bytes: self.backlog_bytes.as_ref(),
+            len,
+        })
     }
 
     async fn enqueue_control(
@@ -521,8 +554,49 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        ControlCmd, OutboundQueueResult, WebSocketOutbound, BACKLOG_BYTES_MAX, VIEWER_CHANNEL_CAP,
+        subtract_backlog, ControlCmd, DataCmd, OutboundQueueResult, WebSocketOutbound,
+        BACKLOG_BYTES_MAX, VIEWER_CHANNEL_CAP,
     };
+
+    #[tokio::test]
+    async fn data_slot_accounts_backlog_before_publication() {
+        let (outbound, mut data_rx, _control_rx) = WebSocketOutbound::test_channels();
+
+        let permit = outbound
+            .reserve_data_slot(4)
+            .expect("reserve accounted data slot");
+
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 4);
+        assert!(data_rx.try_recv().is_err());
+
+        permit.send(DataCmd::Frame {
+            bytes: vec![b'r', b'm', b'u', b'x'],
+            epoch: 0,
+        });
+        let command = data_rx.recv().await.expect("published data command");
+        let DataCmd::Frame { bytes, epoch } = command else {
+            panic!("expected frame command");
+        };
+        assert_eq!(bytes, b"rmux");
+        assert_eq!(epoch, 0);
+        subtract_backlog(outbound.backlog_bytes.as_ref(), bytes.len());
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_unsent_data_slot_rolls_back_accounting() {
+        let (outbound, mut data_rx, _control_rx) = WebSocketOutbound::test_channels();
+
+        let permit = outbound
+            .reserve_data_slot(4)
+            .expect("reserve accounted data slot");
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 4);
+
+        drop(permit);
+
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 0);
+        assert!(data_rx.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn keyframe_replaces_latest_even_when_data_queue_is_full() {

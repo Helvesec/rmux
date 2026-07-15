@@ -1102,7 +1102,7 @@ impl RequestHandler {
         request: rmux_proto::KillSessionRequest,
     ) -> Response {
         let expected_session_id = explicit_session_id_target(&request.target);
-        self.handle_kill_session_with_identity(request, expected_session_id)
+        self.handle_kill_session_with_identity(request, expected_session_id, None)
             .await
     }
 
@@ -1111,7 +1111,17 @@ impl RequestHandler {
         request: rmux_proto::KillSessionRequest,
         session_id: SessionId,
     ) -> Response {
-        self.handle_kill_session_with_identity(request, Some(session_id))
+        self.handle_kill_session_with_identity(request, Some(session_id), None)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_kill_expired_session_lease_identity(
+        &self,
+        request: rmux_proto::KillSessionRequest,
+        session_id: SessionId,
+        lease_token: u64,
+    ) -> Response {
+        self.handle_kill_session_with_identity(request, Some(session_id), Some(lease_token))
             .await
     }
 
@@ -1119,6 +1129,7 @@ impl RequestHandler {
         &self,
         request: rmux_proto::KillSessionRequest,
         expected_session_id: Option<SessionId>,
+        expected_expired_lease_token: Option<u64>,
     ) -> Response {
         let (session_name, selected_session_id) = {
             let state = self.state.lock().await;
@@ -1230,6 +1241,13 @@ impl RequestHandler {
                 return Response::Error(ErrorResponse {
                     error: RmuxError::SessionNotFound(session_name.to_string()),
                 });
+            }
+            if let Some(token) = expected_expired_lease_token {
+                if !self.claim_expired_session_lease(selected_session_id, token) {
+                    return Response::Error(ErrorResponse {
+                        error: RmuxError::owned_session_lease_lost(session_name),
+                    });
+                }
             }
             let sessions_to_remove = if request.kill_all_except_target {
                 let mut sessions = state

@@ -16,7 +16,7 @@ pub(crate) enum WebSocketMessage {
     Text(String),
     Binary(Vec<u8>),
     Ping(Vec<u8>),
-    Pong,
+    Pong(Vec<u8>),
     Close,
 }
 
@@ -108,7 +108,7 @@ impl WebSocketReader {
             OPCODE_BINARY => Ok(WebSocketMessage::Binary(frame.payload)),
             OPCODE_CLOSE => Ok(WebSocketMessage::Close),
             OPCODE_PING => Ok(WebSocketMessage::Ping(frame.payload)),
-            OPCODE_PONG => Ok(WebSocketMessage::Pong),
+            OPCODE_PONG => Ok(WebSocketMessage::Pong(frame.payload)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unsupported websocket frame opcode",

@@ -8,6 +8,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
 mod http;
+mod keepalive;
 mod pre_auth;
 mod rate_limit;
 mod streams;

@@ -150,7 +150,7 @@ def validate_product_divergence_ledger(entries: dict[str, str]) -> tuple[int, st
             return 0, f"{LEDGER}: tracked test {name} is cited by multiple entries: {joined}"
         entry_id = next(iter(entry_ids))
         fixture = test_fixture_block(entries[entry_id])
-        if str(path) not in fixture:
+        if path.as_posix() not in fixture:
             return 0, (
                 f"{LEDGER}: {entry_id} cites {name} without its tracked source {path}"
             )

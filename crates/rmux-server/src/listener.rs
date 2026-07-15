@@ -349,6 +349,12 @@ async fn serve_connection(
                     None
                 };
 
+                #[cfg(feature = "web")]
+                let mut undelivered_web_share = UndeliveredWebShareGuard::for_response(
+                    Arc::clone(&handler),
+                    &outcome.response,
+                );
+
                 let response_result = match (legacy_kill_server_wire, &outcome.response) {
                     (Some(wire_version), Response::KillServer(_)) => {
                         conn.write_legacy_kill_server_response(wire_version).await
@@ -364,6 +370,11 @@ async fn serve_connection(
                     let _ = handler
                         .request_shutdown_if_pending_excluding_detached_connection(Some(connection_id));
                     return Err(error);
+                }
+
+                #[cfg(feature = "web")]
+                if let Some(guard) = undelivered_web_share.as_mut() {
+                    guard.disarm();
                 }
 
                 if let Some(attach) = outcome.attach {
@@ -588,6 +599,41 @@ impl Drop for ConnectionCleanupGuard {
     }
 }
 
+#[cfg(feature = "web")]
+struct UndeliveredWebShareGuard {
+    handler: Arc<RequestHandler>,
+    share_id: Option<String>,
+}
+
+#[cfg(feature = "web")]
+impl UndeliveredWebShareGuard {
+    fn for_response(handler: Arc<RequestHandler>, response: &Response) -> Option<Self> {
+        let Response::WebShare(response) = response else {
+            return None;
+        };
+        let rmux_proto::WebShareResponse::Created(created) = response.as_ref() else {
+            return None;
+        };
+        Some(Self {
+            handler,
+            share_id: Some(created.share_id.clone()),
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.share_id = None;
+    }
+}
+
+#[cfg(feature = "web")]
+impl Drop for UndeliveredWebShareGuard {
+    fn drop(&mut self) {
+        if let Some(share_id) = self.share_id.take() {
+            self.handler.discard_undelivered_web_share(&share_id);
+        }
+    }
+}
+
 fn request_enables_sdk_wait_armed_ack(request: &Request) -> bool {
     matches!(
         request,
@@ -620,6 +666,10 @@ fn request_cancels_on_peer_disconnect(request: &Request) -> bool {
         Request::SdkWaitForOutput(_)
             | Request::SdkWaitForOutputRef(_)
             | Request::PaneStateCursor(rmux_proto::PaneStateCursorRequest { wait: true, .. })
+    ) || matches!(
+        request,
+        Request::WebShare(web_share)
+            if matches!(web_share.as_ref(), rmux_proto::WebShareRequest::Create(_))
     )
 }
 
@@ -1568,6 +1618,10 @@ mod tests {
         assert_eq!(handler.wait_for_counts(channel), expected);
     }
 }
+
+#[cfg(all(test, unix, feature = "web"))]
+#[path = "listener_web_share_tests.rs"]
+mod web_share_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tests {

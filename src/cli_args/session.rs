@@ -114,19 +114,11 @@ pub(crate) struct ServerAccessArgs {
     pub(crate) read_only: bool,
     #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) write: bool,
-    #[arg(short = 't', allow_hyphen_values = true)]
-    pub(crate) target: Option<String>,
     pub(crate) user: Option<String>,
 }
 
 impl ServerAccessArgs {
     pub(super) fn validate(self) -> Result<Self, clap::Error> {
-        if self.target.is_some() {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::UnknownArgument,
-                "command server-access: unknown flag -t",
-            ));
-        }
         if !self.list && self.add && self.deny {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,

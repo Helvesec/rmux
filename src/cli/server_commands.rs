@@ -153,7 +153,7 @@ pub(super) fn run_server_access(
             list: args.list,
             read_only: args.read_only,
             write: args.write,
-            target: args.target,
+            target: None,
             user: args.user,
         })
     })

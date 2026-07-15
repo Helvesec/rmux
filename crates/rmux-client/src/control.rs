@@ -5,15 +5,15 @@ use std::sync::mpsc;
 use std::thread;
 
 use rmux_ipc::BlockingLocalStream;
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 use rmux_proto::CONTROL_STDIN_EOF_MARKER;
 use rmux_proto::{
     ClientTerminalContext, ControlMode, ControlModeRequest, Request, Response, CONTROL_CONTROL_END,
     CONTROL_CONTROL_START,
 };
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::{
@@ -294,7 +294,7 @@ where
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 async fn drive_async_control<Stream>(
     stream: Stream,
     initial_commands: &[String],
@@ -304,7 +304,6 @@ async fn drive_async_control<Stream>(
 where
     Stream: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut completion_tracker = ControlCompletionTracker::default();
     let mut input_closed = false;
     let (mut reader, mut writer) = tokio::io::split(stream);
     write_async_initial_commands(&mut writer, initial_commands).await?;
@@ -327,15 +326,15 @@ where
                 }
             }
             bytes_read = reader.read(&mut buffer) => {
-                let bytes_read = bytes_read?;
+                let bytes_read = match bytes_read {
+                    Ok(bytes_read) => bytes_read,
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+                    Err(error) => return Err(error),
+                };
                 if bytes_read == 0 {
                     return Ok(());
                 }
-                let observed = completion_tracker.observe(&buffer[..bytes_read]);
                 send_control_output(&output_tx, &buffer[..bytes_read]).await?;
-                if observed.exited {
-                    return Ok(());
-                }
             }
         }
     }
@@ -356,7 +355,7 @@ where
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 async fn send_control_output(
     output_tx: &tokio_mpsc::Sender<Vec<u8>>,
     bytes: &[u8],
@@ -367,39 +366,7 @@ async fn send_control_output(
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "control output writer stopped"))
 }
 
-#[cfg(windows)]
-#[derive(Debug, Default)]
-struct ControlCompletionTracker {
-    pending: Vec<u8>,
-}
-
-#[cfg(windows)]
-impl ControlCompletionTracker {
-    fn observe(&mut self, bytes: &[u8]) -> ControlOutputObservation {
-        self.pending.extend_from_slice(bytes);
-        let mut observation = ControlOutputObservation::default();
-        while let Some(position) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let line = self.pending.drain(..=position).collect::<Vec<_>>();
-            if is_control_exit_line(&line) {
-                observation.exited = true;
-            }
-        }
-        observation
-    }
-}
-
-#[cfg(windows)]
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct ControlOutputObservation {
-    exited: bool,
-}
-
-#[cfg(windows)]
-fn is_control_exit_line(line: &[u8]) -> bool {
-    line == b"%exit\n" || line.starts_with(b"%exit ")
-}
-
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 async fn write_async_initial_commands<Writer>(
     writer: &mut Writer,
     initial_commands: &[String],
@@ -494,86 +461,6 @@ mod tests {
     }
 }
 
-#[cfg(all(test, windows))]
-mod windows_tests {
-    use super::drive_async_control;
-    use rmux_proto::CONTROL_STDIN_EOF_MARKER;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::mpsc as tokio_mpsc;
-
-    #[tokio::test]
-    async fn control_input_eof_shutdowns_writer_and_waits_for_exit() -> std::io::Result<()> {
-        let (client, mut server) = tokio::io::duplex(4096);
-        let (input_tx, input_rx) = tokio_mpsc::channel::<Vec<u8>>(1);
-        input_tx
-            .send(b"list-sessions\n".to_vec())
-            .await
-            .expect("send input");
-        drop(input_tx);
-        let (output_tx, output_rx) = tokio_mpsc::channel::<Vec<u8>>(4);
-
-        let drive = drive_async_control(client, &[], input_rx, output_tx);
-        let server_peer = async {
-            let expected_input = format!("list-sessions\n{CONTROL_STDIN_EOF_MARKER}\n");
-            let mut received = Vec::new();
-            let mut buffer = [0_u8; 32];
-            while received.len() < expected_input.len() {
-                let bytes_read = server.read(&mut buffer).await?;
-                assert_ne!(bytes_read, 0, "client closed before sending command");
-                received.extend_from_slice(&buffer[..bytes_read]);
-            }
-            assert_eq!(received, expected_input.as_bytes());
-            server
-                .write_all(b"%begin 1 1 1\n%end 1 1 1\n%exit\n")
-                .await?;
-            Ok::<(), std::io::Error>(())
-        };
-        let output = collect_control_output(output_rx);
-
-        let (_, _, output) = tokio::try_join!(drive, server_peer, output)?;
-        assert_eq!(output, b"%begin 1 1 1\n%end 1 1 1\n%exit\n");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn control_input_eof_drains_exit_after_completed_command() -> std::io::Result<()> {
-        let (client, mut server) = tokio::io::duplex(4096);
-        let (input_tx, input_rx) = tokio_mpsc::channel::<Vec<u8>>(1);
-        input_tx
-            .send(b"list-sessions\n".to_vec())
-            .await
-            .expect("send input");
-        drop(input_tx);
-        let (output_tx, output_rx) = tokio_mpsc::channel::<Vec<u8>>(4);
-
-        let drive = drive_async_control(client, &[], input_rx, output_tx);
-        let server_peer = async {
-            let mut received = Vec::new();
-            let mut buffer = [0_u8; 32];
-            while !received.ends_with(b"\n") {
-                let bytes_read = server.read(&mut buffer).await?;
-                assert_ne!(bytes_read, 0, "client closed before sending command");
-                received.extend_from_slice(&buffer[..bytes_read]);
-            }
-            server.write_all(b"%begin 1 1 1\n%end 1 1 1\n").await?;
-            tokio::task::yield_now().await;
-            server.write_all(b"%exit\n").await?;
-            Ok::<(), std::io::Error>(())
-        };
-        let output = collect_control_output(output_rx);
-
-        let (_, _, output) = tokio::try_join!(drive, server_peer, output)?;
-        assert_eq!(output, b"%begin 1 1 1\n%end 1 1 1\n%exit\n");
-        Ok(())
-    }
-
-    async fn collect_control_output(
-        mut output_rx: tokio_mpsc::Receiver<Vec<u8>>,
-    ) -> std::io::Result<Vec<u8>> {
-        let mut output = Vec::new();
-        while let Some(bytes) = output_rx.recv().await {
-            output.extend_from_slice(&bytes);
-        }
-        Ok(output)
-    }
-}
+#[cfg(test)]
+#[path = "control/windows_tests.rs"]
+mod windows_tests;

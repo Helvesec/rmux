@@ -11,5 +11,6 @@ pub mod identity;
 pub mod memory;
 pub mod path;
 pub mod process;
+pub mod process_tree;
 pub mod signals;
 pub mod terminal;

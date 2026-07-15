@@ -13,7 +13,7 @@ use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand, TerminalGeometry,
     TerminalPixels,
 };
-use rmux_pty::PtyPair;
+use rmux_pty::{ChildCommand, PtyIo, PtyPair};
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::termios::{tcsetwinsize, Winsize};
 
@@ -26,6 +26,53 @@ use super::{
 };
 
 static RESIZE_WATCHER_SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+const CONTROLLING_TTY_CASE_ENV: &str = "RMUX_CLIENT_CONTROLLING_TTY_CASE";
+const LOCK_ACTIONS_TTY_CASE: &str = "lock-actions";
+const STRUCTURED_SHELL_TTY_CASE: &str = "structured-shell";
+
+fn run_test_with_controlling_tty(
+    test_name: &str,
+    case: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let spawned = ChildCommand::new(std::env::current_exe()?)
+        .arg(test_name)
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .env(CONTROLLING_TTY_CASE_ENV, case)
+        .size(rmux_pty::TerminalSize::new(80, 24))
+        .spawn()?;
+    let (master, mut child) = spawned.into_parts();
+    let output_io = master.into_io();
+    output_io.release_startup_slave_guard();
+    let output_thread = std::thread::spawn(move || read_test_pty_output(output_io));
+
+    let status = child.wait()?;
+    let output = output_thread
+        .join()
+        .map_err(|_| io::Error::other("controlling-TTY output reader panicked"))??;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "controlling-TTY child {test_name} failed with {status}: {}",
+            String::from_utf8_lossy(&output)
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn read_test_pty_output(output: PtyIo) -> io::Result<Vec<u8>> {
+    let mut collected = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match output.read(&mut buffer) {
+            Ok(0) => return Ok(collected),
+            Ok(bytes_read) => collected.extend_from_slice(&buffer[..bytes_read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(collected),
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 fn attach_stop_payload() -> Vec<u8> {
     let mut payload = fallback_attach_stop_sequence("xterm-256color");
@@ -228,10 +275,14 @@ fn lock_action_waits_for_an_inflight_unix_input_read_and_forward(
 #[test]
 fn unix_lock_actions_rearm_screen_before_sending_unlock() -> Result<(), Box<dyn std::error::Error>>
 {
-    let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
-    let (_master, slave) = pair.into_split();
-    let terminal = File::from(slave.into_owned_fd());
-    let raw_terminal = RawTerminal::from_fd(&terminal)?;
+    if std::env::var(CONTROLLING_TTY_CASE_ENV).as_deref() != Ok(LOCK_ACTIONS_TTY_CASE) {
+        return run_test_with_controlling_tty(
+            "attach::tests::unix_lock_actions_rearm_screen_before_sending_unlock",
+            LOCK_ACTIONS_TTY_CASE,
+        );
+    }
+
+    let raw_terminal = RawTerminal::from_fd(&io::stdin())?;
     let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
 
     for structured in [false, true] {
@@ -862,6 +913,13 @@ fn fallback_attach_stop_sequence_disables_mouse_and_exits_alt_screen() {
 #[test]
 fn structured_shell_commands_use_server_resolved_shell_and_cwd(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var(CONTROLLING_TTY_CASE_ENV).as_deref() != Ok(STRUCTURED_SHELL_TTY_CASE) {
+        return run_test_with_controlling_tty(
+            "attach::tests::structured_shell_commands_use_server_resolved_shell_and_cwd",
+            STRUCTURED_SHELL_TTY_CASE,
+        );
+    }
+
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let root = std::env::temp_dir().join(format!(
         "rmux-client-shell-context-{}-{nonce}",
@@ -878,10 +936,7 @@ fn structured_shell_commands_use_server_resolved_shell_and_cwd(
     permissions.set_mode(0o700);
     std::fs::set_permissions(&shell, permissions)?;
 
-    let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
-    let (_master, slave) = pair.into_split();
-    let terminal = File::from(slave.into_owned_fd());
-    let raw = RawTerminal::from_fd(&terminal)?;
+    let raw = RawTerminal::from_fd(&io::stdin())?;
     let command = AttachShellCommand::new(
         "printf command > command.txt".to_owned(),
         shell.to_string_lossy().into_owned(),

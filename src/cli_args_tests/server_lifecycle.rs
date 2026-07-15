@@ -385,6 +385,41 @@ fn server_access_rejects_tmux_target_flag_like_tmux_runtime() {
 }
 
 #[test]
+fn server_access_help_and_completion_omit_rejected_target_flag() {
+    let help =
+        parse_args(&["server-access", "--help"]).expect_err("--help renders server-access help");
+    assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+    let help = help.to_string();
+    assert!(help.lines().any(|line| line.trim_start().starts_with("-a")));
+    assert!(help.lines().any(|line| line.trim_start().starts_with("-w")));
+    assert!(
+        !help.lines().any(|line| line.trim_start().starts_with("-t")),
+        "server-access help advertised rejected -t: {help}"
+    );
+
+    let completion = super::super::completion_command();
+    let server_access = completion
+        .get_subcommands()
+        .find(|command| command.get_name() == "server-access")
+        .expect("server-access completion subcommand");
+    let visible_flags = server_access
+        .get_arguments()
+        .filter(|argument| !argument.is_hide_set())
+        .filter_map(|argument| argument.get_short())
+        .collect::<Vec<_>>();
+    for flag in ['a', 'd', 'l', 'r', 'w'] {
+        assert!(
+            visible_flags.contains(&flag),
+            "missing completion flag -{flag}"
+        );
+    }
+    assert!(
+        !visible_flags.contains(&'t'),
+        "server-access completion advertised rejected -t"
+    );
+}
+
+#[test]
 fn server_access_rejects_bare_dash() {
     let error = parse_args(&["server-access", "-"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);

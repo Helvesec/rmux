@@ -184,6 +184,23 @@ async fn wait_for_pipe_descendant_pid(path: &Path) -> Pid {
     }
 }
 
+#[cfg(windows)]
+async fn wait_for_windows_pipe_descendant_pid(path: &Path) -> u32 {
+    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
+    loop {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                return pid;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for Windows pipe-pane descendant pid"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[cfg(unix)]
 async fn wait_for_process_to_exit(pid: Pid) {
     let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
@@ -201,6 +218,18 @@ async fn wait_for_process_to_exit(pid: Pid) {
     }
 }
 
+#[cfg(windows)]
+async fn wait_for_windows_process_to_exit(pid: u32) {
+    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
+    while rmux_os::process::is_live(pid) && tokio::time::Instant::now() < deadline {
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !rmux_os::process::is_live(pid),
+        "Windows pipe-pane descendant {pid} survived pipe shutdown"
+    );
+}
+
 #[cfg(unix)]
 struct PipeDescendantCleanup(Option<Pid>);
 
@@ -209,6 +238,20 @@ impl Drop for PipeDescendantCleanup {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
             let _ = kill_process(pid, Signal::KILL);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsPipeDescendantCleanup(Option<u32>);
+
+#[cfg(windows)]
+impl Drop for WindowsPipeDescendantCleanup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = std::process::Command::new("taskkill.exe")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
         }
     }
 }
@@ -294,6 +337,39 @@ async fn stopping_pipe_pane_terminates_descendants_after_the_shell_exits() {
 
     pipe_pane(&handler, target, false, None).await;
     wait_for_process_to_exit(descendant).await;
+    cleanup.0 = None;
+    let _ = fs::remove_file(pid_file);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn stopping_pipe_pane_terminates_fast_descendants_after_the_shell_exits() {
+    let handler = RequestHandler::new();
+    let target = PaneTarget::with_window(session_name("pipe-windows-job"), 0, 0);
+    let pid_file = unique_temp_path("windows-descendant-pid");
+    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
+    create_session(&handler, "pipe-windows-job").await;
+    let command = crate::test_shell::powershell_encoded_command(&format!(
+        "$child=Start-Process -FilePath ($PSHOME + '\\powershell.exe') -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru; [System.IO.File]::WriteAllText({}, [string]$child.Id)",
+        crate::test_shell::powershell_quote_path(&pid_file)
+    ));
+
+    let response = handler
+        .handle(Request::PipePane(PipePaneRequest {
+            target: target.clone(),
+            stdin: true,
+            stdout: false,
+            once: false,
+            command: Some(command),
+        }))
+        .await;
+    assert!(matches!(response, Response::PipePane(_)));
+    let descendant = wait_for_windows_pipe_descendant_pid(&pid_file).await;
+    let mut cleanup = WindowsPipeDescendantCleanup(Some(descendant));
+    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
+
+    pipe_pane(&handler, target, false, None).await;
+    wait_for_windows_process_to_exit(descendant).await;
     cleanup.0 = None;
     let _ = fs::remove_file(pid_file);
 }

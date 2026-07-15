@@ -657,6 +657,16 @@ async fn forward_control_inner(
                         .and_then(Option::as_deref),
                 )
                 .await;
+                #[cfg(windows)]
+                {
+                    // Tokio's named-pipe `AsyncWrite::shutdown` only flushes;
+                    // it does not half-close the duplex handle. Release both
+                    // split halves after the terminal `%exit` is flushed so
+                    // Windows clients can use transport EOF as the unambiguous
+                    // completion signal while the finite queue drains below.
+                    drop(read_half);
+                    drop(write_half);
+                }
                 let mut drain_context = EofDrainContext {
                     server_events: &mut server_events,
                     events_open: true,

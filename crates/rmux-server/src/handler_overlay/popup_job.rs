@@ -1,6 +1,8 @@
 use std::io;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -25,6 +27,10 @@ use super::super::{attach_support::ActiveAttachIdentity, RequestHandler};
 const POPUP_IO_RECEIPT_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(test)]
 const POPUP_IO_RECEIPT_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(all(unix, not(test)))]
+const POPUP_TERMINATE_GRACE: Duration = Duration::from_millis(250);
+#[cfg(all(unix, test))]
+const POPUP_TERMINATE_GRACE: Duration = Duration::from_millis(25);
 
 pub(in super::super) struct PopupSurface {
     parser: InputParser,
@@ -83,6 +89,8 @@ pub(in super::super) struct PopupJob {
     reader: Arc<PtyIo>,
     io_queue: PopupIoQueue,
     child: Arc<StdMutex<Option<PtyChild>>>,
+    #[cfg(unix)]
+    terminating: Arc<AtomicBool>,
     #[cfg(windows)]
     close_child: Arc<StdMutex<Option<PtyChild>>>,
 }
@@ -99,8 +107,36 @@ impl PopupJob {
 
     pub(in super::super) fn terminate(&self) {
         #[cfg(unix)]
-        if let Some(child) = self.child.lock().expect("popup child").as_ref() {
-            let _ = child.kill(Signal::HUP);
+        {
+            let child_guard = self.child.lock().expect("popup child");
+            if child_guard.is_none() {
+                return;
+            }
+            if self
+                .terminating
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            signal_popup_process_group(child_guard.as_ref(), Signal::HUP);
+            drop(child_guard);
+            let child = Arc::clone(&self.child);
+            let terminating = Arc::clone(&self.terminating);
+            if let Err(error) = std::thread::Builder::new()
+                .name("rmux-popup-terminate".to_owned())
+                .spawn(move || {
+                    let _reset_terminating = PopupTerminationReset(terminating);
+                    std::thread::sleep(POPUP_TERMINATE_GRACE);
+                    signal_popup_child(&child, Signal::TERM);
+                    std::thread::sleep(POPUP_TERMINATE_GRACE);
+                    signal_popup_child(&child, Signal::KILL);
+                })
+            {
+                tracing::warn!("failed to spawn popup termination worker: {error}");
+                signal_popup_child(&self.child, Signal::KILL);
+                self.terminating.store(false, Ordering::Release);
+            }
         }
         #[cfg(windows)]
         {
@@ -112,6 +148,10 @@ impl PopupJob {
 
     #[cfg(test)]
     pub(in crate::handler) fn child_is_running_for_test(&self) -> bool {
+        #[cfg(unix)]
+        if self.terminating.load(Ordering::Acquire) {
+            return true;
+        }
         self.child
             .lock()
             .expect("popup child")
@@ -131,6 +171,8 @@ impl PopupJob {
                 PopupIoOperation::Resize(_) => Ok(()),
             }),
             child: Arc::clone(&self.child),
+            #[cfg(unix)]
+            terminating: Arc::clone(&self.terminating),
             #[cfg(windows)]
             close_child: Arc::clone(&self.close_child),
         }
@@ -148,10 +190,38 @@ impl PopupJob {
                 PopupIoOperation::Resize(size) => resize(size),
             }),
             child: Arc::clone(&self.child),
+            #[cfg(unix)]
+            terminating: Arc::clone(&self.terminating),
             #[cfg(windows)]
             close_child: Arc::clone(&self.close_child),
         }
     }
+}
+
+#[cfg(unix)]
+struct PopupTerminationReset(Arc<AtomicBool>);
+
+#[cfg(unix)]
+impl Drop for PopupTerminationReset {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+fn signal_popup_process_group(child: Option<&PtyChild>, signal: Signal) {
+    let Some(child) = child else {
+        return;
+    };
+    if child.kill(signal).is_err() {
+        let _ = child.kill_session_leader(signal);
+    }
+}
+
+#[cfg(unix)]
+fn signal_popup_child(child: &Arc<StdMutex<Option<PtyChild>>>, signal: Signal) {
+    let child_guard = child.lock().expect("popup child");
+    signal_popup_process_group(child_guard.as_ref(), signal);
 }
 
 #[derive(Debug)]
@@ -295,6 +365,8 @@ pub(super) fn spawn_popup_job(
             reader: Arc::new(reader),
             io_queue,
             child: Arc::new(StdMutex::new(Some(child))),
+            #[cfg(unix)]
+            terminating: Arc::new(AtomicBool::new(false)),
             #[cfg(windows)]
             close_child: Arc::new(StdMutex::new(Some(close_child))),
         },
@@ -328,6 +400,12 @@ impl RequestHandler {
             loop {
                 let status = {
                     let mut child_guard = job.child.lock().expect("popup child");
+                    #[cfg(unix)]
+                    if job.terminating.load(Ordering::Acquire) {
+                        drop(child_guard);
+                        sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
                     let Some(child) = child_guard.as_mut() else {
                         return;
                     };

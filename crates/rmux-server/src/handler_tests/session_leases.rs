@@ -1,5 +1,7 @@
 use super::*;
 
+static LEASE_REAPER_PAUSE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn session_lease_rejects_too_short_ttl() {
     let handler = RequestHandler::new();
@@ -261,6 +263,7 @@ async fn renamed_session_lease_expiration_kills_the_renamed_session() {
 
 #[tokio::test]
 async fn expired_session_lease_reaper_follows_rename_after_expiration_extraction() {
+    let _pause_test_guard = LEASE_REAPER_PAUSE_TEST_LOCK.lock().await;
     let handler = RequestHandler::new();
     let old_name = session_name("lease-reap-race-before-rename");
     let new_name = session_name("lease-reap-race-after-rename");
@@ -310,6 +313,102 @@ async fn expired_session_lease_reaper_follows_rename_after_expiration_extraction
     pause.release.notify_one();
 
     wait_for_session_state(&handler, new_name, false).await;
+}
+
+#[tokio::test]
+async fn expired_session_lease_reaper_preserves_recreated_and_renewed_ownership() {
+    let _pause_test_guard = LEASE_REAPER_PAUSE_TEST_LOCK.lock().await;
+    let handler = RequestHandler::new();
+    let session_name = session_name("lease-reap-recreated-ownership");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let session_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&session_name)
+        .expect("leased session exists")
+        .id();
+    let pause = handler.install_expired_session_lease_reap_pause(session_name.clone(), session_id);
+
+    let initial_lease = handler
+        .handle(Request::CreateSessionLease(
+            rmux_proto::CreateSessionLeaseRequest {
+                session_name: session_name.clone(),
+                ttl_millis: 600,
+            },
+        ))
+        .await;
+    assert!(
+        matches!(initial_lease, Response::CreateSessionLease(_)),
+        "{initial_lease:?}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("lease reaper extracts the expired ownership generation");
+
+    let recreated_lease = handler
+        .handle(Request::CreateSessionLease(
+            rmux_proto::CreateSessionLeaseRequest {
+                session_name: session_name.clone(),
+                ttl_millis: 5_000,
+            },
+        ))
+        .await;
+    let Response::CreateSessionLease(recreated_lease) = recreated_lease else {
+        panic!("expected recreated lease response: {recreated_lease:?}");
+    };
+    let renewed = handler
+        .handle(Request::RenewSessionLease(
+            rmux_proto::RenewSessionLeaseRequest {
+                session_name: session_name.clone(),
+                token: recreated_lease.token,
+                ttl_millis: 5_000,
+            },
+        ))
+        .await;
+    assert_eq!(
+        renewed,
+        Response::RenewSessionLease(rmux_proto::RenewSessionLeaseResponse { renewed: true })
+    );
+
+    pause.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), pause.completed.notified())
+        .await
+        .expect("lease reaper finishes the stale generation attempt");
+
+    let exists = handler
+        .handle(Request::HasSession(HasSessionRequest {
+            target: session_name.clone(),
+        }))
+        .await;
+    assert_eq!(
+        exists,
+        Response::HasSession(rmux_proto::HasSessionResponse { exists: true })
+    );
+    let renewed_after_reap = handler
+        .handle(Request::RenewSessionLease(
+            rmux_proto::RenewSessionLeaseRequest {
+                session_name,
+                token: recreated_lease.token,
+                ttl_millis: 5_000,
+            },
+        ))
+        .await;
+    assert_eq!(
+        renewed_after_reap,
+        Response::RenewSessionLease(rmux_proto::RenewSessionLeaseResponse { renewed: true })
+    );
 }
 
 #[tokio::test]

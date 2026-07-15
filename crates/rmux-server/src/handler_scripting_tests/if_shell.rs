@@ -1192,14 +1192,14 @@ async fn if_shell_nested_set_buffer_accepts_hyphen_prefixed_content() {
 }
 
 #[tokio::test]
-async fn if_shell_nested_wait_for_accepts_hyphen_prefixed_channel_after_mode_flag() {
+async fn if_shell_nested_wait_for_accepts_hyphen_prefixed_channel_after_separator() {
     let handler = RequestHandler::new();
 
     let response = handler
         .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
-            then_command: "wait-for -S -channel".to_owned(),
+            then_command: "wait-for -S -- -channel".to_owned(),
             else_command: None,
             target: None,
             caller_cwd: None,

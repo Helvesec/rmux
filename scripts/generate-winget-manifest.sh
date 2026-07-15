@@ -103,6 +103,7 @@ NestedInstallerType: portable
 NestedInstallerFiles:
   - RelativeFilePath: $nested_path
     PortableCommandAlias: rmux
+ArchiveBinariesDependOnPath: true
 ReleaseDate: "$release_date"
 Dependencies:
   PackageDependencies:

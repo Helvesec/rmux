@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant, MissedTickBehavior, Sleep};
 use tracing::{debug, info};
 
+use super::keepalive::{KeepaliveAction, WebSocketKeepalive, PAYLOAD as KEEPALIVE_PAYLOAD};
 use super::rate_limit::OperatorRateLimiter;
 use crate::handler::{
     RequestHandler, WebPaneStream, WebSessionAttachEvent, WebSessionSnapshot, WebSessionStream,
@@ -31,8 +32,8 @@ const SESSION_SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(50);
 const SESSION_SNAPSHOT_MAX_WAIT: Duration = Duration::from_millis(200);
 const SESSION_INTERACTIVE_DEBOUNCE: Duration = Duration::from_millis(8);
 const SESSION_INTERACTIVE_MAX_WAIT: Duration = Duration::from_millis(32);
-const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-const WEBSOCKET_KEEPALIVE_PAYLOAD: &[u8] = b"rmux";
+const KEEPALIVE_TIMEOUT_CLOSE_CODE: u16 = 4009;
+const KEEPALIVE_TIMEOUT_REASON: &str = "pong_timeout";
 
 pub(super) async fn serve_pane_loop(
     handler: Arc<RequestHandler>,
@@ -51,11 +52,7 @@ pub(super) async fn serve_pane_loop(
     let mut last_connection_counts = pane.connection_counts();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
     alive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut keepalive_tick = tokio::time::interval_at(
-        Instant::now() + WEBSOCKET_KEEPALIVE_INTERVAL,
-        WEBSOCKET_KEEPALIVE_INTERVAL,
-    );
-    keepalive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut keepalive = WebSocketKeepalive::new();
     let snapshot_sleep = sleep(Duration::from_secs(365 * 24 * 60 * 60));
     tokio::pin!(snapshot_sleep);
     let mut snapshot_pending = false;
@@ -132,7 +129,7 @@ pub(super) async fn serve_pane_loop(
                     WebSocketMessage::Ping(payload) => {
                         outbound.write_pong(&payload).await?;
                     }
-                    WebSocketMessage::Pong => {}
+                    WebSocketMessage::Pong(payload) => keepalive.acknowledge_pong(&payload),
                 }
             }
             changed = pane.revoke_rx.changed() => {
@@ -186,8 +183,19 @@ pub(super) async fn serve_pane_loop(
                 )
                 .await?;
             }
-            _ = keepalive_tick.tick() => {
-                outbound.write_ping(WEBSOCKET_KEEPALIVE_PAYLOAD).await?;
+            action = keepalive.next_action() => {
+                match action {
+                    KeepaliveAction::Ping => outbound.write_ping(KEEPALIVE_PAYLOAD).await?,
+                    KeepaliveAction::TimedOut => {
+                        let _ = outbound
+                            .write_close_code(
+                                KEEPALIVE_TIMEOUT_CLOSE_CODE,
+                                KEEPALIVE_TIMEOUT_REASON,
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -264,11 +272,7 @@ pub(super) async fn serve_session_loop(
     let mut last_connection_counts = session.connection_counts();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
     alive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut keepalive_tick = tokio::time::interval_at(
-        Instant::now() + WEBSOCKET_KEEPALIVE_INTERVAL,
-        WEBSOCKET_KEEPALIVE_INTERVAL,
-    );
-    keepalive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut keepalive = WebSocketKeepalive::new();
     let ttl_delay = session
         .expires_at()
         .map(duration_until)
@@ -459,7 +463,7 @@ pub(super) async fn serve_session_loop(
                     WebSocketMessage::Ping(payload) => {
                         outbound.write_pong(&payload).await?;
                     }
-                    WebSocketMessage::Pong => {}
+                    WebSocketMessage::Pong(payload) => keepalive.acknowledge_pong(&payload),
                 }
             }
             changed = session.revoke_rx.changed() => {
@@ -547,8 +551,19 @@ pub(super) async fn serve_session_loop(
                 )
                 .await?;
             }
-            _ = keepalive_tick.tick() => {
-                outbound.write_ping(WEBSOCKET_KEEPALIVE_PAYLOAD).await?;
+            action = keepalive.next_action() => {
+                match action {
+                    KeepaliveAction::Ping => outbound.write_ping(KEEPALIVE_PAYLOAD).await?,
+                    KeepaliveAction::TimedOut => {
+                        let _ = outbound
+                            .write_close_code(
+                                KEEPALIVE_TIMEOUT_CLOSE_CODE,
+                                KEEPALIVE_TIMEOUT_REASON,
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                }
             }
         }
     }

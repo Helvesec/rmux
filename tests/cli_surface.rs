@@ -6,8 +6,8 @@ use std::error::Error;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
-use std::process::{Child, ExitStatus, Output, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1135,6 +1135,34 @@ fn list_commands_filters_by_name_alias_or_unique_prefix() -> Result<(), Box<dyn 
     assert!(stderr(&parser_alias).is_empty());
 
     assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn server_access_inventory_omits_dead_target_flag_product_divergence() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("server-access-honest-inventory")?;
+
+    let inventory = harness.run(&["list-commands", "server-access"])?;
+    assert_eq!(inventory.status.code(), Some(0));
+    assert_eq!(stdout(&inventory), "server-access [-adlrw] [user]\n");
+    assert!(stderr(&inventory).is_empty());
+
+    let help = harness.run(&["server-access", "--help"])?;
+    assert_eq!(help.status.code(), Some(0));
+    assert!(stderr(&help).is_empty());
+    let help = stdout(&help);
+    assert!(help.lines().any(|line| line.trim_start().starts_with("-a")));
+    assert!(help.lines().any(|line| line.trim_start().starts_with("-w")));
+    assert!(
+        !help.lines().any(|line| line.trim_start().starts_with("-t")),
+        "server-access help advertised rejected -t: {help}"
+    );
+
+    let rejected = harness.run(&["server-access", "-t", "%0", "-l"])?;
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(stdout(&rejected).is_empty());
+    assert!(stderr(&rejected).contains("command server-access: unknown flag -t"));
     Ok(())
 }
 
@@ -2793,7 +2821,25 @@ fn show_options_h_uses_full_helper_while_plain_g_remains_tiny() -> Result<(), Bo
 fn show_options_default_shell_preserves_explicit_value() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("show-options-default-shell-explicit")?;
     let _daemon = harness.start_hidden_daemon()?;
-    let expected_shell = "/tmp/rmux-explicit-shell";
+    let expected_shell = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([PathBuf::from("/bin/sh"), PathBuf::from("/usr/bin/sh")])
+        .find(|candidate| {
+            candidate.is_absolute()
+                && candidate.is_file()
+                && Command::new(candidate)
+                    .args(["-c", "exit 0"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no suitable test shell"))?;
+    let expected_shell = expected_shell
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "test shell is not UTF-8"))?;
 
     assert_success(&harness.run(&["set-option", "-g", "default-shell", expected_shell])?);
 

@@ -176,7 +176,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
         "(send) [-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]",
     ),
     ("send-prefix", "[-2] [-t target-pane]"),
-    ("server-access", "[-adlrw] [-t target-pane] [user]"),
+    ("server-access", "[-adlrw] [user]"),
     (
         "set-buffer",
         "(setb) [-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]",

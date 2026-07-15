@@ -13,7 +13,17 @@ const EXECUTABLES: [(&str, u32); 3] = [
     ("bin/rmux", 0o751),
 ];
 
-const FAILURE_CHECKPOINTS: [&str; 11] = [
+const PACKAGE_ASSETS: [(&str, &[u8], &[u8]); 2] = [
+    ("share/rmux/version", b"old-assets\n", b"new-assets\n"),
+    (
+        "share/man/man1/rmux.1",
+        b"old-man-page\n",
+        b"new-man-page\n",
+    ),
+];
+const LOCAL_ASSET: (&str, &[u8]) = ("share/rmux/local-only", b"keep-local-asset\n");
+
+const FAILURE_CHECKPOINTS: [&str; 12] = [
     "after-preflight",
     "after-stage-helper",
     "after-stage-daemon",
@@ -25,13 +35,15 @@ const FAILURE_CHECKPOINTS: [&str; 11] = [
     "after-replace-daemon",
     "after-replace-tiny",
     "after-verify",
+    "after-replace-asset",
 ];
 
-const SIGNAL_CHECKPOINTS: [&str; 4] = [
+const SIGNAL_CHECKPOINTS: [&str; 5] = [
     "after-replace-helper",
     "after-replace-daemon",
     "after-replace-tiny",
     "after-verify",
+    "after-replace-asset",
 ];
 
 struct TempRoot(PathBuf);
@@ -90,7 +102,9 @@ fn setup_archive(root: &TempRoot) -> PathBuf {
     fs::set_permissions(&installer, permissions).expect("make installer executable");
 
     write_valid_archive_binaries(&archive);
-    write_file(&archive.join("share/rmux/version"), b"new-assets\n", 0o644);
+    for (relative, _, contents) in PACKAGE_ASSETS {
+        write_file(&archive.join(relative), contents, 0o644);
+    }
     archive
 }
 
@@ -129,6 +143,13 @@ fn setup_old_layout(prefix: &Path) {
     }
 }
 
+fn setup_old_assets(prefix: &Path) {
+    for (relative, contents, _) in PACKAGE_ASSETS {
+        write_file(&prefix.join(relative), contents, 0o640);
+    }
+    write_file(&prefix.join(LOCAL_ASSET.0), LOCAL_ASSET.1, 0o600);
+}
+
 fn snapshot_layout(prefix: &Path) -> Vec<FileSnapshot> {
     EXECUTABLES
         .iter()
@@ -138,6 +159,25 @@ fn snapshot_layout(prefix: &Path) -> Vec<FileSnapshot> {
                 bytes: fs::read(&path).expect("read installed executable"),
                 mode: fs::metadata(&path)
                     .expect("installed executable metadata")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+            }
+        })
+        .collect()
+}
+
+fn snapshot_old_assets(prefix: &Path) -> Vec<FileSnapshot> {
+    PACKAGE_ASSETS
+        .iter()
+        .map(|(relative, _, _)| *relative)
+        .chain(std::iter::once(LOCAL_ASSET.0))
+        .map(|relative| {
+            let path = prefix.join(relative);
+            FileSnapshot {
+                bytes: fs::read(&path).expect("read installed asset"),
+                mode: fs::metadata(&path)
+                    .expect("installed asset metadata")
                     .permissions()
                     .mode()
                     & 0o7777,
@@ -221,10 +261,12 @@ fn assert_new_layout(prefix: &Path) {
         .expect("run installed tiny dispatcher");
     assert!(help.status.success(), "{}", output_details(&help));
     assert!(String::from_utf8_lossy(&help.stdout).contains("usage: rmux"));
-    assert_eq!(
-        fs::read(prefix.join("share/rmux/version")).expect("read installed asset"),
-        b"new-assets\n"
-    );
+    for (relative, _, expected) in PACKAGE_ASSETS {
+        assert_eq!(
+            fs::read(prefix.join(relative)).expect("read installed asset"),
+            expected
+        );
+    }
     assert_no_transaction_residue(prefix);
 }
 
@@ -236,15 +278,26 @@ fn upgrade_failures_restore_every_old_binary_and_allow_a_clean_retry() {
     for checkpoint in FAILURE_CHECKPOINTS {
         let prefix = root.join(format!("upgrade-{checkpoint}"));
         setup_old_layout(&prefix);
+        setup_old_assets(&prefix);
         let old = snapshot_layout(&prefix);
+        let old_assets = snapshot_old_assets(&prefix);
 
         let failed = run_installer(&archive, &prefix, Some(checkpoint), None);
         assert!(!failed.status.success(), "{}", output_details(&failed));
         assert_old_layout_restored(&prefix, &old, checkpoint);
+        assert_eq!(
+            snapshot_old_assets(&prefix),
+            old_assets,
+            "old assets changed after {checkpoint}"
+        );
 
         let retry = run_installer(&archive, &prefix, None, None);
         assert!(retry.status.success(), "{}", output_details(&retry));
         assert_new_layout(&prefix);
+        assert_eq!(
+            fs::read(prefix.join(LOCAL_ASSET.0)).expect("read preserved local asset"),
+            LOCAL_ASSET.1
+        );
     }
 }
 
@@ -277,7 +330,9 @@ fn handled_signals_restore_the_old_layout_through_verification() {
     for checkpoint in SIGNAL_CHECKPOINTS {
         let prefix = root.join(format!("signal-{checkpoint}"));
         setup_old_layout(&prefix);
+        setup_old_assets(&prefix);
         let old = snapshot_layout(&prefix);
+        let old_assets = snapshot_old_assets(&prefix);
 
         let interrupted = run_installer(&archive, &prefix, None, Some(checkpoint));
         assert!(
@@ -286,6 +341,11 @@ fn handled_signals_restore_the_old_layout_through_verification() {
             output_details(&interrupted)
         );
         assert_old_layout_restored(&prefix, &old, checkpoint);
+        assert_eq!(
+            snapshot_old_assets(&prefix),
+            old_assets,
+            "old assets changed after signal at {checkpoint}"
+        );
     }
 }
 
@@ -363,5 +423,21 @@ fn rollback_preserves_an_existing_dispatcher_symlink() {
         fs::read_link(&tiny).expect("read restored tiny symlink"),
         PathBuf::from("old-rmux-real")
     );
+    assert_no_transaction_residue(&prefix);
+}
+
+#[test]
+fn archive_without_assets_installs_without_transaction_residue() {
+    let root = TempRoot::new("no-assets");
+    let archive = setup_archive(&root);
+    fs::remove_dir_all(archive.join("share")).expect("remove optional archive assets");
+    let prefix = root.join("prefix");
+
+    let installed = run_installer(&archive, &prefix, None, None);
+    assert!(installed.status.success(), "{}", output_details(&installed));
+    for (relative, _) in EXECUTABLES {
+        assert!(prefix.join(relative).is_file(), "missing {relative}");
+    }
+    assert!(!prefix.join("share").exists());
     assert_no_transaction_residue(&prefix);
 }

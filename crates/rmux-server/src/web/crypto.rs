@@ -168,7 +168,7 @@ impl EncryptedWebSocketReader {
         match message {
             WebSocketMessage::Binary(bytes) => self.opener.open_message(&bytes),
             WebSocketMessage::Ping(payload) => Ok(WebSocketMessage::Ping(payload)),
-            WebSocketMessage::Pong => Ok(WebSocketMessage::Pong),
+            WebSocketMessage::Pong(payload) => Ok(WebSocketMessage::Pong(payload)),
             WebSocketMessage::Close => Ok(WebSocketMessage::Close),
             WebSocketMessage::Text(_) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

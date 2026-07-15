@@ -48,6 +48,7 @@ fn current_session_lease_create_addressing() -> SessionLeaseCreateAddressing {
 pub(in crate::handler) struct ExpiredSessionLeaseReapPause {
     pub(in crate::handler) reached: tokio::sync::Notify,
     pub(in crate::handler) release: tokio::sync::Notify,
+    pub(in crate::handler) completed: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -65,6 +66,13 @@ struct SessionOwnership {
     wire_session_name: SessionName,
     current_session_name: SessionName,
     deadline: LeaseDeadline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpiredSessionLease {
+    session_name: SessionName,
+    session_id: SessionId,
+    token: u64,
 }
 
 /// Daemon-side owner lease registry for app-owned sessions.
@@ -177,7 +185,7 @@ impl SessionLeaseStore {
         &mut self,
         now: Instant,
         reaper_wake: Option<ReaperWake>,
-    ) -> Vec<(SessionName, SessionId)> {
+    ) -> Vec<ExpiredSessionLease> {
         if let Some(wake) = reaper_wake {
             for ownership in self.ownerships.values_mut() {
                 ownership.deadline.preserve_budget_across_reaper_pause(wake);
@@ -187,18 +195,24 @@ impl SessionLeaseStore {
             .ownerships
             .iter()
             .filter(|(_, ownership)| ownership.deadline.is_expired_at(now))
-            .map(|(session_id, ownership)| (ownership.current_session_name.clone(), *session_id))
+            .map(|(session_id, ownership)| ExpiredSessionLease {
+                session_name: ownership.current_session_name.clone(),
+                session_id: *session_id,
+                token: ownership.token,
+            })
             .collect::<Vec<_>>();
-        expired.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-        for (session_name, session_id) in &expired {
-            if self.ownerships.get(session_id).is_some_and(|ownership| {
-                ownership.current_session_name == *session_name
-                    && ownership.deadline.is_expired_at(now)
-            }) {
-                self.ownerships.remove(session_id);
-            }
-        }
+        expired.sort_by(|left, right| left.session_name.as_str().cmp(right.session_name.as_str()));
         expired
+    }
+
+    fn claim_expired(&mut self, session_id: SessionId, token: u64, now: Instant) -> bool {
+        if self.ownerships.get(&session_id).is_none_or(|ownership| {
+            ownership.token != token || !ownership.deadline.is_expired_at(now)
+        }) {
+            return false;
+        }
+        self.ownerships.remove(&session_id);
+        true
     }
 }
 
@@ -220,8 +234,8 @@ impl RequestHandler {
     #[cfg(test)]
     async fn pause_after_expired_session_lease_extraction(
         &self,
-        expired: &[(SessionName, SessionId)],
-    ) {
+        expired: &[ExpiredSessionLease],
+    ) -> Option<std::sync::Arc<ExpiredSessionLeaseReapPause>> {
         let pause = {
             let mut installed = EXPIRED_SESSION_LEASE_REAP_PAUSE
                 .lock()
@@ -229,8 +243,8 @@ impl RequestHandler {
             let matches_expired = installed
                 .as_ref()
                 .is_some_and(|(paused_name, paused_id, _)| {
-                    expired.iter().any(|(session_name, session_id)| {
-                        session_name == paused_name && session_id == paused_id
+                    expired.iter().any(|candidate| {
+                        candidate.session_name == *paused_name && candidate.session_id == *paused_id
                     })
                 });
             matches_expired.then(|| {
@@ -240,11 +254,17 @@ impl RequestHandler {
                     .2
             })
         };
-        let Some(pause) = pause else {
-            return;
-        };
+        let pause = pause?;
         pause.reached.notify_one();
         pause.release.notified().await;
+        Some(pause)
+    }
+
+    pub(super) fn claim_expired_session_lease(&self, session_id: SessionId, token: u64) -> bool {
+        self.session_leases
+            .lock()
+            .expect("session lease mutex must not be poisoned")
+            .claim_expired(session_id, token, Instant::now())
     }
 
     pub(in crate::handler) async fn handle_create_session_lease(
@@ -370,19 +390,21 @@ impl RequestHandler {
             .expired(observed_at, Some(wake));
 
         #[cfg(test)]
-        self.pause_after_expired_session_lease_extraction(&expired)
+        let reap_pause = self
+            .pause_after_expired_session_lease_extraction(&expired)
             .await;
 
-        for (session_name, session_id) in expired {
+        for candidate in expired {
             let response = self
-                .handle_kill_session_identity(
+                .handle_kill_expired_session_lease_identity(
                     KillSessionRequest {
-                        target: session_name,
+                        target: candidate.session_name,
                         kill_all_except_target: false,
                         clear_alerts: false,
                         kill_group: false,
                     },
-                    session_id,
+                    candidate.session_id,
+                    candidate.token,
                 )
                 .await;
             if !matches!(
@@ -393,6 +415,10 @@ impl RequestHandler {
             }
         }
         self.refresh_hook_identity_aliases().await;
+        #[cfg(test)]
+        if let Some(pause) = reap_pause {
+            pause.completed.notify_one();
+        }
     }
 }
 
@@ -509,7 +535,14 @@ mod tests {
 
         let expired = leases.expired(Instant::now() + Duration::from_secs(1), None);
 
-        assert_eq!(expired, vec![(session_name, session_id)]);
+        assert_eq!(
+            expired,
+            vec![ExpiredSessionLease {
+                session_name,
+                session_id,
+                token: 1,
+            }]
+        );
     }
 
     #[test]

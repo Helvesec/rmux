@@ -20,7 +20,7 @@ use rmux_proto::{
 use tokio::time::sleep;
 
 const COMMAND_SURFACE_COUNT: usize = 79;
-const INTERNAL_REQUEST_COMMANDS: [&str; 49] = [
+const INTERNAL_REQUEST_COMMANDS: [&str; 50] = [
     "attach-session-ext",
     "attach-session-ext2",
     "attach-session-ext3",
@@ -65,6 +65,7 @@ const INTERNAL_REQUEST_COMMANDS: [&str; 49] = [
     "set-hook-mutation",
     "set-option-by-name",
     "split-window-ext",
+    "split-window-identity",
     "split-window-target-action",
     "switch-client-ext",
     "switch-client-ext2",

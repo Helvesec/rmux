@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 
 use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
+use rmux_os::process_tree::ProcessTreeChild;
 use rmux_proto::{RmuxError, SessionName};
 use rmux_pty::PtyMaster;
 use tokio::sync::{mpsc, watch};
@@ -19,10 +20,7 @@ use tokio::sync::{mpsc, watch};
 mod process_group;
 #[cfg(test)]
 pub(crate) use process_group::active_pipe_child_count_for_test;
-use process_group::{
-    configure_child_process, mark_pipe_child_started_for_test, wait_for_pipe_child,
-    PipeChildProcessGroup,
-};
+use process_group::{mark_pipe_child_started_for_test, wait_for_pipe_child, PipeChildProcessGroup};
 
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
 use crate::terminal::TerminalProfile;
@@ -287,26 +285,15 @@ impl ActivePanePipe {
         for (name, value) in profile.environment() {
             child.env(name, value);
         }
-        configure_child_process(&mut child);
-
-        let mut child = child.spawn().map_err(|error| {
+        let mut child = ProcessTreeChild::spawn(&mut child).map_err(|error| {
             RmuxError::Server(format!("failed to spawn pipe-pane command: {error}"))
         })?;
-        let process_group = match PipeChildProcessGroup::from_child(&child) {
-            Ok(process_group) => Arc::new(process_group),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(RmuxError::Server(format!(
-                    "failed to isolate pipe-pane process tree: {error}"
-                )));
-            }
-        };
+        let process_group = Arc::new(PipeChildProcessGroup::from_controller(child.controller()));
         let pipe_process_group = Arc::clone(&process_group);
         mark_pipe_child_started_for_test();
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdin = child.child_mut().stdin.take();
+        let stdout = child.child_mut().stdout.take();
+        let stderr = child.child_mut().stderr.take();
         let (stop_tx, stop_rx) = watch::channel(false);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let pipe_stop_flag = stop_flag.clone();

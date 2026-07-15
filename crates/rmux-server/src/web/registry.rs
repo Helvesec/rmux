@@ -430,6 +430,21 @@ impl WebShareRegistry {
         }
     }
 
+    pub(crate) fn discard_undelivered(&self, share_id: &str) {
+        let removed = self
+            .inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .remove(share_id, WebShareRevokeReason::StoppedByOwner);
+        if removed {
+            info!(
+                share_id,
+                reason = "response_undelivered",
+                "web_share_stopped"
+            );
+        }
+    }
+
     pub(crate) fn stop_all(&self, _request: StopAllWebSharesRequest) -> WebShareStoppedAllResponse {
         let stopped = self
             .inner

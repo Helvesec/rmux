@@ -749,3 +749,17 @@ locks the rejected command and verifies that its assignment remains absent.
 
 Inventory impact: runtime aliases remain advertised; failed alias expansion is
 transactional instead of copying tmux's partial-mutation behavior.
+
+### C-D68: server-access inventory omits tmux's rejected target flag
+
+tmux 3.7b advertises `server-access -t target-pane` in `list-commands`, but a
+measured invocation rejects `-t` as an unknown flag before dispatch. RMUX omits
+that dead flag from its command inventory so help and runtime behavior agree,
+instead of copying an upstream advertising defect.
+
+Test/fixture:
+`tests/cli_surface.rs::server_access_inventory_omits_dead_target_flag_product_divergence`
+locks both the honest inventory signature and the fail-closed direct CLI path.
+
+Inventory impact: `server-access` remains advertised with the functional
+`-a`, `-d`, `-l`, `-r`, and `-w` flags; the rejected `-t` spelling is not.

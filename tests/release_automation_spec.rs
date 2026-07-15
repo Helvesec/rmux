@@ -98,12 +98,28 @@ fn tmux_ledger_gate_reads_authoritative_inventories_and_named_divergence_tests()
         "has no ledger entry",
         "stale product-divergence test reference(s)",
         "uses a non-auditable product-divergence wildcard",
+        "path.as_posix() not in fixture",
     ] {
         assert!(
             checker.contains(exhaustive_guard),
             "tmux ledger gate lost exhaustive guard {exhaustive_guard}"
         );
     }
+}
+
+#[test]
+fn winget_portable_archive_preserves_the_private_runtime_layout() {
+    let generator = include_str!("../scripts/generate-winget-manifest.sh");
+    let validator = include_str!("../scripts/validate-winget-manifest.ps1");
+
+    assert!(
+        generator.contains("ArchiveBinariesDependOnPath: true"),
+        "WinGet would install only the public shim and discard its private helper layout"
+    );
+    assert!(
+        validator.contains("AssertManifestValue \"ArchiveBinariesDependOnPath\" \"true\""),
+        "the WinGet validator must reject manifests that discard private runtime files"
+    );
 }
 
 #[test]

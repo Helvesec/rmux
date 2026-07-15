@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use rmux_core::{alternate_screen_enter_sequence, alternate_screen_exit_sequence};
+use rmux_os::process_tree::ProcessTreeChild;
 use rmux_proto::{AttachShellCommand, TerminalSize};
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{
@@ -746,11 +747,11 @@ fn run_shell_command(mut child: std::process::Command) -> Result<()> {
     stdout.write_all(alternate_screen_enter_sequence(&term))?;
     stdout.flush()?;
 
-    let status_result = child
+    child
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
+        .stderr(Stdio::inherit());
+    let status_result = ProcessTreeChild::spawn(&mut child).and_then(|mut child| child.wait());
 
     stdout.write_all(alternate_screen_exit_sequence(&term))?;
     stdout.flush()?;

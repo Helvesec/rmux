@@ -25,15 +25,6 @@ archive_root() {
   printf '%s\n' "$script_dir"
 }
 
-install_tree() {
-  local source target
-  source="$1"
-  target="$2"
-  [ -d "$source" ] || return 0
-  mkdir -p "$target"
-  cp -R "$source/." "$target/"
-}
-
 same_file_state() {
   local left right
   left="$1"
@@ -127,6 +118,10 @@ labels=(helper daemon tiny)
 staged_paths=("" "" "")
 backup_paths=("" "" "")
 target_existed=(0 0 0)
+asset_targets=()
+asset_staged_paths=()
+asset_backup_paths=()
+asset_target_existed=()
 created_dirs=()
 transaction_root=""
 transaction_active=0
@@ -141,6 +136,21 @@ ensure_directory() {
   fi
   mkdir "$directory"
   created_dirs+=("$directory")
+}
+
+ensure_directory_tree() {
+  local directory index
+  local missing=()
+  directory="$1"
+  while [ ! -e "$directory" ] && [ ! -L "$directory" ]; do
+    missing+=("$directory")
+    directory="$(dirname "$directory")"
+  done
+  [ -d "$directory" ] || die "install path exists but is not a directory: $directory"
+  for ((index = ${#missing[@]} - 1; index >= 0; index--)); do
+    mkdir "${missing[$index]}"
+    created_dirs+=("${missing[$index]}")
+  done
 }
 
 restore_target() {
@@ -172,9 +182,44 @@ restore_target() {
   same_file_state "$backup" "$target"
 }
 
+restore_asset_target() {
+  local index target backup target_dir tmp
+  index="$1"
+  target="${asset_targets[$index]}"
+  backup="${asset_backup_paths[$index]}"
+
+  if [ "${asset_target_existed[$index]}" -eq 0 ]; then
+    if [ -d "$target" ] && [ ! -L "$target" ]; then
+      return 1
+    fi
+    rm -f "$target" || return 1
+    [ ! -e "$target" ] && [ ! -L "$target" ]
+    return 0
+  fi
+
+  target_dir="$(dirname "$target")"
+  tmp="$(mktemp "$target_dir/.rmux-rollback-asset.XXXXXX")" || return 1
+  rm -f "$tmp" || return 1
+  if ! cp -pP "$backup" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! mv -f "$tmp" "$target"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  same_file_state "$backup" "$target"
+}
+
 rollback_transaction() {
   local index failed
   failed=0
+  for ((index = ${#asset_targets[@]} - 1; index >= 0; index--)); do
+    if ! restore_asset_target "$index"; then
+      printf 'error: failed to restore %s during installer rollback\n' "${asset_targets[$index]}" >&2
+      failed=1
+    fi
+  done
   for ((index = ${#targets[@]} - 1; index >= 0; index--)); do
     if ! restore_target "$index"; then
       printf 'error: failed to restore %s during installer rollback\n' "${targets[$index]}" >&2
@@ -198,6 +243,11 @@ cleanup_transaction() {
   for staged in "${staged_paths[@]}"; do
     [ -z "$staged" ] || rm -f "$staged"
   done
+  if [ "${#asset_staged_paths[@]}" -gt 0 ]; then
+    for staged in "${asset_staged_paths[@]}"; do
+      [ -z "$staged" ] || rm -f "$staged"
+    done
+  fi
   if [ -n "$transaction_root" ] && [ "$rollback_failed" -eq 0 ]; then
     rm -rf "$transaction_root" || rollback_failed=1
   fi
@@ -245,6 +295,41 @@ ensure_directory "$prefix/libexec/rmux"
 
 transaction_root="$(mktemp -d "$prefix/.rmux-install-transaction.XXXXXX")"
 
+# Stage and snapshot every package-owned asset before replacing any installed
+# file. Asset paths share system directories with other packages, so the
+# transaction records individual files instead of swapping the whole share
+# tree. This preserves unrelated files while still allowing a complete
+# rollback after a partial asset install.
+if [ -d "$root/share" ]; then
+  while IFS= read -r -d '' source; do
+    relative="${source#"$root/share/"}"
+    target="$prefix/share/$relative"
+    target_dir="$(dirname "$target")"
+    ensure_directory_tree "$target_dir"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      [ -f "$target" ] || [ -L "$target" ] ||
+        die "destination asset path exists but is not a file: $target"
+    fi
+
+    index="${#asset_targets[@]}"
+    asset_targets+=("$target")
+    asset_staged_paths[$index]="$(mktemp "$target_dir/.rmux-stage-asset.XXXXXX")"
+    rm -f "${asset_staged_paths[$index]}"
+    cp -pP "$source" "${asset_staged_paths[$index]}"
+    same_file_state "$source" "${asset_staged_paths[$index]}" ||
+      die "could not verify staged asset for $target"
+
+    asset_backup_paths[$index]="$transaction_root/backup-asset-$index"
+    asset_target_existed[$index]=0
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      asset_target_existed[$index]=1
+      cp -pP "$target" "${asset_backup_paths[$index]}"
+      same_file_state "$target" "${asset_backup_paths[$index]}" ||
+        die "could not verify backup for $target"
+    fi
+  done < <(find "$root/share" \( -type f -o -type l \) -print0)
+fi
+
 # Stage the entire new executable set before the first destination mutation.
 # Each staging file lives beside its destination, keeping the later rename
 # atomic even when a nested install directory is a separate mount point.
@@ -285,10 +370,14 @@ if [ "$verify" -eq 1 ]; then
   checkpoint after-verify
 fi
 
+# Publish staged assets only while the executable rollback remains armed. A
+# failure or handled signal after any individual replacement restores both the
+# previous binaries and every package-owned asset.
+for ((index = 0; index < ${#asset_targets[@]}; index++)); do
+  mv -f "${asset_staged_paths[$index]}" "${asset_targets[$index]}"
+  asset_staged_paths[$index]=""
+  checkpoint after-replace-asset
+done
+
 transaction_committed=1
-
-# Non-executable assets are copied only after the versioned binary set commits,
-# so an interrupted binary upgrade cannot leave a mixed executable layout.
-install_tree "$root/share" "$prefix/share"
-
 printf 'rmux installed to %s\n' "$prefix/bin/rmux"

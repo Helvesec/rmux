@@ -75,6 +75,15 @@ impl ProcessJob {
         }
         Ok(())
     }
+
+    /// Clears the kill-on-close policy while keeping the process assigned to
+    /// the job until this handle is dropped.
+    ///
+    /// This is used after a foreground child exits normally so descendants it
+    /// intentionally left in the background retain standard shell semantics.
+    pub fn disarm_kill_on_close(&self) -> io::Result<()> {
+        set_job_limit_flags(&self.handle, 0)
+    }
 }
 
 fn create_job_object() -> io::Result<OwnedHandle> {
@@ -87,8 +96,13 @@ fn create_job_object() -> io::Result<OwnedHandle> {
     // SAFETY: `CreateJobObjectW` returned a non-null owned handle and this
     // function transfers it exactly once into `OwnedHandle`.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+    set_job_limit_flags(&handle, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)?;
+    Ok(handle)
+}
+
+fn set_job_limit_flags(handle: &OwnedHandle, flags: u32) -> io::Result<()> {
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    limits.BasicLimitInformation.LimitFlags = flags;
     // SAFETY: `handle` is a live job handle, `limits` points to an initialized
     // structure of the declared size, and the API borrows it only for the call.
     let ok = unsafe {
@@ -102,7 +116,7 @@ fn create_job_object() -> io::Result<OwnedHandle> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(handle)
+    Ok(())
 }
 
 pub(super) fn current_path(pid: u32) -> io::Result<Option<String>> {

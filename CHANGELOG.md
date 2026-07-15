@@ -245,15 +245,16 @@
   the server gone, and an `attach-session` that is final or has no terminal
   tail still performs the normal terminal attach instead of being dropped,
   backed by [queued attach flow tests](tests/cli_attach_flow.rs).
-- Closes plain `-C` control-mode output immediately with `%exit` on input EOF
-  while `-CC` keeps an attached session alive through its final pane output,
-  matching tmux 3.7b control-control lifecycle semantics. Plain control mode
-  retains the requester's identity and permissions long enough to finish
-  already accepted finite automation. Frames that would wait indefinitely are
-  cancelled, shutdown still wins, and a replacement client with the same PID
-  cannot overtake the detached drain. tmux 3.7b instead drops later queued
-  frames after EOF, so the intentional automation-preserving behavior is
-  recorded in
+- On plain `-C` input EOF, emits `%exit` for the active terminal frame and
+  closes the control transport; clients treat transport closure, not
+  control-looking pane output, as authoritative. `-CC` keeps an attached
+  session alive through its final pane output, matching tmux 3.7b
+  control-control lifecycle semantics. Plain control mode retains the
+  requester's identity and permissions long enough to finish already accepted
+  finite automation. Frames that would wait indefinitely are cancelled,
+  shutdown still wins, and a replacement client with the same PID cannot
+  overtake the detached drain. tmux 3.7b instead drops later queued frames
+  after EOF, so the intentional automation-preserving behavior is recorded in
   [ledger entry C-D54](docs/compat/tmux-3.7-divergences.md) and backed by
   [control EOF tests](crates/rmux-server/src/control/tests.rs).
 - Starts control-mode subscriptions for an existing session at the pane output
@@ -279,6 +280,19 @@
 
 ### Reliability
 
+- Revalidates the token and expiry of an owned-session lease under the state
+  lock before reaping it, so a concurrent renewal cannot remove a still-owned
+  session.
+- Preserves Web pre-authentication fairness through loopback tunnels, retains
+  authenticated viewers while they answer pings, expires silent peers, and
+  accounts outbound backlog before publishing it.
+- Cancels abandoned tunnel creation and revokes a newly created Web share when
+  its response cannot be delivered, preventing an SDK timeout or disconnect
+  from leaving an unreachable share active.
+- Owns attach shell commands and `pipe-pane` helpers as complete Unix process
+  groups or Windows Jobs before they run. Shutdown, replacement, and stopped
+  shell paths clean up the group and restore the terminal; Unix popup shutdown
+  now uses a bounded HUP/TERM/KILL escalation.
 - Relays `set-clipboard on` OSC 52 writes from a visible inactive pane to the
   outer terminal of each matching attach client without duplicating the active
   pane's normal output path. Routing is keyed by stable session and window
@@ -343,6 +357,10 @@
 
 ### Release
 
+- Makes installer rollback cover the complete package: Windows restores the
+  dispatcher and private runtime together, Unix restores packaged assets
+  without overwriting unrelated local files, and WinGet preserves the nested
+  archive layout.
 - Added release-0.9.0 performance baselines for attach render, large
   source-file corpus, status format-heavy expansion, hook storm, and daemon
   churn, with SHA, environment, and version stamps.
