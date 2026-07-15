@@ -448,7 +448,13 @@ fn parse_server_access_args(arguments: Vec<String>) -> Result<ServerAccessArgs, 
             continue;
         }
         for flag in flags.chars() {
-            if !matches!(flag, 'a' | 'd' | 'l' | 'r' | 't' | 'w') {
+            if flag == 't' {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::UnknownArgument,
+                    "command server-access: unknown flag -t",
+                ));
+            }
+            if !matches!(flag, 'a' | 'd' | 'l' | 'r' | 'w') {
                 return Err(clap::Error::raw(
                     clap::error::ErrorKind::UnknownArgument,
                     format!("command server-access: unknown flag -{flag}"),

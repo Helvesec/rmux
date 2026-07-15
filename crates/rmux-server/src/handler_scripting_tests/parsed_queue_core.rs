@@ -1344,6 +1344,49 @@ async fn parsed_queue_refresh_client_reserved_wire_flags_are_unknown() {
 }
 
 #[tokio::test]
+async fn parsed_queue_server_access_rejects_runtime_invalid_flags() {
+    let handler = RequestHandler::new();
+    for (command, expected) in [
+        (
+            "server-access -t%0 -l",
+            "command server-access: unknown flag -t",
+        ),
+        (
+            "server-access -ad nobody",
+            "-a and -d cannot be used together",
+        ),
+        (
+            "server-access -rw nobody",
+            "-r and -w cannot be used together",
+        ),
+    ] {
+        let parsed = CommandParser::new()
+            .parse(command)
+            .expect("generic command parser preserves server-access arguments");
+
+        let error = handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+            .expect_err("tmux-invalid server-access flags must fail during request parsing");
+
+        assert_eq!(error, rmux_proto::RmuxError::Server(expected.to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn parsed_queue_server_access_list_ignores_conflicting_flags() {
+    let handler = RequestHandler::new();
+    let parsed = CommandParser::new()
+        .parse("server-access -ladrw nobody")
+        .expect("generic command parser preserves server-access arguments");
+
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("server-access list mode ignores mutation flag conflicts like tmux");
+}
+
+#[tokio::test]
 async fn parsed_queue_uses_current_target_for_kill_pane_without_t() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

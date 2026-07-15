@@ -1,8 +1,8 @@
-#[cfg(windows)]
-use rmux_core::key_string_lookup_string;
 use std::io;
 
-use rmux_core::{key_code_lookup_bits, key_string_lookup_key};
+use rmux_core::{
+    key_code_lookup_bits, key_code_to_bytes, key_string_lookup_key, key_string_lookup_string,
+};
 #[cfg(windows)]
 use rmux_proto::ProcessCommand;
 use rmux_proto::{
@@ -12,7 +12,7 @@ use rmux_pty::PtyMaster;
 #[cfg(windows)]
 use rmux_pty::{ProcessId, WindowsConsoleKeyEvent};
 
-use crate::input_keys::{encode_key, encode_mouse_event, ExtendedKeyFormat};
+use crate::input_keys::{encode_key_with_backspace, encode_mouse_event, ExtendedKeyFormat};
 use crate::keys::parse_key_code;
 #[cfg(windows)]
 use crate::pane_terminals::DeferredInitialPaneConsoleInputAction;
@@ -1018,7 +1018,14 @@ pub(super) fn encode_key_for_target(
     let pane_mode = pane_input_mode(state, target)?;
     let format =
         ExtendedKeyFormat::parse(state.options.resolve(None, OptionName::ExtendedKeysFormat));
-    Ok(encode_key(pane_mode, format, key))
+    let backspace = state
+        .options
+        .resolve(None, OptionName::Backspace)
+        .and_then(key_string_lookup_string)
+        .and_then(key_code_to_bytes)
+        .and_then(|bytes| (bytes.len() == 1).then_some(bytes[0]))
+        .unwrap_or(0x7f);
+    Ok(encode_key_with_backspace(pane_mode, format, key, backspace))
 }
 
 pub(super) fn pane_input_mode(state: &HandlerState, target: &PaneTarget) -> Result<u32, RmuxError> {

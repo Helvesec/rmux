@@ -50,7 +50,7 @@ pub struct ServerAccessRequest {
     /// Whether the resulting entry should be read-write.
     #[serde(default)]
     pub write: bool,
-    /// Optional pane target accepted for tmux CLI compatibility.
+    /// Legacy wire slot rejected at runtime; tmux advertises `-t` but rejects it.
     #[serde(default)]
     pub target: Option<String>,
     /// The optional username argument.

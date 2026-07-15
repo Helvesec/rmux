@@ -59,3 +59,4 @@ rustix = { version = "1.1.4", features = ["event", "fs", "net", "process"] }
 [dev-dependencies]
 rustix = { version = "1.1.4", features = ["event", "fs", "termios"] }
 static_assertions = "1.1"
+tokio = { version = "1.48.0", features = ["test-util"] }

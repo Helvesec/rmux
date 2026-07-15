@@ -10,8 +10,10 @@ use crate::{
     TerminalSizeSpec,
 };
 use rmux_proto::{
-    encode_frame, FrameDecoder, HasSessionRequest, HasSessionResponse, PaneSnapshotCell,
-    PaneSnapshotCursor, PaneSnapshotResponse, Request, Response, SessionName,
+    encode_frame, FrameDecoder, HandshakeResponse, HasSessionRequest, HasSessionResponse,
+    PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse, PaneTarget, Request, Response,
+    SessionName, SplitWindowIdentityResponse, CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
+    RMUX_WIRE_VERSION, SUPPORTED_CAPABILITIES,
 };
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,6 +59,110 @@ async fn returned_pane_clears_the_deadline_of_its_creation_operation() {
             .expect("returned pane starts a fresh operation"),
         Response::HasSession(HasSessionResponse { exists: true })
     );
+}
+
+#[tokio::test]
+async fn split_uses_one_atomic_mutation_rpc_without_display_message_follow_up() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(client_stream);
+    let session_name = SessionName::new("alpha").expect("valid session");
+    let pane = super::Pane::new(
+        PaneRef::new(session_name.clone(), 0, 4),
+        RmuxEndpoint::Default,
+        None,
+        transport,
+    );
+
+    let split = tokio::spawn(async move { pane.split(crate::SplitDirection::Right).await });
+    let handshake = read_transport_request(&mut server_stream).await;
+    assert!(matches!(handshake, Request::Handshake(_)));
+    write_transport_response(
+        &mut server_stream,
+        &Response::Handshake(HandshakeResponse::current()),
+    )
+    .await;
+
+    let mutation = read_transport_request(&mut server_stream).await;
+    let Request::SplitWindowIdentity(request) = mutation else {
+        panic!("expected atomic split request, got {mutation:?}");
+    };
+    assert_eq!(request.action.target.as_deref(), Some("alpha:0.4"));
+    write_transport_response(
+        &mut server_stream,
+        &Response::SplitWindowIdentity(SplitWindowIdentityResponse {
+            pane: PaneTarget::with_window(session_name.clone(), 0, 9),
+            pane_id: PaneId::new(42),
+        }),
+    )
+    .await;
+
+    let returned = split
+        .await
+        .expect("split task must not panic")
+        .expect("atomic split succeeds");
+    assert_eq!(returned.target(), &PaneRef::new(session_name, 0, 9));
+    assert_eq!(returned.stable_id, Some(PaneId::new(42)));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            read_transport_request(&mut server_stream)
+        )
+        .await
+        .is_err(),
+        "split must not issue a post-mutation display-message RPC"
+    );
+}
+
+#[tokio::test]
+async fn split_rejects_missing_identity_capability_before_mutation() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(client_stream);
+    let keepalive = transport.clone();
+    let session_name = SessionName::new("alpha").expect("valid session");
+    let pane = super::Pane::new(
+        PaneRef::new(session_name, 0, 0),
+        RmuxEndpoint::Default,
+        None,
+        transport,
+    );
+
+    let split = tokio::spawn(async move { pane.split(crate::SplitDirection::Right).await });
+    assert!(matches!(
+        read_transport_request(&mut server_stream).await,
+        Request::Handshake(_)
+    ));
+    let capabilities = SUPPORTED_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|capability| *capability != CAPABILITY_SDK_PANE_SPLIT_IDENTITY)
+        .map(str::to_owned)
+        .collect();
+    write_transport_response(
+        &mut server_stream,
+        &Response::Handshake(HandshakeResponse {
+            wire_version: RMUX_WIRE_VERSION,
+            capabilities,
+        }),
+    )
+    .await;
+
+    let error = split
+        .await
+        .expect("split task must not panic")
+        .expect_err("missing identity capability must fail closed");
+    assert!(error
+        .to_string()
+        .contains(CAPABILITY_SDK_PANE_SPLIT_IDENTITY));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            read_transport_request(&mut server_stream)
+        )
+        .await
+        .is_err(),
+        "capability rejection must happen before the split mutation"
+    );
+    drop(keepalive);
 }
 
 async fn read_transport_request(stream: &mut tokio::io::DuplexStream) -> Request {

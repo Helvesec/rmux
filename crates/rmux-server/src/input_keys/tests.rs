@@ -1,6 +1,7 @@
 use super::{
-    decode_extended_key, decode_mouse, encode_key, encode_mouse_event, ExtendedKeyDecode,
-    ExtendedKeyFormat, MouseDecode, MouseForwardEvent, MAX_SGR_MOUSE_FRAME_BYTES,
+    decode_extended_key, decode_mouse, encode_key, encode_key_with_backspace, encode_mouse_event,
+    ExtendedKeyDecode, ExtendedKeyFormat, MouseDecode, MouseForwardEvent,
+    MAX_SGR_MOUSE_FRAME_BYTES,
 };
 use rmux_core::{
     input::mode, key_string_lookup_string, KeyCode, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_KEYPAD,
@@ -448,6 +449,20 @@ fn meta_backspace_encodes_escape_del() {
     assert_eq!(
         encode_key(0, ExtendedKeyFormat::Xterm, parse_key("M-BSpace")).as_deref(),
         Some(b"\x1b\x7f".as_slice())
+    );
+}
+
+#[test]
+fn configured_backspace_byte_controls_plain_and_meta_backspace() {
+    let backspace = parse_key("BSpace");
+    assert_eq!(
+        encode_key_with_backspace(0, ExtendedKeyFormat::Xterm, backspace, 0x08).as_deref(),
+        Some(b"\x08".as_slice())
+    );
+    assert_eq!(
+        encode_key_with_backspace(0, ExtendedKeyFormat::Xterm, backspace | KEYC_META, 0x08,)
+            .as_deref(),
+        Some(b"\x1b\x08".as_slice())
     );
 }
 

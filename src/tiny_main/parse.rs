@@ -249,6 +249,7 @@ pub(super) fn parse_split_window(args: &[OsString]) -> Option<SplitWindowTargetA
     let mut size = None;
     let mut preserve_zoom = false;
     let mut full_size = false;
+    let mut keep_alive_on_exit = false;
     let mut command = None;
     let mut index = 0;
     while index < args.len() {
@@ -265,6 +266,7 @@ pub(super) fn parse_split_window(args: &[OsString]) -> Option<SplitWindowTargetA
             "-b" => before = true,
             "-Z" => preserve_zoom = true,
             "-f" => full_size = true,
+            "-k" => keep_alive_on_exit = true,
             "-t" => {
                 index += 1;
                 target = Some(args.get(index)?.to_str()?.to_owned());
@@ -294,7 +296,7 @@ pub(super) fn parse_split_window(args: &[OsString]) -> Option<SplitWindowTargetA
         command,
         process_command: None,
         start_directory,
-        keep_alive_on_exit: None,
+        keep_alive_on_exit: keep_alive_on_exit.then_some(true),
         detached,
         size,
         preserve_zoom,

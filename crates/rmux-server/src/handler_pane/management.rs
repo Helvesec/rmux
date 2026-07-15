@@ -29,6 +29,13 @@ pub(in crate::handler) struct SplitWindowParts {
     pub(in crate::handler) preserve_zoom: bool,
     pub(in crate::handler) full_size: bool,
     pub(in crate::handler) stdin_payload: Option<Vec<u8>>,
+    pub(in crate::handler) response_mode: SplitWindowResponseMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) enum SplitWindowResponseMode {
+    Legacy,
+    StableIdentity,
 }
 
 impl RequestHandler {
@@ -53,6 +60,7 @@ impl RequestHandler {
                 preserve_zoom: false,
                 full_size: false,
                 stdin_payload: None,
+                response_mode: SplitWindowResponseMode::Legacy,
             },
         )
         .await
@@ -79,6 +87,7 @@ impl RequestHandler {
                 preserve_zoom: request.preserve_zoom,
                 full_size: request.full_size,
                 stdin_payload: request.stdin_payload,
+                response_mode: SplitWindowResponseMode::Legacy,
             },
         )
         .await
@@ -103,6 +112,7 @@ impl RequestHandler {
             preserve_zoom,
             full_size,
             stdin_payload,
+            response_mode,
         } = parts;
         let session_name = match &target {
             rmux_proto::SplitWindowTarget::Session(session_name) => session_name.clone(),
@@ -123,7 +133,7 @@ impl RequestHandler {
         let attached_count = self.attached_count(&session_name).await;
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
-        let response = {
+        let (response, successful_pane) = {
             let mut state = self.state.lock().await;
             if let Err(error) =
                 super::super::require_expected_session_identity(&state, &session_name)
@@ -196,30 +206,32 @@ impl RequestHandler {
                                 return Response::Error(ErrorResponse { error });
                             }
                         }
-                        Response::SplitWindow(response)
+                        let successful_pane = response.pane.clone();
+                        match split_window_response(&state, response, response_mode) {
+                            Ok(response) => (response, Some(successful_pane)),
+                            Err(error) => (Response::Error(ErrorResponse { error }), None),
+                        }
                     }
-                    Err(error) => Response::Error(ErrorResponse { error }),
+                    Err(error) => (Response::Error(ErrorResponse { error }), None),
                 },
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Err(error) => (Response::Error(ErrorResponse { error }), None),
             }
         };
 
-        if matches!(response, Response::SplitWindow(_)) {
-            if let Response::SplitWindow(success) = &response {
-                self.queue_inline_hook(
-                    HookName::AfterSplitWindow,
-                    ScopeSelector::Session(session_name.clone()),
-                    Some(Target::Pane(success.pane.clone())),
-                    PendingInlineHookFormat::AfterCommand,
-                );
-                self.emit(LifecycleEvent::WindowLayoutChanged {
-                    target: WindowTarget::with_window(
-                        session_name.clone(),
-                        success.pane.window_index(),
-                    ),
-                })
-                .await;
-            }
+        if let Some(successful_pane) = successful_pane {
+            self.queue_inline_hook(
+                HookName::AfterSplitWindow,
+                ScopeSelector::Session(session_name.clone()),
+                Some(Target::Pane(successful_pane.clone())),
+                PendingInlineHookFormat::AfterCommand,
+            );
+            self.emit(LifecycleEvent::WindowLayoutChanged {
+                target: WindowTarget::with_window(
+                    session_name.clone(),
+                    successful_pane.window_index(),
+                ),
+            })
+            .await;
             self.refresh_attached_session(&session_name).await;
         }
 
@@ -438,6 +450,47 @@ impl RequestHandler {
                 ));
         }
     }
+}
+
+fn split_window_response(
+    state: &HandlerState,
+    response: rmux_proto::SplitWindowResponse,
+    mode: SplitWindowResponseMode,
+) -> Result<Response, rmux_proto::RmuxError> {
+    if mode == SplitWindowResponseMode::Legacy {
+        return Ok(Response::SplitWindow(response));
+    }
+
+    let raw_target = &response.pane;
+    let session = state
+        .sessions
+        .session(raw_target.session_name())
+        .ok_or_else(|| {
+            rmux_proto::RmuxError::SessionNotFound(raw_target.session_name().to_string())
+        })?;
+    let pane_id = crate::pane_terminal_lookup::pane_id_for_target(
+        &state.sessions,
+        raw_target.session_name(),
+        raw_target.window_index(),
+        raw_target.pane_index(),
+    )?;
+    let visible_index = crate::pane_indices::visible_pane_index(
+        session,
+        &state.options,
+        raw_target.window_index(),
+        raw_target.pane_index(),
+    );
+
+    Ok(Response::SplitWindowIdentity(
+        rmux_proto::SplitWindowIdentityResponse {
+            pane: rmux_proto::PaneTarget::with_window(
+                raw_target.session_name().clone(),
+                raw_target.window_index(),
+                visible_index,
+            ),
+            pane_id,
+        },
+    ))
 }
 
 fn inject_split_window_stdin_output(

@@ -242,6 +242,10 @@ impl RequestHandler {
                 self.handle_split_window_target_action(requester_pid, *request)
                     .await,
             ),
+            Request::SplitWindowIdentity(request) => HandleOutcome::response(
+                self.handle_split_window_identity(requester_pid, *request)
+                    .await,
+            ),
             Request::SwapPane(request) => {
                 HandleOutcome::response(self.handle_swap_pane(request).await)
             }
@@ -605,6 +609,7 @@ fn request_changes_hook_identity_aliases(request: &Request) -> bool {
             | Request::SplitWindow(_)
             | Request::SplitWindowExt(_)
             | Request::SplitWindowTargetAction(_)
+            | Request::SplitWindowIdentity(_)
             | Request::SwapPane(_)
             | Request::JoinPane(_)
             | Request::MovePane(_)

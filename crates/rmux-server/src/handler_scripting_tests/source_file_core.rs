@@ -33,6 +33,92 @@ async fn compact_short_options_execute_from_source_file() {
 }
 
 #[tokio::test]
+async fn compact_hidden_select_pane_style_executes_from_source_file() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("source-compact-select-style");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let root = temp_root("compact-hidden-select-style");
+    write_config(
+        &root.join("select.conf"),
+        "select-pane -tsource-compact-select-style:0.1 -Pfg=blue,bg=red\n",
+    );
+    let response = handler
+        .handle(source_file_request(
+            vec!["select.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+    fs::remove_dir_all(root).expect("remove compact select source root");
+
+    assert!(matches!(response, Response::SourceFile(_)), "{response:?}");
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    assert_eq!(
+        session
+            .window_at(0)
+            .expect("window exists")
+            .active_pane_index(),
+        1
+    );
+    assert_eq!(
+        state.options.pane_value(
+            &PaneTarget::with_window(alpha, 0, 1),
+            OptionName::WindowStyle
+        ),
+        Some("fg=blue,bg=red")
+    );
+}
+
+#[tokio::test]
+async fn source_file_rejects_unimplemented_display_message_flags() {
+    let handler = RequestHandler::new();
+    let root = temp_root("display-message-inert-flags");
+    write_config(&root.join("display.conf"), "display-message -d0 -p hello\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["display.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+    fs::remove_dir_all(root).expect("remove display-message source root");
+
+    let Response::Error(error) = response else {
+        panic!("source-file should reject inert display-message flags: {response:?}");
+    };
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("display.conf:1: command display-message: unknown flag -d"),
+        "unexpected source error: {}",
+        error.error
+    );
+}
+
+#[tokio::test]
 async fn source_file_command_bounds_matches_across_separate_paths() {
     let handler = RequestHandler::new();
     let root = temp_root("aggregate-path-count");
@@ -211,6 +297,83 @@ async fn source_file_rejects_refresh_client_reserved_wire_flags() {
     }
 
     fs::remove_dir_all(root).expect("remove refresh-client source root");
+}
+
+#[tokio::test]
+async fn source_file_rejects_unknown_options_before_command_tails() {
+    for (label, command, expected_command, expected_flag) in [
+        ("run-shell", "run-shell -Q true", "run-shell", "-Q"),
+        (
+            "if-shell",
+            "if-shell -Q true { set-buffer -b branch bad }",
+            "if-shell",
+            "-Q",
+        ),
+        ("wait-for", "wait-for -Q", "wait-for", "-Q"),
+        ("split-window", "split-window -Q true", "split-window", "-Q"),
+        ("pipe-pane", "pipe-pane -Q true", "pipe-pane", "-Q"),
+        (
+            "respawn-pane",
+            "respawn-pane -k -Q true",
+            "respawn-pane",
+            "-Q",
+        ),
+        (
+            "bind-key",
+            "bind-key -Q X { set-buffer -b binding bad }",
+            "bind-key",
+            "-Q",
+        ),
+        (
+            "display-panes",
+            "display-panes -Q 'select-pane -t %%'",
+            "display-panes",
+            "-Q",
+        ),
+    ] {
+        let handler = RequestHandler::new();
+        let root = temp_root(&format!("unknown-tail-{label}"));
+        let config = root.join("main.conf");
+        let canary = format!("after-{label}");
+        write_config(
+            &config,
+            &format!("{command}\nset-buffer -b {canary} mutated\n"),
+        );
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handler.handle(source_file_request(
+                vec!["main.conf".to_owned()],
+                Some(root.clone()),
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("source-file {label} validation must not block"));
+
+        let Response::Error(response) = response else {
+            panic!("source-file should reject {label} unknown option: {response:?}");
+        };
+        assert_eq!(
+            response.error,
+            rmux_proto::RmuxError::Server(format!(
+                "{}:1: command {expected_command}: unknown flag {expected_flag}",
+                config.display()
+            )),
+            "source-file accepted an unknown option before {label}'s positional tail"
+        );
+        assert!(
+            matches!(
+                handler
+                    .handle(Request::ShowBuffer(ShowBufferRequest {
+                        name: Some(canary),
+                    }))
+                    .await,
+                Response::Error(_)
+            ),
+            "source-file executed commands after {label}'s validation error"
+        );
+        fs::remove_dir_all(root).expect("remove unknown-tail source root");
+    }
 }
 
 #[tokio::test]

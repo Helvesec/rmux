@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use rmux_core::OptionStore;
 use rmux_proto::{OptionName, SessionName};
 #[cfg(unix)]
+use rustix::fs::{access, Access};
+#[cfg(unix)]
 use rustix::process::getuid;
 
 #[cfg(windows)]
@@ -26,16 +28,29 @@ pub(super) fn resolve_shell_path(
         .or_else(|| options.resolve(None, OptionName::DefaultShell))
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
+        .filter(|path| is_suitable_shell(path))
         .map(normalize_shell_path)
         .or_else(|| {
             environment
                 .get("SHELL")
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
+                .filter(|path| is_suitable_shell(path))
         })
-        .or_else(current_user_login_shell)
+        .or_else(|| current_user_login_shell().filter(|path| is_suitable_shell(path)))
         .map(normalize_shell_path)
         .unwrap_or_else(default_shell_path)
+}
+
+#[cfg(unix)]
+pub(crate) fn is_suitable_shell(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && access(path, Access::EXEC_OK).is_ok()
 }
 
 #[cfg(windows)]
@@ -47,6 +62,7 @@ pub(super) fn resolve_shell_path(
     explicit_default_shell(options, session_name)
         .map(PathBuf::from)
         .map(|path| resolve_program_path(&path, environment))
+        .filter(|path| path.is_file())
         .or_else(|| inherited_client_shell(environment))
         .unwrap_or_else(|| default_shell_path(environment))
 }
@@ -309,6 +325,43 @@ fn environment_string_value<'a>(
     })
 }
 
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_shell_environment_falls_back_to_a_suitable_login_shell() {
+        let environment = HashMap::from([(
+            "SHELL".to_owned(),
+            "/definitely/missing/rmux-shell".to_owned(),
+        )]);
+
+        let resolved = resolve_shell_path(&OptionStore::new(), None, &environment);
+
+        assert_ne!(resolved, PathBuf::from(&environment["SHELL"]));
+        assert!(is_suitable_shell(&resolved), "{resolved:?}");
+    }
+
+    #[test]
+    fn invalid_stored_default_shell_falls_back_to_the_session_environment() {
+        let mut options = OptionStore::new();
+        options
+            .set(
+                rmux_proto::ScopeSelector::Global,
+                OptionName::DefaultShell,
+                "/definitely/missing/rmux-shell".to_owned(),
+                rmux_proto::SetOptionMode::Replace,
+            )
+            .expect("core option storage accepts string values");
+        let environment = HashMap::from([("SHELL".to_owned(), "/bin/sh".to_owned())]);
+
+        assert_eq!(
+            resolve_shell_path(&options, None, &environment),
+            PathBuf::from("/bin/sh")
+        );
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -477,6 +530,31 @@ mod tests {
             .to_ascii_lowercase();
 
         assert_eq!(leaf, "cmd.exe");
+    }
+
+    #[test]
+    fn invalid_explicit_default_shell_falls_back_to_inherited_client_shell() {
+        let environment = HashMap::from([(CLIENT_SHELL_ENV.to_owned(), "cmd.exe".to_owned())]);
+        let mut options = OptionStore::new();
+        options
+            .set(
+                rmux_proto::ScopeSelector::Global,
+                OptionName::DefaultShell,
+                r"C:\definitely\missing\rmux-shell.exe".to_owned(),
+                rmux_proto::SetOptionMode::Replace,
+            )
+            .expect("default-shell set succeeds");
+
+        let resolved = resolve_shell_path(&options, None, &environment);
+
+        assert_eq!(
+            resolved
+                .file_name()
+                .expect("fallback shell has a leaf")
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+            "cmd.exe"
+        );
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

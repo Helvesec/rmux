@@ -53,7 +53,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ),
     (
         "display-message",
-        "(display) [-aCIlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]",
+        "(display) [-aCIlpv] [-c target-client] [-F format] [-t target-pane] [message]",
     ),
     (
         "display-popup",
@@ -213,7 +213,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("source-file", "(source) [-Fnqv] [-t target-pane] path ..."),
     (
         "split-window",
-        "(splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane][shell-command]",
+        "(splitw) [-bdefhIklPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane][shell-command]",
     ),
     ("start-server", "(start) "),
     ("suspend-client", "(suspendc) [-t target-client]"),

@@ -262,6 +262,7 @@ async fn next_overlay(
             Some(AttachControl::DetachKill) => panic!("unexpected detach kill"),
             Some(AttachControl::DetachExecShellCommand(_)) => panic!("unexpected detach exec"),
             Some(AttachControl::Write(_)) => {}
+            Some(AttachControl::ClipboardWrite { .. }) => {}
             Some(AttachControl::LockShellCommand(_)) => {}
             Some(AttachControl::Suspend) => panic!("unexpected suspend"),
             None => panic!("attach control closed"),

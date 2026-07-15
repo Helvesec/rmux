@@ -38,9 +38,10 @@ pub use pane::{
     PipePaneRequest, ResizePaneRequest, ResizePaneTargetActionRequest, RespawnPaneRequest,
     SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
     SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest, SplitWindowExtRequest,
-    SplitWindowRequest, SplitWindowTarget, SplitWindowTargetActionRequest,
-    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneStateRequest,
-    SwapPaneDirection, SwapPaneRequest, UnsubscribePaneOutputRequest, UnsubscribePaneStateRequest,
+    SplitWindowIdentityRequest, SplitWindowRequest, SplitWindowTarget,
+    SplitWindowTargetActionRequest, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
+    SubscribePaneStateRequest, SwapPaneDirection, SwapPaneRequest, UnsubscribePaneOutputRequest,
+    UnsubscribePaneStateRequest,
 };
 
 #[path = "request/window.rs"]
@@ -368,6 +369,8 @@ pub enum Request {
     UnsubscribePaneState(UnsubscribePaneStateRequest),
     /// SDK pane foreground-state endpoint with stable pane-id targeting.
     PaneForegroundState(PaneForegroundStateRequest),
+    /// SDK split endpoint returning visible and stable pane identity atomically.
+    SplitWindowIdentity(Box<SplitWindowIdentityRequest>),
 }
 
 impl Request {
@@ -390,9 +393,10 @@ impl Request {
             Self::MoveWindow(_) => "move-window",
             Self::SwapWindow(_) => "swap-window",
             Self::RotateWindow(_) => "rotate-window",
-            Self::SplitWindow(_) | Self::SplitWindowExt(_) | Self::SplitWindowTargetAction(_) => {
-                "split-window"
-            }
+            Self::SplitWindow(_)
+            | Self::SplitWindowExt(_)
+            | Self::SplitWindowTargetAction(_)
+            | Self::SplitWindowIdentity(_) => "split-window",
             Self::SwapPane(_) => "swap-pane",
             Self::LastPane(_) => "last-pane",
             Self::JoinPane(_) => "join-pane",

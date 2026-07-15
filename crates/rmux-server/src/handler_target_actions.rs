@@ -3,13 +3,43 @@ use rmux_proto::{
     Target,
 };
 
-use super::{pane_support::SplitWindowParts, RequestHandler};
+use super::{
+    pane_support::{SplitWindowParts, SplitWindowResponseMode},
+    RequestHandler,
+};
 
 impl RequestHandler {
     pub(in crate::handler) async fn handle_split_window_target_action(
         &self,
         requester_pid: u32,
         request: rmux_proto::SplitWindowTargetActionRequest,
+    ) -> Response {
+        self.handle_split_window_target_action_with_mode(
+            requester_pid,
+            request,
+            SplitWindowResponseMode::Legacy,
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn handle_split_window_identity(
+        &self,
+        requester_pid: u32,
+        request: rmux_proto::SplitWindowIdentityRequest,
+    ) -> Response {
+        self.handle_split_window_target_action_with_mode(
+            requester_pid,
+            request.action,
+            SplitWindowResponseMode::StableIdentity,
+        )
+        .await
+    }
+
+    async fn handle_split_window_target_action_with_mode(
+        &self,
+        requester_pid: u32,
+        request: rmux_proto::SplitWindowTargetActionRequest,
+        response_mode: SplitWindowResponseMode,
     ) -> Response {
         let target = match self
             .resolve_target_for_requester(
@@ -51,6 +81,7 @@ impl RequestHandler {
                 preserve_zoom: request.preserve_zoom,
                 full_size: request.full_size,
                 stdin_payload: request.stdin_payload,
+                response_mode,
             },
         )
         .await

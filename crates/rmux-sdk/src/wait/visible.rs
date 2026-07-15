@@ -12,7 +12,8 @@ use tokio::time::Instant;
 use crate::{Pane, PaneSnapshot, Result, RmuxError};
 
 use super::{
-    resolved_wait_timeout, snapshot_with_wait_deadline, TEXT_POLL_INTERVAL, WAIT_FOR_TEXT_OPERATION,
+    resolved_wait_timeout_override, snapshot_with_wait_deadline, wait_deadline, TEXT_POLL_INTERVAL,
+    WAIT_FOR_TEXT_OPERATION,
 };
 
 #[cfg(feature = "regex")]
@@ -162,10 +163,9 @@ impl<'a> VisibleTextWait<'a> {
     }
 
     async fn run(self) -> Result<PaneSnapshot> {
-        let timeout = self
-            .timeout
-            .or_else(|| resolved_wait_timeout(self.pane.configured_default_timeout()));
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let timeout =
+            resolved_wait_timeout_override(self.timeout, self.pane.configured_default_timeout());
+        let deadline = wait_deadline(timeout);
         self.run_with_deadline(timeout, deadline).await
     }
 

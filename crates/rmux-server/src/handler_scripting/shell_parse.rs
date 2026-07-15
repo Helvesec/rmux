@@ -6,7 +6,7 @@ use rmux_proto::{
 };
 
 use super::tokens::{rebuild_shell_command, CommandTokens};
-use super::values::parse_non_negative_f64;
+use super::values::{parse_non_negative_f64, reject_unknown_option_before_positional};
 use super::{parse_pane_target, parse_target_arg};
 
 pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -68,7 +68,10 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 target = Some(parse_pane_target("run-shell", args.required("-t target")?)?);
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("run-shell", token)?;
+                break;
+            }
         }
     }
     let command_parts = args.remaining();
@@ -127,7 +130,10 @@ pub(super) fn parse_if_shell(
                 let _ = args.optional();
                 target = Some(parse_target_arg("if-shell", args.required("-t target")?)?);
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("if-shell", token)?;
+                break;
+            }
         }
     }
 
@@ -155,7 +161,10 @@ pub(super) fn parse_wait_for(mut args: CommandTokens) -> Result<Request, RmuxErr
             "-S" => WaitForMode::Signal,
             "-L" => WaitForMode::Lock,
             "-U" => WaitForMode::Unlock,
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("wait-for", token)?;
+                break;
+            }
         };
         let _ = args.optional();
         if mode != WaitForMode::Wait {

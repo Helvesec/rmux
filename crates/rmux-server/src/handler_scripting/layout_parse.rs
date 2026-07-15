@@ -6,7 +6,7 @@ use rmux_proto::{
 };
 
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::{parse_percentage, parse_u64};
+use super::values::{parse_percentage, parse_u64, reject_unknown_option_before_positional};
 use super::{
     implicit_pane_target, implicit_session_name, implicit_window_target, parse_layout_name,
     parse_pane_target, parse_select_layout_target,
@@ -50,6 +50,7 @@ pub(super) fn parse_display_panes(
             }
             _ => {
                 let Some(cluster) = parse_compact_flag_cluster(&token, "bN", "dt") else {
+                    reject_unknown_option_before_positional("display-panes", &token)?;
                     break;
                 };
                 let _ = args.optional();

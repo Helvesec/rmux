@@ -28,6 +28,38 @@ async fn send_keys_writes_resolved_bytes_to_the_correct_pane() {
 }
 
 #[tokio::test]
+async fn send_keys_uses_configured_backspace_byte() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("send-keys-backspace-option");
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::Backspace,
+            value: "C-h".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "backspace-option", 3).await;
+    let response = handler
+        .handle(Request::SendKeys(SendKeysRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            keys: vec!["BSpace".to_owned(), "M-BSpace".to_owned()],
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 2 })
+    );
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"\x08\x1b\x08").await;
+}
+
+#[tokio::test]
 async fn send_keys_marks_attached_session_input_as_interactive() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

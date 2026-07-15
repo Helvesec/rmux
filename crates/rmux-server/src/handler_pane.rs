@@ -67,7 +67,7 @@ use pane_io_encoding::{
 pub(super) use pane_io_encoding::{
     prepare_pane_input_write, write_bytes_to_target_io, PaneInputLiveness,
 };
-pub(in crate::handler) use pane_management::SplitWindowParts;
+pub(in crate::handler) use pane_management::{SplitWindowParts, SplitWindowResponseMode};
 pub(super) use pane_prompt_input::decode_prompt_input_event;
 pub(in crate::handler) use pane_snapshot::PaneSnapshotRevisionRegistry;
 

@@ -15,7 +15,8 @@ use rmux_proto::{
     NewSessionExtRequest, NewSessionRequest, OptionName, PaneTarget, RenameSessionRequest, Request,
     ResizePaneAdjustment, ResizePaneTargetActionRequest, Response, RmuxError, ScopeSelector,
     SelectPaneRequest, SessionName, SetHookRequest, SetOptionMode, SetOptionRequest,
-    SplitWindowRequest, SplitWindowTarget, SplitWindowTargetActionRequest, Target, TerminalSize,
+    SplitWindowIdentityRequest, SplitWindowRequest, SplitWindowTarget,
+    SplitWindowTargetActionRequest, Target, TerminalSize,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

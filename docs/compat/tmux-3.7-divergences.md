@@ -213,21 +213,22 @@ Inventory impact: expression-format docs may describe RMUX's permissive operand
 trimming, but compatibility summaries must not call this subcase byte-identical
 to tmux 3.7b.
 
-### C-D39: tmux 3.7b split-window extension flags remain deferred
+### C-D39: other tmux 3.7b split-window extension flags remain deferred
 
-tmux 3.7b accepts the newer `split-window -k`, `-m`, `-s`, `-S`, and `-R`
-surfaces. RMUX 0.9.0 does not implement their runtime semantics yet, so it
-rejects them instead of accepting flags that would behave incorrectly.
+RMUX implements `split-window -k` with the pane-local keep-on-exit behavior
+measured on tmux 3.7b. With global `remain-on-exit` off, tmux retained an
+`exit 7` pane as dead with status 7 and reported its pane option as
+`remain-on-exit key`; the same split without `-k` disappeared. The newer
+`split-window -m`, `-s`, `-S`, and `-R` surfaces remain deferred, so RMUX
+rejects them instead of accepting flags whose runtime semantics are absent.
 
-Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records tmux 3.7b accepting
-`split-window -k` with rc 0 and parsing `split-window -m`, `-s`, `-S`, and
-`-R` far enough to report `expects an argument`; RMUX reports
-`command split-window: unknown flag -k` and the analogous unknown-flag errors
-for `-m`, `-s`, `-S`, and `-R`.
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records the scoped
+`-k` oracle probe and the remaining parser divergences. Direct CLI,
+`source-file`, and server-queue regression tests pin RMUX's retained dead-pane
+behavior.
 
-Inventory impact: RMUX must not advertise these split-window flags as supported
-runtime behavior until parser, command inventory, runtime, and oracle fixtures
-land together.
+Inventory impact: RMUX advertises `-k`, but must not advertise `-m`, `-s`,
+`-S`, or `-R` until parser, runtime, and oracle fixtures land together.
 
 ### C-D41: refresh-client subscription flags are unsupported and unadvertised
 
@@ -364,9 +365,11 @@ set that exact OSC 10/11/12 slot; otherwise the query remains unanswered. This
 avoids presenting a daemon-wide guessed dark palette as the attached client's
 real theme. `OSC 110/111/112` resets the corresponding slot to unknown.
 
-Test/fixture: `crates/rmux-core/src/input/tests/osc_dcs_misc.rs` covers the
-unknown-query silence for all three slots with both terminators, the
-set-then-query round trip, and reset-to-unknown behavior.
+Test/fixture:
+`crates/rmux-core/src/input/tests/osc_dcs_misc.rs::osc_11_set_then_query_round_trips_product_divergence`
+locks the application-set round trip. The same tracked module covers the
+unknown-query silence for all three slots with both terminators and the
+reset-to-unknown behavior.
 
 Inventory impact: OSC colour handling remains advertised, but compatibility
 claims must describe attached query forwarding as unsupported. Per-pane
@@ -523,11 +526,19 @@ accepted frames reach the still-open transport before RMUX switches to the
 detached finite drain. The grace never extends per frame, and no reply is
 written after the transport closes.
 
-Test/fixture: `crates/rmux-server/src/control/tests.rs` names the intentional
-cases `..._product_divergence` and covers finite follow-on work, conditional
-waits, parse failures, explicit exit, kill-server, shutdown cancellation,
-permissions, and same-PID lease ordering. The oracle-backed guard and `%exit`
-tuple remains covered by
+Test/fixture: `crates/rmux-server/src/control/tests.rs` locks each intentional
+case in
+`eof_closes_transport_while_finite_control_queue_continues_product_divergence`,
+`eof_preserves_active_if_shell_when_wait_is_only_in_unselected_branch_product_divergence`,
+`eof_queued_if_shell_cancels_only_a_selected_wait_frame_product_divergence`,
+`eof_queue_skips_parse_errors_and_blocking_frames_before_later_finite_frame_product_divergence`,
+`eof_after_deferred_exit_with_removed_registration_finishes_only_active_frame_product_divergence`,
+`external_shutdown_cancels_finite_eof_queue_drain_product_divergence`,
+`eof_drains_finite_queue_through_kill_server_product_divergence`, and
+`eof_queue_lease_blocks_same_pid_registration_and_preserves_permissions_product_divergence`.
+Together they cover finite follow-on work, conditional waits, parse failures,
+explicit exit, kill-server, shutdown cancellation, permissions, and same-PID
+lease ordering. The oracle-backed guard and `%exit` tuple remains covered by
 `tests/tmux_compat_surface_matrix/client_control.rs`.
 
 Inventory impact: control-mode framing and terminal `%exit` remain compatible;
@@ -591,19 +602,6 @@ locks the RMUX response for bare, zero-valued, and extended queries.
 Inventory impact: XTVERSION is supported, but callers must not use its product
 name as a promise of byte-identical tmux behavior.
 
-### C-D58: a trailing bare format hash is preserved literally
-
-tmux 3.7b consumes a final bare `#` during format expansion (`prefix#` renders
-as `prefix`, measured on 2026-07-15). RMUX renders `prefix#` literally. The
-divergence avoids silently deleting an unmatched user character while retaining
-the normal `#{...}` and `##` format forms.
-
-Test/fixture: `trailing_bare_hash_is_literal_product_divergence` in
-`crates/rmux-core/src/formats/tests/transformations.rs` locks the RMUX behavior.
-
-Inventory impact: format expansion is advertised, with unmatched trailing
-hashes treated as literals rather than copied from tmux's lossy edge case.
-
 ### C-D59: rejected mutations between grouped aliases are transactional
 
 For relative `move-window` and `link-window` between two aliases of the same
@@ -650,3 +648,104 @@ truncated suffix.
 
 Inventory impact: status length options remain advertised, with Unicode-safe
 truncation preferred over byte/code-point-identical tmux output.
+
+### C-D62: parse-time assignments may precede a command alias
+
+tmux 3.7b rejects an invocation such as `NAME=value probe` before expanding a
+user-defined `probe` command alias. RMUX retains the assignment while resolving
+the alias, so configuration aliases can consume the value and a cold-start
+queue can carry it into a later aliased command. Built-in commands after a
+leading assignment remain rejected; the extension is limited to queues that
+actually contain a configured alias.
+
+Test/fixture:
+`cold_start_assignment_before_builtin_preserves_later_config_alias_product_divergence`
+in `tests/acceptance_cli_matrix.rs` and
+`runtime_alias_fallback_preserves_assignment_before_alias_product_divergence`
+in `tests/cli_surface.rs` lock cold-start and existing-daemon entry paths.
+
+Inventory impact: command aliases remain advertised, with leading parse-time
+assignments supported as an RMUX extension rather than silently claiming tmux
+parity.
+
+### C-D63: last-window moves preserve the removed session's local close hook
+
+When `move-window` removes the source session's last window, tmux 3.7b resolves
+`session-closed` after deleting the session-local hook scope and therefore runs
+the global fallback instead. This was remeasured on 2026-07-15 with distinct
+session-local and global environment sentinels. RMUX snapshots the local hook
+before removing the source scope, so the more specific user hook is not lost.
+
+Test/fixture:
+`crates/rmux-server/src/handler_environment_hook_tests.rs::move_window_last_source_session_preserves_local_closed_hook_product_divergence`
+locks the local-hook dispatch and verifies that the global fallback does not
+replace it.
+
+Inventory impact: lifecycle hooks remain advertised; the destructive
+last-window move favors preservation of the configured local hook over tmux's
+scope-removal ordering bug.
+
+### C-D64: session-qualified stable pane kills remove only the addressed alias
+
+tmux 3.7b accepts a global pane ID for `kill-pane`, but killing the only pane in
+a grouped window removes every alias in the group. It has no session-qualified
+stable-ID operation. RMUX's SDK request carries both a session identity and a
+stable pane ID; it removes only that addressed alias and retains the shared pane
+runtime for the unaddressed owner. This prevents an SDK mutation scoped to one
+session from destroying peer sessions.
+
+Test/fixture:
+`crates/rmux-server/src/handler_pane_family_lifecycle_tests.rs::pane_id_grouped_last_pane_removes_only_addressed_alias_product_divergence`
+locks the addressed-alias lifecycle events and the surviving group owner's pane
+runtime.
+
+Inventory impact: the tmux-compatible CLI path keeps tmux family semantics;
+only the session-qualified stable-ID SDK extension uses the narrower safety
+scope.
+
+### C-D65: set-hook validates targets and rejects ignored run mutations
+
+tmux 3.7b exits successfully and silently ignores invalid or irrelevant state
+in `set-hook` combinations including a missing or ambiguous `-t` under `-g`, a
+missing `-t` under `-R`, and `-R` combined with append, unset, an index, or a
+replacement command. These cases were remeasured on 2026-07-15. RMUX resolves
+explicit targets and rejects fields that `-R` cannot apply, preventing typos
+from becoming successful no-ops or installing a hook in an unintended scope.
+
+Test/fixture: `tests/scripting.rs` locks direct and source-file entry paths in
+`set_hook_run_immediately_missing_target_errors_product_divergence`,
+`set_hook_run_immediately_rejects_ignored_mutations_product_divergence`, and
+`set_hook_global_target_is_still_resolved_product_divergence`.
+
+Inventory impact: `set-hook` remains advertised with stricter validation for
+explicit targets and run-immediately-only invocations.
+
+### C-D66: cold-start configuration aliases apply to the first command
+
+tmux 3.7b parses the first CLI command before a cold-start configuration alias
+can replace its built-in name. RMUX loads the configuration alias before final
+dispatch, so the first command uses the same alias semantics as later command
+groups. This avoids a startup-only exception where a valid configured alias is
+silently bypassed.
+
+Test/fixture:
+`tests/acceptance_cli_matrix.rs::cold_start_config_alias_applies_to_first_builtin_product_divergence`
+locks alias expansion, parse-time assignment persistence, and the created
+session through the cold-start entry path.
+
+Inventory impact: command aliases remain advertised and apply consistently to
+the first and later cold-start commands.
+
+### C-D67: rejected runtime aliases do not commit parse-time assignments
+
+tmux 3.7b commits a leading assignment from a runtime command alias even when
+the expanded command then fails option parsing. RMUX validates the expanded
+command before committing its parse-time environment mutations, so a rejected
+alias is atomic and cannot leave hidden global state behind.
+
+Test/fixture:
+`tests/acceptance_cli_matrix.rs::invalid_runtime_alias_does_not_apply_parse_time_assignments_product_divergence`
+locks the rejected command and verifies that its assignment remains absent.
+
+Inventory impact: runtime aliases remain advertised; failed alias expansion is
+transactional instead of copying tmux's partial-mutation behavior.

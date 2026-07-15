@@ -10,7 +10,10 @@ use rmux_proto::{
 
 use super::RequestHandler;
 
-const LEASE_REAPER_INTERVAL: Duration = Duration::from_millis(100);
+#[path = "leases/clock.rs"]
+mod clock;
+
+use clock::{LeaseDeadline, ReaperSchedule, ReaperWake, REAPER_INTERVAL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionLeaseCreateAddressing {
@@ -61,7 +64,7 @@ struct SessionOwnership {
     token: u64,
     wire_session_name: SessionName,
     current_session_name: SessionName,
-    deadline: Instant,
+    deadline: LeaseDeadline,
 }
 
 /// Daemon-side owner lease registry for app-owned sessions.
@@ -90,7 +93,7 @@ impl SessionLeaseStore {
                 token,
                 wire_session_name,
                 current_session_name,
-                deadline: Instant::now() + ttl,
+                deadline: LeaseDeadline::from_now(ttl),
             },
         );
         Ok(token)
@@ -110,7 +113,7 @@ impl SessionLeaseStore {
             .ownerships
             .get_mut(&session_id)
             .expect("validated lease ownership must remain present");
-        ownership.deadline = Instant::now() + ttl;
+        ownership.deadline.renew_from_now(ttl);
         true
     }
 
@@ -170,17 +173,27 @@ impl SessionLeaseStore {
         true
     }
 
-    fn expired(&mut self, now: Instant) -> Vec<(SessionName, SessionId)> {
+    fn expired(
+        &mut self,
+        now: Instant,
+        reaper_wake: Option<ReaperWake>,
+    ) -> Vec<(SessionName, SessionId)> {
+        if let Some(wake) = reaper_wake {
+            for ownership in self.ownerships.values_mut() {
+                ownership.deadline.preserve_budget_across_reaper_pause(wake);
+            }
+        }
         let mut expired = self
             .ownerships
             .iter()
-            .filter(|(_, ownership)| ownership.deadline <= now)
+            .filter(|(_, ownership)| ownership.deadline.is_expired_at(now))
             .map(|(session_id, ownership)| (ownership.current_session_name.clone(), *session_id))
             .collect::<Vec<_>>();
         expired.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
         for (session_name, session_id) in &expired {
             if self.ownerships.get(session_id).is_some_and(|ownership| {
-                ownership.current_session_name == *session_name && ownership.deadline <= now
+                ownership.current_session_name == *session_name
+                    && ownership.deadline.is_expired_at(now)
             }) {
                 self.ownerships.remove(session_id);
             }
@@ -335,23 +348,26 @@ impl RequestHandler {
         }
 
         let weak = self.downgrade();
+        let mut reaper_schedule = ReaperSchedule::new(Instant::now());
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(LEASE_REAPER_INTERVAL).await;
+                tokio::time::sleep(REAPER_INTERVAL).await;
                 let Some(handler) = weak.upgrade() else {
                     break;
                 };
-                handler.reap_expired_session_leases().await;
+                let wake = reaper_schedule.observe_wake(Instant::now());
+                handler.reap_expired_session_leases(wake).await;
             }
         });
     }
 
-    async fn reap_expired_session_leases(&self) {
+    async fn reap_expired_session_leases(&self, wake: ReaperWake) {
+        let observed_at = wake.observed_at();
         let expired = self
             .session_leases
             .lock()
             .expect("session lease mutex must not be poisoned")
-            .expired(Instant::now());
+            .expired(observed_at, Some(wake));
 
         #[cfg(test)]
         self.pause_after_expired_session_lease_extraction(&expired)
@@ -491,7 +507,7 @@ mod tests {
             )
             .expect("lease token");
 
-        let expired = leases.expired(Instant::now() + Duration::from_secs(1));
+        let expired = leases.expired(Instant::now() + Duration::from_secs(1), None);
 
         assert_eq!(expired, vec![(session_name, session_id)]);
     }

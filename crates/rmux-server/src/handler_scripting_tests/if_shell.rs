@@ -139,6 +139,32 @@ async fn queued_background_if_shell_keeps_detached_write_access_after_response()
 }
 
 #[tokio::test]
+async fn queued_if_shell_rejects_unknown_option_before_condition() {
+    let handler = RequestHandler::new();
+    let parsed = CommandParser::new()
+        .parse("if-shell -Q true { set-buffer -b queued-unknown mutated }")
+        .expect("generic parser preserves the unknown if-shell option");
+
+    let error = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect_err("queued if-shell must reject an unknown option before its condition");
+
+    assert_eq!(
+        error,
+        rmux_proto::RmuxError::Server("command if-shell: unknown flag -Q".to_owned())
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("queued-unknown".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
 async fn queued_background_if_shell_rejects_a_reused_control_registration() {
     let handler = RequestHandler::new();
     let requester_pid = 424_107;

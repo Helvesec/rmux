@@ -59,7 +59,7 @@ pub(in crate::cli) fn run_split_window(
         command,
         process_command,
         start_directory: args.start_directory,
-        keep_alive_on_exit: stdin_to_empty_pane.then_some(true),
+        keep_alive_on_exit: (args.keep_alive_on_exit || stdin_to_empty_pane).then_some(true),
         detached: args.detached,
         size,
         preserve_zoom: args.preserve_zoom,
@@ -140,6 +140,7 @@ fn run_split_window_legacy_with_stdin(
         || size.is_some()
         || args.full_size
         || args.preserve_zoom
+        || args.keep_alive_on_exit
         || stdin_payload.is_some()
     {
         connection
@@ -151,7 +152,8 @@ fn run_split_window_legacy_with_stdin(
                 command,
                 process_command,
                 start_directory: args.start_directory,
-                keep_alive_on_exit: stdin_to_empty_pane.then_some(true),
+                keep_alive_on_exit: (args.keep_alive_on_exit || stdin_to_empty_pane)
+                    .then_some(true),
                 detached: args.detached,
                 size,
                 preserve_zoom: args.preserve_zoom,

@@ -462,6 +462,8 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) preserve_zoom: bool,
     #[arg(short = 'I', action = ArgAction::SetTrue)]
     pub(crate) stdin: bool,
+    #[arg(short = 'k', action = ArgAction::SetTrue)]
+    pub(crate) keep_alive_on_exit: bool,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]

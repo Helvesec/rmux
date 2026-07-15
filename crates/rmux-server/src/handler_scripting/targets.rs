@@ -443,7 +443,7 @@ fn queue_compact_bare_flags(command_name: &str) -> Option<&'static str> {
         "send-keys" | "send" => Some("FHlKMRX"),
         "set-hook" => Some("agpRuw"),
         "show-hooks" => Some("gpw"),
-        "split-window" => Some("bdfhIPvZP"),
+        "split-window" => Some("bdfhIkpvZP"),
         "swap-pane" => Some("dDUZ"),
         "swap-window" => Some("d"),
         _ => None,

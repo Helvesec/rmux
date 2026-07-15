@@ -139,8 +139,8 @@ async fn pane_set_close_all_reports_per_pane_outcomes() -> TestResult {
             .iter()
             .map(|success| success.pane_id())
             .collect::<Vec<_>>(),
-        vec![Some(down_id), Some(right_id_before_reindex)],
-        "close_all must resolve destructive slot operations in caller order after recompression"
+        vec![Some(right_id_before_reindex), Some(down_id)],
+        "close_all must preserve caller-provided stable pane order after recompression"
     );
     assert!(root.exists().await?, "root pane should remain alive");
 

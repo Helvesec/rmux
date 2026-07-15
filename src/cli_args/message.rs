@@ -8,7 +8,7 @@ pub(crate) struct DisplayMessageArgs {
     pub(crate) target_client: Option<String>,
     #[arg(short = 't', allow_hyphen_values = true)]
     pub(crate) target: Option<String>,
-    #[arg(short = 'd', allow_hyphen_values = true)]
+    #[arg(short = 'd', allow_hyphen_values = true, hide = true)]
     pub(crate) delay: Option<String>,
     #[arg(short = 'F', allow_hyphen_values = true)]
     pub(crate) format: Option<String>,
@@ -23,7 +23,7 @@ pub(crate) struct DisplayMessageArgs {
     pub(crate) stdin: bool,
     #[arg(short = 'l', action = ArgAction::SetTrue)]
     pub(crate) literal: bool,
-    #[arg(short = 'N', action = ArgAction::SetTrue)]
+    #[arg(short = 'N', action = ArgAction::SetTrue, hide = true)]
     pub(crate) no_format: bool,
     #[arg(short = 'p', action = ArgAction::SetTrue, conflicts_with = "json")]
     pub(crate) print: bool,
@@ -45,6 +45,18 @@ impl QueuedCommand for DisplayMessageArgs {
 
 impl DisplayMessageArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+        if self.delay.is_some() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::UnknownArgument,
+                "command display-message: unknown flag -d",
+            ));
+        }
+        if self.no_format {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::UnknownArgument,
+                "command display-message: unknown flag -N",
+            ));
+        }
         if self.message.len() > 1 {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::TooManyValues,

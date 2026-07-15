@@ -13,11 +13,18 @@ use rmux_pty::{PtyChild, PtyIo, TerminalSize as PtyTerminalSize};
 #[cfg(unix)]
 use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::terminal::{parse_environment_assignments, TerminalProfile};
 
 use super::super::{attach_support::ActiveAttachIdentity, RequestHandler};
+
+#[cfg(not(test))]
+// Leave room for a large paste on a loaded ConPTY while still bounding a
+// permanently blocked synchronous WriteFile.
+const POPUP_IO_RECEIPT_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(test)]
+const POPUP_IO_RECEIPT_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub(in super::super) struct PopupSurface {
     parser: InputParser,
@@ -104,6 +111,15 @@ impl PopupJob {
     }
 
     #[cfg(test)]
+    pub(in crate::handler) fn child_is_running_for_test(&self) -> bool {
+        self.child
+            .lock()
+            .expect("popup child")
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)))
+    }
+
+    #[cfg(test)]
     pub(in crate::handler) fn with_test_writer<F>(&self, writer: F) -> Self
     where
         F: Fn(Vec<u8>) -> io::Result<()> + Send + Sync + 'static,
@@ -157,12 +173,17 @@ pub(super) struct PopupIoReceipt {
 
 impl PopupIoReceipt {
     pub(super) async fn wait(self) -> io::Result<()> {
-        self.result_rx.await.map_err(|_| {
-            io::Error::new(
+        match timeout(POPUP_IO_RECEIPT_TIMEOUT, self.result_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "popup I/O worker stopped before replying",
-            )
-        })?
+            )),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "popup I/O worker did not reply before the deadline",
+            )),
+        }
     }
 }
 

@@ -61,7 +61,13 @@ impl PreAuthQueue {
         if state.entries.len() >= self.capacity {
             return None;
         }
-        let peer_bucket = peer_ip.map(auth_peer_bucket);
+        // Tunnel providers and local reverse proxies connect through loopback,
+        // so counting loopback as one peer would turn the per-IP guard into an
+        // accidental daemon-wide cap. The global queue capacity still bounds
+        // slow local handshakes.
+        let peer_bucket = peer_ip
+            .filter(|peer| !peer.is_loopback())
+            .map(auth_peer_bucket);
         if let Some(peer_bucket) = peer_bucket {
             let active_for_ip = state
                 .entries
@@ -168,5 +174,28 @@ mod tests {
 
         drop(first_guard);
         drop(second_guard);
+    }
+
+    #[test]
+    fn pre_auth_queue_exempts_loopback_from_per_ip_capacity_but_not_global_capacity() {
+        let queue = PreAuthQueue::with_per_ip_capacity(3, 1);
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let first = queue
+            .try_register_peer(loopback)
+            .expect("first loopback connection fits");
+        let second = queue
+            .try_register_peer(loopback)
+            .expect("loopback is not constrained by the per-IP cap");
+        let third = queue
+            .try_register_peer(IpAddr::V6(Ipv6Addr::LOCALHOST))
+            .expect("IPv6 loopback shares the same global capacity");
+
+        assert!(
+            queue.try_register_peer(loopback).is_none(),
+            "loopback connections must still respect the global pre-auth cap"
+        );
+
+        drop((first, second, third));
+        assert_eq!(queue.pending_count(), 0);
     }
 }

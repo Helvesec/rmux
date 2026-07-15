@@ -348,6 +348,16 @@ fn split_window_simple_form_is_tiny_parseable() {
 }
 
 #[test]
+fn split_window_keep_alive_form_is_tiny_parseable() {
+    let args = os_args(&["-d", "-k", "-t", "0", "exit 7"]);
+
+    let request = parse_split_window(&args).expect("split-window -k fast path");
+    assert!(request.detached);
+    assert_eq!(request.keep_alive_on_exit, Some(true));
+    assert_eq!(request.command.as_deref(), Some(&["exit 7".into()][..]));
+}
+
+#[test]
 fn new_session_detached_simple_form_is_tiny_parseable() {
     let args = os_args(&["-d", "-s", "bench", "sleep", "1"]);
 

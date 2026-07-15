@@ -1148,6 +1148,10 @@ pub(crate) async fn forward_attach(
                         Some(AttachControl::Write(bytes)) => {
                             emit_attach_bytes(&stream, &bytes).await?;
                         }
+                        Some(AttachControl::ClipboardWrite { bytes, reservation }) => {
+                            emit_attach_bytes(&stream, &bytes).await?;
+                            drop(reservation);
+                        }
                         Some(AttachControl::LockShellCommand(command)) => {
                             PendingAttachInputState::new(
                                 &mut pending_input,

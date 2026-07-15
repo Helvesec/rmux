@@ -79,6 +79,33 @@ async fn popup_io_queue_preserves_write_resize_write_enqueue_order() {
     );
 }
 
+#[tokio::test]
+async fn popup_io_receipt_times_out_when_blocking_write_never_acknowledges() {
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let callback_release = Arc::clone(&release);
+    let queue = PopupIoQueue::spawn(move |_| {
+        let (released, released_cv) = &*callback_release;
+        let mut released = released.lock().expect("I/O release");
+        while !*released {
+            released = released_cv.wait(released).expect("I/O release wait");
+        }
+        Ok(())
+    });
+    let receipt = queue
+        .enqueue(PopupIoOperation::Write(b"blocked".to_vec()))
+        .expect("enqueue blocked write");
+
+    let error = receipt
+        .wait()
+        .await
+        .expect_err("blocked popup I/O must have a deadline");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+
+    let (released, released_cv) = &*release;
+    *released.lock().expect("I/O release") = true;
+    released_cv.notify_all();
+}
+
 #[cfg(windows)]
 mod windows {
     use std::sync::mpsc;

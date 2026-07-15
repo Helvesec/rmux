@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,9 +15,12 @@ use rustix::termios::{
 };
 
 use super::terminal_cleanup::fallback_attach_stop_sequence;
+use super::termination;
 
 const TERMINATION_OUTPUT_RETRY: Duration = Duration::from_millis(100);
 const TERMINATION_OUTPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+const SHELL_CHILD_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+const SHELL_CHILD_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
 pub(super) fn current_process_pid() -> io::Result<Pid> {
     let raw = i32::try_from(std::process::id())
@@ -276,6 +279,142 @@ fn run_shell_command_with_terminal(
     if let Some(cwd) = cwd {
         process.current_dir(cwd);
     }
-    process.status().map_err(AttachError::Io)?;
+    let mut child = process.spawn().map_err(AttachError::Io)?;
+    wait_for_shell_child(&mut child, termination::requested_signal).map_err(AttachError::Io)?;
     Ok(())
+}
+
+fn wait_for_shell_child(
+    child: &mut Child,
+    requested_signal: impl Fn() -> Option<i32>,
+) -> io::Result<()> {
+    loop {
+        if child_has_exited(child)? {
+            return Ok(());
+        }
+        let Some(signal) = requested_signal() else {
+            thread::sleep(SHELL_CHILD_WAIT_INTERVAL);
+            continue;
+        };
+
+        forward_signal_to_child(child, signal)?;
+        if wait_for_child_exit_until(child, Instant::now() + SHELL_CHILD_TERMINATION_GRACE)? {
+            return Err(termination::interruption_error());
+        }
+
+        // The shell may trap or ignore the forwarded signal. Bound that grace
+        // period too so terminal restoration and the attach guard can re-raise
+        // the original signal promptly.
+        let _ = child.kill();
+        let _ = wait_for_child_exit_until(child, Instant::now() + SHELL_CHILD_TERMINATION_GRACE);
+        return Err(termination::interruption_error());
+    }
+}
+
+fn child_has_exited(child: &mut Child) -> io::Result<bool> {
+    loop {
+        match child.try_wait() {
+            Ok(status) => return Ok(status.is_some()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn wait_for_child_exit_until(child: &mut Child, deadline: Instant) -> io::Result<bool> {
+    while Instant::now() < deadline {
+        if child_has_exited(child)? {
+            return Ok(true);
+        }
+        thread::sleep(SHELL_CHILD_WAIT_INTERVAL);
+    }
+    child_has_exited(child)
+}
+
+fn forward_signal_to_child(child: &Child, signal: i32) -> io::Result<()> {
+    let pid = i32::try_from(child.id())
+        .map_err(|_| io::Error::other("shell child process id does not fit in i32"))?;
+    let result = unsafe {
+        // SAFETY: `pid` is the live child owned by the caller and `signal` was
+        // captured from the attach termination handler.
+        libc::kill(pid, signal)
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::wait_for_shell_child;
+
+    #[test]
+    fn shell_child_wait_is_bounded_after_hup_or_term() {
+        for signal in [libc::SIGHUP, libc::SIGTERM] {
+            let mut child = Command::new("sh")
+                .args(["-c", "exec sleep 60"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn sleeping shell child");
+            let requested = Arc::new(AtomicI32::new(0));
+            let request_from_thread = Arc::clone(&requested);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(40));
+                request_from_thread.store(signal, Ordering::SeqCst);
+            });
+
+            let started = Instant::now();
+            let error = wait_for_shell_child(&mut child, || {
+                let signal = requested.load(Ordering::SeqCst);
+                (signal != 0).then_some(signal)
+            })
+            .expect_err("termination must interrupt the shell wait");
+
+            assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "shell wait should not remain blocked after signal {signal}"
+            );
+            assert!(
+                child.try_wait().expect("query child status").is_some(),
+                "the interrupted shell child should be reaped"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_child_wait_force_kills_a_child_that_ignores_term() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn signal-ignoring shell child");
+        std::thread::sleep(Duration::from_millis(40));
+
+        let started = Instant::now();
+        let error = wait_for_shell_child(&mut child, || Some(libc::SIGTERM))
+            .expect_err("ignored termination must still bound the shell wait");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            child.try_wait().expect("query child status").is_some(),
+            "the force-killed shell child should be reaped"
+        );
+    }
 }

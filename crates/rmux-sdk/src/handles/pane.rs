@@ -9,13 +9,9 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::events::streams::{PaneLineStream, PaneOutputStart, PaneOutputStream};
 use crate::handles::split::SplitDirection;
 use crate::transport::{OperationDeadline, TransportClient};
-use crate::{
-    CollectedPaneOutput, InfoSnapshot, PaneId, PaneRef, PaneRenderStream, PaneSnapshot,
-    PaneTextMatch, ProcessSpec, Result, RmuxEndpoint, RmuxError, TerminalSizeSpec,
-};
+use crate::{PaneId, PaneRef, ProcessSpec, Result, RmuxEndpoint, RmuxError, TerminalSizeSpec};
 
 #[path = "pane/capture_pane.rs"]
 mod capture_pane;
@@ -29,6 +25,10 @@ mod input;
 mod lifecycle;
 #[path = "pane/options.rs"]
 mod options;
+#[path = "pane/output.rs"]
+mod output;
+#[path = "pane/queries.rs"]
+mod queries;
 #[path = "pane/snapshot.rs"]
 mod snapshot;
 #[path = "pane/spawn.rs"]
@@ -48,11 +48,10 @@ mod waits;
 
 pub use capture_pane::{PaneCapture, PaneCaptureBuilder};
 pub use foreground::{ForegroundSource, ForegroundSources, ForegroundState};
-use info::{current_pane_entry, current_pane_ref_for_id, pane_info_snapshot};
+use info::current_pane_ref_for_id;
 use input::{resize_to_size, send_key, send_text};
 use lifecycle::{close_pane, respawn_pane};
 use options::{get_option, set_option, unset_option};
-use snapshot::pane_snapshot;
 pub use spawn::PaneSpawnBuilder;
 use split::split_pane;
 pub use split_builder::PaneSplitBuilder;
@@ -61,7 +60,7 @@ pub use state_events::{
     PaneStateOption,
 };
 pub(crate) use target::is_already_closed_pane_error;
-use target::{is_stale_pane_id_target_error, stale_slot_error};
+use target::stale_slot_error;
 use title::{get_title, set_title};
 
 pub(crate) async fn resolve_pane_ref_for_id(
@@ -283,201 +282,6 @@ impl Pane {
     pub(crate) fn pin_to_id(mut self, pane_id: PaneId) -> Self {
         self.stable_id = Some(pane_id);
         self
-    }
-
-    /// Subscribes to the live raw pane output as a typed byte stream.
-    ///
-    /// Setup performs one `subscribe-pane-output` round trip and is
-    /// fallible: a stale pane slot, a transport failure, or a refused
-    /// daemon capability propagates as [`crate::RmuxError`].
-    ///
-    /// The returned [`PaneOutputStream`] preserves arbitrary bytes,
-    /// pairs every chunk with the daemon's monotonic per-pane sequence,
-    /// and surfaces any retained-output gaps as
-    /// [`PaneOutputChunk::Lag`](crate::PaneOutputChunk::Lag) without ever
-    /// converting raw bytes through `String::from_utf8_lossy`. Dropping
-    /// the stream emits exactly one best-effort
-    /// `unsubscribe-pane-output` request; if the unsubscribe is refused,
-    /// late, or the transport is already gone the drop never closes the
-    /// pane, its window/session/process, or the daemon itself.
-    pub async fn output_stream(&self) -> Result<PaneOutputStream> {
-        self.output_stream_starting_at(PaneOutputStart::Now).await
-    }
-
-    /// Subscribes to the live raw pane output, anchoring the cursor at
-    /// the requested start position.
-    ///
-    /// See [`Self::output_stream`] for setup, drop, and lag semantics.
-    pub async fn output_stream_starting_at(
-        &self,
-        start: PaneOutputStart,
-    ) -> Result<PaneOutputStream> {
-        let pane = self.begin_operation_handle();
-        let target = pane.required_resolved_proto_target_ref().await?;
-        crate::capabilities::require(&pane.transport, &[rmux_proto::CAPABILITY_SDK_PANE_BY_ID])
-            .await?;
-        match PaneOutputStream::open(pane.transport.clone(), target.clone(), start).await {
-            Ok(stream) => Ok(stream),
-            Err(error) if pane.is_stable_id() && is_stale_pane_id_target_error(&error, &target) => {
-                let pane_id = pane
-                    .stable_id
-                    .expect("stable-id retry is guarded by is_stable_id");
-                let retry_target = pane.resolved_proto_target_ref().await?.ok_or_else(|| {
-                    RmuxError::pane_not_found(pane.target.session_name.clone(), pane_id)
-                })?;
-                PaneOutputStream::open(pane.transport.clone(), retry_target, start).await
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Collects bounded raw pane output bytes until the pane process exits.
-    ///
-    /// Collection starts at the live output cursor, retains at most
-    /// `max_bytes`, and keeps waiting for pane exit even after the cap is
-    /// reached. Returned bytes are raw pane-output bytes; lag notices are
-    /// reported on the returned [`CollectedPaneOutput`] and are not spliced
-    /// into the byte buffer.
-    pub async fn collect_output_until_exit(&self, max_bytes: usize) -> Result<CollectedPaneOutput> {
-        crate::extract::collect_output_until_exit(self, max_bytes).await
-    }
-
-    /// Collects bounded raw pane output from the requested stream start until
-    /// the pane process exits.
-    ///
-    /// See [`Self::collect_output_until_exit`] for cap, lag, and byte
-    /// preservation semantics.
-    pub async fn collect_output_until_exit_starting_at(
-        &self,
-        start: PaneOutputStart,
-        max_bytes: usize,
-    ) -> Result<CollectedPaneOutput> {
-        crate::extract::collect_output_until_exit_starting_at(self, start, max_bytes).await
-    }
-
-    /// Subscribes to the live pane output rendered into UTF-8 lines.
-    ///
-    /// Setup is fallible (see [`Self::output_stream`]). Beyond the raw
-    /// stream the line stream applies two well-isolated transformations:
-    /// it splits on the LF byte `b'\n'` and runs each completed line
-    /// through `String::from_utf8_lossy`, replacing every byte that is
-    /// not valid UTF-8 with the Unicode replacement character `U+FFFD`.
-    /// Bytes between LFs stay buffered until the next LF arrives, and a
-    /// daemon-side lag drops the in-flight partial line; both
-    /// transformations are documented in detail on the
-    /// [`crate::events::streams`] module. Drop semantics match
-    /// [`Self::output_stream`].
-    pub async fn line_stream(&self) -> Result<PaneLineStream> {
-        self.line_stream_starting_at(PaneOutputStart::Now).await
-    }
-
-    /// Subscribes to rendered output lines, anchoring the cursor at the
-    /// requested start position.
-    pub async fn line_stream_starting_at(&self, start: PaneOutputStart) -> Result<PaneLineStream> {
-        let inner = self.output_stream_starting_at(start).await?;
-        Ok(PaneLineStream::wrap(inner))
-    }
-
-    /// Opens a minimal render stream that emits snapshots after output.
-    ///
-    /// The implementation is output-driven with debounce and revision
-    /// filtering. It avoids fixed-rate blind refresh loops but is not a
-    /// daemon-native snapshot-diff stream.
-    pub async fn render_stream(&self) -> Result<PaneRenderStream> {
-        PaneRenderStream::open(self.clone()).await
-    }
-
-    /// Returns the live daemon pane identity for this slot, when it is
-    /// currently listed.
-    ///
-    /// Returns `Ok(None)` (rather than an error) for a stale slot, mirroring
-    /// the [`Window`](super::Window)-handle stale-slot semantics.
-    pub async fn id(&self) -> Result<Option<PaneId>> {
-        let pane = self.begin_operation_handle();
-        if let Some(pane_id) = pane.stable_id {
-            let current =
-                current_pane_ref_for_id(&pane.transport, &pane.target.session_name, pane_id)
-                    .await?;
-            return Ok(current.map(|_| pane_id));
-        }
-        Ok(current_pane_entry(&pane.transport, &pane.target)
-            .await?
-            .map(|entry| entry.pane_id))
-    }
-
-    /// Checks whether this exact pane slot is currently listed by the
-    /// daemon.
-    pub async fn exists(&self) -> Result<bool> {
-        Ok(self.id().await?.is_some())
-    }
-
-    /// Returns a sticky info snapshot scoped to this pane's session,
-    /// window, and pane.
-    ///
-    /// The snapshot is assembled from live `list-sessions`,
-    /// `list-windows`, `list-panes`, and `display-message -p` responses so
-    /// pane process state — running pid, exit state, geometry — reflects
-    /// the daemon's current view rather than any handle-cached value.
-    /// Stale slots return what is still observable: a session-only
-    /// snapshot when the window or pane is gone, or an empty snapshot
-    /// when the session itself is gone.
-    pub async fn info(&self) -> Result<InfoSnapshot> {
-        let pane = self.begin_operation_handle();
-        match pane.stable_id {
-            Some(pane_id) => {
-                let Some(target) =
-                    current_pane_ref_for_id(&pane.transport, &pane.target.session_name, pane_id)
-                        .await?
-                else {
-                    return Ok(InfoSnapshot::default());
-                };
-                pane_info_snapshot(&pane.transport, &target).await
-            }
-            None => pane_info_snapshot(&pane.transport, &pane.target).await,
-        }
-    }
-
-    /// Captures the live pane grid as a [`PaneSnapshot`].
-    ///
-    /// The captured grid is read directly from the daemon's live
-    /// rmux-core screen — the same in-memory grid that the crate-private
-    /// terminal parser feeds from PTY output — so dimensions, cursor
-    /// state, and per-cell glyph/attribute/colour data round-trip without
-    /// any `capture-pane -p` text reconstruction step. Wide-glyph padding
-    /// is preserved as padding cells in the row-major layout, raw bytes
-    /// that are not valid UTF-8 stay isolated to the cell text payload
-    /// rather than reaching helper output, and the daemon-derived
-    /// [`revision`](PaneSnapshot::revision) is non-zero for a live pane
-    /// and changes whenever any observable pane field mutates — output,
-    /// resize, clear, exit. Stale slots resolve to a default empty
-    /// snapshot whose revision is `0`, distinct from any prior live
-    /// revision.
-    pub async fn snapshot(&self) -> Result<PaneSnapshot> {
-        pane_snapshot(&self.begin_operation_handle()).await
-    }
-
-    /// Starts a daemon `capture-pane` request builder.
-    pub fn capture_pane(&self) -> PaneCaptureBuilder<'_> {
-        PaneCaptureBuilder::new(self)
-    }
-
-    /// Captures a fresh snapshot and searches its rendered visible text for
-    /// the first literal match.
-    ///
-    /// This is a lossy rendered-text helper built from
-    /// [`PaneSnapshot::visible_lines`]. It does not inspect raw output bytes
-    /// and does not use any daemon/core regex search surface.
-    pub async fn find_text(&self, text: impl AsRef<str>) -> Result<Option<PaneTextMatch>> {
-        crate::extract::find_text(&self.begin_operation_handle(), text.as_ref().to_owned()).await
-    }
-
-    /// Captures a fresh snapshot and returns every literal rendered-text
-    /// match, including overlapping matches on the same visible line.
-    ///
-    /// See [`Self::find_text`] for rendered-text and coordinate semantics.
-    pub async fn find_text_all(&self, text: impl AsRef<str>) -> Result<Vec<PaneTextMatch>> {
-        crate::extract::find_text_all(&self.begin_operation_handle(), text.as_ref().to_owned())
-            .await
     }
 
     /// Sends literal UTF-8 text bytes to this pane through the daemon.

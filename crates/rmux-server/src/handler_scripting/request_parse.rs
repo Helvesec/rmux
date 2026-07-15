@@ -326,6 +326,14 @@ mod tests {
         args: &[&str],
         sessions: &SessionStore,
     ) -> Request {
+        parse_request_result(command, args, sessions).expect("request parses")
+    }
+
+    fn parse_request_result(
+        command: &str,
+        args: &[&str],
+        sessions: &SessionStore,
+    ) -> Result<Request, RmuxError> {
         parse_request_from_parts(
             command.to_owned(),
             args.iter().map(|arg| (*arg).to_owned()).collect(),
@@ -334,7 +342,80 @@ mod tests {
             &OptionStore::default(),
             &TargetFindContext::new(None),
         )
-        .expect("request parses")
+    }
+
+    #[test]
+    fn command_tail_parsers_reject_unknown_options_before_positionals() {
+        let cases = [
+            ("run-shell", &["-Q", "true"][..]),
+            ("if-shell", &["-Q", "true", "display-message ok"][..]),
+            ("wait-for", &["-Q"][..]),
+            ("split-window", &["-Q", "true"][..]),
+            ("pipe-pane", &["-Q", "true"][..]),
+            ("respawn-pane", &["-Q", "true"][..]),
+            ("bind-key", &["-Q", "x", "display-message ok"][..]),
+            ("display-panes", &["-Q", "select-pane -t %%"][..]),
+        ];
+
+        for (command, arguments) in cases {
+            let error = parse_request_result(command, arguments, &SessionStore::default())
+                .expect_err("unknown option before positional tail must fail");
+            assert_eq!(
+                error,
+                RmuxError::Server(format!("command {command}: unknown flag -Q")),
+                "{command} accepted an unknown option as a positional tail"
+            );
+        }
+    }
+
+    #[test]
+    fn command_tail_parsers_reject_long_and_mixed_unknown_options() {
+        for (command, arguments, expected_flag) in [
+            ("run-shell", &["-bQ", "true"][..], "-bQ"),
+            (
+                "if-shell",
+                &["-bQ", "true", "display-message ok"][..],
+                "-bQ",
+            ),
+            ("wait-for", &["--bogus"][..], "--bogus"),
+            ("split-window", &["-hQ", "true"][..], "-hQ"),
+            ("pipe-pane", &["-IQ", "true"][..], "-IQ"),
+            ("respawn-pane", &["-kQ", "true"][..], "-kQ"),
+            ("bind-key", &["-nQ", "x", "display-message ok"][..], "-nQ"),
+            ("display-panes", &["-bQ", "select-pane -t %%"][..], "-bQ"),
+        ] {
+            let error = parse_request_result(command, arguments, &SessionStore::default())
+                .expect_err("mixed or long unknown option must fail");
+            assert_eq!(
+                error,
+                RmuxError::Server(format!("command {command}: unknown flag {expected_flag}"))
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_separator_allows_dash_prefixed_positional_tails() {
+        let mut sessions = SessionStore::new();
+        sessions
+            .create_session(
+                SessionName::new("alpha").expect("valid session name"),
+                TerminalSize { cols: 80, rows: 24 },
+            )
+            .expect("session create succeeds");
+
+        for (command, arguments) in [
+            ("run-shell", &["--", "-Q"][..]),
+            ("if-shell", &["--", "-Q", "display-message ok"][..]),
+            ("wait-for", &["--", "-Q"][..]),
+            ("split-window", &["--", "-Q"][..]),
+            ("pipe-pane", &["--", "-Q"][..]),
+            ("respawn-pane", &["--", "-Q"][..]),
+            ("bind-key", &["--", "-Q", "display-message ok"][..]),
+            ("display-panes", &["--", "-Q"][..]),
+        ] {
+            parse_request_result(command, arguments, &sessions)
+                .unwrap_or_else(|error| panic!("{command} rejected -- -Q: {error}"));
+        }
     }
 
     fn assert_mouse_target(target: Option<&PaneTarget>) {

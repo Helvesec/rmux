@@ -284,8 +284,8 @@ fn cold_start_config_alias_applies_to_later_command_group() -> Result<(), Box<dy
 }
 
 #[test]
-fn cold_start_assignment_before_builtin_preserves_later_config_alias() -> Result<(), Box<dyn Error>>
-{
+fn cold_start_assignment_before_builtin_preserves_later_config_alias_product_divergence(
+) -> Result<(), Box<dyn Error>> {
     let harness = AcceptanceHarness::new("cold-start-assignment-later-alias")?;
     let config = harness.tmpdir().join("cold-start-alias.conf");
     fs::write(

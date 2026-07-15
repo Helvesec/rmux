@@ -32,17 +32,72 @@ pub(crate) enum AttachControl {
     AdvancePersistentOverlayState(u64),
     Overlay(OverlayFrame),
     Write(Vec<u8>),
+    ClipboardWrite {
+        bytes: Vec<u8>,
+        reservation: AttachControlBacklogReservation,
+    },
     LockShellCommand(AttachShellCommand),
     Suspend,
 }
 
 impl AttachControl {
+    const CLIPBOARD_BACKLOG_UNIT_BYTES: usize = 128 * 1024;
+
     pub(crate) fn switch(target: AttachTarget) -> Self {
         Self::Switch(Box::new(target))
     }
 
     pub(crate) fn is_coalescible_render_switch(&self) -> bool {
         matches!(self, Self::Switch(target) if target.is_coalescible_render_refresh())
+    }
+
+    pub(crate) fn try_clipboard_write(
+        bytes: Vec<u8>,
+        backlog: Arc<AtomicUsize>,
+        backlog_limit: usize,
+    ) -> Option<Self> {
+        let units = bytes
+            .len()
+            .div_ceil(Self::CLIPBOARD_BACKLOG_UNIT_BYTES)
+            .max(1);
+        let reserved = backlog
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current
+                    .checked_add(units)
+                    .filter(|next| *next <= backlog_limit)
+            })
+            .is_ok();
+        reserved.then(|| Self::ClipboardWrite {
+            bytes,
+            reservation: AttachControlBacklogReservation { backlog, units },
+        })
+    }
+
+    pub(crate) fn received_backlog_units(&self) -> usize {
+        match self {
+            // The weighted reservation follows the clipboard payload through
+            // deferred queues and is released only after it is emitted or
+            // dropped. All older controls retain their established single-unit
+            // accounting at receive time.
+            Self::ClipboardWrite { .. } => 0,
+            _ => 1,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct AttachControlBacklogReservation {
+    backlog: Arc<AtomicUsize>,
+    units: usize,
+}
+
+impl Drop for AttachControlBacklogReservation {
+    fn drop(&mut self) {
+        let _ = self
+            .backlog
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(self.units)
+            });
     }
 }
 
@@ -1000,6 +1055,35 @@ pub(crate) fn pane_output_channel_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_control_reserves_encoded_bytes_until_drop() {
+        let backlog = Arc::new(AtomicUsize::new(0));
+        let control = AttachControl::try_clipboard_write(
+            vec![b'x'; AttachControl::CLIPBOARD_BACKLOG_UNIT_BYTES + 1],
+            Arc::clone(&backlog),
+            64,
+        )
+        .expect("two backlog units fit");
+
+        assert_eq!(backlog.load(Ordering::Acquire), 2);
+        assert_eq!(control.received_backlog_units(), 0);
+        drop(control);
+        assert_eq!(backlog.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn clipboard_control_rejects_without_overcommitting_byte_budget() {
+        let backlog = Arc::new(AtomicUsize::new(63));
+        let control = AttachControl::try_clipboard_write(
+            vec![b'x'; AttachControl::CLIPBOARD_BACKLOG_UNIT_BYTES + 1],
+            Arc::clone(&backlog),
+            64,
+        );
+
+        assert!(control.is_none());
+        assert_eq!(backlog.load(Ordering::Acquire), 63);
+    }
 
     #[test]
     fn stale_generation_output_is_not_published() {

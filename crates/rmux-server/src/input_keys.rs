@@ -41,6 +41,15 @@ pub(crate) fn encode_key(
     format: ExtendedKeyFormat,
     key: KeyCode,
 ) -> Option<Vec<u8>> {
+    encode_key_with_backspace(pane_mode, format, key, 0x7f)
+}
+
+pub(crate) fn encode_key_with_backspace(
+    pane_mode: u32,
+    format: ExtendedKeyFormat,
+    key: KeyCode,
+    backspace: u8,
+) -> Option<Vec<u8>> {
     let format = if (pane_mode & mode::MODE_KEYS_KITTY) != 0 {
         ExtendedKeyFormat::CsiU
     } else {
@@ -57,18 +66,22 @@ pub(crate) fn encode_key(
         return Some(b"\x1b[Z".to_vec());
     }
 
+    if (key & KEYC_MASK_MODIFIERS) == 0 && (key & KEYC_MASK_KEY) == KEYC_BSPACE {
+        return Some(vec![backspace]);
+    }
+
     if is_trivial_key(key) {
         return key_code_to_bytes(key);
     }
 
     if (pane_mode & mode::MODE_KEYS_EXTENDED_2) != 0 {
-        input_key_extended(key, format).or_else(|| input_key_vt10x(pane_mode, key))
+        input_key_extended(key, format).or_else(|| input_key_vt10x(pane_mode, key, backspace))
     } else if (pane_mode & mode::MODE_KEYS_EXTENDED) != 0 {
-        input_key_mode1(key)
+        input_key_mode1(key, backspace)
             .or_else(|| input_key_extended(key, format))
-            .or_else(|| input_key_vt10x(pane_mode, key))
+            .or_else(|| input_key_vt10x(pane_mode, key, backspace))
     } else {
-        input_key_vt10x(pane_mode, key)
+        input_key_vt10x(pane_mode, key, backspace)
     }
 }
 
@@ -291,7 +304,7 @@ fn xterm_modifier_parameter(key: KeyCode) -> Option<u8> {
     }
 }
 
-fn input_key_vt10x(pane_mode: u32, key: KeyCode) -> Option<Vec<u8>> {
+fn input_key_vt10x(pane_mode: u32, key: KeyCode, backspace: u8) -> Option<Vec<u8>> {
     let mut key = key;
 
     if let Some(sequence) = input_key_modified_cursor(key) {
@@ -343,7 +356,7 @@ fn input_key_vt10x(pane_mode: u32, key: KeyCode) -> Option<Vec<u8>> {
     }
 
     if onlykey == KEYC_BSPACE {
-        output.push(0x7f);
+        output.push(backspace);
         return Some(output);
     }
     if (key & KEYC_CTRL) != 0 && onlykey == b' ' as u64 {
@@ -391,10 +404,10 @@ fn tmux_noop_control_key(key: KeyCode, onlykey: KeyCode) -> bool {
         )
 }
 
-fn input_key_mode1(key: KeyCode) -> Option<Vec<u8>> {
+fn input_key_mode1(key: KeyCode, backspace: u8) -> Option<Vec<u8>> {
     let onlykey = key & KEYC_MASK_KEY;
     if (key & (KEYC_CTRL | KEYC_META)) == KEYC_META {
-        return input_key_vt10x(0, key);
+        return input_key_vt10x(0, key, backspace);
     }
     if (key & KEYC_CTRL) != 0
         && (onlykey == b' ' as u64
@@ -404,7 +417,7 @@ fn input_key_mode1(key: KeyCode) -> Option<Vec<u8>> {
             || (b'2' as u64..=b'8' as u64).contains(&onlykey)
             || (b'@' as u64..=b'~' as u64).contains(&onlykey))
     {
-        return input_key_vt10x(0, key);
+        return input_key_vt10x(0, key, backspace);
     }
     None
 }

@@ -771,7 +771,7 @@ fn clipboard_alert(session: SessionName, pane_id: PaneId) -> crate::pane_io::Pan
 fn drain_clipboard_writes(receiver: &mut mpsc::UnboundedReceiver<AttachControl>) -> Vec<Vec<u8>> {
     let mut writes = Vec::new();
     while let Ok(control) = receiver.try_recv() {
-        if let AttachControl::Write(bytes) = control {
+        if let AttachControl::ClipboardWrite { bytes, .. } = control {
             writes.push(bytes);
         }
     }
@@ -1676,7 +1676,7 @@ async fn active_pane_osc52_does_not_enqueue_a_second_clipboard_write() {
 
     assert!(
         drain_clipboard_writes(&mut control_rx).is_empty(),
-        "the active pane is forwarded by its output ring, not AttachControl::Write"
+        "the active pane is forwarded by its output ring, not a clipboard control"
     );
 }
 
@@ -1804,7 +1804,7 @@ async fn inactive_pane_osc52_is_enqueued_before_a_following_session_switch() {
 
     assert!(matches!(
         control_rx.try_recv(),
-        Ok(AttachControl::Write(bytes)) if bytes == b"\x1b]52;;QQ==\x07"
+        Ok(AttachControl::ClipboardWrite { bytes, .. }) if bytes == b"\x1b]52;;QQ==\x07"
     ));
     assert!(matches!(
         control_rx.try_recv(),
@@ -1874,7 +1874,7 @@ async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_li
     let mut detaches = 0;
     while let Ok(control) = control_rx.try_recv() {
         match control {
-            AttachControl::Write(_) => writes += 1,
+            AttachControl::ClipboardWrite { .. } => writes += 1,
             AttachControl::Detach => detaches += 1,
             _ => {}
         }
@@ -1884,6 +1884,64 @@ async fn inactive_pane_osc52_disconnects_a_non_draining_attach_at_the_backlog_li
     assert!(
         !handler.active_attach.lock().await.by_pid.contains_key(&310),
         "the bounded relay must remove a client that does not drain clipboard writes"
+    );
+}
+
+#[tokio::test]
+async fn inactive_pane_osc52_backlog_is_bounded_by_encoded_bytes() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "osc52-byte-bounded-backlog").await;
+    split_quiet_window(&handler, &session).await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let inactive_pane_id = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&session).expect("session exists");
+        let active = session.active_pane_id();
+        session
+            .window_at(0)
+            .expect("window exists")
+            .panes()
+            .iter()
+            .find_map(|pane| (Some(pane.id()) != active).then_some(pane.id()))
+            .expect("inactive pane exists")
+    };
+    let mut control_rx = register_clipboard_attach(&handler, 311, &session).await;
+    drain_attach_controls_until_idle(&mut control_rx).await;
+    let control_backlog = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&311)
+            .expect("attach is registered")
+            .control_backlog
+            .clone()
+    };
+    let callback = handler.pane_alert_callback();
+    let mut large_alert = clipboard_alert(session, inactive_pane_id);
+    large_alert.clipboard_writes = vec![vec![b'A'; 512 * 1024]];
+
+    for _ in 0..ATTACH_CONTROL_BACKLOG_LIMIT {
+        callback(large_alert.clone());
+    }
+
+    let mut writes = 0;
+    let mut detaches = 0;
+    while let Ok(control) = control_rx.try_recv() {
+        match control {
+            AttachControl::ClipboardWrite { .. } => writes += 1,
+            AttachControl::Detach => detaches += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        writes > 0 && writes < ATTACH_CONTROL_BACKLOG_LIMIT,
+        "large clipboard controls must exhaust the byte budget before the message-count limit"
+    );
+    assert_eq!(detaches, 1);
+    assert_eq!(
+        control_backlog.load(Ordering::Acquire),
+        0,
+        "dropping queued clipboard controls releases every weighted reservation"
     );
 }
 

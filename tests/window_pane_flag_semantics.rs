@@ -198,6 +198,64 @@ fn source_file_split_window_stdin_flag_creates_empty_pane() -> Result<(), Box<dy
 }
 
 #[test]
+fn split_window_keep_flag_retains_exited_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("split-window-keep-flag")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "s"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-k", "-t", "s:0.0", "exit 7"])?);
+
+    let panes = wait_for_stdout_contains(
+        &harness,
+        &[
+            "list-panes",
+            "-t",
+            "s",
+            "-F",
+            "#{pane_index}:dead=#{pane_dead}:status=#{pane_dead_status}",
+        ],
+        "1:dead=1:status=7",
+    )?;
+    assert!(
+        panes.contains("1:dead=1:status=7"),
+        "split-window -k should retain the exited pane: {panes:?}"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn source_file_split_window_keep_flag_retains_exited_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-split-window-keep-flag")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "s"])?);
+    let source = harness.tmpdir().join("split-keep.conf");
+    fs::write(&source, "split-window -dk -t s:0.0 'exit 9'\n")?;
+    assert_success(&harness.run(&["source-file", source.to_str().expect("utf-8 path")])?);
+
+    let panes = wait_for_stdout_contains(
+        &harness,
+        &[
+            "list-panes",
+            "-t",
+            "s",
+            "-F",
+            "#{pane_index}:dead=#{pane_dead}:status=#{pane_dead_status}",
+        ],
+        "1:dead=1:status=9",
+    )?;
+    assert!(
+        panes.contains("1:dead=1:status=9"),
+        "source-file split-window -k should retain the exited pane: {panes:?}"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn initial_session_pane_preserves_non_utf8_client_environment() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("non-utf8-client-env")?;
     let mut daemon = harness.start_hidden_daemon()?;

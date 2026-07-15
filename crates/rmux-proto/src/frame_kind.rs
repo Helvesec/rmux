@@ -1318,6 +1318,15 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         Some("pane_foreground_state_request"),
         "SDK pane foreground-state request; pinned bincode tag 126.",
     ),
+    entry(
+        c2s(127),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "SplitWindowIdentityRequest",
+        FrameFeature::Panes,
+        Some("split_window_identity_request"),
+        "Atomic SDK split identity request; pinned bincode tag 127.",
+    ),
     // Reserved client→server slot. Removed values must be listed and never reused.
     entry(
         c2s(0x7FFE),
@@ -2247,6 +2256,15 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         Some("pane_foreground_state_response"),
         "SDK pane foreground-state response; pinned bincode tag 100.",
     ),
+    entry(
+        s2c(101),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "SplitWindowIdentityResponse",
+        FrameFeature::Panes,
+        Some("split_window_identity_response"),
+        "Atomic SDK split identity response; pinned bincode tag 101.",
+    ),
     // Reserved server→client slot. Removed values must be listed and never reused.
     entry(
         s2c(0x7FFE),
@@ -2403,6 +2421,7 @@ pub const fn frame_kind_for_request(request: &Request) -> FrameKind {
         Request::PaneStateCursor(_) => c2s(124),
         Request::UnsubscribePaneState(_) => c2s(125),
         Request::PaneForegroundState(_) => c2s(126),
+        Request::SplitWindowIdentity(_) => c2s(127),
     }
 }
 
@@ -2511,6 +2530,7 @@ pub const fn frame_kind_for_response(response: &Response) -> FrameKind {
         Response::PaneStateLag(_) => s2c(98),
         Response::UnsubscribePaneState(_) => s2c(99),
         Response::PaneForegroundState(_) => s2c(100),
+        Response::SplitWindowIdentity(_) => s2c(101),
     }
 }
 

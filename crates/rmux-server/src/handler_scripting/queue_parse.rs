@@ -18,7 +18,7 @@ use super::targets::{
     NewWindowTargetIndex,
 };
 use super::tokens::{parse_compact_flag_cluster, CompactFlag};
-use super::values::{missing_argument, unsupported_flag};
+use super::values::{missing_argument, reject_unknown_option_before_positional, unsupported_flag};
 use crate::pane_terminals::session_not_found;
 
 const DEFAULT_NEW_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
@@ -377,6 +377,7 @@ pub(super) fn parse_queued_if_shell(
             }
             token => {
                 let Some(cluster) = parse_compact_flag_cluster(token, "bF", "t") else {
+                    reject_unknown_option_before_positional("if-shell", token)?;
                     break;
                 };
                 let _ = args.pop_front();

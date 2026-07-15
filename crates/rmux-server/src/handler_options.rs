@@ -12,6 +12,8 @@ use crate::handler_support::{ensure_option_scope_exists, ensure_scope_session_ex
 use super::target_support::target_for_option_scope;
 use super::{attach_support::option_affects_attached_rendering, RequestHandler};
 
+#[path = "handler_options/default_shell.rs"]
+mod default_shell;
 #[path = "handler_options/pane_sdk.rs"]
 mod pane_sdk;
 #[path = "handler_options/pane_state_events.rs"]
@@ -19,6 +21,7 @@ mod pane_state_events;
 #[path = "handler_options/resize_reconciliation.rs"]
 mod resize_reconciliation;
 
+use default_shell::{validate_named_mutation, validate_typed_mutation};
 use pane_state_events::{
     pane_option_events_for_outcome, synchronize_pane_option_aliases_for_outcome,
 };
@@ -55,6 +58,9 @@ impl RequestHandler {
             let mut state = self.state.lock().await;
 
             if let Err(error) = ensure_scope_session_exists(&state, &request.scope) {
+                return Response::Error(ErrorResponse { error });
+            }
+            if let Err(error) = validate_typed_mutation(&state.options, &request) {
                 return Response::Error(ErrorResponse { error });
             }
             if resize_policy_requested {
@@ -223,6 +229,10 @@ impl RequestHandler {
                 value.as_deref(),
                 request.unset,
             ) {
+                return Response::Error(ErrorResponse { error });
+            }
+            if let Err(error) = validate_named_mutation(&state.options, &request, value.as_deref())
+            {
                 return Response::Error(ErrorResponse { error });
             }
 

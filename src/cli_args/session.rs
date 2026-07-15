@@ -121,6 +121,24 @@ pub(crate) struct ServerAccessArgs {
 
 impl ServerAccessArgs {
     pub(super) fn validate(self) -> Result<Self, clap::Error> {
+        if self.target.is_some() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::UnknownArgument,
+                "command server-access: unknown flag -t",
+            ));
+        }
+        if !self.list && self.add && self.deny {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "-a and -d cannot be used together",
+            ));
+        }
+        if !self.list && self.read_only && self.write {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "-r and -w cannot be used together",
+            ));
+        }
         Ok(self)
     }
 }

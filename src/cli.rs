@@ -188,7 +188,7 @@ where
                     return parse_failure_or_absent_server(&args, error);
                 }
                 ColdAliasParseOutcome::Parsed(cold_cli, connection) => {
-                    startup_connection = Some(connection);
+                    startup_connection = Some(*connection);
                     *cold_cli
                 }
                 ColdAliasParseOutcome::Dispatched(exit_code) => return Ok(exit_code),
@@ -285,7 +285,7 @@ where
 
 enum ColdAliasParseOutcome {
     NotApplicable(clap::Error),
-    Parsed(Box<Cli>, Connection),
+    Parsed(Box<Cli>, Box<Connection>),
     Dispatched(i32),
 }
 
@@ -339,7 +339,10 @@ fn parse_cold_alias_queue_after_startup(
     }
     let cli =
         parse_with_runtime_resolution(args, Some(&resolution)).map_err(ExitFailure::from_clap)?;
-    Ok(ColdAliasParseOutcome::Parsed(Box::new(cli), connection))
+    Ok(ColdAliasParseOutcome::Parsed(
+        Box::new(cli),
+        Box::new(connection),
+    ))
 }
 
 fn parse_with_runtime_resolution(

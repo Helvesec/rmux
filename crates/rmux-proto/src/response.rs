@@ -45,8 +45,9 @@ pub use pane::{
     PaneSnapshotCursor, PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorResponse,
     PaneStateEventDto, PaneStateLagResponse, PaneStateSnapshot, PipePaneResponse,
     ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse, SendKeysResponse,
-    SplitWindowResponse, SubscribePaneOutputResponse, SubscribePaneStateResponse, SwapPaneResponse,
-    UnsubscribePaneOutputResponse, UnsubscribePaneStateResponse,
+    SplitWindowIdentityResponse, SplitWindowResponse, SubscribePaneOutputResponse,
+    SubscribePaneStateResponse, SwapPaneResponse, UnsubscribePaneOutputResponse,
+    UnsubscribePaneStateResponse,
 };
 
 #[path = "response/client.rs"]
@@ -283,6 +284,8 @@ pub enum Response {
     UnsubscribePaneState(UnsubscribePaneStateResponse),
     /// Success payload for SDK pane foreground-state lookup.
     PaneForegroundState(Box<PaneForegroundStateResponse>),
+    /// Atomic visible and stable identity returned by an SDK split.
+    SplitWindowIdentity(SplitWindowIdentityResponse),
 }
 
 impl Response {
@@ -307,7 +310,7 @@ impl Response {
             Self::MoveWindow(_) => "move-window",
             Self::SwapWindow(_) => "swap-window",
             Self::RotateWindow(_) => "rotate-window",
-            Self::SplitWindow(_) => "split-window",
+            Self::SplitWindow(_) | Self::SplitWindowIdentity(_) => "split-window",
             Self::SwapPane(_) => "swap-pane",
             Self::LastPane(_) => "last-pane",
             Self::JoinPane(_) => "join-pane",
@@ -445,6 +448,7 @@ impl Response {
             | Self::PaneStateLag(_)
             | Self::UnsubscribePaneState(_)
             | Self::PaneForegroundState(_)
+            | Self::SplitWindowIdentity(_)
             | Self::CreateSessionLease(_)
             | Self::RenewSessionLease(_)
             | Self::ReleaseSessionLease(_)

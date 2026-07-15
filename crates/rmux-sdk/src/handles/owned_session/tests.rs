@@ -9,6 +9,8 @@ use rmux_proto::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod signal_handlers;
+
 struct FakeDaemon {
     stream: tokio::io::DuplexStream,
     decoder: FrameDecoder,
@@ -62,165 +64,6 @@ impl FakeDaemon {
             Ok(Err(error)) => panic!("failed while checking for an unexpected request: {error}"),
         }
     }
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn live_signal_guard_is_disarmed_by_detach_without_killing_the_session() {
-    let (runtime, owned, mut daemon, state) = signal_install_fixture("retry-signal-owner");
-
-    assert_signal_install_fails_without_latching(&owned, &state);
-
-    let guard = runtime
-        .block_on(async { owned.install_default_signal_handlers() })
-        .expect("installation can be retried inside a Tokio runtime");
-    let duplicate = runtime
-        .block_on(async { owned.install_default_signal_handlers() })
-        .expect_err("an installed guard must keep the uniqueness reservation");
-    assert!(
-        duplicate.to_string().contains("already installed"),
-        "unexpected duplicate-install error: {duplicate}"
-    );
-    let detached = runtime
-        .block_on(owned.detach_owned())
-        .expect("detaching ownership must disarm the live signal guard");
-    assert!(state.is_disarmed(), "live signal cleanup must be disarmed");
-    assert!(
-        !state.try_begin_cleanup(),
-        "a signal after detach must not begin cleanup"
-    );
-
-    runtime.block_on(async {
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), daemon.read_request())
-                .await
-                .is_err(),
-            "detach with a live signal guard must not kill the session"
-        );
-    });
-    drop(guard);
-    drop(detached);
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn live_signal_guard_is_disarmed_by_preserve_without_killing_the_session() {
-    let (runtime, owned, mut daemon, state) = signal_install_fixture("preserve-signal-owner");
-
-    assert_signal_install_fails_without_latching(&owned, &state);
-
-    let guard = runtime
-        .block_on(async { owned.install_default_signal_handlers() })
-        .expect("installation can be retried inside a Tokio runtime");
-    let preserved = runtime
-        .block_on(owned.preserve())
-        .expect("preserving ownership must disarm the live signal guard");
-    assert!(state.is_disarmed(), "live signal cleanup must be disarmed");
-    assert!(
-        !state.try_begin_cleanup(),
-        "a signal after preserve must not begin cleanup"
-    );
-    let keepalive = preserved.session().transport().clone();
-
-    runtime.block_on(async {
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), daemon.read_request())
-                .await
-                .is_err(),
-            "preserve with a live signal guard must not kill the session"
-        );
-    });
-    drop(guard);
-    drop(preserved);
-    drop(keepalive);
-}
-
-#[cfg(any(unix, windows))]
-fn signal_install_fixture(
-    name: &str,
-) -> (
-    tokio::runtime::Runtime,
-    OwnedSession,
-    FakeDaemon,
-    Arc<signals::SignalHandlerState>,
-) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime builds");
-    let (owned, daemon, state) = runtime.block_on(async {
-        let (client_stream, server_stream) = tokio::io::duplex(1024);
-        let state = Arc::new(signals::SignalHandlerState::default());
-        let owned = OwnedSession {
-            session: Some(Session::new(
-                SessionName::new(name).expect("valid session name"),
-                crate::RmuxEndpoint::Default,
-                None,
-                TransportClient::spawn(client_stream),
-                true,
-                None,
-            )),
-            session_id: SessionId::new(42),
-            cleanup_policy: CleanupPolicy::KillOnDrop,
-            lease: None,
-            signal_handler_state: Arc::clone(&state),
-        };
-        (owned, FakeDaemon::new(server_stream), state)
-    });
-    (runtime, owned, daemon, state)
-}
-
-#[cfg(any(unix, windows))]
-fn assert_signal_install_fails_without_latching(
-    owned: &OwnedSession,
-    state: &signals::SignalHandlerState,
-) {
-    let error = owned
-        .install_default_signal_handlers()
-        .expect_err("installation outside a Tokio runtime must fail");
-    assert!(
-        error.to_string().contains("require a Tokio runtime"),
-        "unexpected installation error: {error}"
-    );
-    assert!(
-        !state.is_installed(),
-        "failed installation must release the single-handler reservation"
-    );
-}
-
-#[tokio::test]
-async fn released_owner_rejects_signal_handlers_without_latching_installation() {
-    let (client_stream, _server_stream) = tokio::io::duplex(1024);
-    let state = Arc::new(signals::SignalHandlerState::default());
-    let owned = OwnedSession {
-        session: Some(Session::new(
-            SessionName::new("preserved-owner").expect("valid session name"),
-            crate::RmuxEndpoint::Default,
-            None,
-            TransportClient::spawn(client_stream),
-            true,
-            None,
-        )),
-        session_id: SessionId::new(42),
-        cleanup_policy: CleanupPolicy::Preserve,
-        lease: None,
-        signal_handler_state: Arc::clone(&state),
-    };
-
-    let error = owned
-        .install_default_signal_handlers()
-        .expect_err("released ownership cannot install token-guarded signal cleanup");
-
-    assert!(
-        error
-            .to_string()
-            .contains("owned session ownership has already been released"),
-        "unexpected error: {error}"
-    );
-    assert!(
-        !state.is_installed(),
-        "rejected installation must not latch the single-handler flag"
-    );
 }
 
 #[tokio::test]
@@ -399,6 +242,44 @@ async fn owner_exit_marks_the_lease_lost_when_a_renewal_never_answers() {
         .expect("owned lease state sender remains live");
     assert_eq!(*state.borrow(), LeaseState::Lost);
     assert!(owned.lease_lost());
+}
+
+#[tokio::test(start_paused = true)]
+async fn owner_exit_attempts_renewal_after_a_scheduler_pause_longer_than_the_ttl() {
+    let (builder, mut daemon, session_name) =
+        start_owned_builder(CleanupPolicy::KillOnOwnerExit).await;
+    answer_new_session(&mut daemon, session_name).await;
+    answer_lease_identity_handshake(&mut daemon, current_capabilities()).await;
+    assert!(matches!(
+        daemon.read_request().await,
+        Request::CreateSessionLease(_)
+    ));
+    daemon
+        .write_response(Response::CreateSessionLease(CreateSessionLeaseResponse {
+            token: 12,
+            ttl_millis: 600,
+        }))
+        .await;
+
+    let owned = builder
+        .await
+        .expect("builder task joins")
+        .expect("leased owner builds");
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(owned.lease_state(), LeaseState::Active);
+    let Request::RenewSessionLease(renew) = daemon.read_request().await else {
+        panic!("resumed owner must attempt renewal before declaring its lease lost");
+    };
+    assert_eq!(renew.session_name.as_str(), "$42");
+    assert_eq!(renew.token, 12);
+    daemon
+        .write_response(Response::RenewSessionLease(RenewSessionLeaseResponse {
+            renewed: true,
+        }))
+        .await;
+    drop(owned);
 }
 
 #[tokio::test]

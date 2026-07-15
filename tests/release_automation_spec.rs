@@ -71,6 +71,42 @@ fn changelog_checker_rejects_unversioned_tmux_claim_without_test_link() {
 }
 
 #[test]
+fn tmux_ledger_gate_reads_authoritative_inventories_and_named_divergence_tests() {
+    let checker = include_str!("../scripts/check-tmux-release-ledger.py");
+
+    for authoritative_path in [
+        "crates/rmux-core/src/command_inventory/signatures.rs",
+        "crates/rmux-core/src/options/table.rs",
+    ] {
+        assert!(
+            checker.contains(authoritative_path),
+            "tmux ledger gate lost authoritative inventory {authoritative_path}"
+        );
+    }
+    for stale_facade in [
+        "COMMAND_INVENTORY = Path(\"src/cli/command_inventory.rs\")",
+        "OPTIONS_REGISTRY = Path(\"crates/rmux-core/src/options/registry.rs\")",
+    ] {
+        assert!(
+            !checker.contains(stale_facade),
+            "tmux ledger gate regressed to stale facade {stale_facade}"
+        );
+    }
+    for exhaustive_guard in [
+        "PRODUCT_DIVERGENCE_TEST",
+        "git\", \"ls-files\"",
+        "has no ledger entry",
+        "stale product-divergence test reference(s)",
+        "uses a non-auditable product-divergence wildcard",
+    ] {
+        assert!(
+            checker.contains(exhaustive_guard),
+            "tmux ledger gate lost exhaustive guard {exhaustive_guard}"
+        );
+    }
+}
+
+#[test]
 fn current_changelog_records_the_exact_detached_wire_version() {
     let changelog = include_str!("../CHANGELOG.md");
     let current_release = changelog
@@ -352,7 +388,7 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
         .split("- name: Create or update release")
         .nth(1)
         .expect("release asset upload step")
-        .split("- name: Deploy Linux package repositories")
+        .split("\n  publish-snap:")
         .next()
         .expect("bounded release asset upload step");
     assert_eq!(release_asset_step.matches("--json isDraft").count(), 2);
@@ -385,21 +421,160 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
     assert!(release.contains("RPM-GPG-KEY-rmux-repository"));
     assert_eq!(
         release.matches("uses: actions/checkout@").count(),
-        6,
+        10,
         "every release source checkout must remain covered by this identity assertion"
     );
     assert_eq!(release.matches("ref: ${{ github.sha }}").count(), 1);
-    assert_eq!(release.matches("ref: ${{ env.SOURCE_GIT_SHA }}").count(), 5);
+    assert_eq!(release.matches("ref: ${{ env.SOURCE_GIT_SHA }}").count(), 9);
     assert_eq!(
         release
             .matches("- name: Verify immutable source checkout")
             .count(),
-        5
+        9
     );
     assert!(
         !release.contains("ref: ${{ env.RELEASE_REF }}"),
         "mutable release tags must never be used as checkout identities"
     );
+}
+
+#[test]
+fn release_publication_waits_for_native_and_package_validations() {
+    let release = include_str!("../.github/workflows/release.yml");
+
+    let build = release
+        .split("\n  build:\n")
+        .nth(1)
+        .expect("release build job")
+        .split("\n  platform-gates:\n")
+        .next()
+        .expect("bounded release build job");
+    assert!(build.contains("rmux-windows-interactive"));
+
+    let platform_gates = release
+        .split("\n  platform-gates:\n")
+        .nth(1)
+        .expect("native platform gates job")
+        .split("\n  snap:\n")
+        .next()
+        .expect("bounded native platform gates job");
+    assert!(platform_gates.contains("macos-15-intel"));
+    assert!(platform_gates.contains("macos-15"));
+    assert!(platform_gates.contains("windows-latest"));
+    assert!(platform_gates.contains("name: Windows native release review gate"));
+    assert!(platform_gates.contains("release-review-gate-windows.ps1 -SkipPackage -SkipClippy"));
+    assert!(platform_gates.contains("name: macOS native runtime smoke"));
+    assert!(platform_gates.contains("run: scripts/smoke-macos.sh"));
+
+    let prepare = release
+        .split("\n  prepare-release:\n")
+        .nth(1)
+        .expect("release preparation job")
+        .split("\n  publish-snap:\n")
+        .next()
+        .expect("bounded release preparation job");
+    assert!(prepare.contains("name: Prepare signed release draft"));
+    assert!(prepare.contains("- source-gates\n      - build\n      - platform-gates\n      - snap"));
+    assert!(prepare.contains("--draft"));
+    assert!(prepare.contains("gh release upload"));
+    for public_mutation in ["--draft=false", "git push", "choco push", "action-publish"] {
+        assert!(
+            !prepare.contains(public_mutation),
+            "release preparation performed public mutation {public_mutation:?}"
+        );
+    }
+    for store_secret in [
+        "SNAPCRAFT_STORE_CREDENTIALS",
+        "RMUX_PACKAGE_REPO_TOKEN",
+        "CHOCOLATEY_API_KEY",
+    ] {
+        assert!(
+            !prepare.contains(store_secret),
+            "draft preparation must not receive store secret {store_secret}"
+        );
+    }
+
+    let winget = release
+        .split("\n  validate-winget:\n")
+        .nth(1)
+        .expect("WinGet validation job")
+        .split("\n  validate-chocolatey:\n")
+        .next()
+        .expect("bounded WinGet validation job");
+    assert!(winget.contains("- prepare-release"));
+    assert!(winget.contains("release-validation-assets-${{ env.RELEASE_REF }}"));
+    assert!(winget.contains("winget validate --manifest"));
+    assert!(!winget.contains("gh release download"));
+
+    let chocolatey_validation = release
+        .split("\n  validate-chocolatey:\n")
+        .nth(1)
+        .expect("Chocolatey validation job")
+        .split("\n  publish:\n")
+        .next()
+        .expect("bounded Chocolatey validation job");
+    assert!(chocolatey_validation.contains("- prepare-release"));
+    assert!(chocolatey_validation.contains("choco pack"));
+    assert!(!chocolatey_validation.contains("choco push"));
+    assert!(!chocolatey_validation.contains("CHOCOLATEY_API_KEY"));
+
+    let publish = release
+        .split("\n  publish:\n")
+        .nth(1)
+        .expect("canonical publication job")
+        .split("\n  publish-linux-repositories:\n")
+        .next()
+        .expect("bounded canonical publication job");
+    for prerequisite in [
+        "- prepare-release",
+        "- validate-external-configuration",
+        "- validate-winget",
+        "- validate-chocolatey",
+    ] {
+        assert!(publish.contains(prerequisite));
+    }
+    assert!(publish.contains("name: Publish canonical GitHub release"));
+    assert!(publish.contains("--draft=false"));
+    assert!(publish.contains("cannot be made transactionally atomic"));
+    assert!(publish.contains("is already public"));
+    for store_secret in [
+        "SNAPCRAFT_STORE_CREDENTIALS",
+        "RMUX_PACKAGE_REPO_TOKEN",
+        "CHOCOLATEY_API_KEY",
+    ] {
+        assert!(
+            !publish.contains(store_secret),
+            "canonical publication must not receive store secret {store_secret}"
+        );
+    }
+
+    let linux_publish = release
+        .split("\n  publish-linux-repositories:\n")
+        .nth(1)
+        .expect("Linux repository publication job")
+        .split("\n  publish-chocolatey:\n")
+        .next()
+        .expect("bounded Linux repository publication job");
+    assert!(linux_publish.contains("- publish"));
+    assert!(linux_publish.contains("git push"));
+
+    let snap_publish = release
+        .split("\n  publish-snap:\n")
+        .nth(1)
+        .expect("Snap publication job")
+        .split("\n  validate-winget:\n")
+        .next()
+        .expect("bounded Snap publication job");
+    assert!(snap_publish.contains("- publish"));
+    assert!(snap_publish.contains("snapcore/action-publish@"));
+
+    let chocolatey_publish = release
+        .split("\n  publish-chocolatey:\n")
+        .nth(1)
+        .expect("Chocolatey publication job");
+    assert!(chocolatey_publish.contains("- publish"));
+    assert!(chocolatey_publish.contains("- validate-chocolatey"));
+    assert!(chocolatey_publish.contains("choco push"));
 }
 
 #[test]
@@ -496,14 +671,14 @@ fn windows_package_reuses_the_exact_ctrl_tested_release_binaries() {
 }
 
 #[test]
-fn windows_installer_preserves_backup_only_when_rollback_fails() {
+fn windows_installer_transactions_complete_package_and_preserves_failed_rollback() {
     let installer = include_str!("../scripts/install-windows.ps1");
     let transaction = installer
-        .split_once("function Install-BinarySet")
+        .split_once("function Install-PackageFileSet")
         .map(|(_, transaction)| transaction)
         .and_then(|transaction| transaction.split_once("function Test-PackageRoot"))
         .map(|(transaction, _)| transaction)
-        .expect("bounded Install-BinarySet function");
+        .expect("bounded Install-PackageFileSet function");
 
     let initial_state = transaction
         .find("$preserveTransactionBackup = $false")
@@ -514,7 +689,7 @@ fn windows_installer_preserves_backup_only_when_rollback_fails() {
     let rollback_failure = transaction
         .split_once("if ($rollbackErrors.Count -gt 0)")
         .map(|(_, failure)| failure)
-        .and_then(|failure| failure.split_once("previous binaries restored"))
+        .and_then(|failure| failure.split_once("previous package restored"))
         .map(|(failure, _)| failure)
         .expect("bounded rollback-failure branch");
     assert!(rollback_failure.contains("$preserveTransactionBackup = $true"));
@@ -546,6 +721,25 @@ fn windows_installer_preserves_backup_only_when_rollback_fails() {
         1,
         "only a failed rollback may retain the backup; normal success and a successful rollback must still clean it up"
     );
+
+    let package_install = installer
+        .split_once("function Install-PackageRoot")
+        .map(|(_, install)| install)
+        .and_then(|install| install.split_once("if ([string]::IsNullOrWhiteSpace($InstallDir))"))
+        .map(|(install, _)| install)
+        .expect("bounded Install-PackageRoot function");
+    let share_plan = package_install
+        .find("Get-ChildItem -LiteralPath $shareSource -Recurse -File -Force")
+        .expect("share files are enumerated into the package transaction");
+    let root_plan = package_install
+        .find("foreach ($optional in")
+        .expect("optional root files are enumerated into the package transaction");
+    let commit = package_install
+        .find("Install-PackageFileSet $installPlan $destination $Verify")
+        .expect("one package transaction installs the complete plan");
+    assert!(share_plan < commit && root_plan < commit);
+    assert!(!package_install.contains("Copy-Tree"));
+    assert!(transaction.contains("Invoke-InstallCheckpoint \"after-copy-package\""));
 }
 
 #[test]
@@ -633,6 +827,48 @@ fn debug_configuration_cannot_produce_or_satisfy_release_artifact_metadata() {
     }
     assert!(include_str!("../scripts/verify-package-windows.ps1")
         .contains("release artifact metadata configuration is not release"));
+}
+
+#[test]
+fn packaged_artifact_metadata_never_embeds_builder_paths() {
+    let unix = include_str!("../scripts/package-unix.sh");
+    for expected in [
+        "\"binary_path\": \"bin/rmux\"",
+        "\"helper_binary_path\": \"libexec/rmux/rmux\"",
+        "\"daemon_binary_path\": \"bin/rmux-daemon\"",
+    ] {
+        assert!(unix.contains(expected), "Unix metadata lost {expected}");
+    }
+
+    for (name, producer) in [
+        ("Debian", include_str!("../scripts/package-debian.sh")),
+        ("RPM", include_str!("../scripts/package-rpm.sh")),
+    ] {
+        for expected in [
+            "\"binary_path\": \"/usr/bin/rmux\"",
+            "\"helper_binary_path\": \"/usr/libexec/rmux/rmux\"",
+            "\"daemon_binary_path\": \"/usr/bin/rmux-daemon\"",
+        ] {
+            assert!(
+                producer.contains(expected),
+                "{name} metadata lost {expected}"
+            );
+        }
+    }
+
+    let windows = include_str!("../scripts/package-windows.ps1");
+    for expected in [
+        "binary_path = \"rmux.exe\"",
+        "helper_binary_path = \"libexec/rmux/rmux.exe\"",
+        "daemon_binary_path = \"rmux-daemon.exe\"",
+    ] {
+        assert!(
+            windows.contains(expected),
+            "Windows metadata lost {expected}"
+        );
+    }
+    assert!(!unix.contains("\"binary_path\": \"$(printf"));
+    assert!(!windows.contains("binary_path = $binaryAbs"));
 }
 
 #[test]

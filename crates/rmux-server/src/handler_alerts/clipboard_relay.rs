@@ -100,23 +100,17 @@ impl RequestHandler {
             if payload.is_empty() {
                 continue;
             }
-            if active.control_backlog.load(Ordering::Acquire) >= ATTACH_CONTROL_BACKLOG_LIMIT {
+            let Some(control) = AttachControl::try_clipboard_write(
+                payload,
+                active.control_backlog.clone(),
+                ATTACH_CONTROL_BACKLOG_LIMIT,
+            ) else {
                 let _ = active.control_tx.send(AttachControl::Detach);
                 active.closing.store(true, Ordering::SeqCst);
                 disconnected.push(*attach_pid);
                 continue;
-            }
-            active.control_backlog.fetch_add(1, Ordering::AcqRel);
-            if active
-                .control_tx
-                .send(AttachControl::Write(payload))
-                .is_err()
-            {
-                let _ = active.control_backlog.fetch_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |value| value.checked_sub(1),
-                );
+            };
+            if active.control_tx.send(control).is_err() {
                 disconnected.push(*attach_pid);
             }
         }

@@ -2,7 +2,9 @@ use rmux_proto::{Request, RmuxError, SendKeysRequest};
 
 use super::parse_pane_target;
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::{missing_argument, parse_usize, unsupported_flag};
+use super::values::{
+    missing_argument, parse_usize, reject_unknown_option_before_positional, unsupported_flag,
+};
 
 pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut target = None;
@@ -195,6 +197,7 @@ pub(super) fn parse_bind_key(mut args: CommandTokens) -> Result<Request, RmuxErr
             }
             _ => {
                 let Some(cluster) = parse_compact_flag_cluster(&token, "nr", "NT") else {
+                    reject_unknown_option_before_positional("bind-key", &token)?;
                     break;
                 };
                 let _ = args.optional();

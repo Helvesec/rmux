@@ -105,8 +105,8 @@ pub(super) async fn recv_attach_control(
     match control_rx {
         Some(control_rx) => {
             let control = control_rx.recv().await;
-            if control.is_some() {
-                decrement_control_backlog(control_backlog);
+            if let Some(control) = control.as_ref() {
+                decrement_control_backlog_by(control_backlog, control.received_backlog_units());
             }
             control
         }
@@ -114,9 +114,12 @@ pub(super) async fn recv_attach_control(
     }
 }
 
-pub(super) fn decrement_control_backlog(control_backlog: &AtomicUsize) {
+fn decrement_control_backlog_by(control_backlog: &AtomicUsize, units: usize) {
+    if units == 0 {
+        return;
+    }
     let _ = control_backlog.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-        value.checked_sub(1)
+        value.checked_sub(units)
     });
 }
 
@@ -125,7 +128,7 @@ pub(super) fn try_recv_attach_control(
     control_backlog: &AtomicUsize,
 ) -> Result<AttachControl, mpsc::error::TryRecvError> {
     let control = control_rx.try_recv()?;
-    decrement_control_backlog(control_backlog);
+    decrement_control_backlog_by(control_backlog, control.received_backlog_units());
     Ok(control)
 }
 
@@ -457,6 +460,10 @@ pub(super) async fn apply_pending_attach_controls(
             }
             Ok(AttachControl::Write(bytes)) => {
                 emit_attach_bytes(stream, &bytes).await?;
+            }
+            Ok(AttachControl::ClipboardWrite { bytes, reservation }) => {
+                emit_attach_bytes(stream, &bytes).await?;
+                drop(reservation);
             }
             Ok(AttachControl::LockShellCommand(command)) => {
                 if let Some(pending_input) = pending_input.as_mut() {

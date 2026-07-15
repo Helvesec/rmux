@@ -245,7 +245,11 @@ fn resolve_runtime_command_with_connection(
     };
 
     if queue_has_builtin_after_parse_time_assignment(&groups) {
-        return Ok(Some(RuntimeCommandResolution::LegacyDirect));
+        let aliases = server_command_alias_definitions(connection)
+            .map_err(|error| error.with_socket_context(socket_path))?;
+        if queue_requires_direct_parse_for_builtin_assignment(&groups, &aliases) {
+            return Ok(Some(RuntimeCommandResolution::LegacyDirect));
+        }
     }
 
     Ok(Some(RuntimeCommandResolution::Canonical(vec![
@@ -322,6 +326,14 @@ fn queue_has_builtin_after_parse_time_assignment(groups: &[Vec<String>]) -> bool
         };
         has_tmux_command_candidate(command_name)
     })
+}
+
+fn queue_requires_direct_parse_for_builtin_assignment(
+    groups: &[Vec<String>],
+    aliases: &[String],
+) -> bool {
+    queue_has_builtin_after_parse_time_assignment(groups)
+        && !queue_uses_server_alias(groups, aliases)
 }
 
 fn alias_lookup_command_name(group: &[String]) -> Option<&str> {
@@ -561,18 +573,34 @@ mod tests {
 
     #[test]
     fn builtin_cli_assignments_do_not_enter_the_runtime_source_bridge() {
-        assert!(!queue_has_builtin_after_parse_time_assignment(&[vec![
-            "FOO=x".to_owned(),
-            "probe".to_owned(),
-        ]]));
-        assert!(queue_has_builtin_after_parse_time_assignment(&[vec![
+        let alias_only = vec![vec!["FOO=x".to_owned(), "probe".to_owned()]];
+        let builtin_only = vec![vec![
             "FOO=x".to_owned(),
             "BAR=y".to_owned(),
             "display-message".to_owned(),
-        ]]));
+        ]];
+        assert!(!queue_has_builtin_after_parse_time_assignment(&alias_only));
+        assert!(queue_has_builtin_after_parse_time_assignment(&builtin_only));
         assert!(queue_has_builtin_after_parse_time_assignment(&[vec![
             "FOO=x".to_owned(),
         ]]));
+        assert!(queue_requires_direct_parse_for_builtin_assignment(
+            &builtin_only,
+            &[]
+        ));
+
+        let builtin_then_alias = vec![
+            vec!["FOO=x".to_owned(), "new-session".to_owned()],
+            vec!["probe".to_owned()],
+        ];
+        let aliases = vec!["probe=display-message -p $FOO".to_owned()];
+        assert!(queue_has_builtin_after_parse_time_assignment(
+            &builtin_then_alias
+        ));
+        assert!(!queue_requires_direct_parse_for_builtin_assignment(
+            &builtin_then_alias,
+            &aliases
+        ));
     }
 
     #[test]

@@ -636,7 +636,8 @@ fn unknown_subcommand_fallback_rejects_source_syntax() -> Result<(), Box<dyn Err
 }
 
 #[test]
-fn runtime_alias_fallback_preserves_assignment_before_alias() -> Result<(), Box<dyn Error>> {
+fn runtime_alias_fallback_preserves_assignment_before_alias_product_divergence(
+) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("runtime-alias-leading-assignment")?;
     let _daemon = harness.start_hidden_daemon()?;
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
@@ -821,7 +822,7 @@ fn list_commands_is_client_local_and_supports_formatting() -> Result<(), Box<dyn
     assert_eq!(split_signature.status.code(), Some(0));
     assert_eq!(
         stdout(&split_signature),
-        "split-window (splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane][shell-command]\n"
+        "split-window (splitw) [-bdefhIklPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane][shell-command]\n"
     );
     assert!(stderr(&split_signature).is_empty());
 
@@ -1425,14 +1426,15 @@ fn server_access_missing_user_is_reported_like_tmux() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn server_access_target_flag_is_accepted_like_tmux() -> Result<(), Box<dyn Error>> {
+fn server_access_target_flag_is_rejected_like_tmux_runtime() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("server-access-target-flag")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     let output = harness.run(&["server-access", "-t", "%0", "-l", "ignored-user"])?;
 
-    assert_eq!(output.status.code(), Some(0));
-    assert!(stderr(&output).is_empty());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("command server-access: unknown flag -t"));
     Ok(())
 }
 

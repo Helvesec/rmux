@@ -61,23 +61,12 @@ function Sha256File([string]$Path) {
     }
 }
 
-function Copy-Tree([string]$Source, [string]$Destination) {
-    if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
-        return
-    }
-
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    Get-ChildItem -LiteralPath $Source -Force | ForEach-Object {
-        Copy-Item -Recurse -Force -LiteralPath $_.FullName -Destination $Destination
-    }
-}
-
-function Assert-BinaryReplaceable([string]$Path) {
+function Assert-FileReplaceable([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
         return
     }
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw "destination binary path exists but is not a file: $Path"
+        throw "destination file path exists but is not a file: $Path"
     }
 
     $stream = $null
@@ -89,7 +78,7 @@ function Assert-BinaryReplaceable([string]$Path) {
             [System.IO.FileShare]::None
         )
     } catch {
-        throw "destination binary is in use or cannot be replaced safely: $Path"
+        throw "destination file is in use or cannot be replaced safely: $Path"
     } finally {
         if ($null -ne $stream) {
             $stream.Dispose()
@@ -97,11 +86,21 @@ function Assert-BinaryReplaceable([string]$Path) {
     }
 }
 
-function Install-BinarySet([object[]]$Plan, [bool]$Verify) {
+function Invoke-InstallCheckpoint([string]$Name) {
+    if ($env:RMUX_INSTALL_TEST_FAIL_AT -eq $Name) {
+        throw "injected installer failure at $Name"
+    }
+}
+
+function Install-PackageFileSet(
+    [object[]]$Plan,
+    [string]$VerifyBinary,
+    [bool]$Verify
+) {
     # Refuse the whole upgrade before its first mutation if any installed
-    # executable is already locked (most commonly a running rmux daemon).
+    # package file is already locked (most commonly a running rmux daemon).
     foreach ($entry in $Plan) {
-        Assert-BinaryReplaceable $entry.Destination
+        Assert-FileReplaceable $entry.Destination
     }
 
     $transactionRoot = Join-Path ([System.IO.Path]::GetTempPath()) `
@@ -117,7 +116,7 @@ function Install-BinarySet([object[]]$Plan, [bool]$Verify) {
             New-Item -ItemType Directory -Force -Path $destinationDirectory | Out-Null
 
             $existed = Test-Path -LiteralPath $entry.Destination -PathType Leaf
-            $backup = Join-Path $transactionRoot ("binary-$index.exe")
+            $backup = Join-Path $transactionRoot ("file-$index")
             if ($existed) {
                 Copy-Item -LiteralPath $entry.Destination -Destination $backup
             }
@@ -130,14 +129,15 @@ function Install-BinarySet([object[]]$Plan, [bool]$Verify) {
 
         # Close the small check-to-copy window created while taking backups.
         foreach ($entry in $Plan) {
-            Assert-BinaryReplaceable $entry.Destination
+            Assert-FileReplaceable $entry.Destination
         }
 
         foreach ($entry in $Plan) {
             Copy-Item -Force -LiteralPath $entry.Source -Destination $entry.Destination
         }
+        Invoke-InstallCheckpoint "after-copy-package"
         if ($Verify) {
-            Verify-InstalledLayout $Plan[$Plan.Count - 1].Destination
+            Verify-InstalledLayout $VerifyBinary
         }
     } catch {
         $installError = $_.Exception.Message
@@ -148,14 +148,14 @@ function Install-BinarySet([object[]]$Plan, [bool]$Verify) {
                 if ($record.Existed) {
                     Copy-Item -Force -LiteralPath $record.Backup -Destination $record.Destination
                     if ((Sha256File $record.Backup) -ne (Sha256File $record.Destination)) {
-                        throw "restored binary does not match its backup: $($record.Destination)"
+                        throw "restored file does not match its backup: $($record.Destination)"
                     }
                 } else {
                     if (Test-Path -LiteralPath $record.Destination) {
                         Remove-Item -Force -LiteralPath $record.Destination -ErrorAction Stop
                     }
                     if (Test-Path -LiteralPath $record.Destination) {
-                        throw "new binary remained after rollback: $($record.Destination)"
+                        throw "new file remained after rollback: $($record.Destination)"
                     }
                 }
             } catch {
@@ -174,13 +174,13 @@ function Install-BinarySet([object[]]$Plan, [bool]$Verify) {
                 }
             }
             $recovery = $recoveryActions -join "; "
-            $errorMessage = "binary install failed: $installError; "
+            $errorMessage = "package install failed: $installError; "
             $errorMessage += "rollback also failed: $($rollbackErrors -join '; '); "
             $errorMessage += "recovery backup preserved at '$transactionRoot'. "
             $errorMessage += "Stop running rmux processes, inspect the affected files, then manually $recovery"
             throw $errorMessage
         }
-        throw "binary install failed; previous binaries restored: $installError"
+        throw "package install failed; previous package restored: $installError"
     } finally {
         if (-not $preserveTransactionBackup) {
             Remove-Item -Recurse -Force -LiteralPath $transactionRoot -ErrorAction SilentlyContinue
@@ -245,7 +245,7 @@ function Install-PackageRoot([string]$PackageRoot, [string]$DestinationBin, [boo
         }
     }
 
-    $binaryPlan = @(
+    $installPlan = @(
         [pscustomobject]@{
             Source = Join-Path $PackageRoot "libexec\rmux\rmux.exe"
             Destination = Join-Path $installRoot "libexec\rmux\rmux.exe"
@@ -260,24 +260,36 @@ function Install-PackageRoot([string]$PackageRoot, [string]$DestinationBin, [boo
         }
     )
 
-    try {
-        Install-BinarySet $binaryPlan $Verify
-    } catch {
-        Fail $_.Exception.Message
+    $shareSource = Join-Path $PackageRoot "share"
+    if (Test-Path -LiteralPath $shareSource -PathType Container) {
+        Get-ChildItem -LiteralPath $shareSource -Recurse -File -Force |
+            Sort-Object FullName |
+            ForEach-Object {
+                $relative = $_.FullName.Substring($shareSource.Length)
+                $relative = $relative.TrimStart([char]'\', [char]'/')
+                $installPlan += [pscustomobject]@{
+                    Source = $_.FullName
+                    Destination = Join-Path (Join-Path $installRoot "share") $relative
+                }
+            }
     }
-
-    # Non-executable assets are installed only after the versioned binary set
-    # has committed successfully, so a locked daemon cannot leave mixed assets.
-    Copy-Tree (Join-Path $PackageRoot "share") (Join-Path $installRoot "share")
 
     foreach ($optional in @("README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1", "SHA256SUMS.txt")) {
         $source = Join-Path $PackageRoot $optional
         if (Test-Path -LiteralPath $source -PathType Leaf) {
-            Copy-Item -Force -LiteralPath $source -Destination (Join-Path $installRoot $optional)
+            $installPlan += [pscustomobject]@{
+                Source = $source
+                Destination = Join-Path $installRoot $optional
+            }
         }
     }
 
     $destination = Join-Path $installBin "rmux.exe"
+    try {
+        Install-PackageFileSet $installPlan $destination $Verify
+    } catch {
+        Fail $_.Exception.Message
+    }
 
     Write-Host "Installed rmux to $destination"
 

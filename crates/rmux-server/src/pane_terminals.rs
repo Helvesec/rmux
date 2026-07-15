@@ -82,9 +82,9 @@ pub(in crate::pane_terminals) use pane_lifecycle::{
 };
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
-#[cfg(test)]
-pub(crate) use pane_pipe::active_pipe_child_count_for_test;
 use pane_pipe::PanePipeStore;
+#[cfg(test)]
+pub(crate) use pane_pipe::{active_pipe_child_count_for_test, PipeProcessGroupProbe};
 use pane_terminal_store::PaneTerminalStore;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use pane_transcripts::PaneCaptureRequest;

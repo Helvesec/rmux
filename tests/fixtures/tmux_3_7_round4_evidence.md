@@ -25,10 +25,16 @@ empty stdout. RMUX exited 0 with stdout `8`.
 
 ## C-D39 split-window extension flags
 
-tmux accepted `split-window -k` with rc 0. For `split-window -m`, `-s`, `-S`,
-and `-R`, tmux parsed far enough to report `expects an argument`. RMUX reported
-`command split-window: unknown flag -k` and analogous unknown-flag errors for
-`-m`, `-s`, `-S`, and `-R`.
+The `split-window -k` behavior was re-probed on July 15, 2026 against tmux
+3.7b. With global `remain-on-exit` reporting `off`, an `exit 7` split created
+with `-k` remained listed with `pane_dead=1` and `pane_dead_status=7`;
+`show-options -p` reported `remain-on-exit key`. An otherwise identical split
+without `-k` disappeared. RMUX now pins that scoped behavior across direct CLI,
+`source-file`, and server-queue entry paths.
+
+For `split-window -m`, `-s`, `-S`, and `-R`, tmux parsed far enough to report
+`expects an argument`. RMUX continues to report analogous unknown-flag errors
+for those unimplemented surfaces.
 
 ## C-D40 list size ordering
 

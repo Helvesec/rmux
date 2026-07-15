@@ -13,6 +13,15 @@ pub struct SplitWindowResponse {
     pub pane: PaneTarget,
 }
 
+/// Atomic identity returned by the capability-gated SDK split endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitWindowIdentityResponse {
+    /// The newly created pane target using its visible `pane-base-index`.
+    pub pane: PaneTarget,
+    /// The newly created pane's stable daemon-lifetime identity.
+    pub pane_id: PaneId,
+}
+
 /// Response payload for `swap-pane`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapPaneResponse {

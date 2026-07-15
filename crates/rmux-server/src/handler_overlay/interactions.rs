@@ -311,7 +311,17 @@ impl RequestHandler {
                     .transpose()?
             };
             if let Some(receipt) = receipt {
-                receipt.wait().await?;
+                if receipt.wait().await.is_err() {
+                    // A synchronous ConPTY write can remain blocked when the
+                    // popup child stops reading. Retire only the popup whose
+                    // write failed so a concurrently installed replacement is
+                    // never cleared, and keep the attached client alive.
+                    self.clear_interactive_overlay_for_optional_identity_and_id(
+                        attach_pid, identity, popup.id, true,
+                    )
+                    .await
+                    .map_err(io::Error::other)?;
+                }
             }
         }
         Ok(true)

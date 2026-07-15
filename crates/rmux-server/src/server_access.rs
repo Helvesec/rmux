@@ -359,8 +359,23 @@ fn display_message_request_is_read_only(print: bool) -> bool {
 pub(crate) fn validate_server_access_request(
     request: &ServerAccessRequest,
 ) -> Result<(), RmuxError> {
+    if request.target.is_some() {
+        return Err(RmuxError::Server(
+            "command server-access: unknown flag -t".to_owned(),
+        ));
+    }
     if request.list {
         return Ok(());
+    }
+    if request.add && request.deny {
+        return Err(RmuxError::Server(
+            "-a and -d cannot be used together".to_owned(),
+        ));
+    }
+    if request.read_only && request.write {
+        return Err(RmuxError::Server(
+            "-r and -w cannot be used together".to_owned(),
+        ));
     }
     #[cfg(windows)]
     {

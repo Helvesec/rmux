@@ -45,6 +45,9 @@
 - Aligns compact-flag parsing, command aliases, source-file dispatch, and
   control-mode errors with the advertised command inventory instead of
   accepting flags that are later ignored.
+- Retains parse-time assignments while resolving a configured command alias,
+  including cold-start queues; tmux 3.7b rejects this ordering, so the scoped
+  RMUX extension is recorded as C-D62 rather than claimed as parity.
 - Preserves Windows PowerShell profile startup and recovers from incomplete
   tmux-wrapped terminal strings so the reported PowerShell and opencode paths
   remain live (issues #76 and #77).

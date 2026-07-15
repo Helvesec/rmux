@@ -363,13 +363,13 @@ $generatedAtUtc = GitOutput @("show", "-s", "--format=%cI", "HEAD")
 $metadata = [ordered]@{
     schema = 1
     artifact_kind = "windows-package-binary"
-    binary_path = $binaryAbs
+    binary_path = "rmux.exe"
     binary_sha256 = $binarySha256
     binary_bytes = $binaryBytes
-    helper_binary_path = $helperBinaryAbs
+    helper_binary_path = "libexec/rmux/rmux.exe"
     helper_binary_sha256 = $helperBinarySha256
     helper_binary_bytes = $helperBinaryBytes
-    daemon_binary_path = $daemonBinaryAbs
+    daemon_binary_path = "rmux-daemon.exe"
     daemon_binary_sha256 = $daemonBinarySha256
     daemon_binary_bytes = $daemonBinaryBytes
     rmux_version = $version

@@ -169,14 +169,17 @@ impl RequestHandler {
             )
             .await?;
 
-        let existing_popup = {
+        let existing_overlay_is_menu = {
             let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .get(&attach_pid)
-                .and_then(|active| active.overlay.clone())
+            matches!(
+                active_attach
+                    .by_pid
+                    .get(&attach_pid)
+                    .and_then(|active| active.overlay.as_ref()),
+                Some(ClientOverlayState::Menu(_))
+            )
         };
-        if matches!(existing_popup, Some(ClientOverlayState::Menu(_))) {
+        if existing_overlay_is_menu {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
@@ -189,7 +192,7 @@ impl RequestHandler {
             .build_display_popup_state(attach_pid, requester_pid, command, target)
             .await?;
 
-        let popup_identity = {
+        let (popup_identity, replaced_popup_job) = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -197,9 +200,22 @@ impl RequestHandler {
                 .ok_or_else(|| attached_client_required("display-popup"))?;
             active.overlay_state_id = active.overlay_state_id.saturating_add(1);
             popup.id = active.overlay_state_id;
-            active.overlay = Some(ClientOverlayState::Popup(Box::new(popup.clone())));
-            active.identity(attach_pid)
+            let replaced_popup_job = match active
+                .overlay
+                .replace(ClientOverlayState::Popup(Box::new(popup.clone())))
+            {
+                Some(ClientOverlayState::Popup(replaced)) => replaced.job,
+                Some(ClientOverlayState::Menu(_)) | None => None,
+            };
+            (active.identity(attach_pid), replaced_popup_job)
         };
+
+        // Termination may touch a PTY or schedule ConPTY teardown, so keep it
+        // outside the attach-state mutex. The old popup id can no longer match
+        // the replacement, which makes its waiter and reader callbacks stale.
+        if let Some(job) = replaced_popup_job {
+            job.terminate();
+        }
 
         if let Some(job) = popup.job.clone() {
             self.spawn_popup_waiter(popup_identity, popup.id, job.clone());

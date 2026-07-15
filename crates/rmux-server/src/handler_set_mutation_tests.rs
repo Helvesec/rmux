@@ -77,6 +77,87 @@ async fn set_option_updates_the_store_and_session_values_override_global() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn typed_and_named_default_shell_mutations_reject_unsuitable_paths() {
+    let handler = RequestHandler::new();
+    let invalid = "/definitely/missing/rmux-shell";
+    let expected = Response::Error(ErrorResponse {
+        error: RmuxError::Message(format!("not a suitable shell: {invalid}")),
+    });
+
+    assert_eq!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::DefaultShell,
+                value: invalid.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        expected
+    );
+    assert_eq!(
+        handler
+            .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+                scope: OptionScopeSelector::SessionGlobal,
+                name: "default-shell".to_owned(),
+                value: Some(invalid.to_owned()),
+                mode: SetOptionMode::Replace,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                format: false,
+                format_target: None,
+            })))
+            .await,
+        expected
+    );
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .options
+            .global_value(OptionName::DefaultShell),
+        None
+    );
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::DefaultShell,
+                value: "/bin/sh".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    assert_eq!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::DefaultShell,
+                value: ".invalid".to_owned(),
+                mode: SetOptionMode::Append,
+            }))
+            .await,
+        Response::Error(ErrorResponse {
+            error: RmuxError::Message("not a suitable shell: /bin/sh.invalid".to_owned()),
+        })
+    );
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .options
+            .global_value(OptionName::DefaultShell),
+        Some("/bin/sh")
+    );
+}
+
 #[tokio::test]
 async fn terminal_features_append_preserves_order_and_invalid_requests_fail_first() {
     let handler = RequestHandler::new();

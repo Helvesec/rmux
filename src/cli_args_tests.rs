@@ -65,6 +65,30 @@ fn help_dispatch_is_supported(name: &str) -> bool {
     }
 }
 
+#[test]
+fn direct_cli_rejects_unknown_options_before_command_tails() {
+    for (command, arguments) in [
+        ("wait-for", &["-Q"][..]),
+        ("pipe-pane", &["-Q", "true"][..]),
+        ("respawn-pane", &["-Q", "true"][..]),
+        ("bind-key", &["-Q", "X", "display-message", "ok"][..]),
+        ("display-panes", &["-Q", "select-pane -t %%"][..]),
+    ] {
+        let mut invocation = Vec::with_capacity(arguments.len() + 1);
+        invocation.push(command);
+        invocation.extend_from_slice(arguments);
+
+        let error = parse_args(&invocation).expect_err("unknown option must fail direct CLI parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("command {command}: unknown flag -Q")),
+            "unexpected direct CLI error for {command}: {error}"
+        );
+    }
+}
+
 #[path = "cli_args_tests/session_and_top_level.rs"]
 mod session_and_top_level;
 

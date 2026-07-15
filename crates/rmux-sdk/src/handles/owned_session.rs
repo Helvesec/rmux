@@ -1,5 +1,6 @@
 //! App-owned session guard.
 
+mod lease;
 mod signals;
 #[cfg(test)]
 mod tests;
@@ -7,27 +8,23 @@ mod tests;
 use std::future::{Future, IntoFuture};
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 
 use crate::transport::{DropGuard, TransportClient};
 use crate::{EnsureSession, Result, RmuxError, Session, SessionId, SessionName};
 use rmux_proto::{
-    CreateSessionLeaseRequest, KillSessionRequest, ReleaseSessionLeaseRequest,
-    RenewSessionLeaseRequest, Request, Response, CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
+    KillSessionRequest, Request, Response, CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
     CAPABILITY_SDK_SESSION_LEASE, CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
 };
 
 use super::Rmux;
+use lease::{validate_lease_ttl, OwnedSessionLease};
 pub use signals::OwnedSessionSignalHandlers;
 
 const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(5);
-const MIN_LEASE_RENEW_INTERVAL: Duration = Duration::from_millis(100);
-const MAX_LEASE_RENEW_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Cleanup policy for an [`OwnedSession`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
@@ -338,144 +335,6 @@ impl OwnedSession {
     }
 }
 
-#[derive(Debug)]
-struct OwnedSessionLease {
-    display_name: SessionName,
-    lease_target: SessionName,
-    token: u64,
-    transport: TransportClient,
-    task: JoinHandle<()>,
-    lost: Arc<AtomicBool>,
-    state_tx: watch::Sender<LeaseState>,
-}
-
-impl OwnedSessionLease {
-    async fn start(
-        session: &Session,
-        session_id: SessionId,
-        ttl: Duration,
-        operation_transport: &TransportClient,
-    ) -> Result<Self> {
-        let ttl_millis = ttl_millis(ttl)?;
-        let operation_transport = connect_lease_transport(session, operation_transport).await?;
-        crate::capabilities::require_with_handshake(
-            &operation_transport,
-            &[CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2],
-            &[
-                CAPABILITY_SDK_SESSION_LEASE,
-                CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
-            ],
-        )
-        .await?;
-        let lease_target = stable_session_target(session_id);
-        let response = operation_transport
-            .request(Request::CreateSessionLease(CreateSessionLeaseRequest {
-                session_name: lease_target.clone(),
-                ttl_millis,
-            }))
-            .await?;
-        let Response::CreateSessionLease(response) = response else {
-            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
-                "daemon returned unexpected response for session lease create".to_owned(),
-            )));
-        };
-
-        let token = response.token;
-        let transport = operation_transport.reusable();
-        let renew_transport = transport.clone();
-        let renew_session_name = lease_target.clone();
-        let lost = Arc::new(AtomicBool::new(false));
-        let renew_lost = Arc::clone(&lost);
-        let (state_tx, _) = watch::channel(LeaseState::Active);
-        let renew_state_tx = state_tx.clone();
-        let renew_interval = (ttl / 3).max(MIN_LEASE_RENEW_INTERVAL);
-        let task = tokio::spawn(async move {
-            let mut last_renew_success = tokio::time::Instant::now();
-            loop {
-                tokio::time::sleep(renew_interval).await;
-                let deadline = last_renew_success + ttl;
-                if !renew_lease_with_retries(
-                    &renew_transport,
-                    &renew_session_name,
-                    token,
-                    ttl_millis,
-                    deadline,
-                )
-                .await
-                {
-                    renew_lost.store(true, Ordering::Release);
-                    let _ = renew_state_tx.send(LeaseState::Lost);
-                    break;
-                }
-                last_renew_success = tokio::time::Instant::now();
-            }
-        });
-
-        Ok(Self {
-            display_name: session.name().clone(),
-            lease_target,
-            token,
-            transport,
-            task,
-            lost,
-            state_tx,
-        })
-    }
-
-    fn is_lost(&self) -> bool {
-        self.lost.load(Ordering::Acquire)
-    }
-
-    fn state(&self) -> LeaseState {
-        if self.is_lost() {
-            LeaseState::Lost
-        } else {
-            *self.state_tx.borrow()
-        }
-    }
-
-    fn subscribe(&self) -> watch::Receiver<LeaseState> {
-        self.state_tx.subscribe()
-    }
-
-    fn mark_not_leased(&self) {
-        let _ = self.state_tx.send(LeaseState::NotLeased);
-    }
-
-    async fn release_confirmed(&self) -> Result<bool> {
-        if self.is_lost() {
-            return Err(self.lost_error());
-        }
-
-        let response = self
-            .transport
-            .request(Request::ReleaseSessionLease(ReleaseSessionLeaseRequest {
-                session_name: self.lease_target.clone(),
-                token: self.token,
-            }))
-            .await?;
-        let Response::ReleaseSessionLease(response) = response else {
-            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
-                "daemon returned unexpected response for session lease release".to_owned(),
-            )));
-        };
-        if response.released {
-            self.mark_not_leased();
-            Ok(true)
-        } else {
-            self.lost.store(true, Ordering::Release);
-            let _ = self.state_tx.send(LeaseState::Lost);
-            Err(self.lost_error())
-        }
-    }
-
-    fn lost_error(&self) -> RmuxError {
-        RmuxError::from(rmux_proto::RmuxError::owned_session_lease_lost(
-            self.display_name.clone(),
-        ))
-    }
-}
-
 async fn rollback_owned_session_creation(
     session_id: SessionId,
     source_error: RmuxError,
@@ -531,97 +390,6 @@ async fn kill_session_identity_on_transport(
     }
 }
 
-async fn renew_lease_with_retries(
-    transport: &TransportClient,
-    session_name: &SessionName,
-    token: u64,
-    ttl_millis: u64,
-    deadline: tokio::time::Instant,
-) -> bool {
-    let mut delay = MIN_LEASE_RENEW_INTERVAL;
-
-    loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        match tokio::time::timeout_at(
-            deadline,
-            renew_lease_once(transport, session_name, token, ttl_millis),
-        )
-        .await
-        {
-            Err(_) => return false,
-            Ok(Ok(true)) => return true,
-            Ok(Ok(false)) => return false,
-            Ok(Err(_)) => {
-                let now = tokio::time::Instant::now();
-                if now >= deadline {
-                    return false;
-                }
-                let remaining = deadline - now;
-                tokio::time::sleep(delay.min(remaining)).await;
-                delay = delay
-                    .saturating_add(delay)
-                    .min(MAX_LEASE_RENEW_RETRY_INTERVAL);
-            }
-        }
-    }
-}
-
-async fn connect_lease_transport(
-    session: &Session,
-    operation_transport: &TransportClient,
-) -> Result<TransportClient> {
-    // Unit fixtures use an in-memory transport and no connectable endpoint.
-    // Public SDK handles always retain the resolved endpoint, and integration
-    // tests exercise this production branch through a real local listener.
-    #[cfg(test)]
-    if session.transport().is_fixture_transport() {
-        return Ok(operation_transport.clone());
-    }
-
-    let timeout =
-        crate::bootstrap::discovery::resolve_timeout(None, session.configured_default_timeout());
-    let deadline = operation_transport
-        .operation_deadline()
-        .unwrap_or_else(|| crate::transport::OperationDeadline::from_timeout(timeout));
-    let transport =
-        super::connect_transport_to_endpoint(session.endpoint(), deadline.remaining_timeout())
-            .await?;
-    Ok(transport
-        .with_default_timeout(timeout)
-        .with_operation_deadline(deadline))
-}
-
-async fn renew_lease_once(
-    transport: &TransportClient,
-    session_name: &SessionName,
-    token: u64,
-    ttl_millis: u64,
-) -> Result<bool> {
-    match transport
-        .request(Request::RenewSessionLease(RenewSessionLeaseRequest {
-            session_name: session_name.clone(),
-            token,
-            ttl_millis,
-        }))
-        .await?
-    {
-        Response::RenewSessionLease(response) => Ok(response.renewed),
-        response => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "daemon returned `{}` response for session lease renew",
-            response.command_name()
-        )))),
-    }
-}
-
-impl Drop for OwnedSessionLease {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
 impl Deref for OwnedSession {
     type Target = Session;
 
@@ -645,34 +413,4 @@ impl Drop for OwnedSession {
         let guard = DropGuard::best_effort(session.transport().clone(), request);
         drop(guard);
     }
-}
-
-fn ttl_millis(ttl: Duration) -> Result<u64> {
-    validate_lease_ttl(ttl)?;
-    let millis = u64::try_from(ttl.as_millis()).map_err(|_| {
-        RmuxError::protocol(rmux_proto::RmuxError::Server(
-            "owned session lease ttl is too large".to_owned(),
-        ))
-    })?;
-    Ok(millis)
-}
-
-fn validate_lease_ttl(ttl: Duration) -> Result<()> {
-    let millis = u64::try_from(ttl.as_millis()).map_err(|_| {
-        RmuxError::protocol(rmux_proto::RmuxError::Server(
-            "owned session lease ttl is too large".to_owned(),
-        ))
-    })?;
-    if millis == 0 {
-        return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
-            "owned session lease ttl must be greater than zero".to_owned(),
-        )));
-    }
-    if millis < rmux_proto::MIN_SESSION_LEASE_TTL_MILLIS {
-        return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "owned session lease ttl must be at least {}ms",
-            rmux_proto::MIN_SESSION_LEASE_TTL_MILLIS
-        ))));
-    }
-    Ok(())
 }

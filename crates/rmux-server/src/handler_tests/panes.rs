@@ -157,6 +157,73 @@ async fn target_action_split_and_resize_resolve_raw_targets_server_side() {
 }
 
 #[tokio::test]
+async fn sdk_split_identity_returns_visible_base_index_and_stable_id_atomically() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::PaneBaseIndex,
+                value: "5".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    let response = handler
+        .handle(Request::SplitWindowIdentity(Box::new(
+            SplitWindowIdentityRequest {
+                action: SplitWindowTargetActionRequest {
+                    target: Some("alpha:0.5".to_owned()),
+                    direction: rmux_proto::SplitDirection::Vertical,
+                    before: false,
+                    environment: None,
+                    command: None,
+                    process_command: None,
+                    start_directory: None,
+                    keep_alive_on_exit: None,
+                    detached: false,
+                    size: None,
+                    preserve_zoom: false,
+                    full_size: false,
+                    stdin_payload: None,
+                },
+            },
+        )))
+        .await;
+
+    let Response::SplitWindowIdentity(identity) = response else {
+        panic!("expected atomic split identity response, got {response:?}");
+    };
+    assert_eq!(identity.pane, PaneTarget::new(alpha.clone(), 6));
+
+    let state = handler.state.lock().await;
+    let pane_id = state
+        .sessions
+        .session(&alpha)
+        .expect("session exists")
+        .window()
+        .pane(1)
+        .expect("new raw pane index exists")
+        .id();
+    assert_eq!(identity.pane_id, pane_id);
+}
+
+#[tokio::test]
 async fn select_pane_style_sets_pane_style_and_format_colours() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

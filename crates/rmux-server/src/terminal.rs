@@ -17,6 +17,8 @@ mod shell_spec;
 
 #[cfg(windows)]
 use shell_resolver::cmd_shell_path;
+#[cfg(unix)]
+pub(crate) use shell_resolver::is_suitable_shell;
 #[cfg(windows)]
 use shell_resolver::CLIENT_SHELL_ENV;
 use shell_resolver::{resolve_program_path_from, resolve_shell_path};

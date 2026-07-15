@@ -70,16 +70,19 @@ fn display_message_rejects_multiple_message_arguments() {
 }
 
 #[test]
-fn display_message_accepts_compact_delay_flag() {
-    let cli = parse_args(&["display-message", "-d0", "-p", "hello"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::DisplayMessage(args) => {
-            assert_eq!(args.delay.as_deref(), Some("0"));
-            assert!(args.print);
-            assert_eq!(args.message, vec!["hello"]);
-        }
-        _ => panic!("expected DisplayMessage command"),
+fn display_message_rejects_unimplemented_delay_and_no_format_flags() {
+    for (arguments, flag) in [
+        (&["display-message", "-d0", "-p", "hello"][..], "-d"),
+        (&["display-message", "-pN", "hello"][..], "-N"),
+    ] {
+        let error = parse_args(arguments).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("command display-message: unknown flag {flag}")),
+            "unexpected error for {arguments:?}: {error}"
+        );
     }
 }
 

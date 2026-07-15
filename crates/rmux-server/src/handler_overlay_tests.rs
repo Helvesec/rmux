@@ -595,6 +595,62 @@ async fn stale_same_pid_popup_callbacks_cannot_mutate_replacement_popup() {
 }
 
 #[tokio::test]
+async fn replacing_a_job_backed_popup_terminates_its_child() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-replacement-terminates-child");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -T Old -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+    let old_job = {
+        let active_attach = handler.active_attach.lock().await;
+        let Some(ClientOverlayState::Popup(popup)) =
+            active_attach.by_pid[&requester_pid].overlay.as_ref()
+        else {
+            panic!("expected old popup");
+        };
+        popup.job.clone().expect("old popup should own a job")
+    };
+    let cleanup_job = old_job.clone();
+    let _cleanup = PopupJobCleanup::new(move || cleanup_job.terminate());
+    assert!(
+        old_job.child_is_running_for_test(),
+        "the regression requires a live old popup process"
+    );
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -E -T Replacement -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+    let replacement_frame = next_overlay_frame(&mut control_rx).await;
+    assert!(
+        String::from_utf8_lossy(&replacement_frame.frame).contains("Replacement"),
+        "replacement popup should remain active"
+    );
+
+    timeout(Duration::from_secs(2), async {
+        while old_job.child_is_running_for_test() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replaced popup child should be terminated and reaped");
+
+    handler
+        .clear_interactive_overlay(requester_pid, true)
+        .await
+        .expect("replacement popup cleanup");
+}
+
+#[tokio::test]
 async fn rename_session_rekeys_menu_and_popup_targets_before_they_handle_input() {
     let handler = RequestHandler::new();
     let alpha = session_name("overlay-rename-alpha");
@@ -1011,7 +1067,7 @@ async fn display_menu_extended_key_partial_is_bounded_without_pane_leak() {
 }
 
 #[tokio::test]
-async fn popup_key_write_does_not_stall_other_server_work() {
+async fn blocked_popup_key_write_times_out_without_stalling_attach_or_server() {
     let handler = RequestHandler::new();
     let alpha = session_name("popup-blocking-writer");
     let requester_pid = std::process::id();
@@ -1065,20 +1121,22 @@ async fn popup_key_write_does_not_stall_other_server_work() {
     )
     .await;
 
-    release.release();
-
     writer_started
         .expect("popup writer should receive the key")
         .expect("popup writer start signal should remain connected");
-    let input_result = timeout(Duration::from_secs(2), input_task)
+    let input_result = timeout(Duration::from_secs(1), input_task)
         .await
-        .expect("popup key input should finish after writer release")
+        .expect("popup key input should finish at the I/O deadline")
         .expect("popup key input task should not panic");
-    input_result.expect("popup key input should succeed");
-    handler
-        .clear_interactive_overlay(requester_pid, true)
-        .await
-        .expect("popup cleanup");
+    input_result.expect("popup key timeout should not disconnect the attached client");
+    {
+        let active_attach = handler.active_attach.lock().await;
+        assert!(
+            active_attach.by_pid[&requester_pid].overlay.is_none(),
+            "the blocked popup should be retired after its I/O deadline"
+        );
+    }
+    release.release();
     assert!(
         matches!(&progress, Ok(Response::ListSessions(_))),
         "a blocked popup writer must not prevent unrelated server work: {progress:?}"

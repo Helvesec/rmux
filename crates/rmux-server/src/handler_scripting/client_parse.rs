@@ -461,7 +461,6 @@ pub(super) fn parse_server_access(mut args: CommandTokens) -> Result<Request, Rm
     let mut list = false;
     let mut read_only = false;
     let mut write = false;
-    let mut target = None;
 
     while let Some(token) = args.peek().map(str::to_owned) {
         match token.as_str() {
@@ -490,8 +489,7 @@ pub(super) fn parse_server_access(mut args: CommandTokens) -> Result<Request, Rm
                 write = true;
             }
             "-t" => {
-                let _ = args.optional();
-                target = Some(args.required("-t target-pane")?);
+                return Err(unsupported_flag("server-access", "-t"));
             }
             _ => {
                 let Some(cluster) = parse_compact_flag_cluster(&token, "adlrw", "t") else {
@@ -521,8 +519,8 @@ pub(super) fn parse_server_access(mut args: CommandTokens) -> Result<Request, Rm
                         CompactFlag::Bare('l') => list = true,
                         CompactFlag::Bare('r') => read_only = true,
                         CompactFlag::Bare('w') => write = true,
-                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
-                            target = Some(compact_flag.value_or_next(&mut args, "-t target-pane")?);
+                        CompactFlag::Value { flag: 't', .. } => {
+                            return Err(unsupported_flag("server-access", "-t"));
                         }
                         _ => unreachable!("compact server-access flags are prevalidated"),
                     }
@@ -534,13 +532,24 @@ pub(super) fn parse_server_access(mut args: CommandTokens) -> Result<Request, Rm
     let user = args.optional();
     args.no_extra("server-access")?;
 
+    if !list && add && deny {
+        return Err(RmuxError::Server(
+            "-a and -d cannot be used together".to_owned(),
+        ));
+    }
+    if !list && read_only && write {
+        return Err(RmuxError::Server(
+            "-r and -w cannot be used together".to_owned(),
+        ));
+    }
+
     Ok(Request::ServerAccess(rmux_proto::ServerAccessRequest {
         add,
         deny,
         list,
         read_only,
         write,
-        target,
+        target: None,
         user,
     }))
 }

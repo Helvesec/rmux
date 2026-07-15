@@ -10,9 +10,15 @@ from pathlib import Path
 
 
 LEDGER = Path("docs/compat/tmux-3.7-divergences.md")
-COMMAND_INVENTORY = Path("src/cli/command_inventory.rs")
-OPTIONS_REGISTRY = Path("crates/rmux-core/src/options/registry.rs")
+COMMAND_INVENTORY = Path("crates/rmux-core/src/command_inventory/signatures.rs")
+OPTIONS_REGISTRY = Path("crates/rmux-core/src/options/table.rs")
 GITIGNORED_AUDIT_REFERENCE = ".rmux-audit/"
+PRODUCT_DIVERGENCE_TEST = re.compile(
+    r"(?m)^\s*(?:async\s+)?fn\s+([A-Za-z][A-Za-z0-9_]*_product_divergence)\s*\("
+)
+PRODUCT_DIVERGENCE_REFERENCE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9_]*_product_divergence)\b"
+)
 TRACKED_REFERENCE_PREFIXES = (
     "benches/",
     "crates/",
@@ -90,6 +96,71 @@ def require_entry(entries: dict[str, str], entry_id: str) -> str:
         raise AssertionError(f"missing ledger entry {entry_id}") from None
 
 
+def tracked_rust_sources() -> list[Path]:
+    result = subprocess.run(
+        ["git", "ls-files", "--", "*.rs"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return [Path(line) for line in result.stdout.splitlines() if line]
+
+
+def product_divergence_tests() -> dict[str, Path]:
+    tests: dict[str, Path] = {}
+    for path in tracked_rust_sources():
+        source = path.read_text(encoding="utf-8")
+        for name in PRODUCT_DIVERGENCE_TEST.findall(source):
+            previous = tests.get(name)
+            if previous is not None:
+                raise ValueError(
+                    f"duplicate product-divergence test {name}: {previous} and {path}"
+                )
+            tests[name] = path
+    return tests
+
+
+def test_fixture_block(entry: str) -> str:
+    _, separator, evidence = entry.partition("Test/fixture:")
+    if not separator:
+        return ""
+    return evidence.partition("Inventory impact:")[0]
+
+
+def validate_product_divergence_ledger(entries: dict[str, str]) -> tuple[int, str | None]:
+    try:
+        tests = product_divergence_tests()
+    except (OSError, subprocess.CalledProcessError, ValueError) as error:
+        return 0, f"cannot inventory tracked product-divergence tests: {error}"
+
+    references: dict[str, set[str]] = {}
+    for entry_id, block in entries.items():
+        fixture = test_fixture_block(block)
+        if "..._product_divergence" in fixture:
+            return 0, f"{LEDGER}: {entry_id} uses a non-auditable product-divergence wildcard"
+        for name in PRODUCT_DIVERGENCE_REFERENCE.findall(fixture):
+            references.setdefault(name, set()).add(entry_id)
+
+    for name, path in tests.items():
+        entry_ids = references.get(name, set())
+        if not entry_ids:
+            return 0, f"{LEDGER}: tracked test {path}::{name} has no ledger entry"
+        if len(entry_ids) != 1:
+            joined = ", ".join(sorted(entry_ids))
+            return 0, f"{LEDGER}: tracked test {name} is cited by multiple entries: {joined}"
+        entry_id = next(iter(entry_ids))
+        fixture = test_fixture_block(entries[entry_id])
+        if str(path) not in fixture:
+            return 0, (
+                f"{LEDGER}: {entry_id} cites {name} without its tracked source {path}"
+            )
+
+    stale = sorted(set(references).difference(tests))
+    if stale:
+        return 0, f"{LEDGER}: stale product-divergence test reference(s): {', '.join(stale)}"
+    return len(tests), None
+
+
 def main() -> int:
     ledger = LEDGER.read_text(encoding="utf-8")
     inventory = COMMAND_INVENTORY.read_text(encoding="utf-8")
@@ -128,6 +199,10 @@ def main() -> int:
         if "Inventory impact:" not in block:
             return fail(f"{LEDGER}: {entry_id} has no Inventory impact line")
 
+    product_divergence_count, error = validate_product_divergence_ledger(entries)
+    if error is not None:
+        return fail(error)
+
     try:
         deferred_floating = require_entry(entries, "C-D32")
         copy_line_numbers = require_entry(entries, "C-D34")
@@ -144,10 +219,13 @@ def main() -> int:
     if "copy-mode-line-numbers" in options:
         if "copy-mode-line-numbers" not in copy_line_numbers:
             return fail(f"{LEDGER}: C-D34 must mention copy-mode-line-numbers")
-        if "line-number gutter rendering" not in copy_line_numbers:
+        if re.search(r"line-number gutter\s+rendering", copy_line_numbers) is None:
             return fail(f"{LEDGER}: C-D34 must bound line-number gutter rendering claims")
 
-    print(f"tmux-release-ledger=ok entries={len(entries)}")
+    print(
+        "tmux-release-ledger=ok "
+        f"entries={len(entries)} product_divergence_tests={product_divergence_count}"
+    )
     return 0
 
 

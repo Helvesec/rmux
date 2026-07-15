@@ -14,26 +14,25 @@ pub(super) async fn dispatch_without_unbounded_caller_wait(
     item: LifecycleDispatchItem,
     completion: oneshot::Receiver<()>,
 ) {
-    let (caller_release, caller_wait) = oneshot::channel();
-    tokio::spawn(async move {
-        match dispatch.send_if_active(item).await {
-            Ok(true) => {
-                let _ = completion.await;
-            }
-            Ok(false) => {}
-            Err(_) => warn!("lifecycle dispatch queue closed before ordered hook completed"),
+    let deadline = tokio::time::Instant::now() + ORDERED_LIFECYCLE_CALLER_WAIT;
+    match tokio::time::timeout_at(deadline, dispatch.send_if_active(item)).await {
+        Ok(Ok(true)) => {
+            // The queue owns the accepted event, so dropping this receiver at
+            // the caller deadline cannot cancel the hook. It only stops the
+            // latency-sensitive caller from waiting for completion.
+            let _ = tokio::time::timeout_at(deadline, completion).await;
         }
-        let _ = caller_release.send(());
-    });
-
-    // Dropping a timed-out future that owns `send_if_active` would cancel the FIFO
-    // enqueue, while dropping `completion` would make a running hook appear done.
-    // Keep both in the detached task and bound only the latency-sensitive caller.
-    let _ = tokio::time::timeout(ORDERED_LIFECYCLE_CALLER_WAIT, caller_wait).await;
+        Ok(Ok(false)) => {}
+        Ok(Err(_)) => warn!("lifecycle dispatch queue closed before ordered hook completed"),
+        Err(_) => {
+            warn!("lifecycle dispatch queue remained saturated; dropping ordered hook at admission")
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use rmux_core::LifecycleEvent;
@@ -44,6 +43,8 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::super::prepare_lifecycle_event;
+    use super::super::LifecycleDispatchItem;
+    use crate::handler::lifecycle_dispatch_queue::BoundedDispatchQueue;
     use crate::handler::RequestHandler;
 
     fn session_name(value: &str) -> SessionName {
@@ -176,7 +177,48 @@ mod tests {
         assert_eq!(
             handler.wait_for_counts("ordered-lifecycle-block"),
             (0, 0, false),
-            "shutdown drains the detached hook and its completion"
+            "shutdown drains the queued hook and its completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_ordered_dispatch_drops_at_admission_without_a_detached_sender() {
+        let handler = RequestHandler::new();
+        let session = create_session(&handler, "ordered-saturated-hook").await;
+        let dispatch = Arc::new(BoundedDispatchQueue::new(1));
+        let mut receiver = dispatch.activate().expect("test owns queue receiver");
+
+        dispatch
+            .send_if_active(LifecycleDispatchItem {
+                event: prepared_focus_event(&handler, session.clone()).await,
+                completion: None,
+            })
+            .await
+            .expect("fill bounded dispatch queue");
+
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let started = tokio::time::Instant::now();
+        super::dispatch_without_unbounded_caller_wait(
+            Arc::clone(&dispatch),
+            LifecycleDispatchItem {
+                event: prepared_focus_event(&handler, session).await,
+                completion: Some(completion_tx),
+            },
+            completion_rx,
+        )
+        .await;
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= super::ORDERED_LIFECYCLE_CALLER_WAIT && elapsed < Duration::from_secs(2),
+            "queue admission must respect the bounded caller budget: {elapsed:?}"
+        );
+        assert!(receiver.recv().await.is_some(), "filler remains queued");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), receiver.recv())
+                .await
+                .is_err(),
+            "timed-out admission must not survive in a detached sender task"
         );
     }
 }
