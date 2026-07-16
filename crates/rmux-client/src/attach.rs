@@ -12,12 +12,13 @@ use std::time::{Duration, Instant};
 
 use rmux_proto::{
     decode_attach_data_frame, encode_attach_data, encode_attach_data_into_slice,
-    encode_attach_message, AttachFrameDecoder, AttachMessage, RmuxError, TerminalGeometry,
-    TerminalSize, ATTACH_DATA_HEADER_LEN,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand, RmuxError,
+    TerminalGeometry, TerminalSize, ATTACH_DATA_HEADER_LEN,
 };
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::process::{kill_process, Signal};
 
+use crate::attach_lock_state::AttachLockState;
 use crate::ClientError;
 
 #[path = "attach/render_drain.rs"]
@@ -168,6 +169,22 @@ struct AttachStreamState<'a> {
     resize_geometry_enabled: bool,
 }
 
+struct AttachInputReadLease<'a> {
+    state: &'a AttachLockState,
+}
+
+impl<'a> AttachInputReadLease<'a> {
+    fn acquire(state: &'a AttachLockState) -> Option<Self> {
+        state.begin_input_read().then_some(Self { state })
+    }
+}
+
+impl Drop for AttachInputReadLease<'_> {
+    fn drop(&mut self) {
+        self.state.finish_input_read();
+    }
+}
+
 fn drive_attach_with_terminal_state<Terminal, Input, Output>(
     state: AttachTerminalState<'_, Terminal>,
     input: Input,
@@ -250,7 +267,7 @@ where
     let closed = Arc::new(AtomicBool::new(false));
     let input_closed = Arc::clone(&closed);
     let output_closed = Arc::clone(&closed);
-    let locked = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
     let input_locked = Arc::clone(&locked);
     let output_locked = Arc::clone(&locked);
     let (event_tx, event_rx) = mpsc::channel();
@@ -287,12 +304,14 @@ where
         &mut lock_stream,
         &locked,
         event_rx,
-    )?;
+    );
+    locked.close();
     closed.store(true, Ordering::SeqCst);
     let _ = control.shutdown(Shutdown::Both);
     let _ = input_wakeup.shutdown(Shutdown::Both);
     let input_result = join_attach_thread(input_thread)?;
 
+    let output_result = output_result?;
     output_result?;
     input_result
 }
@@ -317,7 +336,7 @@ fn input_loop<Input>(
     resize_events: mpsc::Receiver<TerminalGeometry>,
     resize_geometry_enabled: bool,
     closed: Arc<AtomicBool>,
-    locked: Arc<AtomicBool>,
+    locked: Arc<AttachLockState>,
     wakeup: UnixStream,
 ) -> std::result::Result<(), ClientError>
 where
@@ -331,7 +350,7 @@ where
         }
 
         drain_resize_events(&mut stream, &resize_events, resize_geometry_enabled)?;
-        if locked.load(Ordering::SeqCst) {
+        if locked.is_locked() {
             thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -351,6 +370,13 @@ where
             return Ok(());
         }
 
+        // The server can request a lock or suspend while this thread is
+        // asleep in poll. Recheck after the wakeup and before touching the
+        // shared terminal input so the lock command remains the sole reader.
+        if locked.is_locked() {
+            continue;
+        }
+
         let ready = fds[0].revents();
         if ready.is_empty() {
             continue;
@@ -365,6 +391,10 @@ where
             }
             continue;
         }
+
+        let Some(_input_read_lease) = AttachInputReadLease::acquire(&locked) else {
+            continue;
+        };
 
         let bytes_read = match input.read(&mut read_buffer) {
             Ok(0) => {
@@ -385,7 +415,7 @@ fn output_loop<Output>(
     initial_bytes: Vec<u8>,
     mut output: Output,
     closed: Arc<AtomicBool>,
-    locked: Arc<AtomicBool>,
+    locked: Arc<AttachLockState>,
     screen_tracker: AttachScreenTracker,
     event_tx: mpsc::Sender<ClientAttachEvent>,
 ) -> std::result::Result<(), ClientError>
@@ -413,18 +443,7 @@ where
                     &mut pending_render,
                     &mut pending_render_started_at,
                 )?;
-                if matches!(
-                    handle_attach_data_payload(
-                        &mut output,
-                        &locked,
-                        &closed,
-                        &mut stop_detector,
-                        bytes,
-                    )?,
-                    AttachDataPayloadOutcome::Stop
-                ) {
-                    return Ok(());
-                }
+                handle_attach_data_payload(&mut output, &locked, &mut stop_detector, bytes)?;
             }
 
             let Some(message) = decoder.next_message().map_err(ClientError::from)? else {
@@ -437,21 +456,10 @@ where
                         &mut pending_render,
                         &mut pending_render_started_at,
                     )?;
-                    if matches!(
-                        handle_attach_data_payload(
-                            &mut output,
-                            &locked,
-                            &closed,
-                            &mut stop_detector,
-                            &bytes,
-                        )?,
-                        AttachDataPayloadOutcome::Stop
-                    ) {
-                        return Ok(());
-                    }
+                    handle_attach_data_payload(&mut output, &locked, &mut stop_detector, &bytes)?;
                 }
                 AttachMessage::Render(bytes) => {
-                    if locked.load(Ordering::SeqCst) {
+                    if locked.is_locked() {
                         continue;
                     }
                     if pending_render.is_none() {
@@ -487,7 +495,7 @@ where
                         &mut pending_render,
                         &mut pending_render_started_at,
                     )?;
-                    locked.store(true, Ordering::SeqCst);
+                    locked.lock();
                     send_attach_action(&event_tx, ClientAttachAction::Lock(command))?;
                 }
                 AttachMessage::LockShellCommand(command) => {
@@ -496,11 +504,8 @@ where
                         &mut pending_render,
                         &mut pending_render_started_at,
                     )?;
-                    locked.store(true, Ordering::SeqCst);
-                    send_attach_action(
-                        &event_tx,
-                        ClientAttachAction::Lock(command.command().to_owned()),
-                    )?;
+                    locked.lock();
+                    send_attach_action(&event_tx, ClientAttachAction::LockShell(command))?;
                 }
                 AttachMessage::Suspend => {
                     flush_pending_render_state(
@@ -508,7 +513,7 @@ where
                         &mut pending_render,
                         &mut pending_render_started_at,
                     )?;
-                    locked.store(true, Ordering::SeqCst);
+                    locked.lock();
                     send_attach_action(&event_tx, ClientAttachAction::Suspend)?;
                 }
                 AttachMessage::DetachKill => {
@@ -538,10 +543,7 @@ where
                         &mut pending_render_started_at,
                     )?;
                     closed.store(true, Ordering::SeqCst);
-                    send_attach_action(
-                        &event_tx,
-                        ClientAttachAction::DetachExec(command.command().to_owned()),
-                    )?;
+                    send_attach_action(&event_tx, ClientAttachAction::DetachExecShell(command))?;
                     return Ok(());
                 }
                 AttachMessage::Unlock => {
@@ -626,18 +628,12 @@ where
                 else {
                     break;
                 };
-                if matches!(
-                    handle_attach_data_payload(
-                        &mut output,
-                        &locked,
-                        &closed,
-                        &mut stop_detector,
-                        frame.payload(),
-                    )?,
-                    AttachDataPayloadOutcome::Stop
-                ) {
-                    return Ok(());
-                }
+                handle_attach_data_payload(
+                    &mut output,
+                    &locked,
+                    &mut stop_detector,
+                    frame.payload(),
+                )?;
                 consumed += frame.frame_len();
             }
         }
@@ -647,33 +643,22 @@ where
     }
 }
 
-enum AttachDataPayloadOutcome {
-    Continue,
-    Stop,
-}
-
 fn handle_attach_data_payload<Output>(
     output: &mut Output,
-    locked: &Arc<AtomicBool>,
-    closed: &Arc<AtomicBool>,
+    locked: &Arc<AttachLockState>,
     stop_detector: &mut AttachStopDetector,
     bytes: &[u8],
-) -> std::result::Result<AttachDataPayloadOutcome, ClientError>
+) -> std::result::Result<(), ClientError>
 where
     Output: Write,
 {
-    let observation = stop_detector.observe(bytes);
-    let attach_done = observation.attach_done();
-    if locked.load(Ordering::SeqCst) {
-        return Ok(AttachDataPayloadOutcome::Continue);
+    stop_detector.observe(bytes);
+    if locked.is_locked() {
+        return Ok(());
     }
     output.write_all(bytes).map_err(ClientError::Io)?;
     output.flush().map_err(ClientError::Io)?;
-    if attach_done {
-        closed.store(true, Ordering::SeqCst);
-        return Ok(AttachDataPayloadOutcome::Stop);
-    }
-    Ok(AttachDataPayloadOutcome::Continue)
+    Ok(())
 }
 
 fn pending_render_expired(started_at: Option<Instant>) -> bool {
@@ -710,7 +695,7 @@ fn wait_for_output_thread(
     output_thread: thread::JoinHandle<std::result::Result<(), ClientError>>,
     raw_terminal: Option<&RawTerminal>,
     lock_stream: &mut UnixStream,
-    locked: &Arc<AtomicBool>,
+    locked: &Arc<AttachLockState>,
     event_rx: mpsc::Receiver<ClientAttachEvent>,
 ) -> std::result::Result<std::result::Result<(), ClientError>, ClientError> {
     while let Ok(ClientAttachEvent::Action(action)) = event_rx.recv() {
@@ -741,35 +726,54 @@ fn send_attach_action(
 fn handle_attach_action(
     raw_terminal: Option<&RawTerminal>,
     lock_stream: &mut UnixStream,
-    locked: &Arc<AtomicBool>,
+    locked: &Arc<AttachLockState>,
     action: ClientAttachAction,
 ) -> std::result::Result<(), ClientError> {
     match action {
         ClientAttachAction::Lock(command) => {
+            locked.wait_until_input_idle();
             let Some(raw_terminal) = raw_terminal else {
-                locked.store(false, Ordering::SeqCst);
+                locked.unlock();
                 return Err(ClientError::Protocol(RmuxError::Decode(
                     "received unexpected lock request without a managed terminal".to_owned(),
                 )));
             };
-            raw_terminal
+            let result = raw_terminal
                 .run_lock_command(&command)
-                .map_err(ClientError::from)?;
-            write_attach_message(lock_stream, AttachMessage::Unlock)?;
-            locked.store(false, Ordering::SeqCst);
-            Ok(())
+                .map_err(ClientError::from)
+                .and_then(|()| write_attach_message(lock_stream, AttachMessage::Unlock));
+            locked.unlock();
+            result
+        }
+        ClientAttachAction::LockShell(command) => {
+            locked.wait_until_input_idle();
+            let Some(raw_terminal) = raw_terminal else {
+                locked.unlock();
+                return Err(ClientError::Protocol(RmuxError::Decode(
+                    "received unexpected lock request without a managed terminal".to_owned(),
+                )));
+            };
+            let result = raw_terminal
+                .run_lock_shell_command(&command)
+                .map_err(ClientError::from)
+                .and_then(|()| write_attach_message(lock_stream, AttachMessage::Unlock));
+            locked.unlock();
+            result
         }
         ClientAttachAction::Suspend => {
+            locked.wait_until_input_idle();
             let Some(raw_terminal) = raw_terminal else {
-                locked.store(false, Ordering::SeqCst);
+                locked.unlock();
                 return Err(ClientError::Protocol(RmuxError::Decode(
                     "received unexpected suspend request without a managed terminal".to_owned(),
                 )));
             };
-            raw_terminal.suspend_self().map_err(ClientError::from)?;
-            write_attach_message(lock_stream, AttachMessage::Unlock)?;
-            locked.store(false, Ordering::SeqCst);
-            Ok(())
+            let result = raw_terminal
+                .suspend_self()
+                .map_err(ClientError::from)
+                .and_then(|()| write_attach_message(lock_stream, AttachMessage::Unlock));
+            locked.unlock();
+            result
         }
         ClientAttachAction::DetachKill => {
             if let Some(raw_terminal) = raw_terminal {
@@ -787,6 +791,16 @@ fn handle_attach_action(
             };
             raw_terminal
                 .run_detach_exec_command(&command)
+                .map_err(ClientError::from)
+        }
+        ClientAttachAction::DetachExecShell(command) => {
+            let Some(raw_terminal) = raw_terminal else {
+                return Err(ClientError::Protocol(RmuxError::Decode(
+                    "received unexpected detach exec request without a managed terminal".to_owned(),
+                )));
+            };
+            raw_terminal
+                .run_detach_exec_shell_command(&command)
                 .map_err(ClientError::from)
         }
     }
@@ -850,9 +864,11 @@ fn shutdown_attach_writes(stream: &UnixStream) -> std::result::Result<(), Client
 #[derive(Debug)]
 enum ClientAttachAction {
     Lock(String),
+    LockShell(AttachShellCommand),
     Suspend,
     DetachKill,
     DetachExec(String),
+    DetachExecShell(AttachShellCommand),
 }
 
 #[derive(Debug)]

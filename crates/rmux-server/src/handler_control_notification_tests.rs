@@ -1,8 +1,8 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::RequestHandler;
-use crate::control::{ControlModeUpgrade, ControlServerEvent};
+use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use rmux_proto::{
     ControlMode, DeleteBufferRequest, DetachClientRequest, DisplayMessageRequest, HookLifecycle,
     HookName, KillSessionRequest, KillWindowRequest, NewSessionRequest, NewWindowRequest,
@@ -60,12 +60,13 @@ async fn register_control_client(
     handler: &RequestHandler,
     requester_pid: u32,
     session_name: Option<SessionName>,
-) -> mpsc::UnboundedReceiver<ControlServerEvent> {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+) -> mpsc::Receiver<ControlServerEvent> {
+    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: ControlMode::Plain,
                 terminal_context: crate::outer_terminal::OuterTerminalContext::default()
                     .with_client_terminal(&rmux_proto::ClientTerminalContext {
@@ -86,9 +87,7 @@ async fn register_control_client(
     event_rx
 }
 
-fn drain_control_notifications(
-    rx: &mut mpsc::UnboundedReceiver<ControlServerEvent>,
-) -> Vec<String> {
+fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<String> {
     let mut lines = Vec::new();
     loop {
         match rx.try_recv() {
@@ -105,14 +104,52 @@ fn drain_control_notifications(
     lines
 }
 
-fn collect_control_events(
-    rx: &mut mpsc::UnboundedReceiver<ControlServerEvent>,
-) -> Vec<ControlServerEvent> {
+fn collect_control_events(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<ControlServerEvent> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);
     }
     events
+}
+
+#[tokio::test]
+async fn full_control_server_event_queue_closes_and_removes_client() {
+    let handler = RequestHandler::new();
+    let requester_pid = 4242;
+    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let _control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::clone(&closing),
+        )
+        .await;
+
+    for index in 0..CONTROL_SERVER_EVENT_CAPACITY {
+        handler
+            .send_control_notification_to(requester_pid, format!("%message queued-{index}"))
+            .await;
+    }
+
+    assert_eq!(event_rx.len(), CONTROL_SERVER_EVENT_CAPACITY);
+    assert_eq!(event_rx.max_capacity(), CONTROL_SERVER_EVENT_CAPACITY);
+    assert!(!closing.load(Ordering::SeqCst));
+    assert!(handler.is_control_client(requester_pid).await);
+
+    handler
+        .send_control_notification_to(requester_pid, "%message overflow".to_owned())
+        .await;
+
+    assert_eq!(event_rx.len(), CONTROL_SERVER_EVENT_CAPACITY);
+    assert!(event_rx.is_closed());
+    assert!(closing.load(Ordering::SeqCst));
+    assert!(!handler.is_control_client(requester_pid).await);
 }
 
 async fn session_id(handler: &RequestHandler, session_name: &SessionName) -> u32 {
@@ -328,13 +365,14 @@ async fn paste_buffer_notifications_use_the_buffer_name() {
     let _ = drain_control_notifications(&mut control_rx);
 
     let set_response = handler
-        .handle(Request::SetBuffer(SetBufferRequest {
+        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
             name: Some("named".to_owned()),
             content: b"hello".to_vec(),
             append: false,
             set_clipboard: false,
             new_name: None,
-        }))
+            target_client: None,
+        })))
         .await;
     assert!(matches!(set_response, Response::SetBuffer(_)));
     assert_eq!(
@@ -354,13 +392,14 @@ async fn paste_buffer_notifications_use_the_buffer_name() {
     );
 
     let set_response = handler
-        .handle(Request::SetBuffer(SetBufferRequest {
+        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
             name: Some("bad\nname".to_owned()),
             content: b"hello".to_vec(),
             append: false,
             set_clipboard: false,
             new_name: None,
-        }))
+            target_client: None,
+        })))
         .await;
     assert!(matches!(set_response, Response::SetBuffer(_)));
     assert_eq!(
@@ -402,17 +441,22 @@ async fn sessions_changed_notifications_reach_control_clients_with_and_without_s
         vec!["%sessions-changed".to_owned()]
     );
 
+    let beta_window_id = window_id(&handler, &WindowTarget::new(beta.clone())).await;
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {
             target: beta,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert!(matches!(response, Response::KillSession(_)));
     assert_eq!(
         drain_control_notifications(&mut attached_rx),
-        vec!["%sessions-changed".to_owned()]
+        vec![
+            "%sessions-changed".to_owned(),
+            format!("%unlinked-window-close @{beta_window_id}")
+        ]
     );
     assert_eq!(
         drain_control_notifications(&mut detached_rx),
@@ -644,6 +688,7 @@ async fn hook_commands_do_not_emit_nested_control_notifications() {
             value_only: false,
             include_inherited: true,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     assert!(matches!(response, Response::ShowOptions(_)));

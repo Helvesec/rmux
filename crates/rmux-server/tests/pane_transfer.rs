@@ -81,11 +81,14 @@ async fn break_pane_last_source_window_to_other_session_removes_source_session(
     assert!(sessions.lines().any(|line| line == hidden.as_str()));
 
     let panes = client
-        .send_request(&Request::ListPanes(ListPanesRequest {
+        .send_request(&Request::ListPanes(Box::new(ListPanesRequest {
             target: hidden.clone(),
             target_window_index: None,
             format: Some("#{window_index}.#{pane_index}:#{pane_id}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await?;
     let Response::ListPanes(panes) = panes else {
         panic!("expected list-panes response");
@@ -249,11 +252,14 @@ async fn join_pane_last_source_window_to_other_session_removes_source_session(
     assert!(sessions.lines().any(|line| line == hidden.as_str()));
 
     let panes = client
-        .send_request(&Request::ListPanes(ListPanesRequest {
+        .send_request(&Request::ListPanes(Box::new(ListPanesRequest {
             target: hidden.clone(),
             target_window_index: None,
             format: Some("#{window_index}.#{pane_index}:#{pane_id}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await?;
     let Response::ListPanes(panes) = panes else {
         panic!("expected list-panes response");

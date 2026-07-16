@@ -33,6 +33,9 @@ fn capture_pane_request(
         alternate: false,
         escape_ansi: false,
         escape_sequences: false,
+        include_format: false,
+        hyperlinks: false,
+        line_numbers: false,
         join_wrapped: false,
         use_mode_screen: false,
         preserve_trailing_spaces: false,
@@ -51,6 +54,7 @@ fn set_buffer_request(name: &str, content: &[u8]) -> SetBufferRequest {
         append: false,
         new_name: None,
         set_clipboard: false,
+        target_client: None,
     }
 }
 
@@ -64,6 +68,7 @@ fn load_buffer_request(
         cwd,
         name: Some(name.to_owned()),
         set_clipboard: false,
+        target_client: None,
     }
 }
 
@@ -121,6 +126,9 @@ async fn target_action_capture_resolves_raw_target_server_side() {
                 alternate: false,
                 escape_ansi: false,
                 escape_sequences: false,
+                include_format: false,
+                hyperlinks: false,
+                line_numbers: false,
                 join_wrapped: false,
                 use_mode_screen: false,
                 preserve_trailing_spaces: false,
@@ -355,9 +363,9 @@ async fn load_buffer_reads_server_file() {
     std::fs::write(&path, b"loaded data").expect("write input");
 
     let response = handler
-        .handle(Request::LoadBuffer(load_buffer_request(
+        .handle(Request::LoadBuffer(Box::new(load_buffer_request(
             &path, None, "loaded",
-        )))
+        ))))
         .await;
     match response {
         Response::LoadBuffer(response) => assert_eq!(response.buffer_name, "loaded"),
@@ -385,18 +393,18 @@ async fn load_buffer_failure_does_not_mutate_existing_buffer() {
     let missing_path = temp_path("load-missing");
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             "stable",
             b"original",
-        )))
+        ))))
         .await;
 
     let response = handler
-        .handle(Request::LoadBuffer(load_buffer_request(
+        .handle(Request::LoadBuffer(Box::new(load_buffer_request(
             &missing_path,
             None,
             "stable",
-        )))
+        ))))
         .await;
     assert!(matches!(response, Response::Error(_)));
 
@@ -422,11 +430,11 @@ async fn load_buffer_resolves_relative_path_against_request_cwd() {
     std::fs::write(nested_dir.join("input.txt"), b"relative data").expect("write input");
 
     let response = handler
-        .handle(Request::LoadBuffer(load_buffer_request(
+        .handle(Request::LoadBuffer(Box::new(load_buffer_request(
             &std::path::Path::new("nested").join("input.txt"),
             Some(root.clone()),
             "loaded",
-        )))
+        ))))
         .await;
     match response {
         Response::LoadBuffer(response) => assert_eq!(response.buffer_name, "loaded"),
@@ -454,7 +462,9 @@ async fn save_buffer_writes_server_file() {
     let path = temp_path("save-success");
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request("saved", b"save me")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            "saved", b"save me",
+        ))))
         .await;
 
     let response = handler
@@ -479,10 +489,10 @@ async fn save_buffer_resolves_relative_path_against_request_cwd() {
     std::fs::create_dir_all(&nested_dir).expect("create nested dir");
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             "saved",
             b"relative save",
-        )))
+        ))))
         .await;
 
     let response = handler
@@ -510,10 +520,10 @@ async fn save_buffer_failure_does_not_mutate_existing_buffer() {
     let path = temp_path("missing-parent").join("out.txt");
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             "stable",
             b"original",
-        )))
+        ))))
         .await;
 
     let response = handler

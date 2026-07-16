@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::RequestHandler;
-use crate::control::{ControlModeUpgrade, ControlServerEvent};
+use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::pane_io::AttachControl;
 use rmux_core::{
     input::{mode, InputParser},
@@ -171,12 +171,13 @@ async fn register_control_client(
     handler: &RequestHandler,
     requester_pid: u32,
     session_name: SessionName,
-) -> mpsc::UnboundedReceiver<ControlServerEvent> {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+) -> mpsc::Receiver<ControlServerEvent> {
+    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: ControlMode::Plain,
                 terminal_context: crate::outer_terminal::OuterTerminalContext::default()
                     .with_client_terminal(&rmux_proto::ClientTerminalContext {
@@ -195,9 +196,7 @@ async fn register_control_client(
     event_rx
 }
 
-fn drain_control_notifications(
-    rx: &mut mpsc::UnboundedReceiver<ControlServerEvent>,
-) -> Vec<String> {
+fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<String> {
     let mut lines = Vec::new();
     loop {
         match rx.try_recv() {
@@ -228,11 +227,14 @@ async fn pane_id(handler: &RequestHandler, target: &PaneTarget) -> u32 {
 
 async fn list_panes_text(handler: &RequestHandler, target: &PaneTarget, format: &str) -> String {
     let response = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: target.session_name().clone(),
             format: Some(format.to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let output = response
         .command_output()

@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::DateTime;
 use rmux_client::{detect_context, ClientContext};
 use rmux_proto::{
-    CommandOutput, CreateWebShareRequest, ErrorResponse, ListWebSharesRequest,
+    CommandOutput, CreateWebShareRequest, ErrorResponse, KillSessionRequest, ListWebSharesRequest,
     LookupWebShareRequest, PaneTargetRef, Response, SessionName, StopAllWebSharesRequest,
     StopWebShareRequest, WebShareConfigRequest, WebShareCreatedResponse, WebShareRequest,
     WebShareResponse, WebShareScope, WebShareUrlOptions, WebTerminalTheme,
@@ -32,10 +32,14 @@ pub(super) fn run_web_share(
     validate_web_share_args_without_daemon(&args)?;
     let mut connection = connect_with_startserver(socket_path, startup)?;
     let disconnect_output = args.disconnect.is_some();
-    let request = build_web_share_request(args, &mut connection)?;
-    let response = connection
-        .web_share(request)
-        .map_err(ExitFailure::from_client)?;
+    let built = build_web_share_request(args, &mut connection)?;
+    let response = match connection.web_share(built.request) {
+        Ok(response) => response,
+        Err(error) => {
+            rollback_auto_web_share_session(&mut connection, built.auto_session.as_ref());
+            return Err(ExitFailure::from_client(error));
+        }
+    };
     if let Response::WebShare(response) = &response {
         if let WebShareResponse::Created(created) = response.as_ref() {
             write_created_share_output(created)?;
@@ -53,7 +57,25 @@ pub(super) fn run_web_share(
             }
         }
     }
-    finish_command_success(response, "web-share")
+    let result = finish_command_success(response, "web-share");
+    if result.is_err() {
+        rollback_auto_web_share_session(&mut connection, built.auto_session.as_ref());
+    }
+    result
+}
+
+struct BuiltWebShareRequest {
+    request: WebShareRequest,
+    auto_session: Option<SessionName>,
+}
+
+impl BuiltWebShareRequest {
+    fn existing(request: WebShareRequest) -> Self {
+        Self {
+            request,
+            auto_session: None,
+        }
+    }
 }
 
 fn validate_web_share_args_without_daemon(args: &WebShareArgs) -> Result<(), ExitFailure> {
@@ -95,24 +117,36 @@ fn write_created_share_output(created: &WebShareCreatedResponse) -> Result<(), E
 fn build_web_share_request(
     args: WebShareArgs,
     connection: &mut rmux_client::Connection,
-) -> Result<WebShareRequest, ExitFailure> {
+) -> Result<BuiltWebShareRequest, ExitFailure> {
     if args.list {
-        return Ok(WebShareRequest::List(ListWebSharesRequest));
+        return Ok(BuiltWebShareRequest::existing(WebShareRequest::List(
+            ListWebSharesRequest,
+        )));
     }
     if let Some(share_id) = args.stop {
-        return Ok(WebShareRequest::Stop(StopWebShareRequest { share_id }));
+        return Ok(BuiltWebShareRequest::existing(WebShareRequest::Stop(
+            StopWebShareRequest { share_id },
+        )));
     }
     if let Some(share_id) = args.disconnect {
-        return Ok(WebShareRequest::Stop(StopWebShareRequest { share_id }));
+        return Ok(BuiltWebShareRequest::existing(WebShareRequest::Stop(
+            StopWebShareRequest { share_id },
+        )));
     }
     if args.stop_all {
-        return Ok(WebShareRequest::StopAll(StopAllWebSharesRequest));
+        return Ok(BuiltWebShareRequest::existing(WebShareRequest::StopAll(
+            StopAllWebSharesRequest,
+        )));
     }
     if let Some(share_id) = args.lookup {
-        return Ok(WebShareRequest::Lookup(LookupWebShareRequest { share_id }));
+        return Ok(BuiltWebShareRequest::existing(WebShareRequest::Lookup(
+            LookupWebShareRequest { share_id },
+        )));
     }
     if args.config {
-        return Ok(WebShareRequest::Config(WebShareConfigRequest));
+        return Ok(BuiltWebShareRequest::existing(WebShareRequest::Config(
+            WebShareConfigRequest,
+        )));
     }
 
     if args.ttl_seconds.is_some() && args.expires_at.is_some() {
@@ -125,7 +159,7 @@ fn build_web_share_request(
     let spectator = !args.operator_only;
     validate_create_web_share_args(&args, operator, spectator)?;
     let expires_at_unix = parse_expires_at(args.expires_at.as_deref())?;
-    let scope = resolve_web_share_scope(connection, args.target.as_ref())?;
+    let (scope, auto_session) = resolve_web_share_scope(connection, args.target.as_ref())?;
     if args.kill_session_on_expire && scope.is_pane() {
         return Err(ExitFailure::new(
             1,
@@ -140,30 +174,33 @@ fn build_web_share_request(
             None
         };
     let controls = operator && scope.is_session();
-    Ok(WebShareRequest::Create(CreateWebShareRequest {
-        scope,
-        public_base_url: args.public_base_url,
-        tunnel_provider: args.tunnel_provider,
-        frontend_url: args.frontend_url,
-        ttl_seconds: args.ttl_seconds,
-        expires_at_unix,
-        max_spectators: args.max_spectators,
-        max_operators: args.max_operators,
-        url_options: WebShareUrlOptions {
-            no_navbar: args.no_navbar,
-            no_disclaimer: args.no_disclaimer,
-            show_viewers: !args.hide_viewers,
-            terminal_theme,
-        },
-        require_pin: !args.no_pin,
-        operator_pin: args.pin_operator,
-        spectator_pin: args.pin_spectator,
-        terminal_palette: terminal_palette.map(Box::new),
-        operator,
-        spectator,
-        controls,
-        kill_session_on_expire: args.kill_session_on_expire,
-    }))
+    Ok(BuiltWebShareRequest {
+        request: WebShareRequest::Create(CreateWebShareRequest {
+            scope,
+            public_base_url: args.public_base_url,
+            tunnel_provider: args.tunnel_provider,
+            frontend_url: args.frontend_url,
+            ttl_seconds: args.ttl_seconds,
+            expires_at_unix,
+            max_spectators: args.max_spectators,
+            max_operators: args.max_operators,
+            url_options: WebShareUrlOptions {
+                no_navbar: args.no_navbar,
+                no_disclaimer: args.no_disclaimer,
+                show_viewers: !args.hide_viewers,
+                terminal_theme,
+            },
+            require_pin: !args.no_pin,
+            operator_pin: args.pin_operator,
+            spectator_pin: args.pin_spectator,
+            terminal_palette: terminal_palette.map(Box::new),
+            operator,
+            spectator,
+            controls,
+            kill_session_on_expire: args.kill_session_on_expire,
+        }),
+        auto_session,
+    })
 }
 
 fn should_capture_terminal_palette(
@@ -236,16 +273,38 @@ fn validate_role_pin(value: Option<&str>, flag: &str) -> Result<(), ExitFailure>
 fn resolve_web_share_scope(
     connection: &mut rmux_client::Connection,
     target: Option<&TargetSpec>,
-) -> Result<WebShareScope, ExitFailure> {
+) -> Result<(WebShareScope, Option<SessionName>), ExitFailure> {
     match target {
-        Some(target) => resolve_web_share_target_spec(connection, target),
-        None if detect_context() == ClientContext::Outside => {
-            create_detached_web_share_session(connection).map(WebShareScope::Session)
+        Some(target) => {
+            resolve_web_share_target_spec(connection, target).map(|scope| (scope, None))
         }
-        None => Ok(WebShareScope::Pane(PaneTargetRef::slot(
-            resolve_current_pane_target(connection, "web-share")?,
-        ))),
+        None if detect_context() == ClientContext::Outside => {
+            let session = create_detached_web_share_session(connection)?;
+            Ok((WebShareScope::Session(session.clone()), Some(session)))
+        }
+        None => Ok((
+            WebShareScope::Pane(PaneTargetRef::slot(resolve_current_pane_target(
+                connection,
+                "web-share",
+            )?)),
+            None,
+        )),
     }
+}
+
+fn rollback_auto_web_share_session(
+    connection: &mut rmux_client::Connection,
+    session: Option<&SessionName>,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    let _ = connection.kill_session(KillSessionRequest {
+        target: session.clone(),
+        kill_all_except_target: false,
+        clear_alerts: false,
+        kill_group: false,
+    });
 }
 
 fn create_detached_web_share_session(

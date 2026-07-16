@@ -100,7 +100,12 @@ pub(crate) fn collect_control_notifications(
                 control_arg(buffer_name)
             )),
         ),
-        LifecycleEvent::ClientAttached { .. }
+        LifecycleEvent::ClientActive { .. }
+        | LifecycleEvent::ClientAttached { .. }
+        | LifecycleEvent::ClientFocusIn { .. }
+        | LifecycleEvent::ClientFocusOut { .. }
+        | LifecycleEvent::ClientLightTheme { .. }
+        | LifecycleEvent::ClientDarkTheme { .. }
         | LifecycleEvent::ClientResized { .. }
         | LifecycleEvent::AlertBell { .. }
         | LifecycleEvent::AlertActivity { .. }
@@ -109,6 +114,7 @@ pub(crate) fn collect_control_notifications(
         | LifecycleEvent::PaneDied { .. }
         | LifecycleEvent::PaneFocusIn { .. }
         | LifecycleEvent::PaneFocusOut { .. }
+        | LifecycleEvent::PaneSetClipboard { .. }
         | LifecycleEvent::PaneTitleChanged { .. }
         | LifecycleEvent::WindowResized { .. }
         | LifecycleEvent::AfterSelectWindow { .. }

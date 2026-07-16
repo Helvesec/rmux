@@ -37,6 +37,7 @@ async fn new_session_uses_the_default_size_when_request_omits_geometry() {
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert_eq!(

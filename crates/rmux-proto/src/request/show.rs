@@ -21,6 +21,9 @@ pub struct ShowOptionsRequest {
     /// Whether option lookup errors should be suppressed.
     #[serde(default)]
     pub quiet: bool,
+    /// Whether hook options should be included, matching `show-options -H`.
+    #[serde(default)]
+    pub include_hooks: bool,
 }
 
 impl<'de> Deserialize<'de> for ShowOptionsRequest {
@@ -30,7 +33,14 @@ impl<'de> Deserialize<'de> for ShowOptionsRequest {
     {
         deserializer.deserialize_struct(
             "ShowOptionsRequest",
-            &["scope", "name", "value_only", "include_inherited", "quiet"],
+            &[
+                "scope",
+                "name",
+                "value_only",
+                "include_inherited",
+                "quiet",
+                "include_hooks",
+            ],
             ShowOptionsRequestVisitor,
         )
     }
@@ -54,6 +64,7 @@ impl<'de> Visitor<'de> for ShowOptionsRequestVisitor {
         let value_only = required_next(&mut seq, 2, &self)?;
         let include_inherited = compat_next_element(&mut seq)?;
         let quiet = compat_next_element(&mut seq)?;
+        let include_hooks = compat_next_element(&mut seq)?;
 
         Ok(ShowOptionsRequest {
             scope,
@@ -61,6 +72,7 @@ impl<'de> Visitor<'de> for ShowOptionsRequestVisitor {
             value_only,
             include_inherited,
             quiet,
+            include_hooks,
         })
     }
 
@@ -73,6 +85,7 @@ impl<'de> Visitor<'de> for ShowOptionsRequestVisitor {
         let mut value_only = None;
         let mut include_inherited = None;
         let mut quiet = None;
+        let mut include_hooks = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -81,6 +94,7 @@ impl<'de> Visitor<'de> for ShowOptionsRequestVisitor {
                 "value_only" => value_only = Some(map.next_value()?),
                 "include_inherited" => include_inherited = Some(map.next_value()?),
                 "quiet" => quiet = Some(map.next_value()?),
+                "include_hooks" => include_hooks = Some(map.next_value()?),
                 _ => {
                     let _: de::IgnoredAny = map.next_value()?;
                 }
@@ -93,6 +107,7 @@ impl<'de> Visitor<'de> for ShowOptionsRequestVisitor {
             value_only: value_only.ok_or_else(|| de::Error::missing_field("value_only"))?,
             include_inherited: include_inherited.unwrap_or_default(),
             quiet: quiet.unwrap_or_default(),
+            include_hooks: include_hooks.unwrap_or_default(),
         })
     }
 }

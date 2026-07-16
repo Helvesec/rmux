@@ -1,4 +1,116 @@
 use super::*;
+use crate::pane_io::AttachControl;
+
+#[tokio::test]
+async fn source_file_command_bounds_matches_across_separate_paths() {
+    let handler = RequestHandler::new();
+    let root = temp_root("aggregate-path-count");
+    let mut paths = Vec::new();
+    for index in 0..=256 {
+        let name = format!("{index:04}.conf");
+        write_config(&root.join(&name), "");
+        paths.push(name);
+    }
+
+    let response = handler
+        .handle(source_file_request(paths, Some(root.clone())))
+        .await;
+    fs::remove_dir_all(root).expect("remove aggregate path root");
+
+    let Response::SourceFile(response) = response else {
+        panic!("aggregate source read limit should be a source-file diagnostic: {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    let stderr = std::str::from_utf8(response.stderr()).expect("source diagnostic is UTF-8");
+    assert!(
+        stderr.contains("exceeds 256 matched files"),
+        "unexpected source diagnostic: {stderr:?}"
+    );
+}
+
+#[tokio::test]
+async fn source_file_preserves_target_client_and_show_hooks_flags() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("source-target-client");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler.register_attach(202, alpha, control_tx).await;
+    while control_rx.try_recv().is_ok() {}
+
+    let root = temp_root("target-client-flags");
+    write_config(&root.join("input.txt"), "loaded from source");
+    write_config(
+        &root.join("flags.conf"),
+        "set-buffer -b set-from-source -t 202 payload\n\
+         load-buffer -b loaded-from-source -t 202 input.txt\n\
+         show-options -gH after-load-buffer\n\
+         display-panes -b -d 5000 -t 202\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["flags.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+    let output = response
+        .command_output()
+        .expect("source-file command output");
+    assert_eq!(output.stdout(), b"after-load-buffer\n");
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(AttachControl::Overlay(_))
+    ));
+
+    for (name, expected) in [
+        ("set-from-source", b"payload".as_slice()),
+        ("loaded-from-source", b"loaded from source".as_slice()),
+    ] {
+        assert_eq!(
+            handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some(name.to_owned()),
+                }))
+                .await
+                .command_output()
+                .expect("source-created buffer")
+                .stdout(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_file_show_window_options_rejects_h() {
+    let handler = RequestHandler::new();
+    let root = temp_root("show-window-options-h");
+    let config = root.join("bad.conf");
+    write_config(&config, "show-window-options -H\n");
+
+    let response = handler
+        .handle(source_file_request(vec!["bad.conf".to_owned()], Some(root)))
+        .await;
+    let Response::Error(response) = response else {
+        panic!("expected source-file flag error");
+    };
+    assert_eq!(
+        response.error,
+        rmux_proto::RmuxError::Server(format!(
+            "{}:1: command show-window-options: unknown flag -H",
+            config.display()
+        ))
+    );
+}
 
 #[tokio::test]
 async fn source_file_uses_shared_parser_for_conditions_comments_and_continuations() {
@@ -68,6 +180,284 @@ async fn source_file_handles_crlf_backslash_continuations() {
             .expect("crlf buffer output")
             .stdout(),
         b"windows"
+    );
+}
+
+#[tokio::test]
+async fn source_file_parse_only_verbose_uses_tmux37_end_lines_for_multiline_strings() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-multiline-lines");
+    let config = root.join("main.conf");
+    write_config(&config, "display-message -p \"a\nb\"\nset -g @after yes\n");
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+    request.verbose = true;
+
+    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n -v to return verbose output");
+    };
+    let stdout = response
+        .command_output()
+        .expect("parse-only verbose output")
+        .stdout();
+    assert_eq!(
+        std::str::from_utf8(stdout).expect("verbose output is UTF-8"),
+        format!(
+            "{}:2: display-message -p a\\nb\n{}:3: set-option -g @after yes\n",
+            config.display(),
+            config.display()
+        )
+    );
+}
+
+#[tokio::test]
+async fn source_file_parse_only_validation_errors_use_multiline_command_end_line() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-multiline-error-line");
+    write_config(
+        &root.join("main.conf"),
+        "new-window -Q \"x\ny\"\nset -g @after yes\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+
+    let Response::Error(error) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n to reject invalid flag");
+    };
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("main.conf:2: command new-window: unknown flag -Q"),
+        "{}",
+        error.error
+    );
+}
+
+#[tokio::test]
+async fn source_file_unquoted_percent_word_is_fatal_syntax_error() {
+    let handler = RequestHandler::new();
+    let root = temp_root("percent-word-syntax");
+    write_config(&root.join("main.conf"), "%word\nset-buffer -b after yes\n");
+
+    let Response::Error(error) = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await
+    else {
+        panic!("source-file should reject unquoted percent word");
+    };
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("main.conf:1: syntax error"),
+        "unexpected error: {:?}",
+        error
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("after".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
+async fn source_file_utf8_bom_is_not_stripped_like_tmux() {
+    let handler = RequestHandler::new();
+    let root = temp_root("utf8-bom-syntax");
+    write_config(
+        &root.join("main.conf"),
+        "\u{feff}set-buffer -b bom yes\nset-buffer -b after yes\n",
+    );
+
+    let Response::Error(error) = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await
+    else {
+        panic!("source-file should reject BOM-prefixed command");
+    };
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("main.conf:1: unknown command:"),
+        "unexpected error: {:?}",
+        error
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("after".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
+async fn source_file_reversed_bom_is_not_a_read_error_or_valid_command() {
+    let handler = RequestHandler::new();
+    let root = temp_root("reversed-bom-syntax");
+    fs::create_dir_all(&root).expect("config parent directory");
+    fs::write(
+        root.join("main.conf"),
+        b"\xff\xfeset-buffer -b bom yes\nset-buffer -b after yes\n",
+    )
+    .expect("write config");
+
+    let Response::Error(error) = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await
+    else {
+        panic!("source-file should reject reversed-BOM command");
+    };
+    let message = error.error.to_string();
+    assert!(
+        message.contains("main.conf:1: unknown command:"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !message.contains("stream did not contain valid UTF-8"),
+        "source-file should parse lossy text like tmux, got {message}"
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("after".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
+async fn source_file_execute_verbose_reports_lookup_prefix_without_running_bad_file() {
+    let handler = RequestHandler::new();
+    let root = temp_root("execute-verbose-lookup-stop");
+    let config = root.join("main.conf");
+    write_config(
+        &config,
+        "set-buffer -b before yes\nbogus\nset-buffer -b after yes\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.verbose = true;
+
+    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("source-file -v should return verbose output plus parse error");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert_eq!(
+        response
+            .command_output()
+            .expect("source-file -v output")
+            .stdout(),
+        format!(
+            "{}:1: set-buffer -b before yes\n{}:2: unknown command: bogus\n",
+            config.display(),
+            config.display()
+        )
+        .as_bytes()
+    );
+
+    for name in ["before", "after"] {
+        assert!(
+            matches!(
+                handler
+                    .handle(Request::ShowBuffer(ShowBufferRequest {
+                        name: Some(name.to_owned()),
+                    }))
+                    .await,
+                Response::Error(_)
+            ),
+            "{name} should not run from a file with a lookup parse error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_file_verbose_execution_errors_go_to_stderr() {
+    let handler = RequestHandler::new();
+    let root = temp_root("execute-verbose-stderr");
+    let config = root.join("main.conf");
+    write_config(&config, "set-option -g xyzzy on\n");
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.verbose = true;
+
+    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("source-file -v should return verbose output plus execution stderr");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert_eq!(
+        response
+            .command_output()
+            .expect("source-file -v output")
+            .stdout(),
+        format!("{}:1: set-option -g xyzzy on\n", config.display()).as_bytes()
+    );
+    assert_eq!(
+        std::str::from_utf8(response.stderr()).expect("stderr is UTF-8"),
+        "invalid option: xyzzy\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_read_diagnostics_do_not_move_execution_errors_to_stdout() {
+    let handler = RequestHandler::new();
+    let root = temp_root("read-diagnostic-exec-stderr");
+    fs::create_dir_all(root.join("adir")).expect("create directory entry");
+    write_config(&root.join("b.conf"), "set-option -g xyzzy on\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["*".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should return stderr diagnostics, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert!(
+        response.command_output().is_none(),
+        "read + execution diagnostics must not spill to stdout"
+    );
+    let stderr = std::str::from_utf8(response.stderr()).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("Input/output error"),
+        "stderr should include directory read diagnostic: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("invalid option: xyzzy"),
+        "stderr should include execution error: {stderr:?}"
     );
 }
 
@@ -680,6 +1070,38 @@ async fn queued_source_file_accepts_compact_format_target_with_attached_value() 
 }
 
 #[tokio::test]
+async fn queued_display_message_accepts_compact_print_and_commands_flags() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("display-compact-pc");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse("display-message -pC '#{session_name}'")
+        .expect("display-message -pC parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Session(alpha))),
+        )
+        .await
+        .expect("display-message -pC should execute");
+
+    assert_eq!(output.stdout(), b"display-compact-pc\n");
+}
+
+#[tokio::test]
 async fn nested_source_file_preserves_implicit_target_canfail_behavior() {
     let handler = RequestHandler::new();
     for session in [session_name("alpha"), session_name("beta")] {
@@ -733,12 +1155,14 @@ async fn source_file_nested_limit_reports_too_many_nested_files() {
         ))
         .await;
 
-    let Response::Error(error) = response else {
-        panic!("source-file should report recursion limit, got {response:?}");
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should report recursion limit on stderr, got {response:?}");
     };
+    assert_eq!(response.exit_status(), Some(1));
+    let error = std::str::from_utf8(response.stderr()).expect("stderr is UTF-8");
     assert!(
-        error.error.to_string().contains("too many nested files"),
-        "unexpected error: {:?}",
+        error.contains("too many nested files"),
+        "unexpected error: {}",
         error
     );
 }
@@ -756,13 +1180,16 @@ async fn source_file_non_quiet_rejects_empty_glob_pattern() {
         ))
         .await;
 
-    let Response::Error(error) = response else {
+    let Response::SourceFile(response) = response else {
         panic!("source-file should report empty glob, got {response:?}");
     };
+    assert_eq!(response.exit_status(), Some(1));
     assert!(
-        error.error.to_string().contains("nonexistent*.conf"),
-        "unexpected error: {:?}",
-        error
+        std::str::from_utf8(response.stderr())
+            .expect("stderr is UTF-8")
+            .contains("nonexistent*.conf"),
+        "unexpected stderr: {:?}",
+        response.stderr()
     );
 }
 
@@ -798,6 +1225,45 @@ async fn source_file_multiple_paths_loads_all_in_order() {
 }
 
 #[tokio::test]
+async fn source_file_glob_reports_directories_after_loading_regular_files() {
+    let handler = RequestHandler::new();
+    let root = temp_root("glob-directory-error");
+    fs::create_dir_all(root.join("nested")).expect("create nested directory");
+    write_config(&root.join("a.conf"), "set-buffer -b glob first\n");
+    write_config(&root.join("b.conf"), "set-buffer -b glob second\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["*".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file glob should report the matched directory, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert!(
+        std::str::from_utf8(response.stderr())
+            .expect("stderr is UTF-8")
+            .contains("Input/output error"),
+        "unexpected glob stderr: {:?}",
+        response.stderr()
+    );
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("glob".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("glob buffer output")
+            .stdout(),
+        b"second"
+    );
+}
+
+#[tokio::test]
 async fn source_file_continues_after_missing_paths_and_reports_one_clean_error_prefix() {
     let handler = RequestHandler::new();
     let root = temp_root("multi-path-missing");
@@ -816,16 +1282,14 @@ async fn source_file_continues_after_missing_paths_and_reports_one_clean_error_p
         ))
         .await;
 
-    let Response::Error(error) = response else {
+    let Response::SourceFile(response) = response else {
         panic!("source-file should report missing paths, got {response:?}");
     };
-    assert!(
-        matches!(
-            error.error,
-            rmux_proto::RmuxError::Server(ref message)
-                if message == "missing-a.conf: No such file or directory\nmissing-b.conf: No such file or directory"
-        ),
-        "unexpected missing-path error: {error:?}"
+    assert_eq!(response.exit_status(), Some(1));
+    assert_eq!(
+        std::str::from_utf8(response.stderr()).expect("stderr is UTF-8"),
+        "No such file or directory: missing-a.conf\nNo such file or directory: missing-b.conf\n",
+        "unexpected missing-path stderr"
     );
     assert_eq!(
         handler
@@ -869,10 +1333,10 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
         "source-file should preserve later stdout, got {}",
         String::from_utf8_lossy(output)
     );
+    let stderr = String::from_utf8_lossy(response.stderr());
     assert!(
-        String::from_utf8_lossy(output).contains("definitely/missing.conf"),
-        "source-file should keep runtime error visible, got {}",
-        String::from_utf8_lossy(output)
+        stderr.contains("definitely/missing.conf"),
+        "source-file should keep runtime error visible on stderr, got {stderr}"
     );
     assert_eq!(
         handler
@@ -882,6 +1346,110 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
                 value_only: true,
                 include_inherited: false,
                 quiet: false,
+                include_hooks: false,
+            }))
+            .await
+            .command_output()
+            .expect("show-options output")
+            .stdout(),
+        b"yes\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_sets_server_option_without_explicit_scope_or_target() {
+    let handler = RequestHandler::new();
+    let root = temp_root("server-option-no-target");
+    write_config(&root.join("server.conf"), "set escape-time 77\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["server.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should accept server option without target, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), None);
+    assert!(response.stderr().is_empty());
+    assert_eq!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::ServerGlobal,
+                name: Some("escape-time".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: false,
+                include_hooks: false,
+            }))
+            .await
+            .command_output()
+            .expect("show-options output")
+            .stdout(),
+        b"77\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_sets_bare_server_option_with_current_runtime_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let root = temp_root("server-option-current-target");
+    write_config(
+        &root.join("server.conf"),
+        "set escape-time 77\nset -q escape-time 78\nset -g @after_runtime_escape yes\n",
+    );
+    let mut request = match source_file_request(vec!["server.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.target = Some(PaneTarget::with_window(alpha, 0, 0));
+
+    let response = handler.handle(Request::SourceFile(request)).await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should accept server option with current target, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), None);
+    assert!(response.stderr().is_empty());
+    assert_eq!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::ServerGlobal,
+                name: Some("escape-time".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: false,
+                include_hooks: false,
+            }))
+            .await
+            .command_output()
+            .expect("show-options output")
+            .stdout(),
+        b"78\n"
+    );
+    assert_eq!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::SessionGlobal,
+                name: Some("@after_runtime_escape".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: false,
+                include_hooks: false,
             }))
             .await
             .command_output()
@@ -909,17 +1477,12 @@ async fn source_file_continues_after_non_quiet_legacy_option_lookup_errors() {
         ))
         .await;
 
-    let Response::Error(error) = response else {
-        panic!("non-quiet legacy option should report an error, got {response:?}");
+    let Response::SourceFile(response) = response else {
+        panic!("non-quiet legacy option should report stderr, got {response:?}");
     };
-    assert!(
-        error
-            .error
-            .to_string()
-            .contains("invalid option: status-utf8"),
-        "{}",
-        error.error
-    );
+    assert_eq!(response.exit_status(), Some(1));
+    let error = std::str::from_utf8(response.stderr()).expect("stderr is UTF-8");
+    assert!(error.contains("invalid option: status-utf8"), "{}", error);
 
     for name in ["@before_legacy_error", "@after_legacy_error"] {
         assert_eq!(
@@ -930,6 +1493,7 @@ async fn source_file_continues_after_non_quiet_legacy_option_lookup_errors() {
                     value_only: true,
                     include_inherited: false,
                     quiet: false,
+                    include_hooks: false,
                 }))
                 .await
                 .command_output()
@@ -1001,14 +1565,12 @@ async fn source_file_set_option_quiet_does_not_suppress_bad_values() {
         ))
         .await;
 
-    let Response::Error(error) = response else {
-        panic!("bad option value should remain an error, got {response:?}");
+    let Response::SourceFile(response) = response else {
+        panic!("bad option value should remain stderr, got {response:?}");
     };
-    assert!(
-        error.error.to_string().contains("unknown value: maybe"),
-        "{}",
-        error.error
-    );
+    assert_eq!(response.exit_status(), Some(1));
+    let error = std::str::from_utf8(response.stderr()).expect("stderr is UTF-8");
+    assert!(error.contains("unknown value: maybe"), "{}", error);
     let state = handler.state.lock().await;
     assert_eq!(
         state.options.global_value(OptionName::BaseIndex),

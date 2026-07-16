@@ -16,6 +16,23 @@ use super::{
 };
 
 impl HandlerState {
+    pub(crate) fn pane_ids_no_longer_referenced(
+        &self,
+        pane_ids: impl IntoIterator<Item = PaneId>,
+    ) -> Vec<PaneId> {
+        let mut seen = std::collections::HashSet::new();
+        pane_ids
+            .into_iter()
+            .filter(|pane_id| seen.insert(*pane_id))
+            .filter(|pane_id| {
+                !self
+                    .sessions
+                    .iter()
+                    .any(|(_, session)| session.window_index_for_pane_id(*pane_id).is_some())
+            })
+            .collect()
+    }
+
     pub(crate) fn set_pane_input_disabled(
         &mut self,
         target: &PaneTarget,
@@ -306,7 +323,7 @@ impl HandlerState {
         )
     }
 
-    pub(crate) fn pane_master_in_window(
+    pub(crate) fn clone_pane_master(
         &self,
         session_name: &SessionName,
         window_index: u32,
@@ -314,12 +331,6 @@ impl HandlerState {
     ) -> Result<PtyMaster, RmuxError> {
         let pane_id = pane_id_for_target(&self.sessions, session_name, window_index, pane_index)?;
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        #[cfg(windows)]
-        if self.pane_is_starting_in_window(session_name, window_index, pane_index) {
-            return Err(RmuxError::Server(format!(
-                "pane {session_name}:{window_index}.{pane_index} is still starting"
-            )));
-        }
         self.terminals
             .clone_pane_master(&runtime_session_name, pane_id, window_index, pane_index)
     }
@@ -366,14 +377,18 @@ impl HandlerState {
     ) -> Result<u32, RmuxError> {
         let pane_id = pane_id_for_target(&self.sessions, session_name, window_index, pane_index)?;
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        let result =
+            self.terminals
+                .pane_pid(&runtime_session_name, pane_id, window_index, pane_index);
         #[cfg(windows)]
-        if self.pane_is_starting_in_window(session_name, window_index, pane_index) {
+        if result.is_err()
+            && self.pane_is_starting_in_window(session_name, window_index, pane_index)
+        {
             return Err(RmuxError::Server(format!(
                 "pane {session_name}:{window_index}.{pane_index} is still starting"
             )));
         }
-        self.terminals
-            .pane_pid(&runtime_session_name, pane_id, window_index, pane_index)
+        result
     }
 
     #[cfg(unix)]

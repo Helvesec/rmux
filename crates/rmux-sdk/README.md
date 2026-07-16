@@ -1,6 +1,6 @@
 # rmux-sdk
 
-Public, daemon-backed Rust SDK for the [RMUX](https://github.com/helvesec/rmux) terminal multiplexer.
+Public, daemon-backed Rust SDK for the [RMUX](https://github.com/Helvesec/rmux) terminal multiplexer.
 
 Drives sessions, windows, and panes through typed handles over the local
 RMUX daemon — no TTY scraping, no string-formatted commands. Snapshots,
@@ -11,7 +11,7 @@ the primary primitives.
 
 ```toml
 [dependencies]
-rmux-sdk = "0.8.0"
+rmux-sdk = "0.9.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

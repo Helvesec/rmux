@@ -27,8 +27,11 @@ pub(super) fn parse_capture_pane(
     let mut alternate = false;
     let mut escape_ansi = false;
     let mut escape_sequences = false;
+    let mut include_format = false;
+    let mut hyperlinks = false;
+    let mut line_numbers = false;
     let mut join_wrapped = false;
-    let use_mode_screen = false;
+    let mut use_mode_screen = false;
     let mut do_not_trim_spaces = false;
     let mut preserve_trailing_spaces = false;
     let mut pending_input = false;
@@ -41,8 +44,11 @@ pub(super) fn parse_capture_pane(
             "-a" => alternate = true,
             "-e" => escape_ansi = true,
             "-C" => escape_sequences = true,
+            "-F" => include_format = true,
+            "-H" => hyperlinks = true,
             "-J" => join_wrapped = true,
-            "-M" => return Err(unsupported_flag("capture-pane", "-M")),
+            "-L" => line_numbers = true,
+            "-M" => use_mode_screen = true,
             "-N" => do_not_trim_spaces = true,
             "-T" => preserve_trailing_spaces = true,
             "-P" => pending_input = true,
@@ -93,6 +99,9 @@ pub(super) fn parse_capture_pane(
         alternate,
         escape_ansi,
         escape_sequences,
+        include_format,
+        hyperlinks,
+        line_numbers,
         join_wrapped,
         use_mode_screen,
         preserve_trailing_spaces,
@@ -254,7 +263,7 @@ fn parse_display_message_args(
                 let _ = args.optional();
             }
             flag if is_display_message_compact_cluster(flag) => {
-                let cluster = parse_compact_flag_cluster(flag, "aIlNpv", "cdFt")
+                let cluster = parse_compact_flag_cluster(flag, "aCIlNpv", "cdFt")
                     .expect("display-message compact cluster was prevalidated");
                 let _ = args
                     .optional()
@@ -265,6 +274,7 @@ fn parse_display_message_args(
                             all_formats = true;
                             print = true;
                         }
+                        CompactFlag::Bare('C') => {}
                         CompactFlag::Bare('I') => stdin = true,
                         CompactFlag::Bare('l') => no_expand = true,
                         CompactFlag::Bare('N') => {}
@@ -295,6 +305,9 @@ fn parse_display_message_args(
             "-I" => {
                 let _ = args.optional();
                 stdin = true;
+            }
+            "-C" => {
+                let _ = args.optional();
             }
             "-N" => {
                 let _ = args.optional();
@@ -556,7 +569,7 @@ fn verbose_token_is_simple_variable(token: &str) -> bool {
 }
 
 fn is_display_message_compact_cluster(flag: &str) -> bool {
-    parse_compact_flag_cluster(flag, "aIlNpv", "cdFt").is_some()
+    parse_compact_flag_cluster(flag, "aCIlNpv", "cdFt").is_some()
 }
 
 fn display_all_formats_template() -> String {

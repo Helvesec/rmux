@@ -41,9 +41,9 @@ impl Connection {
         self.write_request(&Request::KillServer(KillServerRequest))
     }
 
-    /// Sends a legacy wire-v1 `kill-server` request for pre-0.6 daemon cleanup.
-    pub fn kill_server_legacy_wire_v1(&mut self) -> Result<(), ClientError> {
-        self.write_legacy_wire_v1_request(&Request::KillServer(KillServerRequest))
+    /// Sends a legacy-wire `kill-server` request for stale daemon cleanup.
+    pub fn kill_server_legacy_wire(&mut self, wire_version: u32) -> Result<(), ClientError> {
+        self.write_legacy_wire_request(&Request::KillServer(KillServerRequest), wire_version)
     }
 
     /// Sends an internal daemon status request over the detached RPC channel.

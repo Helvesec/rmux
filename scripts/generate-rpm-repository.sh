@@ -14,6 +14,7 @@ Options:
   --repo-id <id>                 DNF repo id (default: rmux)
   --repo-name <name>             DNF repo name (default: RMUX)
   --gpg-key-url <url>            Public RPM GPG key URL (default: <baseurl>/RPM-GPG-KEY-rmux)
+  --repo-gpg-key-url <url>       Public repodata GPG key URL
   --repo-signing-key <key-id>    GPG key id/fingerprint for repodata/repomd.xml.asc
   --rpm-signing-key <key-id>     RPM signing key name/fingerprint for rpmsign --addsign
   -h, --help                     Show this help
@@ -45,6 +46,7 @@ baseurl="${RMUX_PACKAGES_RPM_BASE_URL:-https://packages.rmux.io/rpm}"
 repo_id="${RMUX_RPM_REPO_ID:-rmux}"
 repo_name="${RMUX_RPM_REPO_NAME:-RMUX}"
 gpg_key_url=""
+repo_gpg_key_url=""
 repo_signing_key="${RMUX_RPM_REPO_GPG_KEY:-}"
 rpm_signing_key="${RMUX_RPM_GPG_KEY:-}"
 
@@ -80,6 +82,11 @@ while [ "$#" -gt 0 ]; do
       gpg_key_url="$2"
       shift 2
       ;;
+    --repo-gpg-key-url)
+      [ "$#" -ge 2 ] || die "--repo-gpg-key-url requires a value"
+      repo_gpg_key_url="$2"
+      shift 2
+      ;;
     --repo-signing-key)
       [ "$#" -ge 2 ] || die "--repo-signing-key requires a value"
       repo_signing_key="$2"
@@ -108,6 +115,29 @@ case "$baseurl" in http://*|https://*) ;; *) die "--baseurl must be an http(s) U
 case "$repo_id" in *[!A-Za-z0-9_.:-]*|""|.*) die "invalid repo id: $repo_id" ;; esac
 if [ -z "$gpg_key_url" ]; then
   gpg_key_url="${baseurl%/}/RPM-GPG-KEY-rmux"
+fi
+case "$gpg_key_url" in http://*|https://*) ;; *) die "--gpg-key-url must be an http(s) URL" ;; esac
+if [ -n "$repo_signing_key" ] && [ -z "$repo_gpg_key_url" ]; then
+  if [ -n "$rpm_signing_key" ] && [ "$repo_signing_key" = "$rpm_signing_key" ]; then
+    repo_gpg_key_url="$gpg_key_url"
+  else
+    repo_gpg_key_url="${baseurl%/}/RPM-GPG-KEY-rmux-repository"
+  fi
+fi
+if [ -n "$repo_gpg_key_url" ]; then
+  case "$repo_gpg_key_url" in http://*|https://*) ;; *) die "--repo-gpg-key-url must be an http(s) URL" ;; esac
+fi
+
+if [ -n "$rpm_signing_key" ] && [ -n "$repo_signing_key" ]; then
+  [ "$rpm_signing_key" != "$repo_signing_key" ] || \
+    die "RPM package and repository signing keys must be distinct"
+  need gpg
+  rpm_fingerprint="$(gpg --batch --with-colons --fingerprint "$rpm_signing_key" | awk -F: '$1 == "fpr" { print $10; exit }')"
+  repo_fingerprint="$(gpg --batch --with-colons --fingerprint "$repo_signing_key" | awk -F: '$1 == "fpr" { print $10; exit }')"
+  [ -n "$rpm_fingerprint" ] || die "unable to resolve RPM package signing key fingerprint"
+  [ -n "$repo_fingerprint" ] || die "unable to resolve RPM repository signing key fingerprint"
+  [ "$rpm_fingerprint" != "$repo_fingerprint" ] || \
+    die "RPM package and repository signing keys must be distinct"
 fi
 
 repo_tool="$(createrepo_cmd)"
@@ -148,6 +178,15 @@ repo_gpgcheck=0
 if [ -n "$rpm_signing_key" ]; then
   gpgcheck=1
 fi
+
+public_key_urls=""
+if [ -n "$rpm_signing_key" ]; then
+  public_key_urls="$gpg_key_url"
+fi
+if [ -n "$repo_gpg_key_url" ] && [ "$repo_gpg_key_url" != "$public_key_urls" ]; then
+  public_key_urls="${public_key_urls:+$public_key_urls }$repo_gpg_key_url"
+fi
+[ -n "$public_key_urls" ] || public_key_urls="$gpg_key_url"
 if [ -n "$repo_signing_key" ]; then
   repo_gpgcheck=1
 fi
@@ -159,7 +198,7 @@ baseurl=$baseurl
 enabled=1
 gpgcheck=$gpgcheck
 repo_gpgcheck=$repo_gpgcheck
-gpgkey=$gpg_key_url
+gpgkey=$public_key_urls
 EOF
 
 printf 'repository=%s\n' "$output_dir"

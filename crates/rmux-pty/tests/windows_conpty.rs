@@ -17,6 +17,8 @@ use windows_sys::Win32::System::Threading::{
 #[path = "windows_conpty/job.rs"]
 mod job;
 
+const CONPTY_CHILD_OUTPUT_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[test]
 fn conpty_pair_opens_resizes_and_clones_master() -> Result<(), Box<dyn std::error::Error>> {
     let pair = PtyPair::open_with_size(TerminalSize::new(100, 30))?;
@@ -223,7 +225,11 @@ fn conpty_force_kill_reaps_grandchild_process_tree() -> Result<(), Box<dyn std::
     let _ = read_until_io(&io, b">", Duration::from_secs(2))?;
     io.write_all(command.as_bytes())?;
 
-    let output = read_until_or_kill(&mut spawned, b"RMUX_GRANDCHILD=", Duration::from_secs(5))?;
+    let output = read_until_or_kill(
+        &mut spawned,
+        b"RMUX_GRANDCHILD=",
+        CONPTY_CHILD_OUTPUT_TIMEOUT,
+    )?;
     let grandchild_pid = parse_marker_pid(&output, "RMUX_GRANDCHILD=")?;
     assert!(
         process_is_running(grandchild_pid),

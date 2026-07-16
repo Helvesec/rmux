@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::process::{Command, Stdio};
 
-use rmux_core::{alternate_screen_enter_sequence, alternate_screen_exit_sequence};
+use rmux_proto::AttachShellCommand;
 use rustix::process::{kill_process, Pid, Signal};
 use rustix::termios::{
     tcflush, tcgetattr, tcsetattr, OptionalActions, QueueSelector, SpecialCodeIndex, Termios,
@@ -118,7 +118,7 @@ impl RawTerminal {
 
     pub(super) fn run_lock_command(&self, command: &str) -> Result<()> {
         self.restore()?;
-        let result = run_lock_command_with_terminal(&self.fd, command);
+        let result = run_shell_command_with_terminal(&self.fd, "sh", command, None);
         let reapply_result = self.reapply_raw_mode();
         if let Err(error) = result {
             reapply_result?;
@@ -126,6 +126,22 @@ impl RawTerminal {
         }
         reapply_result?;
         Ok(())
+    }
+
+    pub(super) fn run_lock_shell_command(&self, command: &AttachShellCommand) -> Result<()> {
+        self.restore()?;
+        let result = run_shell_command_with_terminal(
+            &self.fd,
+            command.shell(),
+            command.command(),
+            Some(command.cwd()),
+        );
+        let reapply_result = self.reapply_raw_mode();
+        if let Err(error) = result {
+            reapply_result?;
+            return Err(error);
+        }
+        reapply_result
     }
 
     pub(super) fn suspend_self(&self) -> Result<()> {
@@ -137,7 +153,17 @@ impl RawTerminal {
 
     pub(super) fn run_detach_exec_command(&self, command: &str) -> Result<()> {
         self.restore()?;
-        run_lock_command_with_terminal(&self.fd, command)
+        run_shell_command_with_terminal(&self.fd, "sh", command, None)
+    }
+
+    pub(super) fn run_detach_exec_shell_command(&self, command: &AttachShellCommand) -> Result<()> {
+        self.restore()?;
+        run_shell_command_with_terminal(
+            &self.fd,
+            command.shell(),
+            command.command(),
+            Some(command.cwd()),
+        )
     }
 
     pub(super) fn restore_attach_terminal_state(&self) -> Result<()> {
@@ -166,30 +192,25 @@ fn configure_raw_mode(termios: &mut Termios) {
     termios.special_codes[SpecialCodeIndex::VTIME] = 0;
 }
 
-fn run_lock_command_with_terminal(fd: &OwnedFd, command: &str) -> Result<()> {
+fn run_shell_command_with_terminal(
+    fd: &OwnedFd,
+    shell: &str,
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<()> {
     let stdin = File::from(fd.as_fd().try_clone_to_owned()?);
     let stdout = File::from(fd.as_fd().try_clone_to_owned()?);
     let stderr = File::from(fd.as_fd().try_clone_to_owned()?);
-    let mut terminal = File::from(fd.as_fd().try_clone_to_owned()?);
-    let term = std::env::var("TERM").unwrap_or_default();
-
-    terminal.write_all(alternate_screen_enter_sequence(&term))?;
-    terminal.flush()?;
-
-    let status_result = Command::new("sh")
+    let mut process = Command::new(shell);
+    process
         .arg("-c")
         .arg(command)
         .stdin(Stdio::from(stdin))
         .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .status();
-
-    let restore_result = terminal
-        .write_all(alternate_screen_exit_sequence(&term))
-        .and_then(|()| terminal.flush())
-        .map_err(AttachError::Io);
-
-    restore_result?;
-    status_result.map_err(AttachError::Io)?;
+        .stderr(Stdio::from(stderr));
+    if let Some(cwd) = cwd {
+        process.current_dir(cwd);
+    }
+    process.status().map_err(AttachError::Io)?;
     Ok(())
 }

@@ -7,15 +7,17 @@ use crate::format_runtime::render_runtime_template;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use crate::server_access::current_owner_uid;
-use rmux_core::{WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE};
+use rmux_core::{PaneId, WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE};
 #[cfg(unix)]
 use rmux_proto::SendKeysRequest;
 use rmux_proto::{
-    DisplayMessageRequest, HookName, KillWindowRequest, NewSessionExtRequest, NewSessionRequest,
-    NewWindowRequest, NextWindowRequest, OptionName, PaneTarget, PreviousWindowRequest, Request,
-    Response, ScopeSelector, SelectPaneRequest, SessionName, SetOptionMode, SetOptionRequest,
-    ShowMessagesRequest, SplitDirection, SplitWindowExtRequest, SplitWindowTarget, Target,
-    TerminalSize, WindowTarget,
+    DisplayMessageRequest, HookLifecycle, HookName, KillWindowRequest, NewSessionExtRequest,
+    NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName, OptionScopeSelector,
+    PaneStateCursorRequest, PaneStateEventDto, PaneTarget, PaneTargetRef, PreviousWindowRequest,
+    Request, Response, ScopeSelector, SelectPaneRequest, SessionName, SetHookMutationRequest,
+    SetOptionByNameRequest, SetOptionMode, SetOptionRequest, ShowMessagesRequest, SplitDirection,
+    SplitWindowExtRequest, SplitWindowTarget, SubscribePaneStateRequest, Target, TerminalSize,
+    WindowTarget,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -26,6 +28,8 @@ use tokio::time::{timeout, Duration};
 const ALERT_TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
 const ALERT_TEST_EVENT_TIMEOUT: Duration = Duration::from_millis(500);
+const ACTIVITY_BASELINE_SETTLE: Duration = Duration::from_millis(1200);
+const ACTIVITY_BASELINE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
@@ -43,6 +47,57 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
         .await;
     assert!(matches!(response, Response::NewSession(_)));
     session
+}
+
+async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &str) {
+    let response = handler
+        .handle(Request::SetHookMutation(SetHookMutationRequest {
+            scope: ScopeSelector::Global,
+            hook,
+            command: Some(command.to_owned()),
+            lifecycle: HookLifecycle::Persistent,
+            append: false,
+            unset: false,
+            run_immediately: false,
+            index: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
+}
+
+async fn wait_for_buffer(handler: &RequestHandler, name: &str, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        {
+            let state = handler.state.lock().await;
+            if let Ok((_, content)) = state.buffers.show(Some(name)) {
+                if String::from_utf8_lossy(content) == expected {
+                    return;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "buffer {name} did not reach {expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn drain_lifecycle_hooks(
+    handler: &RequestHandler,
+    events: &mut broadcast::Receiver<QueuedLifecycleEvent>,
+) {
+    loop {
+        match events.try_recv() {
+            Ok(event) => handler.dispatch_lifecycle_hook(event).await,
+            Err(broadcast::error::TryRecvError::Empty)
+            | Err(broadcast::error::TryRecvError::Closed) => break,
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("lifecycle events lagged during test: {skipped}");
+            }
+        }
+    }
 }
 
 async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionName {
@@ -69,6 +124,9 @@ async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionNa
         })))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
+        .await;
     session
 }
 
@@ -110,7 +168,67 @@ async fn split_quiet_window(handler: &RequestHandler, session: &SessionName) {
             stdin_payload: None,
         })))
         .await;
-    assert!(matches!(response, Response::SplitWindow(_)));
+    let Response::SplitWindow(response) = response else {
+        panic!("expected split-window response");
+    };
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&response.pane)
+        .await;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActivitySnapshot {
+    origin_pane_id: PaneId,
+    window: i64,
+    origin: i64,
+    other: i64,
+}
+
+async fn two_pane_activity_snapshot(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+) -> ActivitySnapshot {
+    let state = handler.state.lock().await;
+    let session = state
+        .sessions
+        .session(session_name)
+        .expect("session exists");
+    let window = session.window_at(0).expect("window exists");
+    let origin = window.pane(0).expect("origin pane exists");
+    let other = window.pane(1).expect("other pane exists");
+    ActivitySnapshot {
+        origin_pane_id: origin.id(),
+        window: window.activity_at(),
+        origin: origin.activity_at(),
+        other: other.activity_at(),
+    }
+}
+
+async fn wait_for_two_pane_activity_to_settle(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+) -> ActivitySnapshot {
+    let deadline = tokio::time::Instant::now() + ACTIVITY_BASELINE_TIMEOUT;
+    let mut previous = two_pane_activity_snapshot(handler, session_name).await;
+    let mut stable_since = tokio::time::Instant::now();
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let current = two_pane_activity_snapshot(handler, session_name).await;
+        let now = tokio::time::Instant::now();
+        if current == previous {
+            if now.duration_since(stable_since) >= ACTIVITY_BASELINE_SETTLE {
+                return current;
+            }
+        } else {
+            previous = current;
+            stable_since = now;
+        }
+        assert!(
+            now < deadline,
+            "activity baseline did not settle; last snapshot: {previous:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -173,6 +291,26 @@ async fn set_option(
         }))
         .await;
     assert!(matches!(response, Response::SetOption(_)));
+}
+
+async fn set_server_option_by_name(handler: &RequestHandler, name: &str, value: &str) {
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::ServerGlobal,
+            name: name.to_owned(),
+            value: Some(value.to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(response, Response::SetOptionByName(_)),
+        "{response:?}"
+    );
 }
 
 async fn recv_lifecycle(
@@ -295,7 +433,14 @@ async fn assert_no_lifecycle_hooks(
 }
 
 fn is_lifecycle_noise(hook_name: HookName) -> bool {
-    matches!(hook_name, HookName::PaneTitleChanged)
+    matches!(
+        hook_name,
+        HookName::ClientActive
+            | HookName::ClientFocusIn
+            | HookName::ClientFocusOut
+            | HookName::PaneSetClipboard
+            | HookName::PaneTitleChanged
+    )
 }
 
 async fn recv_attach_control(
@@ -483,6 +628,8 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
         pane_id,
         bell_count: 1,
         title_changed: false,
+        title_change: None,
+        clipboard_set: false,
         queue_activity_alert: true,
         generation: None,
     });
@@ -509,7 +656,11 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
 #[tokio::test]
 async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
     let handler = RequestHandler::new();
-    let session = create_session(&handler, "alerts-reader-thread").await;
+    // Keep the real pane reader quiescent so this test observes only the
+    // callback invoked below. In particular, an interactive Windows shell can
+    // publish an initial title/activity event concurrently and consume the
+    // one-shot activity alert before the synthetic reader-thread event runs.
+    let session = create_quiet_session(&handler, "alerts-reader-thread").await;
     set_option(
         &handler,
         ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
@@ -542,6 +693,8 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
+            clipboard_set: false,
             queue_activity_alert: true,
             generation: None,
         });
@@ -549,8 +702,7 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
     .join()
     .expect("reader-thread alert callback should not panic outside the Tokio runtime");
 
-    let event = recv_lifecycle(&mut lifecycle).await;
-    assert_eq!(event.hook_name, HookName::AlertActivity);
+    recv_lifecycle_hook(&mut lifecycle, HookName::AlertActivity).await;
 }
 
 #[tokio::test]
@@ -573,12 +725,447 @@ async fn pane_title_change_output_emits_lifecycle_hook_event() {
         pane_id,
         bell_count: 0,
         title_changed: true,
+        title_change: None,
+        clipboard_set: false,
         queue_activity_alert: false,
         generation: None,
     });
 
     let event = recv_lifecycle(&mut lifecycle).await;
     assert_eq!(event.hook_name, HookName::PaneTitleChanged);
+}
+
+#[tokio::test]
+async fn pane_state_title_alert_ignores_stale_generation() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-title-state-generation").await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let (pane_id, generation) = {
+        let state = handler.state.lock().await;
+        let pane_id = state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("window pane exists");
+        (pane_id, state.pane_output_generation(&session, pane_id))
+    };
+    let subscription_id = match handler
+        .handle_subscribe_pane_state(
+            71,
+            SubscribePaneStateRequest {
+                target: PaneTargetRef::slot(target),
+                include_title: true,
+                include_options: false,
+                include_foreground: false,
+            },
+        )
+        .await
+    {
+        Response::SubscribePaneState(response) => response.subscription_id,
+        response => panic!("subscribe-pane-state failed: {response:?}"),
+    };
+
+    let callback = handler.pane_alert_callback();
+    callback(crate::pane_io::PaneAlertEvent {
+        session_name: session.clone(),
+        pane_id,
+        bell_count: 0,
+        title_changed: true,
+        title_change: Some(("old".to_owned(), "current".to_owned())),
+        clipboard_set: false,
+        queue_activity_alert: false,
+        generation: Some(generation),
+    });
+
+    let revision = timeout(Duration::from_secs(2), async {
+        let mut after_revision = 0;
+        'wait_for_title: loop {
+            match handler
+                .handle_pane_state_cursor(
+                    71,
+                    PaneStateCursorRequest {
+                        subscription_id,
+                        after_revision,
+                        wait: false,
+                        max_events: Some(16),
+                    },
+                )
+                .await
+            {
+                Response::PaneStateCursor(response) if !response.events.is_empty() => {
+                    for event in response.events {
+                        match event {
+                            PaneStateEventDto::TitleChanged {
+                                revision,
+                                old_title,
+                                new_title,
+                                ..
+                            } if old_title == "old" && new_title == "current" => {
+                                break 'wait_for_title revision;
+                            }
+                            PaneStateEventDto::TitleChanged { revision, .. }
+                            | PaneStateEventDto::OptionSet { revision, .. }
+                            | PaneStateEventDto::OptionUnset { revision, .. }
+                            | PaneStateEventDto::ForegroundChanged { revision, .. }
+                            | PaneStateEventDto::Closed { revision, .. } => {
+                                after_revision = after_revision.max(revision);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Response::PaneStateCursor(_) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                response => panic!("pane-state-cursor failed: {response:?}"),
+            }
+        }
+    })
+    .await
+    .expect("current-generation title event must arrive");
+
+    callback(crate::pane_io::PaneAlertEvent {
+        session_name: session,
+        pane_id,
+        bell_count: 0,
+        title_changed: true,
+        title_change: Some(("current".to_owned(), "stale".to_owned())),
+        clipboard_set: false,
+        queue_activity_alert: false,
+        generation: Some(generation.saturating_add(1)),
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    match handler
+        .handle_pane_state_cursor(
+            71,
+            PaneStateCursorRequest {
+                subscription_id,
+                after_revision: revision,
+                wait: false,
+                max_events: Some(16),
+            },
+        )
+        .await
+    {
+        Response::PaneStateCursor(response) => assert!(
+            !response.events.iter().any(|event| matches!(
+                event,
+                PaneStateEventDto::TitleChanged { new_title, .. } if new_title == "stale"
+            )),
+            "stale-generation title change leaked into pane-state stream: {:?}",
+            response.events
+        ),
+        response => panic!("pane-state-cursor failed: {response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pane_state_reports_pane_option_unset_from_handler() {
+    let handler = RequestHandler::new();
+    let session = create_session(&handler, "pane-option-unset-handler").await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("pane exists")
+    };
+    let subscription_id = match handler
+        .handle_subscribe_pane_state(
+            72,
+            SubscribePaneStateRequest {
+                target: PaneTargetRef::slot(target.clone()),
+                include_title: false,
+                include_options: true,
+                include_foreground: false,
+            },
+        )
+        .await
+    {
+        Response::SubscribePaneState(response) => response.subscription_id,
+        response => panic!("subscribe-pane-state failed: {response:?}"),
+    };
+
+    let set = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Pane(target.clone()),
+            name: "@agent.state".to_owned(),
+            value: Some("waiting".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(matches!(set, Response::SetOptionByName(_)), "{set:?}");
+
+    let unset = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Pane(target),
+            name: "@agent.state".to_owned(),
+            value: None,
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: true,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(matches!(unset, Response::SetOptionByName(_)), "{unset:?}");
+
+    let cursor = handler
+        .handle_pane_state_cursor(
+            72,
+            PaneStateCursorRequest {
+                subscription_id,
+                after_revision: 0,
+                wait: false,
+                max_events: Some(16),
+            },
+        )
+        .await;
+    let Response::PaneStateCursor(cursor) = cursor else {
+        panic!("pane-state-cursor failed: {cursor:?}");
+    };
+    assert!(cursor.events.iter().any(|event| matches!(
+        event,
+        PaneStateEventDto::OptionUnset {
+            pane_id: event_pane_id,
+            name,
+            old_value,
+            ..
+        } if *event_pane_id == pane_id
+            && name == "@agent.state"
+            && old_value.as_deref() == Some("waiting")
+    )));
+}
+
+#[tokio::test]
+async fn pane_state_reports_related_pane_option_unset_from_window_mass_unset() {
+    let handler = RequestHandler::new();
+    let session = create_session(&handler, "pane-option-related-unset").await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let window = WindowTarget::with_window(session.clone(), 0);
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("pane exists")
+    };
+    let subscription_id = match handler
+        .handle_subscribe_pane_state(
+            73,
+            SubscribePaneStateRequest {
+                target: PaneTargetRef::slot(target.clone()),
+                include_title: false,
+                include_options: true,
+                include_foreground: false,
+            },
+        )
+        .await
+    {
+        Response::SubscribePaneState(response) => response.subscription_id,
+        response => panic!("subscribe-pane-state failed: {response:?}"),
+    };
+
+    let set_window = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Window(window.clone()),
+            name: "@agent.state".to_owned(),
+            value: Some("window".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(set_window, Response::SetOptionByName(_)),
+        "{set_window:?}"
+    );
+    let set_pane = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Pane(target),
+            name: "@agent.state".to_owned(),
+            value: Some("pane".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(set_pane, Response::SetOptionByName(_)),
+        "{set_pane:?}"
+    );
+
+    let unset_window = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Window(window),
+            name: "@agent.state".to_owned(),
+            value: None,
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: true,
+            unset_pane_overrides: true,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(unset_window, Response::SetOptionByName(_)),
+        "{unset_window:?}"
+    );
+
+    let cursor = handler
+        .handle_pane_state_cursor(
+            73,
+            PaneStateCursorRequest {
+                subscription_id,
+                after_revision: 0,
+                wait: false,
+                max_events: Some(16),
+            },
+        )
+        .await;
+    let Response::PaneStateCursor(cursor) = cursor else {
+        panic!("pane-state-cursor failed: {cursor:?}");
+    };
+    assert!(cursor.events.iter().any(|event| matches!(
+        event,
+        PaneStateEventDto::OptionUnset {
+            pane_id: event_pane_id,
+            name,
+            old_value,
+            ..
+        } if *event_pane_id == pane_id
+            && name == "@agent.state"
+            && old_value.as_deref() == Some("pane")
+    )));
+}
+
+#[tokio::test]
+async fn pane_output_updates_activity_for_originating_pane_only() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-output-activity").await;
+    split_quiet_window(&handler, &session).await;
+    let before = wait_for_two_pane_activity_to_settle(&handler, &session).await;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    handler
+        .handle_pane_alert_event(crate::pane_io::PaneAlertEvent {
+            session_name: session.clone(),
+            pane_id: before.origin_pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            clipboard_set: false,
+            queue_activity_alert: false,
+            generation: None,
+        })
+        .await;
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&session).expect("session exists");
+    let window = session.window_at(0).expect("window exists");
+    let origin = window.pane(0).expect("origin pane exists");
+    let other = window.pane(1).expect("other pane exists");
+    assert!(window.activity_at() > before.window);
+    assert!(origin.activity_at() > before.origin);
+    assert_eq!(other.activity_at(), before.other);
+}
+
+#[tokio::test]
+async fn pane_set_clipboard_output_emits_hook_without_activity() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-clipboard-hook").await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    set_global_hook(
+        &handler,
+        HookName::PaneSetClipboard,
+        "set-buffer -a -b clipboard-hook clip,",
+    )
+    .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("window pane exists")
+    };
+
+    handler
+        .handle_pane_alert_event(crate::pane_io::PaneAlertEvent {
+            session_name: session,
+            pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            clipboard_set: true,
+            queue_activity_alert: false,
+            generation: None,
+        })
+        .await;
+
+    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
+    wait_for_buffer(&handler, "clipboard-hook", "clip,").await;
+}
+
+#[tokio::test]
+async fn pane_set_clipboard_hook_requires_set_clipboard_on() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-clipboard-external").await;
+    set_global_hook(
+        &handler,
+        HookName::PaneSetClipboard,
+        "set-buffer -a -b clipboard-hook clip,",
+    )
+    .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("window pane exists")
+    };
+
+    handler
+        .handle_pane_alert_event(crate::pane_io::PaneAlertEvent {
+            session_name: session,
+            pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            clipboard_set: true,
+            queue_activity_alert: false,
+            generation: None,
+        })
+        .await;
+
+    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
+    let state = handler.state.lock().await;
+    assert!(state.buffers.show(Some("clipboard-hook")).is_err());
 }
 
 #[tokio::test]
@@ -693,6 +1280,8 @@ async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
+            clipboard_set: false,
             queue_activity_alert: false,
             generation: None,
         });
@@ -749,7 +1338,7 @@ async fn pane_exit_callback_can_be_invoked_from_reader_thread() {
 #[tokio::test]
 async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_rename() {
     let handler = RequestHandler::new();
-    let session = create_session(&handler, "alerts-name").await;
+    let session = create_quiet_session(&handler, "alerts-name").await;
     set_option(
         &handler,
         ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
@@ -772,6 +1361,8 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
         pane_id,
         bell_count: 0,
         title_changed: false,
+        title_change: None,
+        clipboard_set: false,
         queue_activity_alert: true,
         generation: None,
     });
@@ -802,7 +1393,7 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
 #[tokio::test]
 async fn pane_alert_event_respects_automatic_rename_off() {
     let handler = RequestHandler::new();
-    let session = create_session(&handler, "alerts-name-off").await;
+    let session = create_quiet_session(&handler, "alerts-name-off").await;
     let target = WindowTarget::with_window(session.clone(), 0);
     set_option(
         &handler,
@@ -834,6 +1425,8 @@ async fn pane_alert_event_respects_automatic_rename_off() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
+            clipboard_set: false,
             queue_activity_alert: true,
             generation: None,
         })
@@ -851,7 +1444,7 @@ async fn pane_alert_event_respects_automatic_rename_off() {
 #[tokio::test]
 async fn pane_alert_event_updates_grouped_session_window_names() {
     let handler = RequestHandler::new();
-    let alpha = create_session(&handler, "alerts-group-alpha").await;
+    let alpha = create_quiet_session(&handler, "alerts-group-alpha").await;
     let beta = session_name("alerts-group-beta");
     let response = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
@@ -899,6 +1492,8 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
+            clipboard_set: false,
             queue_activity_alert: true,
             generation: None,
         })
@@ -1187,10 +1782,10 @@ async fn show_messages_log_is_available_without_current_client() {
                 target_client: None,
             }))
             .await;
-        let Response::Error(error) = response else {
-            panic!("expected show-messages -J/-T to require a current client");
+        let Response::ShowMessages(response) = response else {
+            panic!("expected detached show-messages -J/-T to succeed with empty output");
         };
-        assert_eq!(error.error.to_string(), "no current client");
+        assert!(response.output.stdout().is_empty());
     }
 }
 

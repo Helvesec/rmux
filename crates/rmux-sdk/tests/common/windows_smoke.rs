@@ -27,6 +27,7 @@ pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 // real prompt/output transitions without making successful tests slower.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const OUTPUT_BUDGET: usize = 64 * 1024;
+const SNAPSHOT_STABLE_PERIOD: Duration = Duration::from_millis(500);
 const RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN_ENV: &str = "RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN";
 
 pub static LIVE_DAEMON_LOCK: Mutex<()> = Mutex::const_new(());
@@ -198,23 +199,29 @@ pub async fn wait_for_stable_snapshot(
 ) -> TestResult<rmux_sdk::PaneSnapshot> {
     let deadline = Instant::now() + DEFAULT_TIMEOUT;
     let mut previous = pane.snapshot().await?;
+    let mut stable_since = Instant::now();
     loop {
         sleep(Duration::from_millis(100)).await;
         let current = pane.snapshot().await?;
-        if current.revision >= minimum_revision
-            && current.revision == previous.revision
-            && current.visible_text() == previous.visible_text()
-        {
-            return Ok(current);
+        let last_revision = current.revision;
+        let now = Instant::now();
+        if current == previous {
+            if current.revision >= minimum_revision
+                && now.duration_since(stable_since) >= SNAPSHOT_STABLE_PERIOD
+            {
+                return Ok(current);
+            }
+        } else {
+            previous = current;
+            stable_since = now;
         }
         if Instant::now() >= deadline {
             return Err(format!(
                 "snapshot did not stabilize after revision {minimum_revision}; last revision was {}",
-                current.revision
+                last_revision
             )
             .into());
         }
-        previous = current;
     }
 }
 
@@ -297,20 +304,30 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
     }
 
     let target_dir = target_dir()?;
-    let candidate = target_dir.join("debug").join("rmux.exe");
+    let build_target_dir = windows_cargo_build::private_target_dir(&target_dir);
+    let candidate = build_target_dir.join("debug").join("rmux.exe");
 
-    let _cargo_build_guard = windows_cargo_build::acquire()?;
-    let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .arg("build")
-        .arg("--bin")
-        .arg("rmux")
-        .arg("--locked")
-        .arg("--manifest-path")
-        .arg(workspace_root().join("Cargo.toml"))
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .status()?;
-    if !status.success() {
-        return Err(format!("failed to build rmux binary for Windows SDK smoke: {status}").into());
+    let _cargo_build_guard = windows_cargo_build::acquire(&target_dir)?;
+
+    let output = windows_cargo_build::run_cargo_build_with_lnk1104_retry(|| {
+        let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        command
+            .arg("build")
+            .arg("--bin")
+            .arg("rmux")
+            .arg("--locked")
+            .arg("--manifest-path")
+            .arg(workspace_root().join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &build_target_dir);
+        command
+    })?;
+    windows_cargo_build::emit_command_output(&output)?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to build rmux binary for Windows SDK smoke: {}",
+            output.status
+        )
+        .into());
     }
     if !candidate.is_file() {
         return Err(format!(
@@ -320,7 +337,10 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
         .into());
     }
 
-    Ok(candidate)
+    Ok(windows_cargo_build::copy_binary_for_current_process(
+        &candidate,
+        &target_dir,
+    )?)
 }
 
 fn target_dir() -> TestResult<PathBuf> {

@@ -31,6 +31,8 @@ const SESSION_SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(50);
 const SESSION_SNAPSHOT_MAX_WAIT: Duration = Duration::from_millis(200);
 const SESSION_INTERACTIVE_DEBOUNCE: Duration = Duration::from_millis(8);
 const SESSION_INTERACTIVE_MAX_WAIT: Duration = Duration::from_millis(32);
+const WEBSOCKET_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+const WEBSOCKET_KEEPALIVE_PAYLOAD: &[u8] = b"rmux";
 
 pub(super) async fn serve_pane_loop(
     handler: Arc<RequestHandler>,
@@ -49,6 +51,11 @@ pub(super) async fn serve_pane_loop(
     let mut last_connection_counts = pane.connection_counts();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
     alive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut keepalive_tick = tokio::time::interval_at(
+        Instant::now() + WEBSOCKET_KEEPALIVE_INTERVAL,
+        WEBSOCKET_KEEPALIVE_INTERVAL,
+    );
+    keepalive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let snapshot_sleep = sleep(Duration::from_secs(365 * 24 * 60 * 60));
     tokio::pin!(snapshot_sleep);
     let mut snapshot_pending = false;
@@ -173,6 +180,9 @@ pub(super) async fn serve_pane_loop(
                 )
                 .await?;
             }
+            _ = keepalive_tick.tick() => {
+                outbound.write_ping(WEBSOCKET_KEEPALIVE_PAYLOAD).await?;
+            }
         }
     }
 }
@@ -244,6 +254,11 @@ pub(super) async fn serve_session_loop(
     let mut last_connection_counts = session.connection_counts();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
     alive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut keepalive_tick = tokio::time::interval_at(
+        Instant::now() + WEBSOCKET_KEEPALIVE_INTERVAL,
+        WEBSOCKET_KEEPALIVE_INTERVAL,
+    );
+    keepalive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let ttl_delay = session
         .expires_at()
         .map(duration_until)
@@ -521,6 +536,9 @@ pub(super) async fn serve_session_loop(
                     session.connection_counts(),
                 )
                 .await?;
+            }
+            _ = keepalive_tick.tick() => {
+                outbound.write_ping(WEBSOCKET_KEEPALIVE_PAYLOAD).await?;
             }
         }
     }

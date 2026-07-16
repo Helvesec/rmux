@@ -256,3 +256,26 @@ fn render_mode_tree_overlay_keeps_cursor_hidden_while_active() {
     assert!(rendered.contains("\u{1b}[?25l"));
     assert!(!rendered.contains("\u{1b}[?25h"));
 }
+
+#[test]
+fn render_mode_tree_overlay_uses_compact_plain_lines() {
+    let mut state = HandlerState::default();
+    state
+        .sessions
+        .create_session(
+            SessionName::new("test").expect("valid session"),
+            rmux_proto::TerminalSize { cols: 80, rows: 24 },
+        )
+        .expect("session create succeeds");
+    let mut mode = test_mode(10);
+    mode.selected_id = Some("root".to_owned());
+    let build = flat_build(&["root"]);
+
+    let frame = render_mode_tree_overlay(&state, &mode, &build);
+
+    assert!(
+        frame.len() < 2_000,
+        "plain choose-tree overlay should stay below common tty output queues, got {} bytes",
+        frame.len()
+    );
+}

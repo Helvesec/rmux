@@ -315,6 +315,11 @@ fn read_only_request_allowed(request: &Request) -> bool {
                 | Request::PaneOutputCursor(_)
                 | Request::PaneSnapshot(_)
                 | Request::PaneSnapshotRef(_)
+                | Request::PaneOptionGet(_)
+                | Request::SubscribePaneState(_)
+                | Request::PaneStateCursor(_)
+                | Request::UnsubscribePaneState(_)
+                | Request::PaneForegroundState(_)
                 | Request::ResolveTarget(_)
                 | Request::SdkWaitForOutput(_)
                 | Request::SdkWaitForOutputRef(_)
@@ -483,6 +488,46 @@ mod tests {
     }
 
     #[test]
+    fn read_only_access_allows_pane_state_observation() {
+        let session = session_name();
+        let pane = PaneTarget::new(session.clone(), 0);
+        let pane_ref = rmux_proto::PaneTargetRef::slot(pane.clone());
+        let subscription_id = rmux_proto::PaneStateSubscriptionId::new(1);
+        let requests = [
+            Request::PaneOptionGet(rmux_proto::PaneOptionGetRequest {
+                target: pane_ref.clone(),
+                name: "@agent.kind".to_owned(),
+            }),
+            Request::SubscribePaneState(rmux_proto::SubscribePaneStateRequest {
+                target: pane_ref.clone(),
+                include_title: true,
+                include_options: true,
+                include_foreground: true,
+            }),
+            Request::PaneStateCursor(rmux_proto::PaneStateCursorRequest {
+                subscription_id,
+                after_revision: 0,
+                wait: true,
+                max_events: Some(1),
+            }),
+            Request::UnsubscribePaneState(rmux_proto::UnsubscribePaneStateRequest {
+                subscription_id,
+            }),
+            Request::PaneForegroundState(rmux_proto::PaneForegroundStateRequest {
+                target: pane_ref,
+            }),
+        ];
+
+        for request in requests {
+            assert_eq!(
+                apply_access_policy(request.clone(), false)
+                    .expect("pane-state SDK request is read-only observation"),
+                request
+            );
+        }
+    }
+
+    #[test]
     fn read_only_access_allows_capture_pane_target_action() {
         let capture =
             Request::CapturePaneTargetAction(Box::new(capture_pane_target_action(true, None)));
@@ -575,13 +620,14 @@ mod tests {
                 empty_target_context: false,
             },
         )));
-        assert_read_only_rejected(Request::DisplayPanes(DisplayPanesRequest {
+        assert_read_only_rejected(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: session_name(),
             duration_ms: None,
             non_blocking: false,
             no_command: false,
             template: None,
-        }));
+            target_client: None,
+        })));
     }
 
     #[test]
@@ -850,6 +896,9 @@ mod tests {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -871,6 +920,9 @@ mod tests {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -891,6 +943,7 @@ mod tests {
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some("someone".to_owned()),
         })
         .expect_err("Windows cannot safely map server-access users to Unix UIDs");
@@ -909,6 +962,7 @@ mod tests {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: None,
         })
         .expect("server-access -l remains read-only and portable");

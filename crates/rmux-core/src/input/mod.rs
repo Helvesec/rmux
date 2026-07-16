@@ -317,6 +317,13 @@ impl InputParser {
             return;
         }
 
+        if self.should_recover_tmux_passthrough_osc_bel() {
+            self.input_end = InputEndType::Bel;
+            self.handle_dcs_dispatch(writer);
+            self.set_state(InputState::Ground, writer);
+            return;
+        }
+
         if let Some(next) = trans.next_state {
             self.set_state(next, writer);
         }
@@ -515,6 +522,18 @@ impl InputParser {
             || (matches!(self.state, InputState::DcsHandler | InputState::DcsEscape)
                 && self.interm_len == 0
                 && (self.input_buf.first() == Some(&b'q') || self.input_buf.starts_with(b"tmux;")))
+    }
+
+    fn should_recover_tmux_passthrough_osc_bel(&self) -> bool {
+        if self.state != InputState::DcsHandler || self.ch != 0x07 || self.interm_len != 0 {
+            return false;
+        }
+
+        let Some(payload) = self.input_buf.strip_prefix(b"tmux;") else {
+            return false;
+        };
+
+        payload.starts_with(b"\x1b]") || payload.first() == Some(&0x9d)
     }
 
     fn handle_end_bel(&mut self) -> bool {

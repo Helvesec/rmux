@@ -1,5 +1,305 @@
 use super::*;
 
+#[test]
+fn parsed_list_keys_accepts_attached_sort_order_format_and_reverse() {
+    let handler = RequestHandler::new();
+    let state = handler.state.blocking_lock();
+    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+        "list-keys".to_owned(),
+        vec![
+            "-r".to_owned(),
+            "-F#{key_table}".to_owned(),
+            "-Okey".to_owned(),
+        ],
+        None,
+        &state.sessions,
+        &state.options,
+        &TargetFindContext::new(None),
+    )
+    .expect("list-keys sort flags parse like tmux");
+
+    let Request::ListKeys(request) = parsed else {
+        panic!("expected ListKeys request");
+    };
+    assert!(request.reversed);
+    assert_eq!(request.format.as_deref(), Some("#{key_table}"));
+    assert_eq!(request.sort_order.as_deref(), Some("key"));
+}
+
+#[tokio::test]
+async fn parsed_list_panes_accepts_filter_sort_order_and_reverse() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha,
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let state = handler.state.lock().await;
+    let parsed = crate::handler::scripting_support::parse_request_from_parts(
+        "list-panes".to_owned(),
+        vec![
+            "-t".to_owned(),
+            "alpha:0".to_owned(),
+            "-f".to_owned(),
+            "#{==:#{pane_index},0}".to_owned(),
+            "-O".to_owned(),
+            "index".to_owned(),
+            "-r".to_owned(),
+            "-F".to_owned(),
+            "#{pane_index}".to_owned(),
+        ],
+        None,
+        &state.sessions,
+        &state.options,
+        &TargetFindContext::new(None),
+    )
+    .expect("list-panes filter/sort flags parse like tmux");
+
+    let Request::ListPanes(request) = parsed else {
+        panic!("expected ListPanes request");
+    };
+    assert_eq!(request.target, session_name("alpha"));
+    assert_eq!(request.target_window_index, Some(0));
+    assert_eq!(request.filter.as_deref(), Some("#{==:#{pane_index},0}"));
+    assert_eq!(request.sort_order.as_deref(), Some("index"));
+    assert!(request.reversed);
+    assert_eq!(request.format.as_deref(), Some("#{pane_index}"));
+}
+
+#[tokio::test]
+async fn parsed_list_windows_applies_filter_sort_order_and_reverse() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: alpha.clone(),
+            name: None,
+            command: None,
+            process_command: None,
+            detached: false,
+            start_directory: None,
+            environment: None,
+            target_window_index: None,
+            insert_at_target: false,
+        })))
+        .await;
+
+    let filtered = CommandParser::new()
+        .parse("list-windows -t alpha -f '#{==:#{window_index},1}' -F '#{window_index}'")
+        .expect("list-windows filter parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), filtered)
+        .await
+        .expect("filtered list-windows executes");
+    assert_eq!(output.stdout(), b"1\n");
+
+    let reversed = CommandParser::new()
+        .parse("list-windows -t alpha -O index -r -F '#{window_index}'")
+        .expect("list-windows sort parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), reversed)
+        .await
+        .expect("sorted list-windows executes");
+    assert_eq!(output.stdout(), b"1\n0\n");
+}
+
+#[tokio::test]
+async fn parsed_set_option_scope_flags_use_tmux_precedence_and_natural_tables() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha,
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse("set-option -s -p @scope server")
+        .expect("set-option user scope flags parse");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option user scope executes");
+    let shown = CommandParser::new()
+        .parse("show-options -gsv @scope")
+        .expect("show-options server user parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), shown)
+        .await
+        .expect("show-options server user executes");
+    assert_eq!(output.stdout(), b"server\n");
+
+    let parsed = CommandParser::new()
+        .parse("set-option -w -t alpha status off")
+        .expect("set-option known option parses");
+    {
+        let state = handler.state.lock().await;
+        let request = crate::handler::scripting_support::parse_request_from_parts(
+            "set-option".to_owned(),
+            vec![
+                "-w".to_owned(),
+                "-t".to_owned(),
+                "alpha:0".to_owned(),
+                "status".to_owned(),
+                "off".to_owned(),
+            ],
+            None,
+            &state.sessions,
+            &state.options,
+            &TargetFindContext::new(None),
+        )
+        .expect("resolved set-option parses");
+        let Request::SetOptionByName(request) = request else {
+            panic!("expected SetOptionByName request");
+        };
+        assert_eq!(
+            request.scope,
+            OptionScopeSelector::Session(session_name("alpha"))
+        );
+    }
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option known option executes");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .options
+                .resolve(Some(&session_name("alpha")), OptionName::Status),
+            Some("off")
+        );
+    }
+    let shown = CommandParser::new()
+        .parse("show-options -v -t alpha status")
+        .expect("show-options session status parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), shown)
+        .await
+        .expect("show-options session status executes");
+    assert_eq!(output.stdout(), b"off\n");
+
+    let parsed = CommandParser::new()
+        .parse("set-option -wg status on")
+        .expect("set-option -wg known option parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option -wg known option executes");
+    let shown = CommandParser::new()
+        .parse("show-options -gv status")
+        .expect("show-options global status parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), shown)
+        .await
+        .expect("show-options global status executes");
+    assert_eq!(output.stdout(), b"on\n");
+
+    let parsed = CommandParser::new()
+        .parse("set-option -pg status off")
+        .expect("set-option -pg known option parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option -pg known option executes");
+    let output = handler
+        .execute_parsed_commands_for_test(
+            std::process::id(),
+            CommandParser::new()
+                .parse("show-options -gv status")
+                .expect("show-options global status parses"),
+        )
+        .await
+        .expect("show-options global status executes");
+    assert_eq!(output.stdout(), b"off\n");
+
+    let parsed = CommandParser::new()
+        .parse("set-option -gp pane-border-style fg=red")
+        .expect("set-option -gp pane option parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option -gp pane option executes");
+    let output = handler
+        .execute_parsed_commands_for_test(
+            std::process::id(),
+            CommandParser::new()
+                .parse("show-options -gpqv pane-border-style")
+                .expect("show-options -gp pane option parses"),
+        )
+        .await
+        .expect("show-options -gp pane option executes");
+    assert_eq!(output.stdout(), b"fg=red\n");
+
+    let parsed = CommandParser::new()
+        .parse("set-option -gp @pane-global pane-global")
+        .expect("set-option -gp user option parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option -gp user option executes");
+    let output = handler
+        .execute_parsed_commands_for_test(
+            std::process::id(),
+            CommandParser::new()
+                .parse("show-options -gpqv @pane-global")
+                .expect("show-options -gp user option parses"),
+        )
+        .await
+        .expect("show-options -gp user option executes");
+    assert_eq!(output.stdout(), b"pane-global\n");
+
+    let parsed = CommandParser::new()
+        .parse("set-option -p -t alpha:0.0 pane-border-style fg=blue")
+        .expect("pane-local option parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("pane-local option executes");
+    let parsed = CommandParser::new()
+        .parse("set-option -U -t alpha:0 pane-border-style")
+        .expect("set-option -U without value parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option -U unsets pane overrides without a value");
+
+    let output = handler
+        .execute_parsed_commands_for_test(
+            std::process::id(),
+            CommandParser::new()
+                .parse("show-options -pqv -t alpha:0.0 pane-border-style")
+                .expect("show pane option parses"),
+        )
+        .await
+        .expect("show pane option executes");
+    assert_eq!(output.stdout(), b"");
+}
+
 #[tokio::test]
 async fn parsed_queue_bind_key_accepts_command_blocks() {
     let handler = RequestHandler::new();
@@ -12,7 +312,7 @@ async fn parsed_queue_bind_key_accepts_command_blocks() {
         .expect("bind-key block executes");
 
     let list = CommandParser::new()
-        .parse("list-keys -T prefix x")
+        .parse("list-keys -T prefix")
         .expect("list-keys parses");
     let output = handler
         .execute_parsed_commands_for_test(std::process::id(), list)
@@ -74,4 +374,150 @@ async fn parsed_queue_set_hook_resolves_relative_targets_before_block_parse() {
         )
         .await
         .expect("set-hook -t . should execute");
+}
+
+#[tokio::test]
+async fn parsed_queue_set_hook_session_target_uses_hook_natural_window_scope() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse("set-hook -t alpha window-renamed { display-message -p -- renamed }")
+        .expect("set-hook parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-hook executes");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.hooks.session_command(&alpha, HookName::WindowRenamed),
+        None
+    );
+    assert_eq!(
+        state.hooks.window_command(
+            &WindowTarget::with_window(alpha, 0),
+            HookName::WindowRenamed
+        ),
+        Some("display-message -p -- renamed")
+    );
+}
+
+#[tokio::test]
+async fn parsed_hook_commands_resolve_implicit_current_scopes() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-implicit-hooks");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let state = handler.state.lock().await;
+    let current = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+        alpha.clone(),
+        0,
+        0,
+    ))));
+    for (arguments, expected_scope) in [
+        (vec![], ScopeSelector::Session(alpha.clone())),
+        (
+            vec!["-w".to_owned()],
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+        ),
+        (
+            vec!["-p".to_owned()],
+            ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+        ),
+    ] {
+        let request = crate::handler::scripting_support::parse_request_from_parts(
+            "show-hooks".to_owned(),
+            arguments,
+            None,
+            &state.sessions,
+            &state.options,
+            &current,
+        )
+        .expect("show-hooks resolves its implicit current target");
+        let Request::ShowHooks(request) = request else {
+            panic!("expected ShowHooks request");
+        };
+        assert_eq!(request.scope, expected_scope);
+    }
+
+    for (arguments, expected_scope) in [
+        (
+            vec![
+                "-w".to_owned(),
+                "window-renamed".to_owned(),
+                "display-message window".to_owned(),
+            ],
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+        ),
+        (
+            vec![
+                "-p".to_owned(),
+                "pane-mode-changed".to_owned(),
+                "display-message pane".to_owned(),
+            ],
+            ScopeSelector::Pane(PaneTarget::with_window(alpha, 0, 0)),
+        ),
+    ] {
+        let request = crate::handler::scripting_support::parse_request_from_parts(
+            "set-hook".to_owned(),
+            arguments,
+            None,
+            &state.sessions,
+            &state.options,
+            &current,
+        )
+        .expect("set-hook resolves its implicit current target");
+        let Request::SetHookMutation(request) = request else {
+            panic!("expected SetHookMutation request");
+        };
+        assert_eq!(request.scope, expected_scope);
+    }
+}
+
+#[test]
+fn parsed_set_window_option_rejects_non_window_scope_flags() {
+    let handler = RequestHandler::new();
+    let state = handler.state.blocking_lock();
+    for token in ["-s", "-w", "-p", "-U", "-gs", "-gw", "-gp", "-gU"] {
+        let error = crate::handler::scripting_support::parse_request_from_parts(
+            "set-window-option".to_owned(),
+            vec![
+                token.to_owned(),
+                "-g".to_owned(),
+                "pane-border-style".to_owned(),
+                "fg=red".to_owned(),
+            ],
+            None,
+            &state.sessions,
+            &state.options,
+            &TargetFindContext::new(None),
+        )
+        .expect_err("set-window-option rejects incompatible scope flags");
+        assert!(
+            error.to_string().contains("unknown flag"),
+            "unexpected error for {token}: {error}"
+        );
+    }
 }

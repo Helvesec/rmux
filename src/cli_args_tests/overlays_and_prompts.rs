@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn overlay_client_flags_preserve_list_clients_names() {
+    let menu = parse_args(&["display-menu", "-c", "/dev/pts/11", "Item", "i", "true"]).unwrap();
+    match menu.command.expect("parsed command") {
+        super::super::Command::DisplayMenu(args) => {
+            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/11"));
+        }
+        other => panic!("expected display-menu, got {other:?}"),
+    }
+
+    let popup = parse_args(&["display-popup", "-c", "/dev/pts/12", "true"]).unwrap();
+    match popup.command.expect("parsed command") {
+        super::super::Command::DisplayPopup(args) => {
+            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/12"));
+        }
+        other => panic!("expected display-popup, got {other:?}"),
+    }
+}
+
+#[test]
 fn display_menu_parses_overlay_flags_and_queue_command() {
     let cli = parse_args(&[
         "display-menu",
@@ -181,15 +200,16 @@ fn prompt_commands_accept_target_client_flags() {
 }
 
 #[test]
-fn command_prompt_rejects_tmux_invalid_short_flags() {
-    for flag in ["-e", "-l"] {
-        let error = parse_args(&["command-prompt", flag, "display-message hi"]).unwrap_err();
+fn command_prompt_accepts_tmux_command_error_backspace_and_literal_flags() {
+    let cli = parse_args(&["command-prompt", "-Cel", "display-message hi"]).unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("command command-prompt: unknown flag {flag}")),
-            "{error}"
-        );
+    match cli.command.expect("parsed command") {
+        super::super::Command::Prompt(args) => {
+            assert!(args.command_error);
+            assert!(args.backspace_exit);
+            assert!(args.literal);
+            assert_eq!(args.template, vec!["display-message hi"]);
+        }
+        other => panic!("expected Prompt command, got {other:?}"),
     }
 }

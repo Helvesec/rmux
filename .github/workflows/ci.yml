@@ -9,7 +9,6 @@ on:
   pull_request:
     branches:
       - main
-      - "release/**"
   workflow_dispatch:
     inputs:
       windows_runtime_smoke:
@@ -33,6 +32,7 @@ jobs:
   linux-quality:
     name: Linux format, lint, and docs
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       RUST_MIN_STACK: "8388608"
     steps:
@@ -40,7 +40,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
           components: clippy, rustfmt
 
       - name: Cache cargo
@@ -76,6 +76,7 @@ jobs:
   linux-build:
     name: Linux workspace build
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       RUST_MIN_STACK: "8388608"
     steps:
@@ -83,7 +84,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -106,6 +107,7 @@ jobs:
   wasm-crypto:
     name: WASM crypto build and supply-chain gate
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -190,6 +192,7 @@ jobs:
   linux-tests:
     name: Linux tests (${{ matrix.group }})
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -210,7 +213,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -234,6 +237,7 @@ jobs:
   linux-source-gates:
     name: Linux source boundary gates
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -249,9 +253,71 @@ jobs:
       - name: No side effects in debug assertions
         run: scripts/no-debug-assert-side-effects.sh
 
+  tmux-oracle-linux:
+    name: Linux tmux 3.7b oracle harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RUST_MIN_STACK: "8388608"
+      RMUX_REQUIRE_TMUX: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.96.1"
+
+      - name: Install tmux oracle build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison \
+            build-essential \
+            ca-certificates \
+            curl \
+            libevent-dev \
+            libncurses-dev \
+            libutf8proc-dev \
+            pkg-config
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache tmux oracle source
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/.cache/rmux-oracle
+          key: tmux-oracle-3.7b-87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96
+
+      - name: Build pinned tmux 3.7b oracle
+        run: scripts/oracle/build-tmux37.sh --prefix "$RUNNER_TEMP/rmux-oracle"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Source-file oracle must not skip
+        env:
+          RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
+        run: cargo test --locked --test unix_source_file_tmux_oracle -- --test-threads=1
+
+      - name: Differential harness oracle self-tests
+        env:
+          RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
+        run: cargo test --locked --test tmux_compat_harness -- --test-threads=1
+
   release-review-gate:
     name: Release review gate (no package)
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     env:
       RUST_MIN_STACK: "8388608"
     steps:
@@ -259,7 +325,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
           components: clippy, rustfmt
 
       - name: Cache cargo
@@ -277,7 +343,32 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
+      - name: Install tmux oracle build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison \
+            build-essential \
+            ca-certificates \
+            curl \
+            libevent-dev \
+            libncurses-dev \
+            libutf8proc-dev \
+            pkg-config
+
+      - name: Build pinned tmux 3.7b oracle
+        run: scripts/oracle/build-tmux37.sh --prefix "$RUNNER_TEMP/rmux-oracle"
+
       - name: Release review gate
+        env:
+          RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
+          RMUX_REQUIRE_TMUX: "1"
+          RMUX_PERF_AUTO_CURRENT: "1"
+          RMUX_PERF_GATE_MODE: portable-budget
+          RMUX_PERF_EXPECTED_GIT_SHA: ${{ github.sha }}
+          RMUX_PERF_EXPECTED_PLATFORM: linux
+          RMUX_PERF_EXPECTED_PROVENANCE: github-actions:${{ github.repository }}:${{ github.workflow }}:${{ github.job }}:${{ github.run_id }}:${{ github.run_attempt }}
+          RMUX_PERF_MAX_CURRENT_AGE_SECONDS: "21600"
         run: scripts/release-review-gate.sh --skip-package --target-dir target/release-review-ci
 
   snap-package:
@@ -341,6 +432,7 @@ jobs:
   linux-sdk-smoke:
     name: Linux SDK v1 daemon smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       RUST_MIN_STACK: "8388608"
     steps:
@@ -348,7 +440,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -368,14 +460,18 @@ jobs:
   linux-perf-smoke:
     name: Linux non-final performance smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       RUST_MIN_STACK: "8388608"
+      RMUX_PERF_EXPECTED_GIT_SHA: ${{ github.sha }}
+      RMUX_PERF_EXPECTED_PLATFORM: linux
+      RMUX_PERF_EXPECTED_PROVENANCE: github-actions:${{ github.repository }}:${{ github.workflow }}:${{ github.job }}:${{ github.run_id }}:${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -405,12 +501,13 @@ jobs:
   linux-dependency-audit:
     name: Linux dependency audit
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -437,6 +534,7 @@ jobs:
   platform-runtime:
     name: Platform build and smoke on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -452,7 +550,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
+          components: clippy
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -505,7 +604,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
           targets: x86_64-pc-windows-gnu
 
       - name: Cache cargo
@@ -532,12 +631,13 @@ jobs:
     name: Native Windows runtime smoke
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.windows_runtime_smoke)
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830

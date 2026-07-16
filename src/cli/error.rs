@@ -16,6 +16,8 @@ pub(crate) struct ExitFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitFailureKind {
     Generic,
+    AmbiguousTarget,
+    ServerAbsent,
     UnsupportedWireVersion,
 }
 
@@ -32,8 +34,20 @@ impl ExitFailure {
         self.use_stderr
     }
 
+    pub(super) fn is_ambiguous_target(&self) -> bool {
+        self.kind == ExitFailureKind::AmbiguousTarget
+    }
+
+    pub(super) fn is_server_absent(&self) -> bool {
+        self.kind == ExitFailureKind::ServerAbsent
+    }
+
     pub(crate) fn new(exit_code: i32, message: impl Into<String>) -> Self {
         Self::new_with_kind(exit_code, message, ExitFailureKind::Generic)
+    }
+
+    pub(super) fn ambiguous_target(message: impl Into<String>) -> Self {
+        Self::new_with_kind(1, message, ExitFailureKind::AmbiguousTarget)
     }
 
     fn new_with_kind(exit_code: i32, message: impl Into<String>, kind: ExitFailureKind) -> Self {
@@ -80,7 +94,7 @@ impl ExitFailure {
 
     pub(super) fn from_client_connect(socket_path: &Path, error: ClientError) -> Self {
         if let Some(message) = tmux_client_connect_error_message(socket_path, &error) {
-            return Self::new(1, message);
+            return Self::new_with_kind(1, message, ExitFailureKind::ServerAbsent);
         }
 
         Self::from_client(error)
@@ -138,6 +152,11 @@ fn shell_quote_path(path: &Path) -> String {
         return text;
     }
 
+    #[cfg(windows)]
+    {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    }
+    #[cfg(not(windows))]
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 

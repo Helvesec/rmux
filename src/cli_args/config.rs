@@ -138,6 +138,8 @@ pub(crate) struct SetEnvironmentArgs {
 pub(crate) struct ShowOptionsArgs {
     #[arg(short = 'A', action = ArgAction::SetTrue)]
     pub(crate) include_inherited: bool,
+    #[arg(short = 'H', action = ArgAction::SetTrue)]
+    pub(crate) include_hooks: bool,
     #[arg(short = 'g', action = ArgAction::SetTrue)]
     pub(crate) global: bool,
     #[arg(short = 's', action = ArgAction::SetTrue, group = "scope")]
@@ -158,18 +160,15 @@ pub(crate) struct ShowOptionsArgs {
 
 impl ShowOptionsArgs {
     pub(crate) fn validate(self, kind: ShowOptionsCommandKind) -> Result<Self, clap::Error> {
-        if self.global && self.pane {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ArgumentConflict,
-                "show-options does not support combining -g and -p",
-            ));
-        }
         if matches!(kind, ShowOptionsCommandKind::ShowWindowOptions) {
             if self.quiet {
                 return Err(unknown_flag_error(kind.command_name(), "-q"));
             }
             if self.include_inherited {
                 return Err(unknown_flag_error(kind.command_name(), "-A"));
+            }
+            if self.include_hooks {
+                return Err(unknown_flag_error(kind.command_name(), "-H"));
             }
             if self.server {
                 return Err(unknown_flag_error(kind.command_name(), "-s"));

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::Child;
 use std::process::Stdio;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 #[cfg(windows)]
 use std::sync::Mutex as StdMutex;
 use std::sync::{
@@ -18,9 +20,33 @@ use rmux_pty::PtyMaster;
 use tokio::sync::{mpsc, watch};
 
 const PIPE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(test)]
+static ACTIVE_PIPE_CHILDREN: AtomicUsize = AtomicUsize::new(0);
 
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
 use crate::terminal::TerminalProfile;
+
+#[cfg(test)]
+pub(crate) fn active_pipe_child_count_for_test() -> usize {
+    ACTIVE_PIPE_CHILDREN.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn mark_pipe_child_started_for_test() {
+    ACTIVE_PIPE_CHILDREN.fetch_add(1, Ordering::SeqCst);
+}
+
+#[cfg(not(test))]
+fn mark_pipe_child_started_for_test() {}
+
+struct ActivePipeChildGuard;
+
+impl Drop for ActivePipeChildGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        ACTIVE_PIPE_CHILDREN.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct PanePipeStore {
@@ -233,7 +259,7 @@ impl ActivePanePipe {
         read_from_pipe: bool,
         write_to_pipe: bool,
     ) -> Result<Self, RmuxError> {
-        let mut child = profile.shell_std_command(command);
+        let mut child = tmux_pipe_shell_command(profile, command);
         child.current_dir(profile.cwd());
         child.env_clear();
         child.stdin(if write_to_pipe {
@@ -258,6 +284,7 @@ impl ActivePanePipe {
         let mut child = child.spawn().map_err(|error| {
             RmuxError::Server(format!("failed to spawn pipe-pane command: {error}"))
         })?;
+        mark_pipe_child_started_for_test();
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -437,6 +464,7 @@ where
 }
 
 fn wait_for_pipe_child(mut child: Child, stop_flag: Arc<AtomicBool>) {
+    let _active_child = ActivePipeChildGuard;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             let _ = child.kill();
@@ -448,6 +476,16 @@ fn wait_for_pipe_child(mut child: Child, stop_flag: Arc<AtomicBool>) {
             Ok(None) => thread::sleep(PIPE_CHILD_POLL_INTERVAL),
         }
     }
+}
+
+#[cfg(unix)]
+fn tmux_pipe_shell_command(profile: &TerminalProfile, command: &str) -> std::process::Command {
+    crate::terminal::shell_std_command(std::path::Path::new("/bin/sh"), profile.cwd(), command)
+}
+
+#[cfg(not(unix))]
+fn tmux_pipe_shell_command(profile: &TerminalProfile, command: &str) -> std::process::Command {
+    profile.shell_std_command(command)
 }
 
 fn spawn_pipe_thread<F>(
@@ -463,5 +501,70 @@ fn spawn_pipe_thread<F>(
         .spawn(move || task(stop_flag))
     {
         tasks.push(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn pipe_pane_uses_bin_sh_instead_of_profile_shell_like_tmux() {
+        use rmux_core::{EnvironmentStore, OptionStore};
+        use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode};
+
+        let root = std::env::temp_dir().join(format!(
+            "rmux-pipe-pane-bin-sh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock must be after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir exists");
+        let fake_shell = root.join("fake-shell.sh");
+        std::fs::write(&fake_shell, "#!/bin/sh\nexit 42\n").expect("write fake shell");
+        let mut permissions = std::fs::metadata(&fake_shell)
+            .expect("fake shell metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_shell, permissions).expect("fake shell permissions");
+
+        let environment = EnvironmentStore::new();
+        let mut options = OptionStore::new();
+        options
+            .set(
+                ScopeSelector::Global,
+                OptionName::DefaultShell,
+                fake_shell.to_string_lossy().into_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("default-shell succeeds");
+        let session_name = SessionName::new("pipe-shell").expect("valid session name");
+        let profile = TerminalProfile::for_session(
+            &environment,
+            &options,
+            &session_name,
+            7,
+            root.join("socket").as_path(),
+            None,
+            false,
+            None,
+            Some(rmux_core::PaneId::new(3)),
+            Some(root.as_path()),
+        )
+        .expect("profile");
+
+        assert_eq!(profile.shell(), fake_shell.as_path());
+        let command = tmux_pipe_shell_command(&profile, "printf ok");
+        assert_eq!(command.get_program(), std::path::Path::new("/bin/sh"));
+
+        let _ = std::fs::remove_file(&fake_shell);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

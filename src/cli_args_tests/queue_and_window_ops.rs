@@ -17,15 +17,78 @@ fn argv_semicolons_build_an_ordered_command_queue() {
 }
 
 #[test]
-fn list_keys_rejects_tmux_invalid_reverse_flag() {
-    let error = parse_args(&["list-keys", "-r"]).unwrap_err();
+fn standalone_argv_semicolon_builds_an_ordered_command_queue() {
+    let cli = parse_args(&["attach-session", "-t", "alpha", ";", "detach-client"]).unwrap();
+    let commands = cli.into_command_queue();
 
+    assert_eq!(commands.len(), 2);
+    assert!(matches!(
+        &commands[0],
+        super::super::Command::AttachSession(_)
+    ));
+    assert!(matches!(
+        &commands[1],
+        super::super::Command::DetachClient(_)
+    ));
+}
+
+#[test]
+fn target_client_and_hook_flags_survive_argv_queue_parsing() {
+    let cli = parse_args(&[
+        "load-buffer",
+        "-wt",
+        "/dev/pts/10",
+        "/tmp/input",
+        ";",
+        "show-options",
+        "-gH",
+    ])
+    .unwrap();
+    let commands = cli.into_command_queue();
+
+    match &commands[0] {
+        super::super::Command::LoadBuffer(args) => {
+            assert!(args.set_clipboard);
+            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/10"));
+        }
+        other => panic!("expected load-buffer, got {other:?}"),
+    }
+    match &commands[1] {
+        super::super::Command::ShowOptions(args) => assert!(args.include_hooks),
+        other => panic!("expected show-options, got {other:?}"),
+    }
+}
+
+#[test]
+fn trailing_semicolon_after_send_keys_payload_is_a_queue_separator() {
+    let error = parse_args(&["send-keys", "-t", "alpha:0.0", "xyz;", "final"]).unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("command list-keys: unknown flag -r"),
+        error.to_string().contains("unknown command: final"),
         "{error}"
     );
+}
+
+#[test]
+fn bare_semicolon_builds_a_noop_command_queue() {
+    let cli = parse_args(&[";"]).unwrap();
+    let commands = cli.into_command_queue();
+
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(&commands[0], super::super::Command::Noop));
+}
+
+#[test]
+fn list_keys_accepts_tmux_sort_format_and_reverse_flags() {
+    let cli = parse_args(&["list-keys", "-r", "-F", "#{key_table}", "-Okey"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ListKeys(args) => {
+            assert!(args.reversed);
+            assert_eq!(args.format.as_deref(), Some("#{key_table}"));
+            assert_eq!(args.sort_order.as_deref(), Some("key"));
+        }
+        _ => panic!("expected ListKeys command"),
+    }
 }
 
 #[cfg(unix)]

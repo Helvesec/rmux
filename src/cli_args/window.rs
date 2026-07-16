@@ -156,6 +156,10 @@ pub(crate) struct ListWindowsArgs {
     pub(crate) json: bool,
     #[arg(short = 'f', allow_hyphen_values = true)]
     pub(crate) filter: Option<String>,
+    #[arg(short = 'O')]
+    pub(crate) sort_order: Option<String>,
+    #[arg(short = 'r', action = ArgAction::SetTrue)]
+    pub(crate) reversed: bool,
 }
 
 #[derive(Debug, Clone, Args)]

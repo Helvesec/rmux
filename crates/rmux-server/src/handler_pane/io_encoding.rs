@@ -1,5 +1,7 @@
 #[cfg(windows)]
 use rmux_core::key_string_lookup_string;
+use std::io;
+
 use rmux_core::{key_code_lookup_bits, key_string_lookup_key};
 use rmux_proto::{
     ErrorResponse, OptionName, PaneTarget, Response, RmuxError, SendKeysResponse, SessionName,
@@ -17,7 +19,7 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 #[cfg(unix)]
 const IMMEDIATE_PANE_INPUT_MAX_BYTES: usize = 256;
 
-pub(super) struct PaneInputWrite {
+pub(in crate::handler) struct PaneInputWrite {
     session_name: SessionName,
     window_index: u32,
     pane_index: u32,
@@ -86,10 +88,21 @@ impl WindowsConsoleInputAction {
     }
 }
 
-pub(super) fn prepare_pane_input_write(
+/// Whether resolving a pane input write should treat an exited child process
+/// as an error. Paste-buffer rejects dead remain-on-exit panes like tmux;
+/// attached input and send-keys must not use child-process liveness as a pane
+/// liveness gate (dead-pane write errors are tolerated downstream instead).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) enum PaneInputLiveness {
+    TolerateDead,
+    RejectDead,
+}
+
+pub(in crate::handler) fn prepare_pane_input_write(
     state: &mut HandlerState,
     target: &PaneTarget,
     bytes: &[u8],
+    liveness: PaneInputLiveness,
 ) -> Result<PaneInputWrite, RmuxError> {
     let session_name = target.session_name().clone();
     let window_index = target.window_index();
@@ -123,7 +136,14 @@ pub(super) fn prepare_pane_input_write(
             sink: PaneInputSink::QueuedStarting,
         });
     }
-    let master = state.pane_master_in_window(&session_name, window_index, pane_index)?;
+    let master = match liveness {
+        PaneInputLiveness::RejectDead => {
+            state.clone_pane_master_if_alive(&session_name, window_index, pane_index)?
+        }
+        PaneInputLiveness::TolerateDead => {
+            state.clone_pane_master(&session_name, window_index, pane_index)?
+        }
+    };
     #[cfg(not(any(test, windows)))]
     let _ = bytes;
     Ok(PaneInputWrite {
@@ -645,7 +665,9 @@ pub(super) fn prepare_synchronized_pane_input_writes(
 ) -> Result<Vec<PaneInputWrite>, RmuxError> {
     synchronized_input_targets(state, target)?
         .into_iter()
-        .map(|target| prepare_pane_input_write(state, &target, bytes))
+        .map(|target| {
+            prepare_pane_input_write(state, &target, bytes, PaneInputLiveness::TolerateDead)
+        })
         .collect()
 }
 
@@ -724,7 +746,7 @@ pub(super) async fn write_bytes_to_targets(
     Response::SendKeys(SendKeysResponse { key_count })
 }
 
-pub(super) async fn write_bytes_to_target_io(
+pub(in crate::handler) async fn write_bytes_to_target_io(
     write: PaneInputWrite,
     bytes: Vec<u8>,
 ) -> Result<(), RmuxError> {
@@ -741,15 +763,50 @@ pub(super) async fn write_bytes_to_target_io(
         PaneInputSink::Disabled => Ok(()),
         #[cfg(windows)]
         PaneInputSink::QueuedStarting => Ok(()),
-        PaneInputSink::Pty(master) => write_pane_bytes(master, bytes).await.map_err(|error| {
-            RmuxError::Server(format!(
+        PaneInputSink::Pty(master) => match write_pane_bytes(master, bytes).await {
+            Ok(()) => Ok(()),
+            Err(error) if is_dead_pane_write_error(&error) => {
+                Err(RmuxError::Server("target pane has exited".to_owned()))
+            }
+            Err(error) => Err(RmuxError::Server(format!(
                 "failed to write to pane {}:{}.{}: {}",
                 session_name, window_index, pane_index, error
-            ))
-        }),
+            ))),
+        },
         #[cfg(test)]
         PaneInputSink::CapturedForTest => Ok(()),
     }
+}
+
+pub(in crate::handler) async fn write_attached_bytes_to_target_io(
+    write: PaneInputWrite,
+    bytes: Vec<u8>,
+) -> Result<(), RmuxError> {
+    match write_bytes_to_target_io(write, bytes).await {
+        Err(error) if is_dead_pane_input_error(&error) => Ok(()),
+        result => result,
+    }
+}
+
+fn is_dead_pane_input_error(error: &RmuxError) -> bool {
+    matches!(error, RmuxError::Server(message) if message == "target pane has exited")
+}
+
+pub(in crate::handler) fn is_dead_pane_write_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    ) || is_unix_pty_eio(error)
+}
+
+#[cfg(unix)]
+fn is_unix_pty_eio(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
+}
+
+#[cfg(not(unix))]
+fn is_unix_pty_eio(_error: &io::Error) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -777,13 +834,19 @@ pub(super) async fn write_windows_console_input_action_to_target_io(
             );
             tokio::task::spawn_blocking(move || match action {
                 WindowsConsoleInputAction::Key(key) => {
-                    rmux_pty::write_windows_console_key(pid, key)
+                    crate::windows_console_input::write_with_transient_retry(|| {
+                        rmux_pty::write_windows_console_key(pid, key)
+                    })
                 }
                 WindowsConsoleInputAction::KeyThenInterrupt(key) => {
-                    rmux_pty::write_windows_console_key_then_interrupt_if_processed(pid, key)
+                    crate::windows_console_input::write_with_transient_retry(|| {
+                        rmux_pty::write_windows_console_key_then_interrupt_if_processed(pid, key)
+                    })
                 }
                 WindowsConsoleInputAction::Interrupt => {
-                    rmux_pty::send_windows_console_interrupt(pid)
+                    crate::windows_console_input::write_with_transient_retry(|| {
+                        rmux_pty::send_windows_console_interrupt(pid)
+                    })
                 }
                 WindowsConsoleInputAction::Noop => Ok(()),
             })
@@ -888,41 +951,6 @@ fn should_try_immediate_pane_input(byte_len: usize) -> bool {
 #[cfg(not(any(unix, windows)))]
 async fn write_pane_bytes(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<()> {
     master.write_all(&bytes)
-}
-
-pub(in crate::handler) async fn write_bracketed_pane_payload(
-    master: PtyMaster,
-    payload: Vec<u8>,
-    bracketed: bool,
-) -> std::io::Result<()> {
-    #[cfg(any(unix, windows))]
-    {
-        tokio::task::spawn_blocking(move || {
-            write_bracketed_pane_payload_blocking(&master, &payload, bracketed)
-        })
-        .await
-        .map_err(|error| std::io::Error::other(format!("pane paste task failed: {error}")))?
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        write_bracketed_pane_payload_blocking(&master, &payload, bracketed)
-    }
-}
-
-fn write_bracketed_pane_payload_blocking(
-    master: &PtyMaster,
-    payload: &[u8],
-    bracketed: bool,
-) -> std::io::Result<()> {
-    if bracketed {
-        master.write_all(b"\x1b[200~")?;
-    }
-    master.write_all(payload)?;
-    if bracketed {
-        master.write_all(b"\x1b[201~")?;
-    }
-    Ok(())
 }
 
 pub(super) fn encode_tokens_for_target(

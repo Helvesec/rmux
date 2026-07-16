@@ -86,6 +86,60 @@ impl HandlerState {
         Ok(transcript.capture_main(request.range, request.options))
     }
 
+    pub(crate) fn capture_line_format_flags(
+        &self,
+        target: &PaneTarget,
+        request: PaneCaptureRequest,
+    ) -> Result<Vec<u8>, RmuxError> {
+        let runtime_session_name =
+            self.runtime_session_name_for_window(target.session_name(), target.window_index());
+        let pane_id = pane_id_for_target(
+            &self.sessions,
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )?;
+        let transcript = self
+            .transcripts
+            .get(&runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .ok_or_else(|| {
+                missing_pane_terminal(
+                    target.session_name(),
+                    target.window_index(),
+                    target.pane_index(),
+                )
+            })?;
+        let transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+
+        if request.pending_input {
+            return Ok(Vec::new());
+        }
+        if request.use_mode_screen {
+            if let Some(flags) = transcript.capture_copy_mode_line_format_flags(request.range) {
+                return Ok(flags);
+            }
+        }
+        if request.alternate {
+            return transcript
+                .capture_saved_line_format_flags(request.range)
+                .map_or_else(
+                    || {
+                        if request.quiet {
+                            Ok(Vec::new())
+                        } else {
+                            Err(RmuxError::Server("no alternate screen".to_owned()))
+                        }
+                    },
+                    Ok,
+                );
+        }
+
+        Ok(transcript.capture_main_line_format_flags(request.range))
+    }
+
     pub(crate) fn transcript_handle(
         &self,
         target: &PaneTarget,
@@ -164,13 +218,12 @@ impl HandlerState {
         &mut self,
         target: &PaneTarget,
         title: &str,
-    ) -> Result<(), RmuxError> {
+    ) -> Result<Option<(String, String)>, RmuxError> {
         let transcript = self.transcript_handle(target)?;
         let mut transcript = transcript
             .lock()
             .expect("pane transcript mutex must not be poisoned");
-        transcript.set_title(title);
-        Ok(())
+        Ok(transcript.set_title(title))
     }
 
     pub(crate) fn refresh_transcript_limits_for_scope(

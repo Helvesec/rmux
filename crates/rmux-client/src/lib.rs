@@ -13,6 +13,7 @@ pub mod attach;
 #[cfg(windows)]
 #[path = "attach_windows.rs"]
 pub mod attach;
+mod attach_lock_state;
 pub mod auto_start;
 pub(crate) mod commands;
 pub mod connection;

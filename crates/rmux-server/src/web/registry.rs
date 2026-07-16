@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rmux_core::PaneId;
 use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest,
     StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest, WebShareConfigResponse,
@@ -33,7 +34,7 @@ use super::secrets::{
 use super::settings::WebShareSettings;
 use super::tunnel::TunnelInfo;
 use output::{created_output, list_output, lookup_output, stopped_output, CreatedOutput};
-pub(crate) use state::ExpiredWebShare;
+pub(crate) use state::{ExpiredWebShare, WebShareExpiryPoll};
 use state::{WebListenerState, WebShareState};
 
 const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -90,6 +91,10 @@ impl ResolvedCreateWebShareRequest {
             WebShareTarget::Session(target) => Some(target.clone()),
             WebShareTarget::Pane(_) => None,
         }
+    }
+
+    pub(crate) const fn target(&self) -> &WebShareTarget {
+        &self.target
     }
 }
 
@@ -316,11 +321,23 @@ impl WebShareRegistry {
         })
     }
 
-    pub(crate) fn expire_if_due(&self, share_id: &str) -> Option<ExpiredWebShare> {
+    pub(crate) fn poll_expiry(&self, share_id: &str) -> WebShareExpiryPoll {
         self.inner
             .lock()
             .expect("web-share registry mutex must not be poisoned")
-            .expire_if_due(share_id)
+            .poll_expiry(share_id)
+    }
+
+    pub(crate) fn expiry_revoke_receiver(
+        &self,
+        share_id: &str,
+    ) -> Option<watch::Receiver<Option<WebShareRevokeReason>>> {
+        self.inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .records
+            .get(share_id)
+            .map(|record| record.revoke_tx.subscribe())
     }
 
     pub(crate) fn list(&self, _request: ListWebSharesRequest) -> WebShareListResponse {
@@ -380,6 +397,38 @@ impl WebShareRegistry {
             info!(removed, reason = "session_removed", "web_share_pruned");
         }
         removed
+    }
+
+    pub(crate) fn remove_targets_for_panes(&self, pane_ids: &[PaneId]) -> u32 {
+        if pane_ids.is_empty() {
+            return 0;
+        }
+        let removed = self
+            .inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .remove_targets_for_panes(pane_ids, WebShareRevokeReason::PaneGone);
+        if removed > 0 {
+            info!(removed, reason = "pane_removed", "web_share_pruned");
+        }
+        removed
+    }
+
+    pub(crate) fn rename_session_targets(
+        &self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+        session_id: SessionId,
+    ) -> u32 {
+        let renamed = self
+            .inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .rename_session_targets(old_name, new_name, session_id);
+        if renamed > 0 {
+            info!(renamed, reason = "session_renamed", "web_share_retargeted");
+        }
+        renamed
     }
 
     pub(crate) fn lookup(&self, request: LookupWebShareRequest) -> WebShareLookupResponse {

@@ -25,6 +25,18 @@ impl RequestHandler {
                 .await
             {
                 Ok(filter) => filter,
+                Err(error)
+                    if request.target_client.is_none()
+                        && matches!(
+                            &error,
+                            RmuxError::Server(message) | RmuxError::Message(message)
+                                if message == "no current client"
+                        ) =>
+                {
+                    return Response::ShowMessages(ShowMessagesResponse::from_output(
+                        command_output_from_lines(&[]),
+                    ));
+                }
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
             let terminals = if request.terminals {

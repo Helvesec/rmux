@@ -51,6 +51,19 @@ impl Window {
         direction: SplitDirection,
         before: bool,
     ) -> u32 {
+        self.split_at_position_with_id_and_direction_detached(
+            position, pane_id, direction, before, false,
+        )
+    }
+
+    pub(crate) fn split_at_position_with_id_and_direction_detached(
+        &mut self,
+        position: usize,
+        pane_id: PaneId,
+        direction: SplitDirection,
+        before: bool,
+        detached: bool,
+    ) -> u32 {
         assert!(
             position < self.panes.len(),
             "split target position must reference an existing pane"
@@ -62,6 +75,10 @@ impl Window {
         self.auto_unzoom();
         self.layout = layout_for_split(direction);
         let previous_active_pane_id = self.active_pane().map(Pane::id);
+        let previous_last_pane_id = self
+            .last_pane
+            .and_then(|pane_index| self.pane(pane_index))
+            .map(Pane::id);
         let new_index = self.allocate_pane_index();
         let insert_at = if before { position } else { position + 1 };
         self.panes.insert(
@@ -80,9 +97,39 @@ impl Window {
         } else {
             self.apply_layout_tree();
         }
-        self.renumber_panes_by_position(pane_id, previous_active_pane_id);
-        self.mark_pane_active(self.active_pane);
-        self.active_pane
+        self.commit_split_renumber(
+            pane_id,
+            previous_active_pane_id,
+            previous_last_pane_id,
+            detached,
+        );
+        self.pane_index_for_id(pane_id)
+            .expect("new pane id must survive split renumbering")
+    }
+
+    /// Finalizes pane numbering after a split. A detached spawn (tmux `-d`,
+    /// oracle-probed 2026-07-09) keeps the active pane, the last pane, and
+    /// every active_point untouched (`select-pane -l` after `split -d`
+    /// errors "no last pane"); a non-detached split activates the new pane,
+    /// records the previous one as last, and stamps active_point only when
+    /// the active identity actually changed.
+    pub(crate) fn commit_split_renumber(
+        &mut self,
+        new_pane_id: PaneId,
+        previous_active_pane_id: Option<PaneId>,
+        previous_last_pane_id: Option<PaneId>,
+        detached: bool,
+    ) {
+        if detached {
+            let active_pane_id =
+                previous_active_pane_id.expect("split source window must have an active pane");
+            self.renumber_panes_by_position(active_pane_id, previous_last_pane_id);
+            return;
+        }
+        self.renumber_panes_by_position(new_pane_id, previous_active_pane_id);
+        if self.active_pane().map(Pane::id) != previous_active_pane_id {
+            self.mark_pane_active(self.active_pane);
+        }
     }
 
     pub(crate) fn extract_pane(&mut self, pane_index: u32) -> Option<Pane> {
@@ -169,6 +216,8 @@ impl Window {
             self.last_pane = Some(self.active_pane);
             self.active_pane = pane_index;
             self.mark_pane_active(pane_index);
+        } else if let Some(pane) = self.pane_mut(pane_index) {
+            pane.touch_activity();
         }
 
         true
@@ -206,12 +255,6 @@ impl Window {
         }
     }
 
-    pub(crate) fn clear_last_pane_reference(&mut self, pane_index: u32) {
-        if self.last_pane == Some(pane_index) {
-            self.last_pane = None;
-        }
-    }
-
     pub(super) fn mark_pane_active(&mut self, pane_index: u32) {
         let next_active_point = self
             .panes
@@ -222,6 +265,7 @@ impl Window {
             .saturating_add(1);
         if let Some(pane) = self.pane_mut(pane_index) {
             pane.set_active_point(next_active_point);
+            pane.touch_activity();
         }
     }
 
@@ -258,12 +302,8 @@ impl Window {
             return;
         }
 
-        let pane_id = self.panes[0].id();
-        self.panes[0] = Pane::new_with_id(
-            pane_id,
-            0,
-            PaneGeometry::new(0, 0, self.size.cols, self.size.rows),
-        );
+        self.panes[0].set_index(0);
+        self.panes[0].set_geometry(PaneGeometry::new(0, 0, self.size.cols, self.size.rows));
         self.next_pane_index = 1;
         self.active_pane = 0;
         self.last_pane = None;
@@ -322,6 +362,24 @@ impl Window {
         self.last_pane = last_pane_id
             .and_then(|pane_id| self.pane_index_for_id(pane_id))
             .filter(|pane_index| *pane_index != self.active_pane);
+    }
+
+    /// [`Self::renumber_panes_by_position`] for non-detached transfers
+    /// (join/move/swap without `-d`): tmux routes those activations through
+    /// `window_set_active_pane`, so the newly active pane must also receive
+    /// an `active_point` stamp when the active identity actually changed.
+    /// The caller passes the pre-transfer active pane id because the window
+    /// is mid-surgery and its own active index is not reliable here.
+    pub(crate) fn renumber_panes_by_position_stamping(
+        &mut self,
+        active_pane_id: PaneId,
+        last_pane_id: Option<PaneId>,
+        previous_active_pane_id: Option<PaneId>,
+    ) {
+        self.renumber_panes_by_position(active_pane_id, last_pane_id);
+        if previous_active_pane_id != Some(active_pane_id) {
+            self.mark_pane_active(self.active_pane);
+        }
     }
 
     fn allocate_pane_index(&mut self) -> u32 {

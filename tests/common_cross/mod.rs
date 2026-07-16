@@ -5,8 +5,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static UNIQUE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct CrossPlatformHarness {
     label: String,
@@ -78,7 +81,7 @@ impl CrossPlatformHarness {
         let mut last = String::new();
         while Instant::now() < deadline {
             last = self.stdout(["capture-pane", "-p", "-t", target])?;
-            if last.contains(needle) {
+            if capture_contains_terminal_text(&last, needle) {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(100));
@@ -88,6 +91,18 @@ impl CrossPlatformHarness {
         )
         .into())
     }
+}
+
+fn capture_contains_terminal_text(capture: &str, needle: &str) -> bool {
+    if capture.contains(needle) {
+        return true;
+    }
+
+    let unwrapped: String = capture
+        .chars()
+        .filter(|ch| !matches!(ch, '\r' | '\n'))
+        .collect();
+    unwrapped.contains(needle)
 }
 
 impl Drop for CrossPlatformHarness {
@@ -114,22 +129,41 @@ pub(crate) fn rmux_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_rmux"))
 }
 
-fn unique_id(_label: &str) -> String {
+fn unique_id(label: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_nanos();
+    let counter = UNIQUE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let label_hash = label.bytes().fold(0u16, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as u16)
+    });
     let suffix = nanos % 1_000_000_000;
-    format!("rx-{}-{suffix}", std::process::id())
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    format!(
+        "rx-{}-{label_hash:04x}-{counter}-{suffix}",
+        std::process::id()
+    )
+    .chars()
+    .map(|ch| {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            ch
+        } else {
+            '-'
+        }
+    })
+    .collect()
+}
+
+#[test]
+fn capture_contains_terminal_text_accepts_soft_wrapped_needles() {
+    assert!(capture_contains_terminal_text(
+        "prompt>rename_capture_marker\n_1234\n",
+        "rename_capture_marker_1234"
+    ));
+    assert!(!capture_contains_terminal_text(
+        "prompt>rename_capture_marker\n_wrong\n",
+        "rename_capture_marker_1234"
+    ));
 }
 
 fn temp_root() -> PathBuf {

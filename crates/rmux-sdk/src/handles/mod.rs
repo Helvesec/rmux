@@ -18,8 +18,10 @@ pub use owned_session::{
 };
 pub(crate) use pane::is_already_closed_pane_error;
 pub use pane::{
-    Pane, PaneCapture, PaneCaptureBuilder, PaneCloseOutcome, PaneRespawnOptions, PaneSpawnBuilder,
-    PaneSplitBuilder,
+    ForegroundSource, ForegroundSources, ForegroundState, Pane, PaneCapture, PaneCaptureBuilder,
+    PaneCloseOutcome, PaneOptionMutation, PaneRespawnOptions, PaneSpawnBuilder, PaneSplitBuilder,
+    PaneStateClosedReason, PaneStateEvent, PaneStateEventStream, PaneStateEventsOptions,
+    PaneStateOption,
 };
 pub(crate) use rmux::connect_transport_to_endpoint;
 pub use rmux::Rmux;

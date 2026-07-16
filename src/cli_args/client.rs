@@ -24,6 +24,8 @@ pub(crate) struct RefreshClientArgs {
     pub(crate) pan_left: bool,
     #[arg(short = 'R', action = ArgAction::SetTrue)]
     pub(crate) pan_right: bool,
+    #[arg(short = 'r')]
+    pub(crate) colour_report: Option<String>,
     #[arg(short = 'S', action = ArgAction::SetTrue)]
     pub(crate) status_only: bool,
     #[arg(short = 't', allow_hyphen_values = true)]
@@ -42,24 +44,12 @@ pub(crate) struct ListClientsArgs {
     pub(crate) filter: Option<String>,
     #[arg(long = "json", action = ArgAction::SetTrue)]
     pub(crate) json: bool,
-    #[arg(short = 'O', hide = true)]
-    unsupported_sort_order: Option<String>,
+    #[arg(short = 'O')]
+    pub(crate) sort_order: Option<String>,
     #[arg(short = 'r', action = ArgAction::SetTrue, hide = true)]
-    unsupported_reversed: bool,
+    pub(crate) reversed: bool,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target_session: Option<TargetSpec>,
-}
-
-impl ListClientsArgs {
-    pub(crate) fn unsupported_flag(&self) -> Option<&'static str> {
-        if self.unsupported_reversed {
-            Some("-r")
-        } else if self.unsupported_sort_order.is_some() {
-            Some("-O")
-        } else {
-            None
-        }
-    }
 }
 
 #[derive(Debug, Clone, Args)]

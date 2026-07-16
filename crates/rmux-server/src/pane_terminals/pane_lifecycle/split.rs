@@ -54,6 +54,7 @@ impl HandlerState {
         keep_alive_on_exit: Option<bool>,
         split_size: Option<u32>,
         full_size: bool,
+        detached: bool,
         pane_alert_callback: Option<PaneAlertCallback>,
         pane_exit_callback: Option<PaneExitCallback>,
     ) -> Result<SplitWindowResponse, RmuxError> {
@@ -65,6 +66,8 @@ impl HandlerState {
             .session(&session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&session_name))?;
+        let previous_options = self.options.clone();
+        let before_pane_options = self.pane_option_slots_for_session(&session_name)?;
         let (window_index, new_pane_index, _preview_pane_geometry) =
             preview_split(&self.sessions, &target, internal_direction, before)?;
         let runtime_session_name =
@@ -87,16 +90,28 @@ impl HandlerState {
             before,
             split_size,
             full_size,
+            detached,
         )?;
+        if let Err(error) =
+            self.rekey_pane_options_after_session_change(&before_pane_options, &session_name)
+        {
+            self.options = previous_options;
+            self.replace_session(&session_name, previous_session)?;
+            return Err(error);
+        }
         let new_target =
             PaneTarget::with_window(session_name.clone(), window_index, committed_pane_index);
         if let Some(keep_alive) = keep_alive_on_exit {
-            self.options.set(
+            if let Err(error) = self.options.set(
                 ScopeSelector::Pane(new_target.clone()),
                 OptionName::RemainOnExit,
                 if keep_alive { "on" } else { "off" }.to_owned(),
                 SetOptionMode::Replace,
-            )?;
+            ) {
+                self.options = previous_options;
+                self.replace_session(&session_name, previous_session)?;
+                return Err(error);
+            }
         }
 
         let base_environment = match &target {
@@ -122,6 +137,7 @@ impl HandlerState {
         ) {
             Ok(profile) => profile,
             Err(error) => {
+                self.options = previous_options;
                 self.replace_session(&session_name, previous_session)?;
                 return Err(error);
             }
@@ -137,6 +153,7 @@ impl HandlerState {
         ) {
             Ok(terminal) => terminal,
             Err(error) => {
+                self.options = previous_options;
                 self.replace_session(&session_name, previous_session)?;
                 return Err(error);
             }
@@ -146,6 +163,7 @@ impl HandlerState {
             match clone_terminal_for_output_reader(&mut terminal, &session_name, new_pane_id) {
                 Ok(output_reader) => output_reader,
                 Err(error) => {
+                    self.options = previous_options;
                     self.replace_session(&session_name, previous_session)?;
                     return Err(error);
                 }
@@ -155,6 +173,7 @@ impl HandlerState {
             match clone_terminal_for_exit_watcher(&terminal, &session_name, new_pane_id) {
                 Ok(exit_watcher) => exit_watcher,
                 Err(error) => {
+                    self.options = previous_options;
                     self.replace_session(&session_name, previous_session)?;
                     return Err(error);
                 }
@@ -167,6 +186,7 @@ impl HandlerState {
             new_pane_index,
             terminal,
         ) {
+            self.options = previous_options;
             self.replace_session(&session_name, previous_session)?;
             return Err(error);
         }
@@ -186,6 +206,7 @@ impl HandlerState {
             let _ = self
                 .terminals
                 .remove_pane(&runtime_session_name, new_pane_id);
+            self.options = previous_options;
             self.replace_session(&session_name, previous_session)?;
             return Err(error);
         }
@@ -204,6 +225,7 @@ impl HandlerState {
                 )));
             }
 
+            self.options = previous_options;
             self.restore_session_after_resize_error(&session_name, previous_session, &error)?;
             return Err(error);
         }
@@ -249,6 +271,7 @@ impl HandlerState {
         before: bool,
         split_size: Option<u32>,
         full_size: bool,
+        detached: bool,
     ) -> Result<CommittedSplit, RmuxError> {
         // Capture `cwd` as an owned `PathBuf` so the caller can keep it past
         // the `&mut SessionStore` borrow.
@@ -263,21 +286,24 @@ impl HandlerState {
             SplitWindowTarget::Pane(pane) => (pane.window_index(), pane.pane_index()),
         };
         let committed_index = if full_size {
-            session.split_pane_full_size_in_window_with_id_and_direction_before(
+            session.split_pane_full_size_in_window_with_id_and_direction_before_detached(
                 target_window_index,
                 target_pane_index,
                 new_pane_id,
                 direction,
                 before,
+                detached,
             )?
         } else {
-            let committed_index = session.split_pane_in_window_with_id_and_direction_before(
-                target_window_index,
-                target_pane_index,
-                new_pane_id,
-                direction,
-                before,
-            )?;
+            let committed_index = session
+                .split_pane_in_window_with_id_and_direction_before_detached(
+                    target_window_index,
+                    target_pane_index,
+                    new_pane_id,
+                    direction,
+                    before,
+                    detached,
+                )?;
             debug_assert_eq!(committed_index, expected_pane_index);
             committed_index
         };

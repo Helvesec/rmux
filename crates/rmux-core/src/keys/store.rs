@@ -370,7 +370,7 @@ impl KeyBindingStore {
                         .active
                         .values()
                         .cloned()
-                        .map(|binding| display_binding(table, binding))
+                        .flat_map(|binding| display_bindings(table, binding))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
@@ -382,7 +382,7 @@ impl KeyBindingStore {
                         .active
                         .values()
                         .cloned()
-                        .map(|binding| display_binding(table, binding))
+                        .flat_map(|binding| display_bindings(table, binding))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
@@ -495,27 +495,34 @@ fn compare_key_sort(left: &KeyBindingDisplay, right: &KeyBindingDisplay) -> Orde
     }
 }
 
-fn display_binding(table: &KeyBindingTable, binding: KeyBinding) -> KeyBindingDisplay {
-    let default_display = table
+fn display_bindings(table: &KeyBindingTable, binding: KeyBinding) -> Vec<KeyBindingDisplay> {
+    let default_displays = table
         .defaults
         .get(&binding.key)
         .filter(|default| *default == &binding)
-        .and_then(|_| defaults::list_keys_display(&table.name, binding.key));
-    let key_string = default_display.map_or_else(
-        || key_string_lookup_key(binding.key, false),
-        |display| display.key_string.to_owned(),
-    );
-    let command_string = default_display.map_or_else(
-        || binding.commands.to_tmux_binding_string(),
-        |display| display.command_string.to_owned(),
-    );
-    KeyBindingDisplay {
-        table_name: table.name.clone(),
-        binding,
-        key_string,
-        command_string,
-        default_index: default_display.map(|display| display.index),
+        .map(|_| defaults::list_keys_displays(&table.name, binding.key))
+        .unwrap_or_default();
+
+    if default_displays.is_empty() {
+        return vec![KeyBindingDisplay {
+            table_name: table.name.clone(),
+            key_string: key_string_lookup_key(binding.key, false),
+            command_string: binding.commands.to_tmux_binding_string(),
+            default_index: None,
+            binding,
+        }];
     }
+
+    default_displays
+        .into_iter()
+        .map(|display| KeyBindingDisplay {
+            table_name: table.name.clone(),
+            binding: binding.clone(),
+            key_string: display.key_string,
+            command_string: display.command_string.to_owned(),
+            default_index: Some(display.index),
+        })
+        .collect()
 }
 
 fn parse_bind_command(

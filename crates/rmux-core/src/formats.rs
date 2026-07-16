@@ -55,6 +55,8 @@ use transforms::{
     apply_substitution, format_unescape, shell_quote, style_quote, truncate_left, truncate_right,
 };
 
+const FORMAT_REPEAT_BYTES_LIMIT: usize = 5 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -171,7 +173,7 @@ const MOD_BASENAME: u32 = 1 << 6;
 const MOD_DIRNAME: u32 = 1 << 7;
 const MOD_LENGTH: u32 = 1 << 8;
 const MOD_EXPAND_TIME: u32 = 1 << 9;
-const FORMAT_PADDING_LIMIT: usize = 1024 * 1024;
+const FORMAT_PADDING_LIMIT: usize = 10_000;
 
 /// Processes the content inside `#{...}`, applying modifiers and returning the
 /// expanded result.
@@ -199,6 +201,8 @@ where
     let mut name_exists: Option<&FormatModifier> = None;
     let mut expression: Option<&FormatModifier> = None;
     let mut search: Option<&FormatModifier> = None;
+    let mut bool_unary: Option<&FormatModifier> = None;
+    let mut repeat = false;
 
     for fm in &modifiers {
         if fm.modifier.len() == 1 {
@@ -254,12 +258,14 @@ where
                 b'e' => expression = Some(fm),
                 b'C' => search = Some(fm),
                 b'w' => display_width = true,
-                // Runtime-deferred: R
+                b'!' => bool_unary = Some(fm),
+                b'R' => repeat = true,
                 _ => {}
             }
         } else if fm.modifier.len() == 2 {
             match fm.modifier.as_str() {
                 "||" | "&&" => bool_op_n = Some(fm),
+                "!!" => bool_unary = Some(fm),
                 "==" | "!=" | "<=" | ">=" => cmp = Some(fm),
                 _ => {}
             }
@@ -309,7 +315,16 @@ where
 
     let value;
 
-    if let Some(op) = bool_op_n {
+    if let Some(op) = bool_unary {
+        let truthy = is_truthy(&format_expand1(state, body, variables));
+        value = match op.modifier.as_str() {
+            "!" => bool_value(!truthy),
+            "!!" => bool_value(truthy),
+            _ => String::new(),
+        };
+    } else if repeat {
+        value = format_repeat(state, body, variables);
+    } else if let Some(op) = bool_op_n {
         // N-ary boolean operator.
         let is_and = op.modifier == "&&";
         value = format_bool_op(state, body, is_and, variables);
@@ -398,16 +413,18 @@ where
 
     // Padding.
     if width > 0 {
-        let w = bounded_format_padding_width(width);
-        let current_width = text_width(&result, &Utf8Config::default());
-        if current_width < w {
-            result.push_str(&" ".repeat(w - current_width));
+        if let Some(w) = bounded_format_padding_width(width) {
+            let current_width = text_width(&result, &Utf8Config::default());
+            if current_width < w {
+                result.push_str(&" ".repeat(w - current_width));
+            }
         }
     } else if width < 0 {
-        let w = bounded_format_padding_width(width);
-        let current_width = text_width(&result, &Utf8Config::default());
-        if current_width < w {
-            result = format!("{}{result}", " ".repeat(w - current_width));
+        if let Some(w) = bounded_format_padding_width(width) {
+            let current_width = text_width(&result, &Utf8Config::default());
+            if current_width < w {
+                result = format!("{}{result}", " ".repeat(w - current_width));
+            }
         }
     }
 
@@ -454,8 +471,36 @@ fn signed_i32_abs_usize(value: i32) -> usize {
     value.unsigned_abs() as usize
 }
 
-fn bounded_format_padding_width(value: i32) -> usize {
-    signed_i32_abs_usize(value).min(FORMAT_PADDING_LIMIT)
+fn bounded_format_padding_width(value: i32) -> Option<usize> {
+    let width = signed_i32_abs_usize(value);
+    (width <= FORMAT_PADDING_LIMIT).then_some(width)
+}
+
+fn format_repeat<V>(state: &mut ExpandState, body: &str, variables: &V) -> String
+where
+    V: FormatVariables + ?Sized,
+{
+    let Some((unit, count)) = format_choose(state, body, variables) else {
+        state.stop_expansion = true;
+        return String::new();
+    };
+    let Ok(count) = count.parse::<usize>() else {
+        return String::new();
+    };
+    if count == 0 || count > FORMAT_PADDING_LIMIT || unit.is_empty() {
+        return String::new();
+    }
+    let Some(capacity) = unit.len().checked_mul(count) else {
+        return String::new();
+    };
+    if capacity > FORMAT_REPEAT_BYTES_LIMIT {
+        return String::new();
+    }
+    let mut repeated = String::with_capacity(capacity);
+    for _ in 0..count {
+        repeated.push_str(&unit);
+    }
+    repeated
 }
 
 fn split_loop_body(body: &str) -> (&str, Option<&str>) {

@@ -31,6 +31,8 @@ if (-not $env:RUSTFLAGS) {
     $env:RUSTFLAGS = "$env:RUSTFLAGS $pdbSuppressFlag"
 }
 
+$assertCargoFilter = Join-Path $PSScriptRoot "assert-cargo-filter-nonempty.ps1"
+
 function Step([string]$Name, [scriptblock]$Body) {
     Write-Host ""
     Write-Host "[release-review-windows] $Name"
@@ -42,6 +44,25 @@ function Run([string]$Program, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) {
         throw "$Program $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
     }
+}
+
+function Assert-CargoFilter([int]$MinTests, [string[]]$CargoArguments) {
+    $arguments = @([string]$MinTests, "--") + $CargoArguments
+    & $assertCargoFilter @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo filter check failed for cargo $($CargoArguments -join ' ')"
+    }
+}
+
+function Run-PythonScript([string]$Script, [string[]]$Arguments = @()) {
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) {
+        $python = Get-Command python3 -ErrorAction SilentlyContinue
+    }
+    if (-not $python) {
+        throw "python is required for $Script"
+    }
+    Run $python.Source (@($Script) + $Arguments)
 }
 
 function Read-CargoPackageVersion([string]$Manifest) {
@@ -86,6 +107,11 @@ function Read-CargoPackageVersion([string]$Manifest) {
 
 function Check-ReleaseVersions {
     $rootVersion = Read-CargoPackageVersion "Cargo.toml"
+    $rootText = Get-Content -LiteralPath "Cargo.toml" -Raw
+    if ($rootText -notmatch '(?ms)^\s*\[package\].*?^\s*publish\s*=\s*true') {
+        throw "root rmux package must keep publish=true"
+    }
+    Write-Host "root-publish=true"
     $manpage = Get-Content -LiteralPath "docs\man\rmux.1" -Raw
     if ($manpage -notmatch [regex]::Escape("RMUX $rootVersion")) {
         throw "docs\man\rmux.1 does not contain RMUX $rootVersion"
@@ -99,6 +125,7 @@ function Check-ReleaseVersions {
         "crates\rmux-os\Cargo.toml",
         "crates\rmux-proto\Cargo.toml",
         "crates\rmux-pty\Cargo.toml",
+        "crates\rmux-render-core\Cargo.toml",
         "crates\rmux-sdk\Cargo.toml",
         "crates\rmux-server\Cargo.toml",
         "crates\rmux-types\Cargo.toml",
@@ -154,7 +181,37 @@ function Check-CfgBudgets {
     Write-Host "cfg(target_os) check passed."
 }
 
+function Git-LsFiles([string[]]$Arguments) {
+    $output = @(& git ls-files @Arguments)
+    if ($LASTEXITCODE -ne 0) {
+        throw "git ls-files $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+    }
+    $output
+}
+
+function Check-WorktreeHygiene {
+    $trackedLocal = @(Git-LsFiles @(".claude", ".claude/**", ".codex", ".codex/**"))
+    if ($trackedLocal.Count -gt 0) {
+        $trackedLocal | ForEach-Object { Write-Error $_ }
+        throw "tracked local assistant metadata is forbidden"
+    }
+    $trackedArtifacts = @(Git-LsFiles @(".release-deployment", ".release-deployment/**", ".rmux-audit", ".rmux-audit/**", "dist", "dist/**"))
+    if ($trackedArtifacts.Count -gt 0) {
+        $trackedArtifacts | ForEach-Object { Write-Error $_ }
+        throw "tracked local deployment artifacts are forbidden"
+    }
+    $untrackedSockets = @(Git-LsFiles @("--others", "--exclude-standard") | Where-Object { $_ -match '\.(sock|socket)$' })
+    if ($untrackedSockets.Count -gt 0) {
+        $untrackedSockets | ForEach-Object { Write-Error $_ }
+        throw "untracked socket-like files are forbidden in the worktree"
+    }
+    Write-Host "worktree-hygiene=ok"
+}
+
 Step "release versions" { Check-ReleaseVersions }
+Step "changelog release audit" { Run-PythonScript "scripts\check-changelog-release.py" @("CHANGELOG.md") }
+Step "tmux divergence ledger" { Run-PythonScript "scripts\check-tmux-release-ledger.py" }
+Step "feature inventory" { Run "cargo" @("run", "--locked", "--package", "xtask", "--", "feature-inventory", "--check") }
 Write-Host "cargo-target-dir=$env:CARGO_TARGET_DIR"
 Write-Host "cargo-incremental=$env:CARGO_INCREMENTAL"
 Write-Host "cargo-build-jobs=$env:CARGO_BUILD_JOBS"
@@ -164,6 +221,7 @@ Write-Host "cargo-profile-test-debug=$env:CARGO_PROFILE_TEST_DEBUG"
 Write-Host "rustflags=$env:RUSTFLAGS"
 Step "formatting" { Run "cargo" @("fmt", "--all", "--check") }
 Step "platform cfg budget" { Check-CfgBudgets }
+Step "worktree hygiene" { Check-WorktreeHygiene }
 
 if (-not $SkipClippy) {
     Step "workspace clippy" {
@@ -172,9 +230,11 @@ if (-not $SkipClippy) {
 }
 
 Step "tiny parser and boundary tests" {
+    Assert-CargoFilter 1 @("test", "-p", "rmux", "--features", "tiny-cli", "tiny_main", "--locked")
     Run "cargo" @("test", "-p", "rmux", "--features", "tiny-cli", "tiny_main", "--locked")
 }
 Step "mutating target-action retry tests" {
+    Assert-CargoFilter 1 @("test", "-p", "rmux", "--bin", "rmux", "--locked", "target_action_retry_is_limited")
     Run "cargo" @("test", "-p", "rmux", "--bin", "rmux", "--locked", "target_action_retry_is_limited")
 }
 Step "server lib tests" {
@@ -193,9 +253,16 @@ Step "target/format acceptance matrix" {
     Run "cargo" @("test", "--locked", "--test", "acceptance_target_format_matrix", "--", "--test-threads=1")
 }
 Step "Windows attach stream queue regressions" {
+    Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes")
     Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes", "--", "--test-threads=1")
+    Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "blocked_console_output_does_not_block_input_forwarding")
     Run "cargo" @("test", "-p", "rmux-client", "--locked", "blocked_console_output_does_not_block_input_forwarding", "--", "--test-threads=1")
+    Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live")
     Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live", "--", "--test-threads=1")
+}
+Step "Windows CLI queue formats" {
+    Assert-CargoFilter 1 @("test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")
+    Run "cargo" @("test", "--locked", "-p", "rmux", "--test", "windows_cli_queue_formats", "--", "--test-threads=1")
 }
 Step "Windows Ctrl matrix spec" {
     Run "powershell" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\windows_ctrl_matrix.ps1", "-StaticMatrixSpec")
@@ -253,6 +320,10 @@ if (-not $SkipPackage) {
 if ($RunCtrlMatrixSmoke) {
     Step "Windows Ctrl matrix portable smoke" {
         $rmux = Join-Path $TargetDir "x86_64-pc-windows-msvc\release\rmux.exe"
+        $expectedGitSha = (& git rev-parse HEAD).Trim()
+        if ($LASTEXITCODE -ne 0 -or $expectedGitSha -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "unable to resolve the expected Git SHA for Windows Ctrl matrix evidence"
+        }
         Run "powershell" @(
             "-NoProfile",
             "-ExecutionPolicy",
@@ -261,7 +332,9 @@ if ($RunCtrlMatrixSmoke) {
             "scripts\windows_ctrl_matrix.ps1",
             "-Rmux",
             $rmux,
-            "-PortableSmokeOnly"
+            "-PortableSmokeOnly",
+            "-ExpectedGitSha",
+            $expectedGitSha
         )
     }
 }

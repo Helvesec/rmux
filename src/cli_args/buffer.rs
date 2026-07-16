@@ -10,8 +10,8 @@ pub(crate) struct SetBufferArgs {
     pub(crate) name: Option<String>,
     #[arg(short = 'n')]
     pub(crate) new_name: Option<String>,
-    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
-    pub(crate) target: Option<TargetSpec>,
+    #[arg(short = 't', allow_hyphen_values = true)]
+    pub(crate) target_client: Option<String>,
     #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) set_clipboard: bool,
     #[arg()]
@@ -64,6 +64,8 @@ pub(crate) struct DeleteBufferArgs {
 pub(crate) struct LoadBufferArgs {
     #[arg(short = 'b')]
     pub(crate) name: Option<String>,
+    #[arg(short = 't', allow_hyphen_values = true)]
+    pub(crate) target_client: Option<String>,
     #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) set_clipboard: bool,
     #[arg(allow_hyphen_values = true)]
@@ -86,20 +88,8 @@ pub(crate) struct ListBuffersArgs {
     pub(crate) format: Option<String>,
     #[arg(short = 'f')]
     pub(crate) filter: Option<String>,
-    #[arg(short = 'O', hide = true)]
-    unsupported_sort_order: Option<String>,
+    #[arg(short = 'O')]
+    pub(crate) sort_order: Option<String>,
     #[arg(short = 'r', action = ArgAction::SetTrue, hide = true)]
-    unsupported_reversed: bool,
-}
-
-impl ListBuffersArgs {
-    pub(crate) fn unsupported_flag(&self) -> Option<&'static str> {
-        if self.unsupported_reversed {
-            Some("-r")
-        } else if self.unsupported_sort_order.is_some() {
-            Some("-O")
-        } else {
-            None
-        }
-    }
+    pub(crate) reversed: bool,
 }

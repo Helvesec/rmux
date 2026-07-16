@@ -247,6 +247,106 @@ async fn parsed_queue_resize_pane_mouse_flag_resizes_from_border_context() {
 }
 
 #[tokio::test]
+async fn parsed_queue_resize_pane_mouse_flag_shrinks_horizontal_split_from_border_context() {
+    let handler = RequestHandler::new();
+    let session = session_name("resize-mouse-border-shrink-h");
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
+    execute(
+        &handler,
+        "split-window -h -t resize-mouse-border-shrink-h:0.0",
+    )
+    .await;
+
+    let before = pane_sizes(&handler, &session).await;
+    let border_x = before.first().expect("first pane").0;
+    let mouse_event = border_mouse_event(
+        target.clone(),
+        PaneId::new(0),
+        border_x.saturating_sub(4),
+        0,
+        border_x,
+        0,
+    );
+    let parsed = CommandParser::new()
+        .parse("resize-pane -M")
+        .expect("command parses");
+
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Pane(target.clone())))
+                .with_mouse_target(Some(Target::Pane(target.clone())))
+                .with_mouse_event(Some(mouse_event)),
+        )
+        .await
+        .expect("mouse resize executes");
+
+    let after = pane_sizes(&handler, &session).await;
+    assert!(
+        after[0].0 < before[0].0,
+        "first pane should shrink after dragging the vertical border left: before={before:?} after={after:?}"
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_resize_pane_mouse_flag_shrinks_vertical_split_from_border_context() {
+    let handler = RequestHandler::new();
+    let session = session_name("resize-mouse-border-shrink-v");
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
+    execute(
+        &handler,
+        "split-window -v -t resize-mouse-border-shrink-v:0.0",
+    )
+    .await;
+
+    let before = pane_sizes(&handler, &session).await;
+    let border_y = before.first().expect("first pane").1;
+    let mouse_event = border_mouse_event(
+        target.clone(),
+        PaneId::new(0),
+        0,
+        border_y.saturating_sub(3),
+        0,
+        border_y,
+    );
+    let parsed = CommandParser::new()
+        .parse("resize-pane -M")
+        .expect("command parses");
+
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Pane(target.clone())))
+                .with_mouse_target(Some(Target::Pane(target.clone())))
+                .with_mouse_event(Some(mouse_event)),
+        )
+        .await
+        .expect("mouse resize executes");
+
+    let after = pane_sizes(&handler, &session).await;
+    assert!(
+        after[0].1 < before[0].1,
+        "first pane should shrink after dragging the horizontal border up: before={before:?} after={after:?}"
+    );
+}
+
+#[tokio::test]
 async fn parsed_queue_mouse_resize_survives_prior_command_in_pipeline() {
     let handler = RequestHandler::new();
     let session = session_name("resize-mouse-pipeline");
@@ -379,7 +479,7 @@ async fn parsed_queue_mouse_resize_can_recover_attached_current_mouse_event() {
 async fn create_test_session(handler: &RequestHandler, session: SessionName, size: TerminalSize) {
     let response = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session),
+            session_name: Some(session.clone()),
             working_directory: None,
             detached: true,
             size: Some(size),
@@ -402,6 +502,10 @@ async fn create_test_session(handler: &RequestHandler, session: SessionName, siz
         matches!(response, Response::NewSession(_)),
         "resize test session should be created, got {response:?}"
     );
+    let target = PaneTarget::with_window(session, 0, 0);
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
 }
 
 #[cfg(unix)]
@@ -462,4 +566,35 @@ async fn pane_sizes(handler: &RequestHandler, session: &SessionName) -> Vec<(u16
             (geometry.cols(), geometry.rows())
         })
         .collect()
+}
+
+fn border_mouse_event(
+    target: PaneTarget,
+    pane_id: PaneId,
+    x: u16,
+    y: u16,
+    start_x: u16,
+    start_y: u16,
+) -> AttachedMouseEvent {
+    AttachedMouseEvent {
+        raw: MouseForwardEvent {
+            b: 32,
+            lb: 0,
+            x,
+            y,
+            lx: start_x,
+            ly: start_y,
+            sgr_b: 32,
+            sgr_type: 'M',
+            ignore: false,
+        },
+        session_id: 1,
+        window_id: Some(1),
+        pane_id: Some(pane_id),
+        pane_target: Some(target),
+        location: MouseLocation::Border,
+        status_at: None,
+        status_lines: 0,
+        ignore: false,
+    }
 }

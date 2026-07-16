@@ -1,4 +1,4 @@
-pub(super) fn pane_path_from_osc7(raw_path: &str) -> Option<String> {
+pub(crate) fn pane_path_from_osc7(raw_path: &str) -> Option<String> {
     let raw_path = raw_path.trim();
     if raw_path.is_empty() {
         return None;

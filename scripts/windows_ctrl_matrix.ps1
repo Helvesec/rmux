@@ -6,7 +6,10 @@ param(
     [string[]]$OnlyProgram = @(),
     [string[]]$OnlyKey = @(),
     [switch]$StaticMatrixSpec,
-    [switch]$PortableSmokeOnly
+    [switch]$PortableSmokeOnly,
+    [switch]$AllowPortableSmokeSkip,
+    [string]$ExpectedGitSha = $env:RMUX_EXPECTED_GIT_SHA,
+    [string]$EvidencePath = ""
 )
 
 Set-StrictMode -Version Latest
@@ -14,6 +17,29 @@ $ErrorActionPreference = "Stop"
 
 if ($StaticMatrixSpec) {
     $scriptText = Get-Content -LiteralPath $PSCommandPath -Raw
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $PSCommandPath,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($parseErrors.Count -gt 0) {
+        throw "Windows Ctrl matrix static spec parse failed: $($parseErrors[0].Message)"
+    }
+    $staticSpecBlock = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses.Count -gt 0 -and
+        $node.Clauses[0].Item1.Extent.Text -eq '$StaticMatrixSpec'
+    }, $true)
+    if (-not $staticSpecBlock) {
+        throw "Windows Ctrl matrix static spec could not locate its own guard block"
+    }
+    $scriptUnderTest = $scriptText.Remove(
+        $staticSpecBlock.Extent.StartOffset,
+        $staticSpecBlock.Extent.EndOffset - $staticSpecBlock.Extent.StartOffset
+    )
     $requiredSnippets = @(
         "function Invoke-DirectCase",
         "function Invoke-AttachCase",
@@ -28,6 +54,13 @@ if ($StaticMatrixSpec) {
         "WezTerm",
         "Alacritty",
         "PortableSmokeOnly",
+        "AllowPortableSmokeSkip",
+        "ExpectedGitSha",
+        "portable-smoke.evidence.json",
+        "binary_sha256",
+        "matrix_script_sha256",
+        "executed_cases",
+        "windows-ctrl-matrix-portable-smoke requires an interactive session",
         "Ctrl-C",
         "Ctrl-D",
         "Ctrl-A",
@@ -48,11 +81,12 @@ if ($StaticMatrixSpec) {
         "fzf",
         '$Direct.Returned -eq $Attach.Returned -and $Direct.Returned -eq $Send.Returned',
         '$Results.Count -eq 0',
+        'Windows Ctrl matrix executed no cases (all skipped)',
         'Where-Object { $_.Verdict -eq "NO GO" }',
         "Windows Ctrl matrix found"
     )
     foreach ($snippet in $requiredSnippets) {
-        if (-not $scriptText.Contains($snippet)) {
+        if (-not $scriptUnderTest.Contains($snippet)) {
             throw "Windows Ctrl matrix static spec missing required snippet: $snippet"
         }
     }
@@ -60,12 +94,101 @@ if ($StaticMatrixSpec) {
     exit 0
 }
 
+function Get-Sha256([string]$Path) {
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Write-PortableJson([string]$Name, [object]$Payload) {
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+    $Payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutDir $Name) -Encoding utf8
+}
+
+function Assert-PortableEvidence([string]$Path, [string]$GitSha, [string]$BinarySha, [string]$ScriptSha) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Windows Ctrl matrix evidence file was not found: $Path"
+    }
+    $evidence = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ($evidence.schema -ne 1 -or $evidence.kind -ne "rmux-windows-ctrl-matrix-evidence") {
+        throw "Windows Ctrl matrix evidence has an unsupported schema or kind"
+    }
+    if ($evidence.status -ne "passed" -or $evidence.execution -ne "interactive") {
+        throw "Windows Ctrl matrix evidence is not an interactive passing result"
+    }
+    if ($evidence.git_commit -ne $GitSha) {
+        throw "Windows Ctrl matrix evidence Git SHA mismatch: expected=$GitSha evidence=$($evidence.git_commit)"
+    }
+    if ($evidence.binary_sha256 -ne $BinarySha) {
+        throw "Windows Ctrl matrix evidence binary SHA-256 mismatch"
+    }
+    if ($evidence.matrix_script_sha256 -ne $ScriptSha) {
+        throw "Windows Ctrl matrix evidence script SHA-256 mismatch"
+    }
+    if ([int]$evidence.session_id -le 0 -or [int]$evidence.executed_cases -le 0) {
+        throw "Windows Ctrl matrix evidence does not prove an interactive executed case"
+    }
+    return $evidence
+}
+
+if ($PortableSmokeOnly) {
+    if ($ExpectedGitSha -notmatch '^[0-9a-fA-F]{40}$') {
+        throw "Portable Ctrl smoke requires -ExpectedGitSha with a full 40-character Git SHA"
+    }
+    $ExpectedGitSha = $ExpectedGitSha.ToLowerInvariant()
+    if (-not (Test-Path -LiteralPath $Rmux -PathType Leaf)) {
+        throw "rmux binary not found: $Rmux"
+    }
+    $portableBinarySha = Get-Sha256 $Rmux
+    $portableScriptSha = Get-Sha256 $PSCommandPath
+}
+
 if ($PortableSmokeOnly -and -not $env:RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI) {
     $currentSession = (Get-Process -Id $PID).SessionId
     if ($currentSession -eq 0) {
-        Write-Host "windows-ctrl-matrix-portable-smoke=skipped reason=non-interactive-session-0"
-        Write-Host "Set RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI=1 to force the GUI focus smoke from this session."
-        exit 0
+        if (-not [string]::IsNullOrWhiteSpace($EvidencePath)) {
+            try {
+                $verified = Assert-PortableEvidence $EvidencePath $ExpectedGitSha $portableBinarySha $portableScriptSha
+                Write-PortableJson "portable-smoke.evidence.json" $verified
+                Write-Host "windows-ctrl-matrix-portable-smoke=verified-evidence git=$ExpectedGitSha binary_sha256=$portableBinarySha"
+                $global:LASTEXITCODE = 0
+                return
+            } catch {
+                Write-PortableJson "portable-smoke.unavailable.json" ([ordered]@{
+                    schema = 1
+                    kind = "rmux-windows-ctrl-matrix-unavailable"
+                    status = "failed"
+                    reason = "invalid-evidence"
+                    git_commit = $ExpectedGitSha
+                    binary_sha256 = $portableBinarySha
+                    matrix_script_sha256 = $portableScriptSha
+                    detail = $_.Exception.Message
+                })
+                throw
+            }
+        }
+        $skipMessage = "windows-ctrl-matrix-portable-smoke=unavailable reason=non-interactive-session-0"
+        Write-PortableJson "portable-smoke.unavailable.json" ([ordered]@{
+            schema = 1
+            kind = "rmux-windows-ctrl-matrix-unavailable"
+            status = "unavailable"
+            reason = "non-interactive-session-0"
+            git_commit = $ExpectedGitSha
+            binary_sha256 = $portableBinarySha
+            matrix_script_sha256 = $portableScriptSha
+        })
+        if ($AllowPortableSmokeSkip -or $env:RMUX_ALLOW_WINDOWS_CTRL_MATRIX_SKIP -eq '1') {
+            Set-Content -LiteralPath (Join-Path $OutDir "portable-smoke.skip.txt") -Encoding ASCII -Value @(
+                $skipMessage
+                "status=non-passing"
+                "git_commit=$ExpectedGitSha"
+                "binary_sha256=$portableBinarySha"
+                "owner=release-engineering"
+                "cadence=release-candidate-and-manual-windows-review"
+            )
+            Write-Host $skipMessage
+            Write-Host "Set RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI=1 to force the GUI focus smoke from this session."
+            exit 3
+        }
+        throw "windows-ctrl-matrix-portable-smoke requires an interactive session or passing -EvidencePath bound to this Git SHA and binary; session-0 evidence is unavailable."
     }
 }
 
@@ -165,26 +288,6 @@ $script:LastGuiKind = $null
 
 function New-Directory([string]$Path) {
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
-}
-
-function Escape-SendKeysText([string]$Text) {
-    $builder = [System.Text.StringBuilder]::new()
-    foreach ($ch in $Text.ToCharArray()) {
-        switch ($ch) {
-            "+" { [void]$builder.Append("{+}") }
-            "^" { [void]$builder.Append("{^}") }
-            "%" { [void]$builder.Append("{%}") }
-            "~" { [void]$builder.Append("{~}") }
-            "(" { [void]$builder.Append("{(}") }
-            ")" { [void]$builder.Append("{)}") }
-            "{" { [void]$builder.Append("{{}") }
-            "}" { [void]$builder.Append("{}}") }
-            "[" { [void]$builder.Append("{[}") }
-            "]" { [void]$builder.Append("{]}") }
-            default { [void]$builder.Append($ch) }
-        }
-    }
-    $builder.ToString()
 }
 
 function Send-Line([string]$Text) {
@@ -339,6 +442,12 @@ function Close-Window([string]$Title) {
 
 function Command-Exists([string]$Name) {
     [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Wsl-Command-Exists([string]$Name) {
+    if (-not (Command-Exists "wsl.exe")) { return $false }
+    & wsl.exe --exec sh -lc "command -v '$Name' >/dev/null 2>&1" *> $null
+    $LASTEXITCODE -eq 0
 }
 
 function Find-FirstPath([string[]]$Candidates) {
@@ -515,7 +624,7 @@ function ConvertTo-MsysPath([string]$Path) {
 }
 
 function Python-Literal([string]$Value) {
-    "'" + $Value.Replace("\", "\\").Replace("'", "\\'") + "'"
+    "'" + $Value.Replace("\", "\\").Replace("'", "\'") + "'"
 }
 
 function Write-PythonCaseScript([string]$Path, [string]$MarkerPath, [string]$Body) {
@@ -743,6 +852,20 @@ function Add-Result($Terminal, $Shell, $Program, $Key, $Direct, $Attach, $Send) 
     })
 }
 
+function Add-SkipResult([string]$Terminal, [string]$Shell, [string]$Program, [string]$Key, [string]$Reason) {
+    $detail = "skipped/$Reason"
+    $Results.Add([pscustomobject]@{
+        Terminal = $Terminal
+        Shell = $Shell
+        Programme = $Program
+        Touche = $Key
+        "Direct natif" = $detail
+        "RMUX attach" = $detail
+        "RMUX send-keys" = $detail
+        Verdict = "SKIP"
+    })
+}
+
 function New-FailedOutcome([string]$Stage, [object]$ErrorRecord) {
     $message = if ($ErrorRecord -and $ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { [string]$ErrorRecord }
     if ($message.Length -gt 80) {
@@ -805,17 +928,53 @@ foreach ($terminal in $terminalSpecs) {
             if ($OnlyShell.Count -gt 0 -and $OnlyShell -notcontains $shell) { continue }
             if ($OnlyProgram.Count -gt 0 -and $OnlyProgram -notcontains $case.Program) { continue }
             if ($OnlyKey.Count -gt 0 -and $OnlyKey -notcontains $case.Key) { continue }
-            if ($shell -eq "pwsh" -and -not (Command-Exists "pwsh.exe")) { continue }
-            if ($shell -eq "powershell.exe" -and -not (Command-Exists "powershell.exe")) { continue }
-            if ($shell -eq "wsl-bash" -and -not (Command-Exists "wsl.exe")) { continue }
+            if ($shell -eq "pwsh" -and -not (Command-Exists "pwsh.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing pwsh.exe"
+                continue
+            }
+            if ($shell -eq "powershell.exe" -and -not (Command-Exists "powershell.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing powershell.exe"
+                continue
+            }
+            if ($shell -eq "wsl-bash" -and -not (Command-Exists "wsl.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing wsl.exe"
+                continue
+            }
+            if ($case.Program.StartsWith("wsl ") -and -not (Command-Exists "wsl.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing wsl.exe"
+                continue
+            }
+            if ($case.Program -eq "fzf" -and -not (Command-Exists "fzf.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing fzf.exe"
+                continue
+            }
             if ($shell -eq "git-bash") {
                 try {
-                    [void](Shell-Spec "git-bash" "probe" "direct" "" "")
+                    $gitBashSpec = Shell-Spec "git-bash" "probe" "direct" "" ""
                 } catch {
+                    Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing git-bash"
+                    continue
+                }
+                if (-not $gitBashSpec) {
+                    Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing git-bash"
                     continue
                 }
             }
-            if (-not (Command-Exists "python.exe") -and $case.Program.StartsWith("python")) { continue }
+            if ($case.Program.StartsWith("wsl ") -and -not (Wsl-Command-Exists "python3")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "wsl python3 unavailable"
+                continue
+            }
+            if ($case.Program.StartsWith("python")) {
+                if ($shell -eq "wsl-bash") {
+                    if (-not (Wsl-Command-Exists "python3")) {
+                        Add-SkipResult $terminal.Name $shell $case.Program $case.Key "wsl python3 unavailable"
+                        continue
+                    }
+                } elseif (-not (Command-Exists "python.exe")) {
+                    Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing python.exe"
+                    continue
+                }
+            }
             $caseIndex++
             $caseName = "c{0:D3}" -f $caseIndex
             $caseDir = Join-Path $OutDir $caseName
@@ -856,11 +1015,39 @@ $lines | Set-Content -LiteralPath $md -Encoding UTF8
 Write-Host "Results: $md"
 $lines | ForEach-Object { Write-Host $_ }
 
+$skipped = @($Results | Where-Object { $_.Verdict -eq "SKIP" })
+if ($skipped.Count -gt 0) {
+    Write-Warning "Windows Ctrl matrix skipped $($skipped.Count) non-executable case(s); see $md"
+}
+
 if ($Results.Count -eq 0) {
     throw "Windows Ctrl matrix produced no cases"
+}
+
+$executed = @($Results | Where-Object { $_.Verdict -ne "SKIP" })
+if ($executed.Count -eq 0) {
+    throw "Windows Ctrl matrix executed no cases (all skipped); see $md"
 }
 
 $failed = @($Results | Where-Object { $_.Verdict -eq "NO GO" })
 if ($failed.Count -gt 0) {
     throw "Windows Ctrl matrix found $($failed.Count) NO GO case(s); see $md"
+}
+
+if ($PortableSmokeOnly) {
+    $currentSession = (Get-Process -Id $PID).SessionId
+    Write-PortableJson "portable-smoke.evidence.json" ([ordered]@{
+        schema = 1
+        kind = "rmux-windows-ctrl-matrix-evidence"
+        status = "passed"
+        execution = "interactive"
+        git_commit = $ExpectedGitSha
+        binary_sha256 = $portableBinarySha
+        matrix_script_sha256 = $portableScriptSha
+        session_id = $currentSession
+        executed_cases = $executed.Count
+        generated_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+    })
+    Write-Host "windows-ctrl-matrix-portable-smoke=passed git=$ExpectedGitSha binary_sha256=$portableBinarySha executed=$($executed.Count)"
+    $global:LASTEXITCODE = 0
 }

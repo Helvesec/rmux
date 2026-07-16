@@ -54,9 +54,7 @@ fn prefix_pane_right_matches_attached_client_surface_when_frozen_tmux_is_availab
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let deadline = AttachedClientDeadline::new();
     let config = attached_client_config();
 
@@ -198,9 +196,7 @@ fn prefix_q_display_panes_timeout_matches_tmux_when_frozen_tmux_is_available(
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let deadline = AttachedClientDeadline::new();
     let config = attached_client_config();
 
@@ -216,25 +212,36 @@ fn prefix_q_display_panes_timeout_matches_tmux_when_frozen_tmux_is_available(
     let mut tmux_attach = spawn_tmux_attached_input_client(&harness, &tmux_binary, "alpha")?;
     wait_for_attached_clients(&harness, &tmux_binary, config, &deadline)?;
 
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(1_500));
     let mut rmux_bytes = drain_pty(&mut rmux_attach)?;
     let mut tmux_bytes = drain_pty(&mut tmux_attach)?;
 
     write_attached_keys(&mut rmux_attach, b"\x02q", &deadline)?;
     write_attached_keys(&mut tmux_attach, b"\x02q", &deadline)?;
 
-    std::thread::sleep(Duration::from_millis(200));
-    rmux_bytes.extend(drain_pty(&mut rmux_attach)?);
-    tmux_bytes.extend(drain_pty(&mut tmux_attach)?);
+    let mut saw_rmux_overlay = false;
+    let mut saw_tmux_overlay = false;
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(100));
+        rmux_bytes.extend(drain_pty(&mut rmux_attach)?);
+        tmux_bytes.extend(drain_pty(&mut tmux_attach)?);
+        saw_rmux_overlay |=
+            display_panes_overlay_visible(String::from_utf8_lossy(&rmux_bytes).as_ref());
+        saw_tmux_overlay |=
+            display_panes_overlay_visible(String::from_utf8_lossy(&tmux_bytes).as_ref());
+        if saw_rmux_overlay && saw_tmux_overlay {
+            break;
+        }
+    }
 
     let rmux_early = render_transcript(&rmux_bytes, 80, 24);
     let tmux_early = render_transcript(&tmux_bytes, 80, 24);
     assert!(
-        display_panes_overlay_visible(&rmux_early),
+        saw_rmux_overlay,
         "rmux should show display-panes shortly after prefix q, got {rmux_early:?}"
     );
     assert!(
-        display_panes_overlay_visible(&tmux_early),
+        saw_tmux_overlay,
         "tmux should show display-panes shortly after prefix q, got {tmux_early:?}"
     );
 
@@ -263,9 +270,7 @@ fn copy_mode_search_select_matches_attached_client_surface_when_frozen_tmux_is_a
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let deadline = AttachedClientDeadline::new();
     let config = attached_client_config();
 
@@ -321,9 +326,7 @@ fn copy_mode_q_exit_matches_attached_client_surface_when_frozen_tmux_is_availabl
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let deadline = AttachedClientDeadline::new();
     let config = attached_client_config();
 
@@ -407,9 +410,7 @@ fn copy_mode_escape_exit_matches_attached_client_surface_when_frozen_tmux_is_ava
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let deadline = AttachedClientDeadline::new();
     let config = attached_client_config();
 
@@ -478,9 +479,7 @@ fn copy_mode_u_render_matches_attached_client_surface_when_frozen_tmux_is_availa
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let deadline = AttachedClientDeadline::new();
     let config = attached_client_config();
 
@@ -550,9 +549,7 @@ fn choose_tree_window_matches_attached_client_surface_when_frozen_tmux_is_availa
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let deadline = AttachedClientDeadline::new();
     let config = attached_client_config();
 

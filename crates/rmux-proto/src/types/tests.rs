@@ -345,6 +345,9 @@ fn option_name_bincode_tags_keep_v1_order_and_append_new_variants() {
         (OptionName::WindowStyle, 29),
         (OptionName::Backspace, 30),
         (OptionName::XtermKeys, 145),
+        (OptionName::CopyModeLineNumbers, 146),
+        (OptionName::CopyModeLineNumberStyle, 147),
+        (OptionName::CopyModeCurrentLineNumberStyle, 148),
     ] {
         let encoded = bincode::serialize(&option).expect("option encodes");
 

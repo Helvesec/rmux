@@ -317,6 +317,7 @@ pub(in crate::handler) fn sort_list_clients(
     sort_order: Option<&str>,
     reversed: bool,
 ) {
+    let reversed = reversed && sort_order.is_some();
     clients.sort_by(|left, right| {
         let ordering = match parse_session_sort_order(sort_order)
             .unwrap_or(SessionSortOrder::Creation)
@@ -566,8 +567,48 @@ mod tests {
 
     use super::{
         effective_client_terminal_context, format_client_uid, format_client_user,
-        format_requester_uid,
+        format_requester_uid, sort_list_clients, ListClientSnapshot,
     };
+
+    fn client_snapshot(name: &str, order: u64) -> ListClientSnapshot {
+        ListClientSnapshot {
+            name: name.to_owned(),
+            pid: u32::try_from(order).unwrap_or(0),
+            tty: String::new(),
+            control: false,
+            session_name: None,
+            order,
+            width: 80,
+            height: 24,
+            termname: String::new(),
+            termtype: String::new(),
+            termfeatures: String::new(),
+            utf8: true,
+            key_table: None,
+            uid: 0,
+            user: UserIdentity::Uid(0),
+            flags: String::new(),
+        }
+    }
+
+    #[test]
+    fn list_clients_bare_reverse_does_not_reverse_default_order() {
+        let mut clients = vec![client_snapshot("beta", 2), client_snapshot("alpha", 1)];
+
+        sort_list_clients(&mut clients, None, true);
+        let names = clients
+            .iter()
+            .map(|client| client.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["alpha", "beta"]);
+
+        sort_list_clients(&mut clients, Some("name"), true);
+        let names = clients
+            .iter()
+            .map(|client| client.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["beta", "alpha"]);
+    }
 
     #[test]
     fn windows_terminal_environment_enables_synchronized_rendering() {

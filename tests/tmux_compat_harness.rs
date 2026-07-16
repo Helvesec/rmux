@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use common::{
     FrozenTmuxBinary, TmuxCompatHarness, TmuxCompatRunConfig, DEFAULT_FROZEN_TMUX_PATH,
     DEFAULT_TMUX_COMPAT_TERM, FROZEN_TMUX_ENV, FROZEN_TMUX_REFERENCE_REL_PATH,
-    PTY_SERIALIZATION_NOTE, TMUX_COMPAT_PREREQUISITES_NOTE,
+    PTY_SERIALIZATION_NOTE, REQUIRE_TMUX_ENV, TMUX_COMPAT_DIVERGENCE_LEDGER_REL_PATH,
+    TMUX_COMPAT_PREREQUISITES_NOTE, TMUX_ORACLE_ENV,
 };
 use rmux_client::{connect_or_absent, ConnectResult};
 
@@ -40,16 +41,19 @@ fn canonical_socket_parent(socket_path: &Path) -> Result<PathBuf, Box<dyn Error>
 }
 
 #[test]
-fn tmux_compat_harness_records_step2c_prerequisites() {
+fn tmux_compat_harness_records_oracle_prerequisites() {
     assert!(TMUX_COMPAT_PREREQUISITES_NOTE.contains("attached-client"));
     assert!(TMUX_COMPAT_PREREQUISITES_NOTE.contains("PTY"));
     assert!(TMUX_COMPAT_PREREQUISITES_NOTE.contains("80x24"));
     assert!(TMUX_COMPAT_PREREQUISITES_NOTE.contains(DEFAULT_TMUX_COMPAT_TERM));
     assert!(TMUX_COMPAT_PREREQUISITES_NOTE.contains("LC_ALL/LC_CTYPE=C.UTF-8"));
-    assert!(TMUX_COMPAT_PREREQUISITES_NOTE.contains("frozen tmux authority record"));
+    assert!(TMUX_COMPAT_PREREQUISITES_NOTE.contains("frozen tmux 3.7b authority record"));
+    assert!(TMUX_COMPAT_PREREQUISITES_NOTE.contains(TMUX_COMPAT_DIVERGENCE_LEDGER_REL_PATH));
     assert!(TMUX_COMPAT_PREREQUISITES_NOTE.contains("man"));
     assert!(DEFAULT_FROZEN_TMUX_PATH.contains("/tmux-frozen/"));
+    assert!(DEFAULT_FROZEN_TMUX_PATH.contains("e802909de06012a4df6209d55e86487c56223163"));
     assert!(FROZEN_TMUX_REFERENCE_REL_PATH.ends_with("frozen_reference.yaml"));
+    assert!(TMUX_COMPAT_DIVERGENCE_LEDGER_REL_PATH.ends_with("divergences.toml"));
 }
 
 #[test]
@@ -101,6 +105,14 @@ fn tmux_compat_harness_runs_same_argv_when_frozen_tmux_is_available() -> Result<
                 OsString::from("TMUX_TMPDIR"),
                 Some(harness.tmpdir().as_os_str().to_owned())
             ),
+            (
+                OsString::from("HOME"),
+                Some(harness.tmpdir().join("home").into_os_string())
+            ),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                Some(harness.tmpdir().join("xdg").into_os_string())
+            ),
             (OsString::from("TMUX"), None),
             (
                 OsString::from("TERM"),
@@ -115,6 +127,8 @@ fn tmux_compat_harness_runs_same_argv_when_frozen_tmux_is_available() -> Result<
     assert_eq!(
         run.tmux.effective_argv,
         vec![
+            OsString::from("-f"),
+            OsString::from("/dev/null"),
             OsString::from("-S"),
             harness.tmux_socket_path().as_os_str().to_owned(),
             OsString::from("-V"),
@@ -178,6 +192,32 @@ fn frozen_tmux_discovery_rejects_unrecorded_executables() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn frozen_tmux_discovery_hard_fails_when_required_and_missing() {
+    let _lock = common::env_lock().lock().expect("env lock");
+    let _restore_required =
+        common::EnvVarGuard::new(REQUIRE_TMUX_ENV, std::env::var_os(REQUIRE_TMUX_ENV));
+    let _restore_oracle =
+        common::EnvVarGuard::new(TMUX_ORACLE_ENV, std::env::var_os(TMUX_ORACLE_ENV));
+    let _restore_frozen =
+        common::EnvVarGuard::new(FROZEN_TMUX_ENV, std::env::var_os(FROZEN_TMUX_ENV));
+
+    std::env::set_var(REQUIRE_TMUX_ENV, "1");
+    std::env::set_var(TMUX_ORACLE_ENV, "/definitely/missing/rmux-tmux-3.7b");
+    std::env::remove_var(FROZEN_TMUX_ENV);
+
+    let panic = std::panic::catch_unwind(FrozenTmuxBinary::discover)
+        .expect_err("required missing oracle must panic instead of runtime-skipping");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("<non-string panic>");
+
+    assert!(message.contains("tmux 3.7b oracle is required"));
+    assert!(message.contains(REQUIRE_TMUX_ENV));
+}
+
+#[test]
 fn tmux_compat_harness_records_effective_tmux_argv_and_env_overrides() -> Result<(), Box<dyn Error>>
 {
     let harness = TmuxCompatHarness::new("tmux-compat-fake-tmux")?;
@@ -200,6 +240,8 @@ fn tmux_compat_harness_records_effective_tmux_argv_and_env_overrides() -> Result
     assert_eq!(
         run.tmux.effective_argv,
         vec![
+            OsString::from("-f"),
+            OsString::from("/dev/null"),
             OsString::from("-S"),
             harness.tmux_socket_path().as_os_str().to_owned(),
             OsString::from("-V"),
@@ -223,6 +265,14 @@ fn tmux_compat_harness_records_effective_tmux_argv_and_env_overrides() -> Result
             (
                 OsString::from("TMUX_TMPDIR"),
                 Some(override_tmpdir.as_os_str().to_owned())
+            ),
+            (
+                OsString::from("HOME"),
+                Some(harness.tmpdir().join("home").into_os_string())
+            ),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                Some(harness.tmpdir().join("xdg").into_os_string())
             ),
             (OsString::from("TMUX"), Some(OsString::from("inside-tmux"))),
             (
@@ -259,7 +309,7 @@ fn tmux_compat_harness_records_effective_tmux_argv_and_env_overrides() -> Result
     assert!(tmux_stdout.contains("TERM=screen-256color"));
     assert!(tmux_stdout.contains("EXTRA=set"));
     assert!(tmux_stdout.contains(&format!(
-        "ARGV=[-S][{}][-V]",
+        "ARGV=[-f][/dev/null][-S][{}][-V]",
         harness.tmux_socket_path().display()
     )));
 
@@ -884,9 +934,7 @@ fn tmux_compat_config_with_clean_homes(
     Ok(TmuxCompatRunConfig::default()
         .with_timeout(Duration::from_secs(3))
         .with_term("xterm-256color")
-        .without_tmux()
-        .with_env("HOME", home.as_os_str())
-        .with_env("XDG_CONFIG_HOME", xdg.as_os_str()))
+        .without_tmux())
 }
 
 fn wait_for_socket_absent(socket_path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {

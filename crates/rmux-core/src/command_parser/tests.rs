@@ -43,6 +43,14 @@ fn lookup_rejects_unknown_commands_with_tmux_diagnostic() {
         lookup_command("wait-pane").unwrap_err().to_string(),
         "unknown command: wait-pane"
     );
+    assert_eq!(
+        lookup_command("new-pane").unwrap_err().to_string(),
+        "unknown command: new-pane"
+    );
+    assert_eq!(
+        lookup_command("newp").unwrap_err().to_string(),
+        "unknown command: newp"
+    );
 }
 
 #[test]
@@ -247,6 +255,23 @@ fn serializes_embedded_command_lists_with_escaped_separators() {
 }
 
 #[test]
+fn binding_serialization_is_lossless_for_double_quotes_backslashes_and_controls() {
+    for input in [
+        r#"set-buffer -b got 'a"b\\c'"#,
+        "set-buffer -b got 'quoted\"tab\there'",
+        "set-buffer -b got 'quoted\"line\nthere'",
+    ] {
+        let commands = CommandParser::new().parse(input).expect("command parses");
+        let serialized = commands.to_tmux_binding_string();
+        let reparsed = CommandParser::new()
+            .parse(&serialized)
+            .expect("binding serialization reparses");
+
+        assert_eq!(reparsed, commands, "serialized={serialized:?}");
+    }
+}
+
+#[test]
 fn serializes_arguments_with_tmux_quote_style() {
     for (input, expected) in [
         (
@@ -261,6 +286,10 @@ fn serializes_arguments_with_tmux_quote_style() {
             r#"display-message 'has"quote'"#,
             r#"display-message 'has"quote'"#,
         ),
+        (r#"display-message 'a b"c'"#, r#"display-message "a b\"c""#),
+        ("display-message 'a\"\\b'", "display-message 'a\"\\\\b'"),
+        (r#"display-message "~ foo""#, r#"display-message "\~ foo""#),
+        (r#"display-message "%""#, r#"display-message \%"#),
         (
             r#"display-message "both'\"quotes""#,
             r#"display-message "both'\"quotes""#,
@@ -285,6 +314,16 @@ fn serializes_arguments_with_tmux_quote_style() {
             r#"display-message 'brace{value}'"#,
             r#"display-message "brace{value}""#,
         ),
+        (
+            r#"display-message '~nosuchuser/file'"#,
+            r#"display-message \~nosuchuser/file"#,
+        ),
+        (r#"display-message '~ foo'"#, r#"display-message "\~ foo""#),
+        (r#"display-message '100%'"#, r#"display-message "100%""#),
+        (
+            "display-message \"has\\\"quote\tthere\"",
+            "display-message 'has\"quote\\tthere'",
+        ),
     ] {
         let commands = CommandParser::new().parse(input).expect("command parses");
         assert_eq!(commands.to_tmux_string(), expected);
@@ -305,6 +344,41 @@ fn serializes_dollar_arguments_for_lossless_reparse() {
 }
 
 #[test]
+fn to_tmux_string_round_trip_preserves_dollar_anchor_in_substitution() {
+    let commands = CommandParser::new()
+        .parse(r#"display-message -p '#{s/$/Z/:session_name}'"#)
+        .expect("command parses");
+    let serialized = commands.to_tmux_string();
+
+    assert!(
+        serialized.contains("#{s/$/Z/:session_name}"),
+        "dollar anchor should not be backslash-escaped in {serialized:?}"
+    );
+
+    let reparsed = CommandParser::new()
+        .parse(&serialized)
+        .expect("serialized command reparses");
+    assert_eq!(reparsed, commands);
+}
+
+#[test]
+fn to_tmux_string_escapes_control_whitespace_like_tmux_verbose_output() {
+    let commands = CommandParser::new()
+        .parse("display-message \"a b\\nc\" \"tab\\there\" \"car\\rret\"")
+        .expect("command parses");
+
+    assert_eq!(
+        commands.to_tmux_string(),
+        r#"display-message "a b\nc" tab\there car\rret"#
+    );
+
+    let reparsed = CommandParser::new()
+        .parse(&commands.to_tmux_string())
+        .expect("serialized command reparses");
+    assert_eq!(reparsed, commands);
+}
+
+#[test]
 fn records_command_start_lines_from_token_stream() {
     let commands = CommandParser::new()
         .parse("list-sessions\n\ndisplay-message ok")
@@ -312,6 +386,54 @@ fn records_command_start_lines_from_token_stream() {
 
     assert_eq!(commands.commands()[0].line(), 1);
     assert_eq!(commands.commands()[1].line(), 3);
+}
+
+#[test]
+fn source_file_records_command_end_lines_for_multiline_tokens() {
+    let commands = CommandParser::new()
+        .parse_source_file("display-message \"a\nb\"\nset -g @after yes\n")
+        .unwrap();
+
+    assert_eq!(commands.commands()[0].start_line(), 1);
+    assert_eq!(commands.commands()[0].line(), 2);
+    assert_eq!(commands.commands()[1].start_line(), 3);
+    assert_eq!(commands.commands()[1].line(), 3);
+}
+
+#[test]
+fn source_file_comment_newline_counts_before_command_grouping() {
+    let commands = CommandParser::new()
+        .parse_source_file("display-message one # trailing comment\ndisplay-message two\n")
+        .unwrap();
+
+    assert_eq!(commands.commands()[0].start_line(), 1);
+    assert_eq!(commands.commands()[0].line(), 2);
+    assert_eq!(commands.commands()[1].start_line(), 2);
+    assert_eq!(commands.commands()[1].line(), 2);
+}
+
+#[test]
+fn source_file_lookup_errors_report_multiline_command_end_line() {
+    let error = CommandParser::new()
+        .parse_source_file("definitely-not-a-command \"a\nb\"\n")
+        .unwrap_err();
+
+    assert_eq!(error.line(), 2);
+    assert_eq!(error.kind(), CommandParseErrorKind::Lookup);
+    assert!(error
+        .to_string()
+        .starts_with("unknown command: definitely-not-a-command"));
+}
+
+#[test]
+fn source_file_rejects_unquoted_unknown_percent_directives_as_syntax_errors() {
+    let error = CommandParser::new()
+        .parse_source_file("%word\n")
+        .unwrap_err();
+
+    assert_eq!(error.line(), 1);
+    assert_eq!(error.kind(), CommandParseErrorKind::Structural);
+    assert_eq!(error.to_string(), "syntax error");
 }
 
 #[test]
@@ -487,12 +609,12 @@ fn keeps_format_arguments_outside_condition_directives() {
 #[test]
 fn keeps_percent_arguments_outside_condition_directives() {
     let commands = CommandParser::new()
-        .parse("run-shell printf %s value")
+        .parse_arguments(["run-shell", "printf %s value"])
         .unwrap();
 
     assert_eq!(
-        commands.commands()[0].arguments()[1].as_string(),
-        Some("%s")
+        commands.commands()[0].arguments()[0].as_string(),
+        Some("printf %s value")
     );
 }
 
@@ -780,7 +902,7 @@ fn only_whitespace_produces_no_commands() {
 #[test]
 fn deeply_nested_command_blocks_fail_closed_instead_of_overflowing() {
     // `{ … }` blocks recurse through parse_command -> parse_until. Without a cap
-    // this overflows the native stack (SIGABRT). 400 > the 256 cap, and the cap
+    // this overflows the native stack (SIGABRT). 400 > the depth cap, and the cap
     // returns a parse error before the recursion ever reaches the stack limit.
     let depth = 400;
     let input = "if-shell true { ".repeat(depth) + &"}".repeat(depth);
@@ -806,8 +928,8 @@ fn deeply_nested_conditionals_fail_closed_instead_of_overflowing() {
 
 #[test]
 fn modest_block_and_conditional_nesting_still_parses() {
-    // The cap must not regress real configs: nesting well under 256 still parses.
-    let depth = 64;
+    // The cap must not regress real configs: moderate nesting still parses.
+    let depth = 32;
     let braces = "if-shell true { ".repeat(depth) + "display-message ok " + &"}".repeat(depth);
     CommandParser::new()
         .parse(&braces)

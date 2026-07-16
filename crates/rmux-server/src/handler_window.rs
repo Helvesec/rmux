@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use rmux_core::{LifecycleEvent, PaneId};
+use rmux_core::LifecycleEvent;
 use rmux_proto::{
     ErrorResponse, HookName, PaneTarget, Response, ScopeSelector, SessionName, Target,
 };
@@ -13,17 +13,9 @@ use super::{
 };
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminals::{
-    HandlerState, NewWindowOptions, RespawnWindowOptions, WindowSpawnOptions,
+    HandlerState, NewWindowOptions, RemovedWindowHookContext, RespawnWindowOptions,
+    WindowSpawnOptions,
 };
-
-#[derive(Debug, Clone)]
-struct UnlinkedWindowSnapshot {
-    target: rmux_proto::WindowTarget,
-    window_id: u32,
-    window_name: String,
-    pane_ids: Vec<PaneId>,
-    link_count: usize,
-}
 
 fn linked_resize_sessions_for_window_change(
     state: &HandlerState,
@@ -61,6 +53,11 @@ impl RequestHandler {
         requester_pid: u32,
         request: rmux_proto::NewWindowRequest,
     ) -> Response {
+        #[cfg(windows)]
+        let wait_for_deferred_pane_pid = !request.detached
+            || request.start_directory.as_ref().is_some_and(|path| {
+                format_references_pane_pid(Some(path.as_os_str().to_string_lossy().as_ref()))
+            });
         let session_name = request.target;
         let environment_overrides = request.environment;
         let start_directory = request.start_directory;
@@ -73,7 +70,7 @@ impl RequestHandler {
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let attached_count = self.attached_count(&session_name).await;
         #[cfg(windows)]
-        if !request.detached {
+        if wait_for_deferred_pane_pid {
             self.wait_for_windows_deferred_all_pane_pids().await;
         }
         let response = {
@@ -118,6 +115,15 @@ impl RequestHandler {
         if matches!(response, Response::NewWindow(_)) {
             self.sync_session_silence_timers(&session_name).await;
             if let Response::NewWindow(success) = &response {
+                {
+                    let mut active_attach = self.active_attach.lock().await;
+                    active_attach.seed_active_client_for_window(
+                        requester_pid,
+                        success.target.session_name(),
+                        success.target.window_index(),
+                    );
+                }
+                self.bump_active_attach_epoch();
                 self.queue_inline_hook(
                     HookName::AfterNewWindow,
                     ScopeSelector::Session(session_name.clone()),
@@ -148,11 +154,14 @@ impl RequestHandler {
         let (response, removed_windows, removed_pane_ids) = {
             let mut state = self.state.lock().await;
             match state.kill_window(request.target, request.kill_all_others) {
-                Ok(result) => (
-                    Response::KillWindow(result.response),
-                    result.removed_windows,
-                    result.removed_pane_ids,
-                ),
+                Ok(result) => {
+                    self.record_panes_closed_as_killed(&result.removed_pane_ids);
+                    (
+                        Response::KillWindow(result.response),
+                        result.removed_windows,
+                        result.removed_pane_ids,
+                    )
+                }
                 Err(error) => (
                     Response::Error(ErrorResponse { error }),
                     Vec::new(),
@@ -171,6 +180,13 @@ impl RequestHandler {
             for affected_session in &affected_sessions {
                 self.sync_session_silence_timers(affected_session).await;
             }
+            {
+                let mut active_attach = self.active_attach.lock().await;
+                for removed_window in &removed_windows {
+                    active_attach.forget_window(&removed_window.target);
+                }
+            }
+            self.bump_active_attach_epoch();
             for removed_window in removed_windows {
                 let removed_session_name = removed_window.target.session_name().clone();
                 self.emit(LifecycleEvent::WindowUnlinked {
@@ -191,6 +207,7 @@ impl RequestHandler {
 
     pub(super) async fn handle_select_window(
         &self,
+        requester_pid: Option<u32>,
         request: rmux_proto::SelectWindowRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
@@ -224,6 +241,16 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::SelectWindow(_)) {
+            if let Some(requester_pid) = requester_pid {
+                let mut active_attach = self.active_attach.lock().await;
+                active_attach.seed_active_client_for_window(
+                    requester_pid,
+                    &session_name,
+                    target_window_index,
+                );
+                drop(active_attach);
+                self.bump_active_attach_epoch();
+            }
             if window_changed {
                 self.emit(LifecycleEvent::SessionWindowChanged {
                     session_name: session_name.clone(),
@@ -431,11 +458,20 @@ impl RequestHandler {
             active_attach.attached_count(&request.target)
         };
         #[cfg(windows)]
-        if format_references_pane_pid(request.format.as_deref()) {
+        if format_references_pane_pid(request.format.as_deref())
+            || format_references_pane_pid(request.filter.as_deref())
+        {
             self.wait_for_windows_deferred_all_pane_pids().await;
         }
         let state = self.state.lock().await;
-        match state.list_windows(&request.target, request.format.as_deref(), attached_count) {
+        match state.list_windows(
+            &request.target,
+            request.format.as_deref(),
+            attached_count,
+            request.filter.as_deref(),
+            request.sort_order.as_deref(),
+            request.reversed,
+        ) {
             Ok(response) => Response::ListWindows(response),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
@@ -447,15 +483,18 @@ impl RequestHandler {
     ) -> Response {
         let refresh_sessions =
             unique_sessions(request.source.session_name(), request.target.session_name());
-        let removed_destination_pane_ids = {
-            let state = self.state.lock().await;
-            link_window_replaced_destination_pane_ids(&state, &request)
-        };
-        let response = {
+        self.pause_before_window_lifecycle_mutation().await;
+        let (response, removed_destination_pane_ids) = {
             let mut state = self.state.lock().await;
             match state.link_window(request.clone()) {
-                Ok(response) => Response::LinkWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(result) => {
+                    self.record_panes_closed_as_killed(&result.removed_pane_ids);
+                    (
+                        Response::LinkWindow(result.response),
+                        result.removed_pane_ids,
+                    )
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
@@ -480,19 +519,19 @@ impl RequestHandler {
         request: rmux_proto::MoveWindowRequest,
     ) -> Response {
         let refresh_sessions = move_window_refresh_sessions(&request);
-        let unlinked_window = {
-            let state = self.state.lock().await;
-            move_window_unlinked_window_snapshot(&state, &request)
-        };
-        let removed_destination_pane_ids = {
-            let state = self.state.lock().await;
-            move_window_replaced_destination_pane_ids(&state, &request)
-        };
-        let response = {
+        self.pause_before_window_lifecycle_mutation().await;
+        let (response, unlinked_window, removed_destination_pane_ids) = {
             let mut state = self.state.lock().await;
             match state.move_window(request.clone()) {
-                Ok(response) => Response::MoveWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(result) => {
+                    self.record_panes_closed_as_killed(&result.removed_pane_ids);
+                    (
+                        Response::MoveWindow(result.response),
+                        result.unlinked_window,
+                        result.removed_pane_ids,
+                    )
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), None, Vec::new()),
             }
         };
 
@@ -516,38 +555,26 @@ impl RequestHandler {
         &self,
         request: rmux_proto::UnlinkWindowRequest,
     ) -> Response {
-        let kill_if_last = request.kill_if_last;
-        let removed_window = {
-            let state = self.state.lock().await;
-            state
-                .sessions
-                .session(request.target.session_name())
-                .and_then(|session| session.window_at(request.target.window_index()))
-                .map(|window| UnlinkedWindowSnapshot {
-                    target: request.target.clone(),
-                    window_id: window.id().as_u32(),
-                    window_name: window.name().unwrap_or_default().to_owned(),
-                    pane_ids: window_pane_ids(window),
-                    link_count: state.window_link_count(
-                        request.target.session_name(),
-                        request.target.window_index(),
-                    ),
-                })
-        };
         let session_name = request.target.session_name().clone();
-        let response = {
+        self.pause_before_window_lifecycle_mutation().await;
+        let (response, removed_window, removed_pane_ids) = {
             let mut state = self.state.lock().await;
             match state.unlink_window(request.target, request.kill_if_last) {
-                Ok(response) => Response::UnlinkWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(result) => {
+                    self.record_panes_closed_as_killed(&result.removed_pane_ids);
+                    (
+                        Response::UnlinkWindow(result.response),
+                        Some(result.removed_window),
+                        result.removed_pane_ids,
+                    )
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), None, Vec::new()),
             }
         };
 
         if matches!(response, Response::UnlinkWindow(_)) {
+            self.forget_pane_snapshot_coalescers(&removed_pane_ids);
             if let Some(removed_window) = removed_window {
-                if kill_if_last && removed_window.link_count == 1 {
-                    self.forget_pane_snapshot_coalescers(&removed_window.pane_ids);
-                }
                 self.emit(LifecycleEvent::WindowUnlinked {
                     session_name: session_name.clone(),
                     target: Some(removed_window.target),
@@ -670,7 +697,7 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let attached_count = self.attached_count(&session_name).await;
-        let response = {
+        let (response, removed_pane_ids) = {
             let mut state = self.state.lock().await;
             request.start_directory = match render_start_directory_template(
                 &state,
@@ -696,12 +723,22 @@ impl RequestHandler {
                     },
                 },
             ) {
-                Ok(response) => Response::RespawnWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(result) => {
+                    self.record_panes_closed_as_killed(&result.removed_pane_ids);
+                    self.record_pane_respawn_boundary(result.retained_pane_id);
+                    (
+                        Response::RespawnWindow(result.response),
+                        result.removed_pane_ids,
+                    )
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
-        if matches!(response, Response::RespawnWindow(_)) {
+        if !removed_pane_ids.is_empty() {
+            self.forget_pane_snapshot_coalescers(&removed_pane_ids);
+        }
+        if matches!(&response, Response::RespawnWindow(_)) {
             self.refresh_attached_session(&session_name).await;
         }
 
@@ -799,7 +836,7 @@ fn move_window_refresh_sessions(
 fn move_window_lifecycle_events(
     response: &Response,
     request: &rmux_proto::MoveWindowRequest,
-    unlinked_window: Option<&UnlinkedWindowSnapshot>,
+    unlinked_window: Option<&RemovedWindowHookContext>,
 ) -> Vec<LifecycleEvent> {
     if request.renumber {
         return Vec::new();
@@ -832,72 +869,6 @@ fn move_window_lifecycle_events(
             target: success.target.clone(),
         },
     ]
-}
-
-fn move_window_unlinked_window_snapshot(
-    state: &HandlerState,
-    request: &rmux_proto::MoveWindowRequest,
-) -> Option<UnlinkedWindowSnapshot> {
-    let source = request.source.as_ref()?;
-    let window = state
-        .sessions
-        .session(source.session_name())?
-        .window_at(source.window_index())?;
-    Some(UnlinkedWindowSnapshot {
-        target: source.clone(),
-        window_id: window.id().as_u32(),
-        window_name: window.name().unwrap_or_default().to_owned(),
-        pane_ids: window_pane_ids(window),
-        link_count: state.window_link_count(source.session_name(), source.window_index()),
-    })
-}
-
-fn link_window_replaced_destination_pane_ids(
-    state: &HandlerState,
-    request: &rmux_proto::LinkWindowRequest,
-) -> Vec<PaneId> {
-    if !request.kill_destination || request.after || request.before {
-        return Vec::new();
-    }
-    if state.window_link_count(request.target.session_name(), request.target.window_index()) > 1 {
-        return Vec::new();
-    }
-    state
-        .sessions
-        .session(request.target.session_name())
-        .and_then(|session| session.window_at(request.target.window_index()))
-        .map(window_pane_ids)
-        .unwrap_or_default()
-}
-
-fn move_window_replaced_destination_pane_ids(
-    state: &HandlerState,
-    request: &rmux_proto::MoveWindowRequest,
-) -> Vec<PaneId> {
-    if request.renumber || !request.kill_destination || request.after || request.before {
-        return Vec::new();
-    }
-    let Some(source) = request.source.as_ref() else {
-        return Vec::new();
-    };
-    let rmux_proto::MoveWindowTarget::Window(target) = &request.target else {
-        return Vec::new();
-    };
-    if source.session_name() == target.session_name()
-        && source.window_index() == target.window_index()
-    {
-        return Vec::new();
-    }
-    state
-        .sessions
-        .session(target.session_name())
-        .and_then(|session| session.window_at(target.window_index()))
-        .map(window_pane_ids)
-        .unwrap_or_default()
-}
-
-fn window_pane_ids(window: &rmux_core::Window) -> Vec<PaneId> {
-    window.panes().iter().map(|pane| pane.id()).collect()
 }
 
 fn unique_sessions(

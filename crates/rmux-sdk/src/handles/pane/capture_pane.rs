@@ -26,6 +26,9 @@ pub struct PaneCaptureBuilder<'a> {
     alternate: bool,
     escape_ansi: bool,
     escape_sequences: bool,
+    include_format: bool,
+    hyperlinks: bool,
+    line_numbers: bool,
     join_wrapped: bool,
     use_mode_screen: bool,
     preserve_trailing_spaces: bool,
@@ -46,6 +49,9 @@ impl<'a> PaneCaptureBuilder<'a> {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -119,6 +125,24 @@ impl<'a> PaneCaptureBuilder<'a> {
         self
     }
 
+    /// Prefixes each captured line with tmux line flags (`-F`).
+    pub const fn include_format(mut self, enabled: bool) -> Self {
+        self.include_format = enabled;
+        self
+    }
+
+    /// Captures hyperlink metadata instead of rendered text (`-H`).
+    pub const fn hyperlinks(mut self, enabled: bool) -> Self {
+        self.hyperlinks = enabled;
+        self
+    }
+
+    /// Prefixes each captured line with its source line number (`-L`).
+    pub const fn line_numbers(mut self, enabled: bool) -> Self {
+        self.line_numbers = enabled;
+        self
+    }
+
     /// Joins wrapped rows (`-J`).
     pub const fn join_wrapped(mut self, enabled: bool) -> Self {
         self.join_wrapped = enabled;
@@ -170,6 +194,9 @@ impl<'a> PaneCaptureBuilder<'a> {
                 alternate: self.alternate,
                 escape_ansi: self.escape_ansi,
                 escape_sequences: self.escape_sequences,
+                include_format: self.include_format,
+                hyperlinks: self.hyperlinks,
+                line_numbers: self.line_numbers,
                 join_wrapped: self.join_wrapped,
                 use_mode_screen: self.use_mode_screen,
                 preserve_trailing_spaces: self.preserve_trailing_spaces,
@@ -257,6 +284,9 @@ mod tests {
                     .end(0)
                     .alternate(true)
                     .escape_ansi(true)
+                    .include_format(true)
+                    .hyperlinks(true)
+                    .line_numbers(true)
                     .join_wrapped(true)
                     .await
             }
@@ -270,6 +300,9 @@ mod tests {
                 assert!(request.print);
                 assert!(request.alternate);
                 assert!(request.escape_ansi);
+                assert!(request.include_format);
+                assert!(request.hyperlinks);
+                assert!(request.line_numbers);
                 assert!(request.join_wrapped);
                 assert!(!request.escape_sequences);
             }

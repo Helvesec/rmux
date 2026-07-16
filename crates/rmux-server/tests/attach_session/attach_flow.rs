@@ -95,6 +95,7 @@ async fn attach_stream_forwards_bytes_resize_and_client_eof() -> Result<(), Box<
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -220,6 +221,7 @@ async fn attach_stream_emits_border_frames_for_multi_pane_sessions() -> Result<(
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -275,6 +277,7 @@ async fn attach_stream_preserves_bytes_sent_with_the_upgrade_request() -> Result
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -319,6 +322,7 @@ async fn attach_stream_terminates_when_the_session_is_killed() -> Result<(), Box
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -382,6 +386,7 @@ async fn detach_client_closes_the_attach_stream() -> Result<(), Box<dyn Error>> 
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -437,6 +442,7 @@ async fn attached_prefix_d_emits_detached_message_and_closes_stream() -> Result<
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -540,6 +546,7 @@ async fn detach_client_clears_the_active_attach_state() -> Result<(), Box<dyn Er
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;

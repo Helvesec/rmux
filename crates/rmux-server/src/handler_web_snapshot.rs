@@ -225,8 +225,9 @@ impl WebSessionPaneView {
 pub(crate) fn session_content_geometry(
     geometry: PaneGeometry,
     session_size: TerminalSize,
+    status: Option<&str>,
 ) -> Option<PaneGeometry> {
-    let content_rows = session_size.rows.saturating_sub(1);
+    let content_rows = crate::status_lines::content_rows_for_status(status, session_size.rows);
     if geometry.y() >= content_rows {
         return None;
     }
@@ -435,16 +436,20 @@ mod tests {
         };
 
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), size),
+            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), size, Some("on")),
             Some(PaneGeometry::new(0, 0, 120, 31)),
         );
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(60, 16, 60, 16), size),
+            session_content_geometry(PaneGeometry::new(60, 16, 60, 16), size, Some("on")),
             Some(PaneGeometry::new(60, 16, 60, 15)),
         );
         assert_eq!(
-            session_content_geometry(PaneGeometry::new(0, 31, 120, 1), size),
+            session_content_geometry(PaneGeometry::new(0, 31, 120, 1), size, Some("on")),
             None,
+        );
+        assert_eq!(
+            session_content_geometry(PaneGeometry::new(0, 0, 120, 32), size, Some("2")),
+            Some(PaneGeometry::new(0, 0, 120, 30)),
         );
     }
 }

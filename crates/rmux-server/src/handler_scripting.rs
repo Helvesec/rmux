@@ -1,12 +1,12 @@
 use rmux_core::{
-    command_parser::{CommandParseError, ParsedCommand, ParsedCommands},
+    command_parser::{CommandArgument, CommandParseError, ParsedCommand, ParsedCommands},
     command_queue::CommandQueue,
     LifecycleEvent, PaneGeometry, ENVIRON_HIDDEN,
 };
 use rmux_proto::request::Request;
 use rmux_proto::{
-    CommandOutput, PaneTarget, ResizePaneAdjustment, ResizePaneRequest, Response, RmuxError,
-    ScopeSelector, Target,
+    CommandOutput, DisplayMessageRequest, PaneTarget, ResizePaneAdjustment, ResizePaneRequest,
+    Response, RmuxError, ScopeSelector, Target,
 };
 use std::collections::VecDeque;
 
@@ -34,6 +34,8 @@ mod hook_commands;
 mod key_parse;
 #[path = "handler_scripting/layout_parse.rs"]
 mod layout_parse;
+#[path = "handler_scripting/list_commands_runtime.rs"]
+mod list_commands_runtime;
 #[path = "handler_scripting/list_parse.rs"]
 mod list_parse;
 #[path = "handler_scripting/mode_parse.rs"]
@@ -95,15 +97,16 @@ pub(crate) use self::request_parse::parse_request_from_parts;
 pub(super) use self::runtime::spawn_background_async;
 use self::targets::{
     implicit_pane_target, implicit_session_name, implicit_split_target, implicit_window_target,
-    is_unsupported_named_layout, marked_pane_target, marked_pane_target_or_current,
-    parse_layout_name, parse_move_window_target, parse_new_window_target_argument,
-    parse_pane_target, parse_select_layout_target, parse_session_name, parse_split_window_target,
-    parse_target_arg, parse_window_target, queue_target_find_context,
-    resolve_target_argument_with_spec, QueueTargetFindContextInput,
+    marked_pane_target, marked_pane_target_or_current, parse_layout_name, parse_move_window_target,
+    parse_new_window_target_argument, parse_pane_target, parse_select_layout_target,
+    parse_session_name, parse_split_window_target, parse_target_arg, parse_window_target,
+    queue_target_find_context, resolve_target_argument_with_spec, QueueTargetFindContextInput,
 };
 use super::target_support::requester_environment_pane_id;
 
 const SOURCE_FILE_NESTING_LIMIT: usize = 50;
+pub(in crate::handler) const CONTROL_QUEUE_INSERTED_COMMAND_LIMIT: usize = 1024;
+pub(in crate::handler) const CONTROL_QUEUE_STDOUT_LIMIT: usize = 4 * 1024 * 1024;
 
 impl RequestHandler {
     #[cfg(test)]
@@ -243,7 +246,9 @@ impl RequestHandler {
         {
             return ControlCommandResult {
                 stdout: Vec::new(),
-                error: Some(error),
+                error: Some(error.clone()),
+                source_file_error: None,
+                execution_error: Some(error),
                 exit_status: Some(1),
             };
         }
@@ -251,9 +256,12 @@ impl RequestHandler {
         let mut contexts = VecDeque::from(vec![context; queue.len()]);
         let mut stdout = Vec::new();
         let mut errors = Vec::new();
+        let mut source_file_errors = Vec::new();
+        let mut execution_errors = Vec::new();
         let mut exit_status = None;
+        let mut inserted_command_count = 0_usize;
 
-        while let Some(item) = queue.pop_front() {
+        'command_queue: while let Some(item) = queue.pop_front() {
             let item_context = contexts
                 .pop_front()
                 .expect("queue item context must stay aligned");
@@ -264,25 +272,42 @@ impl RequestHandler {
                 Ok(QueueCommandAction::Normal {
                     output: Some(output),
                     error,
+                    source_file_error,
                     exit_status: action_exit_status,
                 }) => {
-                    stdout.extend_from_slice(output.stdout());
+                    if let Err(error) = append_queue_stdout(&mut stdout, output.stdout(), mode) {
+                        execution_errors.push(error.clone());
+                        errors.push(error);
+                        exit_status = Some(1);
+                        break 'command_queue;
+                    }
                     if let Some(status) = action_exit_status {
                         exit_status = Some(status);
                     }
+                    if let Some(error) = source_file_error {
+                        source_file_errors.push(error.clone());
+                        errors.push(error);
+                    }
                     if let Some(error) = error {
+                        execution_errors.push(error.clone());
                         errors.push(error);
                     }
                 }
                 Ok(QueueCommandAction::Normal {
                     output: None,
                     error,
+                    source_file_error,
                     exit_status: action_exit_status,
                 }) => {
                     if let Some(status) = action_exit_status {
                         exit_status = Some(status);
                     }
+                    if let Some(error) = source_file_error {
+                        source_file_errors.push(error.clone());
+                        errors.push(error);
+                    }
                     if let Some(error) = error {
+                        execution_errors.push(error.clone());
                         errors.push(error);
                     }
                 }
@@ -290,22 +315,51 @@ impl RequestHandler {
                     batches,
                     output,
                     error,
+                    source_file_error,
                     exit_status: action_exit_status,
                 }) => {
                     if let Some(output) = output {
-                        stdout.extend_from_slice(output.stdout());
+                        if let Err(error) = append_queue_stdout(&mut stdout, output.stdout(), mode)
+                        {
+                            execution_errors.push(error.clone());
+                            errors.push(error);
+                            exit_status = Some(1);
+                            break 'command_queue;
+                        }
                     }
                     if let Some(status) = action_exit_status {
                         exit_status = Some(status);
                     }
-                    if let Some(error) = error {
+                    if let Some(error) = source_file_error {
+                        source_file_errors.push(error.clone());
                         errors.push(error);
                     }
+                    if let Some(error) = error {
+                        execution_errors.push(error.clone());
+                        errors.push(error);
+                    }
+                    let inserted = batches.iter().fold(0_usize, |count, (commands, _)| {
+                        count.saturating_add(parsed_command_count(commands))
+                    });
+                    let next_inserted_count = inserted_command_count.saturating_add(inserted);
+                    if mode == QueueMode::Control
+                        && next_inserted_count > CONTROL_QUEUE_INSERTED_COMMAND_LIMIT
+                    {
+                        let error = RmuxError::Server(format!(
+                            "control command queue inserted too many commands: {next_inserted_count} (maximum {CONTROL_QUEUE_INSERTED_COMMAND_LIMIT})"
+                        ));
+                        execution_errors.push(error.clone());
+                        errors.push(error);
+                        exit_status = Some(1);
+                        break 'command_queue;
+                    }
+                    inserted_command_count = next_inserted_count;
                     for (commands, context) in batches.into_iter().rev() {
                         if let Err(error) = self
                             .apply_parse_time_assignments(requester_pid, &commands)
                             .await
                         {
+                            execution_errors.push(error.clone());
                             errors.push(error);
                             exit_status = Some(1);
                             continue;
@@ -318,6 +372,7 @@ impl RequestHandler {
                     }
                 }
                 Err(error) => {
+                    execution_errors.push(error.clone());
                     errors.push(error);
                     remove_group_contexts(&queue, &mut contexts, item.group());
                     queue.remove_group(item.group());
@@ -347,6 +402,8 @@ impl RequestHandler {
         ControlCommandResult {
             stdout,
             error: aggregate_rmux_errors(errors),
+            source_file_error: aggregate_rmux_errors(source_file_errors),
+            execution_error: aggregate_rmux_errors(execution_errors),
             exit_status,
         }
     }
@@ -420,9 +477,14 @@ impl RequestHandler {
             QueueInvocation::NoOp => Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             }),
             QueueInvocation::Request(request) => {
+                let explicit_target_run_shell = match &request {
+                    Request::RunShell(request) => request.target.clone(),
+                    _ => None,
+                };
                 let request = apply_queue_context_to_request(request, context);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
                 let request_for_hooks = request.clone();
@@ -433,6 +495,14 @@ impl RequestHandler {
                     context.client_name.clone(),
                 ))
                 .await;
+                let targeted_output_delivered = if let Some(target) =
+                    explicit_target_run_shell.as_ref()
+                {
+                    self.deliver_targeted_run_shell_output(requester_pid, target, &outcome.response)
+                        .await
+                } else {
+                    false
+                };
                 let inline_hook_names = inline_hooks
                     .iter()
                     .map(|pending| pending.hook)
@@ -447,7 +517,7 @@ impl RequestHandler {
                     &inline_hook_names,
                 )
                 .await;
-                match mode {
+                let action = match mode {
                     QueueMode::Detached => queue_action_from_response(outcome.response),
                     QueueMode::Control => {
                         self.control_queue_action_from_outcome(
@@ -457,13 +527,20 @@ impl RequestHandler {
                         )
                         .await
                     }
+                };
+                if targeted_output_delivered {
+                    action.map(QueueCommandAction::without_output)
+                } else {
+                    action
                 }
             }
             QueueInvocation::StartServer => Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             }),
+            QueueInvocation::ListCommands(command) => self.execute_queued_list_commands(command),
             QueueInvocation::NewWindow(command) => {
                 self.execute_queued_new_window(requester_pid, command, context)
                     .await
@@ -526,6 +603,39 @@ impl RequestHandler {
         result.map_err(|error| source_file_context_error(error, &command_for_hooks, context))
     }
 
+    async fn deliver_targeted_run_shell_output(
+        &self,
+        requester_pid: u32,
+        target: &PaneTarget,
+        response: &Response,
+    ) -> bool {
+        let Response::RunShell(response) = response else {
+            return false;
+        };
+        let Some(output) = response.command_output() else {
+            return true;
+        };
+        let message = String::from_utf8_lossy(output.stdout())
+            .trim_end_matches(['\r', '\n'])
+            .replace('#', "##");
+        if message.is_empty() {
+            return true;
+        }
+        matches!(
+            self.handle_display_message(
+                requester_pid,
+                DisplayMessageRequest {
+                    target: Some(Target::Pane(target.clone())),
+                    print: false,
+                    message: Some(message),
+                    empty_target_context: false,
+                },
+            )
+            .await,
+            Response::DisplayMessage(_)
+        )
+    }
+
     async fn apply_parse_time_assignments(
         &self,
         requester_pid: u32,
@@ -575,12 +685,16 @@ impl RequestHandler {
                     target: session_name,
                     target_window_index: None,
                     format: command.format.clone(),
+                    filter: command.filter.clone(),
+                    sort_order: command.sort_order.clone(),
+                    reversed: command.reversed,
                 })
                 .await;
             let action = queue_action_from_response(response)?;
             if let QueueCommandAction::Normal {
                 output: Some(output),
                 error,
+                source_file_error: _,
                 exit_status: _,
             } = action
             {
@@ -594,6 +708,7 @@ impl RequestHandler {
         Ok(QueueCommandAction::Normal {
             output: Some(CommandOutput::from_stdout(stdout)),
             error: None,
+            source_file_error: None,
             exit_status: None,
         })
     }
@@ -619,6 +734,7 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    source_file_error: None,
                     exit_status: None,
                 });
             };
@@ -627,6 +743,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         };
@@ -634,6 +751,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -653,6 +771,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -670,6 +789,7 @@ fn queue_invocation_allowed_for_read_only(invocation: &QueueInvocation) -> bool 
         QueueInvocation::Request(_)
             | QueueInvocation::NoOp
             | QueueInvocation::StartServer
+            | QueueInvocation::ListCommands(_)
             | QueueInvocation::NewWindow(_)
             | QueueInvocation::ListPanesAll(_)
             | QueueInvocation::SplitWindow(_)
@@ -682,15 +802,28 @@ fn mouse_resize_adjustment(
 ) -> ResizePaneAdjustment {
     let x = event.raw.x;
     let y = adjusted_mouse_y(event);
+    let start_x = event.raw.lx;
+    let start_y = adjusted_mouse_y_value(event, event.raw.ly);
     let right_border = geometry.x().saturating_add(geometry.cols());
     let bottom_border = geometry.y().saturating_add(geometry.rows());
+    let started_on_right_border = start_x == right_border
+        && start_y >= geometry.y().saturating_sub(1)
+        && start_y <= bottom_border;
+    let started_on_bottom_border = start_y == bottom_border
+        && start_x >= geometry.x().saturating_sub(1)
+        && start_x <= right_border;
 
-    if x >= right_border {
+    let horizontal_delta = x.abs_diff(start_x);
+    let vertical_delta = y.abs_diff(start_y);
+
+    if started_on_right_border
+        || (!started_on_bottom_border && horizontal_delta >= vertical_delta && horizontal_delta > 0)
+    {
         return ResizePaneAdjustment::AbsoluteWidth {
             columns: x.saturating_sub(geometry.x()).max(1),
         };
     }
-    if y >= bottom_border {
+    if started_on_bottom_border || vertical_delta > 0 {
         return ResizePaneAdjustment::AbsoluteHeight {
             rows: y.saturating_sub(geometry.y()).max(1),
         };
@@ -700,12 +833,46 @@ fn mouse_resize_adjustment(
 }
 
 fn adjusted_mouse_y(event: &AttachedMouseEvent) -> u16 {
+    adjusted_mouse_y_value(event, event.raw.y)
+}
+
+fn adjusted_mouse_y_value(event: &AttachedMouseEvent, y: u16) -> u16 {
     match event.status_at {
-        Some(0) if event.raw.y >= event.status_lines => {
-            event.raw.y.saturating_sub(event.status_lines)
-        }
-        _ => event.raw.y,
+        Some(0) if y >= event.status_lines => y.saturating_sub(event.status_lines),
+        _ => y,
     }
+}
+
+fn append_queue_stdout(
+    stdout: &mut Vec<u8>,
+    bytes: &[u8],
+    mode: QueueMode,
+) -> Result<(), RmuxError> {
+    let next_len = stdout.len().saturating_add(bytes.len());
+    if mode == QueueMode::Control && next_len > CONTROL_QUEUE_STDOUT_LIMIT {
+        return Err(RmuxError::Server(format!(
+            "control command stdout exceeds {CONTROL_QUEUE_STDOUT_LIMIT} bytes"
+        )));
+    }
+    stdout.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn parsed_command_count(commands: &ParsedCommands) -> usize {
+    commands.commands().iter().fold(0_usize, |count, command| {
+        command
+            .arguments()
+            .iter()
+            .fold(
+                count.saturating_add(1),
+                |nested_count, argument| match argument {
+                    CommandArgument::Commands(nested) => {
+                        nested_count.saturating_add(parsed_command_count(nested))
+                    }
+                    CommandArgument::String(_) => nested_count,
+                },
+            )
+    })
 }
 
 fn aggregate_rmux_errors(errors: Vec<RmuxError>) -> Option<RmuxError> {

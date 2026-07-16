@@ -30,6 +30,7 @@ use super::key_parse::{
 use super::layout_parse::{
     parse_display_panes, parse_resize_pane, parse_resize_pane_mouse_target, parse_select_layout,
 };
+use super::list_commands_runtime::parse_queued_list_commands;
 use super::list_parse::{
     parse_list_panes, parse_list_sessions, parse_list_windows, parse_queued_list_panes_all,
 };
@@ -79,6 +80,9 @@ pub(super) fn parse_queue_invocation(
     if command.name() == "source-file" {
         return parse_queued_source_file(command, caller_cwd, sessions, find_context)
             .map(QueueInvocation::SourceFile);
+    }
+    if command.name() == "list-commands" {
+        return parse_queued_list_commands(command).map(QueueInvocation::ListCommands);
     }
     if command.name() == "list-panes" {
         let arguments = command_arguments_as_strings(command.name(), command.arguments())?;
@@ -179,7 +183,7 @@ pub(super) fn parse_queue_invocation(
     }
     if command_name == "start-server" {
         let args = CommandTokens::new(arguments);
-        parse_no_argument_request(args, "start-server")?;
+        args.no_extra("start-server")?;
         return Ok(QueueInvocation::StartServer);
     }
     parse_request_from_parts(
@@ -218,11 +222,11 @@ pub(crate) fn parse_request_from_parts(
             default_set_option_target(sessions, find_context),
         ),
         "set-environment" => parse_set_environment(args, sessions, find_context),
-        "set-hook" => parse_set_hook(args),
+        "set-hook" => parse_set_hook(args, sessions, find_context),
         "show-options" => parse_show_options(args, false, sessions, find_context),
         "show-window-options" => parse_show_options(args, true, sessions, find_context),
         "show-environment" => parse_show_environment(args, sessions, find_context),
-        "show-hooks" => parse_show_hooks(args),
+        "show-hooks" => parse_show_hooks(args, sessions, find_context),
         "set-buffer" => parse_set_buffer(args),
         "show-buffer" => parse_show_buffer(args),
         "paste-buffer" => parse_paste_buffer(args, sessions, find_context),

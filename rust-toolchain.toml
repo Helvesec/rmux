@@ -10,9 +10,9 @@
 # rustc that reproduces the shipped blob is
 # recorded in rmux-web-share's PROVENANCE.json (toolchain.rustc) and pinned both by
 # the CI wasm-crypto job and by rmux-web-share's cross-repo
-# verify-wasm-from-source.mjs gate (via RUSTUP_TOOLCHAIN). A local rebuild must use
-# that same rustc to match byte-for-byte; this floating "stable" is for the rest of
-# the workspace, not a guarantee the wasm reproduces on an arbitrary stable.
+# verify-wasm-from-source.mjs gate (via RUSTUP_TOOLCHAIN). Bump this file only
+# through the contributor process so lint and codegen changes are reviewed with
+# the workspace gates.
 [toolchain]
-channel = "stable"
+channel = "1.96.1"
 targets = ["wasm32-unknown-unknown"]

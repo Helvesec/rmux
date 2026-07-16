@@ -63,7 +63,10 @@ impl ArmedWait {
             _wait_client: wait_client,
             wait_id,
             cancel_guard,
-            timeout: timeout.map(|duration| Box::pin(tokio::time::sleep(duration))),
+            // Arm lazily on the first poll so platform dispatch-settle work
+            // performed before this value is returned cannot consume the
+            // caller's wait budget.
+            timeout: None,
             timeout_duration: timeout,
             operation,
         }
@@ -92,6 +95,9 @@ impl Future for ArmedWait {
         }
 
         if let Some(duration) = self.timeout_duration {
+            if self.timeout.is_none() {
+                self.timeout = Some(Box::pin(tokio::time::sleep(duration)));
+            }
             if let Some(timeout) = self.timeout.as_mut() {
                 if timeout.as_mut().poll(cx).is_ready() {
                     self.cancel_guard.trigger();
@@ -122,12 +128,8 @@ pub(crate) async fn wait_for_bytes(pane: &Pane, bytes: Vec<u8>) -> Result<()> {
     }
 
     let timeout = resolved_wait_timeout(pane.configured_default_timeout());
-    with_wait_timeout(
-        WAIT_FOR_BYTES_OPERATION,
-        timeout,
-        wait_for_bytes_without_timeout(pane, bytes, timeout),
-    )
-    .await
+    let armed_wait = arm_sdk_wait(pane, bytes, WAIT_FOR_BYTES_OPERATION, timeout).await?;
+    armed_wait.await
 }
 
 pub(crate) async fn wait_for_next_bytes(pane: &Pane, bytes: Vec<u8>) -> Result<ArmedWait> {
@@ -184,16 +186,26 @@ pub(crate) async fn wait_exit(pane: &Pane) -> Result<Option<crate::PaneExitState
     .await
 }
 
-async fn wait_for_bytes_without_timeout(
+async fn arm_sdk_wait(
     pane: &Pane,
     bytes: Vec<u8>,
+    operation: &'static str,
     timeout: Option<Duration>,
-) -> Result<()> {
-    let armed_wait = arm_sdk_wait(pane, bytes, WAIT_FOR_BYTES_OPERATION, timeout).await?;
-    armed_wait.await
+) -> Result<ArmedWait> {
+    let armed_wait = with_wait_timeout(
+        operation,
+        timeout,
+        arm_sdk_wait_inner(pane, bytes, operation, timeout),
+    )
+    .await?;
+
+    #[cfg(windows)]
+    tokio::time::sleep(SDK_WAIT_ARM_DISPATCH_SETTLE).await;
+
+    Ok(armed_wait)
 }
 
-async fn arm_sdk_wait(
+async fn arm_sdk_wait_inner(
     pane: &Pane,
     bytes: Vec<u8>,
     operation: &'static str,
@@ -213,11 +225,7 @@ async fn arm_sdk_wait(
     let cancel_guard = DropGuard::best_effort(cancel_client, cancel_request);
     let request = sdk_wait_request_for_pane(pane, owner_id, wait_id, bytes).await?;
 
-    let response =
-        with_wait_timeout(operation, timeout, wait_client.armed_request(request)).await?;
-
-    #[cfg(windows)]
-    tokio::time::sleep(SDK_WAIT_ARM_DISPATCH_SETTLE).await;
+    let response = wait_client.armed_request(request).await?;
 
     Ok(ArmedWait::new(
         response,
@@ -293,6 +301,11 @@ pub(crate) enum PaneExitObservation {
     Exited(Option<crate::PaneExitState>),
 }
 
+/// Applies an SDK wait timeout to one protocol phase.
+///
+/// Platform settle delays that run after the daemon has acknowledged success
+/// should happen outside this wrapper so short user timeouts do not fail after
+/// the requested phase already completed.
 pub(crate) async fn with_wait_timeout<F, T>(
     operation: &'static str,
     timeout: Option<Duration>,

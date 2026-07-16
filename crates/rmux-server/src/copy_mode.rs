@@ -59,6 +59,30 @@ pub(crate) struct CopyModeState {
     search_count_partial: bool,
     search_highlighted: bool,
     jump: Option<JumpState>,
+    recentre_top_bottom: Option<RecentreTopBottomState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecentreTopBottomState {
+    line: usize,
+    next: RecentreTopBottomPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecentreTopBottomPosition {
+    Middle,
+    Top,
+    Bottom,
+}
+
+impl RecentreTopBottomPosition {
+    const fn next(self) -> Self {
+        match self {
+            Self::Middle => Self::Top,
+            Self::Top => Self::Bottom,
+            Self::Bottom => Self::Middle,
+        }
+    }
 }
 
 impl CopyModeState {
@@ -96,6 +120,7 @@ impl CopyModeState {
             search_count_partial: false,
             search_highlighted: false,
             jump: None,
+            recentre_top_bottom: None,
             backing,
         };
         state.top_line = state.bottom_top_line();

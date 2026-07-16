@@ -93,18 +93,20 @@ impl RequestHandler {
         registration: AttachRegistration,
     ) -> u64 {
         #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
+        self.wait_for_windows_deferred_session_panes_ready(&session_name)
+            .await;
         let mut replaced_key_table = None;
         let attached_session_name = session_name.clone();
-        let client_size = if let Some(client_size) = registration.client_size {
-            client_size
-        } else {
+        let (client_size, active_window_index) = {
             let state = self.state.lock().await;
-            state
-                .sessions
-                .session(&attached_session_name)
-                .map(|session| session.window().size())
-                .unwrap_or(super::super::DEFAULT_SESSION_SIZE)
+            let session = state.sessions.session(&attached_session_name);
+            let active_window_index = session.map(rmux_core::Session::active_window_index);
+            let client_size = registration.client_size.unwrap_or_else(|| {
+                session
+                    .map(|session| session.window().size())
+                    .unwrap_or(super::super::DEFAULT_SESSION_SIZE)
+            });
+            (client_size, active_window_index)
         };
         let mut active_attach = self.active_attach.lock().await;
         let attach_id = active_attach.next_id;
@@ -156,12 +158,21 @@ impl RequestHandler {
                 display_panes: None,
             },
         ) {
+            active_attach.forget_attached_client_windows(requester_pid);
             replaced_key_table = previous.key_table_name.clone();
             super::terminate_overlay_job(previous.overlay.take());
             let _ = previous.control_tx.send(AttachControl::Detach);
             previous.closing.store(true, Ordering::SeqCst);
         }
+        if let Some(window_index) = active_window_index {
+            active_attach.seed_active_client_for_window(
+                requester_pid,
+                &attached_session_name,
+                window_index,
+            );
+        }
         drop(active_attach);
+        self.bump_active_attach_epoch();
 
         if let Some(table_name) = replaced_key_table {
             let mut state = self.state.lock().await;
@@ -187,8 +198,7 @@ impl RequestHandler {
                 .is_some_and(|active| active.id == attach_id)
             {
                 active_attach
-                    .by_pid
-                    .remove(&requester_pid)
+                    .remove_attached_client(requester_pid)
                     .map(|active| {
                         let emit_detached = !active.closing.load(Ordering::SeqCst);
                         (
@@ -203,6 +213,9 @@ impl RequestHandler {
                 (None, None, None, false)
             }
         };
+        if removed_session.is_some() {
+            self.bump_active_attach_epoch();
+        }
         super::terminate_overlay_job(removed_overlay);
         if let Some(table_name) = removed_key_table {
             let mut state = self.state.lock().await;

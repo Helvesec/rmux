@@ -8,16 +8,18 @@ pub(crate) struct PromptArgs {
     pub(crate) single: bool,
     #[arg(short = 'b', action = ArgAction::SetTrue)]
     pub(crate) background: bool,
-    #[arg(short = 'e', action = ArgAction::SetTrue, hide = true)]
-    unsupported_backspace_exit: bool,
+    #[arg(short = 'C', action = ArgAction::SetTrue)]
+    pub(crate) command_error: bool,
+    #[arg(short = 'e', action = ArgAction::SetTrue)]
+    pub(crate) backspace_exit: bool,
     #[arg(short = 'F', action = ArgAction::SetTrue)]
     pub(crate) format_template: bool,
     #[arg(short = 'i', action = ArgAction::SetTrue)]
     pub(crate) incremental: bool,
     #[arg(short = 'k', action = ArgAction::SetTrue)]
     pub(crate) key: bool,
-    #[arg(short = 'l', action = ArgAction::SetTrue, hide = true)]
-    unsupported_literal: bool,
+    #[arg(short = 'l', action = ArgAction::SetTrue)]
+    pub(crate) literal: bool,
     #[arg(short = 'N', action = ArgAction::SetTrue)]
     pub(crate) numeric: bool,
     #[arg(short = 'I', allow_hyphen_values = true)]
@@ -36,12 +38,6 @@ pub(crate) struct PromptArgs {
 
 impl PromptArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.unsupported_backspace_exit {
-            return Err(unknown_flag_error("command-prompt", "-e"));
-        }
-        if self.unsupported_literal {
-            return Err(unknown_flag_error("command-prompt", "-l"));
-        }
         Ok(self)
     }
 }
@@ -90,11 +86,4 @@ impl QueuedCommand for PromptHistoryArgs {
     fn set_queue_command(&mut self, queue_command: String) {
         self.queue_command = queue_command;
     }
-}
-
-fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command {command_name}: unknown flag {flag}"),
-    )
 }

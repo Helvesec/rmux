@@ -10,7 +10,7 @@ pub(super) struct FormatModifier {
 }
 
 /// Single-char modifiers that take no arguments when followed by `;` or `:`.
-const SINGLE_NO_ARG: &[u8] = b"labcdnwETSWPL<>";
+const SINGLE_NO_ARG: &[u8] = b"labcdnwETSWPL<>!";
 
 /// Single-char modifiers that may take arguments.
 const SINGLE_WITH_ARG: &[u8] = b"mCLNPSst=pReqW";
@@ -155,6 +155,7 @@ fn double_no_arg_at(bytes: &[u8], index: usize) -> Option<&'static str> {
     match bytes.get(index..index + 2)? {
         b"||" => Some("||"),
         b"&&" => Some("&&"),
+        b"!!" => Some("!!"),
         b"!=" => Some("!="),
         b"==" => Some("=="),
         b"<=" => Some("<="),

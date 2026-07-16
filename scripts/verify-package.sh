@@ -59,6 +59,27 @@ verify_checksum_manifest() {
   done < "$manifest"
 }
 
+verify_package_hygiene() {
+  local root forbidden
+  root="$1"
+
+  forbidden="$(
+    find "$root" \( \
+      -name .claude -o \
+      -name .codex -o \
+      -name '*.sock' -o \
+      -name '*.tmp' -o \
+      -name '*.bak' -o \
+      -name '*.orig' -o \
+      -name '*~' \
+    \) -print -quit
+  )"
+  [ -z "$forbidden" ] || die "forbidden package entry: ${forbidden#$root/}"
+
+  forbidden="$(find "$root" -type s -print -quit 2>/dev/null || true)"
+  [ -z "$forbidden" ] || die "package contains a Unix socket: ${forbidden#$root/}"
+}
+
 archive=""
 checksums=""
 run_binary=0
@@ -121,6 +142,7 @@ tar -xzf "$archive_abs" -C "$tmpdir"
 
 package_root="$tmpdir/${archive_name%.tar.gz}"
 [ -d "$package_root" ] || die "archive root directory is missing: ${archive_name%.tar.gz}"
+verify_package_hygiene "$package_root"
 
 for required in bin/rmux libexec/rmux/rmux bin/rmux-daemon install.sh LICENSE-APACHE LICENSE-MIT SHA256SUMS.txt share/rmux/artifact-metadata.json share/man/man1/rmux.1; do
   [ -e "$package_root/$required" ] || die "missing package file: $required"
@@ -151,14 +173,23 @@ grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-package-v2"' "$metadata"
 if [ "$require_release_artifact" -eq 1 ]; then
   grep -q '"release_artifact"[[:space:]]*:[[:space:]]*true' "$metadata" ||
     die "metadata release_artifact is not true"
+  grep -q '"configuration"[[:space:]]*:[[:space:]]*"release"' "$metadata" ||
+    die "release artifact metadata configuration is not release"
 fi
 
 if [ "$run_binary" -eq 1 ]; then
   "$package_root/bin/rmux" -V >/dev/null
-  "$script_dir/smoke-installed-rmux.sh" "$package_root/bin/rmux" >/dev/null
+  mkdir -p "$tmpdir/home"
+  env \
+    HOME="$tmpdir/home" \
+    PATH="$package_root/bin:$package_root/libexec/rmux:/usr/bin:/bin" \
+    "$script_dir/smoke-installed-rmux.sh" "$package_root/bin/rmux" >/dev/null
   install_prefix="$tmpdir/install-prefix"
   "$package_root/install.sh" --prefix "$install_prefix" >/dev/null
-  "$script_dir/smoke-installed-rmux.sh" "$install_prefix/bin/rmux" >/dev/null
+  env \
+    HOME="$tmpdir/home" \
+    PATH="$install_prefix/bin:$install_prefix/libexec/rmux:/usr/bin:/bin" \
+    "$script_dir/smoke-installed-rmux.sh" "$install_prefix/bin/rmux" >/dev/null
 fi
 
 printf 'archive=%s\n' "$archive_abs"

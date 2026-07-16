@@ -2,14 +2,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use rmux_core::{
-    AlertFlags, LifecycleEvent, WINDOW_ACTIVITY, WINDOW_BELL, WINDOW_SILENCE, WINLINK_ACTIVITY,
-    WINLINK_BELL, WINLINK_SILENCE,
+    AlertFlags, LifecycleEvent, PaneId, WINDOW_ACTIVITY, WINDOW_BELL, WINDOW_SILENCE,
+    WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE,
 };
 use rmux_proto::{OptionName, SessionName, WindowTarget};
 use tokio::task::JoinHandle;
 
 use super::RequestHandler;
 use crate::pane_io::{AttachControl, PaneAlertCallback, PaneAlertEvent};
+use crate::pane_state_journal::PaneStateChange;
 use crate::renderer;
 
 #[path = "handler_alerts/automatic_names.rs"]
@@ -148,6 +149,27 @@ impl RequestHandler {
             let Some(handler) = handler.upgrade() else {
                 return;
             };
+            if let Some((old, new)) = event
+                .title_change
+                .clone()
+                .filter(|_| handler.pane_state_has_title_subscriptions())
+            {
+                let title_handler = handler.clone();
+                let session_name = event.session_name.clone();
+                let pane_id = event.pane_id;
+                let generation = event.generation;
+                runtime.spawn(async move {
+                    title_handler
+                        .record_pane_title_change_for_runtime_event(
+                            session_name,
+                            pane_id,
+                            generation,
+                            old,
+                            new,
+                        )
+                        .await;
+                });
+            }
             let should_spawn = {
                 let mut pending_alerts = pending_alerts
                     .lock()
@@ -252,12 +274,42 @@ impl RequestHandler {
         }
     }
 
+    async fn record_pane_title_change_for_runtime_event(
+        &self,
+        session_name: SessionName,
+        pane_id: PaneId,
+        generation: Option<u64>,
+        old: String,
+        new: String,
+    ) {
+        let resolved_generation = {
+            let state = self.state.lock().await;
+            let Some(runtime_session_name) =
+                state.resolve_pane_event_runtime_session(&session_name, pane_id, generation)
+            else {
+                return;
+            };
+            if state
+                .pane_target_for_runtime_pane(&runtime_session_name, pane_id)
+                .is_none()
+            {
+                return;
+            }
+            Some(state.pane_output_generation(&runtime_session_name, pane_id))
+        };
+        self.record_pane_state_change(
+            pane_id,
+            resolved_generation,
+            PaneStateChange::TitleChanged { old, new },
+        );
+    }
+
     async fn handle_pane_alert_event_deferred_refresh(
         &self,
         event: PaneAlertEvent,
     ) -> Vec<SessionName> {
-        let (target, pane_target, inactive_output_refresh) = {
-            let state = self.state.lock().await;
+        let (target, pane_target, inactive_output_refresh, clipboard_hook_enabled) = {
+            let mut state = self.state.lock().await;
             let Some(runtime_session_name) = state.resolve_pane_event_runtime_session(
                 &event.session_name,
                 event.pane_id,
@@ -271,6 +323,15 @@ impl RequestHandler {
                 return Vec::new();
             };
             let window_index = pane_target.window_index();
+            {
+                let Some(session) = state.sessions.session_mut(pane_target.session_name()) else {
+                    return Vec::new();
+                };
+                let Some(window) = session.window_at_mut(window_index) else {
+                    return Vec::new();
+                };
+                let _ = window.touch_activity_for_pane(pane_target.pane_index());
+            }
             let refresh_for_inactive_pane_output = state
                 .sessions
                 .session(pane_target.session_name())
@@ -287,10 +348,20 @@ impl RequestHandler {
                 WindowTarget::with_window(pane_target.session_name().clone(), window_index),
                 pane_target,
                 inactive_output_refresh,
+                matches!(
+                    state.options.resolve(None, OptionName::SetClipboard),
+                    Some("on")
+                ),
             )
         };
         if event.title_changed {
             self.emit(LifecycleEvent::PaneTitleChanged {
+                target: pane_target.clone(),
+            })
+            .await;
+        }
+        if event.clipboard_set && clipboard_hook_enabled {
+            self.emit(LifecycleEvent::PaneSetClipboard {
                 target: pane_target,
             })
             .await;

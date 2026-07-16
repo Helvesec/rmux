@@ -36,6 +36,8 @@ mod marked_pane;
 mod pane_access;
 #[path = "pane_terminals/pane_lifecycle.rs"]
 mod pane_lifecycle;
+#[path = "pane_terminals/pane_option_rekey.rs"]
+mod pane_option_rekey;
 #[path = "pane_terminals/pane_outputs.rs"]
 mod pane_outputs;
 #[path = "pane_pipe.rs"]
@@ -69,8 +71,13 @@ pub(crate) use lifecycle_state::PaneLifecycleProcessState;
 use lifecycle_state::PaneLifecycleSpawn;
 pub(crate) use lifecycle_state::PaneLifecycleState;
 use marked_pane::MarkedPane;
+pub(in crate::pane_terminals) use pane_lifecycle::{
+    terminate_removed_terminals, PreparedWindowTerminal,
+};
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
+#[cfg(test)]
+pub(crate) use pane_pipe::active_pipe_child_count_for_test;
 use pane_pipe::PanePipeStore;
 use pane_terminal_store::PaneTerminalStore;
 #[cfg_attr(windows, allow(unused_imports))]
@@ -237,6 +244,8 @@ pub(crate) struct KilledPaneResult {
     pub(crate) session_destroyed: bool,
     pub(crate) removed_session_id: Option<u32>,
     pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) affected_sessions: Vec<SessionName>,
+    pub(crate) destroyed_sessions: Vec<(SessionName, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +259,26 @@ pub(crate) struct RemovedWindowHookContext {
 pub(crate) struct KilledWindowResult {
     pub(crate) response: KillWindowResponse,
     pub(crate) removed_windows: Vec<RemovedWindowHookContext>,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkedWindowResult {
+    pub(crate) response: rmux_proto::LinkWindowResponse,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MovedWindowResult {
+    pub(crate) response: rmux_proto::MoveWindowResponse,
+    pub(crate) unlinked_window: Option<RemovedWindowHookContext>,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnlinkedWindowResult {
+    pub(crate) response: rmux_proto::UnlinkWindowResponse,
+    pub(crate) removed_window: RemovedWindowHookContext,
     pub(crate) removed_pane_ids: Vec<PaneId>,
 }
 
@@ -417,14 +446,10 @@ fn session_content_rows(session: &Session, options: &OptionStore) -> u16 {
         return size.rows;
     }
 
-    if matches!(
+    crate::status_lines::content_rows_for_status(
         options.resolve(Some(session.name()), OptionName::Status),
-        Some("off")
-    ) {
-        size.rows
-    } else {
-        size.rows.saturating_sub(1)
-    }
+        size.rows,
+    )
 }
 
 pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
@@ -435,7 +460,8 @@ pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{HandlerState, InitialPaneSpawnOptions};
+    use super::{session_content_rows, HandlerState, InitialPaneSpawnOptions};
+    use rmux_core::Session;
     use rmux_proto::{
         HookLifecycle, HookName, OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName,
         SetOptionMode, TerminalSize, WindowTarget,
@@ -443,6 +469,47 @@ mod tests {
 
     fn session_name(value: &str) -> SessionName {
         SessionName::new(value).expect("valid session name")
+    }
+
+    #[test]
+    fn attached_session_content_rows_use_multi_line_status() {
+        let alpha = session_name("alpha");
+        let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        session.touch_attached();
+        let mut state = HandlerState::default();
+
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha.clone()),
+                OptionName::Status,
+                "2".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options), 22);
+
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha.clone()),
+                OptionName::Status,
+                "5".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options), 19);
+
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha),
+                OptionName::Status,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options), 24);
     }
 
     #[tokio::test]

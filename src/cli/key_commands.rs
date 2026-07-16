@@ -145,13 +145,13 @@ pub(super) fn run_list_keys(args: ListKeysArgs, socket_path: &Path) -> Result<i3
 fn run_default_list_keys(request: ListKeysRequest) -> Result<i32, ExitFailure> {
     let sort_order = match request.sort_order.as_deref() {
         Some(value) => KeyBindingSortOrder::parse(value)
-            .ok_or_else(|| ExitFailure::new(1, format!("invalid sort order: {value}")))?,
+            .ok_or_else(|| ExitFailure::new(1, rmux_core::INVALID_SORT_ORDER))?,
         None => KeyBindingSortOrder::default(),
     };
     let filter_key = match request.key.as_deref() {
         Some(key) => match key_string_lookup_string(key) {
             Some(key) if key != KEYC_NONE && key != KEYC_UNKNOWN => Some(key_code_lookup_bits(key)),
-            _ => return Err(ExitFailure::new(1, format!("unknown key: {key}"))),
+            _ => return Err(ExitFailure::new(1, format!("invalid key: {key}"))),
         },
         None => None,
     };
@@ -166,11 +166,11 @@ fn run_default_list_keys(request: ListKeysRequest) -> Result<i32, ExitFailure> {
     }
     let mut bindings = list_default_key_bindings(&store, &request, sort_order);
     if let Some(filter_key) = filter_key {
-        bindings.retain(|binding| key_code_lookup_bits(binding.binding().key()) == filter_key);
-        if bindings.is_empty() {
-            let key = request.key.as_deref().unwrap_or_default();
-            return Err(ExitFailure::new(1, format!("unknown key: {key}")));
+        if request.table_name.is_some() {
+            write_command_output(&CommandOutput::from_stdout(Vec::new()))?;
+            return Ok(0);
         }
+        bindings.retain(|binding| key_code_lookup_bits(binding.binding().key()) == filter_key);
     }
     if request.notes && !request.include_unnoted {
         bindings.retain(|binding| binding.binding().note().is_some());
@@ -192,14 +192,15 @@ fn list_default_key_bindings(
     request: &ListKeysRequest,
     sort_order: KeyBindingSortOrder,
 ) -> Vec<KeyBindingDisplay> {
+    let reversed = request.reversed && request.sort_order.is_some();
     if request.notes && request.table_name.is_none() {
         store
-            .list_bindings(None, sort_order, request.reversed)
+            .list_bindings(None, sort_order, reversed)
             .into_iter()
             .filter(|binding| matches!(binding.table_name(), "prefix" | "root"))
             .collect()
     } else {
-        store.list_bindings(request.table_name.as_deref(), sort_order, request.reversed)
+        store.list_bindings(request.table_name.as_deref(), sort_order, reversed)
     }
 }
 
@@ -214,6 +215,7 @@ fn render_default_list_keys_output(
     let lines = bindings
         .iter()
         .map(|binding| {
+            let default_template = request.format.is_none();
             if request.format.is_none() && request.notes {
                 return render_notes_binding_line(
                     binding,
@@ -223,9 +225,16 @@ fn render_default_list_keys_output(
                     notes_key_width,
                 );
             }
-            if request.format.is_none() && request.key.is_some() && !request.notes {
-                return render_default_key_filtered_binding_line(binding, render_metrics);
-            }
+            let key_string = if default_template {
+                list_keys_command_key(binding.key_string())
+            } else {
+                binding.key_string().to_owned()
+            };
+            let key_string_width = if default_template {
+                render_metrics.escaped_key_string_width
+            } else {
+                render_metrics.key_string_width
+            };
             let key_has_repeat = if request.key.is_some() {
                 binding.binding().repeat()
             } else {
@@ -239,14 +248,11 @@ fn render_default_list_keys_output(
                     note_prefix(binding.table_name(), request, "C-b", note_prefix_width),
                 )
                 .with_named_value("key_table", binding.table_name())
-                .with_named_value("key_string", binding.key_string())
+                .with_named_value("key_string", key_string)
                 .with_named_value("key_command", binding.command_string())
                 .with_named_value("notes_only", bool_format(request.notes))
                 .with_named_value("key_has_repeat", bool_format(key_has_repeat))
-                .with_named_value(
-                    "key_string_width",
-                    render_metrics.key_string_width.to_string(),
-                )
+                .with_named_value("key_string_width", key_string_width.to_string())
                 .with_named_value(
                     "key_table_width",
                     render_metrics.key_table_width.to_string(),
@@ -294,28 +300,21 @@ fn list_keys_note_key(key: &str) -> &str {
         .unwrap_or(key)
 }
 
-fn render_default_key_filtered_binding_line(
-    binding: &KeyBindingDisplay,
-    render_metrics: ListKeysRenderMetrics,
-) -> String {
-    let repeat = if binding.binding().repeat() {
-        " -r"
-    } else {
-        ""
-    };
-    format!(
-        "bind-key{repeat} -T {table:<table_width$} {key:<key_width$} {command}",
-        table = binding.table_name(),
-        table_width = render_metrics.key_table_width,
-        key = binding.key_string(),
-        key_width = render_metrics.key_string_width,
-        command = binding.command_string()
-    )
+fn list_keys_command_key(key: &str) -> String {
+    let mut escaped = String::new();
+    for ch in key.chars() {
+        if matches!(ch, '"' | '#' | '$' | '%' | '\'' | ';' | '{' | '}' | '~') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ListKeysRenderMetrics {
     key_string_width: usize,
+    escaped_key_string_width: usize,
     key_table_width: usize,
     has_repeat: bool,
 }
@@ -324,6 +323,11 @@ impl ListKeysRenderMetrics {
     fn from_bindings(bindings: &[KeyBindingDisplay]) -> Self {
         Self {
             key_string_width: KeyBindingStore::key_string_width(bindings),
+            escaped_key_string_width: bindings
+                .iter()
+                .map(|binding| list_keys_command_key(binding.key_string()).len())
+                .max()
+                .unwrap_or(0),
             key_table_width: KeyBindingStore::key_table_width(bindings),
             has_repeat: KeyBindingStore::has_repeat(bindings),
         }

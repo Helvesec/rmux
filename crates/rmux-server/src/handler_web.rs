@@ -2,13 +2,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
     CreateWebShareRequest, ErrorResponse, KillPaneRequest, KillSessionRequest, KillWindowRequest,
-    NewWindowRequest, PaneInputRequest, PaneResizeRequest, PaneSelectRequest, PaneTarget,
-    PaneTargetRef, RenameWindowRequest, ResizePaneAdjustment, Response, RmuxError,
+    NewWindowRequest, OptionName, PaneInputRequest, PaneResizeRequest, PaneSelectRequest,
+    PaneTarget, PaneTargetRef, RenameWindowRequest, ResizePaneAdjustment, Response, RmuxError,
     SelectWindowRequest, SessionId, SessionName, SplitDirection, SplitWindowRequest,
     SplitWindowTarget, WebShareRequest, WebShareScope, WindowTarget,
 };
@@ -24,7 +24,10 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
-use crate::web::{ResolvedCreateWebShareRequest, WebSessionTarget, WebShareAccess, WebShareTarget};
+use crate::web::{
+    ResolvedCreateWebShareRequest, WebSessionTarget, WebShareAccess, WebShareExpiryPoll,
+    WebShareTarget,
+};
 use rmux_core::{input::mode, PaneId};
 
 const WEB_ATTACH_PID_BASE: u32 = 0x8000_0000;
@@ -105,12 +108,21 @@ impl RequestHandler {
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 };
                 let expiry_kill_target = request.expiry_kill_target();
-                match self.web_shares.create(request) {
+                let created = {
+                    let state = self.state.lock().await;
+                    if let Err(error) = validate_resolved_web_target(&state, request.target()) {
+                        return Response::Error(ErrorResponse { error });
+                    }
+                    self.web_shares.create(request)
+                };
+                match created {
                     Ok(created) => {
+                        let revoke_rx = self.web_shares.expiry_revoke_receiver(&created.share_id);
                         self.spawn_web_share_expiry_task(
                             created.share_id.clone(),
                             created.expires_at_unix,
                             expiry_kill_target,
+                            revoke_rx,
                         );
                         Ok(rmux_proto::WebShareResponse::Created(created))
                     }
@@ -152,6 +164,20 @@ impl RequestHandler {
         if let Some((name, id)) = removed {
             self.web_shares.remove_targets_for_sessions(&[(name, id)]);
         }
+    }
+
+    pub(in crate::handler) fn prune_web_panes(&self, pane_ids: &[PaneId]) {
+        self.web_shares.remove_targets_for_panes(pane_ids);
+    }
+
+    pub(in crate::handler) fn rekey_web_session(
+        &self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+        session_id: SessionId,
+    ) {
+        self.web_shares
+            .rename_session_targets(old_name, new_name, session_id);
     }
 
     async fn open_web_share_access(
@@ -361,7 +387,11 @@ impl RequestHandler {
         let Some(pane) = panes.into_iter().find(|pane| pane.id() == pane_id) else {
             return Ok(None);
         };
-        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
+        let status = state
+            .options
+            .resolve(Some(session.name()), OptionName::Status);
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size(), status)
+        else {
             return Ok(None);
         };
         let Some(scrollback) =
@@ -483,6 +513,7 @@ impl RequestHandler {
                 target: session_target.name().clone(),
                 kill_all_except_target: false,
                 clear_alerts: false,
+                kill_group: false,
             })
             .await;
         response_to_result(response)
@@ -598,9 +629,12 @@ impl RequestHandler {
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_select_window(SelectWindowRequest {
-                target: WindowTarget::with_window(session_target.name().clone(), window_index),
-            })
+            .handle_select_window(
+                None,
+                SelectWindowRequest {
+                    target: WindowTarget::with_window(session_target.name().clone(), window_index),
+                },
+            )
             .await;
         response_to_result(response)
     }
@@ -656,7 +690,8 @@ impl RequestHandler {
         if active.control_backlog.load(Ordering::Acquire) >= ATTACH_CONTROL_BACKLOG_LIMIT {
             let _ = active.control_tx.send(AttachControl::Detach);
             active.closing.store(true, Ordering::SeqCst);
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return Err(RmuxError::Server(
                 "web session attach is not draining updates".to_owned(),
             ));
@@ -675,7 +710,8 @@ impl RequestHandler {
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                         value.checked_sub(1)
                     });
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return Err(RmuxError::Server(
                 "web session attach disappeared".to_owned(),
             ));
@@ -723,19 +759,19 @@ impl RequestHandler {
         share_id: String,
         expires_at_unix: Option<u64>,
         kill_target: Option<WebSessionTarget>,
+        revoke_rx: Option<watch::Receiver<Option<crate::web::WebShareRevokeReason>>>,
     ) {
-        let Some(expires_at_unix) = expires_at_unix else {
+        let (Some(_), Some(revoke_rx)) = (expires_at_unix, revoke_rx) else {
             return;
         };
         let handler = self.clone();
         tokio::spawn(async move {
-            // The public response carries whole Unix seconds, while the registry
-            // keeps the exact SystemTime deadline. First wake at the advertised
-            // second, then retry briefly so sub-second TTLs do not check early
-            // and leave the share expired-but-not-enforced.
-            tokio::time::sleep(duration_until_unix(expires_at_unix)).await;
+            // The wire response exposes whole Unix seconds, but the registry
+            // retains the exact SystemTime deadline. Poll that exact deadline
+            // atomically with record presence so rounding cannot leave an
+            // expired share unenforced and stopping a share cannot leak a task.
             let Some(expired) = handler
-                .wait_for_web_share_expiry(&share_id, expires_at_unix)
+                .wait_for_web_share_expiry(&share_id, revoke_rx)
                 .await
             else {
                 return;
@@ -757,19 +793,23 @@ impl RequestHandler {
     async fn wait_for_web_share_expiry(
         &self,
         share_id: &str,
-        expires_at_unix: u64,
+        mut revoke_rx: watch::Receiver<Option<crate::web::WebShareRevokeReason>>,
     ) -> Option<crate::web::ExpiredWebShare> {
-        let retry_until = UNIX_EPOCH
-            .checked_add(Duration::from_secs(expires_at_unix))
-            .and_then(|deadline| deadline.checked_add(Duration::from_secs(1)))?;
         loop {
-            if let Some(expired) = self.web_shares.expire_if_due(share_id) {
-                return Some(expired);
+            match self.web_shares.poll_expiry(share_id) {
+                WebShareExpiryPoll::Expired(expired) => return Some(expired),
+                WebShareExpiryPoll::Pending(deadline) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(duration_until(deadline)) => {}
+                        changed = revoke_rx.changed() => {
+                            if changed.is_err() {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                WebShareExpiryPoll::Gone => return None,
             }
-            if SystemTime::now() >= retry_until {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -892,10 +932,21 @@ impl RequestHandler {
     }
 }
 
-fn duration_until_unix(expires_at_unix: u64) -> Duration {
-    let Some(deadline) = UNIX_EPOCH.checked_add(Duration::from_secs(expires_at_unix)) else {
-        return Duration::ZERO;
-    };
+fn validate_resolved_web_target(
+    state: &crate::pane_terminals::HandlerState,
+    target: &WebShareTarget,
+) -> Result<(), RmuxError> {
+    match target {
+        WebShareTarget::Pane(target) => resolve_pane_target_ref(state, target).map(|_| ()),
+        WebShareTarget::Session(target) => state
+            .sessions
+            .session_by_id(target.id())
+            .map(|_| ())
+            .ok_or_else(|| session_not_found_web(target.name())),
+    }
+}
+
+fn duration_until(deadline: SystemTime) -> Duration {
     deadline
         .duration_since(SystemTime::now())
         .unwrap_or(Duration::ZERO)
@@ -952,7 +1003,11 @@ fn web_session_snapshot_from_state(
             }
             screen.mode
         });
-        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
+        let status = state
+            .options
+            .resolve(Some(session.name()), OptionName::Status);
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size(), status)
+        else {
             continue;
         };
         let scrollback = match scrolls.get(&pane.id()).copied() {

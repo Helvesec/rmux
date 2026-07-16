@@ -371,8 +371,8 @@ mod tests {
     use crate::{Pane, PaneId, PaneRef, RmuxEndpoint, SessionName};
     use rmux_proto::{
         encode_frame, CommandOutput, FrameDecoder, HandshakeRequest, HandshakeResponse,
-        ListPanesRequest, ListPanesResponse, Request, Response, SendKeysExtRequest,
-        SendKeysResponse, CAPABILITY_HANDSHAKE, CAPABILITY_SDK_PANE_BROADCAST,
+        ListPanesResponse, Request, Response, SendKeysExtRequest, SendKeysResponse,
+        CAPABILITY_HANDSHAKE, CAPABILITY_SDK_PANE_BROADCAST,
     };
 
     #[tokio::test]
@@ -413,13 +413,9 @@ mod tests {
         .await;
 
         match read_request(&mut server_stream).await {
-            Request::ListPanes(ListPanesRequest {
-                target,
-                target_window_index,
-                ..
-            }) => {
-                assert_eq!(target, session_name);
-                assert_eq!(target_window_index, Some(0));
+            Request::ListPanes(request) => {
+                assert_eq!(request.target, session_name);
+                assert_eq!(request.target_window_index, Some(0));
             }
             request => panic!("expected client fallback pane-id lookup, got {request:?}"),
         }

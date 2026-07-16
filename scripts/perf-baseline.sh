@@ -5,7 +5,12 @@ iterations=30
 line_count=10000
 binary=""
 output_dir="target/perf-baseline"
+json_out=""
 skip_build=0
+release_name="release-0.9.0"
+source_command_count="${RMUX_PERF_SOURCE_COMMANDS:-1000}"
+hook_storm_events="${RMUX_PERF_HOOK_STORM_EVENTS:-25}"
+daemon_churn_cycles="${RMUX_PERF_DAEMON_CHURN_CYCLES:-10}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -25,6 +30,10 @@ while [ "$#" -gt 0 ]; do
             output_dir="$2"
             shift 2
             ;;
+        --json-out|--baseline-file)
+            json_out="$2"
+            shift 2
+            ;;
         --skip-build)
             skip_build=1
             shift
@@ -33,10 +42,11 @@ while [ "$#" -gt 0 ]; do
             cat <<'USAGE'
 usage: scripts/perf-baseline.sh [--iterations N] [--line-count N]
                                 [--binary PATH] [--output-dir DIR]
+                                [--json-out PATH]
                                 [--skip-build]
 
 Runs the current Unix perf bench, records repository baseline metadata, and
-writes a schema-2 JSON artifact for release/0.7.0 performance work.
+writes a schema-2 JSON artifact for release/0.9.0 performance work.
 USAGE
             exit 0
             ;;
@@ -66,8 +76,30 @@ if ! is_positive_integer "$line_count"; then
     exit 2
 fi
 
+if ! is_positive_integer "$source_command_count"; then
+    echo "RMUX_PERF_SOURCE_COMMANDS must be a positive integer, got: $source_command_count" >&2
+    exit 2
+fi
+
+if ! is_positive_integer "$hook_storm_events"; then
+    echo "RMUX_PERF_HOOK_STORM_EVENTS must be a positive integer, got: $hook_storm_events" >&2
+    exit 2
+fi
+
+if ! is_positive_integer "$daemon_churn_cycles"; then
+    echo "RMUX_PERF_DAEMON_CHURN_CYCLES must be a positive integer, got: $daemon_churn_cycles" >&2
+    exit 2
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+source "$repo_root/scripts/perf-provenance.sh"
+
+git_head="$(git rev-parse HEAD)"
+platform_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
+export RMUX_PERF_EXPECTED_GIT_SHA="${RMUX_PERF_EXPECTED_GIT_SHA:-$git_head}"
+export RMUX_PERF_EXPECTED_PLATFORM="${RMUX_PERF_EXPECTED_PLATFORM:-$platform_name}"
+export RMUX_PERF_EXPECTED_PROVENANCE="${RMUX_PERF_EXPECTED_PROVENANCE:-baseline:$release_name:$git_head}"
 
 if [ -z "$binary" ]; then
     binary="${CARGO_TARGET_DIR:-target}/release/rmux"
@@ -105,6 +137,12 @@ if [ ! -x "$binary" ]; then
 fi
 
 binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+case "$binary" in
+    */debug/rmux)
+        echo "perf baseline requires a release artifact, got debug binary: $binary" >&2
+        exit 2
+        ;;
+esac
 
 rss_proxy_kib=null
 rss_proxy_status="unavailable"
@@ -135,14 +173,6 @@ if [ -x /usr/bin/time ]; then
     fi
 fi
 
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-json_string() {
-    printf '"%s"' "$(json_escape "$1")"
-}
-
 command_or_unknown() {
     local fallback="$1"
     shift
@@ -150,14 +180,20 @@ command_or_unknown() {
 }
 
 git_commit="$(command_or_unknown unknown git rev-parse HEAD)"
-git_branch="$(command_or_unknown unknown git rev-parse --abbrev-ref HEAD)"
 git_describe="$(command_or_unknown unknown git describe --tags --always --dirty)"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "perf baseline requires a clean tracked worktree" >&2
+    exit 2
+fi
 rustc_version="$(command_or_unknown unknown rustc -V)"
 rustc_verbose="$(command_or_unknown unknown rustc -Vv | tr '\n' ';' | sed 's/;*$//')"
 toolchain="$(command_or_unknown unknown rustup show active-toolchain)"
+rmux_version="$(command_or_unknown unknown "$binary" -V)"
+tmux_version="$(command_or_unknown unavailable tmux -V)"
 platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
 kernel="$(uname -r)"
 machine="$(uname -m)"
+host_fingerprint="$(rmux_perf_host_fingerprint)"
 cpu_governor="unknown"
 if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
     cpu_governor="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
@@ -165,10 +201,71 @@ fi
 allocator="system"
 binary_size_bytes="$(wc -c <"$binary" | tr -d ' ')"
 timestamp="$(date -u +%Y%m%d-%H%M%S)"
-json_path="$output_dir/baseline-$timestamp.json"
+if [ -n "$json_out" ]; then
+    mkdir -p "$(dirname "$json_out")"
+    json_path="$(cd "$(dirname "$json_out")" && pwd)/$(basename "$json_out")"
+else
+    json_path="$output_dir/baseline-$timestamp.json"
+fi
 
 fixture_manifest="benches/perf/fixtures/MANIFEST.sha256"
-baseline_file="$output_dir/baselines.md"
+baseline_summary="$output_dir/baselines.md"
+
+repo_relative_path() {
+    local path="$1"
+    case "$path" in
+        "$repo_root")
+            printf '.'
+            ;;
+        "$repo_root"/*)
+            printf '%s' "${path#"$repo_root"/}"
+            ;;
+        *)
+            printf '%s' "$path"
+            ;;
+    esac
+}
+
+portable_binary="$(repo_relative_path "$binary")"
+portable_legacy_json="$(repo_relative_path "$legacy_json")"
+portable_legacy_summary="$(repo_relative_path "$legacy_summary")"
+portable_json_path="$(repo_relative_path "$json_path")"
+portable_baseline_summary="$(repo_relative_path "$baseline_summary")"
+portable_toolchain="$toolchain"
+case "$portable_toolchain" in
+    *"$repo_root"*)
+        portable_toolchain="${toolchain%% *} (workspace rust-toolchain.toml)"
+        ;;
+esac
+
+write_portable_source() {
+    python3 - "$legacy_json" "$repo_root" <<'PY'
+import json
+import sys
+
+source_path, repo_root = sys.argv[1:]
+with open(source_path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+repo_prefix = repo_root.rstrip("/") + "/"
+
+
+def scrub(value):
+    if isinstance(value, dict):
+        return {key: scrub(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    if isinstance(value, str):
+        if value == repo_root:
+            return "."
+        if value.startswith(repo_prefix):
+            return value[len(repo_prefix):]
+    return value
+
+
+json.dump(scrub(payload), sys.stdout, ensure_ascii=False, separators=(",", ":"))
+PY
+}
 
 target_json_line() {
     local name="$1"
@@ -186,62 +283,64 @@ target_json_line() {
     printf '{\n'
     printf '  "schema": 2,\n'
     printf '  "kind": "rmux-perf-baseline",\n'
+    printf '  "release": %s,\n' "$(json_string "$release_name")"
     printf '  "timestamp": %s,\n' "$(json_string "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
-    printf '  "git": {"branch":%s,"commit":%s,"describe":%s},\n' \
-        "$(json_string "$git_branch")" "$(json_string "$git_commit")" "$(json_string "$git_describe")"
-    printf '  "environment": {"platform":%s,"kernel":%s,"machine":%s,"rustc":%s,"rustc_verbose":%s,"toolchain":%s,"allocator":%s,"cpu_governor":%s},\n' \
-        "$(json_string "$platform")" "$(json_string "$kernel")" "$(json_string "$machine")" \
+    printf '  "git": {"commit":%s,"describe":%s,"dirty":false},\n' \
+        "$(json_string "$git_commit")" "$(json_string "$git_describe")"
+    printf '  "environment": {"platform":%s,"kernel":%s,"machine":%s,"host_fingerprint":%s,"rustc":%s,"rustc_verbose":%s,"toolchain":%s,"allocator":%s,"cpu_governor":%s},\n' \
+        "$(json_string "$platform")" "$(json_string "$kernel")" "$(json_string "$machine")" "$(json_string "$host_fingerprint")" \
         "$(json_string "$rustc_version")" "$(json_string "$rustc_verbose")" \
-        "$(json_string "$toolchain")" "$(json_string "$allocator")" "$(json_string "$cpu_governor")"
-    printf '  "binary": {"path":%s,"size_bytes":%s},\n' "$(json_string "$binary")" "$binary_size_bytes"
+        "$(json_string "$portable_toolchain")" "$(json_string "$allocator")" "$(json_string "$cpu_governor")"
+    printf '  "versions": {"rmux":%s,"tmux":%s,"rustc":%s},\n' \
+        "$(json_string "$rmux_version")" "$(json_string "$tmux_version")" "$(json_string "$rustc_version")"
+    printf '  "binary": {"path":%s,"size_bytes":%s},\n' "$(json_string "$portable_binary")" "$binary_size_bytes"
     printf '  "memory": {"rss_proxy_kib":%s,"status":%s,"note":%s},\n' \
         "$rss_proxy_kib" "$(json_string "$rss_proxy_status")" "$(json_string "$rss_proxy_note")"
     printf '  "parameters": {"iterations":%s,"line_count":%s},\n' "$iterations" "$line_count"
-    printf '  "artifacts": {"schema1_json":%s,"schema1_summary":%s,"baseline_file":%s,"fixture_manifest":%s},\n' \
-        "$(json_string "$legacy_json")" "$(json_string "$legacy_summary")" \
-        "$(json_string "$baseline_file")" "$(json_string "$fixture_manifest")"
+    printf '  "artifacts": {"schema1_json":%s,"schema1_summary":%s,"baseline_file":%s,"baseline_summary":%s,"fixture_manifest":%s},\n' \
+        "$(json_string "$portable_legacy_json")" "$(json_string "$portable_legacy_summary")" \
+        "$(json_string "$portable_json_path")" "$(json_string "$portable_baseline_summary")" "$(json_string "$fixture_manifest")"
     printf '  "required_targets": [\n'
-    target_json_line "attach_deep_scrollback_render" "pending" "" "requires attach render golden harness"
+    target_json_line "attach_render" "collected" "attach_render_${line_count}_line_scrollback" "PTY attach render until the final scrollback marker is visible"
     printf ',\n'
-    target_json_line "pane_snapshot_deep_scrollback_80x24_200x60" "proxy" "capture_pane_${line_count}_lines" "current CLI proxy until SDK snapshot bench lands"
+    target_json_line "source_file_large_corpus" "collected" "source_file_${source_command_count}_commands" "large source-file corpus of set-option commands"
     printf ',\n'
-    target_json_line "capture_pane_sb10k" "pending" "" "requires loadavg < 1 run with --line-count 10000 and marker pre-fill verification before samples are release-facing"
+    target_json_line "status_format_heavy" "collected" "status_format_heavy_expand" "heavy status-format expansion through display-message -F"
     printf ',\n'
-    target_json_line "copy_mode_search_10k" "pending" "" "requires copy-mode search harness"
+    target_json_line "hook_storm" "collected" "hook_storm_${hook_storm_events}_after_set_option" "after-set-option hook storm driven by source-file"
     printf ',\n'
-    target_json_line "resize_reflow_10k" "proxy" "resize_pane_round_trip" "current resize proxy does not yet preload deep scrollback"
-    printf ',\n'
-    target_json_line "codec_roundtrip_50B_8KiB_1MiB" "pending" "" "requires codec microbench"
-    printf ',\n'
-    target_json_line "pane_output_flood" "proxy" "pane_output_${line_count}_lines_ready" "line flood readiness proxy"
-    printf ',\n'
-    target_json_line "web_backpressure_resize" "pending" "" "requires web-share harness"
-    printf ',\n'
-    target_json_line "ws_outbound_frame" "pending" "" "requires web outbound microbench"
+    target_json_line "daemon_churn" "collected" "daemon_churn_${daemon_churn_cycles}_create_kill" "repeated release-artifact daemon create/kill cycles"
     printf ',\n'
     target_json_line "cold_path_size" "collected" "binary.size_bytes" "release binary byte size"
     printf '\n  ],\n'
     printf '  "notes": [\n'
-    printf '    %s,\n' "$(json_string "PR0A records proxy/pending targets honestly; do not treat pending targets as measured.")"
-    printf '    %s\n' "$(json_string "Use PR0B-PR0E to add byte goldens, protocol ledgers, comparator statistics, and CI gates.")"
+    printf '    %s,\n' "$(json_string "Release 0.9.0 records p50/p95 baselines for attach render, large source-file, status format, hook storm, and daemon churn.")"
+    printf '    %s\n' "$(json_string "Benchmarks must use a release artifact; debug binaries are rejected by perf-bench.sh and perf-baseline.sh.")"
     printf '  ],\n'
     printf '  "source": '
-    cat "$legacy_json"
+    write_portable_source
     printf '\n'
     printf '}\n'
 } >"$json_path"
 
+# A generated release baseline is not successful until the same fail-closed
+# validator used by release gates accepts its portable paths and identity.
+python3 scripts/check-perf-baseline.py \
+    "$json_path" \
+    --expected-platform "$platform" >&2
+
 {
     printf '# RMUX Perf Baseline\n\n'
     printf 'Generated at `%s`.\n\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '- JSON artifact: `%s`\n' "$json_path"
-    printf '- Schema 1 JSON: `%s`\n' "$legacy_json"
-    printf '- Schema 1 summary: `%s`\n' "$legacy_summary"
-    printf '- Fixture manifest: `%s`\n\n' "$fixture_manifest"
+    printf -- '- JSON artifact: `%s`\n' "$json_path"
+    printf -- '- Schema 1 JSON: `%s`\n' "$legacy_json"
+    printf -- '- Schema 1 summary: `%s`\n' "$legacy_summary"
+    printf -- '- Fixture manifest: `%s`\n\n' "$fixture_manifest"
     printf 'This file is generated beside local perf baseline artifacts and is not release-facing documentation.\n'
-} >"$baseline_file"
+} >"$baseline_summary"
 
 printf 'json=%s\n' "$json_path"
 printf 'schema1_json=%s\n' "$legacy_json"
 printf 'schema1_summary=%s\n' "$legacy_summary"
-printf 'baseline_file=%s\n' "$baseline_file"
+printf 'baseline_file=%s\n' "$json_path"
+printf 'baseline_summary=%s\n' "$baseline_summary"

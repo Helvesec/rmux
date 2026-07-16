@@ -128,13 +128,14 @@ pub(super) fn parse_session_request(
             alerts_only,
         })),
         "last-window" => Ok(Request::LastWindow(LastWindowRequest { target })),
-        "display-panes" => Ok(Request::DisplayPanes(DisplayPanesRequest {
+        "display-panes" => Ok(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target,
             duration_ms: None,
             non_blocking: false,
             no_command: false,
             template: None,
-        })),
+            target_client: None,
+        }))),
         "switch-client" => Ok(Request::SwitchClient(SwitchClientRequest { target })),
         "lock-session" => Ok(Request::LockSession(LockSessionRequest { target })),
         _ => Err(RmuxError::Server(format!(
@@ -151,11 +152,13 @@ pub(super) fn parse_kill_session(
     let mut target = None;
     let mut kill_all_except_target = false;
     let mut clear_alerts = false;
+    let mut kill_group = false;
 
     while let Some(token) = args.optional() {
         match token.as_str() {
             "-a" => kill_all_except_target = true,
             "-C" => clear_alerts = true,
+            "-g" => kill_group = true,
             "-t" => target = Some(parse_session_name(args.required("-t target")?)?),
             flag if flag.starts_with('-') => return Err(unsupported_flag("kill-session", flag)),
             _ => {
@@ -174,6 +177,7 @@ pub(super) fn parse_kill_session(
         )?),
         kill_all_except_target,
         clear_alerts,
+        kill_group,
     }))
 }
 

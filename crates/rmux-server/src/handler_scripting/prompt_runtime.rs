@@ -32,6 +32,7 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    source_file_error: None,
                     exit_status: None,
                 });
             }
@@ -89,7 +90,7 @@ impl RequestHandler {
                 None => RuntimeFormatContext::new(FormatContext::new()).with_state(&state),
             };
             let template = match &command.template {
-                Some(CommandListArgument::Parsed(commands)) => commands.to_tmux_string(),
+                Some(CommandListArgument::Parsed(commands)) => commands.to_tmux_reparse_string(),
                 Some(CommandListArgument::String(value)) if command.format_template => {
                     render_runtime_template(value, &runtime, true)
                 }
@@ -155,6 +156,7 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    source_file_error: None,
                     exit_status: None,
                 });
             }
@@ -238,7 +240,7 @@ impl RequestHandler {
                         .map_err(super::command_parse_error_to_rmux)?
                 }
             };
-            let template = parsed.to_tmux_string();
+            let template = parsed.to_tmux_reparse_string();
             let prompt = match &command.prompt {
                 Some(prompt) => format!("{} ", render_runtime_template(prompt, &runtime, true)),
                 None => {

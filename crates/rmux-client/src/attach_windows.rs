@@ -17,8 +17,6 @@ use crate::ClientError;
 mod action;
 #[path = "attach_windows/input.rs"]
 mod input;
-#[path = "attach_windows/lock_state.rs"]
-mod lock_state;
 #[path = "attach_windows/metrics.rs"]
 mod metrics;
 #[path = "attach_windows/output.rs"]
@@ -34,7 +32,7 @@ mod terminal;
 #[path = "attach/terminal_cleanup.rs"]
 mod terminal_cleanup;
 
-use lock_state::AttachLockState;
+use crate::attach_lock_state::AttachLockState;
 use screen::AttachScreenTracker;
 pub use terminal::{AttachError, RawTerminal, Result};
 
@@ -210,8 +208,10 @@ where
     let input_thread = thread::spawn(move || input_loop(input, input_tx, input_lock_state));
     let (action_tx, action_rx) = std_mpsc::channel();
     let (action_completion_tx, action_completion_rx) = mpsc::unbounded_channel();
-    let action_thread =
-        thread::spawn(move || action_loop(actions, action_rx, action_completion_tx));
+    let action_lock_state = Arc::clone(&lock_state);
+    let action_thread = thread::spawn(move || {
+        action_loop(actions, action_rx, action_completion_tx, action_lock_state)
+    });
     let (pipe, runtime) = stream.into_async_parts();
     let output_result = runtime.block_on(async {
         let (reader, writer) = tokio::io::split(pipe);
@@ -251,11 +251,15 @@ fn action_loop<Actions>(
     completion_tx: mpsc::UnboundedSender<
         std::result::Result<action::AttachActionOutcome, ClientError>,
     >,
+    lock_state: Arc<AttachLockState>,
 ) -> std::result::Result<(), ClientError>
 where
     Actions: action::AttachActionExecutor,
 {
     while let Ok(request) = action_rx.recv() {
+        if request.requires_exclusive_input() {
+            lock_state.wait_until_input_idle();
+        }
         let result = action::run_attach_action(&mut actions, request);
         if completion_tx.send(result).is_err() {
             return Ok(());
@@ -284,6 +288,10 @@ where
         if lock_state.is_closed() || input_tx.is_closed() {
             return Ok(());
         }
+        if lock_state.is_locked() {
+            lock_state.wait_while_locked();
+            continue;
+        }
         if terminal::take_pending_ctrl_c_event() && !lock_state.is_locked() {
             let input = input::synthetic_ctrl_c_input();
             if input_tx.blocking_send(input).is_err() {
@@ -292,7 +300,6 @@ where
             continue;
         }
 
-        let locked = lock_state.is_locked();
         if !terminal::wait_for_key_input(input_handle, 50).map_err(ClientError::Io)? {
             if lock_state.is_closed() || input_tx.is_closed() {
                 return Ok(());
@@ -306,25 +313,45 @@ where
             continue;
         }
 
+        if !lock_state.begin_input_read() {
+            continue;
+        }
+
         let inputs = if let Some(console_input) = console_input.as_mut() {
             match console_input.read_key_inputs() {
-                Ok(inputs) => inputs,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(ClientError::Io(error)),
+                Ok(inputs) => Ok(inputs),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(None),
+                Err(error) => Err(Some(ClientError::Io(error))),
             }
         } else {
             let bytes_read = match input.read(&mut read_buffer) {
-                Ok(0) => return Ok(()),
+                Ok(0) => 0,
                 Ok(bytes_read) => bytes_read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(ClientError::Io(error)),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    lock_state.finish_input_read();
+                    continue;
+                }
+                Err(error) => {
+                    lock_state.finish_input_read();
+                    return Err(ClientError::Io(error));
+                }
             };
-            vec![input::AttachInput::bytes(
+            if bytes_read == 0 {
+                lock_state.finish_input_read();
+                return Ok(());
+            }
+            Ok(vec![input::AttachInput::bytes(
                 read_buffer[..bytes_read].to_vec(),
-            )]
+            )])
+        };
+        lock_state.finish_input_read();
+        let inputs = match inputs {
+            Ok(inputs) => inputs,
+            Err(None) => continue,
+            Err(Some(error)) => return Err(error),
         };
 
-        if inputs.is_empty() || locked || lock_state.is_locked() {
+        if inputs.is_empty() || lock_state.is_locked() {
             continue;
         }
 

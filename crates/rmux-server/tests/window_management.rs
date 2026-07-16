@@ -301,10 +301,13 @@ async fn window_navigation_and_listing_requests_round_trip_through_the_socket(
     );
 
     let listed = client
-        .send_request(&Request::ListWindows(ListWindowsRequest {
+        .send_request(&Request::ListWindows(Box::new(ListWindowsRequest {
             target: session,
             format: Some("#{window_index}:#{window_id}:#{window_active}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await?;
     let Response::ListWindows(listed) = listed else {
         panic!("expected list-windows response");
@@ -327,11 +330,14 @@ async fn wait_for_session_pane_ttys(
 
     while Instant::now() < deadline {
         let listed = client
-            .send_request(&Request::ListPanes(ListPanesRequest {
+            .send_request(&Request::ListPanes(Box::new(ListPanesRequest {
                 target: session.clone(),
                 format: Some("#{window_index}:#{pane_index}:#{pane_tty}".to_owned()),
+                filter: None,
+                sort_order: None,
+                reversed: false,
                 target_window_index: None,
-            }))
+            })))
             .await?;
         let output = listed
             .command_output()
@@ -492,10 +498,13 @@ async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
     );
 
     let listed = client
-        .send_request(&Request::ListWindows(ListWindowsRequest {
+        .send_request(&Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha.clone(),
             format: Some("#{window_index}:#{window_panes}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await?;
     let Response::ListWindows(listed) = listed else {
         panic!("expected list-windows response");

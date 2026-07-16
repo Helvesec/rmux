@@ -2,8 +2,19 @@
 daemon-integration = { max-threads = 6 }
 windows-console = { max-threads = 1 }
 
+[profile.default]
+retries = 0
+
+[[profile.default.overrides]]
+filter = 'test(/^quarantine::/)'
+retries = 1
+
 [[profile.default.overrides]]
 filter = 'binary(windows_attach_exit)'
+test-group = 'windows-console'
+
+[[profile.default.overrides]]
+filter = 'binary(windows_conpty) | (package(rmux-server) & test(/^(terminal::tests::windows_interactive_|handler::pane_command_tests::(split_window_ext_applies_start_directory_to_spawned_process|respawn_pane_with_kill_flag_applies_directory_environment_and_command))/))'
 test-group = 'windows-console'
 
 [[profile.default.overrides]]

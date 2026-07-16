@@ -678,6 +678,33 @@ fn middle_line_uses_upper_middle_on_even_height_like_tmux() {
 }
 
 #[test]
+fn recentre_top_bottom_cycles_for_same_cursor_line() {
+    let screen = build_screen(
+        20,
+        5,
+        "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\nline7\r\nline8\r\nline9\r\nline10\r\n",
+    );
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+    state.cursor.y = 6;
+    state.cursor.x = 0;
+    state.top_line = 0;
+
+    let _ = state.execute_command("recentre-top-bottom", &[], &ctx);
+    assert_eq!(state.top_line, 4);
+
+    let _ = state.execute_command("recentre-top-bottom", &[], &ctx);
+    assert_eq!(state.top_line, 6);
+
+    let _ = state.execute_command("recentre-top-bottom", &[], &ctx);
+    assert_eq!(state.top_line, 2);
+
+    state.cursor.y = 7;
+    let _ = state.execute_command("recentre-top-bottom", &[], &ctx);
+    assert_eq!(state.top_line, 5);
+}
+
+#[test]
 fn goto_line_scrolls_from_bottom_like_tmux() {
     let screen = build_screen(
         30,

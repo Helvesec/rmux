@@ -49,6 +49,7 @@ fn install_tokio_signal_handlers(
                 target,
                 kill_all_except_target: false,
                 clear_alerts: false,
+                kill_group: false,
             }))
             .await;
     });
@@ -86,6 +87,7 @@ fn install_unix_signal_handlers(
                             target,
                             kill_all_except_target: false,
                             clear_alerts: false,
+                            kill_group: false,
                         }))
                         .await;
                 });

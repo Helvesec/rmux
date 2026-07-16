@@ -38,9 +38,9 @@ const DEFERRED_INITIAL_PANE_READY_TIMEOUT: Duration = Duration::from_millis(250)
 #[cfg(windows)]
 const DEFERRED_INITIAL_PANE_READY_SETTLE: Duration = Duration::from_millis(100);
 #[cfg(windows)]
-const DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRIES: usize = 8;
-#[cfg(windows)]
-const DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRY_DELAY: Duration = Duration::from_millis(50);
+// Keep immediate post-new-session console control input queued until the
+// autostarted ConPTY console is safely isolated from the launching client.
+const DEFERRED_INITIAL_PANE_INPUT_GRACE: Duration = Duration::from_secs(2);
 
 use client_environment::{
     new_session_client_environment, new_session_raw_client_environment,
@@ -94,6 +94,7 @@ impl RequestHandler {
                     target: session_name,
                     kill_all_except_target: false,
                     clear_alerts: false,
+                    kill_group: false,
                 })
                 .await;
         }
@@ -215,6 +216,13 @@ impl RequestHandler {
         };
         let group_target = request.group_target;
         let working_directory = request.working_directory;
+        #[cfg(windows)]
+        if working_directory
+            .as_ref()
+            .is_some_and(|path| format_references_pane_pid(Some(path.as_str())))
+        {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let requester_cwd_pane_id = if working_directory
             .as_ref()
             .is_some_and(|path| path.contains("#{"))
@@ -364,6 +372,19 @@ impl RequestHandler {
                     .session_mut(&session_name)
                     .expect("newly created session must accept cwd assignment");
                 session.set_cwd((!rendered.is_empty()).then(|| PathBuf::from(rendered)));
+            }
+
+            if let Some(template_session) = created_group
+                .as_ref()
+                .and_then(|created| created.template_session.as_ref())
+                .and_then(|template| state.sessions.session(template))
+                .cloned()
+            {
+                if let Err(error) =
+                    state.synchronize_pane_alias_options_from_session(&template_session)
+                {
+                    return Response::Error(ErrorResponse { error });
+                }
             }
 
             let needs_terminal = created_group
@@ -533,8 +554,15 @@ impl RequestHandler {
         self.wait_for_deferred_initial_pane_ready(&runtime_session_name, pane_id)
             .await;
 
+        let input_grace_deadline = tokio::time::Instant::now() + DEFERRED_INITIAL_PANE_INPUT_GRACE;
         loop {
             if let Some(flush) = pending {
+                let now = tokio::time::Instant::now();
+                if now < input_grace_deadline {
+                    pending = Some(flush);
+                    tokio::time::sleep(input_grace_deadline - now).await;
+                    continue;
+                }
                 let write_result = Self::flush_deferred_initial_pane_input(flush).await;
                 if let Err(error) = write_result {
                     let mut state = self.state.lock().await;
@@ -547,15 +575,24 @@ impl RequestHandler {
                 }
             }
 
+            let now = tokio::time::Instant::now();
+            if now < input_grace_deadline {
+                pending = None;
+                tokio::time::sleep(input_grace_deadline - now).await;
+                continue;
+            }
+
             let drained = {
                 let mut state = self.state.lock().await;
-                state.drain_or_finish_deferred_initial_pane_input(&runtime_session_name, pane_id)
+                state.take_deferred_initial_pane_input_or_finish(&runtime_session_name, pane_id)
             };
             match drained {
                 Ok(Some(next)) => {
                     pending = Some(next);
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    break;
+                }
                 Err(error) => {
                     let mut state = self.state.lock().await;
                     state.add_message(error.to_string());
@@ -642,37 +679,18 @@ impl RequestHandler {
         pane_pid: rmux_pty::ProcessId,
         action: crate::pane_terminals::DeferredInitialPaneConsoleInputAction,
     ) -> std::io::Result<()> {
-        for attempt in 0..=DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRIES {
-            let result = match action {
-                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Key(key) => {
-                    rmux_pty::write_windows_console_key(pane_pid, key)
-                }
-                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(
-                    key,
-                ) => rmux_pty::write_windows_console_key_then_interrupt_if_processed(pane_pid, key),
-                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Interrupt => {
-                    rmux_pty::send_windows_console_interrupt(pane_pid)
-                }
-                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Noop => Ok(()),
-            };
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if attempt < DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRIES
-                        && Self::is_transient_deferred_initial_console_input_error(&error) =>
-                {
-                    std::thread::sleep(DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRY_DELAY);
-                }
-                Err(error) => return Err(error),
+        crate::windows_console_input::write_with_transient_retry(|| match action {
+            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Key(key) => {
+                rmux_pty::write_windows_console_key(pane_pid, key)
             }
-        }
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn is_transient_deferred_initial_console_input_error(error: &std::io::Error) -> bool {
-        const ERROR_GEN_FAILURE: i32 = 31;
-        error.raw_os_error() == Some(ERROR_GEN_FAILURE)
+            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(key) => {
+                rmux_pty::write_windows_console_key_then_interrupt_if_processed(pane_pid, key)
+            }
+            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Interrupt => {
+                rmux_pty::send_windows_console_interrupt(pane_pid)
+            }
+            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Noop => Ok(()),
+        })
     }
 
     #[cfg(windows)]
@@ -750,6 +768,12 @@ impl RequestHandler {
                     .collect::<Vec<_>>();
                 sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
                 sessions
+            } else if request.kill_group {
+                let mut sessions = state.sessions.session_group_members(&session_name);
+                if sessions.is_empty() {
+                    sessions.push(session_name.clone());
+                }
+                sessions
             } else {
                 vec![session_name.clone()]
             }
@@ -760,11 +784,12 @@ impl RequestHandler {
             self.cancel_session_silence_timers(session_name).await;
         }
 
-        let (response, queued_session_closed, removed_pane_ids, removed_sessions) = {
+        let (response, queued_lifecycle_events, removed_pane_ids, removed_sessions) = {
             let mut state = self.state.lock().await;
             let mut queued_events = Vec::new();
             let mut removed_pane_ids = Vec::new();
             let mut removed_sessions: Vec<(SessionName, SessionId)> = Vec::new();
+            let mut response_error = None;
 
             for session_name in &sessions_to_remove {
                 if !state.sessions.contains_session(session_name) {
@@ -798,6 +823,20 @@ impl RequestHandler {
                                 session_id: Some(removed_session.id().as_u32()),
                             },
                         ));
+                        for (window_index, window) in removed_session.windows() {
+                            queued_events.push(prepare_lifecycle_event(
+                                &mut state,
+                                &LifecycleEvent::WindowUnlinked {
+                                    session_name: session_name.clone(),
+                                    target: Some(WindowTarget::with_window(
+                                        session_name.clone(),
+                                        *window_index,
+                                    )),
+                                    window_id: Some(window.id().as_u32()),
+                                    window_name: Some(window.name().unwrap_or_default().to_owned()),
+                                },
+                            ));
+                        }
                         let _ = state.options.remove_session(session_name);
                         let _ = state.environment.remove_session(session_name);
                         let _ = state.hooks.remove_session(session_name);
@@ -806,22 +845,25 @@ impl RequestHandler {
                             current_runtime_owner.as_ref(),
                             next_runtime_owner.as_ref(),
                         ) {
-                            return Response::Error(ErrorResponse { error });
+                            response_error = Some(error);
+                            break;
                         }
                     }
                     Err(RmuxError::SessionNotFound(_)) => {}
                     Err(error) => {
-                        return Response::Error(ErrorResponse { error });
+                        response_error = Some(error);
+                        break;
                     }
                 }
             }
 
-            (
-                Response::KillSession(KillSessionResponse { existed: true }),
-                queued_events,
-                removed_pane_ids,
-                removed_sessions,
-            )
+            let response = response_error.map_or_else(
+                || Response::KillSession(KillSessionResponse { existed: true }),
+                |error| Response::Error(ErrorResponse { error }),
+            );
+            let removed_pane_ids = state.pane_ids_no_longer_referenced(removed_pane_ids);
+            self.record_panes_closed_as_killed(&removed_pane_ids);
+            (response, queued_events, removed_pane_ids, removed_sessions)
         };
 
         #[cfg(all(any(unix, windows), feature = "web"))]
@@ -832,10 +874,14 @@ impl RequestHandler {
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
         }
-        for event in queued_session_closed {
+        for event in queued_lifecycle_events {
             self.emit_prepared(event);
         }
-        self.remove_session_leases(&sessions_to_remove);
+        let removed_session_names = removed_sessions
+            .iter()
+            .map(|(session_name, _)| session_name.clone())
+            .collect::<Vec<_>>();
+        self.remove_session_leases(&removed_session_names);
 
         let _ = self.queue_shutdown_if_server_empty().await;
 
@@ -846,16 +892,22 @@ impl RequestHandler {
         &self,
         request: rmux_proto::RenameSessionRequest,
     ) -> Response {
-        let session_name = {
+        let (session_name, session_id) = {
             let state = self.state.lock().await;
-            match resolve_existing_session_target(
+            let session_name = match resolve_existing_session_target(
                 &state.sessions,
                 "rename-session",
                 &request.target,
             ) {
                 Ok(session_name) => session_name,
                 Err(error) => return Response::Error(ErrorResponse { error }),
-            }
+            };
+            let session_id = state
+                .sessions
+                .session(&session_name)
+                .expect("resolved session must exist")
+                .id();
+            (session_name, session_id)
         };
         let new_name = request.new_name;
         if session_name == new_name {
@@ -872,6 +924,7 @@ impl RequestHandler {
 
             match state.rename_session(&session_name, &new_name) {
                 Ok(()) => {
+                    self.rekey_web_session(&session_name, &new_name, session_id);
                     let mut active_attach = self.active_attach.lock().await;
                     active_attach.rename_session(&session_name, &new_name);
                     drop(active_attach);
@@ -904,12 +957,12 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ListSessionsRequest,
     ) -> Response {
+        let has_explicit_sort = request.sort_order.is_some();
         let sort_order = match parse_session_sort_order(request.sort_order.as_deref()) {
             Some(sort_order) => sort_order,
             None if request.sort_order.is_some() => {
-                let value = request.sort_order.unwrap_or_default();
                 return Response::Error(ErrorResponse {
-                    error: RmuxError::Server(format!("invalid sort order: {value}")),
+                    error: RmuxError::Server(rmux_core::INVALID_SORT_ORDER.to_owned()),
                 });
             }
             None => SessionSortOrder::Name,
@@ -932,7 +985,11 @@ impl RequestHandler {
                 activity_at: session.activity_at(),
             })
             .collect::<Vec<_>>();
-        sort_list_sessions(&mut sessions, sort_order, request.reversed);
+        sort_list_sessions(
+            &mut sessions,
+            sort_order,
+            request.reversed && has_explicit_sort,
+        );
 
         let active_attach = self.active_attach.lock().await;
         let active_control = self.active_control.lock().await;
@@ -1042,11 +1099,8 @@ fn should_defer_windows_initial_pane(
 ) -> bool {
     #[cfg(windows)]
     {
-        detached
-            && !print_session_info
-            && !grouped
-            && !has_command
-            && windows_deferred_initial_pane_enabled()
+        let _ = has_command;
+        detached && !print_session_info && !grouped && windows_deferred_initial_pane_enabled()
     }
     #[cfg(not(windows))]
     {

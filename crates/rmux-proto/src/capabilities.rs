@@ -34,6 +34,12 @@ pub const CAPABILITY_SDK_WAITS_ARMED: &str = "sdk.waits.armed";
 pub const CAPABILITY_SDK_PANE_BY_ID: &str = "sdk.pane.by_id";
 /// Stable feature id for daemon-side SDK pane input broadcast.
 pub const CAPABILITY_SDK_PANE_BROADCAST: &str = "sdk.pane.broadcast";
+/// Stable feature id for SDK pane-local option access.
+pub const CAPABILITY_SDK_PANE_OPTIONS: &str = "sdk.pane.options";
+/// Stable feature id for SDK pane title/option/close state events.
+pub const CAPABILITY_SDK_PANE_STATE_EVENTS: &str = "sdk.pane.state_events";
+/// Stable feature id for SDK best-effort pane foreground process state.
+pub const CAPABILITY_SDK_PANE_FOREGROUND: &str = "sdk.pane.foreground";
 /// Stable feature id for daemon-side app-owned session leases.
 pub const CAPABILITY_SDK_SESSION_LEASE: &str = "sdk.session.lease";
 /// Stable feature id for explicit SDK process launch modes.
@@ -67,6 +73,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_SDK_WAITS_ARMED,
     CAPABILITY_SDK_PANE_BY_ID,
     CAPABILITY_SDK_PANE_BROADCAST,
+    CAPABILITY_SDK_PANE_OPTIONS,
+    CAPABILITY_SDK_PANE_STATE_EVENTS,
+    CAPABILITY_SDK_PANE_FOREGROUND,
     CAPABILITY_SDK_SESSION_LEASE,
     CAPABILITY_SDK_PROCESS_COMMAND,
     CAPABILITY_TARGET_CLIENT_COMMANDS,
@@ -75,6 +84,12 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
 ];
 
 /// Client-to-server version and capability negotiation request.
+///
+/// The detached frame envelope remains mandatory and exact-versioned. These
+/// min/max fields are an advisory post-decode compatibility window for peers
+/// that already share the current envelope version. Required capabilities are
+/// mandatory: the daemon must reject the request if any listed capability is
+/// absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandshakeRequest {
     /// Lowest detached RPC wire version accepted by the caller.
@@ -167,10 +182,11 @@ impl HandshakeResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandshakeResponse, CAPABILITY_ATTACH_RENDER, CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY,
-        CAPABILITY_CLI_CAPTURE_TARGET_ACTION, CAPABILITY_CLI_TARGET_ACTIONS,
-        CAPABILITY_SDK_WAITS_ARMED,
+        HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
+        CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
+        CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_HANDSHAKE, CAPABILITY_SDK_WAITS_ARMED,
     };
+    use crate::{RmuxError, RMUX_WIRE_VERSION};
 
     #[test]
     fn current_handshake_advertises_attach_stream_capabilities() {
@@ -203,5 +219,47 @@ mod tests {
                 "missing capability {expected}"
             );
         }
+    }
+
+    #[test]
+    fn current_handshake_uses_exact_wire_window() {
+        let request = HandshakeRequest::current();
+
+        assert_eq!(request.minimum_wire_version, RMUX_WIRE_VERSION);
+        assert_eq!(request.maximum_wire_version, RMUX_WIRE_VERSION);
+    }
+
+    #[test]
+    fn handshake_wire_window_is_advisory_after_envelope_decode() {
+        let request = HandshakeRequest {
+            minimum_wire_version: RMUX_WIRE_VERSION.saturating_sub(1),
+            maximum_wire_version: RMUX_WIRE_VERSION + 1,
+            required_capabilities: vec![CAPABILITY_HANDSHAKE.to_owned()],
+        };
+
+        request
+            .validate_against(&[CAPABILITY_HANDSHAKE])
+            .expect("post-decode compatible wire window should validate");
+
+        let future_only = HandshakeRequest {
+            minimum_wire_version: RMUX_WIRE_VERSION + 1,
+            maximum_wire_version: RMUX_WIRE_VERSION + 1,
+            required_capabilities: Vec::new(),
+        };
+        assert!(matches!(
+            future_only.validate_against(&[CAPABILITY_HANDSHAKE]),
+            Err(RmuxError::UnsupportedWireVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn required_handshake_capabilities_are_mandatory() {
+        let request = HandshakeRequest::requiring(["missing.capability"]);
+
+        assert!(matches!(
+            request.validate_against(&[CAPABILITY_HANDSHAKE]),
+            Err(RmuxError::UnsupportedCapability { feature, .. })
+                if feature == "missing.capability"
+        ));
     }
 }

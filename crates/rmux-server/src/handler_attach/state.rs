@@ -22,6 +22,8 @@ pub(in crate::handler) struct ActiveAttachState {
     pub(in crate::handler) next_id: u64,
     pub(in crate::handler) next_size_sequence: u64,
     pub(in crate::handler) by_pid: HashMap<u32, ActiveAttach>,
+    pub(in crate::handler) active_client_by_window:
+        HashMap<rmux_proto::SessionName, HashMap<u32, u32>>,
 }
 
 #[derive(Debug)]
@@ -120,6 +122,87 @@ impl ActiveAttachState {
             if active.last_session.as_ref() == Some(session_name) {
                 active.last_session = Some(new_name.clone());
             }
+        }
+        if let Some(renamed_windows) = self.active_client_by_window.remove(session_name) {
+            self.active_client_by_window
+                .entry(new_name.clone())
+                .or_default()
+                .extend(renamed_windows);
+        }
+    }
+
+    pub(in crate::handler) fn remove_attached_client(
+        &mut self,
+        attach_pid: u32,
+    ) -> Option<ActiveAttach> {
+        let active = self.by_pid.remove(&attach_pid)?;
+        self.forget_attached_client_windows(attach_pid);
+        Some(active)
+    }
+
+    pub(in crate::handler) fn forget_attached_client_windows(&mut self, attach_pid: u32) {
+        self.active_client_by_window.retain(|_, windows| {
+            windows.retain(|_, pid| *pid != attach_pid);
+            !windows.is_empty()
+        });
+    }
+
+    pub(in crate::handler) fn forget_session_windows(
+        &mut self,
+        session_name: &rmux_proto::SessionName,
+    ) {
+        let _ = self.active_client_by_window.remove(session_name);
+    }
+
+    pub(in crate::handler) fn forget_window(&mut self, target: &WindowTarget) {
+        let remove_session = self
+            .active_client_by_window
+            .get_mut(target.session_name())
+            .is_some_and(|windows| {
+                let _ = windows.remove(&target.window_index());
+                windows.is_empty()
+            });
+        if remove_session {
+            let _ = self.active_client_by_window.remove(target.session_name());
+        }
+    }
+
+    pub(in crate::handler) fn seed_active_client_for_window(
+        &mut self,
+        attach_pid: u32,
+        session_name: &rmux_proto::SessionName,
+        window_index: u32,
+    ) {
+        if self.by_pid.contains_key(&attach_pid) {
+            self.active_client_by_window
+                .entry(session_name.clone())
+                .or_default()
+                .insert(window_index, attach_pid);
+        }
+    }
+
+    pub(in crate::handler) fn record_active_client_for_window(
+        &mut self,
+        attach_pid: u32,
+        target: &PaneTarget,
+    ) -> bool {
+        if self
+            .active_client_by_window
+            .get(target.session_name())
+            .and_then(|windows| windows.get(&target.window_index()))
+            == Some(&attach_pid)
+        {
+            return false;
+        }
+
+        match self
+            .active_client_by_window
+            .entry(target.session_name().clone())
+            .or_default()
+            .insert(target.window_index(), attach_pid)
+        {
+            Some(previous) => previous != attach_pid,
+            None => false,
         }
     }
 

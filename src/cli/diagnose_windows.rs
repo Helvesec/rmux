@@ -1,6 +1,8 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use rmux_os::shell::is_usable_shell_candidate;
+
 pub(super) fn detected_pane_shell() -> String {
     find_command_on_path(Path::new("pwsh.exe"))
         .or_else(windows_powershell_path)
@@ -30,14 +32,6 @@ fn find_command_on_path_in(
         }
     }
     None
-}
-
-fn is_usable_shell_candidate(path: &Path) -> bool {
-    // WindowsApps entries are app-execution aliases; CreateProcessW can reject
-    // their package paths with AccessDenied when used as ConPTY shells.
-    !path
-        .components()
-        .any(|component| component.as_os_str().eq_ignore_ascii_case("WindowsApps"))
 }
 
 fn windows_powershell_path() -> Option<PathBuf> {
@@ -129,6 +123,9 @@ mod tests {
     #[test]
     fn windowsapps_shell_candidate_is_not_reported_as_usable() {
         assert!(!is_usable_shell_candidate(Path::new(
+            r"C:\Users\RMUXUser\AppData\Local\Microsoft\WindowsApps\pwsh.exe"
+        )));
+        assert!(is_usable_shell_candidate(Path::new(
             r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7_x64__8wekyb3d8bbwe\pwsh.exe"
         )));
         assert!(is_usable_shell_candidate(Path::new(
@@ -139,7 +136,7 @@ mod tests {
     #[test]
     fn shell_path_lookup_uses_pathext_and_skips_windowsapps() {
         let root = unique_test_dir("pathext");
-        let windows_apps = root.join("WindowsApps");
+        let windows_apps = root.join("Microsoft").join("WindowsApps");
         let regular_bin = root.join("regular-bin");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&windows_apps).expect("windowsapps temp dir");

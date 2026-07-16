@@ -11,15 +11,15 @@ use crate::hook_runtime::with_hook_execution;
 use rmux_core::command_parser::CommandParser;
 use rmux_core::TargetFindContext;
 use rmux_proto::{
-    BreakPaneRequest, DisplayMessageRequest, IfShellRequest, KillWindowRequest, LastWindowRequest,
-    LinkWindowRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest,
-    NextWindowRequest, OptionName, OptionScopeSelector, PaneTarget, PreviousWindowRequest, Request,
-    RespawnPaneRequest, RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest,
-    RunShellDelaySeconds, RunShellRequest, RunShellResponse, ScopeSelector, SelectPaneRequest,
-    SessionName, SetEnvironmentRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
-    ShowOptionsRequest, SourceFileRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    SwapPaneDirection, SwapPaneRequest, Target, TerminalSize, WaitForMode, WaitForRequest,
-    WaitForResponse, WindowTarget,
+    BreakPaneRequest, DisplayMessageRequest, HookName, IfShellRequest, KillWindowRequest,
+    LastWindowRequest, LinkWindowRequest, NewSessionExtRequest, NewSessionRequest,
+    NewWindowRequest, NextWindowRequest, OptionName, OptionScopeSelector, PaneTarget,
+    PreviousWindowRequest, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
+    RotateWindowDirection, RotateWindowRequest, RunShellDelaySeconds, RunShellRequest,
+    RunShellResponse, ScopeSelector, SelectPaneRequest, SessionName, SetEnvironmentRequest,
+    SetOptionMode, SetOptionRequest, ShowBufferRequest, ShowOptionsRequest, SourceFileRequest,
+    SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapPaneDirection, SwapPaneRequest,
+    Target, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse, WindowTarget,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -36,8 +36,8 @@ fn wait_for(channel: &str, mode: WaitForMode) -> Request {
 fn run_shell(command: &str, background: bool) -> Request {
     Request::RunShell(Box::new(RunShellRequest {
         command: command.to_owned(),
+        arguments: Vec::new(),
         background,
-
         as_commands: false,
         show_stderr: false,
         delay_seconds: None,
@@ -127,7 +127,7 @@ async fn use_platform_test_shell(handler: &RequestHandler) {
 }
 
 async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &[u8]) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(background_shell_test_timeout(), async {
         loop {
             if let Some(output) = handler
                 .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -148,7 +148,7 @@ async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &
 }
 
 async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usize) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(background_shell_test_timeout(), async {
         loop {
             let active = handler
                 .active_detached_requests
@@ -161,6 +161,17 @@ async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usi
     })
     .await
     .unwrap_or_else(|_| panic!("detached request count did not become {expected}"));
+}
+
+fn background_shell_test_timeout() -> std::time::Duration {
+    #[cfg(windows)]
+    {
+        std::time::Duration::from_secs(10)
+    }
+    #[cfg(not(windows))]
+    {
+        std::time::Duration::from_secs(2)
+    }
 }
 
 #[cfg(unix)]
@@ -200,6 +211,19 @@ fn shell_print_then_exit_command(text: &str, code: u8) -> String {
 }
 
 #[cfg(unix)]
+fn shell_stderr_command(text: &str) -> String {
+    format!("printf {} >&2", command_quote(text))
+}
+
+#[cfg(windows)]
+fn shell_stderr_command(text: &str) -> String {
+    format!(
+        "[Console]::Error.Write({})",
+        crate::test_shell::powershell_quote(text)
+    )
+}
+
+#[cfg(unix)]
 fn shell_success_command() -> String {
     "true".to_owned()
 }
@@ -223,6 +247,9 @@ mod if_shell;
 
 #[path = "handler_scripting_tests/parsed_queue_core.rs"]
 mod parsed_queue_core;
+
+#[path = "handler_scripting_tests/queued_inventory.rs"]
+mod queued_inventory;
 
 #[path = "handler_scripting_tests/parsed_queue_split.rs"]
 mod parsed_queue_split;

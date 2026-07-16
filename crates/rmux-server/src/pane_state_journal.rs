@@ -1,0 +1,1790 @@
+//! Revisioned pane-state event journal for SDK streams.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use rmux_core::events::{SubscriptionLimitError, SubscriptionLimits};
+use rmux_core::PaneId;
+use rmux_proto::{
+    ForegroundStateDto, PaneStateClosedReason, PaneStateEventDto, PaneStateSubscriptionId,
+    DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+};
+
+#[path = "pane_state_journal/retention.rs"]
+mod retention;
+#[path = "pane_state_journal/subscriptions.rs"]
+mod subscriptions;
+
+use retention::retained_record_bytes;
+
+pub(crate) const PANE_STATE_JOURNAL_CAPACITY: usize = 4096;
+pub(crate) const PANE_STATE_CURSOR_BATCH: usize = 256;
+pub(crate) const PANE_STATE_JOURNAL_BYTE_CAPACITY: usize = DEFAULT_MAX_DETACHED_FRAME_LENGTH / 2;
+
+type PaneGeneration = (PaneId, Option<u64>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneStateInclude {
+    pub(crate) title: bool,
+    pub(crate) options: bool,
+    pub(crate) foreground: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneStateRecord {
+    pub(crate) revision: u64,
+    pub(crate) pane_id: PaneId,
+    pub(crate) generation: Option<u64>,
+    pub(crate) change: PaneStateChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaneStateChange {
+    TitleChanged {
+        old: String,
+        new: String,
+    },
+    OptionSet {
+        name: String,
+        old: Option<String>,
+        new: String,
+    },
+    OptionUnset {
+        name: String,
+        old: Option<String>,
+    },
+    ForegroundChanged {
+        old: ForegroundStateDto,
+        new: ForegroundStateDto,
+    },
+    Closed {
+        reason: PaneStateClosedReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneStateRead {
+    Ready {
+        next_revision: u64,
+        limited: bool,
+        event_count: usize,
+    },
+    Lag {
+        missed_from_revision: u64,
+        resume_revision: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneStateSubscriptionError {
+    Limit(SubscriptionLimitError),
+    Capacity { limit: usize },
+}
+
+#[derive(Debug, Clone)]
+struct PaneStateSubscription {
+    connection_id: u64,
+    pane_id: PaneId,
+    include: PaneStateInclude,
+    generation: Option<u64>,
+    closed: bool,
+    closed_revision: Option<u64>,
+    closed_reason: Option<PaneStateClosedReason>,
+    evicted_state_revision_before_close: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EvictedPaneStateRevisions {
+    title: u64,
+    options: u64,
+    foreground: u64,
+    closed: u64,
+}
+
+impl EvictedPaneStateRevisions {
+    fn record(&mut self, record: &PaneStateRecord) {
+        let revision = record.revision;
+        match record.change {
+            PaneStateChange::TitleChanged { .. } => {
+                self.title = self.title.max(revision);
+            }
+            PaneStateChange::OptionSet { .. } | PaneStateChange::OptionUnset { .. } => {
+                self.options = self.options.max(revision);
+            }
+            PaneStateChange::ForegroundChanged { .. } => {
+                self.foreground = self.foreground.max(revision);
+            }
+            PaneStateChange::Closed { .. } => {
+                self.closed = self.closed.max(revision);
+            }
+        }
+    }
+
+    fn max_matching(self, include: PaneStateInclude) -> u64 {
+        self.closed.max(self.max_matching_state_change(include))
+    }
+
+    fn max_matching_state_change(self, include: PaneStateInclude) -> u64 {
+        let mut revision = 0;
+        if include.title {
+            revision = revision.max(self.title);
+        }
+        if include.options {
+            revision = revision.max(self.options);
+        }
+        if include.foreground {
+            revision = revision.max(self.foreground);
+        }
+        revision
+    }
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            title: self.title.max(other.title),
+            options: self.options.max(other.options),
+            foreground: self.foreground.max(other.foreground),
+            closed: self.closed.max(other.closed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneStateSubscriptionInfo {
+    pub(crate) pane_id: PaneId,
+    pub(crate) include: PaneStateInclude,
+    pub(crate) generation: Option<u64>,
+    pub(crate) closed: bool,
+    pub(crate) closed_revision: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PaneStateJournal {
+    capacity: usize,
+    byte_capacity: usize,
+    retained_bytes: usize,
+    next_revision: u64,
+    next_subscription: u64,
+    limits: SubscriptionLimits,
+    records: VecDeque<PaneStateRecord>,
+    retained_record_counts: HashMap<PaneGeneration, usize>,
+    evicted_revisions: HashMap<PaneGeneration, EvictedPaneStateRevisions>,
+    subscriptions: HashMap<PaneStateSubscriptionId, PaneStateSubscription>,
+    subscription_counts: HashMap<PaneId, usize>,
+    subscription_generation_counts: HashMap<PaneGeneration, usize>,
+    closed_panes: HashSet<PaneId>,
+    closed_pane_order: VecDeque<PaneId>,
+}
+
+impl Default for PaneStateJournal {
+    fn default() -> Self {
+        Self::new(PANE_STATE_JOURNAL_CAPACITY)
+    }
+}
+
+impl PaneStateJournal {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self::with_limits(capacity, SubscriptionLimits::default())
+    }
+
+    pub(crate) fn with_limits(capacity: usize, limits: SubscriptionLimits) -> Self {
+        Self::with_limits_and_byte_capacity(capacity, PANE_STATE_JOURNAL_BYTE_CAPACITY, limits)
+    }
+
+    fn with_limits_and_byte_capacity(
+        capacity: usize,
+        byte_capacity: usize,
+        limits: SubscriptionLimits,
+    ) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            byte_capacity: byte_capacity.max(1),
+            retained_bytes: 0,
+            next_revision: 0,
+            next_subscription: 1,
+            limits,
+            records: VecDeque::new(),
+            retained_record_counts: HashMap::new(),
+            evicted_revisions: HashMap::new(),
+            subscriptions: HashMap::new(),
+            subscription_counts: HashMap::new(),
+            subscription_generation_counts: HashMap::new(),
+            closed_panes: HashSet::new(),
+            closed_pane_order: VecDeque::new(),
+        }
+    }
+
+    pub(crate) const fn current_revision(&self) -> u64 {
+        self.next_revision
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        pane_id: PaneId,
+        generation: Option<u64>,
+        change: PaneStateChange,
+    ) -> u64 {
+        self.next_revision = self.next_revision.saturating_add(1);
+        let revision = self.next_revision;
+        let record = PaneStateRecord {
+            revision,
+            pane_id,
+            generation,
+            change,
+        };
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(retained_record_bytes(&record));
+        self.records.push_back(record);
+        increment_generation_count(&mut self.retained_record_counts, (pane_id, generation));
+        while self.records.len() > self.capacity || self.retained_bytes > self.byte_capacity {
+            if let Some(record) = self.records.pop_front() {
+                self.retained_bytes = self
+                    .retained_bytes
+                    .saturating_sub(retained_record_bytes(&record));
+                decrement_generation_count(
+                    &mut self.retained_record_counts,
+                    (record.pane_id, record.generation),
+                );
+                self.record_eviction(&record);
+                self.prune_evicted_revision_key((record.pane_id, record.generation));
+            }
+        }
+        debug_assert!(self.retained_bytes <= self.byte_capacity);
+        revision
+    }
+
+    fn record_eviction(&mut self, record: &PaneStateRecord) {
+        self.evicted_revisions
+            .entry((record.pane_id, record.generation))
+            .or_default()
+            .record(record);
+        if matches!(record.change, PaneStateChange::Closed { .. }) {
+            return;
+        }
+        for subscription in self.subscriptions.values_mut() {
+            if subscription
+                .closed_revision
+                .is_some_and(|closed_revision| record.revision < closed_revision)
+                && record_matches_subscription(record, subscription)
+            {
+                subscription.evicted_state_revision_before_close = subscription
+                    .evicted_state_revision_before_close
+                    .max(record.revision);
+            }
+        }
+    }
+
+    fn prune_evicted_revision_key(&mut self, key: PaneGeneration) {
+        if self.retained_record_counts.contains_key(&key)
+            || self.subscription_generation_counts.contains_key(&key)
+        {
+            return;
+        }
+        let legacy_subscription = key.1.is_some()
+            && self
+                .subscription_generation_counts
+                .contains_key(&(key.0, None));
+        if let Some(evicted) = self.evicted_revisions.remove(&key) {
+            if legacy_subscription {
+                let aggregate = self.evicted_revisions.entry((key.0, None)).or_default();
+                *aggregate = aggregate.merge(evicted);
+            }
+        }
+    }
+
+    fn prune_evicted_revisions_for_pane(&mut self, pane_id: PaneId) {
+        let keys = self
+            .evicted_revisions
+            .keys()
+            .copied()
+            .filter(|(candidate, _)| *candidate == pane_id)
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.prune_evicted_revision_key(key);
+        }
+    }
+
+    fn prune_closed_panes(&mut self) {
+        while self.closed_panes.len() > self.capacity {
+            let Some(pane_id) = self.closed_pane_order.pop_front() else {
+                break;
+            };
+            self.closed_panes.remove(&pane_id);
+        }
+    }
+}
+fn increment_generation_count(counts: &mut HashMap<PaneGeneration, usize>, key: PaneGeneration) {
+    *counts.entry(key).or_insert(0) += 1;
+}
+
+fn decrement_generation_count(counts: &mut HashMap<PaneGeneration, usize>, key: PaneGeneration) {
+    if let Some(count) = counts.get_mut(&key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&key);
+        }
+    }
+}
+
+fn record_matches_include(record: &PaneStateRecord, include: PaneStateInclude) -> bool {
+    match record.change {
+        PaneStateChange::TitleChanged { .. } => include.title,
+        PaneStateChange::OptionSet { .. } | PaneStateChange::OptionUnset { .. } => include.options,
+        PaneStateChange::ForegroundChanged { .. } => include.foreground,
+        PaneStateChange::Closed { .. } => true,
+    }
+}
+
+fn record_matches_subscription(
+    record: &PaneStateRecord,
+    subscription: &PaneStateSubscription,
+) -> bool {
+    record.pane_id == subscription.pane_id
+        && subscription
+            .generation
+            .is_none_or(|generation| record.generation == Some(generation))
+        && record_matches_include(record, subscription.include)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane_id(value: u32) -> PaneId {
+        PaneId::new(value)
+    }
+
+    fn close_pane(journal: &mut PaneStateJournal, pane_id: PaneId) -> u64 {
+        assert!(journal.mark_pane_closed(pane_id));
+        let revision = journal.push(
+            pane_id,
+            Some(9),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::Killed,
+            },
+        );
+        journal.remember_pane_closed_event(pane_id, PaneStateClosedReason::Killed, revision);
+        revision
+    }
+
+    #[test]
+    fn journal_byte_budget_evicts_oversized_records_and_preserves_cursor_progress() {
+        let watched = pane_id(41);
+        let mut journal =
+            PaneStateJournal::with_limits_and_byte_capacity(8, 512, SubscriptionLimits::default());
+        let subscription = journal
+            .subscribe(
+                7,
+                watched,
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription fits");
+
+        let oversized_revision = journal.push(
+            watched,
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".repeat(512),
+                new: "b".repeat(512),
+            },
+        );
+        assert_eq!(oversized_revision, 1);
+        assert!(journal.records.is_empty());
+        assert_eq!(journal.retained_bytes, 0);
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal
+                .read_after(7, subscription, 0, 8, &mut events)
+                .expect("lag is reported"),
+            PaneStateRead::Lag {
+                missed_from_revision: 0,
+                resume_revision: 1,
+            }
+        );
+        assert!(events.is_empty());
+
+        journal.push(
+            watched,
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "b".to_owned(),
+                new: "c".to_owned(),
+            },
+        );
+        assert!(journal.retained_bytes <= journal.byte_capacity);
+        assert!(matches!(
+            journal
+                .read_after(7, subscription, 1, 8, &mut events)
+                .expect("cursor progresses after rebase"),
+            PaneStateRead::Ready { event_count: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn revisions_are_global_and_strictly_increasing() {
+        let mut journal = PaneStateJournal::new(8);
+        assert_eq!(
+            journal.push(
+                pane_id(1),
+                Some(1),
+                PaneStateChange::TitleChanged {
+                    old: "a".to_owned(),
+                    new: "b".to_owned(),
+                },
+            ),
+            1
+        );
+        assert_eq!(
+            journal.push(
+                pane_id(2),
+                Some(1),
+                PaneStateChange::OptionUnset {
+                    name: "@x".to_owned(),
+                    old: Some("1".to_owned()),
+                },
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn subscription_filters_by_pane_and_include_mask() {
+        let mut journal = PaneStateJournal::new(8);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::OptionSet {
+                name: "@x".to_owned(),
+                old: None,
+                new: "1".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(2),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".to_owned(),
+                new: "b".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".to_owned(),
+                new: "b".to_owned(),
+            },
+        );
+
+        let mut events = Vec::new();
+        let read = journal
+            .read_after(7, subscription, 0, 16, &mut events)
+            .expect("read should succeed");
+        assert_eq!(
+            read,
+            PaneStateRead::Ready {
+                next_revision: 3,
+                limited: false,
+                event_count: 1,
+            }
+        );
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn empty_filtered_read_advances_to_current_revision() {
+        let mut journal = PaneStateJournal::new(4);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::OptionSet {
+                name: "@x".to_owned(),
+                old: None,
+                new: "1".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(2),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".to_owned(),
+                new: "b".to_owned(),
+            },
+        );
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: 2,
+                limited: false,
+                event_count: 0,
+            })
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn stale_cursor_reports_lag() {
+        let mut journal = PaneStateJournal::new(2);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: true,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+        for index in 0..4 {
+            journal.push(
+                pane_id(1),
+                Some(1),
+                PaneStateChange::TitleChanged {
+                    old: index.to_string(),
+                    new: (index + 1).to_string(),
+                },
+            );
+        }
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Lag {
+                missed_from_revision: 0,
+                resume_revision: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn closed_pane_stops_foreground_watch_without_hiding_closed_event() {
+        let mut journal = PaneStateJournal::new(8);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: false,
+                    options: false,
+                    foreground: true,
+                },
+            )
+            .expect("subscription within limits");
+        assert_eq!(journal.foreground_subscription_count(), 1);
+
+        journal.push(
+            pane_id(1),
+            Some(9),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::Killed,
+            },
+        );
+        journal.mark_pane_closed(pane_id(1));
+
+        assert_eq!(journal.foreground_subscription_count(), 0);
+        assert!(journal.pane_ids_with_foreground_subscriptions().is_empty());
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: 1,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                reason: PaneStateClosedReason::Killed,
+                ..
+            }]
+        ));
+        assert!(journal.remove_closed_subscription(7, subscription));
+        assert_eq!(
+            journal.read_after(7, subscription, 1, 16, &mut Vec::new()),
+            Err("subscription not found")
+        );
+    }
+
+    #[test]
+    fn unread_closed_subscriptions_count_toward_connection_and_pane_limits() {
+        let mut journal = PaneStateJournal::with_limits(
+            8,
+            SubscriptionLimits::new(1, 1, 16, std::time::Duration::from_secs(60)),
+        );
+        let include = PaneStateInclude {
+            title: false,
+            options: false,
+            foreground: true,
+        };
+        let first = journal
+            .subscribe(7, pane_id(1), include)
+            .expect("first subscription fits the limit");
+        close_pane(&mut journal, pane_id(1));
+
+        assert_eq!(
+            journal.subscribe(7, pane_id(2), include),
+            Err(PaneStateSubscriptionError::Limit(
+                SubscriptionLimitError::PerConnection { limit: 1 }
+            ))
+        );
+        assert_eq!(
+            journal.subscribe(8, pane_id(1), include),
+            Err(PaneStateSubscriptionError::Limit(
+                SubscriptionLimitError::PerPane { limit: 1 }
+            ))
+        );
+
+        assert_eq!(journal.unsubscribe(7, first), Ok(true));
+        let replacement = journal
+            .subscribe(7, pane_id(1), include)
+            .expect("unsubscribe must release connection and pane quota");
+        close_pane(&mut journal, pane_id(1));
+        journal.remove_connection(7);
+        journal
+            .subscribe(8, pane_id(1), include)
+            .expect("disconnect must release connection and pane quota");
+        assert_ne!(replacement, first);
+    }
+
+    #[test]
+    fn capacity_rejects_n_plus_one_and_retains_oldest_closed_until_delivery() {
+        let mut journal = PaneStateJournal::with_limits(
+            2,
+            SubscriptionLimits::new(8, 8, 16, std::time::Duration::from_secs(60)),
+        );
+        let include = PaneStateInclude {
+            title: false,
+            options: false,
+            foreground: true,
+        };
+
+        let oldest = journal
+            .subscribe(7, pane_id(1), include)
+            .expect("first subscription fits capacity");
+        let oldest_closed_revision = close_pane(&mut journal, pane_id(1));
+        journal
+            .subscribe(8, pane_id(2), include)
+            .expect("Nth subscription fits capacity");
+        close_pane(&mut journal, pane_id(2));
+
+        for pane in 3..=4 {
+            journal.push(
+                pane_id(pane),
+                Some(9),
+                PaneStateChange::TitleChanged {
+                    old: "old".to_owned(),
+                    new: "new".to_owned(),
+                },
+            );
+        }
+
+        assert_eq!(
+            journal.subscribe(9, pane_id(3), include),
+            Err(PaneStateSubscriptionError::Capacity { limit: 2 })
+        );
+        assert_eq!(journal.subscriptions.len(), 2);
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, oldest, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: oldest_closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::Killed,
+                ..
+            }] if *revision == oldest_closed_revision
+        ));
+
+        assert!(journal.remove_closed_subscription(7, oldest));
+        journal
+            .subscribe(9, pane_id(3), include)
+            .expect("delivering Closed must release global capacity");
+        assert_eq!(journal.subscriptions.len(), 2);
+    }
+
+    #[test]
+    fn evicted_revisions_drop_panes_without_records_or_subscriptions() {
+        let mut journal = PaneStateJournal::new(1);
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".to_owned(),
+                new: "b".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(2),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "c".to_owned(),
+                new: "d".to_owned(),
+            },
+        );
+
+        assert!(!journal
+            .evicted_revisions
+            .keys()
+            .any(|(candidate, _)| *candidate == pane_id(1)));
+        assert!(journal.evicted_revisions.is_empty());
+    }
+
+    #[test]
+    fn evicted_revisions_keep_subscribed_panes_without_records() {
+        let mut journal = PaneStateJournal::new(1);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".to_owned(),
+                new: "b".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(2),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "c".to_owned(),
+                new: "d".to_owned(),
+            },
+        );
+
+        assert!(journal.evicted_revisions.contains_key(&(pane_id(1), None)));
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut Vec::new()),
+            Ok(PaneStateRead::Lag {
+                missed_from_revision: 0,
+                resume_revision: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn closed_pane_tracking_is_bounded_by_journal_capacity() {
+        let mut journal = PaneStateJournal::new(2);
+
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        assert!(journal.mark_pane_closed(pane_id(2)));
+        assert!(journal.mark_pane_closed(pane_id(3)));
+
+        assert_eq!(journal.closed_panes.len(), 2);
+        assert!(!journal.closed_panes.contains(&pane_id(1)));
+        assert!(journal.closed_panes.contains(&pane_id(2)));
+        assert!(journal.closed_panes.contains(&pane_id(3)));
+    }
+
+    #[test]
+    fn closed_subscription_reads_retained_closed_event_before_reporting_global_lag() {
+        let mut journal = PaneStateJournal::new(2);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: true,
+                    foreground: true,
+                },
+            )
+            .expect("subscription within limits");
+
+        for index in 0..4 {
+            journal.push(
+                pane_id(2),
+                Some(1),
+                PaneStateChange::TitleChanged {
+                    old: index.to_string(),
+                    new: (index + 1).to_string(),
+                },
+            );
+        }
+        journal.push(
+            pane_id(1),
+            Some(9),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::Killed,
+            },
+        );
+        journal.mark_pane_closed(pane_id(1));
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: 5,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                reason: PaneStateClosedReason::Killed,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn closed_subscription_reports_pane_scoped_lag_before_retained_closed_suffix() {
+        let mut journal = PaneStateJournal::new(1);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+
+        for index in 0..5 {
+            journal.push(
+                pane_id(1),
+                Some(1),
+                PaneStateChange::TitleChanged {
+                    old: index.to_string(),
+                    new: (index + 1).to_string(),
+                },
+            );
+        }
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::Killed,
+            },
+        );
+        journal.mark_pane_closed(pane_id(1));
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::Killed,
+            closed_revision,
+        );
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Lag {
+                missed_from_revision: 0,
+                resume_revision: closed_revision,
+            })
+        );
+        assert!(events.is_empty());
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, closed_revision - 1, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::Killed,
+                ..
+            }] if *revision == closed_revision
+        ));
+    }
+
+    #[test]
+    fn closed_subscription_synthesizes_closed_after_record_eviction() {
+        let mut journal = PaneStateJournal::new(2);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::Killed,
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::Killed,
+            closed_revision,
+        );
+        for index in 0..3 {
+            journal.push(
+                pane_id(2),
+                Some(1),
+                PaneStateChange::TitleChanged {
+                    old: index.to_string(),
+                    new: (index + 1).to_string(),
+                },
+            );
+        }
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::Killed,
+                ..
+            }] if *revision == closed_revision
+        ));
+    }
+
+    #[test]
+    fn closed_subscription_synthesizes_closed_before_retained_post_close_state() {
+        let mut journal = PaneStateJournal::new(2);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: false,
+                    options: true,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::DiedKept,
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::DiedKept,
+            closed_revision,
+        );
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::OptionSet {
+                name: "@post-close".to_owned(),
+                old: None,
+                new: "ignored".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(2),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".to_owned(),
+                new: "b".to_owned(),
+            },
+        );
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::DiedKept,
+                ..
+            }] if *revision == closed_revision
+        ));
+    }
+
+    #[test]
+    fn post_close_eviction_does_not_fabricate_pre_close_lag() {
+        let mut journal = PaneStateJournal::new(1);
+        let subscription = journal
+            .subscribe_at_generation(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: false,
+                    options: true,
+                    foreground: false,
+                },
+                Some(1),
+            )
+            .expect("subscription within limits");
+
+        journal.push(
+            pane_id(2),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".to_owned(),
+                new: "b".to_owned(),
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::DiedKept,
+            },
+        );
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::DiedKept,
+            closed_revision,
+        );
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::OptionSet {
+                name: "@post-close".to_owned(),
+                old: None,
+                new: "ignored".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(2),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "b".to_owned(),
+                new: "c".to_owned(),
+            },
+        );
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::DiedKept,
+                ..
+            }] if *revision == closed_revision
+        ));
+    }
+
+    #[test]
+    fn closed_subscription_reports_lag_before_partial_retained_suffix() {
+        let mut journal = PaneStateJournal::new(2);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".to_owned(),
+                new: "b".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "b".to_owned(),
+                new: "c".to_owned(),
+            },
+        );
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::Killed,
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::Killed,
+            closed_revision,
+        );
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Lag {
+                missed_from_revision: 0,
+                resume_revision: 2,
+            })
+        );
+        assert!(events.is_empty());
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 1, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 2,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                PaneStateEventDto::TitleChanged { revision: 2, .. },
+                PaneStateEventDto::Closed { revision, .. },
+            ] if *revision == closed_revision
+        ));
+    }
+
+    #[test]
+    fn late_subscription_after_died_kept_receives_final_killed_close() {
+        let mut journal = PaneStateJournal::new(8);
+        let first_closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::DiedKept,
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::DiedKept,
+            first_closed_revision,
+        );
+
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: false,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("late subscription within limits");
+        assert!(
+            journal.mark_pane_closed(pane_id(1)),
+            "an open late subscription requires a final close record even for an already closed pane"
+        );
+        let killed_revision = journal.push(
+            pane_id(1),
+            None,
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::Killed,
+            },
+        );
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::Killed,
+            killed_revision,
+        );
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, first_closed_revision, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: killed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::Killed,
+                ..
+            }] if *revision == killed_revision
+        ));
+    }
+
+    #[test]
+    fn unrelated_evictions_do_not_lag_active_subscription() {
+        let mut journal = PaneStateJournal::new(2);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+
+        for index in 0..4 {
+            journal.push(
+                pane_id(2),
+                Some(1),
+                PaneStateChange::TitleChanged {
+                    old: index.to_string(),
+                    new: (index + 1).to_string(),
+                },
+            );
+        }
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: 4,
+                limited: false,
+                event_count: 0,
+            })
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn closed_subscription_is_bounded_at_close_revision_after_reopen() {
+        let mut journal = PaneStateJournal::new(8);
+        let subscription = journal
+            .subscribe(
+                7,
+                pane_id(1),
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription within limits");
+
+        journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "initial".to_owned(),
+                new: "before-close".to_owned(),
+            },
+        );
+        let closed_revision = journal.push(
+            pane_id(1),
+            Some(1),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::Killed,
+            },
+        );
+        assert!(journal.mark_pane_closed(pane_id(1)));
+        journal.remember_pane_closed_event(
+            pane_id(1),
+            PaneStateClosedReason::Killed,
+            closed_revision,
+        );
+        journal.reopen_pane(pane_id(1));
+        journal.push(
+            pane_id(1),
+            Some(2),
+            PaneStateChange::TitleChanged {
+                old: "after-reopen".to_owned(),
+                new: "new-generation".to_owned(),
+            },
+        );
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: closed_revision,
+                limited: false,
+                event_count: 2,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                PaneStateEventDto::TitleChanged { revision: 1, .. },
+                PaneStateEventDto::Closed { revision, .. },
+            ] if *revision == closed_revision
+        ));
+
+        journal.remove_closed_subscription(7, subscription);
+        let mut events = Vec::new();
+        assert!(journal
+            .read_after(7, subscription, closed_revision, 16, &mut events)
+            .is_err());
+    }
+
+    /// Model-based check of journal ordering, replay, and overflow invariants:
+    /// random interleavings of watched-pane pushes (including post-close
+    /// races), eviction-driving noise pushes, a close, and bounded consumer
+    /// reads against a tiny journal. The consumer must observe its matching
+    /// events in order with every gap preceded by a Lag rebase, must receive
+    /// exactly one terminal Closed within a bounded number of reads (no stuck
+    /// cursor, no error), and must observe nothing after it.
+    #[test]
+    fn invariants_hold_under_random_push_evict_close_read_interleavings() {
+        for seed in 0..128u64 {
+            run_invariant_scenario(seed);
+        }
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    fn watched_title_change(step: u64) -> PaneStateChange {
+        PaneStateChange::TitleChanged {
+            old: format!("t{step}"),
+            new: format!("t{}", step + 1),
+        }
+    }
+
+    fn event_revision(event: &PaneStateEventDto) -> u64 {
+        match event {
+            PaneStateEventDto::TitleChanged { revision, .. }
+            | PaneStateEventDto::OptionSet { revision, .. }
+            | PaneStateEventDto::OptionUnset { revision, .. }
+            | PaneStateEventDto::ForegroundChanged { revision, .. }
+            | PaneStateEventDto::Closed { revision, .. } => *revision,
+            _ => unreachable!("unknown pane-state event variant from this rmux-proto version"),
+        }
+    }
+
+    struct InvariantConsumer {
+        seed: u64,
+        subscription: PaneStateSubscriptionId,
+        cursor: u64,
+        expected: VecDeque<u64>,
+        closed_delivered: usize,
+    }
+
+    impl InvariantConsumer {
+        fn read(&mut self, journal: &PaneStateJournal, max_events: usize) {
+            // The request handler removes terminal subscriptions immediately
+            // after delivering Closed. Model that terminal stream contract
+            // rather than calling the journal again after completion.
+            if self.closed_delivered > 0 {
+                return;
+            }
+            let seed = self.seed;
+            let mut events = Vec::new();
+            match journal
+                .read_after(7, self.subscription, self.cursor, max_events, &mut events)
+                .unwrap_or_else(|error| {
+                    panic!("seed {seed}: read_after must never error (I2), got: {error}")
+                }) {
+                PaneStateRead::Ready { next_revision, .. } => {
+                    for event in &events {
+                        let revision = event_revision(event);
+                        assert!(
+                            revision > self.cursor,
+                            "seed {seed}: delivered revision {revision} not past cursor (I1)"
+                        );
+                        self.cursor = revision;
+                        if matches!(event, PaneStateEventDto::Closed { .. }) {
+                            self.closed_delivered += 1;
+                            assert!(
+                                self.expected.is_empty(),
+                                "seed {seed}: Closed delivered before pending events (I5)"
+                            );
+                        } else {
+                            assert_eq!(
+                                self.expected.pop_front(),
+                                Some(revision),
+                                "seed {seed}: out-of-order or silently skipped event (I5)"
+                            );
+                        }
+                        assert!(
+                            self.closed_delivered <= 1,
+                            "seed {seed}: more than one terminal Closed delivered (I3)"
+                        );
+                    }
+                    assert!(
+                        next_revision >= self.cursor,
+                        "seed {seed}: next_revision regressed below cursor (I1)"
+                    );
+                    if events.is_empty() {
+                        self.cursor = self.cursor.max(next_revision);
+                    }
+                }
+                PaneStateRead::Lag {
+                    resume_revision, ..
+                } => {
+                    // Rebase this journal-only consumer to the first retained
+                    // revision. The handler separately returns a current
+                    // snapshot before draining retained events.
+                    let rebased = resume_revision.saturating_sub(1);
+                    assert!(
+                        rebased >= self.cursor,
+                        "seed {seed}: Lag rebase moved cursor backwards (I1)"
+                    );
+                    self.cursor = rebased;
+                    while self
+                        .expected
+                        .front()
+                        .is_some_and(|revision| *revision <= rebased)
+                    {
+                        self.expected.pop_front();
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_invariant_scenario(seed: u64) {
+        let mut rng = Lcg(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1));
+        let mut journal = PaneStateJournal::new(4);
+        let include = PaneStateInclude {
+            title: true,
+            options: true,
+            foreground: true,
+        };
+        let watched = pane_id(1);
+        let subscription = journal
+            .subscribe(7, watched, include)
+            .expect("subscribe watched pane");
+        let mut consumer = InvariantConsumer {
+            seed,
+            subscription,
+            cursor: 0,
+            expected: VecDeque::new(),
+            closed_delivered: 0,
+        };
+        let mut closed_revision: Option<u64> = None;
+        let close = |journal: &mut PaneStateJournal, closed_revision: &mut Option<u64>| {
+            if closed_revision.is_none() && journal.mark_pane_closed(watched) {
+                let revision = journal.push(
+                    watched,
+                    Some(1),
+                    PaneStateChange::Closed {
+                        reason: PaneStateClosedReason::Killed,
+                    },
+                );
+                journal.remember_pane_closed_event(
+                    watched,
+                    PaneStateClosedReason::Killed,
+                    revision,
+                );
+                *closed_revision = Some(revision);
+            }
+        };
+
+        for step in 0..200u64 {
+            match rng.below(14) {
+                0..=4 => {
+                    // Watched-pane state change; post-close pushes model the
+                    // in-flight title/option tasks that race a kill and must
+                    // never be delivered past the terminal Closed (I3) nor
+                    // wedge the cursor once evicted.
+                    let revision = journal.push(watched, Some(1), watched_title_change(step));
+                    if closed_revision.is_none() {
+                        consumer.expected.push_back(revision);
+                    }
+                }
+                5..=9 => {
+                    let noise = pane_id(2 + rng.below(3) as u32);
+                    journal.push(noise, Some(1), watched_title_change(step));
+                }
+                10 => close(&mut journal, &mut closed_revision),
+                _ => {
+                    let max_events = 1 + rng.below(3) as usize;
+                    consumer.read(&journal, max_events);
+                }
+            }
+        }
+
+        close(&mut journal, &mut closed_revision);
+        assert!(closed_revision.is_some(), "seed {seed}: close recorded");
+
+        // Drain: the consumer must reach the terminal Closed in bounded
+        // reads — a stuck cursor (Lag that never progresses) fails here.
+        let mut drain_reads = 0usize;
+        while consumer.closed_delivered == 0 {
+            drain_reads += 1;
+            assert!(
+                drain_reads < 1_000,
+                "seed {seed}: consumer did not reach terminal Closed within 1000 reads \
+                 (stuck cursor; I2/progress)"
+            );
+            consumer.read(&journal, 2);
+        }
+        assert_eq!(
+            consumer.closed_delivered, 1,
+            "seed {seed}: exactly one Closed (I3)"
+        );
+
+        // Post-terminal reads must deliver nothing (I3).
+        for _ in 0..2 {
+            let before_closed = consumer.closed_delivered;
+            let before_expected = consumer.expected.len();
+            let cursor_before = consumer.cursor;
+            consumer.read(&journal, 4);
+            assert_eq!(
+                consumer.closed_delivered, before_closed,
+                "seed {seed}: event after Closed (I3)"
+            );
+            assert_eq!(
+                consumer.expected.len(),
+                before_expected,
+                "seed {seed}: matching event delivered after Closed (I3)"
+            );
+            assert!(
+                consumer.cursor >= cursor_before,
+                "seed {seed}: cursor regressed after terminal Closed (I1)"
+            );
+        }
+    }
+
+    #[test]
+    fn generation_scoped_subscription_ignores_late_and_evicted_old_generation_events() {
+        let watched = pane_id(91);
+        let mut journal = PaneStateJournal::new(1);
+        let subscription = journal
+            .subscribe_at_generation(
+                7,
+                watched,
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+                Some(2),
+            )
+            .expect("generation-scoped subscription");
+
+        journal.push(
+            watched,
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "old".to_owned(),
+                new: "stale".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(92),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "noise-old".to_owned(),
+                new: "noise-new".to_owned(),
+            },
+        );
+
+        let mut output = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 8, &mut output),
+            Ok(PaneStateRead::Ready {
+                next_revision: 2,
+                limited: false,
+                event_count: 0,
+            })
+        );
+        assert!(output.is_empty());
+
+        journal.push(
+            watched,
+            Some(2),
+            PaneStateChange::TitleChanged {
+                old: "current-old".to_owned(),
+                new: "current-new".to_owned(),
+            },
+        );
+        assert_eq!(
+            journal.read_after(7, subscription, 2, 8, &mut output),
+            Ok(PaneStateRead::Ready {
+                next_revision: 3,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            output.as_slice(),
+            [PaneStateEventDto::TitleChanged { new_title, .. }] if new_title == "current-new"
+        ));
+    }
+
+    #[test]
+    fn generation_scoped_subscription_ignores_retained_old_generation_option_events() {
+        let watched = pane_id(95);
+        let mut journal = PaneStateJournal::new(4);
+        let subscription = journal
+            .subscribe_at_generation(
+                7,
+                watched,
+                PaneStateInclude {
+                    title: false,
+                    options: true,
+                    foreground: false,
+                },
+                Some(2),
+            )
+            .expect("generation-scoped subscription");
+
+        journal.push(
+            watched,
+            Some(1),
+            PaneStateChange::OptionSet {
+                name: "@stale".to_owned(),
+                old: None,
+                new: "old-generation".to_owned(),
+            },
+        );
+        let mut output = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 8, &mut output),
+            Ok(PaneStateRead::Ready {
+                next_revision: 1,
+                limited: false,
+                event_count: 0,
+            })
+        );
+        assert!(output.is_empty());
+
+        journal.push(
+            watched,
+            Some(2),
+            PaneStateChange::OptionSet {
+                name: "@current".to_owned(),
+                old: None,
+                new: "current-generation".to_owned(),
+            },
+        );
+        assert_eq!(
+            journal.read_after(7, subscription, 1, 8, &mut output),
+            Ok(PaneStateRead::Ready {
+                next_revision: 2,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            output.as_slice(),
+            [PaneStateEventDto::OptionSet { name, new_value, .. }]
+                if name == "@current" && new_value == "current-generation"
+        ));
+    }
+
+    #[test]
+    fn legacy_subscription_compacts_evictions_across_many_generations() {
+        let watched = pane_id(93);
+        let noise = pane_id(94);
+        let mut journal = PaneStateJournal::new(1);
+        let _subscription = journal
+            .subscribe(
+                7,
+                watched,
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("legacy subscription");
+
+        for generation in 1..=100 {
+            journal.push(
+                watched,
+                Some(generation),
+                PaneStateChange::TitleChanged {
+                    old: generation.to_string(),
+                    new: (generation + 1).to_string(),
+                },
+            );
+            journal.push(
+                noise,
+                Some(generation),
+                PaneStateChange::TitleChanged {
+                    old: "noise".to_owned(),
+                    new: "noise-next".to_owned(),
+                },
+            );
+        }
+
+        let watched_keys = journal
+            .evicted_revisions
+            .keys()
+            .filter(|(pane_id, _)| *pane_id == watched)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(watched_keys, vec![(watched, None)]);
+    }
+}

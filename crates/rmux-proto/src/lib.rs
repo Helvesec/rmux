@@ -28,10 +28,13 @@ pub use capabilities::{
     CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_CONTROL_STREAM, CAPABILITY_DAEMON_SHUTDOWN,
     CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, CAPABILITY_DAEMON_STATUS, CAPABILITY_DETACHED_RPC,
     CAPABILITY_FRAMED_ERRORS, CAPABILITY_HANDSHAKE, CAPABILITY_SDK_PANE_BROADCAST,
-    CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PROCESS_COMMAND, CAPABILITY_SDK_SESSION_LEASE,
+    CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_OPTIONS,
+    CAPABILITY_SDK_PANE_STATE_EVENTS, CAPABILITY_SDK_PROCESS_COMMAND, CAPABILITY_SDK_SESSION_LEASE,
     CAPABILITY_SDK_WAITS, CAPABILITY_SDK_WAITS_ARMED, CAPABILITY_TARGET_CLIENT_COMMANDS,
     CAPABILITY_WEB_SHARE, SUPPORTED_CAPABILITIES,
 };
+#[cfg(feature = "fuzzing")]
+pub use codec::fuzz_detached_frame_decoder;
 pub use codec::{
     decode_frame, encode_frame, FrameDecoder, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
     DEFAULT_MAX_FRAME_LENGTH,
@@ -56,7 +59,10 @@ pub use identity::{PaneId, SessionId, SessionName, WindowId};
 pub use request::*;
 pub use response::*;
 pub use types::*;
-pub use types::{OptionScopeSelector, PaneOutputSubscriptionId, SdkWaitId, SdkWaitOwnerId};
+pub use types::{
+    OptionScopeSelector, PaneOutputSubscriptionId, PaneStateSubscriptionId, SdkWaitId,
+    SdkWaitOwnerId,
+};
 
 /// Detached request/response protocol revision.
 pub const PROTOCOL_VERSION: u16 = RMUX_WIRE_VERSION as u16;

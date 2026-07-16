@@ -126,11 +126,14 @@ async fn list_panes_returns_error_for_missing_session() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: session_name("missing"),
             format: None,
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
 
     assert_eq!(

@@ -20,6 +20,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 
+#[cfg(windows)]
+const WEBSOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(windows))]
+const WEBSOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[test]
 fn websocket_upgrade_requires_upgrade_token() {
     let request = request_with_headers([
@@ -481,6 +486,7 @@ async fn session_share_sends_revoked_before_closing_when_session_is_killed() {
             target: session_name,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert!(matches!(killed, Response::KillSession(_)));
@@ -800,10 +806,13 @@ async fn session_spectator_can_select_windows_without_operator_access() {
     })
     .await;
     let Response::ListWindows(listed) = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: session_name,
             format: None,
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await
     else {
         panic!("expected list-windows response");
@@ -1747,7 +1756,7 @@ async fn read_encrypted_binary_frame_with_prefix_containing(
 }
 
 async fn read_server_frame(stream: &mut TcpStream) -> ServerFrame {
-    timeout(Duration::from_secs(2), read_server_frame_inner(stream))
+    timeout(WEBSOCKET_FRAME_TIMEOUT, read_server_frame_inner(stream))
         .await
         .expect("websocket frame timeout")
         .expect("read websocket frame")

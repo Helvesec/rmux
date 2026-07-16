@@ -41,6 +41,12 @@ fn current_process_command_name_is_available() {
 }
 
 #[test]
+fn current_process_executable_path_is_available() {
+    let path = executable_path(std::process::id()).expect("current process exe should be visible");
+    assert!(!path.is_empty());
+}
+
+#[test]
 fn current_process_environment_is_available() {
     let environment =
         environment(std::process::id()).expect("current process environment should be visible");

@@ -157,7 +157,10 @@ impl RequestHandler {
             return HandleOutcome::response(response);
         }
         if let Request::DaemonStatus(_request) = request {
-            return HandleOutcome::response(self.handle_daemon_status(connection_id).await);
+            return HandleOutcome::response(
+                self.handle_daemon_status(requester_pid, connection_id)
+                    .await,
+            );
         }
 
         #[cfg(windows)]
@@ -193,9 +196,10 @@ impl RequestHandler {
             Request::KillWindow(request) => {
                 HandleOutcome::response(self.handle_kill_window(request).await)
             }
-            Request::SelectWindow(request) => {
-                HandleOutcome::response(self.handle_select_window(request).await)
-            }
+            Request::SelectWindow(request) => HandleOutcome::response(
+                self.handle_select_window(Some(requester_pid), request)
+                    .await,
+            ),
             Request::RenameWindow(request) => {
                 HandleOutcome::response(self.handle_rename_window(request).await)
             }
@@ -209,7 +213,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_last_window(request).await)
             }
             Request::ListWindows(request) => {
-                HandleOutcome::response(self.handle_list_windows(request).await)
+                HandleOutcome::response(self.handle_list_windows(*request).await)
             }
             Request::LinkWindow(request) => {
                 HandleOutcome::response(self.handle_link_window(request).await)
@@ -307,10 +311,10 @@ impl RequestHandler {
                     .await,
             ),
             Request::DisplayPanes(request) => {
-                HandleOutcome::response(self.handle_display_panes(request).await)
+                HandleOutcome::response(self.handle_display_panes(requester_pid, *request).await)
             }
             Request::ListPanes(request) => {
-                HandleOutcome::response(self.handle_list_panes(request).await)
+                HandleOutcome::response(self.handle_list_panes(*request).await)
             }
             Request::SelectPane(request) => {
                 HandleOutcome::response(self.handle_select_pane(*request).await)
@@ -338,6 +342,26 @@ impl RequestHandler {
             ),
             Request::PaneBroadcastInput(request) => {
                 HandleOutcome::response(self.handle_pane_broadcast_input(request).await)
+            }
+            Request::PaneOptionSet(request) => {
+                HandleOutcome::response(self.handle_pane_option_set(request).await)
+            }
+            Request::PaneOptionGet(request) => {
+                HandleOutcome::response(self.handle_pane_option_get(request).await)
+            }
+            Request::SubscribePaneState(request) => HandleOutcome::response(
+                self.handle_subscribe_pane_state(connection_id, request)
+                    .await,
+            ),
+            Request::PaneStateCursor(request) => {
+                HandleOutcome::response(self.handle_pane_state_cursor(connection_id, request).await)
+            }
+            Request::UnsubscribePaneState(request) => HandleOutcome::response(
+                self.handle_unsubscribe_pane_state(connection_id, request)
+                    .await,
+            ),
+            Request::PaneForegroundState(request) => {
+                HandleOutcome::response(self.handle_pane_foreground_state(request).await)
             }
             Request::BindKey(request) => {
                 HandleOutcome::response(self.handle_bind_key(*request).await)
@@ -391,7 +415,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_list_sessions(request).await)
             }
             Request::SetBuffer(request) => {
-                HandleOutcome::response(self.handle_set_buffer(requester_pid, request).await)
+                HandleOutcome::response(self.handle_set_buffer(requester_pid, *request).await)
             }
             Request::ShowBuffer(request) => {
                 HandleOutcome::response(self.handle_show_buffer(request).await)
@@ -406,7 +430,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_delete_buffer(request).await)
             }
             Request::LoadBuffer(request) => {
-                HandleOutcome::response(self.handle_load_buffer(requester_pid, request).await)
+                HandleOutcome::response(self.handle_load_buffer(requester_pid, *request).await)
             }
             Request::SaveBuffer(request) => {
                 HandleOutcome::response(self.handle_save_buffer(request).await)
@@ -526,6 +550,7 @@ impl RequestHandler {
                     crate::control::ControlModeUpgrade {
                         mode: request.mode,
                         terminal_context,
+                        initial_command_count: request.initial_command_count,
                     },
                 )
             }
@@ -586,7 +611,9 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::KillServer(_)
             | Request::ShutdownIfIdle(_)
             | Request::KillPane(_)
+            | Request::PaneKill(_)
             | Request::RespawnPane(_)
+            | Request::PaneRespawn(_)
             | Request::LockServer(_)
             | Request::LockSession(_)
             | Request::LockClient(_)
@@ -615,11 +642,16 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::SaveBuffer(_)
             | Request::CapturePane(_)
             | Request::CapturePaneTargetAction(_)
+            | Request::PaneOptionGet(_)
             | Request::PaneSnapshot(_)
             | Request::SubscribePaneOutput(_)
             | Request::SubscribePaneOutputRef(_)
             | Request::UnsubscribePaneOutput(_)
             | Request::PaneOutputCursor(_)
+            | Request::SubscribePaneState(_)
+            | Request::PaneStateCursor(_)
+            | Request::UnsubscribePaneState(_)
+            | Request::PaneForegroundState(_)
             | Request::SdkWaitForOutput(_)
             | Request::SdkWaitForOutputRef(_)
             | Request::CancelSdkWait(_)
@@ -662,11 +694,14 @@ fn supported_capabilities() -> Vec<&'static str> {
 
 #[cfg(all(test, windows))]
 mod windows_deferred_wait_tests {
+    use rmux_core::PaneId;
     use rmux_proto::request::{
-        KillPaneRequest, NewWindowRequest, Request, RespawnPaneRequest, SplitWindowExtRequest,
-        SplitWindowTargetActionRequest,
+        KillPaneRequest, NewWindowRequest, PaneKillRequest, PaneRespawnRequest, Request,
+        RespawnPaneRequest, SplitWindowExtRequest, SplitWindowTargetActionRequest,
     };
-    use rmux_proto::{PaneTarget, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget};
+    use rmux_proto::{
+        PaneTarget, PaneTargetRef, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget,
+    };
 
     use super::request_waits_for_windows_deferred_panes;
 
@@ -742,6 +777,25 @@ mod windows_deferred_wait_tests {
         }))
     }
 
+    fn pane_kill_by_id() -> Request {
+        Request::PaneKill(PaneKillRequest {
+            target: PaneTargetRef::by_id(session_name("bench"), PaneId::new(7)),
+            kill_all_except: false,
+        })
+    }
+
+    fn pane_respawn_by_id() -> Request {
+        Request::PaneRespawn(Box::new(PaneRespawnRequest {
+            target: PaneTargetRef::by_id(session_name("bench"), PaneId::new(7)),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: Some(ProcessCommand::Shell("exit 0".to_owned())),
+            keep_alive_on_exit: None,
+        }))
+    }
+
     #[test]
     fn detached_new_window_does_not_wait_for_windows_deferred_panes() {
         assert!(!request_waits_for_windows_deferred_panes(&new_window(true)));
@@ -751,6 +805,10 @@ mod windows_deferred_wait_tests {
     fn final_pane_lifecycle_mutations_do_not_wait_for_deferred_initial_spawn() {
         assert!(!request_waits_for_windows_deferred_panes(&kill_pane()));
         assert!(!request_waits_for_windows_deferred_panes(&respawn_pane()));
+        assert!(!request_waits_for_windows_deferred_panes(&pane_kill_by_id()));
+        assert!(!request_waits_for_windows_deferred_panes(
+            &pane_respawn_by_id()
+        ));
     }
 
     #[test]

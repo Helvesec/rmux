@@ -96,6 +96,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -106,6 +107,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -134,6 +136,7 @@ impl RequestHandler {
         Ok(QueueCommandAction::Normal {
             output: None,
             error: None,
+            source_file_error: None,
             exit_status: None,
         })
     }
@@ -327,7 +330,7 @@ impl RequestHandler {
         Ok(())
     }
 
-    pub(super) async fn dismiss_mode_tree(
+    pub(in crate::handler) async fn dismiss_mode_tree(
         &self,
         attach_pid: u32,
     ) -> Result<Vec<SessionName>, RmuxError> {

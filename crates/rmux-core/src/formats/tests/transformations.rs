@@ -19,7 +19,11 @@ fn truncation_with_marker() {
 #[test]
 fn negative_modifier_bounds_do_not_overflow() {
     assert_eq!(signed_i32_abs_usize(i32::MIN), 2_147_483_648);
-    assert_eq!(bounded_format_padding_width(i32::MIN), FORMAT_PADDING_LIMIT);
+    assert_eq!(
+        bounded_format_padding_width(FORMAT_PADDING_LIMIT as i32),
+        Some(FORMAT_PADDING_LIMIT)
+    );
+    assert_eq!(bounded_format_padding_width(i32::MIN), None);
     assert_eq!(
         render_template("#{=-2147483648:session_name}", &StaticWindowValues),
         "alpha"
@@ -36,6 +40,9 @@ fn substitution_basic() {
         render_template("#{s/alpha/beta/:session_name}", &StaticWindowValues),
         "beta"
     );
+
+    let context = FormatContext::new().with_named_value("text", "foofoo");
+    assert_eq!(render_template("#{s/^foo/bar/:text}", &context), "barfoo");
 }
 
 #[test]
@@ -122,6 +129,11 @@ fn substitution_uses_regex_and_case_insensitive_flag() {
         render_template("#{s/AL.HA/beta/i:session_name}", &StaticWindowValues),
         "beta"
     );
+}
+
+#[test]
+fn trailing_bare_hash_is_literal_product_divergence() {
+    assert_eq!(render_template("prefix#", &StaticWindowValues), "prefix#");
 }
 
 // -----------------------------------------------------------------------
@@ -233,10 +245,10 @@ fn escaped_comma_inside_conditional_value() {
 
 #[test]
 fn escaped_comma_in_boolean_operand() {
-    // tmux 3.4 requires a real top-level comma for boolean operators.
+    // Escaped commas stay inside a single truthy operand.
     assert_eq!(
         render_template("#{||:hello#,world}", &StaticWindowValues),
-        ""
+        "1"
     );
 }
 
@@ -345,14 +357,14 @@ fn fnmatch_character_class() {
 
 #[test]
 fn multi_pair_conditional_with_nested_expansion() {
-    // tmux does not treat an expanded true condition in the false arm as a
-    // new chained condition; the remaining body is returned as the false arm.
+    // tmux 3.7 treats additional condition,value pairs in the false arm as
+    // chained else-if branches.
     assert_eq!(
         render_template(
             "#{?#{window_last_flag},first,#{window_active},#{window_name},default}",
             &StaticWindowValues
         ),
-        "1,logs,default"
+        "logs"
     );
 }
 

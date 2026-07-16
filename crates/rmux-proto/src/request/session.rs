@@ -243,6 +243,9 @@ pub struct KillSessionRequest {
     /// Whether the target session's window alert flags should be cleared instead of destroying it.
     #[serde(default)]
     pub clear_alerts: bool,
+    /// Whether every session in the target session's group should be destroyed.
+    #[serde(default)]
+    pub kill_group: bool,
 }
 
 /// Request payload for creating an app-owner lease for one session.

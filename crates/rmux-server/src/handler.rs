@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use rmux_core::events::{PaneSnapshotCoalescerRegistry, SubscriptionLimits};
 use rmux_ipc::PeerIdentity;
 use rmux_proto::{RmuxError, TerminalSize, WindowTarget};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 use crate::daemon::ShutdownHandle;
 #[path = "handler_alerts.rs"]
@@ -46,6 +46,8 @@ mod mode_tree_support;
 mod option_support;
 #[path = "handler_overlay.rs"]
 mod overlay_support;
+#[path = "handler_pane_state.rs"]
+mod pane_state_support;
 #[path = "handler_pane.rs"]
 mod pane_support;
 #[path = "handler_prompt.rs"]
@@ -63,10 +65,15 @@ mod shutdown_support;
 pub(crate) use shutdown_support::DetachedRequestGuard;
 #[path = "handler_subscriptions.rs"]
 mod subscription_support;
+#[path = "handler_switch_target.rs"]
+mod switch_target_support;
 #[path = "handler_target_actions.rs"]
 mod target_action_support;
 #[path = "handler_targets.rs"]
 mod target_support;
+#[cfg(test)]
+#[path = "handler_test_support.rs"]
+mod test_support;
 #[path = "handler_waits.rs"]
 mod wait_support;
 pub(crate) use wait_support::PreparedSdkWait;
@@ -87,6 +94,7 @@ pub(crate) use web_support::{
 };
 #[path = "handler_window.rs"]
 mod window_support;
+use crate::pane_state_journal::{PaneStateJournal, PANE_STATE_JOURNAL_CAPACITY};
 use crate::pane_terminals::HandlerState;
 use crate::server_access::{current_owner_uid, AccessMode, ServerAccessStore};
 use crate::wait_for::WaitForStore;
@@ -123,6 +131,7 @@ use option_support::option_value_u32;
 use pane_support::PaneSnapshotRevisionRegistry;
 use session_lease_support::SessionLeaseStore;
 use subscription_support::OutputSubscriptionState;
+pub(in crate::handler) use switch_target_support::switch_client_target_find_type;
 pub(in crate::handler) use target_support::{
     active_session_target, active_window_target, fallback_current_target,
     resolve_existing_session_target, resolve_session_lookup, target_for_request_response,
@@ -164,6 +173,7 @@ impl DetachedRequesterAccess {
 pub(crate) struct RequestHandler {
     state: Arc<Mutex<HandlerState>>,
     active_attach: Arc<Mutex<ActiveAttachState>>,
+    active_attach_epoch: Arc<AtomicU64>,
     active_control: Arc<Mutex<ActiveControlState>>,
     silence_timers: Arc<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Arc<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -189,6 +199,11 @@ pub(crate) struct RequestHandler {
     session_lease_janitor_started: Arc<AtomicBool>,
     pane_snapshot_coalescers: Arc<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Arc<StdMutex<PaneSnapshotRevisionRegistry>>,
+    pane_state_journal: Arc<StdMutex<PaneStateJournal>>,
+    pane_state_notify: Arc<Notify>,
+    foreground_watch_started: Arc<AtomicBool>,
+    foreground_state_cache:
+        Arc<StdMutex<HashMap<rmux_core::PaneId, (u64, rmux_proto::ForegroundStateDto)>>>,
     #[cfg(all(any(unix, windows), feature = "web"))]
     web_shares: Arc<WebShareRegistry>,
     #[cfg(all(any(unix, windows), feature = "web"))]
@@ -198,6 +213,14 @@ pub(crate) struct RequestHandler {
     cleanup_on_drop: bool,
     #[cfg(test)]
     paste_buffer_delete_pause: Arc<StdMutex<Option<Arc<PasteBufferDeletePause>>>>,
+    #[cfg(test)]
+    window_lifecycle_mutation_pause: Arc<StdMutex<Option<Arc<WindowLifecycleMutationPause>>>>,
+    #[cfg(test)]
+    pane_state_lag_rebase_pause: Arc<StdMutex<Option<Arc<PaneStateLagRebasePause>>>>,
+    #[cfg(test)]
+    pane_option_journal_pause: Arc<StdMutex<Option<Arc<PaneOptionJournalPause>>>>,
+    #[cfg(test)]
+    pane_exit_commit_pause: Arc<StdMutex<Option<Arc<PaneExitCommitPause>>>>,
 }
 
 pub(crate) struct ConfigLoadingGuard {
@@ -215,6 +238,7 @@ impl Clone for RequestHandler {
         Self {
             state: self.state.clone(),
             active_attach: self.active_attach.clone(),
+            active_attach_epoch: self.active_attach_epoch.clone(),
             active_control: self.active_control.clone(),
             silence_timers: self.silence_timers.clone(),
             pane_alert_coalescer: self.pane_alert_coalescer.clone(),
@@ -240,6 +264,10 @@ impl Clone for RequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.clone(),
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.clone(),
             pane_snapshot_revisions: self.pane_snapshot_revisions.clone(),
+            pane_state_journal: self.pane_state_journal.clone(),
+            pane_state_notify: self.pane_state_notify.clone(),
+            foreground_watch_started: self.foreground_watch_started.clone(),
+            foreground_state_cache: self.foreground_state_cache.clone(),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: self.web_shares.clone(),
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -249,6 +277,14 @@ impl Clone for RequestHandler {
             cleanup_on_drop: false,
             #[cfg(test)]
             paste_buffer_delete_pause: self.paste_buffer_delete_pause.clone(),
+            #[cfg(test)]
+            window_lifecycle_mutation_pause: self.window_lifecycle_mutation_pause.clone(),
+            #[cfg(test)]
+            pane_state_lag_rebase_pause: self.pane_state_lag_rebase_pause.clone(),
+            #[cfg(test)]
+            pane_option_journal_pause: self.pane_option_journal_pause.clone(),
+            #[cfg(test)]
+            pane_exit_commit_pause: self.pane_exit_commit_pause.clone(),
         }
     }
 }
@@ -257,6 +293,7 @@ impl Clone for RequestHandler {
 pub(crate) struct WeakRequestHandler {
     state: Weak<Mutex<HandlerState>>,
     active_attach: Weak<Mutex<ActiveAttachState>>,
+    active_attach_epoch: Weak<AtomicU64>,
     active_control: Weak<Mutex<ActiveControlState>>,
     silence_timers: Weak<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Weak<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -282,6 +319,11 @@ pub(crate) struct WeakRequestHandler {
     session_lease_janitor_started: Weak<AtomicBool>,
     pane_snapshot_coalescers: Weak<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Weak<StdMutex<PaneSnapshotRevisionRegistry>>,
+    pane_state_journal: Weak<StdMutex<PaneStateJournal>>,
+    pane_state_notify: Weak<Notify>,
+    foreground_watch_started: Weak<AtomicBool>,
+    foreground_state_cache:
+        Weak<StdMutex<HashMap<rmux_core::PaneId, (u64, rmux_proto::ForegroundStateDto)>>>,
     #[cfg(all(any(unix, windows), feature = "web"))]
     web_shares: Weak<WebShareRegistry>,
     #[cfg(all(any(unix, windows), feature = "web"))]
@@ -296,6 +338,7 @@ impl WeakRequestHandler {
         Some(RequestHandler {
             state: self.state.upgrade()?,
             active_attach: self.active_attach.upgrade()?,
+            active_attach_epoch: self.active_attach_epoch.upgrade()?,
             active_control: self.active_control.upgrade()?,
             silence_timers: self.silence_timers.upgrade()?,
             pane_alert_coalescer: self.pane_alert_coalescer.upgrade()?,
@@ -321,6 +364,10 @@ impl WeakRequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.upgrade()?,
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.upgrade()?,
             pane_snapshot_revisions: self.pane_snapshot_revisions.upgrade()?,
+            pane_state_journal: self.pane_state_journal.upgrade()?,
+            pane_state_notify: self.pane_state_notify.upgrade()?,
+            foreground_watch_started: self.foreground_watch_started.upgrade()?,
+            foreground_state_cache: self.foreground_state_cache.upgrade()?,
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: self.web_shares.upgrade()?,
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -330,6 +377,14 @@ impl WeakRequestHandler {
             cleanup_on_drop: false,
             #[cfg(test)]
             paste_buffer_delete_pause: self.paste_buffer_delete_pause.upgrade()?,
+            #[cfg(test)]
+            window_lifecycle_mutation_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_state_lag_rebase_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_option_journal_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_exit_commit_pause: Arc::new(StdMutex::new(None)),
         })
     }
 }
@@ -337,6 +392,34 @@ impl WeakRequestHandler {
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct PasteBufferDeletePause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WindowLifecycleMutationPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PaneStateLagRebasePause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PaneOptionJournalPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PaneExitCommitPause {
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -443,6 +526,7 @@ impl RequestHandler {
         Self {
             state: Arc::new(Mutex::new(state)),
             active_attach: Arc::new(Mutex::new(ActiveAttachState::default())),
+            active_attach_epoch: Arc::new(AtomicU64::new(0)),
             active_control: Arc::new(Mutex::new(ActiveControlState::default())),
             silence_timers: Arc::new(StdMutex::new(HashMap::new())),
             pane_alert_coalescer: Arc::new(StdMutex::new(
@@ -476,6 +560,13 @@ impl RequestHandler {
             pane_snapshot_revisions: Arc::new(StdMutex::new(
                 PaneSnapshotRevisionRegistry::default(),
             )),
+            pane_state_journal: Arc::new(StdMutex::new(PaneStateJournal::with_limits(
+                PANE_STATE_JOURNAL_CAPACITY,
+                subscription_limits,
+            ))),
+            pane_state_notify: Arc::new(Notify::new()),
+            foreground_watch_started: Arc::new(AtomicBool::new(false)),
+            foreground_state_cache: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: Arc::new(WebShareRegistry::default()),
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -485,6 +576,14 @@ impl RequestHandler {
             cleanup_on_drop: true,
             #[cfg(test)]
             paste_buffer_delete_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            window_lifecycle_mutation_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_state_lag_rebase_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_option_journal_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_exit_commit_pause: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -492,6 +591,7 @@ impl RequestHandler {
         WeakRequestHandler {
             state: Arc::downgrade(&self.state),
             active_attach: Arc::downgrade(&self.active_attach),
+            active_attach_epoch: Arc::downgrade(&self.active_attach_epoch),
             active_control: Arc::downgrade(&self.active_control),
             silence_timers: Arc::downgrade(&self.silence_timers),
             pane_alert_coalescer: Arc::downgrade(&self.pane_alert_coalescer),
@@ -519,6 +619,10 @@ impl RequestHandler {
             session_lease_janitor_started: Arc::downgrade(&self.session_lease_janitor_started),
             pane_snapshot_coalescers: Arc::downgrade(&self.pane_snapshot_coalescers),
             pane_snapshot_revisions: Arc::downgrade(&self.pane_snapshot_revisions),
+            pane_state_journal: Arc::downgrade(&self.pane_state_journal),
+            pane_state_notify: Arc::downgrade(&self.pane_state_notify),
+            foreground_watch_started: Arc::downgrade(&self.foreground_watch_started),
+            foreground_state_cache: Arc::downgrade(&self.foreground_state_cache),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: Arc::downgrade(&self.web_shares),
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -531,6 +635,10 @@ impl RequestHandler {
 
     pub(crate) fn allocate_connection_id(&self) -> u64 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(in crate::handler) fn bump_active_attach_epoch(&self) {
+        self.active_attach_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn server_task_runtime(&self) -> Option<tokio::runtime::Handle> {
@@ -629,6 +737,116 @@ impl RequestHandler {
 
     #[cfg(not(test))]
     async fn pause_before_paste_buffer_delete(&self) {}
+
+    #[cfg(test)]
+    fn install_window_lifecycle_mutation_pause(&self) -> Arc<WindowLifecycleMutationPause> {
+        let pause = Arc::new(WindowLifecycleMutationPause::default());
+        *self
+            .window_lifecycle_mutation_pause
+            .lock()
+            .expect("window lifecycle mutation pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_window_lifecycle_mutation(&self) {
+        let pause = self
+            .window_lifecycle_mutation_pause
+            .lock()
+            .expect("window lifecycle mutation pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_before_window_lifecycle_mutation(&self) {}
+
+    #[cfg(test)]
+    fn install_pane_state_lag_rebase_pause(&self) -> Arc<PaneStateLagRebasePause> {
+        let pause = Arc::new(PaneStateLagRebasePause::default());
+        *self
+            .pane_state_lag_rebase_pause
+            .lock()
+            .expect("pane state lag rebase pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_pane_state_lag_snapshot(&self) {
+        let pause = self
+            .pane_state_lag_rebase_pause
+            .lock()
+            .expect("pane state lag rebase pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_before_pane_state_lag_snapshot(&self) {}
+
+    #[cfg(test)]
+    fn install_pane_option_journal_pause(&self) -> Arc<PaneOptionJournalPause> {
+        let pause = Arc::new(PaneOptionJournalPause::default());
+        *self
+            .pane_option_journal_pause
+            .lock()
+            .expect("pane option journal pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_pane_option_journal(&self) {
+        let pause = self
+            .pane_option_journal_pause
+            .lock()
+            .expect("pane option journal pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_before_pane_option_journal(&self) {}
+
+    #[cfg(test)]
+    fn install_pane_exit_commit_pause(&self) -> Arc<PaneExitCommitPause> {
+        let pause = Arc::new(PaneExitCommitPause::default());
+        *self
+            .pane_exit_commit_pause
+            .lock()
+            .expect("pane exit commit pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_after_pane_exit_commit(&self) {
+        let pause = self
+            .pane_exit_commit_pause
+            .lock()
+            .expect("pane exit commit pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_after_pane_exit_commit(&self) {}
+
+    #[cfg(test)]
+    async fn wait_for_initial_panes_for_test(&self) {
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_panes_ready().await;
+    }
 }
 
 #[cfg(test)]
@@ -718,3 +936,19 @@ mod pane_pipe_tests;
 #[cfg(test)]
 #[path = "handler_pane_exit_format_tests.rs"]
 mod pane_exit_format_tests;
+
+#[cfg(test)]
+#[path = "handler_pane_state_tests.rs"]
+mod pane_state_tests;
+
+#[cfg(test)]
+#[path = "handler_pane_state_race_tests.rs"]
+mod pane_state_race_tests;
+
+#[cfg(test)]
+#[path = "handler_pane_alias_lifecycle_tests.rs"]
+mod pane_alias_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "handler_linked_pane_kill_tests.rs"]
+mod linked_pane_kill_tests;

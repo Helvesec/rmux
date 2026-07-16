@@ -14,8 +14,12 @@ use super::pane_io_encoding::{
 };
 #[cfg(windows)]
 use super::pane_windows_console_sequence::prepare_single_pane_windows_console_input_sequence;
-use super::{encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_target};
+use super::{
+    encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_target, PaneInputLiveness,
+};
 use crate::hook_runtime::PendingInlineHookFormat;
+use crate::pane_state_journal::PaneStateChange;
+use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_terminals::{session_not_found, HandlerState};
 
 impl RequestHandler {
@@ -67,7 +71,12 @@ impl RequestHandler {
                     windows_console_input_for_target_tokens(&state, &target, &request.keys, 1)
                 {
                     if tokens_route_windows_control_as_pty_bytes(&state, &target, &request.keys) {
-                        let write = match prepare_pane_input_write(&mut state, &target, &bytes) {
+                        let write = match prepare_pane_input_write(
+                            &mut state,
+                            &target,
+                            &bytes,
+                            PaneInputLiveness::TolerateDead,
+                        ) {
                             Ok(write) => write,
                             Err(error) => return Response::Error(ErrorResponse { error }),
                         };
@@ -112,7 +121,12 @@ impl RequestHandler {
                         .await;
                 }
             }
-            let write = match prepare_pane_input_write(&mut state, &target, &bytes) {
+            let write = match prepare_pane_input_write(
+                &mut state,
+                &target,
+                &bytes,
+                PaneInputLiveness::TolerateDead,
+            ) {
                 Ok(write) => write,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
@@ -200,8 +214,9 @@ impl RequestHandler {
             response,
             queued_pane_exited,
             queued_session_closed,
-            session_destroyed,
-            removed_session,
+            extra_session_closed,
+            affected_sessions,
+            destroyed_sessions,
             removed_subscription_keys,
             removed_pane_ids,
             layout_window,
@@ -219,6 +234,8 @@ impl RequestHandler {
                 .unwrap_or_default();
             match state.kill_pane_with_options(target.clone(), request.kill_all_except) {
                 Ok(result) => {
+                    let affected_sessions = result.affected_sessions.clone();
+                    let destroyed_sessions = result.destroyed_sessions.clone();
                     let queued_session = if result.session_destroyed {
                         let _ = state.hooks.remove_session(&session_name);
                         result.removed_session_id.map(|session_id| {
@@ -240,14 +257,27 @@ impl RequestHandler {
                         let _ = state.hooks.remove_pane(&target);
                         None
                     };
+                    let extra_session_closed = destroyed_sessions
+                        .iter()
+                        .filter(|(destroyed_session, _)| destroyed_session != &session_name)
+                        .map(|(destroyed_session, session_id)| {
+                            prepare_lifecycle_event(
+                                &mut state,
+                                &LifecycleEvent::SessionClosed {
+                                    session_name: destroyed_session.clone(),
+                                    session_id: Some(*session_id),
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    self.record_panes_closed_as_killed(&result.removed_pane_ids);
                     (
                         Response::KillPane(result.response),
                         None,
                         queued_session,
-                        result.session_destroyed,
-                        result
-                            .removed_session_id
-                            .map(|session_id| (session_name.clone(), SessionId::new(session_id))),
+                        extra_session_closed,
+                        affected_sessions,
+                        destroyed_sessions,
                         removed_subscription_keys,
                         result.removed_pane_ids,
                         layout_window,
@@ -257,8 +287,9 @@ impl RequestHandler {
                     Response::Error(ErrorResponse { error }),
                     None,
                     None,
-                    false,
-                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     layout_window,
@@ -266,7 +297,12 @@ impl RequestHandler {
             }
         };
 
-        self.prune_web_session(removed_session);
+        for (destroyed_session, session_id) in &destroyed_sessions {
+            self.prune_web_session(Some((
+                destroyed_session.clone(),
+                SessionId::new(*session_id),
+            )));
+        }
 
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
@@ -277,27 +313,38 @@ impl RequestHandler {
         if let Some(event) = queued_session_closed {
             self.emit_prepared(event);
         }
+        for event in extra_session_closed {
+            self.emit_prepared(event);
+        }
         if matches!(response, Response::KillPane(_)) {
             self.cleanup_pane_output_subscriptions(&removed_subscription_keys)
                 .await;
-            if session_destroyed {
-                self.remove_session_leases(std::slice::from_ref(&session_name));
-                self.exit_attached_session(&session_name).await;
-                self.cancel_session_silence_timers(&session_name).await;
-                self.refresh_control_session(&session_name).await;
-                let _ = self.queue_shutdown_if_server_empty().await;
-            } else {
-                self.sync_session_silence_timers(&session_name).await;
-                if let Response::KillPane(success) = &response {
-                    if !success.window_destroyed {
-                        self.emit(LifecycleEvent::WindowLayoutChanged {
-                            target: WindowTarget::with_window(session_name.clone(), layout_window),
-                        })
-                        .await;
-                    }
+            let destroyed_names = destroyed_sessions
+                .iter()
+                .map(|(destroyed_session, _)| destroyed_session.clone())
+                .collect::<Vec<_>>();
+            self.remove_session_leases(&destroyed_names);
+            for affected_session in affected_sessions {
+                if destroyed_names.contains(&affected_session) {
+                    self.exit_attached_session(&affected_session).await;
+                    self.cancel_session_silence_timers(&affected_session).await;
+                    self.refresh_control_session(&affected_session).await;
+                } else {
+                    self.sync_session_silence_timers(&affected_session).await;
+                    self.dismiss_mode_tree_for_session(&affected_session).await;
+                    self.refresh_attached_session(&affected_session).await;
                 }
-                self.dismiss_mode_tree_for_session(&session_name).await;
-                self.refresh_attached_session(&session_name).await;
+            }
+            if !destroyed_names.is_empty() {
+                let _ = self.queue_shutdown_if_server_empty().await;
+            }
+            if let Response::KillPane(success) = &response {
+                if !success.window_destroyed {
+                    self.emit(LifecycleEvent::WindowLayoutChanged {
+                        target: WindowTarget::with_window(session_name.clone(), layout_window),
+                    })
+                    .await;
+                }
             }
         }
 
@@ -310,19 +357,31 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let socket_path = self.socket_path();
-        let response = {
+        let (response, respawned_pane_id) = {
             let mut state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
                 Ok(target) => target,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            if let Some(keep_alive) = request.keep_alive_on_exit {
-                if let Err(error) = state.options.set(
+            let previous_options = request.keep_alive_on_exit.map(|_| state.options.clone());
+            let keep_alive_outcome = if let Some(keep_alive) = request.keep_alive_on_exit {
+                match state.options.set(
                     ScopeSelector::Pane(target.clone()),
                     OptionName::RemainOnExit,
                     if keep_alive { "on" } else { "off" }.to_owned(),
                     SetOptionMode::Replace,
                 ) {
+                    Ok(outcome) => Some(outcome),
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                }
+            } else {
+                None
+            };
+            if keep_alive_outcome.is_some() {
+                if let Err(error) = state.synchronize_pane_alias_options_from_target(&target) {
+                    if let Some(previous_options) = previous_options {
+                        state.options = previous_options;
+                    }
                     return Response::Error(ErrorResponse { error });
                 }
             }
@@ -334,6 +393,15 @@ impl RequestHandler {
                 command: request.command,
                 process_command: request.process_command,
             };
+            let pane_id = match pane_id_for_target(
+                &state.sessions,
+                request.target.session_name(),
+                request.target.window_index(),
+                request.target.pane_index(),
+            ) {
+                Ok(pane_id) => pane_id,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             match state.respawn_pane(
                 request,
                 &socket_path,
@@ -342,12 +410,24 @@ impl RequestHandler {
                 Some(self.pane_exit_callback()),
                 |_, _| {},
             ) {
-                Ok(response) => Response::RespawnPane(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(response) => {
+                    self.record_pane_respawn_boundary(pane_id);
+                    if let Some(outcome) = keep_alive_outcome.as_ref() {
+                        let generation = state.pane_output_generation(&session_name, pane_id);
+                        self.record_pane_option_mutation(pane_id, Some(generation), outcome);
+                    }
+                    (Response::RespawnPane(response), Some(pane_id))
+                }
+                Err(error) => {
+                    if let Some(previous_options) = previous_options {
+                        state.options = previous_options;
+                    }
+                    (Response::Error(ErrorResponse { error }), None)
+                }
             }
         };
 
-        if matches!(response, Response::RespawnPane(_)) {
+        if respawned_pane_id.is_some() {
             self.refresh_attached_session(&session_name).await;
         }
 
@@ -378,7 +458,7 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let title = request.title.clone();
-        let (response, pane_changed, window_index) = {
+        let (response, pane_changed, window_index, title_changed_target) = {
             let mut state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
                 Ok(target) => target,
@@ -392,9 +472,18 @@ impl RequestHandler {
                     .session(&session_name)
                     .and_then(|session| session.window_at(window_index))
                     .is_some_and(|window| window.active_pane_index() != pane_index);
+            let mut title_changed_target = None;
+            let mut title_state_event = None;
             match (|| -> Result<SelectPaneResponse, RmuxError> {
                 let response_target = if let Some(title) = title.as_deref() {
-                    state.set_pane_title(&target, title)?;
+                    if let Some((old, new)) = state.set_pane_title(&target, title)? {
+                        title_changed_target = Some(target.clone());
+                        if let Some(pane_id) = pane_id_for_select_target(&state, &target) {
+                            let generation =
+                                state.pane_output_generation(target.session_name(), pane_id);
+                            title_state_event = Some((pane_id, generation, old, new));
+                        }
+                    }
                     target.clone()
                 } else {
                     let session = state
@@ -412,11 +501,29 @@ impl RequestHandler {
                     target: response_target,
                 })
             })() {
-                Ok(response) => (Response::SelectPane(response), pane_changed, window_index),
+                Ok(response) => {
+                    if let Some((pane_id, generation, old, new)) = &title_state_event {
+                        self.record_pane_state_change(
+                            *pane_id,
+                            Some(*generation),
+                            PaneStateChange::TitleChanged {
+                                old: old.clone(),
+                                new: new.clone(),
+                            },
+                        );
+                    }
+                    (
+                        Response::SelectPane(response),
+                        pane_changed,
+                        window_index,
+                        title_changed_target,
+                    )
+                }
                 Err(error) => (
                     Response::Error(ErrorResponse { error }),
                     false,
                     window_index,
+                    None,
                 ),
             }
         };
@@ -427,6 +534,9 @@ impl RequestHandler {
                     target: WindowTarget::with_window(session_name.clone(), window_index),
                 })
                 .await;
+            }
+            if let Some(target) = title_changed_target {
+                self.emit(LifecycleEvent::PaneTitleChanged { target }).await;
             }
             if let Response::SelectPane(success) = &response {
                 self.queue_inline_hook(
@@ -441,6 +551,18 @@ impl RequestHandler {
 
         response
     }
+}
+
+fn pane_id_for_select_target(
+    state: &HandlerState,
+    target: &PaneTarget,
+) -> Option<rmux_core::PaneId> {
+    state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .and_then(|window| window.pane(target.pane_index()))
+        .map(|pane| pane.id())
 }
 
 pub(crate) fn resolve_pane_target_ref(

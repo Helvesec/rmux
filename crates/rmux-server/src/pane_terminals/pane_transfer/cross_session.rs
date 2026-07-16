@@ -17,6 +17,8 @@ impl HandlerState {
     ) -> Result<SwapPaneResponse, RmuxError> {
         let source_session_name = source.session_name().clone();
         let target_session_name = target.session_name().clone();
+        let mut source_before_options = self.pane_option_slots_for_session(&source_session_name)?;
+        let mut target_before_options = self.pane_option_slots_for_session(&target_session_name)?;
         let previous_source_session = self
             .sessions
             .session(&source_session_name)
@@ -32,23 +34,18 @@ impl HandlerState {
         self.ensure_panes_exist(&source_session_name, &[source_pane_id])?;
         self.ensure_panes_exist(&target_session_name, &[target_pane_id])?;
 
-        let mut source_session = self
-            .sessions
-            .remove_session(&source_session_name)
-            .map_err(|_| session_not_found(&source_session_name))?;
-        let mutation_result = {
-            let target_session = self
-                .sessions
-                .session_mut(&target_session_name)
-                .ok_or_else(|| session_not_found(&target_session_name))?;
-            source_session.swap_panes_with_session(
-                SessionPaneTarget::from(&source),
-                target_session,
-                SessionPaneTarget::from(&target),
-                PaneSwapOptions::new(detached, preserve_zoom),
-            )
-        };
-        self.sessions.insert_existing_session(source_session)?;
+        let mutation_result = self.sessions.with_extracted_session_pair(
+            &source_session_name,
+            &target_session_name,
+            |source_session, target_session| {
+                source_session.swap_panes_with_session(
+                    SessionPaneTarget::from(&source),
+                    target_session,
+                    SessionPaneTarget::from(&target),
+                    PaneSwapOptions::new(detached, preserve_zoom),
+                )
+            },
+        )?;
         if let Err(error) = mutation_result {
             self.restore_cross_session_snapshots(
                 &source_session_name,
@@ -127,6 +124,27 @@ impl HandlerState {
             self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
         }
 
+        source_before_options.remove(&source_pane_id);
+        target_before_options.remove(&target_pane_id);
+        self.rekey_pane_options_after_session_change(&source_before_options, &source_session_name)?;
+        self.rekey_pane_options_after_session_change(&target_before_options, &target_session_name)?;
+        let source_final_target = pane_target_for_id(
+            self,
+            &target_session_name,
+            target.window_index(),
+            source_pane_id,
+        )?;
+        let target_final_target = pane_target_for_id(
+            self,
+            &source_session_name,
+            source.window_index(),
+            target_pane_id,
+        )?;
+        self.options.rekey_pane_overrides(&[
+            (source.clone(), Some(source_final_target)),
+            (target.clone(), Some(target_final_target)),
+        ])?;
+
         Ok(SwapPaneResponse { source, target })
     }
 
@@ -136,6 +154,8 @@ impl HandlerState {
     ) -> Result<JoinPaneResponse, RmuxError> {
         let source_session_name = request.source.session_name().clone();
         let target_session_name = request.target.session_name().clone();
+        let mut source_before_options = self.pane_option_slots_for_session(&source_session_name)?;
+        let target_before_options = self.pane_option_slots_for_session(&target_session_name)?;
         let previous_source_session = self
             .sessions
             .session(&source_session_name)
@@ -154,37 +174,30 @@ impl HandlerState {
         let source_pane_id = pane_id_for_target(&previous_source_session, &request.source)?;
         self.ensure_panes_exist(&source_session_name, &[source_pane_id])?;
 
-        let mut source_session = self
-            .sessions
-            .remove_session(&source_session_name)
-            .map_err(|_| session_not_found(&source_session_name))?;
-        let mutation_result = {
-            let target_session = self
+        let direction = join_pane_internal_direction(request.direction);
+        let mutation_result = self.sessions.with_extracted_session_pair(
+            &source_session_name,
+            &target_session_name,
+            |source_session, target_session| {
+                target_session.join_pane_from_session(
+                    SessionPaneTarget::from(&request.target),
+                    source_session,
+                    SessionPaneTarget::from(&request.source),
+                    PaneJoinOptions::new(
+                        direction,
+                        request.detached,
+                        request.before,
+                        request.full_size,
+                        request.size,
+                    ),
+                )
+            },
+        )?;
+        let source_session_will_be_removed = mutation_result.is_ok()
+            && self
                 .sessions
-                .session_mut(&target_session_name)
-                .ok_or_else(|| session_not_found(&target_session_name))?;
-            let direction = join_pane_internal_direction(request.direction);
-            target_session.join_pane_from_session(
-                SessionPaneTarget::from(&request.target),
-                &mut source_session,
-                SessionPaneTarget::from(&request.source),
-                PaneJoinOptions::new(
-                    direction,
-                    request.detached,
-                    request.before,
-                    request.full_size,
-                    request.size,
-                ),
-            )
-        };
-        let source_session_will_be_removed =
-            mutation_result.is_ok() && source_session.windows().is_empty();
-        let empty_source_session = if source_session_will_be_removed {
-            Some(source_session)
-        } else {
-            self.sessions.insert_existing_session(source_session)?;
-            None
-        };
+                .session(&source_session_name)
+                .is_some_and(|session| session.windows().is_empty());
         if let Err(error) = mutation_result {
             self.restore_cross_session_snapshots(
                 &source_session_name,
@@ -244,8 +257,7 @@ impl HandlerState {
                 &[source_pane_id],
             )?;
             if source_session_will_be_removed {
-                self.sessions
-                    .insert_existing_session(previous_source_session)?;
+                self.replace_session(&source_session_name, previous_source_session)?;
                 self.replace_session(&target_session_name, previous_target_session)?;
                 resize_two_sessions(self, &source_session_name, &target_session_name).map_err(
                     |rollback_error| {
@@ -267,13 +279,31 @@ impl HandlerState {
             return Err(error);
         }
 
+        let moved_index = self
+            .sessions
+            .session(&target_session_name)
+            .and_then(|session| {
+                pane_index_for_id(session, request.target.window_index(), source_pane_id)
+            })
+            .ok_or_else(|| {
+                RmuxError::Server("moved pane disappeared after cross-session join-pane".to_owned())
+            })?;
+        let moved_target = PaneTarget::with_window(
+            target_session_name.clone(),
+            request.target.window_index(),
+            moved_index,
+        );
+        source_before_options.remove(&source_pane_id);
+        self.rekey_pane_options_after_session_change(&source_before_options, &source_session_name)?;
+        self.rekey_pane_options_after_session_change(&target_before_options, &target_session_name)?;
+        self.options
+            .transfer_pane_overrides(&request.source, &moved_target);
+
         if source_session_will_be_removed {
             if source_group_members_before.len() > 1 {
-                if let Some(source_session) = empty_source_session {
-                    self.sessions.insert_existing_session(source_session)?;
-                }
                 self.remove_empty_source_session_group(source_group_members_before)?;
             } else {
+                let _ = self.sessions.remove_session(&source_session_name)?;
                 let _ = self.options.remove_session(&source_session_name);
                 let _ = self.environment.remove_session(&source_session_name);
                 let _ = self.hooks.remove_session(&source_session_name);
@@ -294,16 +324,6 @@ impl HandlerState {
             self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
         }
 
-        let moved_index = self
-            .sessions
-            .session(&target_session_name)
-            .and_then(|session| {
-                pane_index_for_id(session, request.target.window_index(), source_pane_id)
-            })
-            .ok_or_else(|| {
-                RmuxError::Server("moved pane disappeared after cross-session join-pane".to_owned())
-            })?;
-
         self.clear_marked_pane_if_id(source_pane_id);
         Ok(JoinPaneResponse {
             target: PaneTarget::with_window(
@@ -320,6 +340,9 @@ impl HandlerState {
         destination_session_name: SessionName,
     ) -> Result<BreakPaneResponse, RmuxError> {
         let source_session_name = request.source.session_name().clone();
+        let mut source_before_options = self.pane_option_slots_for_session(&source_session_name)?;
+        let destination_before_options =
+            self.pane_option_slots_for_session(&destination_session_name)?;
         let previous_source_session = self
             .sessions
             .session(&source_session_name)
@@ -338,35 +361,28 @@ impl HandlerState {
         let source_pane_id = pane_id_for_target(&previous_source_session, &request.source)?;
         self.ensure_panes_exist(&source_session_name, &[source_pane_id])?;
 
-        let mut source_session = self
-            .sessions
-            .remove_session(&source_session_name)
-            .map_err(|_| session_not_found(&source_session_name))?;
-        let destination_index = {
-            let destination_session = self
+        let destination_index = self.sessions.with_extracted_session_pair(
+            &source_session_name,
+            &destination_session_name,
+            |source_session, destination_session| {
+                source_session.break_pane_to_session(
+                    SessionPaneTarget::from(&request.source),
+                    destination_session,
+                    BreakPaneOptions::new(
+                        request.target.as_ref().map(WindowTarget::window_index),
+                        request.name.clone(),
+                        request.detached,
+                        request.after,
+                        request.before,
+                    ),
+                )
+            },
+        )?;
+        let source_session_will_be_removed = destination_index.is_ok()
+            && self
                 .sessions
-                .session_mut(&destination_session_name)
-                .ok_or_else(|| session_not_found(&destination_session_name))?;
-            source_session.break_pane_to_session(
-                SessionPaneTarget::from(&request.source),
-                destination_session,
-                BreakPaneOptions::new(
-                    request.target.as_ref().map(WindowTarget::window_index),
-                    request.name.clone(),
-                    request.detached,
-                    request.after,
-                    request.before,
-                ),
-            )
-        };
-        let source_session_will_be_removed =
-            destination_index.is_ok() && source_session.windows().is_empty();
-        let empty_source_session = if source_session_will_be_removed {
-            Some(source_session)
-        } else {
-            self.sessions.insert_existing_session(source_session)?;
-            None
-        };
+                .session(&source_session_name)
+                .is_some_and(|session| session.windows().is_empty());
         let destination_index = match destination_index {
             Ok(destination_index) => destination_index,
             Err(error) => {
@@ -429,8 +445,7 @@ impl HandlerState {
                 &[source_pane_id],
             )?;
             if source_session_will_be_removed {
-                self.sessions
-                    .insert_existing_session(previous_source_session)?;
+                self.replace_session(&source_session_name, previous_source_session)?;
                 self.replace_session(&destination_session_name, previous_destination_session)?;
                 resize_two_sessions(self, &source_session_name, &destination_session_name)
                     .map_err(|rollback_error| {
@@ -451,13 +466,22 @@ impl HandlerState {
             return Err(error);
         }
 
+        let moved_target =
+            PaneTarget::with_window(destination_session_name.clone(), destination_index, 0);
+        source_before_options.remove(&source_pane_id);
+        self.rekey_pane_options_after_session_change(&source_before_options, &source_session_name)?;
+        self.rekey_pane_options_after_session_change(
+            &destination_before_options,
+            &destination_session_name,
+        )?;
+        self.options
+            .transfer_pane_overrides(&request.source, &moved_target);
+
         if source_session_will_be_removed {
             if source_group_members_before.len() > 1 {
-                if let Some(source_session) = empty_source_session {
-                    self.sessions.insert_existing_session(source_session)?;
-                }
                 self.remove_empty_source_session_group(source_group_members_before)?;
             } else {
+                let _ = self.sessions.remove_session(&source_session_name)?;
                 let _ = self.options.remove_session(&source_session_name);
                 let _ = self.environment.remove_session(&source_session_name);
                 let _ = self.hooks.remove_session(&source_session_name);
@@ -507,6 +531,29 @@ impl HandlerState {
             self.sessions.insert_existing_session(previous_session)
         }
     }
+}
+
+fn pane_target_for_id(
+    state: &HandlerState,
+    session_name: &SessionName,
+    window_index: u32,
+    pane_id: rmux_core::PaneId,
+) -> Result<PaneTarget, RmuxError> {
+    let session = state
+        .sessions
+        .session(session_name)
+        .ok_or_else(|| session_not_found(session_name))?;
+    let pane_index = pane_index_for_id(session, window_index, pane_id).ok_or_else(|| {
+        RmuxError::Server(format!(
+            "pane {} disappeared from {session_name}:{window_index} after cross-session move",
+            pane_id.as_u32()
+        ))
+    })?;
+    Ok(PaneTarget::with_window(
+        session_name.clone(),
+        window_index,
+        pane_index,
+    ))
 }
 
 fn resize_two_sessions(

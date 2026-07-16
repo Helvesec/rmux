@@ -566,6 +566,45 @@ async fn kill_server_does_not_wait_for_retained_exited_pane_output() {
         .expect("shutdown receiver should complete cleanly");
 }
 
+#[tokio::test]
+async fn kill_server_does_not_wait_for_an_active_output_subscription() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+    let connection_id = 60;
+    let pane = PaneOutputSubscriptionKey::new(
+        SessionName::new("active").expect("valid session name"),
+        PaneId::new(45),
+    );
+    let sender = pane_output_channel_with_limits(8, 1024);
+    let receiver = sender.subscribe();
+    {
+        let mut subscriptions = handler
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned");
+        let subscription_id = subscriptions
+            .registry
+            .subscribe(connection_id, pane, Instant::now())
+            .expect("subscription is within limits")
+            .id();
+        subscriptions.receivers.insert(subscription_id, receiver);
+    }
+
+    let Response::KillServer(_) = handler.handle_kill_server().await else {
+        panic!("kill-server should acknowledge shutdown");
+    };
+    assert!(
+        handler.request_shutdown_if_pending(),
+        "explicit kill-server must bypass active SDK subscriptions"
+    );
+    tokio::time::timeout(Duration::from_millis(50), &mut shutdown_rx)
+        .await
+        .expect("shutdown should be requested immediately")
+        .expect("shutdown receiver should complete cleanly");
+    drop(sender);
+}
+
 async fn assert_retained_output_by_id(
     handler: &RequestHandler,
     connection_id: u64,

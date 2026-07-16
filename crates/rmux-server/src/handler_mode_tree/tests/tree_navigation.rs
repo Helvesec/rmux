@@ -204,7 +204,10 @@ fn parse_choose_tree_zw_preserves_trailing_direct_command_arguments_from_argv() 
         .expect("recognized");
     assert_eq!(mode.tree_depth, TreeDepth::Window);
     assert!(mode.zoom);
-    assert_eq!(mode.template.as_deref(), Some("set-buffer -b chosen %%"));
+    assert_eq!(
+        mode.template.as_deref(),
+        Some("set-buffer -b chosen \"%%\"")
+    );
 }
 
 #[test]

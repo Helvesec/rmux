@@ -64,6 +64,10 @@ enum ControlCmd {
         payload: Vec<u8>,
         done: oneshot::Sender<io::Result<()>>,
     },
+    Ping {
+        payload: Vec<u8>,
+        done: oneshot::Sender<io::Result<()>>,
+    },
 }
 
 struct KeyframeCmd {
@@ -210,6 +214,14 @@ impl WebSocketOutbound {
 
     pub(crate) async fn write_pong(&self, payload: &[u8]) -> io::Result<()> {
         self.enqueue_control(|done| ControlCmd::Pong {
+            payload: payload.to_vec(),
+            done,
+        })
+        .await
+    }
+
+    pub(crate) async fn write_ping(&self, payload: &[u8]) -> io::Result<()> {
+        self.enqueue_control(|done| ControlCmd::Ping {
             payload: payload.to_vec(),
             done,
         })
@@ -442,6 +454,17 @@ async fn handle_control_cmd(
                 return false;
             }
         }
+        ControlCmd::Ping { payload, done } => {
+            let _span = crate::perf_instrument::span("web_writer")
+                .with_str("frame", "ping")
+                .with_usize("bytes", payload.len());
+            let result = write_with_timeout(writer.write_ping(&payload)).await;
+            let failed = log_writer_failure("ping", &result);
+            let _ = done.send(result);
+            if failed {
+                return false;
+            }
+        }
     }
     true
 }
@@ -584,5 +607,22 @@ mod tests {
         assert!(control_rx.try_recv().is_err());
         let latest = outbound.latest_keyframe.lock().expect("keyframe lock");
         assert!(latest.is_none());
+    }
+
+    #[tokio::test]
+    async fn write_ping_enqueues_control_ping_with_payload() {
+        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
+        let writer = tokio::spawn(async move { outbound.write_ping(b"rmux").await });
+
+        let command = control_rx.recv().await.expect("control command");
+        match command {
+            ControlCmd::Ping { payload, done } => {
+                assert_eq!(payload, b"rmux");
+                done.send(Ok(())).expect("complete ping write");
+            }
+            _ => panic!("expected ping command"),
+        }
+
+        writer.await.expect("ping task should not panic").unwrap();
     }
 }

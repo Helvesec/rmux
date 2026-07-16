@@ -156,6 +156,18 @@ impl RequestHandler {
         command_name: &str,
         next_session_name: Option<rmux_proto::SessionName>,
     ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+        let is_switch = matches!(command, AttachControl::Switch(_));
+        let switch_changes_session = if is_switch {
+            self.attach_switch_changes_session(attach_pid, next_session_name.as_ref(), command_name)
+                .await?
+        } else {
+            false
+        };
+        let mode_tree_refresh_sessions = if switch_changes_session {
+            self.dismiss_mode_tree(attach_pid).await?
+        } else {
+            Vec::new()
+        };
         let clear_prompt = matches!(
             command,
             AttachControl::Switch(_)
@@ -169,9 +181,14 @@ impl RequestHandler {
             return Err(attached_client_required(command_name));
         };
         let previous_session_name = active.session_name.clone();
+        let mut overlay_to_terminate = None;
 
-        if matches!(command, AttachControl::Switch(_)) {
-            active.render_generation = active.render_generation.saturating_add(1);
+        if is_switch
+            && next_session_name
+                .as_ref()
+                .is_some_and(|session_name| session_name != &active.session_name)
+        {
+            overlay_to_terminate = reset_interactive_attach_state_for_session_switch(active);
         }
         let closing_control = matches!(
             command,
@@ -195,7 +212,8 @@ impl RequestHandler {
             if !active.render_refresh_pending {
                 active.render_refresh_pending = true;
                 if active.control_tx.send(AttachControl::Refresh).is_err() {
-                    active_attach.by_pid.remove(&attach_pid);
+                    active_attach.remove_attached_client(attach_pid);
+                    self.bump_active_attach_epoch();
                     return Err(attached_client_required(command_name));
                 }
             }
@@ -203,7 +221,14 @@ impl RequestHandler {
             if clear_prompt {
                 self.clear_prompt_for_attach(attach_pid).await;
             }
+            for session_name in mode_tree_refresh_sessions {
+                self.refresh_attached_session(&session_name).await;
+            }
+            terminate_overlay_job(overlay_to_terminate);
             return Ok(previous_session_name);
+        }
+        if is_switch {
+            active.render_generation = active.render_generation.saturating_add(1);
         }
         let tracked_control = matches!(command, AttachControl::Switch(_) | AttachControl::Refresh);
         if tracked_control
@@ -211,7 +236,8 @@ impl RequestHandler {
         {
             let _ = active.control_tx.send(AttachControl::Detach);
             active.closing.store(true, Ordering::SeqCst);
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return Err(rmux_proto::RmuxError::Server(
                 "attached client is not draining updates".to_owned(),
             ));
@@ -227,7 +253,8 @@ impl RequestHandler {
                     |value| value.checked_sub(1),
                 );
             }
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return Err(attached_client_required(command_name));
         }
         if closing_control {
@@ -244,8 +271,29 @@ impl RequestHandler {
         if clear_prompt {
             self.clear_prompt_for_attach(attach_pid).await;
         }
+        for session_name in mode_tree_refresh_sessions {
+            self.refresh_attached_session(&session_name).await;
+        }
+        terminate_overlay_job(overlay_to_terminate);
 
         Ok(previous_session_name)
+    }
+
+    async fn attach_switch_changes_session(
+        &self,
+        attach_pid: u32,
+        next_session_name: Option<&rmux_proto::SessionName>,
+        command_name: &str,
+    ) -> Result<bool, rmux_proto::RmuxError> {
+        let Some(next_session_name) = next_session_name else {
+            return Ok(false);
+        };
+        let active_attach = self.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .ok_or_else(|| attached_client_required(command_name))?;
+        Ok(next_session_name != &active.session_name)
     }
 
     pub(super) async fn exit_attached_session(&self, session_name: &rmux_proto::SessionName) {
@@ -277,7 +325,9 @@ impl RequestHandler {
             active.closing.store(true, Ordering::SeqCst);
             false
         });
+        active_attach.forget_session_windows(session_name);
         drop(active_attach);
+        self.bump_active_attach_epoch();
         for overlay in overlay_jobs {
             terminate_overlay_job(overlay);
         }
@@ -294,8 +344,9 @@ impl RequestHandler {
         let session_name = session_name.clone();
         let mut active_attach = self.active_attach.lock().await;
         let mut delivered = false;
+        let mut removed_pids = Vec::new();
 
-        active_attach.by_pid.retain(|_, active| {
+        active_attach.by_pid.retain(|pid, active| {
             if active.session_name != session_name || active.suspended {
                 return true;
             }
@@ -312,6 +363,7 @@ impl RequestHandler {
                 )))
                 .is_err()
             {
+                removed_pids.push(*pid);
                 return false;
             }
 
@@ -333,6 +385,14 @@ impl RequestHandler {
             delivered = true;
             true
         });
+        let removed_any = !removed_pids.is_empty();
+        for pid in removed_pids {
+            active_attach.forget_attached_client_windows(pid);
+        }
+        if removed_any {
+            drop(active_attach);
+            self.bump_active_attach_epoch();
+        }
 
         delivered
     }
@@ -366,7 +426,8 @@ impl RequestHandler {
             )))
             .is_err()
         {
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return false;
         }
 
@@ -384,6 +445,23 @@ impl RequestHandler {
         });
         true
     }
+}
+
+fn reset_interactive_attach_state_for_session_switch(
+    active: &mut ActiveAttach,
+) -> Option<super::overlay_support::ClientOverlayState> {
+    active.prompt = None;
+    active.display_panes = None;
+    active.display_panes_state_id = active.display_panes_state_id.saturating_add(1);
+    active.mode_tree = None;
+    active.mode_tree_frame = None;
+    active.mode_tree_state_id = active.mode_tree_state_id.saturating_add(1);
+    active
+        .persistent_overlay_epoch
+        .store(active.mode_tree_state_id, Ordering::SeqCst);
+    active.overlay_generation = active.overlay_generation.saturating_add(1);
+    active.overlay_state_id = active.overlay_state_id.saturating_add(1);
+    active.overlay.take()
 }
 
 fn terminate_overlay_job(overlay: Option<super::overlay_support::ClientOverlayState>) {
@@ -530,12 +608,15 @@ fn attach_target_for_session_with_prompt(
         Some(session_name),
         options.terminal_context.clone(),
     );
-    let pane_output = state.pane_output_for_target(
+    let pane_output_sender = state.pane_output_for_target(
         session_name,
         session.active_window_index(),
         session.active_pane_index(),
     )?;
-    let (pane_output_start_sequence, ()) = pane_output.capture_with_next_sequence(|| ());
+    // Reserve the live receiver at the same sequence boundary used by the
+    // render target. Output emitted before the transport upgrade is then
+    // replayable without retaining live-only passthroughs for detached panes.
+    let (pane_output_start_sequence, pane_output) = pane_output_sender.subscribe_live_from_now();
     let active_pane = session.window().active_pane().cloned();
     let pane_state = session
         .active_pane_id()
@@ -786,14 +867,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use rmux_core::{command_parser::CommandParser, OptionStore, PaneGeometry};
     use rmux_os::identity::UserIdentity;
-    use rmux_proto::{SessionName, TerminalSize};
+    use rmux_proto::{NewSessionRequest, PaneTarget, Request, Response, SessionName, TerminalSize};
     use tokio::sync::mpsc;
 
-    use super::{AttachRegistration, RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT};
+    use super::{
+        reset_interactive_attach_state_for_session_switch, ActiveAttach, AttachRegistration,
+        RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
+    };
     use crate::client_flags::ClientFlags;
-    use crate::outer_terminal::OuterTerminalContext;
-    use crate::pane_io::AttachControl;
+    use crate::handler::scripting_support::QueueExecutionContext;
+    use crate::mouse::ClientMouseState;
+    use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
+    use crate::pane_io::{pane_output_channel, AttachControl, AttachTarget};
     use crate::server_access::current_owner_uid;
 
     #[tokio::test]
@@ -835,5 +922,236 @@ mod tests {
             ATTACH_CONTROL_BACKLOG_LIMIT
         );
         assert!(!handler.active_attach.lock().await.by_pid.contains_key(&77));
+    }
+
+    #[tokio::test]
+    async fn render_stream_refresh_substitution_does_not_advance_render_generation() {
+        let handler = RequestHandler::new();
+        let session_name = SessionName::new("alpha").expect("valid session name");
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let control_backlog = Arc::new(AtomicUsize::new(0));
+        let uid = current_owner_uid();
+
+        handler
+            .register_attach_with_access(
+                77,
+                session_name.clone(),
+                AttachRegistration {
+                    control_tx,
+                    control_backlog: control_backlog.clone(),
+                    closing: Arc::new(AtomicBool::new(false)),
+                    persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
+                    terminal_context: OuterTerminalContext::default(),
+                    flags: ClientFlags::default(),
+                    render_stream: true,
+                    uid,
+                    user: UserIdentity::Uid(uid),
+                    can_write: true,
+                    client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+                },
+            )
+            .await;
+
+        let pane_output = pane_output_channel();
+        let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
+        let target = AttachTarget {
+            session_name: session_name.clone(),
+            input_target: PaneTarget::new(session_name.clone(), 0),
+            pane_master: None,
+            pane_output,
+            pane_output_start_sequence,
+            render_frame: b"BASE".to_vec(),
+            outer_terminal: OuterTerminal::resolve(
+                &OptionStore::default(),
+                OuterTerminalContext::default(),
+            ),
+            cursor_style: 0,
+            active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+            raw_passthrough: false,
+            kitty_graphics_passthrough: false,
+            sixel_passthrough: false,
+            persistent_overlay_state_id: None,
+            live_pane: None,
+        };
+
+        handler
+            .send_attach_control(
+                77,
+                AttachControl::switch(target),
+                "switch-client",
+                Some(session_name.clone()),
+            )
+            .await
+            .expect("render-stream refresh substitution should be accepted");
+
+        assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Refresh)));
+        assert_eq!(control_backlog.load(Ordering::Acquire), 0);
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach.by_pid.get(&77).expect("attach is active");
+        assert_eq!(
+            active.render_generation, 0,
+            "server generation must only count Switch controls actually sent to the client"
+        );
+        assert!(active.render_refresh_pending);
+    }
+
+    #[tokio::test]
+    async fn session_switch_dismisses_mode_tree_pane_mode() {
+        let handler = RequestHandler::new();
+        let alpha = SessionName::new("alpha").expect("valid session name");
+        let beta = SessionName::new("beta").expect("valid session name");
+        for session_name in [&alpha, &beta] {
+            assert!(matches!(
+                handler
+                    .handle(Request::NewSession(NewSessionRequest {
+                        session_name: session_name.clone(),
+                        detached: true,
+                        size: Some(TerminalSize { cols: 80, rows: 24 }),
+                        environment: None,
+                    }))
+                    .await,
+                Response::NewSession(_)
+            ));
+        }
+
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        handler.register_attach(77, alpha.clone(), control_tx).await;
+
+        let parsed = CommandParser::new()
+            .parse_arguments(["choose-tree"])
+            .expect("choose-tree parses");
+        let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+            .expect("mode tree parse succeeds")
+            .expect("choose-tree is a mode tree command");
+        handler
+            .execute_queued_mode_tree(77, command, &QueueExecutionContext::without_caller_cwd())
+            .await
+            .expect("mode tree opens");
+
+        let alpha_pane_id = {
+            let state = handler.state.lock().await;
+            let session = state.sessions.session(&alpha).expect("alpha exists");
+            let pane = session
+                .window_at(0)
+                .expect("alpha window exists")
+                .pane(0)
+                .expect("alpha pane exists");
+            assert_eq!(state.pane_mode_name(&alpha, pane.id()), Some("tree-mode"));
+            pane.id()
+        };
+
+        let pane_output = pane_output_channel();
+        let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
+        let target = AttachTarget {
+            session_name: beta.clone(),
+            input_target: PaneTarget::new(beta.clone(), 0),
+            pane_master: None,
+            pane_output,
+            pane_output_start_sequence,
+            render_frame: b"BETA".to_vec(),
+            outer_terminal: OuterTerminal::resolve(
+                &OptionStore::default(),
+                OuterTerminalContext::default(),
+            ),
+            cursor_style: 0,
+            active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+            raw_passthrough: false,
+            kitty_graphics_passthrough: false,
+            sixel_passthrough: false,
+            persistent_overlay_state_id: None,
+            live_pane: None,
+        };
+
+        handler
+            .send_attach_control(
+                77,
+                AttachControl::switch(target),
+                "switch-client",
+                Some(beta),
+            )
+            .await
+            .expect("session switch succeeds");
+
+        {
+            let state = handler.state.lock().await;
+            assert!(
+                !state.pane_in_mode(&alpha, alpha_pane_id),
+                "switching away from a mode-tree session must clear the host pane mode"
+            );
+            assert_eq!(state.pane_mode_name(&alpha, alpha_pane_id), None);
+        }
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&77)
+            .expect("attach remains active");
+        assert_eq!(active.session_name.as_str(), "beta");
+        assert!(active.mode_tree.is_none());
+        assert!(active.mode_tree_frame.is_none());
+    }
+
+    #[test]
+    fn session_switch_resets_stale_interactive_overlay_state() {
+        let session_name = SessionName::new("alpha").expect("valid session name");
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let persistent_overlay_epoch = Arc::new(AtomicU64::new(7));
+        let uid = current_owner_uid();
+        let mut active = ActiveAttach {
+            id: 1,
+            session_name,
+            last_session: None,
+            flags: ClientFlags::default(),
+            pan_window: Some(2),
+            pan_ox: 3,
+            pan_oy: 4,
+            control_tx,
+            control_backlog: Arc::new(AtomicUsize::new(0)),
+            render_stream: true,
+            render_refresh_pending: false,
+            uid,
+            user: UserIdentity::Uid(uid),
+            can_write: true,
+            suspended: false,
+            closing: Arc::new(AtomicBool::new(false)),
+            terminal_context: OuterTerminalContext::default(),
+            client_size: TerminalSize { cols: 80, rows: 24 },
+            client_pixels: None,
+            size_sequence: 0,
+            persistent_overlay_epoch: persistent_overlay_epoch.clone(),
+            render_generation: 5,
+            overlay_generation: 11,
+            overlay_state_id: 13,
+            display_panes_state_id: 17,
+            key_table_name: None,
+            key_table_set_at: None,
+            repeat_deadline: None,
+            repeat_active: false,
+            last_key: None,
+            mouse: ClientMouseState {
+                slider_mpos: -1,
+                ..ClientMouseState::default()
+            },
+            prompt: None,
+            mode_tree_state_id: 7,
+            mode_tree: None,
+            mode_tree_frame: Some(b"stale-tree-frame".to_vec()),
+            overlay: None,
+            display_panes: None,
+        };
+
+        let overlay = reset_interactive_attach_state_for_session_switch(&mut active);
+
+        assert!(overlay.is_none());
+        assert!(active.prompt.is_none());
+        assert!(active.mode_tree.is_none());
+        assert!(active.mode_tree_frame.is_none());
+        assert!(active.overlay.is_none());
+        assert!(active.display_panes.is_none());
+        assert_eq!(active.mode_tree_state_id, 8);
+        assert_eq!(persistent_overlay_epoch.load(Ordering::SeqCst), 8);
+        assert_eq!(active.overlay_generation, 12);
+        assert_eq!(active.overlay_state_id, 14);
+        assert_eq!(active.display_panes_state_id, 18);
+        assert_eq!(active.render_generation, 5);
     }
 }

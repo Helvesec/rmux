@@ -126,7 +126,14 @@ pub(super) fn run_list_panes(args: ListPanesArgs, socket_path: &Path) -> Result<
     let mut json_stdout = Vec::new();
     for (session_name, target_window_index) in pane_targets {
         let response = connection
-            .list_panes_in_window(session_name.clone(), target_window_index, format.clone())
+            .list_panes_in_window_with_options(
+                session_name.clone(),
+                target_window_index,
+                format.clone(),
+                args.filter.clone(),
+                args.sort_order.clone(),
+                args.reversed,
+            )
             .map_err(ExitFailure::from_client)?;
         let output = expect_command_output(&response, "list-panes")?;
         if json {
@@ -202,23 +209,7 @@ fn resolve_list_panes_target(
         return Ok((session_name, Some(window_index)));
     };
 
-    match target.exact() {
-        Some(rmux_proto::Target::Window(window_target)) => {
-            return Ok((
-                window_target.session_name().clone(),
-                Some(window_target.window_index()),
-            ));
-        }
-        Some(rmux_proto::Target::Pane(pane_target)) => {
-            return Ok((
-                pane_target.session_name().clone(),
-                Some(pane_target.window_index()),
-            ));
-        }
-        _ => {}
-    }
-
-    match resolve_target_spec(connection, &target, ResolveTargetType::Window, false, false)? {
+    match resolve_target_spec(connection, &target, ResolveTargetType::Pane, false, false)? {
         rmux_proto::Target::Window(window_target) => Ok((
             window_target.session_name().clone(),
             Some(window_target.window_index()),

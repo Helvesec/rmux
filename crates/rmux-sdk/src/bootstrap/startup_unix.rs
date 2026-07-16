@@ -403,24 +403,13 @@ fn prepare_parent_for_filesystem_socket(
     socket_path: &Path,
     owner_uid: u32,
 ) -> Result<filesystem::PreparedSocketParent, StartupError> {
-    let parent = socket_path
-        .parent()
-        .ok_or_else(|| StartupError::InvalidPath {
-            reason: "socket path has no parent directory".to_owned(),
-            path: socket_path.to_path_buf(),
-        })?;
-    if parent.as_os_str().is_empty() {
-        return Err(StartupError::InvalidPath {
-            reason: "socket path has an empty parent directory".to_owned(),
-            path: socket_path.to_path_buf(),
-        });
-    }
     if socket_path.file_name().is_none() {
         return Err(StartupError::InvalidPath {
             reason: "socket path has no file name component".to_owned(),
             path: socket_path.to_path_buf(),
         });
     }
+    let parent = socket_parent_or_current(socket_path)?;
 
     prepare_socket_parent(socket_path, parent, owner_uid)
 }
@@ -432,7 +421,14 @@ fn can_probe_existing_socket_before_startup_validation(socket_path: &Path) -> bo
     let Some(parent) = socket_path.parent() else {
         return false;
     };
-    !parent.as_os_str().is_empty() && socket_path.file_name().is_some()
+    (parent.as_os_str().is_empty() || parent.exists()) && socket_path.file_name().is_some()
+}
+
+fn socket_parent_or_current(socket_path: &Path) -> Result<&Path, StartupError> {
+    rmux_os::path::parent_or_current(socket_path).ok_or_else(|| StartupError::InvalidPath {
+        reason: "socket path has no parent directory".to_owned(),
+        path: socket_path.to_path_buf(),
+    })
 }
 
 async fn try_connect_validated(

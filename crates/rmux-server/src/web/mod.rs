@@ -18,7 +18,9 @@ pub(crate) use record::{
     WebSessionTarget, WebShareAccess, WebShareConnectionCounts, WebShareRevokeReason,
     WebShareTarget,
 };
-pub(crate) use registry::{ExpiredWebShare, ResolvedCreateWebShareRequest, WebShareRegistry};
+pub(crate) use registry::{
+    ExpiredWebShare, ResolvedCreateWebShareRequest, WebShareExpiryPoll, WebShareRegistry,
+};
 pub(crate) use secrets::SecretHash as SecretHashForCrypto;
 pub(crate) use server::spawn;
 pub(crate) use settings::WebShareSettings;

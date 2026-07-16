@@ -13,7 +13,7 @@ use super::super::{
 };
 use super::pane_io_encoding::{
     encode_key_for_target, encode_mouse_for_target, prepare_attached_pane_input_writes,
-    write_bytes_to_target_io, PaneInputWrite,
+    write_attached_bytes_to_target_io, PaneInputWrite,
 };
 #[cfg(windows)]
 use super::pane_io_encoding::{
@@ -227,7 +227,7 @@ impl RequestHandler {
         match prepared {
             PreparedAttachedPaneForward::EncodedKey { writes, bytes } => {
                 for write in writes {
-                    write_bytes_to_target_io(write, bytes.clone())
+                    write_attached_bytes_to_target_io(write, bytes.clone())
                         .await
                         .map_err(io_other)?;
                 }
@@ -565,7 +565,7 @@ impl RequestHandler {
         };
 
         for write in prepared.0 {
-            write_bytes_to_target_io(write, prepared.1.clone())
+            write_attached_bytes_to_target_io(write, prepared.1.clone())
                 .await
                 .map_err(io_other)?;
         }
@@ -586,7 +586,7 @@ impl RequestHandler {
             prepare_attached_pane_input_writes(&mut state, &target, bytes).map_err(io_other)?
         };
         for write in writes {
-            write_bytes_to_target_io(write, bytes.to_vec())
+            write_attached_bytes_to_target_io(write, bytes.to_vec())
                 .await
                 .map_err(io_other)?;
         }

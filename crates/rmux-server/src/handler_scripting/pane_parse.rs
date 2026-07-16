@@ -11,7 +11,7 @@ use rmux_proto::{
 use super::tokens::{
     parse_compact_flag_cluster, rebuild_shell_command, CommandTokens, CompactFlag,
 };
-use super::values::unsupported_flag;
+use super::values::{parse_percentage, unsupported_flag};
 use super::{
     implicit_pane_target, implicit_split_target, marked_pane_target_or_current, parse_pane_target,
     parse_split_window_target, parse_window_target,
@@ -261,7 +261,7 @@ fn parse_split_window_command(
     let mut start_directory: Option<std::path::PathBuf> = None;
     let mut detached = false;
     let mut size = None;
-    let mut legacy_percentage = false;
+    let mut percentage_size = None;
     let mut full_size = false;
     let mut preserve_zoom = false;
     let mut print_target = false;
@@ -316,12 +316,19 @@ fn parse_split_window_command(
             }
             "-p" => {
                 let _ = args.optional();
-                let _ = args.required("-p size")?;
-                legacy_percentage = true;
+                let percentage = args.required("-p size")?;
+                if size.is_none() {
+                    percentage_size = Some(percentage);
+                }
             }
-            token if legacy_percentage_attached_value(token) => {
+            token if legacy_percentage_attached_value(token).is_some() => {
+                let percentage = legacy_percentage_attached_value(token)
+                    .expect("checked above")
+                    .to_owned();
                 let _ = args.optional();
-                legacy_percentage = true;
+                if size.is_none() {
+                    percentage_size = Some(percentage);
+                }
             }
             "-P" if allow_print_flags => {
                 let _ = args.optional();
@@ -407,8 +414,10 @@ fn parse_split_window_command(
                             size = Some(compact_flag.value_or_next(&mut args, "-l size")?);
                         }
                         compact_flag @ CompactFlag::Value { flag: 'p', .. } => {
-                            let _ = compact_flag.value_or_next(&mut args, "-p size")?;
-                            legacy_percentage = true;
+                            let percentage = compact_flag.value_or_next(&mut args, "-p size")?;
+                            if size.is_none() {
+                                percentage_size = Some(percentage);
+                            }
                         }
                         compact_flag @ CompactFlag::Value { flag: 't', .. } => {
                             target = Some(parse_split_window_target(
@@ -425,8 +434,13 @@ fn parse_split_window_command(
     }
     let command = (!args.is_empty()).then_some(args.remaining());
     let stdin_to_empty_pane = stdin && command.is_none();
-    if size.is_none() && legacy_percentage {
-        return Err(RmuxError::Server("size missing".to_owned()));
+    if size.is_none() {
+        if let Some(percentage) = percentage_size {
+            size = Some(format!(
+                "{}%",
+                parse_percentage("split-window", "-p", &percentage)?
+            ));
+        }
     }
     let target = target.unwrap_or(implicit_split_target(
         sessions,
@@ -473,8 +487,10 @@ fn parse_split_window_command(
     })
 }
 
-fn legacy_percentage_attached_value(token: &str) -> bool {
-    token.starts_with("-p") && token != "-p" && !token.starts_with("--")
+fn legacy_percentage_attached_value(token: &str) -> Option<&str> {
+    token
+        .strip_prefix("-p")
+        .filter(|value| !value.is_empty() && !token.starts_with("--"))
 }
 
 pub(super) fn parse_swap_pane(

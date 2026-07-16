@@ -3,6 +3,7 @@
 use rmux_core::{BoxLines, PaneGeometry, Style};
 use rmux_proto::TerminalSize;
 
+use super::status::status_message_line_index;
 use super::{RenderedPrompt, StatusGeometry};
 use crate::format_runtime::RuntimeFormatContext;
 use crate::status_ranges::{StatusLineLayout, StatusRange, StatusRangeType};
@@ -220,25 +221,40 @@ pub(crate) fn status_line_layout(
         );
         let mut ranges = Vec::new();
         if rendered > 0 {
+            let line = status_message_line_index(session.name(), options, geometry.status_lines);
             push_range(
                 &mut ranges,
                 0,
                 rendered.saturating_sub(1),
                 StatusRangeType::Left,
             );
+            for range in &mut ranges {
+                range.line = line;
+            }
         }
         return Some(StatusLineLayout { ranges });
     }
 
-    Some(StatusLineLayout {
-        ranges: super::status_bar_line(
-            session,
-            options,
-            u16::try_from(width).unwrap_or(u16::MAX),
-            attached_count,
-        )
-        .ranges,
-    })
+    let mut ranges = Vec::new();
+    for (line_index, line) in super::status_bar_lines(
+        session,
+        options,
+        u16::try_from(width).unwrap_or(u16::MAX),
+        attached_count,
+        geometry.status_lines,
+    )
+    .into_iter()
+    .enumerate()
+    {
+        let Ok(line_index) = u16::try_from(line_index) else {
+            break;
+        };
+        ranges.extend(line.ranges.into_iter().map(|mut range| {
+            range.line = line_index;
+            range
+        }));
+    }
+    Some(StatusLineLayout { ranges })
 }
 
 pub(crate) fn render_menu_overlay(spec: &MenuRenderSpec) -> Vec<u8> {

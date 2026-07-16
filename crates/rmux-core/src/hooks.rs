@@ -13,7 +13,10 @@ mod types;
 
 use bindings::HookBindings;
 use rules::{hook_class, hook_inventory, hook_is_visible_in_show_hooks, root_for_hook};
-pub use rules::{hook_global_root, validate_hook_registration, validate_hook_scope};
+pub use rules::{
+    hook_global_root, hook_natural_scope_for_session_target, hook_natural_scope_for_target,
+    validate_hook_registration, validate_hook_scope,
+};
 use types::HookClass;
 pub use types::{HookBindingView, HookDispatch, HookGlobalRoot, HookSetOptions};
 

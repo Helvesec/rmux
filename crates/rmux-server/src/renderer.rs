@@ -61,7 +61,7 @@ pub(crate) use pane_screen::{
 use status::status_bar_runs;
 use status::{
     format_status_message_line, prompt_status_runs, render_status_bar, sanitize_status_text,
-    status_bar_line, status_runs_width, StatusBarRenderRequest, StatusGeometry,
+    status_bar_lines, status_message_y, status_runs_width, StatusBarRenderRequest, StatusGeometry,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,7 +341,7 @@ pub(crate) fn render_status_message(
     message: &str,
 ) -> Vec<u8> {
     let geometry = StatusGeometry::for_session(session, options);
-    let Some(status_y) = geometry.status_y else {
+    let Some(status_y) = status_message_y(session, options, geometry) else {
         return Vec::new();
     };
     let width = usize::from(geometry.terminal_size.cols);
@@ -431,6 +431,7 @@ fn push_range(
         return;
     };
     ranges.push(crate::status_ranges::StatusRange {
+        line: 0,
         x: start..=end,
         kind,
     });
@@ -448,7 +449,7 @@ fn colour_is_unset(colour: Colour) -> bool {
     matches!(colour, COLOUR_DEFAULT | COLOUR_TERMINAL | COLOUR_NONE)
 }
 
-fn style_sgr_bytes(style: &Style, use_fill_background: bool) -> Vec<u8> {
+pub(crate) fn style_sgr_bytes(style: &Style, use_fill_background: bool) -> Vec<u8> {
     let mut params = Vec::new();
     for code in attr_sgr_codes(style.cell.attr) {
         params.push(sgr_code_text(code));

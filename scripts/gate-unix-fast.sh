@@ -160,6 +160,7 @@ if [ "$skip_doc" -eq 0 ]; then
 fi
 
 if [ "$skip_source_gates" -eq 0 ]; then
+  run_step "worktree hygiene" scripts/check-worktree-hygiene.sh
   run_step "runtime network source scan" scripts/no-network-in-runtime.sh
   run_step "platform neutrality source scan" scripts/check-platform-neutrality.sh
   run_step "debug_assert side-effect scan" scripts/no-debug-assert-side-effects.sh

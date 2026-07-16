@@ -76,7 +76,7 @@ fn display_panes_accepts_duration_no_command_and_template_flags() {
             assert!(args.non_blocking);
             assert_eq!(args.duration_ms, Some(250));
             assert!(args.no_command);
-            assert_eq!(target_text(&args.target), "alpha");
+            assert_eq!(args.target_client.as_deref(), Some("alpha"));
             assert_eq!(
                 args.template_command().as_deref(),
                 Some("select-pane -t %%")
@@ -497,28 +497,30 @@ fn capture_pane_alias_accepts_print_mode() {
 }
 
 #[test]
-fn capture_pane_rejects_tmux_invalid_mode_screen_flag() {
-    let error = parse_args(&["capture-pane", "-M", "-p", "-t", "alpha:0.0"]).unwrap_err();
+fn capture_pane_accepts_tmux_mode_screen_flag() {
+    let cli = parse_args(&["capture-pane", "-M", "-p", "-t", "alpha:0.0"]).unwrap();
 
-    assert!(
-        error
-            .to_string()
-            .contains("command capture-pane: unknown flag -M"),
-        "{error}"
-    );
+    match cli.command.expect("parsed command") {
+        super::super::Command::CapturePane(args) => {
+            assert!(args.use_mode_screen);
+            assert!(args.print);
+            assert_eq!(target_text(&args.target), "alpha:0.0");
+        }
+        _ => panic!("expected CapturePane command"),
+    }
 }
 
 #[test]
-fn copy_mode_rejects_tmux_invalid_short_flags() {
-    for flag in ["-d", "-S"] {
-        let error = parse_args(&["copy-mode", flag, "-t", "alpha:0.0"]).unwrap_err();
+fn copy_mode_accepts_tmux_page_down_and_scrollbar_flags() {
+    let cli = parse_args(&["copy-mode", "-dS", "-t", "alpha:0.0"]).unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("command copy-mode: unknown flag {flag}")),
-            "{error}"
-        );
+    match cli.command.expect("parsed command") {
+        super::super::Command::CopyMode(args) => {
+            assert!(args.page_down);
+            assert!(args.scrollbar_scroll);
+            assert_eq!(target_text(&args.target), "alpha:0.0");
+        }
+        _ => panic!("expected CopyMode command"),
     }
 }
 

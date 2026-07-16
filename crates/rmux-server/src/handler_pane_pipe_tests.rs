@@ -9,6 +9,8 @@ use rmux_proto::{
 };
 use tokio::time::sleep;
 
+const PANE_PIPE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
@@ -61,6 +63,9 @@ async fn create_session(handler: &RequestHandler, name: &str) {
         }))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session_name(name), 0))
+        .await;
 }
 
 async fn display_pane_format(
@@ -121,7 +126,7 @@ async fn pipe_pane(
 }
 
 async fn wait_for_file_contains(path: &Path, expected: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
     loop {
         match fs::read_to_string(path) {
             Ok(contents) if contents.contains(expected) => return,
@@ -143,6 +148,21 @@ async fn wait_for_file_contains(path: &Path, expected: &str) {
     }
 }
 
+async fn wait_for_pipe_child_count_to_return_to(baseline: usize) {
+    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
+    loop {
+        let active = crate::pane_terminals::active_pipe_child_count_for_test();
+        if active <= baseline {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for pipe-pane children to stop; baseline={baseline}, active={active}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
     let handler = RequestHandler::new();
@@ -150,6 +170,7 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let first_output = unique_temp_path("once-first");
     let second_output = unique_temp_path("once-second");
+    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
     create_session(&handler, "alpha").await;
     wait_for_pane_process(&handler, target.clone()).await;
 
@@ -183,7 +204,7 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
         }))
         .await;
     assert!(matches!(sent, Response::SendKeys(_)));
-    sleep(Duration::from_millis(250)).await;
+    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
 
     let first_contents = fs::read_to_string(&first_output).expect("first pipe output exists");
     assert!(first_contents.contains("pipe-one"));
@@ -199,6 +220,7 @@ async fn pane_pipe_format_reports_active_pipe_state() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
     create_session(&handler, "alpha").await;
 
     assert_eq!(
@@ -221,4 +243,5 @@ async fn pane_pipe_format_reports_active_pipe_state() {
         display_pane_format(&handler, target, "#{pane_pipe}").await,
         "0"
     );
+    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
 }

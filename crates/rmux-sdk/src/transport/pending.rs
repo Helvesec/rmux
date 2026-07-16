@@ -105,6 +105,9 @@ impl PendingCall {
         if self.command_name == "pane-output-cursor" && actual == "pane-output-lag" {
             return Ok(());
         }
+        if self.command_name == "pane-state-cursor" && actual == "pane-state-lag" {
+            return Ok(());
+        }
 
         Err(TransportFailure::mismatched_response(
             self.command_name,

@@ -78,12 +78,14 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
     .await?;
     assert_eq!(
         scalar_append,
-        Response::Error(rmux_proto::ErrorResponse {
-            error: RmuxError::InvalidSetOption("status is not an array option".to_owned()),
+        Response::SetOption(rmux_proto::SetOptionResponse {
+            scope: ScopeSelector::Global,
+            option: OptionName::Status,
+            mode: SetOptionMode::Append,
         })
     );
 
-    let invalid_scope = send_request(
+    let explicit_local_scope = send_request(
         &socket_path,
         &Request::SetOption(SetOptionRequest {
             scope: ScopeSelector::Session(session_name("alpha")),
@@ -94,11 +96,28 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
     )
     .await?;
     assert_eq!(
-        invalid_scope,
+        explicit_local_scope,
+        Response::SetOption(rmux_proto::SetOptionResponse {
+            scope: ScopeSelector::Session(session_name("alpha")),
+            option: OptionName::TerminalFeatures,
+            mode: SetOptionMode::Replace,
+        })
+    );
+
+    let invalid_value = send_request(
+        &socket_path,
+        &Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::Status,
+            value: "maybe".to_owned(),
+            mode: SetOptionMode::Replace,
+        }),
+    )
+    .await?;
+    assert_eq!(
+        invalid_value,
         Response::Error(rmux_proto::ErrorResponse {
-            error: RmuxError::InvalidSetOption(
-                "terminal-features is only supported at global scope".to_owned()
-            ),
+            error: RmuxError::InvalidSetOption("unknown value: maybe".to_owned()),
         })
     );
 

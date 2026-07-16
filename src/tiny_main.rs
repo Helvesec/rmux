@@ -15,25 +15,23 @@ use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
 #[cfg(windows)]
 use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
 use rmux_client::{
-    connect, ensure_server_running_with_config, resolve_socket_path,
+    connect, connect_or_absent, ensure_server_running_with_config, resolve_socket_path,
     resolve_tmux_compatible_socket_path, AttachTransition, AutoStartConfig, ClientError,
-    Connection, StartServerError,
+    ConnectResult, Connection, StartServerError,
 };
-#[cfg(not(windows))]
-use rmux_client::{connect_or_absent, ConnectResult};
 use rmux_core::formats::{DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT};
 use rmux_proto::request::{
     AttachSessionExt2Request, AttachSessionExt3Request, DisplayMessageRequest, KillSessionRequest,
     NewSessionExtRequest,
 };
-#[cfg(windows)]
-use rmux_proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
 use rmux_proto::{
     CapturePaneTargetActionRequest, JoinPaneRequest, ListSessionsRequest, Request,
     ResizePaneTargetActionRequest, Response, RmuxError, SetOptionMode, SourceFileResponse,
     SplitDirection, SplitWindowTargetActionRequest, CAPABILITY_ATTACH_RENDER,
-    CAPABILITY_ATTACH_RESIZE_GEOMETRY,
+    CAPABILITY_ATTACH_RESIZE_GEOMETRY, RMUX_WIRE_VERSION,
 };
+#[cfg(windows)]
+use rmux_proto::{CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_DAEMON_STATUS};
 
 mod helper;
 mod output;
@@ -44,7 +42,7 @@ use crate::tmux_error_surface::{source_file_error_uses_stdout, tmux_cli_error_me
 #[cfg(not(windows))]
 use helper::daemon_helper_path;
 use helper::exec_full_helper;
-use output::{client_error, write_response_output_or_error, write_stdout};
+use output::{client_error, write_response_output_or_error, write_stderr, write_stdout};
 use parse::{
     parse_attach_session, parse_capture_pane, parse_display_message, parse_has_session,
     parse_join_pane, parse_kill_pane, parse_kill_session, parse_list_panes, parse_list_windows,
@@ -708,7 +706,7 @@ impl TinyCommand {
             Self::NewWindow {
                 socket_path,
                 request,
-            } => run_new_window(&socket_path, request),
+            } => run_new_window(original_args, &socket_path, request),
             Self::NewSession {
                 socket_path,
                 request,
@@ -725,19 +723,19 @@ impl TinyCommand {
             Self::RenameWindow {
                 socket_path,
                 request,
-            } => run_rename_window(&socket_path, request),
+            } => run_rename_window(original_args, &socket_path, request),
             Self::SelectWindow {
                 socket_path,
                 request,
-            } => run_select_window(&socket_path, request),
+            } => run_select_window(original_args, &socket_path, request),
             Self::KillPane {
                 socket_path,
                 request,
-            } => run_kill_pane(&socket_path, request),
+            } => run_kill_pane(original_args, &socket_path, request),
             Self::JoinPane {
                 socket_path,
                 request,
-            } => run_join_pane(&socket_path, request),
+            } => run_join_pane(original_args, &socket_path, request),
             Self::SetOption {
                 socket_path,
                 request,
@@ -977,11 +975,28 @@ fn resolve_active_window_index(
 #[cfg(windows)]
 fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    match probe_kill_server_compatible(&mut connection) {
+        Ok(()) => {}
+        Err(error) if kill_server_connection_closed(&error) => return Ok(0),
+        Err(error) => {
+            if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
+                return run_legacy_wire_kill_server(socket_path, wire_version);
+            }
+            return Err(error.to_string());
+        }
+    }
     match connection.kill_server_after_write() {
         Ok(()) => Ok(0),
         Err(error) if kill_server_connection_closed(&error) => Ok(0),
         Err(error) => Err(error.to_string()),
     }
+}
+
+#[cfg(windows)]
+fn probe_kill_server_compatible(connection: &mut Connection) -> Result<(), ClientError> {
+    connection
+        .supports_capability(CAPABILITY_DAEMON_STATUS)
+        .map(|_| ())
 }
 
 #[cfg(not(windows))]
@@ -997,10 +1012,13 @@ fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
             wait_for_killed_server_socket_cleanup(socket_path);
             Ok(0)
         }
-        Err(error) if unsupported_wire_version(&error) => {
-            run_legacy_wire_v1_kill_server(socket_path)
+        Err(error) => {
+            if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
+                run_legacy_wire_kill_server(socket_path, wire_version)
+            } else {
+                Err(error.to_string())
+            }
         }
-        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -1045,7 +1063,11 @@ fn run_send_keys(socket_path: &Path, request: TinySendKeys) -> Result<i32, Strin
     write_response_output_or_error(response, "send-keys")
 }
 
-fn run_new_window(socket_path: &Path, request: TinyNewWindow) -> Result<i32, String> {
+fn run_new_window(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinyNewWindow,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .new_window_at_with_environment(
@@ -1059,6 +1081,9 @@ fn run_new_window(socket_path: &Path, request: TinyNewWindow) -> Result<i32, Str
             false,
         )
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "new-window")
 }
 
@@ -1073,6 +1098,7 @@ fn run_kill_session(
             target: request.target,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         })
         .map_err(|error| error.to_string())?;
     if response_needs_session_resolution_retry(&response) {
@@ -1093,31 +1119,56 @@ fn run_show_options(
     write_response_output_or_error(response, command_name)
 }
 
-fn run_rename_window(socket_path: &Path, request: TinyRenameWindow) -> Result<i32, String> {
+fn run_rename_window(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinyRenameWindow,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .rename_window(request.target, request.name.replace('\\', r"\\"))
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "rename-window")
 }
 
-fn run_select_window(socket_path: &Path, request: TinySelectWindow) -> Result<i32, String> {
+fn run_select_window(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinySelectWindow,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .select_window(request.target)
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "select-window")
 }
 
-fn run_kill_pane(socket_path: &Path, request: TinyKillPane) -> Result<i32, String> {
+fn run_kill_pane(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinyKillPane,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .kill_pane(request.target)
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "kill-pane")
 }
 
-fn run_join_pane(socket_path: &Path, request: TinyJoinPane) -> Result<i32, String> {
+fn run_join_pane(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinyJoinPane,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .join_pane(JoinPaneRequest {
@@ -1130,6 +1181,9 @@ fn run_join_pane(socket_path: &Path, request: TinyJoinPane) -> Result<i32, Strin
             size: None,
         })
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "join-pane")
 }
 
@@ -1335,11 +1389,13 @@ fn write_source_file_success_response(response: SourceFileResponse) -> Result<i3
     if let Some(output) = response.command_output() {
         write_stdout(output.stdout()).map_err(|error| error.to_string())?;
     }
+    if !response.stderr().is_empty() {
+        write_stderr(response.stderr()).map_err(|error| error.to_string())?;
+    }
     Ok(response.exit_status().unwrap_or(0))
 }
 
-#[cfg(not(windows))]
-fn run_legacy_wire_v1_kill_server(socket_path: &Path) -> Result<i32, String> {
+fn run_legacy_wire_kill_server(socket_path: &Path, wire_version: u32) -> Result<i32, String> {
     let mut connection =
         match connect_or_absent(socket_path).map_err(|error| client_error(socket_path, error))? {
             ConnectResult::Connected(connection) => connection,
@@ -1349,7 +1405,7 @@ fn run_legacy_wire_v1_kill_server(socket_path: &Path) -> Result<i32, String> {
             }
         };
 
-    match connection.kill_server_legacy_wire_v1() {
+    match connection.kill_server_legacy_wire(wire_version) {
         Ok(()) => {
             wait_for_killed_server_socket_cleanup(socket_path);
             Ok(0)
@@ -1376,12 +1432,56 @@ fn kill_server_connection_closed(error: &ClientError) -> bool {
         )
 }
 
-#[cfg(not(windows))]
-fn unsupported_wire_version(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Protocol(RmuxError::UnsupportedWireVersion { .. })
+fn legacy_shutdown_fallback_wire_version(error: &ClientError) -> Option<u32> {
+    match error {
+        ClientError::Protocol(RmuxError::UnsupportedWireVersion { got, .. })
+            if (1..RMUX_WIRE_VERSION).contains(got) =>
+        {
+            Some(*got)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn incompatible_daemon_error(socket_path: &Path) -> String {
+    format!(
+        "rmux: running daemon on '{}' uses an incompatible protocol.\nrmux: run `{}` to stop it, then retry.",
+        socket_path.display(),
+        incompatible_daemon_kill_server_command(socket_path)
     )
+}
+
+#[cfg(test)]
+fn incompatible_daemon_kill_server_command(socket_path: &Path) -> String {
+    if rmux_client::default_socket_path()
+        .ok()
+        .as_deref()
+        .is_some_and(|default_path| default_path == socket_path)
+    {
+        return "rmux kill-server".to_owned();
+    }
+
+    format!("rmux -S {} kill-server", shell_quote_path(socket_path))
+}
+
+#[cfg(test)]
+fn shell_quote_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+=:@".contains(&byte))
+    {
+        return text;
+    }
+
+    #[cfg(windows)]
+    {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    }
+    #[cfg(not(windows))]
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 fn response_needs_full_helper(

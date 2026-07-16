@@ -178,4 +178,38 @@ mod tests {
             "C:\\Users\\RMUXUser\\.tmux.conf"
         ));
     }
+
+    #[test]
+    fn cli_error_renderer_keeps_tmux_option_and_target_wording() {
+        let prefixed_number = RmuxError::Server(
+            "invalid set-option request: value is too large: 2147483648".to_owned(),
+        );
+        assert_eq!(
+            tmux_cli_error_message("set-option", &prefixed_number),
+            "value is too large: 2147483648"
+        );
+
+        let prefixed_style = RmuxError::InvalidSetOption(
+            "invalid set-option request: invalid style: bad".to_owned(),
+        );
+        assert_eq!(
+            tmux_cli_error_message("set-option", &prefixed_style),
+            "invalid style: bad"
+        );
+
+        let already_set = RmuxError::InvalidSetOption("status is already set".to_owned());
+        assert_eq!(
+            tmux_cli_error_message("set-option", &already_set),
+            "already set: status"
+        );
+
+        let missing_pane = RmuxError::InvalidTarget {
+            value: "alpha:0.99".to_owned(),
+            reason: "can't find pane: 99".to_owned(),
+        };
+        assert_eq!(
+            tmux_cli_error_message("list-panes", &missing_pane),
+            "can't find pane: 99"
+        );
+    }
 }

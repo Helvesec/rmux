@@ -13,7 +13,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{debug, warn};
 
-use crate::control::{self, ControlLifecycle, ControlServerEvent};
+use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
     attach_support::AttachRegistration, ControlRegistration, DetachedRequestGuard, PreparedSdkWait,
@@ -26,6 +26,9 @@ use crate::listener_signals::wait_server_signal;
 use crate::pane_io;
 use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
+
+const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+const DETACHED_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Accept loop: spawns a per-connection task for each incoming client.
 pub(crate) async fn serve(
@@ -149,9 +152,7 @@ pub(crate) async fn serve(
         Err(error) => warn!("startup config task failed: {error}"),
     }
 
-    while let Some(result) = connection_tasks.join_next().await {
-        log_connection_task_result(result);
-    }
+    drain_connection_tasks_for_shutdown(&mut connection_tasks).await;
     if let Err(error) = hook_task.await {
         warn!("lifecycle hook task failed: {error}");
     }
@@ -332,7 +333,11 @@ async fn serve_connection(
                     return result;
                 }
                 if let Some(control_upgrade) = outcome.control {
-                    let (server_event_tx, server_event_rx) = tokio::sync::mpsc::unbounded_channel::<ControlServerEvent>();
+                    let initial_command_count = control_upgrade.initial_command_count as usize;
+                    let (server_event_tx, server_event_rx) =
+                        tokio::sync::mpsc::channel::<ControlServerEvent>(
+                            control::CONTROL_SERVER_EVENT_CAPACITY,
+                        );
                     let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let control_id = handler
                         .register_control_with_access(
@@ -354,7 +359,7 @@ async fn serve_connection(
                         stream,
                         Arc::clone(&handler),
                         requester.pid,
-                        buffered_bytes,
+                        ControlUpgradeInput::new(buffered_bytes, initial_command_count),
                         shutdown,
                         server_event_rx,
                         ControlLifecycle {
@@ -472,6 +477,8 @@ impl ConnectionCleanupGuard {
         self.handler
             .cleanup_connection_subscriptions_sync(self.connection_id);
         self.handler
+            .cleanup_connection_pane_state_subscriptions_sync(self.connection_id);
+        self.handler
             .cleanup_connection_sdk_waits_sync(self.connection_id);
         self.active = false;
     }
@@ -501,7 +508,9 @@ fn request_cancels_on_peer_disconnect(request: &Request) -> bool {
             if matches!(wait.mode, WaitForMode::Wait | WaitForMode::Lock)
     ) || matches!(
         request,
-        Request::SdkWaitForOutput(_) | Request::SdkWaitForOutputRef(_)
+        Request::SdkWaitForOutput(_)
+            | Request::SdkWaitForOutputRef(_)
+            | Request::PaneStateCursor(rmux_proto::PaneStateCursorRequest { wait: true, .. })
     )
 }
 
@@ -518,10 +527,36 @@ fn drain_finished_connection_tasks(tasks: &mut JoinSet<io::Result<()>>) {
     }
 }
 
+async fn drain_connection_tasks_for_shutdown(tasks: &mut JoinSet<io::Result<()>>) {
+    let graceful = async {
+        while let Some(result) = tasks.join_next().await {
+            log_connection_task_result(result);
+        }
+    };
+    if tokio::time::timeout(CONNECTION_SHUTDOWN_GRACE, graceful)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    warn!(
+        remaining = tasks.len(),
+        "aborting client connections that did not drain during daemon shutdown"
+    );
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        log_connection_task_result(result);
+    }
+}
+
 fn log_connection_task_result(result: Result<io::Result<()>, JoinError>) {
     match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!("connection error: {error}"),
+        Err(error) if error.is_cancelled() => {
+            debug!("connection task cancelled during daemon shutdown")
+        }
         Err(error) => warn!("connection task failed: {error}"),
     }
 }
@@ -563,8 +598,18 @@ impl Connection {
     }
 
     async fn write_response(&mut self, response: &Response) -> io::Result<()> {
-        let frame = encode_frame(response).map_err(io::Error::other)?;
-        self.stream.write_all(&frame).await
+        let frame = encode_response_frame(response).map_err(io::Error::other)?;
+        tokio::time::timeout(
+            DETACHED_RESPONSE_WRITE_TIMEOUT,
+            self.stream.write_all(&frame),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "detached client did not drain the response",
+            )
+        })?
     }
 
     fn into_raw_parts(self) -> (LocalStream, Vec<u8>) {
@@ -573,18 +618,70 @@ impl Connection {
     }
 }
 
+fn encode_response_frame(response: &Response) -> Result<Vec<u8>, rmux_proto::RmuxError> {
+    match encode_frame(response) {
+        Ok(frame) => Ok(frame),
+        Err(error @ rmux_proto::RmuxError::FrameTooLarge { .. }) => {
+            // A handler must not turn one oversized, otherwise valid RPC
+            // result into an unexplained transport disconnect. Keep the
+            // stream synchronized and surface the typed codec failure.
+            encode_frame(&Response::Error(ErrorResponse { error }))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::server_access::AccessMode;
     use rmux_proto::{
-        CancelSdkWaitResponse, DaemonStatusRequest, ErrorResponse, HandshakeRequest,
-        ListSessionsRequest, NewSessionRequest, PaneOutputSubscriptionStart, PaneTarget,
-        RenameSessionRequest, RmuxError, SdkWaitForOutputRequest, SdkWaitForOutputResponse,
-        SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest,
-        ShutdownIfIdleResponse, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse,
-        RMUX_WIRE_VERSION,
+        decode_frame, AttachSessionRequest, CancelSdkWaitResponse, DaemonStatusRequest,
+        ErrorResponse, HandshakeRequest, ListSessionsRequest, NewSessionRequest,
+        PaneOutputSubscriptionStart, PaneTarget, RenameSessionRequest, RmuxError,
+        SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome,
+        SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest, ShutdownIfIdleResponse, TerminalSize,
+        WaitForMode, WaitForRequest, WaitForResponse, RMUX_WIRE_VERSION,
     };
+
+    #[test]
+    fn oversized_response_is_replaced_by_a_framed_error() {
+        let response = Response::Error(ErrorResponse {
+            error: RmuxError::Server("x".repeat(rmux_proto::DEFAULT_MAX_DETACHED_FRAME_LENGTH)),
+        });
+        let frame = encode_response_frame(&response).expect("fallback error encodes");
+        assert!(matches!(
+            decode_frame::<Response>(&frame).expect("fallback frame decodes"),
+            Response::Error(ErrorResponse {
+                error: RmuxError::FrameTooLarge { .. }
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_aborts_a_non_reading_detached_response() -> io::Result<()> {
+        let (server, client) = LocalStream::pair()?;
+        let mut connection = Connection::new(server);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            connection
+                .write_response(&Response::Error(ErrorResponse {
+                    error: RmuxError::Server("x".repeat(7_000_000)),
+                }))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the unread response should still be blocked"
+        );
+        drain_connection_tasks_for_shutdown(&mut tasks).await;
+        assert!(tasks.is_empty());
+        drop(client);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn client_disconnect_cancels_plain_waiter() -> io::Result<()> {
@@ -928,6 +1025,48 @@ mod tests {
             })
         ));
         assert!(read_task.await.expect("read task")?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_upgrade_preserves_only_already_read_bounded_remainder() -> io::Result<()> {
+        let (server, mut client) = LocalStream::pair()?;
+        let mut connection = Connection::new(server);
+        let read_capacity = connection.read_buffer.len();
+        let mut bytes = encode_frame(&Request::AttachSession(AttachSessionRequest {
+            target: SessionName::new("alpha").expect("valid session"),
+        }))
+        .map_err(io::Error::other)?;
+        let extra = vec![b'x'; read_capacity + 256];
+        bytes.extend_from_slice(&extra);
+
+        let writer = tokio::spawn(async move {
+            client.write_all(&bytes).await?;
+            client.shutdown().await
+        });
+
+        let request = tokio::time::timeout(Duration::from_secs(5), connection.read_request())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read_request timed out"))??;
+        assert!(matches!(request, Some(Request::AttachSession(_))));
+        let (mut stream, buffered_bytes) = connection.into_raw_parts();
+        let mut stream_remainder = Vec::new();
+        stream.read_to_end(&mut stream_remainder).await?;
+        writer.await.expect("writer task")?;
+
+        assert!(
+            buffered_bytes.len() <= read_capacity,
+            "attach upgrade remainder must be bounded by the server read buffer"
+        );
+        assert!(
+            buffered_bytes.len() < extra.len(),
+            "bytes not yet read by the detached decoder must remain in the stream"
+        );
+        assert_eq!(&buffered_bytes, &extra[..buffered_bytes.len()]);
+
+        let mut observed_extra = buffered_bytes;
+        observed_extra.extend_from_slice(&stream_remainder);
+        assert_eq!(observed_extra, extra);
         Ok(())
     }
 

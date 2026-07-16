@@ -356,6 +356,7 @@ impl RequestHandler {
                 Ok(QueueCommandAction::Normal {
                     output: Some(rmux_proto::CommandOutput::from_stdout(body.into_bytes())),
                     error: None,
+                    source_file_error: None,
                     exit_status: None,
                 })
             }
@@ -364,6 +365,7 @@ impl RequestHandler {
                 Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    source_file_error: None,
                     exit_status: None,
                 })
             }

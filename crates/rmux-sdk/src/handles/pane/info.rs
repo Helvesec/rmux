@@ -231,10 +231,13 @@ async fn list_window_entries(
     session_name: &rmux_proto::SessionName,
 ) -> Result<Vec<ListedWindow>> {
     match client
-        .request(Request::ListWindows(ListWindowsRequest {
+        .request(Request::ListWindows(Box::new(ListWindowsRequest {
             target: session_name.clone(),
             format: None,
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await?
     {
         Response::ListWindows(response) => response
@@ -302,11 +305,14 @@ async fn list_pane_entries(
     target_window_index: Option<u32>,
 ) -> Result<Vec<ListedPane>> {
     let response = client
-        .request(Request::ListPanes(ListPanesRequest {
+        .request(Request::ListPanes(Box::new(ListPanesRequest {
             target: target.session_name.clone(),
             target_window_index,
             format: Some(PANE_LIST_FORMAT.to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await?;
 
     let output = match response {

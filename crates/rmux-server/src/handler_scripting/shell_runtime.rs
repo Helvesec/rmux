@@ -7,6 +7,8 @@ use rmux_proto::{
     RunShellRequest, RunShellResponse, SessionName, Target,
 };
 
+#[cfg(windows)]
+use super::super::pane_support::format_references_pane_pid;
 use super::super::RequestHandler;
 use super::command_args::CommandListArgument;
 use super::format_context::{format_context_for_target_with_server_values, global_format_context};
@@ -160,9 +162,15 @@ impl RequestHandler {
         }
 
         if request.as_commands {
-            let parsed = self
-                .parse_command_string_one_group(&request.command)
+            let command = self
+                .expand_run_shell_command(&request, client_name.as_deref())
                 .await?;
+            let parsed = self.parse_command_string_one_group(&command).await?;
+            if parsed_contains_attach_session(&parsed) {
+                return Err(RmuxError::Server(
+                    "open terminal failed: not a terminal".to_owned(),
+                ));
+            }
             let current_target = self
                 .run_shell_commands_current_target(requester_pid, request.target)
                 .await;
@@ -185,16 +193,19 @@ impl RequestHandler {
 
         let profile = self.run_shell_profile(&request).await?;
         let command = self
-            .expand_run_shell_command(
-                &request.command,
-                request.target.as_ref(),
-                client_name.as_deref(),
-            )
+            .expand_run_shell_command(&request, client_name.as_deref())
             .await?;
-        let output = run_shell_foreground(command, &profile, request.show_stderr).await?;
+        let output = run_shell_foreground(command.clone(), &profile, request.show_stderr).await?;
         let exit_status = shell_exit_status(&output.status);
+        let stdout = run_shell_stdout_for_response(
+            output.stdout,
+            &command,
+            exit_status,
+            shell_exit_signal(&output.status),
+        );
+        let output = (!stdout.is_empty()).then(|| CommandOutput::from_stdout(stdout));
         Ok(RunShellTaskOutput::Shell {
-            output: None,
+            output,
             exit_status,
         })
     }
@@ -205,7 +216,9 @@ impl RequestHandler {
         target: Option<PaneTarget>,
     ) -> Option<Target> {
         if let Some(target) = target {
-            return Some(Target::Pane(target));
+            return self
+                .existing_target_or_none(Some(Target::Pane(target)))
+                .await;
         }
 
         let session_name = match self.current_session_candidate(requester_pid).await {
@@ -214,6 +227,24 @@ impl RequestHandler {
         }?;
         let state = self.state.lock().await;
         active_session_target(&state.sessions, &session_name)
+    }
+
+    async fn existing_target_or_none(&self, target: Option<Target>) -> Option<Target> {
+        let target = target?;
+        let state = self.state.lock().await;
+        let exists = match &target {
+            Target::Session(session_name) => state.sessions.contains_session(session_name),
+            Target::Window(target) => state
+                .sessions
+                .session(target.session_name())
+                .is_some_and(|session| session.window_at(target.window_index()).is_some()),
+            Target::Pane(target) => state
+                .sessions
+                .session(target.session_name())
+                .and_then(|session| session.window_at(target.window_index()))
+                .is_some_and(|window| window.pane(target.pane_index()).is_some()),
+        };
+        exists.then_some(target)
     }
 
     async fn if_shell_task(
@@ -245,12 +276,13 @@ impl RequestHandler {
         let parsed = self
             .parse_command_string_one_group(&selected_command)
             .await?;
+        let current_target = self.existing_target_or_none(request.target).await;
         let output = self
             .execute_parsed_commands(
                 requester_pid,
                 parsed,
                 QueueExecutionContext::new(request.caller_cwd)
-                    .with_current_target(request.target)
+                    .with_current_target(current_target)
                     .with_client_name(client_name),
             )
             .await?;
@@ -259,10 +291,14 @@ impl RequestHandler {
 
     async fn expand_run_shell_command(
         &self,
-        command: &str,
-        target: Option<&PaneTarget>,
+        request: &RunShellRequest,
         client_name: Option<&str>,
     ) -> Result<String, RmuxError> {
+        #[cfg(windows)]
+        if format_references_pane_pid(Some(&request.command)) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
+        let target = request.target.as_ref();
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
         } else {
@@ -278,7 +314,8 @@ impl RequestHandler {
                 &Target::Pane(target.clone()),
                 attached_count,
                 &socket_path,
-            )?,
+            )
+            .unwrap_or_else(|_| global_format_context(&state, &socket_path)),
             None => match hook_formats
                 .iter()
                 .rev()
@@ -301,7 +338,18 @@ impl RequestHandler {
             .fold(context, |context, (name, value)| {
                 context.with_named_value(name, value)
             });
-        Ok(render_runtime_template(command, &context, false))
+        let context = if request.as_commands {
+            context
+        } else {
+            request
+                .arguments
+                .iter()
+                .enumerate()
+                .fold(context, |context, (index, value)| {
+                    context.with_named_value((index + 1).to_string(), value.clone())
+                })
+        };
+        Ok(render_runtime_template(&request.command, &context, false))
     }
 
     async fn run_shell_profile(
@@ -386,6 +434,10 @@ impl RequestHandler {
         request: &IfShellRequest,
         client_name: Option<&str>,
     ) -> Result<String, RmuxError> {
+        #[cfg(windows)]
+        if format_references_pane_pid(Some(&request.condition)) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let fallback_target = if request.target.is_none() {
             self.preferred_session_name().await.ok()
         } else {
@@ -405,7 +457,8 @@ impl RequestHandler {
                 target,
                 attached_count,
                 &socket_path,
-            )?,
+            )
+            .unwrap_or_else(|_| global_format_context(&state, &socket_path)),
             None => fallback_target
                 .as_ref()
                 .and_then(|session_name| active_session_target(&state.sessions, session_name))
@@ -461,12 +514,14 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: Some(error),
+                    source_file_error: None,
                     exit_status: None,
                 });
             }
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -520,6 +575,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         };
@@ -538,6 +594,7 @@ impl RequestHandler {
             )],
             output: None,
             error: None,
+            source_file_error: None,
             exit_status: None,
         })
     }
@@ -656,6 +713,46 @@ impl RequestHandler {
     }
 }
 
+fn parsed_contains_attach_session(parsed: &ParsedCommands) -> bool {
+    parsed.commands().iter().any(command_attaches_client)
+}
+
+fn command_attaches_client(command: &rmux_core::command_parser::ParsedCommand) -> bool {
+    if command.name() == "attach-session" {
+        return true;
+    }
+    // Probed 2026-07-08 against the pinned tmux 3.7b oracle: run-shell -C
+    // "new-session" (without -d) fails with "open terminal failed: not a
+    // terminal" and creates no session, and the same applies to commands
+    // nested in brace bodies.
+    if command.name() == "new-session" && !new_session_is_detached(command) {
+        return true;
+    }
+    command.arguments().iter().any(|argument| match argument {
+        rmux_core::command_parser::CommandArgument::Commands(nested) => {
+            parsed_contains_attach_session(nested)
+        }
+        rmux_core::command_parser::CommandArgument::String(_) => false,
+    })
+}
+
+fn new_session_is_detached(command: &rmux_core::command_parser::ParsedCommand) -> bool {
+    command
+        .arguments()
+        .iter()
+        .filter_map(rmux_core::command_parser::CommandArgument::as_string)
+        .any(|argument| {
+            argument.len() >= 2
+                && argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument
+                    .bytes()
+                    .skip(1)
+                    .all(|byte| byte.is_ascii_alphabetic())
+                && argument.bytes().skip(1).any(|byte| byte == b'd')
+        })
+}
+
 fn pane_id_for_target(
     state: &crate::pane_terminals::HandlerState,
     target: &PaneTarget,
@@ -729,4 +826,37 @@ fn shell_exit_status(status: &std::process::ExitStatus) -> i32 {
     {
         1
     }
+}
+
+fn shell_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        status.signal()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn run_shell_stdout_for_response(
+    mut stdout: Vec<u8>,
+    command: &str,
+    exit_status: i32,
+    signal: Option<i32>,
+) -> Vec<u8> {
+    if !stdout.is_empty() && !stdout.ends_with(b"\n") {
+        stdout.push(b'\n');
+    }
+    if exit_status == 0 {
+        return stdout;
+    }
+    if let Some(signal) = signal {
+        stdout.extend_from_slice(format!("'{command}' terminated by signal {signal}\n").as_bytes());
+        return stdout;
+    }
+    stdout.extend_from_slice(format!("'{command}' returned {exit_status}\n").as_bytes());
+    stdout
 }

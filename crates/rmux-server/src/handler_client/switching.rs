@@ -1,8 +1,12 @@
 use std::time::Instant;
 
-use rmux_core::LifecycleEvent;
+use rmux_core::{
+    LifecycleEvent, TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget,
+};
 use rmux_proto::request::{SwitchClientExt2Request, SwitchClientExt3Request};
-use rmux_proto::{ErrorResponse, OptionName, Response, RmuxError, SwitchClientResponse, Target};
+use rmux_proto::{
+    ErrorResponse, OptionName, Response, RmuxError, SessionName, SwitchClientResponse, Target,
+};
 
 use crate::handler_support::attached_client_required;
 use crate::pane_io::AttachControl;
@@ -11,9 +15,10 @@ use crate::pane_terminals::session_not_found;
 #[cfg(feature = "web")]
 use super::super::attach_support::attach_render_target_for_session;
 use super::super::{
-    attach_support::attach_target_for_session, client_environment_snapshot,
-    control_support::ManagedClient, parse_session_sort_order, switch_target_selector_count,
-    update_environment_from_client, RequestHandler, SessionSortOrder,
+    active_session_target, attach_support::attach_target_for_session, client_environment_snapshot,
+    control_support::ManagedClient, parse_session_sort_order, switch_client_target_find_type,
+    switch_target_selector_count, update_environment_from_client, with_visible_pane_bases,
+    RequestHandler, SessionSortOrder,
 };
 
 impl RequestHandler {
@@ -155,7 +160,15 @@ impl RequestHandler {
         };
 
         let switch_target = if let Some(target) = request.target.as_deref() {
-            match self.apply_switch_target(target, request.zoom).await {
+            match self
+                .apply_switch_target(
+                    target,
+                    session_name.as_ref(),
+                    TargetFindFlags::NONE,
+                    request.zoom,
+                )
+                .await
+            {
                 Ok(session_name) => Some(session_name),
                 Err(error) => return Response::Error(ErrorResponse { error }),
             }
@@ -439,16 +452,44 @@ impl RequestHandler {
     pub(super) async fn apply_switch_target(
         &self,
         target: &str,
+        current_session: Option<&rmux_proto::SessionName>,
+        flags: TargetFindFlags,
         zoom: bool,
     ) -> Result<rmux_proto::SessionName, RmuxError> {
-        match Target::parse(target)? {
-            Target::Session(session_name) => {
-                let state = self.state.lock().await;
-                if state.sessions.session(&session_name).is_none() {
-                    return Err(session_not_found(&session_name));
-                }
-                Ok(session_name)
+        let find_type = switch_client_target_find_type(target);
+        let resolved = {
+            let state = self.state.lock().await;
+            let current_target = current_session
+                .and_then(|session_name| active_session_target(&state.sessions, session_name));
+            let context = with_visible_pane_bases(
+                TargetFindContext::new(current_target),
+                &state.sessions,
+                &state.options,
+            );
+            state.sessions.resolve_unresolved_target(
+                &UnresolvedTarget::new(target.to_owned()),
+                find_type,
+                flags,
+                &context,
+            )
+        }
+        .map_err(|error| {
+            if find_type == TargetFindType::Session {
+                normalize_switch_session_lookup_error(target, error)
+            } else {
+                error
             }
+        })?;
+
+        if find_type == TargetFindType::Session && !matches!(resolved, Target::Session(_)) {
+            return Err(RmuxError::Server(format!(
+                "resolve-target produced {} where a session target was required",
+                switch_target_response_name(&resolved)
+            )));
+        }
+
+        match resolved {
+            Target::Session(session_name) => Ok(session_name),
             Target::Window(target) => {
                 let mut state = self.state.lock().await;
                 let session = state
@@ -550,5 +591,210 @@ impl RequestHandler {
             index - 1
         };
         Ok(session_names.get(next_index).cloned())
+    }
+}
+
+fn normalize_switch_session_lookup_error(target: &str, error: RmuxError) -> RmuxError {
+    if matches!(
+        &error,
+        RmuxError::InvalidTarget { reason, .. } if reason.starts_with("can't find session: ")
+    ) {
+        let lookup = target.strip_prefix('=').unwrap_or(target);
+        if let Ok(session_name) = SessionName::new(lookup.to_owned()) {
+            return session_not_found(&session_name);
+        }
+    }
+    error
+}
+
+fn switch_target_response_name(target: &Target) -> &'static str {
+    match target {
+        Target::Session(_) => "session",
+        Target::Window(_) => "window",
+        Target::Pane(_) => "pane",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_proto::{NewSessionRequest, NewWindowRequest, Request, Response, TerminalSize};
+    use tokio::sync::mpsc;
+
+    fn session_name(value: &str) -> SessionName {
+        SessionName::new(value).expect("valid session name")
+    }
+
+    async fn create_session(handler: &RequestHandler, name: SessionName) {
+        let response = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: name,
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    }
+
+    async fn create_window_with_name(
+        handler: &RequestHandler,
+        session_name: &SessionName,
+        window_name: &str,
+    ) -> u32 {
+        let mut state = handler.state.lock().await;
+        let session = state
+            .sessions
+            .session_mut(session_name)
+            .expect("session exists");
+        let (window_index, _) = session
+            .create_window(TerminalSize { cols: 80, rows: 24 })
+            .expect("window create succeeds");
+        session
+            .rename_window(window_index, window_name.to_owned())
+            .expect("window rename succeeds");
+        window_index
+    }
+
+    #[tokio::test]
+    async fn apply_switch_target_resolves_window_id_target() {
+        let handler = RequestHandler::new();
+        let alpha = session_name("switch-window-id-alpha");
+        create_session(&handler, alpha.clone()).await;
+        let response = handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: alpha.clone(),
+                name: None,
+                detached: true,
+                environment: None,
+                command: None,
+                start_directory: None,
+                target_window_index: None,
+                insert_at_target: false,
+                process_command: None,
+            })))
+            .await;
+        assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
+        let window_id = {
+            let state = handler.state.lock().await;
+            state
+                .sessions
+                .session(&alpha)
+                .and_then(|session| session.window_at(1))
+                .map(|window| window.id().to_string())
+                .expect("second window id exists")
+        };
+
+        let switched = handler
+            .apply_switch_target(&window_id, Some(&alpha), TargetFindFlags::NONE, false)
+            .await
+            .expect("window id target resolves");
+        assert_eq!(switched, alpha);
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .sessions
+                .session(&alpha)
+                .expect("alpha session exists")
+                .active_window_index(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_switch_target_resolves_bare_session_name_before_window_name() {
+        let handler = RequestHandler::new();
+        let alpha = session_name("switch-bare-window-alpha");
+        let editor = session_name("editor");
+        create_session(&handler, alpha.clone()).await;
+        create_session(&handler, editor.clone()).await;
+        let editor_window = create_window_with_name(&handler, &alpha, "editor").await;
+
+        let switched = handler
+            .apply_switch_target("editor", Some(&alpha), TargetFindFlags::NONE, false)
+            .await
+            .expect("bare session name resolves before colliding window name");
+
+        assert_eq!(switched, editor);
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .sessions
+                .session(&alpha)
+                .expect("alpha session exists")
+                .active_window_index(),
+            0,
+            "colliding alpha window {editor_window} must not be selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_switch_target_rejects_bare_numeric_window_without_session_match() {
+        let handler = RequestHandler::new();
+        let alpha = session_name("switch-bare-numeric-alpha");
+        create_session(&handler, alpha.clone()).await;
+        create_window_with_name(&handler, &alpha, "one").await;
+        create_window_with_name(&handler, &alpha, "two").await;
+
+        let error = handler
+            .apply_switch_target("2", Some(&alpha), TargetFindFlags::NONE, false)
+            .await
+            .expect_err("bare numeric window index is not a session target");
+
+        assert!(matches!(error, RmuxError::SessionNotFound(session) if session == "2"));
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .sessions
+                .session(&alpha)
+                .expect("alpha session exists")
+                .active_window_index(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn switch_client_dot_target_keeps_current_attached_session() {
+        let handler = RequestHandler::new();
+        let requester_pid = std::process::id();
+        let work = session_name("switch-dot-work");
+        let idle = session_name("switch-dot-idle");
+        create_session(&handler, work.clone()).await;
+        create_session(&handler, idle).await;
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        handler
+            .register_attach(requester_pid, work.clone(), control_tx)
+            .await;
+
+        let response = handler
+            .handle(Request::SwitchClientExt3(Box::new(
+                SwitchClientExt3Request {
+                    target_client: None,
+                    target: Some(".".to_owned()),
+                    key_table: None,
+                    last_session: false,
+                    next_session: false,
+                    previous_session: false,
+                    toggle_read_only: false,
+                    sort_order: None,
+                    skip_environment_update: false,
+                    zoom: false,
+                },
+            )))
+            .await;
+
+        assert_eq!(
+            response,
+            Response::SwitchClient(SwitchClientResponse {
+                session_name: work.clone()
+            })
+        );
+        assert_eq!(
+            handler
+                .attached_session_name_for_command(requester_pid, "switch-client")
+                .await
+                .expect("attached client remains registered"),
+            work
+        );
     }
 }

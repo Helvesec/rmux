@@ -136,12 +136,27 @@ impl Connection {
         include_inherited: bool,
         quiet: bool,
     ) -> Result<Response, ClientError> {
+        self.show_options_extended(scope, name, value_only, include_inherited, quiet, false)
+    }
+
+    /// Sends an extended `show-options` request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_options_extended(
+        &mut self,
+        scope: OptionScopeSelector,
+        name: Option<String>,
+        value_only: bool,
+        include_inherited: bool,
+        quiet: bool,
+        include_hooks: bool,
+    ) -> Result<Response, ClientError> {
         self.roundtrip(&Request::ShowOptions(ShowOptionsRequest {
             scope,
             name,
             value_only,
             include_inherited,
             quiet,
+            include_hooks,
         }))
     }
 
@@ -211,7 +226,7 @@ mod tests {
     use std::io::{self, Read};
     use std::os::unix::net::UnixStream;
 
-    use rmux_proto::{OptionName, RmuxError, ScopeSelector, SessionName, SetOptionMode};
+    use rmux_proto::{OptionName, RmuxError, ScopeSelector, SetOptionMode};
 
     use super::Connection;
     use crate::ClientError;
@@ -226,9 +241,9 @@ mod tests {
 
         let error = connection
             .set_option(
-                ScopeSelector::Session(SessionName::new("alpha").expect("valid session")),
-                OptionName::DefaultTerminal,
-                "tmux-256color".to_owned(),
+                ScopeSelector::Global,
+                OptionName::BaseIndex,
+                "abc".to_owned(),
                 SetOptionMode::Replace,
             )
             .expect_err("invalid request should fail");
@@ -236,7 +251,7 @@ mod tests {
         assert!(matches!(
             error,
             ClientError::Protocol(RmuxError::InvalidSetOption(message))
-                if message == "default-terminal is only supported at global scope"
+                if message == "value is invalid: abc"
         ));
 
         let mut buffer = [0_u8; 1];

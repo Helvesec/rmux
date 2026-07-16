@@ -268,6 +268,21 @@ fn render_prelude_emits_title_path_and_cursor_colour() {
 }
 
 #[test]
+fn attach_start_queries_client_theme_reports() {
+    let terminal = OuterTerminal::resolve(
+        &OptionStore::new(),
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+
+    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
+    let stop = String::from_utf8(terminal.attach_stop_sequence()).expect("utf8");
+
+    assert!(start.contains("\u{1b}[?2031h"));
+    assert!(start.contains("\u{1b}[?996n"));
+    assert!(stop.contains("\u{1b}[?2031l"));
+}
+
+#[test]
 fn cursor_style_transition_preserves_terminal_default_on_initial_default_attach() {
     let terminal = OuterTerminal::resolve(
         &OptionStore::new(),

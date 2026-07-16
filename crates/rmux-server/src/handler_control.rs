@@ -36,12 +36,12 @@ pub(super) struct ActiveControl {
     pub(super) user: UserIdentity,
     pub(super) can_write: bool,
     pub(super) terminal_context: OuterTerminalContext,
-    event_tx: mpsc::UnboundedSender<ControlServerEvent>,
+    event_tx: mpsc::Sender<ControlServerEvent>,
     closing: Arc<AtomicBool>,
 }
 
 pub(crate) struct ControlRegistration {
-    pub(crate) event_tx: mpsc::UnboundedSender<ControlServerEvent>,
+    pub(crate) event_tx: mpsc::Sender<ControlServerEvent>,
     pub(crate) closing: Arc<AtomicBool>,
     pub(crate) uid: u32,
     pub(crate) user: UserIdentity,
@@ -60,7 +60,7 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         upgrade: ControlModeUpgrade,
-        event_tx: mpsc::UnboundedSender<ControlServerEvent>,
+        event_tx: mpsc::Sender<ControlServerEvent>,
         closing: Arc<AtomicBool>,
     ) -> u64 {
         self.register_control_with_access(
@@ -102,7 +102,7 @@ impl RequestHandler {
             },
         ) {
             previous.closing.store(true, Ordering::SeqCst);
-            let _ = previous.event_tx.send(ControlServerEvent::Exit(None));
+            let _ = try_send_control_event(&previous, ControlServerEvent::Exit(None));
         }
         drop(active_control);
 
@@ -189,17 +189,21 @@ impl RequestHandler {
         new_name: &rmux_proto::SessionName,
     ) {
         let mut active_control = self.active_control.lock().await;
-        for active in active_control.by_pid.values_mut() {
+        active_control.by_pid.retain(|_, active| {
             if active.session_name.as_ref() == Some(session_name) {
                 active.session_name = Some(new_name.clone());
-                let _ = active
-                    .event_tx
-                    .send(ControlServerEvent::SessionChanged(Some(new_name.clone())));
+                if !try_send_control_event(
+                    active,
+                    ControlServerEvent::SessionChanged(Some(new_name.clone())),
+                ) {
+                    return false;
+                }
             }
             if active.last_session.as_ref() == Some(session_name) {
                 active.last_session = Some(new_name.clone());
             }
-        }
+            true
+        });
     }
 
     pub(super) async fn current_session_candidate(
@@ -299,12 +303,10 @@ impl RequestHandler {
             }
         }
         active.session_name = next_session_name.clone();
-        if active
-            .event_tx
-            .send(ControlServerEvent::SessionChanged(next_session_name))
-            .is_err()
-        {
-            active.closing.store(true, Ordering::SeqCst);
+        if !try_send_control_event(
+            active,
+            ControlServerEvent::SessionChanged(next_session_name),
+        ) {
             active_control.by_pid.remove(&requester_pid);
             return Err(attached_client_required("control session"));
         }
@@ -317,7 +319,7 @@ impl RequestHandler {
             if active.session_name.as_ref() != Some(session_name) {
                 return true;
             }
-            active.event_tx.send(ControlServerEvent::Refresh).is_ok()
+            try_send_control_event(active, ControlServerEvent::Refresh)
         });
     }
 
@@ -332,10 +334,7 @@ impl RequestHandler {
                 return true;
             }
             active.closing.store(true, Ordering::SeqCst);
-            active
-                .event_tx
-                .send(ControlServerEvent::Exit(reason.clone()))
-                .is_ok()
+            try_send_control_event(active, ControlServerEvent::Exit(reason.clone()))
         });
     }
 
@@ -358,9 +357,7 @@ impl RequestHandler {
                 continue;
             };
             active.closing.store(true, Ordering::SeqCst);
-            let _ = active
-                .event_tx
-                .send(ControlServerEvent::Exit(reason.clone()));
+            let _ = try_send_control_event(active, ControlServerEvent::Exit(reason.clone()));
         }
         for control_pid in &control_pids {
             active_control.by_pid.remove(control_pid);
@@ -456,7 +453,12 @@ impl RequestHandler {
                 self.exit_control_session(session_name, None).await;
                 self.refresh_all_control_sessions().await;
             }
-            LifecycleEvent::ClientAttached { .. }
+            LifecycleEvent::ClientActive { .. }
+            | LifecycleEvent::ClientAttached { .. }
+            | LifecycleEvent::ClientFocusIn { .. }
+            | LifecycleEvent::ClientFocusOut { .. }
+            | LifecycleEvent::ClientLightTheme { .. }
+            | LifecycleEvent::ClientDarkTheme { .. }
             | LifecycleEvent::AlertBell { .. }
             | LifecycleEvent::AlertActivity { .. }
             | LifecycleEvent::AlertSilence { .. }
@@ -464,6 +466,7 @@ impl RequestHandler {
             | LifecycleEvent::PaneDied { .. }
             | LifecycleEvent::PaneFocusIn { .. }
             | LifecycleEvent::PaneFocusOut { .. }
+            | LifecycleEvent::PaneSetClipboard { .. }
             | LifecycleEvent::PaneTitleChanged { .. }
             | LifecycleEvent::WindowResized { .. }
             | LifecycleEvent::AfterSelectWindow { .. }
@@ -484,11 +487,7 @@ impl RequestHandler {
         };
         let session_name = active.session_name.clone();
         active.closing.store(true, Ordering::SeqCst);
-        if active
-            .event_tx
-            .send(ControlServerEvent::Exit(reason))
-            .is_err()
-        {
+        if !try_send_control_event(active, ControlServerEvent::Exit(reason)) {
             active_control.by_pid.remove(&requester_pid);
         }
         Ok(session_name)
@@ -560,14 +559,19 @@ fn deliver_control_notification(
     let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
         return;
     };
-    if active
-        .event_tx
-        .send(ControlServerEvent::Notification(line))
-        .is_err()
-    {
-        active.closing.store(true, Ordering::SeqCst);
+    if !try_send_control_event(active, ControlServerEvent::Notification(line)) {
         active_control.by_pid.remove(&requester_pid);
     }
+}
+
+fn try_send_control_event(active: &ActiveControl, event: ControlServerEvent) -> bool {
+    // Callers hold `active_control`: never await capacity for a client that is not draining.
+    if active.event_tx.try_send(event).is_ok() {
+        return true;
+    }
+
+    active.closing.store(true, Ordering::SeqCst);
+    false
 }
 
 fn uniform_broadcast_line(

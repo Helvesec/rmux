@@ -1,7 +1,7 @@
 # rmux-render-core
 
 > **Early API.** Workspace-internal building block of
-> [RMUX](https://github.com/helvesec/rmux); the surface is not yet stabilised
+> [RMUX](https://github.com/Helvesec/rmux); the surface is not yet stabilised
 > and may change inside `0.x`. For a stable rendering path, depend on
 > [`ratatui-rmux`](https://crates.io/crates/ratatui-rmux) instead.
 

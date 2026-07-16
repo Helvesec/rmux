@@ -363,11 +363,14 @@ async fn wait_for_session_pane_ttys(
 
     while Instant::now() < deadline {
         let listed = client
-            .send_request(&Request::ListPanes(ListPanesRequest {
+            .send_request(&Request::ListPanes(Box::new(ListPanesRequest {
                 target: session.clone(),
                 format: Some("#{pane_index}:#{pane_tty}".to_owned()),
+                filter: None,
+                sort_order: None,
+                reversed: false,
                 target_window_index: None,
-            }))
+            })))
             .await?;
         let output = listed
             .command_output()

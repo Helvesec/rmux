@@ -134,13 +134,19 @@ impl HandlerState {
                 continue;
             }
 
-            let member = self
-                .sessions
-                .session_mut(&member_name)
-                .ok_or_else(|| session_not_found(&member_name))?;
-            member.synchronize_group_from(&source_session);
+            let before_pane_options = self.pane_option_slots_for_session(&member_name)?;
+            {
+                let member = self
+                    .sessions
+                    .session_mut(&member_name)
+                    .ok_or_else(|| session_not_found(&member_name))?;
+                member.synchronize_group_from(&source_session);
+            }
+            self.rekey_pane_options_after_session_change(&before_pane_options, &member_name)?;
             synchronized.push(member_name);
         }
+
+        self.synchronize_pane_alias_options_from_session(&source_session)?;
 
         Ok(synchronized)
     }

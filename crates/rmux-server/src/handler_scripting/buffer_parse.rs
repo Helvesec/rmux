@@ -12,6 +12,7 @@ pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxE
     let mut append = false;
     let mut new_name = None;
     let mut set_clipboard = false;
+    let mut target_client = None;
     while let Some(token) = args.peek() {
         match token {
             "--" => {
@@ -32,7 +33,7 @@ pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxE
             }
             "-t" => {
                 let _ = args.optional();
-                let _ = args.required("-t target")?;
+                target_client = Some(args.required("-t target-client")?);
             }
             "-w" => {
                 let _ = args.optional();
@@ -47,13 +48,14 @@ pub(super) fn parse_set_buffer(mut args: CommandTokens) -> Result<Request, RmuxE
     }
     let content = content_parts.join(" ");
 
-    Ok(Request::SetBuffer(rmux_proto::SetBufferRequest {
+    Ok(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
         name,
         content: content.into_bytes(),
         append,
         new_name,
         set_clipboard,
-    }))
+        target_client,
+    })))
 }
 
 pub(super) fn parse_show_buffer(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -118,15 +120,15 @@ pub(super) fn parse_paste_buffer(
 pub(super) fn parse_list_buffers(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut format = None;
     let mut filter = None;
-    let sort_order = None;
-    let reversed = false;
+    let mut sort_order = None;
+    let mut reversed = false;
 
     while let Some(token) = args.optional() {
         match token.as_str() {
             "-F" => format = Some(args.required("-F format")?),
             "-f" => filter = Some(args.required("-f filter")?),
-            "-O" => return Err(unsupported_flag("list-buffers", "-O")),
-            "-r" => return Err(unsupported_flag("list-buffers", "-r")),
+            "-O" => sort_order = Some(args.required("-O order")?),
+            "-r" => reversed = true,
             flag if flag.starts_with('-') => return Err(unsupported_flag("list-buffers", flag)),
             _ => {
                 return Err(RmuxError::Server(format!(
@@ -156,6 +158,7 @@ pub(super) fn parse_load_buffer(
 ) -> Result<Request, RmuxError> {
     let mut name = None;
     let mut set_clipboard = false;
+    let mut target_client = None;
     while let Some(token) = args.peek() {
         match token {
             "--" => {
@@ -170,18 +173,23 @@ pub(super) fn parse_load_buffer(
                 let _ = args.optional();
                 set_clipboard = true;
             }
+            "-t" => {
+                let _ = args.optional();
+                target_client = Some(args.required("-t target-client")?);
+            }
             flag if flag.starts_with('-') => return Err(unsupported_flag("load-buffer", flag)),
             _ => break,
         }
     }
     let path = args.required("load-buffer path")?;
     args.no_extra("load-buffer")?;
-    Ok(Request::LoadBuffer(LoadBufferRequest {
+    Ok(Request::LoadBuffer(Box::new(LoadBufferRequest {
         path,
         cwd: caller_cwd.map(PathBuf::from),
         name,
         set_clipboard,
-    }))
+        target_client,
+    })))
 }
 
 pub(super) fn parse_save_buffer(

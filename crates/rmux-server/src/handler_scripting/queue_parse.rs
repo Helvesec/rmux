@@ -21,6 +21,8 @@ use super::tokens::{parse_compact_flag_cluster, CompactFlag};
 use super::values::{missing_argument, unsupported_flag};
 use crate::pane_terminals::session_not_found;
 
+const DEFAULT_NEW_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
+
 #[derive(Debug, Clone)]
 pub(super) struct ParsedNewWindowCommand {
     pub(super) target: SessionName,
@@ -28,6 +30,10 @@ pub(super) struct ParsedNewWindowCommand {
     pub(super) insert_at_target: bool,
     pub(super) name: Option<String>,
     pub(super) detached: bool,
+    pub(super) print_target: bool,
+    pub(super) format: String,
+    pub(super) kill_existing: bool,
+    pub(super) select_existing: bool,
     pub(super) start_directory: Option<PathBuf>,
     pub(super) environment: Option<Vec<String>>,
     pub(super) command: Option<Vec<String>>,
@@ -55,6 +61,10 @@ pub(super) fn parse_queued_new_window(
     let mut target_window_index = None;
     let mut name = None;
     let mut detached = false;
+    let mut print_target = false;
+    let mut format = None;
+    let mut kill_existing = false;
+    let mut select_existing = false;
     let mut after = false;
     let mut before = false;
     let mut target_has_signed_window_part = false;
@@ -90,6 +100,14 @@ pub(super) fn parse_queued_new_window(
                 let _ = args.pop_front();
                 environment.push(pop_string_argument(&mut args, "-e name=value")?);
             }
+            "-F" => {
+                let _ = args.pop_front();
+                format = Some(pop_string_argument(&mut args, "-F format")?);
+            }
+            "-P" => {
+                let _ = args.pop_front();
+                print_target = true;
+            }
             "-t" => {
                 let _ = args.pop_front();
                 let raw_target = pop_string_argument(&mut args, "-t target")?;
@@ -108,8 +126,16 @@ pub(super) fn parse_queued_new_window(
                 let _ = args.pop_front();
                 detached = true;
             }
+            "-k" => {
+                let _ = args.pop_front();
+                kill_existing = true;
+            }
+            "-S" => {
+                let _ = args.pop_front();
+                select_existing = true;
+            }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "abd", "cetn") else {
+                let Some(cluster) = parse_compact_flag_cluster(token, "abdPkS", "ceFtn") else {
                     break;
                 };
                 let _ = args.pop_front();
@@ -125,6 +151,9 @@ pub(super) fn parse_queued_new_window(
                             before = true;
                         }
                         CompactFlag::Bare('d') => detached = true,
+                        CompactFlag::Bare('P') => print_target = true,
+                        CompactFlag::Bare('k') => kill_existing = true,
+                        CompactFlag::Bare('S') => select_existing = true,
                         CompactFlag::Bare(flag) => {
                             return Err(unsupported_flag("new-window", &format!("-{flag}")))
                         }
@@ -140,6 +169,13 @@ pub(super) fn parse_queued_new_window(
                                 &mut args,
                                 value,
                                 "-e name=value",
+                            )?);
+                        }
+                        CompactFlag::Value { flag: 'F', value } => {
+                            format = Some(compact_value_or_next_argument(
+                                &mut args,
+                                value,
+                                "-F format",
                             )?);
                         }
                         CompactFlag::Value { flag: 't', value } => {
@@ -223,6 +259,10 @@ pub(super) fn parse_queued_new_window(
         insert_at_target,
         name,
         detached,
+        print_target,
+        format: format.unwrap_or_else(|| DEFAULT_NEW_WINDOW_PRINT_FORMAT.to_owned()),
+        kill_existing,
+        select_existing,
         start_directory,
         environment: (!environment.is_empty()).then_some(environment),
         command,

@@ -391,7 +391,7 @@ fn terminate_status_job(child: &mut std::process::Child, process_group: StatusJo
 
 fn status_job_command(command: &str, profile: Option<&TerminalProfile>) -> Command {
     if let Some(profile) = profile {
-        let mut process = profile.shell_std_command(command);
+        let mut process = status_job_profile_command(command, profile);
         process.env_clear();
         for (name, value) in profile.raw_environment() {
             process.env(name, value);
@@ -400,6 +400,19 @@ fn status_job_command(command: &str, profile: Option<&TerminalProfile>) -> Comma
     }
 
     shell_command(command)
+}
+
+#[cfg(unix)]
+fn status_job_profile_command(command: &str, profile: &TerminalProfile) -> Command {
+    let mut process =
+        crate::terminal::shell_std_command(std::path::Path::new("/bin/sh"), profile.cwd(), command);
+    process.current_dir(profile.cwd());
+    process
+}
+
+#[cfg(not(unix))]
+fn status_job_profile_command(command: &str, profile: &TerminalProfile) -> Command {
+    profile.shell_std_command(command)
 }
 
 fn shell_command(command: &str) -> Command {

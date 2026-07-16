@@ -29,6 +29,9 @@ use templates::{
 };
 
 const ATTACH_SCREEN_RESET_SEQUENCE: &[u8] = b"\x1b[0m\x1b[?25l\x1b[H\x1b[2J";
+const THEME_REPORT_ENABLE_SEQUENCE: &[u8] = b"\x1b[?2031h";
+const THEME_REPORT_DISABLE_SEQUENCE: &[u8] = b"\x1b[?2031l";
+const THEME_REPORT_QUERY_SEQUENCE: &[u8] = b"\x1b[?996n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorScope {
@@ -173,6 +176,8 @@ impl OuterTerminal {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(alternate_screen_enter_sequence(self.context.term_name()));
         bytes.extend_from_slice(ATTACH_SCREEN_RESET_SEQUENCE);
+        bytes.extend_from_slice(THEME_REPORT_ENABLE_SEQUENCE);
+        bytes.extend_from_slice(THEME_REPORT_QUERY_SEQUENCE);
         if let Some(sequence) = &self.enable_bpaste {
             bytes.extend_from_slice(sequence.as_bytes());
         }
@@ -223,6 +228,7 @@ impl OuterTerminal {
         if let Some(sequence) = self.disable_mouse_sequence().as_deref() {
             bytes.extend_from_slice(sequence.as_bytes());
         }
+        bytes.extend_from_slice(THEME_REPORT_DISABLE_SEQUENCE);
         if let Some(sequence) = &self.disable_bpaste {
             bytes.extend_from_slice(sequence.as_bytes());
         }

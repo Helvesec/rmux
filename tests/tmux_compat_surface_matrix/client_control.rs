@@ -7,9 +7,7 @@ fn tmux_compat_list_clients_attached_readonly_ignore_size_flags_when_frozen_tmux
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let (config, expected_overrides) = config_with_clean_homes(&harness)?;
 
     let create = harness.run_pair_with(
@@ -84,9 +82,7 @@ fn tmux_compat_attached_client_utf8_flags_follow_ascii_locale_without_top_level_
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let (config, _) = config_with_clean_homes(&harness)?;
     let create =
         harness.run_pair_with(&tmux_binary, &["new-session", "-d", "-s", "alpha"], config)?;
@@ -129,9 +125,7 @@ fn tmux_compat_choose_client_multi_attached_overlay_rows_when_frozen_tmux_is_ava
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let config = tmux_compat_config()
         .with_env("LC_ALL", "C.UTF-8")
         .with_env("LC_CTYPE", "C.UTF-8");
@@ -172,16 +166,33 @@ fn tmux_compat_choose_client_multi_attached_overlay_rows_when_frozen_tmux_is_ava
 
     let choose = harness.run_pair_with(&tmux_binary, &["choose-client"], config)?;
     assert_quiet_success(&choose);
-    std::thread::sleep(Duration::from_millis(250));
-
-    let rmux_cells = render_cells(&drain_pty(&mut rmux_first)?, 80, 24)
-        .into_iter()
-        .map(|line| normalize_pts_paths(line.trim_end()))
-        .collect::<Vec<_>>();
-    let tmux_cells = render_cells(&drain_pty(&mut tmux_first)?, 80, 24)
-        .into_iter()
-        .map(|line| normalize_pts_paths(line.trim_end()))
-        .collect::<Vec<_>>();
+    let mut rmux_bytes = Vec::new();
+    let mut tmux_bytes = Vec::new();
+    let mut rmux_cells = Vec::new();
+    let mut tmux_cells = Vec::new();
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(100));
+        rmux_bytes.extend(drain_pty(&mut rmux_first)?);
+        tmux_bytes.extend(drain_pty(&mut tmux_first)?);
+        rmux_cells = render_cells(&rmux_bytes, 80, 24)
+            .into_iter()
+            .map(|line| normalize_pts_paths(line.trim_end()))
+            .collect::<Vec<_>>();
+        tmux_cells = render_cells(&tmux_bytes, 80, 24)
+            .into_iter()
+            .map(|line| normalize_pts_paths(line.trim_end()))
+            .collect::<Vec<_>>();
+        if [0usize, 1, 11, 22].into_iter().all(|row| {
+            if row == 11 {
+                collapse_repeated_horizontal_borders(&rmux_cells[row])
+                    == collapse_repeated_horizontal_borders(&tmux_cells[row])
+            } else {
+                rmux_cells[row] == tmux_cells[row]
+            }
+        }) {
+            break;
+        }
+    }
 
     for row in [0usize, 1, 11, 22] {
         if row == 11 {
@@ -350,21 +361,28 @@ fn tmux_compat_control_mode_guard_tuple_and_exit_framing_when_frozen_tmux_is_ava
         "rmux payload must contain the display-message output: {rmux_payload:?}"
     );
 
-    // Every begin/end guard in the rmux transcript must advertise flags=1
-    // and pair with a matching close kind that reuses the same command
-    // number. This is the Cluster H invariant on the emit-side, independent
-    // of whether tmux reports a different absolute command-number offset.
+    // tmux emits an initial control attach guard pair with flags=0, then
+    // every user command guard uses flags=1. The concrete absolute command
+    // numbers may differ, but rmux must keep them positive and monotonic.
     assert!(
         !rmux_guards.is_empty(),
         "rmux transcript must contain at least one guard tuple: {:?}",
         cmd_rmux.stdout
     );
-    for guard in &rmux_guards {
-        assert_eq!(
-            guard.flags, 1,
-            "every rmux guard flags column must be 1: {guard:?}"
-        );
-    }
+    assert!(
+        rmux_guards
+            .iter()
+            .any(|guard| guard.kind == "begin" && guard.flags == 0),
+        "rmux transcript must include the initial flags=0 control guard: {rmux_guards:?}"
+    );
+    assert_eq!(
+        rmux_last_begin.flags, 1,
+        "last rmux %begin must be the user command guard: {rmux_last_begin:?}"
+    );
+    assert_eq!(
+        rmux_last_end.flags, 1,
+        "last rmux %end must be the user command guard: {rmux_last_end:?}"
+    );
     let rmux_begin_numbers = rmux_guards
         .iter()
         .filter(|guard| guard.kind == "begin")
@@ -537,9 +555,7 @@ fn tmux_compat_attached_client_top_level_terminal_runtime_overrides_when_frozen_
     let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
         return Ok(());
     };
-    let _guard = pty_tmux_compat_lock()
-        .lock()
-        .expect("pty compatibility lock");
+    let _guard = pty_tmux_compat_lock();
     let (config, _) = config_with_clean_homes(&harness)?;
     let create =
         harness.run_pair_with(&tmux_binary, &["new-session", "-d", "-s", "alpha"], config)?;

@@ -12,7 +12,8 @@ impl RequestHandler {
             .with_str("scope", "session")
             .with_str("session", session_name.as_str());
         #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
+        self.wait_for_windows_deferred_session_panes_ready(session_name)
+            .await;
         let removed_stale_clients = self
             .prune_stale_attached_clients_for_session(session_name)
             .await;
@@ -192,7 +193,8 @@ impl RequestHandler {
             .with_u64("attach_pid", u64::from(attach_pid))
             .with_str("session", session_name.as_str());
         #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
+        self.wait_for_windows_deferred_session_panes_ready(session_name)
+            .await;
         let attached_count = self.attached_count(session_name).await;
         let prompt = {
             let active_attach = self.active_attach.lock().await;

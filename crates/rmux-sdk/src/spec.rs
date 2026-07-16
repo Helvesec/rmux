@@ -17,6 +17,9 @@ use crate::SessionName;
 #[non_exhaustive]
 pub enum ProcessCommandSpec {
     /// Execute a program directly with structured argv.
+    ///
+    /// On Windows, `.bat` and `.cmd` targets run through `cmd.exe`, so its
+    /// percent-variable expansion still applies.
     Argv(Vec<String>),
     /// Execute command text through the configured shell.
     Shell(String),
@@ -63,6 +66,9 @@ pub struct ProcessSpec {
 
 impl ProcessSpec {
     /// Creates a process spec that executes direct argv.
+    ///
+    /// On Windows, use a native executable when arguments must bypass
+    /// `cmd.exe` expansion; batch targets inherently run through `cmd.exe`.
     #[must_use]
     pub fn argv<I, S>(command: I) -> Self
     where
@@ -280,13 +286,16 @@ impl From<AttachSessionSpec> for rmux_proto::AttachSessionExt2Request {
     }
 }
 
-/// Control-mode subscription fields for `refresh-client`.
+/// Reserved wire-v5 control-mode subscription fields for `refresh-client`.
+///
+/// RMUX 0.9 does not implement these fields. Populating either field produces
+/// a request that the server rejects fail-closed.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionSpec {
-    /// Control-mode subscription updates from `refresh-client -A`.
+    /// Reserved subscription-update field; unsupported by RMUX 0.9.
     #[serde(default)]
     pub subscriptions: Vec<String>,
-    /// Control-mode subscription definitions from `refresh-client -B`.
+    /// Reserved subscription-definition field; unsupported by RMUX 0.9.
     #[serde(default)]
     pub subscriptions_format: Vec<String>,
 }
@@ -327,13 +336,13 @@ pub struct RefreshClientSpec {
     /// Optional client-flag string from `-F`.
     #[serde(default)]
     pub flags_alias: Option<String>,
-    /// Control-mode subscription fields.
+    /// Reserved control-mode subscription fields; unsupported by RMUX 0.9.
     #[serde(default)]
     pub subscriptions: SubscriptionSpec,
     /// Optional control-mode size string from `-C`.
     #[serde(default)]
     pub control_size: Option<String>,
-    /// Optional control-mode colour report request from `-r`.
+    /// Reserved wire-v5 colour-report field; unsupported by RMUX 0.9.
     #[serde(default)]
     pub colour_report: Option<String>,
 }

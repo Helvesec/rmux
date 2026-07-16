@@ -8,8 +8,10 @@ use rmux_proto::AttachFrameDecoder;
 use tokio::io::DuplexStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 const ATTACH_READ_BUFFER_SIZE: usize = 8192;
+const ATTACH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(feature = "web")]
 const IN_PROCESS_ATTACH_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -73,10 +75,14 @@ impl AttachTransport {
             return Ok(());
         }
         let mut writer = self.writer.lock().await;
-        match writer.write_all(bytes).await {
-            Ok(()) => Ok(()),
-            Err(error) if is_peer_disconnect(&error) => Ok(()),
-            Err(error) => Err(error),
+        match timeout(ATTACH_WRITE_TIMEOUT, writer.write_all(bytes)).await {
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "attach client did not drain server output",
+            )),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if is_peer_disconnect(&error) => Ok(()),
+            Ok(Err(error)) => Err(error),
         }
     }
 

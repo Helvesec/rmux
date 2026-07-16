@@ -1,5 +1,5 @@
 use rmux_core::command_parser::{CommandArgument, ParsedCommand, ParsedCommands};
-use rmux_proto::{RmuxError, SessionName, Target};
+use rmux_proto::{DisplayPanesRequest, ErrorResponse, Response, RmuxError, SessionName, Target};
 
 use crate::mouse::AttachedMouseEvent;
 
@@ -41,6 +41,37 @@ pub(super) async fn execute_attached_binding_commands(
         .with_client_name(Some(attached_client_name(attach_pid)))
         .with_mouse_target(mouse_target)
         .with_mouse_event(mouse_event);
+
+    if attached_live_input && parsed_commands_are_plain_display_panes(&commands) {
+        match handler
+            .handle_display_panes(
+                requester_pid,
+                DisplayPanesRequest {
+                    target: session_name.clone(),
+                    duration_ms: None,
+                    non_blocking: true,
+                    no_command: false,
+                    template: None,
+                    target_client: Some(attached_client_name(attach_pid)),
+                },
+            )
+            .await
+        {
+            Response::DisplayPanes(_) => return Ok(()),
+            Response::Error(ErrorResponse { error }) => {
+                handler
+                    .report_attached_command_error(&session_name, attach_pid, &error)
+                    .await;
+                return Ok(());
+            }
+            other => {
+                return Err(RmuxError::Server(format!(
+                    "display-panes binding returned unexpected {} response",
+                    other.command_name()
+                )));
+            }
+        }
+    }
 
     if parsed_commands_block_for_prompt(&commands) {
         if attached_live_input
@@ -94,6 +125,13 @@ pub(super) async fn execute_attached_binding_commands(
     }
 
     Ok(())
+}
+
+fn parsed_commands_are_plain_display_panes(commands: &ParsedCommands) -> bool {
+    let commands = commands.commands();
+    commands.len() == 1
+        && commands[0].name() == "display-panes"
+        && commands[0].arguments().is_empty()
 }
 
 fn parsed_commands_block_for_prompt(commands: &ParsedCommands) -> bool {

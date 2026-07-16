@@ -1,6 +1,6 @@
 # rmux-os
 
-Small OS abstraction layer used by [RMUX](https://github.com/helvesec/rmux) IPC and terminal integrations.
+Small OS abstraction layer used by [RMUX](https://github.com/Helvesec/rmux) IPC and terminal integrations.
 
 A thin, dependency-light wrapper around the OS-specific bits the RMUX
 runtime needs at its boundary: host introspection, process identity, user

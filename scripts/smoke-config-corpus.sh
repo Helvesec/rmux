@@ -129,7 +129,7 @@ run_startup_fallback() {
   local startup_config="$workdir/startup-$marker.conf"
   rm -rf "$tmux_dir"
   mkdir -p "$tmux_dir" || return $?
-  cp "$path" "$startup_config" || return $?
+  cat "$path" >"$startup_config" || return $?
   printf '\nset -g @rmux-corpus-loaded %s\n' "$marker" >>"$startup_config" || return $?
   ln -s "$startup_config" "$tmux_dir/tmux.conf" || return $?
   run_rmux kill-server >/dev/null 2>&1 || true

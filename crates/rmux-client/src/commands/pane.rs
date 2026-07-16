@@ -137,13 +137,35 @@ impl Connection {
         no_command: bool,
         template: Option<String>,
     ) -> Result<Response, ClientError> {
-        let request = Request::DisplayPanes(DisplayPanesRequest {
+        self.display_panes_target_client(
             target,
             duration_ms,
             non_blocking,
             no_command,
             template,
-        });
+            None,
+        )
+    }
+
+    /// Sends a target-client-aware `display-panes` request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn display_panes_target_client(
+        &mut self,
+        target: SessionName,
+        duration_ms: Option<u64>,
+        non_blocking: bool,
+        no_command: bool,
+        template: Option<String>,
+        target_client: Option<String>,
+    ) -> Result<Response, ClientError> {
+        let request = Request::DisplayPanes(Box::new(DisplayPanesRequest {
+            target,
+            duration_ms,
+            non_blocking,
+            no_command,
+            template,
+            target_client,
+        }));
         if non_blocking {
             self.roundtrip(&request)
         } else {

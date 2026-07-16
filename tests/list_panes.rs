@@ -271,6 +271,23 @@ fn list_panes_window_target_lists_only_that_window() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn list_panes_pane_target_validates_out_of_range_pane_index() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("list-panes-missing-pane")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "alpha:0"])?);
+    assert_success(&harness.run(&["split-window", "-v", "-t", "alpha:0"])?);
+
+    let missing = harness.run(&["list-panes", "-t", "alpha:0.99", "-F", "#{pane_index}"])?;
+
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stdout(&missing).is_empty());
+    assert_eq!(stderr(&missing), "can't find pane: 99\n");
+    Ok(())
+}
+
+#[test]
 fn list_panes_filter_matches_tmux_format_truthiness() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("list-panes-filter")?;
     let _daemon = harness.start_hidden_daemon()?;

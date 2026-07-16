@@ -220,6 +220,44 @@ fn remove_session_reports_missing_sessions() {
 }
 
 #[test]
+fn extracted_session_pair_preserves_owner_and_pair_for_success_and_error() {
+    for mutation_fails in [false, true] {
+        let mut store = SessionStore::new();
+        let owner = session_name("owner");
+        let peer = session_name("peer");
+        let target = session_name("target");
+        let size = TerminalSize { cols: 80, rows: 24 };
+        store
+            .create_session(owner.clone(), size)
+            .expect("owner session succeeds");
+        store
+            .create_grouped_session_with_base_index(peer.clone(), size, 0, owner.clone())
+            .expect("grouped peer succeeds");
+        store
+            .create_session(target.clone(), size)
+            .expect("target session succeeds");
+
+        let mutation_result = store
+            .with_extracted_session_pair(&owner, &target, |source, destination| {
+                assert_eq!(source.name(), &owner);
+                assert_eq!(destination.name(), &target);
+                if mutation_fails {
+                    Err(RmuxError::Server("injected pair failure".to_owned()))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("session pair extracts");
+
+        assert_eq!(mutation_result.is_err(), mutation_fails);
+        assert!(store.contains_session(&owner));
+        assert!(store.contains_session(&target));
+        assert_eq!(store.runtime_owner(&owner), Some(owner.clone()));
+        assert_eq!(store.runtime_owner(&peer), Some(owner));
+    }
+}
+
+#[test]
 fn rename_session_updates_the_store_key_and_internal_name() {
     let mut store = SessionStore::new();
     let alpha = session_name("alpha");

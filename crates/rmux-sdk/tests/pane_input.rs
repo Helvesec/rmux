@@ -607,6 +607,7 @@ impl ControlClient {
                 terminal_features: Vec::new(),
                 utf8: true,
             },
+            initial_command_count: 0,
         }))?;
         stream.write_all(&frame).await?;
         match read_response(&mut stream).await? {

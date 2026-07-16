@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+rmux-proto = { path = "../../crates/rmux-proto", features = ["fuzzing"] }
 rmux-server = { path = "../../crates/rmux-server", features = ["web", "fuzzing"] }
 
 [workspace]
@@ -16,6 +17,13 @@ rmux-server = { path = "../../crates/rmux-server", features = ["web", "fuzzing"]
 [[bin]]
 name = "websocket_client_frame"
 path = "fuzz_targets/websocket_client_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "detached_frame_decoder"
+path = "fuzz_targets/detached_frame_decoder.rs"
 test = false
 doc = false
 bench = false

@@ -2,17 +2,21 @@ use super::*;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::control::{ControlModeUpgrade, ControlServerEvent};
+use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::handler::scripting_support::{
+    CONTROL_QUEUE_INSERTED_COMMAND_LIMIT, CONTROL_QUEUE_STDOUT_LIMIT,
+};
 use crate::handler::ControlRegistration;
 use crate::outer_terminal::OuterTerminalContext;
 use rmux_os::identity::UserIdentity;
+use rmux_proto::SetBufferRequest;
 use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn parsed_queue_assignments_apply_before_following_commands() {
     let handler = RequestHandler::new();
     let parsed = CommandParser::new()
-        .parse("FOO=bar ; run-shell true")
+        .parse("FOO=bar ; run-shell \"exit 0\"")
         .expect("commands parse");
 
     let output = handler
@@ -186,6 +190,66 @@ async fn detached_read_only_requester_rejects_mutating_queue_commands() {
 }
 
 #[tokio::test]
+async fn control_queue_rejects_excessive_runtime_command_insertion() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_005;
+    let _access = handler.begin_detached_requester_access(requester_pid, true);
+    let inserted = "start-server ;".repeat(CONTROL_QUEUE_INSERTED_COMMAND_LIMIT + 1);
+    let parsed = CommandParser::new()
+        .parse(&format!("if-shell -F 1 '{inserted}'"))
+        .expect("dynamic command list parses as one initial command");
+
+    let result = handler
+        .execute_control_commands(requester_pid, parsed)
+        .await;
+
+    let error = result
+        .error
+        .expect("runtime insertion beyond the aggregate limit must fail");
+    assert!(
+        error.to_string().contains("inserted too many commands"),
+        "{error}"
+    );
+    assert_eq!(result.exit_status, Some(1));
+}
+
+#[tokio::test]
+async fn control_queue_bounds_aggregate_stdout_before_extension() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_006;
+    let _access = handler.begin_detached_requester_access(requester_pid, true);
+    let chunk = vec![b'x'; CONTROL_QUEUE_STDOUT_LIMIT / 2 + 1];
+    let response = handler
+        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
+            name: Some("control-limit".to_owned()),
+            content: chunk.clone(),
+            append: false,
+            new_name: None,
+            set_clipboard: false,
+            target_client: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
+    let parsed = CommandParser::new()
+        .parse("show-buffer -b control-limit ; show-buffer -b control-limit")
+        .expect("bounded output commands parse");
+
+    let result = handler
+        .execute_control_commands(requester_pid, parsed)
+        .await;
+
+    let error = result
+        .error
+        .expect("aggregate control stdout beyond the limit must fail");
+    assert!(error.to_string().contains("stdout exceeds"), "{error}");
+    assert_eq!(
+        result.stdout, chunk,
+        "the rejected output must not be appended"
+    );
+    assert_eq!(result.exit_status, Some(1));
+}
+
+#[tokio::test]
 async fn read_only_control_allows_list_panes_all_observation() {
     let handler = RequestHandler::new();
     let requester_pid = 42_004;
@@ -234,11 +298,12 @@ async fn parsed_queue_lock_client_defaults_to_current_client() {
 }
 
 async fn register_read_only_control_client(handler: &RequestHandler, requester_pid: u32) {
-    let (event_tx, _event_rx) = mpsc::unbounded_channel::<ControlServerEvent>();
+    let (event_tx, _event_rx) = mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
     handler
         .register_control_with_access(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: rmux_proto::ControlMode::Plain,
                 terminal_context: OuterTerminalContext::default(),
             },
@@ -257,7 +322,7 @@ async fn register_read_only_control_client(handler: &RequestHandler, requester_p
 async fn if_shell_inserted_hidden_assignments_stay_out_of_process_environments() {
     let handler = RequestHandler::new();
     let parsed = CommandParser::new()
-        .parse("if-shell -F 1 { %hidden SECRET=classified } ; run-shell true")
+        .parse("if-shell -F 1 { %hidden SECRET=classified } ; run-shell \"exit 0\"")
         .expect("commands parse");
 
     let output = handler
@@ -968,7 +1033,7 @@ async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
 }
 
 #[tokio::test]
-async fn parsed_queue_refresh_client_r_is_unknown_flag_like_tmux() {
+async fn parsed_queue_refresh_client_r_is_accepted_but_runtime_unsupported() {
     let handler = RequestHandler::new();
     let parsed = CommandParser::new()
         .parse("refresh-client -r %0")
@@ -977,11 +1042,11 @@ async fn parsed_queue_refresh_client_r_is_unknown_flag_like_tmux() {
     let error = handler
         .execute_parsed_commands_for_test(std::process::id(), parsed)
         .await
-        .expect_err("refresh-client -r should be rejected");
+        .expect_err("refresh-client -r should be accepted by parser and rejected by runtime");
 
     assert_eq!(
         error,
-        rmux_proto::RmuxError::Server("command refresh-client: unknown flag -r".to_owned())
+        rmux_proto::RmuxError::Server("refresh-client -r is not supported".to_owned())
     );
 }
 

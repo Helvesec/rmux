@@ -19,8 +19,8 @@ fn frozen_reference_records_digest_and_rejects_host_tmux_as_reference() {
     for needle in [
         "artifact: frozen_tmux_reference",
         "frozen_tmux_binary_acquisition:",
-        "source_sha: \"31d77e29b6c9fbb07d032018da78db3a8a38d979\"",
-        "binary_sha256: \"525149cdac8d41b7e60ad68c4bab0670c8b769c646bab780e2a7b66239ad83a0\"",
+        "source_sha: \"e802909de06012a4df6209d55e86487c56223163\"",
+        "binary_sha256: \"eb05f981dfc0ed55f29b7dc8e13ed838827ebca2764a9fc559ae817d9cf1acd0\"",
         "used_for_tmux_compat_observations: false",
         "baseline_test_floor:",
     ] {

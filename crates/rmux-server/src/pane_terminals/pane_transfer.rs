@@ -46,7 +46,8 @@ impl HandlerState {
         let (source, target) = resolve_swap_targets(&self.sessions, &request)?;
         if source.session_name() == target.session_name() {
             let session_name = source.session_name().clone();
-            self.mutate_session_and_resize_terminals(&session_name, |session| {
+            let before_pane_options = self.pane_option_slots_for_session(&session_name)?;
+            let response = self.mutate_session_and_resize_terminals(&session_name, |session| {
                 session.swap_panes(
                     SessionPaneTarget::from(&source),
                     SessionPaneTarget::from(&target),
@@ -56,7 +57,9 @@ impl HandlerState {
                     source: source.clone(),
                     target: target.clone(),
                 })
-            })
+            })?;
+            self.rekey_pane_options_after_session_change(&before_pane_options, &session_name)?;
+            Ok(response)
         } else {
             self.swap_pane_across_sessions(source, target, request.detached, request.preserve_zoom)
         }
@@ -73,6 +76,7 @@ impl HandlerState {
         }
         if request.source.session_name() == request.target.session_name() {
             let session_name = request.source.session_name().clone();
+            let before_pane_options = self.pane_option_slots_for_session(&session_name)?;
             let target = request.target.clone();
             let moved_pane_id = self
                 .sessions
@@ -104,6 +108,7 @@ impl HandlerState {
                     ),
                 })
             })?;
+            self.rekey_pane_options_after_session_change(&before_pane_options, &session_name)?;
             self.clear_marked_pane_if_id(moved_pane_id);
             return Ok(response);
         }
@@ -140,6 +145,7 @@ impl HandlerState {
 
         if request.source.session_name() == &destination_session_name {
             let session_name = request.source.session_name().clone();
+            let before_pane_options = self.pane_option_slots_for_session(&session_name)?;
             let source_pane_id = self
                 .sessions
                 .session(&session_name)
@@ -158,6 +164,7 @@ impl HandlerState {
                         ),
                     )
                 })?;
+            self.rekey_pane_options_after_session_change(&before_pane_options, &session_name)?;
             self.clear_marked_pane_if_id(source_pane_id);
 
             return Ok(BreakPaneResponse {

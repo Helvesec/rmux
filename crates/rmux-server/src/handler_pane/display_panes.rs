@@ -31,9 +31,35 @@ const DEFAULT_DISPLAY_PANES_TEMPLATE: &str = "select-pane -t '%%'";
 impl RequestHandler {
     pub(in crate::handler) async fn handle_display_panes(
         &self,
+        requester_pid: u32,
         request: rmux_proto::DisplayPanesRequest,
     ) -> Response {
-        let session_name = request.target;
+        let attach_pid = match self
+            .resolve_target_attach_client_pid(
+                requester_pid,
+                request.target_client.as_deref(),
+                "display-panes",
+            )
+            .await
+        {
+            Ok(attach_pid) => attach_pid,
+            Err(error) => {
+                return Response::Error(ErrorResponse {
+                    error: if request.target_client.is_none() {
+                        RmuxError::Message("no current client".to_owned())
+                    } else {
+                        display_panes_client_error(error)
+                    },
+                });
+            }
+        };
+        let session_name = match self
+            .attached_session_name_for_command(attach_pid, "display-panes")
+            .await
+        {
+            Ok(session_name) => session_name,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
         let (response, overlay_frame, clear_frame, duration) = {
             let state = self.state.lock().await;
             match state.sessions.session(&session_name) {
@@ -68,8 +94,9 @@ impl RequestHandler {
             }
         };
 
-        let armed_states = if let Response::DisplayPanes(success) = &response {
+        let armed_state = if let Response::DisplayPanes(success) = &response {
             self.arm_display_panes_state(
+                attach_pid,
                 &session_name,
                 success.target.clone(),
                 clear_frame.clone(),
@@ -78,23 +105,26 @@ impl RequestHandler {
             )
             .await
         } else {
-            Vec::new()
+            None
         };
-        if armed_states.is_empty() {
+        let Some((attach_pid, state_id)) = armed_state else {
             return Response::Error(ErrorResponse {
                 error: RmuxError::Message("no current client".to_owned()),
             });
-        }
+        };
 
         if !self
-            .send_attached_display_panes_overlay_now(&session_name, overlay_frame, clear_frame)
+            .send_attached_display_panes_overlay_now(
+                attach_pid,
+                &session_name,
+                overlay_frame,
+                clear_frame,
+            )
             .await
         {
-            for (attach_pid, state_id) in armed_states {
-                let _ = self
-                    .clear_display_panes_state(attach_pid, Some(state_id), false)
-                    .await;
-            }
+            let _ = self
+                .clear_display_panes_state(attach_pid, Some(state_id), false)
+                .await;
             return Response::Error(ErrorResponse {
                 error: RmuxError::Message("no current client".to_owned()),
             });
@@ -123,15 +153,11 @@ impl RequestHandler {
 
         if !request.non_blocking {
             tokio::time::sleep(duration).await;
-            for (attach_pid, state_id) in armed_states {
-                let _ = self
-                    .clear_display_panes_state(attach_pid, Some(state_id), true)
-                    .await;
-            }
+            let _ = self
+                .clear_display_panes_state(attach_pid, Some(state_id), true)
+                .await;
         } else {
-            for (attach_pid, state_id) in armed_states {
-                self.schedule_display_panes_timeout(attach_pid, state_id, duration);
-            }
+            self.schedule_display_panes_timeout(attach_pid, state_id, duration);
         }
 
         response
@@ -139,12 +165,13 @@ impl RequestHandler {
 
     async fn arm_display_panes_state(
         &self,
+        attach_pid: u32,
         session_name: &rmux_proto::SessionName,
         window: WindowTarget,
         clear_frame: Vec<u8>,
         no_command: bool,
         template: Option<String>,
-    ) -> Vec<(u32, u64)> {
+    ) -> Option<(u32, u64)> {
         let labels = {
             let state = self.state.lock().await;
             state
@@ -158,76 +185,68 @@ impl RequestHandler {
         } else {
             Some(template.unwrap_or_else(|| DEFAULT_DISPLAY_PANES_TEMPLATE.to_owned()))
         };
-        {
-            let mut active_attach = self.active_attach.lock().await;
-            let mut scheduled = Vec::new();
-            for (&attach_pid, active) in &mut active_attach.by_pid {
-                if active.session_name != *session_name || active.suspended {
-                    continue;
-                }
-                active.display_panes_state_id = active.display_panes_state_id.saturating_add(1);
-                let id = active.display_panes_state_id;
-                active.display_panes = Some(DisplayPanesClientState {
-                    id,
-                    window: window.clone(),
-                    labels: labels
-                        .iter()
-                        .map(|label| DisplayPanesLabel {
-                            label: label.label.clone(),
-                            target: label.target.clone(),
-                            target_string: label.target_string.clone(),
-                        })
-                        .collect(),
-                    input: String::new(),
-                    template: template.clone(),
-                    clear_frame: clear_frame.clone(),
-                });
-                scheduled.push((attach_pid, id));
-            }
-            scheduled
+        let mut active_attach = self.active_attach.lock().await;
+        let active = active_attach.by_pid.get_mut(&attach_pid)?;
+        if active.session_name != *session_name || active.suspended {
+            return None;
         }
+        active.display_panes_state_id = active.display_panes_state_id.saturating_add(1);
+        let id = active.display_panes_state_id;
+        active.display_panes = Some(DisplayPanesClientState {
+            id,
+            window,
+            labels: labels
+                .iter()
+                .map(|label| DisplayPanesLabel {
+                    label: label.label.clone(),
+                    target: label.target.clone(),
+                    target_string: label.target_string.clone(),
+                })
+                .collect(),
+            input: String::new(),
+            template,
+            clear_frame,
+        });
+        Some((attach_pid, id))
     }
 
     async fn send_attached_display_panes_overlay_now(
         &self,
+        attach_pid: u32,
         session_name: &rmux_proto::SessionName,
         overlay_frame: Vec<u8>,
         clear_frame: Vec<u8>,
     ) -> bool {
         let mut active_attach = self.active_attach.lock().await;
-        let mut delivered = false;
+        let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
+            return false;
+        };
+        if active.session_name != *session_name || active.suspended {
+            return false;
+        }
 
-        active_attach.by_pid.retain(|_, active| {
-            if active.session_name != *session_name || active.suspended {
-                return true;
-            }
-
-            active.overlay_generation = active.overlay_generation.saturating_add(1);
-            let render_generation = active.render_generation;
-            let overlay_generation = active.overlay_generation;
-            let mut frame = if active.mode_tree.is_some() || active.overlay.is_some() {
+        active.overlay_generation = active.overlay_generation.saturating_add(1);
+        let render_generation = active.render_generation;
+        let overlay_generation = active.overlay_generation;
+        let mut frame =
+            if active.mode_tree.is_some() || active.overlay.is_some() || active.render_stream {
                 Vec::new()
             } else {
-                clear_frame.clone()
+                clear_frame
             };
-            frame.extend_from_slice(&overlay_frame);
+        frame.extend_from_slice(&overlay_frame);
 
-            if active
-                .control_tx
-                .send(AttachControl::Overlay(OverlayFrame::new(
-                    frame,
-                    render_generation,
-                    overlay_generation,
-                )))
-                .is_err()
-            {
-                return false;
-            }
-
-            delivered = true;
-            true
-        });
-
+        let delivered = active
+            .control_tx
+            .send(AttachControl::Overlay(OverlayFrame::new(
+                frame,
+                render_generation,
+                overlay_generation,
+            )))
+            .is_ok();
+        if !delivered {
+            active_attach.by_pid.remove(&attach_pid);
+        }
         delivered
     }
 
@@ -581,6 +600,15 @@ impl RequestHandler {
         }
 
         Ok(())
+    }
+}
+
+fn display_panes_client_error(error: RmuxError) -> RmuxError {
+    match error {
+        RmuxError::Server(message) if message.starts_with("can't find client: ") => {
+            RmuxError::Message(message)
+        }
+        error => error,
     }
 }
 

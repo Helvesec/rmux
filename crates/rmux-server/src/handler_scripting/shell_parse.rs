@@ -6,13 +6,13 @@ use rmux_proto::{
 };
 
 use super::tokens::{rebuild_shell_command, CommandTokens};
-use super::values::{missing_argument, parse_non_negative_f64, unsupported_flag};
+use super::values::parse_non_negative_f64;
 use super::{parse_pane_target, parse_target_arg};
 
 pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut background = false;
     let mut as_commands = false;
-    let show_stderr = false;
+    let mut show_stderr = false;
     let mut delay_seconds = None;
     let mut start_directory = None;
     let mut target = None;
@@ -23,7 +23,7 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
                 match flag {
                     'b' => background = true,
                     'C' => as_commands = true,
-                    'E' => return Err(unsupported_flag("run-shell", "-E")),
+                    'E' => show_stderr = true,
                     _ => unreachable!("compact run-shell flags are prevalidated"),
                 }
             }
@@ -43,7 +43,8 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
                 as_commands = true;
             }
             "-E" => {
-                return Err(unsupported_flag("run-shell", "-E"));
+                let _ = args.optional();
+                show_stderr = true;
             }
             "-d" => {
                 let _ = args.optional();
@@ -71,19 +72,25 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
         }
     }
     let command_parts = args.remaining();
-    if command_parts.is_empty() && delay_seconds.is_none() {
-        return Err(missing_argument("run-shell", "command"));
-    }
-    let command = if command_parts.is_empty() {
-        String::new()
+    let (command, arguments) = if command_parts.is_empty() {
+        (String::new(), Vec::new())
     } else if as_commands {
-        command_parts.join(" ")
+        let mut command_parts = command_parts.into_iter();
+        let command = command_parts
+            .next()
+            .expect("checked non-empty command parts");
+        (command, Vec::new())
     } else {
-        rebuild_shell_command(command_parts)
+        let mut command_parts = command_parts.into_iter();
+        let command = rebuild_shell_command(vec![command_parts
+            .next()
+            .expect("checked non-empty command parts")]);
+        (command, command_parts.collect())
     };
 
     Ok(Request::RunShell(Box::new(RunShellRequest {
         command,
+        arguments,
         background,
         as_commands,
         show_stderr,

@@ -225,15 +225,16 @@ impl Session {
                 options.direction,
             )?;
         }
-        let (active_after_id, last_after_id) = if options.detached {
-            (target_active_before_id, target_last_before_id)
+        if options.detached {
+            target_window
+                .renumber_panes_by_position(target_active_before_id, target_last_before_id);
         } else {
-            (
+            target_window.renumber_panes_by_position_stamping(
                 moved_pane_id,
                 (target_active_before_id != moved_pane_id).then_some(target_active_before_id),
-            )
-        };
-        target_window.renumber_panes_by_position(active_after_id, last_after_id);
+                Some(target_active_before_id),
+            );
+        }
         let moved_pane_index = target_window
             .panes()
             .iter()
@@ -481,19 +482,24 @@ impl Session {
                 options.before,
             )?
         };
-        let (active_after_id, last_after_id) = if options.detached {
-            (
+        if options.detached {
+            window.renumber_panes_by_position(
                 detached_active_after_removal_id
                     .expect("detached pane move should leave an active pane"),
                 detached_last_after_removal_id,
-            )
+            );
         } else {
-            (
+            let last_after_id = if active_before_id == moved_pane_id {
+                last_before_id
+            } else {
+                Some(active_before_id)
+            };
+            window.renumber_panes_by_position_stamping(
                 moved_pane_id,
-                (active_before_id != moved_pane_id).then_some(active_before_id),
-            )
-        };
-        window.renumber_panes_by_position(active_after_id, last_after_id);
+                last_after_id,
+                Some(active_before_id),
+            );
+        }
         let moved_pane_index = window
             .panes()
             .iter()

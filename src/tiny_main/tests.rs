@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(windows)]
+use crate::windows_shell::WindowsShellEnvironment;
 use parse::{
     has_queue_separator, parse_display_message, parse_has_session, parse_join_pane,
     parse_kill_pane, parse_kill_session, parse_list_panes, parse_list_windows, parse_new_session,
@@ -24,6 +26,14 @@ fn assert_tiny_direct(args: &[&str], command: &str) {
     }
 }
 
+fn assert_tiny_starts_server(args: &[&str], expected: bool) {
+    match TinyInvocation::parse(&os_args(args)) {
+        TinyInvocation::Direct(parsed) => assert_eq!(parsed.starts_server(), expected),
+        TinyInvocation::Fallback => panic!("{args:?} unexpectedly fell back to helper"),
+        TinyInvocation::Version => panic!("{args:?} unexpectedly parsed as version"),
+    }
+}
+
 fn assert_tiny_fallback(args: &[&str]) {
     match TinyInvocation::parse(&os_args(args)) {
         TinyInvocation::Fallback => {}
@@ -31,6 +41,19 @@ fn assert_tiny_fallback(args: &[&str]) {
             panic!("{args:?} unexpectedly parsed as tiny {}", parsed.name())
         }
         TinyInvocation::Version => panic!("{args:?} unexpectedly parsed as version"),
+    }
+}
+
+fn assert_source_file_dispatch(args: &[&str]) {
+    let command_args = args
+        .iter()
+        .position(|arg| *arg == "source-file")
+        .map(|index| os_args(&args[index + 1..]))
+        .expect("source-file command");
+    if source_file_should_use_tiny(&command_args) {
+        assert_tiny_direct(args, "source-file");
+    } else {
+        assert_tiny_fallback(args);
     }
 }
 
@@ -42,6 +65,52 @@ fn explicit_socket_path() -> String {
             .into_owned()
     } else {
         "/tmp/rmux-bench.sock".to_owned()
+    }
+}
+
+#[test]
+fn tiny_runtime_alias_probe_uses_the_original_command_arguments() {
+    assert_eq!(
+        tiny_invoked_command_arguments(&os_args(&["rmux", "list-sessions"])),
+        Some(vec!["list-sessions".to_owned()])
+    );
+    assert_eq!(
+        tiny_invoked_command_arguments(&os_args(&["rmux", "-L", "demo", "ls"])),
+        Some(vec!["ls".to_owned()])
+    );
+    assert_eq!(
+        tiny_invoked_command_arguments(&os_args(&[
+            "rmux",
+            "-S",
+            "/tmp/demo.sock",
+            "display-message",
+            "-p",
+            "$HOME",
+        ])),
+        Some(vec![
+            "display-message".to_owned(),
+            "-p".to_owned(),
+            "$HOME".to_owned(),
+        ])
+    );
+}
+
+#[test]
+fn tiny_start_server_inventory_covers_every_cold_alias_entry_path() {
+    for args in [
+        &["rmux", "start-server"][..],
+        &["rmux", "new-session", "-d"][..],
+        &["rmux", "attach-session"][..],
+    ] {
+        assert_tiny_starts_server(args, true);
+    }
+
+    for args in [
+        &["rmux", "list-sessions"][..],
+        &["rmux", "has-session", "-t", "alpha"][..],
+        &["rmux", "kill-server"][..],
+    ] {
+        assert_tiny_starts_server(args, false);
     }
 }
 
@@ -60,6 +129,43 @@ fn tiny_connect_error_uses_tmux_shape() {
     assert!(message.starts_with("error connecting to /tmp/rmux-missing.sock ("));
     assert!(!message.contains("failed to connect to rmux server"));
     assert!(!message.contains("os error"));
+}
+
+#[test]
+fn tiny_incompatible_daemon_message_uses_kill_server_hint() {
+    let explicit = std::path::Path::new("/tmp/rmux stale.sock");
+    let explicit_message = incompatible_daemon_error(explicit);
+    assert!(explicit_message.contains("uses an incompatible protocol"));
+    #[cfg(windows)]
+    let expected_hint = "rmux -S \"/tmp/rmux stale.sock\" kill-server";
+    #[cfg(not(windows))]
+    let expected_hint = "rmux -S '/tmp/rmux stale.sock' kill-server";
+    assert!(explicit_message.contains(expected_hint));
+
+    let default_socket = rmux_client::default_socket_path().expect("default socket path");
+    let default_message = incompatible_daemon_error(&default_socket);
+    assert!(default_message.contains("rmux kill-server"));
+}
+
+#[test]
+fn tiny_kill_server_legacy_fallback_accepts_every_prior_wire_version() {
+    for got in 1..RMUX_WIRE_VERSION {
+        let error = ClientError::Protocol(RmuxError::UnsupportedWireVersion {
+            got,
+            minimum: RMUX_WIRE_VERSION,
+            maximum: RMUX_WIRE_VERSION,
+        });
+        assert_eq!(legacy_shutdown_fallback_wire_version(&error), Some(got));
+    }
+
+    for got in [0, RMUX_WIRE_VERSION, RMUX_WIRE_VERSION + 1] {
+        let error = ClientError::Protocol(RmuxError::UnsupportedWireVersion {
+            got,
+            minimum: RMUX_WIRE_VERSION,
+            maximum: RMUX_WIRE_VERSION,
+        });
+        assert_eq!(legacy_shutdown_fallback_wire_version(&error), None);
+    }
 }
 
 #[derive(Clone)]
@@ -123,7 +229,7 @@ fn display_message_should_use_tiny(args: &[OsString]) -> bool {
         };
         match arg {
             "--" => {
-                if args[index + 1..].is_empty() || !all_utf8(&args[index + 1..]) {
+                if args[index + 1..].len() != 1 || !all_utf8(&args[index + 1..]) {
                     return false;
                 }
                 message = true;
@@ -149,7 +255,7 @@ fn display_message_should_use_tiny(args: &[OsString]) -> bool {
             "-a" | "-I" | "-l" | "-N" | "-v" | "--json" | "-c" | "-d" => return false,
             value if value.starts_with('-') => return false,
             _ => {
-                if !all_utf8(&args[index..]) {
+                if args[index..].len() != 1 || !all_utf8(&args[index..]) {
                     return false;
                 }
                 message = true;
@@ -244,6 +350,16 @@ fn split_window_simple_form_is_tiny_parseable() {
 }
 
 #[test]
+fn split_window_keep_alive_form_is_tiny_parseable() {
+    let args = os_args(&["-d", "-k", "-t", "0", "exit 7"]);
+
+    let request = parse_split_window(&args).expect("split-window -k fast path");
+    assert!(request.detached);
+    assert_eq!(request.keep_alive_on_exit, Some(true));
+    assert_eq!(request.command.as_deref(), Some(&["exit 7".into()][..]));
+}
+
+#[test]
 fn new_session_detached_simple_form_is_tiny_parseable() {
     let args = os_args(&["-d", "-s", "bench", "sleep", "1"]);
 
@@ -318,6 +434,7 @@ fn show_options_complex_forms_stay_on_full_helper_path() {
         [].as_slice(),
         ["-g", "status"].as_slice(),
         ["-g", "-v"].as_slice(),
+        ["-gH"].as_slice(),
         ["-w"].as_slice(),
     ] {
         assert!(parse_show_options(&os_args(args), false).is_none());
@@ -466,7 +583,7 @@ fn new_session_tiny_windows_replaces_inherited_client_shell_hint() {
             ),
             (
                 OsString::from("USERPROFILE"),
-                OsString::from("C:\\Users\\Shadow"),
+                OsString::from("C:\\Users\\RMUXUser"),
             ),
         ],
         Some("pwsh.exe".to_owned()),
@@ -475,7 +592,7 @@ fn new_session_tiny_windows_replaces_inherited_client_shell_hint() {
     assert!(environment.iter().any(|entry| entry == "Path=C:\\bin"));
     assert!(environment
         .iter()
-        .any(|entry| entry == "USERPROFILE=C:\\Users\\Shadow"));
+        .any(|entry| entry == "USERPROFILE=C:\\Users\\RMUXUser"));
     assert!(environment
         .iter()
         .any(|entry| entry == "RMUX_CLIENT_SHELL=pwsh.exe"));
@@ -493,20 +610,52 @@ fn new_session_tiny_windows_replaces_inherited_client_shell_hint() {
 #[cfg(windows)]
 #[test]
 fn tiny_windows_client_shell_mapping_matches_full_cli_surface() {
-    let expected_cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned());
+    let root = std::env::temp_dir().join(format!("rmux-tiny-shell-hint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let alias_dir = root.join("Microsoft").join("WindowsApps");
+    let regular_dir = root.join("PowerShell").join("7");
+    let cmd = root.join("System32").join("cmd.exe");
+    std::fs::create_dir_all(&alias_dir).expect("WindowsApps fixture directory");
+    std::fs::create_dir_all(&regular_dir).expect("regular shell fixture directory");
+    std::fs::create_dir_all(cmd.parent().expect("cmd fixture parent"))
+        .expect("cmd fixture directory");
+    std::fs::write(alias_dir.join("pwsh.exe"), b"").expect("alias pwsh fixture");
+    std::fs::write(regular_dir.join("pwsh.exe"), b"").expect("regular pwsh fixture");
+    std::fs::write(&cmd, b"").expect("cmd fixture");
+
+    let alias_path = std::env::join_paths([alias_dir.as_os_str()]).expect("alias-only PATH");
+    let alias_environment = WindowsShellEnvironment::for_test(
+        Some(alias_path),
+        Some(root.clone().into_os_string()),
+        Some(cmd.clone().into_os_string()),
+    );
+    let expected_cmd = cmd.to_string_lossy().into_owned();
     assert_eq!(
-        windows_client_shell_for_parent_name("cmd.exe").as_deref(),
+        windows_client_shell_for_parent_name("pwsh.exe", &alias_environment).as_deref(),
         Some(expected_cmd.as_str())
     );
+
+    let real_path = std::env::join_paths([alias_dir.as_os_str(), regular_dir.as_os_str()])
+        .expect("PATH with real pwsh");
+    let real_environment = WindowsShellEnvironment::for_test(
+        Some(real_path),
+        Some(root.clone().into_os_string()),
+        Some(cmd.clone().into_os_string()),
+    );
     assert_eq!(
-        windows_client_shell_for_parent_name("pwsh.exe").as_deref(),
+        windows_client_shell_for_parent_name("powershell.exe", &real_environment).as_deref(),
         Some("pwsh.exe")
     );
     assert_eq!(
-        windows_client_shell_for_parent_name("bash.exe").as_deref(),
+        windows_client_shell_for_parent_name("bash.exe", &real_environment).as_deref(),
         Some("bash.exe")
     );
-    assert_eq!(windows_client_shell_for_parent_name("unknown.exe"), None);
+    assert_eq!(
+        windows_client_shell_for_parent_name("unknown.exe", &real_environment),
+        None
+    );
+
+    std::fs::remove_dir_all(root).expect("remove tiny shell fixture");
 }
 
 #[test]
@@ -715,10 +864,16 @@ fn display_message_complex_forms_fall_back_to_helper() {
         ["-p", "-c", "client", "#{pane_id}"].as_slice(),
         ["-p", "-v", "#{pane_id}"].as_slice(),
         ["-p", "--json", "#{pane_id}"].as_slice(),
+        ["--json", "-a"].as_slice(),
+        ["--json", "-I"].as_slice(),
+        ["--json", "-l", "#{pane_id}"].as_slice(),
+        ["--json", "-v", "#{pane_id}"].as_slice(),
         ["-p", "-F", "#{pane_id}", "#{pane_id}"].as_slice(),
         ["-p", "-t", "%1", "#{pane_id}"].as_slice(),
         ["-p", "#{pane_id}", ";", "list-sessions"].as_slice(),
         ["-p", "echo;", "list-sessions"].as_slice(),
+        ["-p", "one", "two"].as_slice(),
+        ["-p", "--", "one", "two"].as_slice(),
     ] {
         assert!(
             parse_display_message(&os_args(args)).is_none(),
@@ -732,8 +887,36 @@ fn send_keys_exact_pane_target_is_tiny_parseable() {
     let args = os_args(&["-t", "bench:0.0", "true", "Enter"]);
 
     let request = parse_send_keys(&args).expect("send-keys fast path");
-    assert_eq!(request.target.to_string(), "bench:0.0");
+    assert_eq!(request.raw_target, "bench:0.0");
     assert_eq!(request.keys, ["true".to_owned(), "Enter".to_owned()]);
+}
+
+#[test]
+fn send_keys_resolution_forwards_errors_before_any_mutation() {
+    let target = match Target::parse("bench:0.0").expect("exact pane target") {
+        Target::Pane(target) => target,
+        other => panic!("expected pane target, got {other:?}"),
+    };
+    let resolved = Response::ResolveTarget(rmux_proto::ResolveTargetResponse {
+        target: Target::Pane(target.clone()),
+    });
+    assert_eq!(send_keys_resolved_target(resolved), Ok(target));
+
+    let error = Response::Error(ErrorResponse {
+        error: RmuxError::SessionNotFound("missing".to_owned()),
+    });
+    assert_eq!(
+        send_keys_resolved_target(error),
+        Err("session not found: missing".to_owned())
+    );
+
+    let wrong_target = Response::ResolveTarget(rmux_proto::ResolveTargetResponse {
+        target: Target::Session(rmux_proto::SessionName::new("bench").expect("session name")),
+    });
+    assert_eq!(
+        send_keys_resolved_target(wrong_target),
+        Err("protocol error: resolve-target returned a non-pane target for send-keys".to_owned())
+    );
 }
 
 #[test]
@@ -756,17 +939,21 @@ fn send_keys_complex_forms_fall_back_to_helper() {
 }
 
 #[test]
-fn source_file_plain_paths_are_tiny_parseable() {
+fn source_file_plain_paths_follow_nested_context_policy() {
     let args = os_args(&["/tmp/rmux-source-a.conf", "/tmp/rmux-source-b.conf"]);
 
-    let request = parse_source_file(&args).expect("source-file fast path");
-    assert_eq!(
-        request.paths,
-        [
-            "/tmp/rmux-source-a.conf".to_owned(),
-            "/tmp/rmux-source-b.conf".to_owned()
-        ]
-    );
+    if source_file_should_use_tiny(&args) {
+        let request = parse_source_file(&args).expect("source-file fast path");
+        assert_eq!(
+            request.paths,
+            [
+                "/tmp/rmux-source-a.conf".to_owned(),
+                "/tmp/rmux-source-b.conf".to_owned()
+            ]
+        );
+    } else {
+        assert!(parse_source_file(&args).is_none());
+    }
 }
 
 #[test]
@@ -1015,7 +1202,11 @@ fn benchmark_shapes_stay_direct_with_socket_selectors() {
                 )
             })
             .expect("shape contains command");
-        assert_tiny_direct(&shape, command);
+        if *command == "source-file" {
+            assert_source_file_dispatch(&shape);
+        } else {
+            assert_tiny_direct(&shape, command);
+        }
     }
 }
 
@@ -1107,10 +1298,7 @@ fn readme_benchmark_shapes_stay_on_tiny_direct_paths() {
         &["rmux", "send-keys", "-t", "bench:0.0", "true", "Enter"],
         "send-keys",
     );
-    assert_tiny_direct(
-        &["rmux", "source-file", "/tmp/rmux-source.conf"],
-        "source-file",
-    );
+    assert_source_file_dispatch(&["rmux", "source-file", "/tmp/rmux-source.conf"]);
     if std::env::var_os("RMUX").is_none() && std::env::var_os("TMUX").is_none() {
         assert_tiny_direct(&["rmux", "attach-session", "-t", "bench"], "attach-session");
     }
@@ -1177,7 +1365,7 @@ fn tiny_response_errors_use_tmux_cli_error_surface() {
 }
 
 #[test]
-fn tiny_display_message_missing_explicit_target_uses_empty_context() {
+fn tiny_target_resolution_errors_require_canonical_helper_retry() {
     let invalid_target = Response::Error(ErrorResponse {
         error: RmuxError::InvalidTarget {
             value: "s:0.99".to_owned(),
@@ -1188,12 +1376,8 @@ fn tiny_display_message_missing_explicit_target_uses_empty_context() {
         error: RmuxError::SessionNotFound("bogus".to_owned()),
     });
 
-    assert!(display_message_missing_target_uses_empty_context(
-        &invalid_target
-    ));
-    assert!(display_message_missing_target_uses_empty_context(
-        &missing_session
-    ));
+    assert!(response_needs_session_resolution_retry(&invalid_target));
+    assert!(response_needs_session_resolution_retry(&missing_session));
 }
 
 #[test]

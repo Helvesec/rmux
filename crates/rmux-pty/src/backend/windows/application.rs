@@ -168,13 +168,11 @@ fn effective_env_value(command: &ChildCommand, name: &str) -> Option<OsString> {
 }
 
 fn absolutize_existing_path(path: PathBuf) -> io::Result<PathBuf> {
-    path.canonicalize().or_else(|_| {
-        if path.is_absolute() {
-            Ok(path)
-        } else {
-            Ok(env::current_dir()?.join(path))
-        }
-    })
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    Ok(env::current_dir()?.join(path))
 }
 
 #[cfg(test)]
@@ -198,7 +196,16 @@ mod tests {
             .env("PATHEXT", ".EXE");
         let resolved = resolve_application_path(&command).expect("program resolves");
 
-        assert_eq!(resolved, executable.canonicalize().expect("canonical path"));
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&executable.to_string_lossy()),
+            "expected {resolved:?} to resolve to {executable:?}"
+        );
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "ConPTY application paths should avoid verbatim prefixes unless the caller supplied one"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -214,7 +221,16 @@ mod tests {
             ChildCommand::new(PathBuf::from("bin").join("tool.exe")).current_dir(root.clone());
         let resolved = resolve_application_path(&command).expect("program resolves");
 
-        assert_eq!(resolved, executable.canonicalize().expect("canonical path"));
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&executable.to_string_lossy()),
+            "expected {resolved:?} to resolve to {executable:?}"
+        );
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "ConPTY application paths should avoid verbatim prefixes unless the caller supplied one"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -232,7 +248,16 @@ mod tests {
             .env("PATHEXT", ".CMD;.EXE");
         let resolved = resolve_application_path(&command).expect("program resolves");
 
-        assert_eq!(resolved, executable.canonicalize().expect("canonical path"));
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&executable.to_string_lossy()),
+            "expected {resolved:?} to resolve to {executable:?}"
+        );
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "ConPTY application paths should avoid verbatim prefixes unless the caller supplied one"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

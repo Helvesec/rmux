@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.9.0
+
+### Security
+
+- Authenticate Windows named-pipe servers against the expected user SID,
+  integrity level, and canonical pipe name.
+- Bound pre-authentication, terminal parser, input, queue, and outbound backlog
+  resources so malformed or stalled clients fail closed.
+- Own helper processes through Unix process groups or Windows Job Objects and
+  clean them up during shutdown, replacement, and failed startup.
+
+### SDK
+
+- Add pane option APIs, revisioned pane-state streams, foreground process
+  snapshots, explicit argv or shell process specs, and stable pane identities.
+- Resolve index-based pane handles through visible coordinates while retaining
+  stable pane ids across base-index and pane-base-index changes.
+- Preserve armed wait, cancellation, lifecycle, and ownership semantics across
+  reconnects and pane respawns.
+
+### Compatibility
+
+- Expand the tmux 3.7b compatibility surface across command parsing,
+  source-file handling, formats, hooks, control mode, copy mode, targets, and
+  queued commands.
+- Honor default-command, caller working directories, pane-base-index, key
+  tables, and detached split semantics consistently across CLI, SDK, bindings,
+  and sourced commands.
+- Improve startup config compatibility, including nested includes, BOM and CRLF
+  handling, aliases, assignments, and the gpakosz configuration corpus.
+- Keep XTVERSION product identification honest by reporting RMUX rather than a
+  tmux release.
+- Disable incomplete Kitty keyboard negotiation while retaining supported
+  xterm modifyOtherKeys behavior.
+- Improve OSC colour and clipboard handling, Windows bracketed paste, outer
+  mouse reporting, and root mouse binding sequences.
+- Preserve control-mode framing and finite accepted work after input EOF while
+  cancelling operations that could wait indefinitely.
+
+### Reliability
+
+- Harden Windows shell startup, attach recovery, console input, daemon
+  breakaway, native upgrades, and package rollback.
+- Stabilize pane journals, hook ordering, leases, queued background jobs,
+  terminal reflow, attach transitions, and multi-client output isolation.
+- Make Unix socket startup and cleanup reliable for relative socket paths,
+  daemon churn, and exit-empty behavior.
+- Bump the detached RPC frame envelope from wire version 3 to 5. Clients and
+  SDKs must match the 0.9.0 daemon, and an already-running older server must be
+  restarted during upgrade.
+
+### Packaging
+
+- Preserve the complete Windows dispatcher and private runtime layout in
+  archives and installer upgrades (contributed by @isacgalvao).
+- Add deterministic release baselines and cross-platform package, resource,
+  protocol, and runtime gates.
+- Keep the root `rmux` crate installable with
+  `cargo install rmux --locked`.
+
 ## 0.8.0
 
 ### Security
@@ -66,10 +126,8 @@
 - Restored tmux 3.4-compatible binary boolean format semantics for `&&:` and
   `||:`; use nested boolean formats for portable multi-operand conditions.
 - Matched tmux 3.4 expression-format arithmetic for empty operands, `0x`
-  integer literals, invalid `%` operators, and integer divide/modulo-by-zero
-  sentinel results.
-- Matched tmux expression-format overflow sentinels for the
-  `-9223372036854775808 / -1` integer edge case.
+  integer literals, and integer divide-by-zero sentinel results covered by the
+  0.8 compatibility gate.
 - Matched tmux 3.4 substitution-format behavior for empty and zero-width
   regex patterns, avoiding synthetic insertions that tmux leaves untouched.
 - Matched tmux control-mode escaping for DEL and fixed HEAD responses to omit
@@ -144,6 +202,68 @@
   prefix and smoke the installed `bin/rmux` through its packaged helper.
 - Added release-gate coverage for `rmux-server --lib` and SDK wait-cancellation
   regressions so deterministic red tests cannot pass through review-only gates.
+
+## 0.7.1
+
+### Security
+
+- Escaped control-mode window and paste-buffer names before emitting
+  notifications, preventing injected control frames from newline-bearing names.
+- Rejected overflowing and non-minimal varint frame lengths in the protocol
+  decoder while preserving the existing minimal encoder output.
+- Preserved UTF-8 character boundaries when truncating WebSocket close reasons.
+- Capped negative format padding widths before allocation to avoid pathological
+  padding requests.
+- Disabled persisted GitHub checkout credentials in the release workflow.
+
+### Reliability
+
+- Added panic-safe connection cleanup so subscriptions and SDK waits are removed
+  even if a connection task unwinds.
+- Added a Unix archive installer that preserves the tiny/full `bin` and
+  `libexec` layout and installs the public tiny binary last during upgrades.
+- Made connection subscription/wait cleanup tolerate poisoned cleanup locks.
+- Spawned popup waiters before popup readers so popup children are reaped even
+  if reader setup fails.
+- Relaxed the Windows ConPTY Ctrl-D timeout smoke when the host leaves
+  `timeout.exe` running, preserving coverage without failing on runner-specific
+  behavior.
+- Resolved tiny CLI helpers through canonical executable paths, covering
+  portable aliases such as WinGet Links while keeping packaged layouts first.
+- Resolved hidden daemon siblings through canonical executable paths so portable
+  aliases can cold-start the packaged daemon directly.
+- Resolved SDK daemon candidates from installed `rmux` binaries before falling
+  back to PATH names, avoiding extra tiny-helper hops in portable layouts.
+
+### Compatibility
+
+- Restored sparse-map deserialization defaults for `NewSessionExtRequest` and
+  related request types without changing the bincode wire layout.
+- Added a defensive `with-session` empty-command guard before lease creation.
+- Matched tmux control-mode escaping for DEL and fixed HEAD responses to omit
+  bodies.
+- Corrected `input-buffer-size` validation and rejected bare non-boolean choice
+  toggles such as `set -g mode-keys`.
+- Added `Display` and `Error` implementations for `StartServerError`, and
+  corrected public split-direction documentation.
+- Shared detected client terminal features between the full and tiny attach
+  paths, including Windows Terminal rendering and input capabilities.
+- Improved SDK and CLI daemon startup diagnostics when no daemon binary can be
+  found or a hidden daemon exits before creating its endpoint.
+
+### CI
+
+- Bumped release-facing versions to `0.7.1` across Cargo workspace metadata,
+  `Cargo.lock`, the manpage, snap metadata, README download links, and localized
+  README files.
+- Added a Windows package smoke that exercises portable alias fallback, PATH
+  resolution, and daemon startup from a WinGet-like Links layout.
+- Exposed `rmux-daemon` in the Scoop manifest and expanded package-manager
+  metadata smokes to cover the installed daemon path.
+- Added reusable installed-package smokes that force the tiny helper fallback
+  before exercising daemon startup.
+- Extended Unix archive verification to install the archive into a temporary
+  prefix and smoke the installed `bin/rmux` through its packaged helper.
 
 ## 0.7.0
 

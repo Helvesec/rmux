@@ -123,25 +123,25 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
         .await;
     assert_eq!(
         scalar_append,
-        Response::Error(rmux_proto::ErrorResponse {
-            error: RmuxError::InvalidSetOption("status is not an array option".to_owned()),
+        Response::SetOption(rmux_proto::SetOptionResponse {
+            scope: ScopeSelector::Global,
+            option: OptionName::Status,
+            mode: SetOptionMode::Append,
         })
     );
 
-    let invalid_scope = handler
+    let invalid_value = handler
         .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session_name("missing")),
-            option: OptionName::TerminalFeatures,
-            value: "rxvt*:ccolour".to_owned(),
+            scope: ScopeSelector::Global,
+            option: OptionName::Status,
+            value: "maybe".to_owned(),
             mode: SetOptionMode::Replace,
         }))
         .await;
     assert_eq!(
-        invalid_scope,
+        invalid_value,
         Response::Error(ErrorResponse {
-            error: RmuxError::InvalidSetOption(
-                "terminal-features is only supported at global scope".to_owned()
-            ),
+            error: RmuxError::InvalidSetOption("unknown value: maybe".to_owned()),
         })
     );
 
@@ -152,7 +152,7 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
             "xterm*:clipboard:ccolour:cstyle:focus:title,screen*:title,rxvt*:ignorefkeys,xterm*:RGB,screen*:AX"
         )
     );
-    assert_eq!(state.options.global_value(OptionName::Status), None);
+    assert_eq!(state.options.global_value(OptionName::Status), Some("off"));
 }
 
 #[tokio::test]

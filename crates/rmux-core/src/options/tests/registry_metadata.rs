@@ -16,9 +16,9 @@ fn option_registry_is_closed_unique_and_contains_full_frozen_inventory() {
         .map(|entry| entry.name())
         .collect::<HashSet<_>>();
 
-    assert_eq!(metadata.len(), 146);
-    assert_eq!(unique_options.len(), 146);
-    assert_eq!(unique_names.len(), 146);
+    assert_eq!(metadata.len(), 149);
+    assert_eq!(unique_options.len(), 149);
+    assert_eq!(unique_names.len(), 149);
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn option_registry_matches_frozen_tmux_option_names() {
         .map(|entry| entry.name().to_owned())
         .collect::<HashSet<_>>();
 
-    assert_eq!(tmux_names.len(), 146);
+    assert_eq!(tmux_names.len(), 149);
     assert_eq!(registry_names, tmux_names);
 }
 
@@ -142,12 +142,26 @@ fn style_and_array_metadata_capture_tmux_specific_defaults() {
     assert!(status_format.is_array());
     match status_format.default_value() {
         registry::DefaultValue::Array(values) => {
-            assert_eq!(values.len(), 2);
+            assert_eq!(values.len(), 3);
             assert!(values.iter().any(|value| value.contains("#[align=left")));
-            assert!(values.iter().any(|value| value.contains("#[align=centre]")));
+            assert!(values.iter().any(|value| value.contains("#{P:")));
+            assert!(values.iter().any(|value| value.contains("#{S:")));
         }
         default => panic!("unexpected status-format default: {default:?}"),
     }
+
+    assert_eq!(
+        registry::option_metadata(OptionName::CopyModeLineNumbers).default_value(),
+        registry::DefaultValue::Scalar("off")
+    );
+    assert_eq!(
+        registry::option_metadata(OptionName::CopyModeLineNumberStyle).default_value(),
+        registry::DefaultValue::Scalar("fg=white,dim")
+    );
+    assert_eq!(
+        registry::option_metadata(OptionName::CopyModeCurrentLineNumberStyle).default_value(),
+        registry::DefaultValue::Scalar("fg=yellow")
+    );
 
     let update_environment = registry::option_metadata(OptionName::UpdateEnvironment);
     assert!(update_environment.is_array());
@@ -155,9 +169,9 @@ fn style_and_array_metadata_capture_tmux_specific_defaults() {
     assert_eq!(
         update_environment.default_value(),
         registry::DefaultValue::Scalar(concat!(
-            "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AUTH_SOCK SSH_",
-            "AG",
-            "ENT_PID SSH_CONNECTION WINDOWID XAUTHORITY"
+            "DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK ",
+            "SSH_AGENT_PID SSH_CONNECTION WAYLAND_DISPLAY WINDOWID ",
+            "XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE"
         ))
     );
 }

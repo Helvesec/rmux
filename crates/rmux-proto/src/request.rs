@@ -31,15 +31,16 @@ pub use layout::{
 mod pane;
 pub use pane::{
     BreakPaneRequest, DisplayPanesRequest, JoinPaneRequest, KillPaneRequest, LastPaneRequest,
-    MovePaneRequest, PaneBroadcastInputRequest, PaneInputRequest, PaneKillRequest,
-    PaneOutputCursorRequest, PaneOutputSubscriptionStart, PaneResizeRequest, PaneRespawnRequest,
-    PaneSelectRequest, PaneSnapshotRefRequest, PaneSnapshotRequest, PaneSplitSize, PipePaneRequest,
-    ResizePaneRequest, ResizePaneTargetActionRequest, RespawnPaneRequest,
+    MovePaneRequest, PaneBroadcastInputRequest, PaneForegroundStateRequest, PaneInputRequest,
+    PaneKillRequest, PaneOptionGetRequest, PaneOptionSetRequest, PaneOutputCursorRequest,
+    PaneOutputSubscriptionStart, PaneResizeRequest, PaneRespawnRequest, PaneSelectRequest,
+    PaneSnapshotRefRequest, PaneSnapshotRequest, PaneSplitSize, PaneStateCursorRequest,
+    PipePaneRequest, ResizePaneRequest, ResizePaneTargetActionRequest, RespawnPaneRequest,
     SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
     SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest, SplitWindowExtRequest,
     SplitWindowRequest, SplitWindowTarget, SplitWindowTargetActionRequest,
-    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SwapPaneDirection, SwapPaneRequest,
-    UnsubscribePaneOutputRequest,
+    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneStateRequest,
+    SwapPaneDirection, SwapPaneRequest, UnsubscribePaneOutputRequest, UnsubscribePaneStateRequest,
 };
 
 #[path = "request/window.rs"]
@@ -134,7 +135,7 @@ pub enum Request {
     /// `last-window`
     LastWindow(LastWindowRequest),
     /// `list-windows`
-    ListWindows(ListWindowsRequest),
+    ListWindows(Box<ListWindowsRequest>),
     /// `move-window`
     MoveWindow(MoveWindowRequest),
     /// `swap-window`
@@ -158,7 +159,7 @@ pub enum Request {
     /// `resize-pane`
     ResizePane(ResizePaneRequest),
     /// `display-panes`
-    DisplayPanes(DisplayPanesRequest),
+    DisplayPanes(Box<DisplayPanesRequest>),
     /// `select-pane`
     SelectPane(Box<SelectPaneRequest>),
     /// `select-pane -U/-D/-L/-R`
@@ -186,7 +187,7 @@ pub enum Request {
     /// `show-environment`
     ShowEnvironment(ShowEnvironmentRequest),
     /// `set-buffer`
-    SetBuffer(SetBufferRequest),
+    SetBuffer(Box<SetBufferRequest>),
     /// `show-buffer`
     ShowBuffer(ShowBufferRequest),
     /// `paste-buffer`
@@ -196,7 +197,7 @@ pub enum Request {
     /// `delete-buffer`
     DeleteBuffer(DeleteBufferRequest),
     /// `load-buffer`
-    LoadBuffer(LoadBufferRequest),
+    LoadBuffer(Box<LoadBufferRequest>),
     /// `save-buffer`
     SaveBuffer(SaveBufferRequest),
     /// `capture-pane`
@@ -214,7 +215,7 @@ pub enum Request {
     /// `list-sessions`
     ListSessions(ListSessionsRequest),
     /// `list-panes`
-    ListPanes(ListPanesRequest),
+    ListPanes(Box<ListPanesRequest>),
     /// `source-file`
     SourceFile(Box<SourceFileRequest>),
     /// `set-option` using an open string-based option name.
@@ -355,6 +356,18 @@ pub enum Request {
     ResizePaneTargetAction(ResizePaneTargetActionRequest),
     /// `capture-pane` with raw target text resolved server-side.
     CapturePaneTargetAction(Box<CapturePaneTargetActionRequest>),
+    /// SDK pane option mutation endpoint with stable pane-id targeting.
+    PaneOptionSet(PaneOptionSetRequest),
+    /// SDK pane option lookup endpoint with stable pane-id targeting.
+    PaneOptionGet(PaneOptionGetRequest),
+    /// SDK pane-state subscription endpoint with stable pane-id targeting.
+    SubscribePaneState(SubscribePaneStateRequest),
+    /// SDK pane-state cursor endpoint.
+    PaneStateCursor(PaneStateCursorRequest),
+    /// SDK pane-state unsubscription endpoint.
+    UnsubscribePaneState(UnsubscribePaneStateRequest),
+    /// SDK pane foreground-state endpoint with stable pane-id targeting.
+    PaneForegroundState(PaneForegroundStateRequest),
 }
 
 impl Request {
@@ -428,6 +441,12 @@ impl Request {
             Self::PaneRespawn(_) => "respawn-pane",
             Self::PaneSnapshotRef(_) => "pane-snapshot",
             Self::PaneSelect(_) => "select-pane",
+            Self::PaneOptionSet(_) => "pane-option-set",
+            Self::PaneOptionGet(_) => "pane-option-get",
+            Self::SubscribePaneState(_) => "subscribe-pane-state",
+            Self::PaneStateCursor(_) => "pane-state-cursor",
+            Self::UnsubscribePaneState(_) => "unsubscribe-pane-state",
+            Self::PaneForegroundState(_) => "pane-foreground-state",
             Self::DisplayMessage(_) | Self::DisplayMessageExt(_) => "display-message",
             Self::ResolveTarget(_) => "resolve-target",
             Self::RunShell(_) => "run-shell",
@@ -498,6 +517,9 @@ pub struct ShowMessagesRequest {
 pub struct RunShellRequest {
     /// The server-local shell command passed to `sh -c`.
     pub command: String,
+    /// Literal positional format arguments exposed as `#{1}`, `#{2}`, and so on.
+    #[serde(default)]
+    pub arguments: Vec<String>,
     /// Whether the command should run fire-and-forget without output capture.
     pub background: bool,
     /// Whether the command should be executed as tmux commands instead of `sh -c`.
@@ -667,6 +689,15 @@ pub struct ListPanesRequest {
     pub target_window_index: Option<u32>,
     /// An optional server-side format template.
     pub format: Option<String>,
+    /// Optional filter expression.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Optional sort-order token.
+    #[serde(default)]
+    pub sort_order: Option<String>,
+    /// Whether the selected sort order should be reversed.
+    #[serde(default)]
+    pub reversed: bool,
 }
 
 #[cfg(test)]
@@ -1012,6 +1043,44 @@ mod tests {
             unset_pane_overrides: false,
             format: true,
             format_target: Some(crate::Target::Session(alpha())),
+        });
+        assert_box_serializes_like_value(ListWindowsRequest {
+            target: alpha(),
+            format: Some("#{window_index}".to_owned()),
+            filter: Some("#{==:#{window_active},1}".to_owned()),
+            sort_order: Some("index".to_owned()),
+            reversed: true,
+        });
+        assert_box_serializes_like_value(ListPanesRequest {
+            target: alpha(),
+            target_window_index: Some(1),
+            format: Some("#{pane_index}".to_owned()),
+            filter: Some("#{==:#{pane_active},1}".to_owned()),
+            sort_order: Some("index".to_owned()),
+            reversed: true,
+        });
+        assert_box_serializes_like_value(DisplayPanesRequest {
+            target: alpha(),
+            duration_ms: Some(1_000),
+            non_blocking: true,
+            no_command: false,
+            template: Some("select-pane -t '%%'".to_owned()),
+            target_client: Some("/dev/pts/1".to_owned()),
+        });
+        assert_box_serializes_like_value(SetBufferRequest {
+            name: Some("named".to_owned()),
+            content: b"buffer".to_vec(),
+            append: false,
+            new_name: None,
+            set_clipboard: true,
+            target_client: Some("/dev/pts/1".to_owned()),
+        });
+        assert_box_serializes_like_value(LoadBufferRequest {
+            path: "/tmp/input".to_owned(),
+            cwd: Some(PathBuf::from("/tmp")),
+            name: Some("loaded".to_owned()),
+            set_clipboard: true,
+            target_client: Some("/dev/pts/1".to_owned()),
         });
         assert_box_serializes_like_value(AttachSessionExt3Request::from_ext2(
             AttachSessionExt2Request {

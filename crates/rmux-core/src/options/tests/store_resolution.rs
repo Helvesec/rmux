@@ -131,23 +131,19 @@ fn terminal_features_append_preserves_default_then_existing_order() {
 }
 
 #[test]
-fn append_to_non_string_scalar_options_is_rejected() {
+fn append_to_non_string_scalar_options_behaves_like_replace() {
     let mut store = OptionStore::new();
 
-    let error = store
+    store
         .set(
             ScopeSelector::Global,
             OptionName::Status,
             "off".to_owned(),
             SetOptionMode::Append,
         )
-        .expect_err("flag append is not a real append");
+        .expect("tmux treats append on non-string scalar as replace");
 
-    assert_eq!(
-        error,
-        RmuxError::InvalidSetOption("status is not an array option".to_owned())
-    );
-    assert_eq!(store.global_value(OptionName::Status), None);
+    assert_eq!(store.global_value(OptionName::Status), Some("off"));
 }
 
 #[test]
@@ -239,23 +235,26 @@ fn prefix_options_accept_modified_named_keys() {
 }
 
 #[test]
-fn server_only_options_reject_session_scopes() {
+fn server_only_options_can_be_stored_at_explicit_session_scopes() {
     let mut store = OptionStore::new();
+    let alpha = session_name("alpha");
 
-    let error = store
+    store
         .set(
-            ScopeSelector::Session(session_name("alpha")),
+            ScopeSelector::Session(alpha.clone()),
             OptionName::BufferLimit,
             "100".to_owned(),
             SetOptionMode::Replace,
         )
-        .expect_err("session buffer-limit must fail");
+        .expect("tmux accepts explicit local storage for server option names");
 
     assert_eq!(
-        error,
-        rmux_proto::RmuxError::InvalidSetOption(
-            "buffer-limit is only supported at global scope".to_owned()
-        )
+        store.session_value(&alpha, OptionName::BufferLimit),
+        Some("100")
+    );
+    assert_eq!(
+        store.resolve(Some(&alpha), OptionName::BufferLimit),
+        Some("100")
     );
 }
 

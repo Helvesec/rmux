@@ -5,7 +5,9 @@ param(
     [string]$OutputDir = "target/dist",
     [string]$PlatformLabel = "",
     [switch]$SkipBuild,
-    [switch]$AllowStaleBinary
+    [switch]$AllowStaleBinary,
+    [switch]$ReuseReleaseBinaries,
+    [string]$ReleaseBinaryManifest = ""
 )
 
 Set-StrictMode -Version Latest
@@ -127,12 +129,82 @@ function WritePackageChecksums([string]$Root, [string]$Output) {
     WriteAsciiLfFile $Output $lines
 }
 
+function RequireManifestProperty([object]$Manifest, [string]$Name) {
+    if ($null -eq $Manifest -or -not ($Manifest.PSObject.Properties.Name -contains $Name)) {
+        Fail "release binary manifest is missing $Name"
+    }
+    return $Manifest.$Name
+}
+
+function ValidateReleaseBinaryManifest(
+    [string]$ManifestPath,
+    [string]$ExpectedGitCommit,
+    [string]$ExpectedTarget,
+    [string]$ExpectedConfiguration,
+    [string]$Binary,
+    [string]$HelperBinary,
+    [string]$DaemonBinary
+) {
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        Fail "release binary manifest was not found: $ManifestPath"
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+    } catch {
+        Fail "release binary manifest is not valid JSON: $_"
+    }
+    if ((RequireManifestProperty $manifest "schema") -ne 1) {
+        Fail "release binary manifest schema is not 1"
+    }
+    if ((RequireManifestProperty $manifest "kind") -ne "rmux-windows-release-binaries") {
+        Fail "release binary manifest kind is invalid"
+    }
+    if ((RequireManifestProperty $manifest "git_commit") -ne $ExpectedGitCommit) {
+        Fail "release binary manifest Git commit does not match HEAD"
+    }
+    if ((RequireManifestProperty $manifest "target") -ne $ExpectedTarget) {
+        Fail "release binary manifest target does not match $ExpectedTarget"
+    }
+    if ((RequireManifestProperty $manifest "configuration") -ne $ExpectedConfiguration) {
+        Fail "release binary manifest configuration does not match $ExpectedConfiguration"
+    }
+
+    foreach ($entry in @(
+        [pscustomobject]@{ Name = "binary_sha256"; Path = $Binary }
+        [pscustomobject]@{ Name = "helper_binary_sha256"; Path = $HelperBinary }
+        [pscustomobject]@{ Name = "daemon_binary_sha256"; Path = $DaemonBinary }
+    )) {
+        $name = $entry.Name
+        $path = $entry.Path
+        $expectedHash = [string](RequireManifestProperty $manifest $name)
+        if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$') {
+            Fail "release binary manifest $name is not a SHA-256 digest"
+        }
+        $actualHash = Sha256File $path
+        if ($actualHash -ne $expectedHash.ToLowerInvariant()) {
+            Fail "release binary manifest $name does not match $path"
+        }
+    }
+}
+
 $repoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 Set-Location -LiteralPath $repoRoot
 [System.IO.Directory]::SetCurrentDirectory($repoRoot)
 
+if ($SkipBuild -and $ReuseReleaseBinaries) {
+    Fail "-SkipBuild and -ReuseReleaseBinaries are mutually exclusive"
+}
+if ($AllowStaleBinary -and $ReuseReleaseBinaries) {
+    Fail "-AllowStaleBinary cannot be combined with -ReuseReleaseBinaries"
+}
 if ($SkipBuild -and -not $AllowStaleBinary) {
     Fail "-SkipBuild is local-only packaging; pass -AllowStaleBinary to acknowledge that"
+}
+if ($ReuseReleaseBinaries -and $Configuration -ne "release") {
+    Fail "-ReuseReleaseBinaries requires -Configuration release"
+}
+if ($ReuseReleaseBinaries -ne (-not [string]::IsNullOrWhiteSpace($ReleaseBinaryManifest))) {
+    Fail "-ReuseReleaseBinaries requires exactly one -ReleaseBinaryManifest"
 }
 
 $version = WorkspaceVersion
@@ -152,7 +224,7 @@ $binary = Join-Path $targetDir (Join-Path $Target (Join-Path $profileDir "rmux.e
 $helperBinary = Join-Path $targetDir (Join-Path $Target (Join-Path $profileDir "rmux-full.exe"))
 $daemonBinary = Join-Path $targetDir (Join-Path $Target (Join-Path $profileDir "rmux-daemon.exe"))
 
-if (-not $SkipBuild) {
+if (-not $SkipBuild -and -not $ReuseReleaseBinaries) {
     & cargo @cargoArgs --bin rmux
     if ($LASTEXITCODE -ne 0) {
         Fail "cargo build full rmux helper failed"
@@ -188,6 +260,21 @@ if (-not (Test-Path -LiteralPath $helperBinary -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $daemonBinary -PathType Leaf)) {
     Fail "expected daemon binary was not found: $daemonBinary"
+}
+if ($ReuseReleaseBinaries) {
+    $head = GitOutput @("rev-parse", "HEAD")
+    $trackedStatus = GitOutput @("status", "--porcelain", "--untracked-files=no")
+    if (-not [string]::IsNullOrWhiteSpace($trackedStatus)) {
+        Fail "-ReuseReleaseBinaries requires a clean tracked worktree"
+    }
+    ValidateReleaseBinaryManifest `
+        ([System.IO.Path]::GetFullPath($ReleaseBinaryManifest)) `
+        $head `
+        $Target `
+        $Configuration `
+        $binary `
+        $helperBinary `
+        $daemonBinary
 }
 
 $distDir = [System.IO.Path]::GetFullPath($OutputDir)
@@ -267,7 +354,9 @@ $daemonBinaryBytes = (Get-Item -LiteralPath $daemonBinaryAbs).Length
 $gitCommit = GitOutput @("rev-parse", "HEAD")
 $gitStatus = GitOutput @("status", "--porcelain", "--untracked-files=no")
 $gitDirty = -not [string]::IsNullOrWhiteSpace($gitStatus)
-$releaseArtifact = (-not $SkipBuild) -and (-not $gitDirty)
+$releaseArtifact = ($Configuration -eq "release") -and
+    ((-not $SkipBuild -and -not $ReuseReleaseBinaries) -or $ReuseReleaseBinaries) -and
+    (-not $gitDirty)
 $generatedAtUtc = GitOutput @("show", "-s", "--format=%cI", "HEAD")
 
 $metadata = [ordered]@{
@@ -295,6 +384,7 @@ $metadata = [ordered]@{
     package_layout = "rmux-windows-package-v2"
     archive_format = "zip"
     skip_build = [bool]$SkipBuild
+    reuse_release_binaries = [bool]$ReuseReleaseBinaries
     release_artifact = $releaseArtifact
     generated_at_utc = $generatedAtUtc
 }

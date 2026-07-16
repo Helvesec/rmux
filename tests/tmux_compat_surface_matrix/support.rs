@@ -7,7 +7,7 @@ pub(super) use std::io::Write;
 pub(super) use std::os::fd::AsRawFd;
 pub(super) use std::path::{Path, PathBuf};
 pub(super) use std::process::{Child, Command, Stdio};
-pub(super) use std::sync::{Mutex, OnceLock};
+pub(super) use std::sync::{Mutex, MutexGuard, OnceLock};
 pub(super) use std::time::{Duration, Instant};
 
 pub(super) use crate::common::{
@@ -51,20 +51,7 @@ pub(super) fn config_with_clean_homes(
     fs::create_dir_all(&home)?;
     fs::create_dir_all(&xdg)?;
 
-    let config = tmux_compat_config()
-        .with_env("HOME", home.as_os_str())
-        .with_env("XDG_CONFIG_HOME", xdg.as_os_str());
-    let overrides = default_overrides(harness.tmpdir())
-        .into_iter()
-        .chain([
-            (OsString::from("HOME"), Some(home.as_os_str().to_owned())),
-            (
-                OsString::from("XDG_CONFIG_HOME"),
-                Some(xdg.as_os_str().to_owned()),
-            ),
-        ])
-        .collect();
-    Ok((config, overrides))
+    Ok((tmux_compat_config(), default_overrides(harness.tmpdir())))
 }
 
 pub(super) fn default_overrides(tmpdir: &Path) -> EnvironmentOverrides {
@@ -80,6 +67,14 @@ pub(super) fn default_overrides(tmpdir: &Path) -> EnvironmentOverrides {
         (
             OsString::from("TMUX_TMPDIR"),
             Some(tmpdir.as_os_str().to_owned()),
+        ),
+        (
+            OsString::from("HOME"),
+            Some(tmpdir.join("home").into_os_string()),
+        ),
+        (
+            OsString::from("XDG_CONFIG_HOME"),
+            Some(tmpdir.join("xdg").into_os_string()),
         ),
         (OsString::from("TMUX"), None),
         (
@@ -153,6 +148,8 @@ pub(super) fn assert_command_metadata(
 
 pub(super) fn tmux_effective_argv(harness: &TmuxCompatHarness, argv: &[&str]) -> Vec<OsString> {
     let mut effective = vec![
+        OsString::from("-f"),
+        OsString::from("/dev/null"),
         OsString::from("-S"),
         harness.tmux_socket_path().as_os_str().to_owned(),
     ];
@@ -210,17 +207,13 @@ pub(super) fn assert_exact_tmux_compat(run: &TmuxCompatRun) {
     assert_eq!(run.tmux.stderr, run.rmux.stderr);
 }
 
-pub(super) fn drop_frozen_mirrored_layout_bindings(output: &[u8]) -> Vec<u8> {
-    let output = std::str::from_utf8(output).expect("list-keys output is UTF-8");
-    let mut normalized = String::new();
-    for line in output.lines() {
-        if matches!(line, "prefix:M-6:0" | "prefix:M-7:0") {
-            continue;
-        }
-        normalized.push_str(line);
-        normalized.push('\n');
-    }
-    normalized.into_bytes()
+pub(super) fn drop_deferred_new_pane_binding(output: &[u8]) -> Vec<u8> {
+    output
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|line| *line != b"prefix:*:0\n")
+        .flatten()
+        .copied()
+        .collect()
 }
 
 pub(super) fn collapse_repeated_horizontal_borders(line: &str) -> String {
@@ -312,9 +305,11 @@ impl Drop for PtyAttachedClient {
     }
 }
 
-pub(super) fn pty_tmux_compat_lock() -> &'static Mutex<()> {
+pub(super) fn pty_tmux_compat_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub(super) fn spawn_rmux_attached_client(
@@ -668,6 +663,11 @@ pub(super) fn normalize_pts_paths(line: &str) -> String {
                 let _ = chars.next();
             }
             normalized.push('N');
+        } else if normalized.ends_with("/dev/ttys") {
+            while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+                let _ = chars.next();
+            }
+            normalized.push('N');
         }
     }
     normalized
@@ -877,9 +877,15 @@ pub(super) fn run_tmux_control_mode_with(
     environment: &[(&str, &str)],
 ) -> Result<ControlModeOutput, Box<dyn Error>> {
     let mut command = Command::new(tmux_binary);
+    let home = harness.tmpdir().join("home");
+    let xdg = harness.tmpdir().join("xdg");
+    fs::create_dir_all(&home)?;
+    fs::create_dir_all(&xdg)?;
     command
         .env("TMPDIR", harness.tmpdir())
         .env("TMUX_TMPDIR", harness.tmpdir())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg)
         .env("TERM", "xterm-256color")
         .env_remove("TMUX");
     for (name, value) in environment {
@@ -887,6 +893,8 @@ pub(super) fn run_tmux_control_mode_with(
     }
     command
         .args(top_level_args)
+        .arg("-f")
+        .arg("/dev/null")
         .arg("-C")
         .arg("-S")
         .arg(harness.tmux_socket_path());

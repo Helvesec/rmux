@@ -333,7 +333,7 @@ impl RequestHandler {
                 key: rmux_core::key_string_lookup_key(key, false),
                 note: None,
                 repeat: false,
-                command: Some(vec![parsed.to_tmux_string()]),
+                command: Some(vec![parsed.to_tmux_reparse_string()]),
             })
             .await;
         if let Response::Error(error) = response {

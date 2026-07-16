@@ -270,6 +270,9 @@ impl Drop for SameUserSecurityAttributes {
 #[cfg(windows)]
 fn same_user_pipe_sddl(sid: &str, integrity_label: &str) -> io::Result<String> {
     let integrity_sid = integrity_sddl_sid(integrity_label)?;
+    // Keep the pipe scoped to the current account. SSH/desktop process-token
+    // asymmetry is handled by client-side pipe owner validation, not by adding
+    // broad restricted-code access to the pipe DACL.
     Ok(format!(
         "O:{sid}G:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;{integrity_sid})"
     ))

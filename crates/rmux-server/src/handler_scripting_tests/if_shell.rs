@@ -243,6 +243,43 @@ async fn if_shell_format_mode_without_target_uses_preferred_session_context() {
 }
 
 #[tokio::test]
+async fn if_shell_missing_explicit_target_is_nonfatal() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha,
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let response = handler
+        .handle(Request::IfShell(Box::new(IfShellRequest {
+            condition: "1".to_owned(),
+            format_mode: true,
+            then_command: "display-message -p '#{session_name}'".to_owned(),
+            else_command: None,
+            target: Some(Target::Session(session_name("missing"))),
+            caller_cwd: None,
+            background: false,
+        })))
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .expect("if-shell nested command output")
+            .stdout(),
+        b"alpha\n"
+    );
+}
+
+#[tokio::test]
 async fn source_file_if_shell_true_executes_brace_command_list() {
     let handler = RequestHandler::new();
     let root = temp_root("if-shell-true-brace");
@@ -604,7 +641,7 @@ async fn scripted_pane_commands_accept_session_targets_like_tmux() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn if_shell_shell_mode_uses_tmux_shell_environment_and_caller_cwd() {
+async fn if_shell_shell_mode_uses_bin_sh_environment_and_caller_cwd() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let root = temp_root("if-shell-shell-mode");
@@ -685,7 +722,10 @@ async fn if_shell_shell_mode_uses_tmux_shell_environment_and_caller_cwd() {
             .stdout(),
         b"yes"
     );
-    assert_eq!(fs::read_to_string(marker).expect("shell marker"), "used");
+    assert!(
+        !marker.exists(),
+        "if-shell should not execute default-shell for tmux jobs"
+    );
 }
 
 #[cfg(windows)]
@@ -894,7 +934,7 @@ async fn if_shell_string_mode_runs_multiple_commands_in_one_group() {
 async fn if_shell_inserted_assignments_apply_before_parent_queue_tail() {
     let handler = RequestHandler::new();
     let parsed = CommandParser::new()
-        .parse("if-shell -F 1 { FOO=bar } ; run-shell true")
+        .parse("if-shell -F 1 { FOO=bar } ; run-shell \"exit 0\"")
         .expect("commands parse");
 
     let output = handler

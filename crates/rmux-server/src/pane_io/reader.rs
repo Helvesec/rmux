@@ -1,16 +1,14 @@
 use std::io;
 
-use rmux_core::PaneId;
+use rmux_core::{PaneId, TerminalPassthrough, TerminalPassthroughKind};
 #[cfg(windows)]
 use rmux_pty::PtyChild;
 use rmux_pty::{PtyIo, PtyMaster};
 #[cfg(windows)]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::{mpsc as std_mpsc, Arc, OnceLock};
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -27,7 +25,7 @@ use super::{
 };
 #[cfg(unix)]
 use crate::pane_reader_runtime::PaneReaderRuntime;
-use crate::pane_transcript::SharedPaneTranscript;
+use crate::pane_transcript::{PaneGroundTimer, SharedPaneTranscript};
 
 #[cfg(unix)]
 const PANE_BLOCKING_PARSE_MIN_BYTES: usize = 1024 * 1024;
@@ -540,18 +538,22 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
     if !pane_output.accepts_generation(generation) {
         return Vec::new();
     }
-    let Some((_sequence, append_result)) =
+    let Some((_sequence, (append_result, clipboard_set))) =
         pane_output.publish_for_generation(generation, bytes, |bytes| {
             let mut transcript = transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned");
             let mut append_result = transcript.append_bytes_with_effects(bytes);
             let passthroughs = std::mem::take(&mut append_result.passthroughs);
-            (append_result, passthroughs)
+            let clipboard_set = passthroughs.iter().any(passthrough_is_clipboard_set);
+            ((append_result, clipboard_set), passthroughs)
         })
     else {
         return Vec::new();
     };
+    if let Some(timer) = append_result.ground_timer {
+        schedule_pane_ground_timer(session_name, pane_id, Arc::clone(transcript), timer);
+    }
     let replies = append_result.replies;
     let dropped_passthrough_count = append_result.dropped_passthrough_count;
     if dropped_passthrough_count > 0 {
@@ -568,11 +570,166 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
             pane_id,
             bell_count: append_result.bell_count,
             title_changed: append_result.title_changed,
+            title_change: append_result.title_change.clone(),
+            clipboard_set,
             queue_activity_alert: emit_no_bell_alert || append_result.bell_count > 0,
             generation,
         });
     }
     replies
+}
+
+fn passthrough_is_clipboard_set(passthrough: &TerminalPassthrough) -> bool {
+    passthrough.kind() == TerminalPassthroughKind::Clipboard
+        && osc52_payload_is_clipboard_set(passthrough.payload())
+}
+
+fn osc52_payload_is_clipboard_set(sequence: &[u8]) -> bool {
+    let Some(body) = sequence.strip_prefix(b"\x1b]52;") else {
+        return false;
+    };
+    let Some(body) = body
+        .strip_suffix(b"\x07")
+        .or_else(|| body.strip_suffix(b"\x1b\\"))
+    else {
+        return false;
+    };
+    let Some(separator) = body.iter().position(|byte| *byte == b';') else {
+        return false;
+    };
+    let payload = &body[separator + 1..];
+    payload != b"?" && base64_payload_syntax_is_valid(payload)
+}
+
+fn base64_payload_syntax_is_valid(payload: &[u8]) -> bool {
+    if payload.len() % 4 == 1 {
+        return false;
+    }
+
+    let mut padding = 0usize;
+    let mut seen_padding = false;
+    for &byte in payload {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !seen_padding => {}
+            b'=' => {
+                seen_padding = true;
+                padding += 1;
+                if padding > 2 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+struct PaneGroundTimerJob {
+    transcript: SharedPaneTranscript,
+    timer: PaneGroundTimer,
+}
+
+fn schedule_pane_ground_timer(
+    session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
+    transcript: SharedPaneTranscript,
+    timer: PaneGroundTimer,
+) {
+    let job = PaneGroundTimerJob { transcript, timer };
+    if let Err(error) = pane_ground_timer_tx().send(job) {
+        warn!(
+            session = %session_name,
+            pane_id = pane_id.as_u32(),
+            "failed to schedule pane parser ground timer: {error}"
+        );
+    }
+}
+
+fn pane_ground_timer_tx() -> &'static std_mpsc::Sender<PaneGroundTimerJob> {
+    static TIMER_TX: OnceLock<std_mpsc::Sender<PaneGroundTimerJob>> = OnceLock::new();
+    TIMER_TX.get_or_init(|| {
+        let (tx, rx) = std_mpsc::channel();
+        spawn_pane_ground_timer_worker(rx);
+        tx
+    })
+}
+
+fn spawn_pane_ground_timer_worker(rx: std_mpsc::Receiver<PaneGroundTimerJob>) {
+    let thread_name = "rmux-pane-ground-timer".to_owned();
+    if let Err(error) = std::thread::Builder::new()
+        .name(thread_name.clone())
+        .spawn(move || run_pane_ground_timer_worker(rx))
+    {
+        warn!(
+            thread = %thread_name,
+            "failed to spawn pane parser ground timer worker: {error}"
+        );
+    }
+}
+
+fn run_pane_ground_timer_worker(rx: std_mpsc::Receiver<PaneGroundTimerJob>) {
+    let mut jobs = Vec::<PaneGroundTimerJob>::new();
+    loop {
+        if jobs.is_empty() {
+            match rx.recv() {
+                Ok(job) => {
+                    jobs.push(job);
+                    continue;
+                }
+                Err(_) => return,
+            }
+        }
+
+        expire_due_pane_ground_timers(&mut jobs);
+        if jobs.is_empty() {
+            continue;
+        }
+
+        let next_deadline = jobs
+            .iter()
+            .map(|job| job.timer.deadline)
+            .min()
+            .expect("non-empty timer job queue has a deadline");
+        let timeout = next_deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(timeout) {
+            Ok(job) => jobs.push(job),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => expire_due_pane_ground_timers(&mut jobs),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn expire_due_pane_ground_timers(jobs: &mut Vec<PaneGroundTimerJob>) {
+    let now = Instant::now();
+    let mut index = 0;
+    while index < jobs.len() {
+        if now < jobs[index].timer.deadline {
+            index += 1;
+            continue;
+        }
+        let job = jobs.swap_remove(index);
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            expire_pane_ground_timer_job(job);
+        }))
+        .is_err()
+        {
+            warn!("pane parser ground timer job panicked; timer worker is continuing");
+        }
+    }
+}
+
+fn expire_pane_ground_timer_job(job: PaneGroundTimerJob) {
+    let mut transcript = match job.transcript.lock() {
+        Ok(transcript) => transcript,
+        Err(poisoned) => {
+            warn!(
+                "pane transcript mutex was poisoned while expiring parser ground timer; \
+                 recovering timer worker"
+            );
+            poisoned.into_inner()
+        }
+    };
+    let _ = transcript.expire_ground_timer(job.timer);
 }
 
 #[cfg(unix)]
@@ -689,6 +846,20 @@ fn spawn_blocking_pane_output_reader_inner(
             thread = %thread_name,
             "failed to spawn pane output reader: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::osc52_payload_is_clipboard_set;
+
+    #[test]
+    fn osc52_clipboard_set_requires_write_payload() {
+        assert!(osc52_payload_is_clipboard_set(b"\x1b]52;c;aGk=\x07"));
+        assert!(osc52_payload_is_clipboard_set(b"\x1b]52;c;aGk\x1b\\"));
+        assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;?\x07"));
+        assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;%%\x07"));
+        assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;abcde\x07"));
     }
 }
 
@@ -816,7 +987,8 @@ finally:
             PaneReaderRuntime::current().expect("test runtime is active"),
         );
 
-        let contents = wait_for_file_contents(&output, Duration::from_secs(30)).await?;
+        let contents =
+            wait_for_file_contents(&output, b"\x1b[?1;2c".len(), Duration::from_secs(30)).await?;
         let _ = spawned.child_mut().wait();
         output_reader_task.abort();
         let _ = fs::remove_file(&output);
@@ -903,14 +1075,23 @@ finally:
 
     async fn wait_for_file_contents(
         path: &Path,
+        minimum_len: usize,
         timeout: Duration,
     ) -> Result<Vec<u8>, Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         loop {
             match fs::read(path) {
-                Ok(contents) => return Ok(contents),
-                Err(_) if Instant::now() < deadline => {
+                Ok(contents) if contents.len() >= minimum_len => return Ok(contents),
+                Ok(_) | Err(_) if Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(contents) => {
+                    return Err(format!(
+                        "timed out waiting for {} to contain at least {minimum_len} bytes; got {}",
+                        path.display(),
+                        contents.len()
+                    )
+                    .into());
                 }
                 Err(error) => {
                     return Err(format!("timed out waiting for {}: {error}", path.display()).into());
@@ -944,7 +1125,7 @@ finally:
 }
 
 #[cfg(all(test, windows))]
-mod tests {
+mod windows_tests {
     use std::error::Error;
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
@@ -953,9 +1134,38 @@ mod tests {
     use rmux_proto::{SessionName, TerminalSize};
     use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
 
-    use super::{spawn_pane_output_reader, PaneOutputEofState};
+    use super::{
+        expire_due_pane_ground_timers, spawn_pane_output_reader, PaneGroundTimerJob,
+        PaneOutputEofState,
+    };
     use crate::pane_io::pane_output_channel;
     use crate::pane_transcript::PaneTranscript;
+
+    #[test]
+    fn pane_ground_timer_worker_survives_poisoned_transcript_mutex() {
+        let transcript = PaneTranscript::shared(2_000, TerminalSize { cols: 80, rows: 24 });
+        let mut timer = transcript
+            .lock()
+            .expect("new transcript mutex is healthy")
+            .append_bytes_with_effects(b"\x1bPunterminated")
+            .ground_timer
+            .expect("unterminated DCS arms parser ground timer");
+        timer.deadline = Instant::now() - Duration::from_millis(1);
+
+        let poisoned = transcript.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().expect("mutex is healthy before poison");
+            panic!("poison pane transcript mutex for timer worker test");
+        });
+
+        let mut jobs = vec![PaneGroundTimerJob { transcript, timer }];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            expire_due_pane_ground_timers(&mut jobs);
+        }));
+
+        assert!(result.is_ok(), "timer worker must survive poisoned jobs");
+        assert!(jobs.is_empty(), "due poisoned job should be consumed");
+    }
 
     #[test]
     fn windows_output_reader_updates_transcript_after_written_input() -> Result<(), Box<dyn Error>>

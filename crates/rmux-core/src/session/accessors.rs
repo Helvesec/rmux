@@ -85,11 +85,6 @@ impl Session {
         self.cwd = cwd;
     }
 
-    /// Records session activity at the current time.
-    pub fn touch_activity(&mut self) {
-        self.activity_at = current_unix_timestamp();
-    }
-
     /// Records that a client attached to the session at the current time.
     pub fn touch_attached(&mut self) {
         let now = current_unix_timestamp();

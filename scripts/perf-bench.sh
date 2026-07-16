@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export LC_ALL=C
+
 iterations=30
 line_count=10000
 binary=""
 output_dir="target/perf"
 skip_build=0
 fail_on_budget=0
+source_command_count="${RMUX_PERF_SOURCE_COMMANDS:-1000}"
+hook_storm_events="${RMUX_PERF_HOOK_STORM_EVENTS:-25}"
+daemon_churn_cycles="${RMUX_PERF_DAEMON_CHURN_CYCLES:-10}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -68,23 +73,90 @@ if ! is_positive_integer "$line_count"; then
     exit 2
 fi
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$repo_root"
-
-if [ -z "$binary" ]; then
-    binary="${CARGO_TARGET_DIR:-target}/release/rmux"
+if ! is_positive_integer "$source_command_count"; then
+    echo "RMUX_PERF_SOURCE_COMMANDS must be a positive integer, got: $source_command_count" >&2
+    exit 2
 fi
 
+if ! is_positive_integer "$hook_storm_events"; then
+    echo "RMUX_PERF_HOOK_STORM_EVENTS must be a positive integer, got: $hook_storm_events" >&2
+    exit 2
+fi
+
+if ! is_positive_integer "$daemon_churn_cycles"; then
+    echo "RMUX_PERF_DAEMON_CHURN_CYCLES must be a positive integer, got: $daemon_churn_cycles" >&2
+    exit 2
+fi
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+source "$repo_root/scripts/perf-provenance.sh"
+
+release_dir="${CARGO_TARGET_DIR:-target}/release"
+mkdir -p "$release_dir"
+release_dir="$(cd "$release_dir" && pwd)"
+cargo_binary="$release_dir/rmux"
+cargo_daemon="$release_dir/rmux-daemon"
+if [ -z "$binary" ]; then
+    binary="$cargo_binary"
+fi
+mkdir -p "$(dirname "$binary")"
+binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+binary_dir="$(dirname "$binary")"
+helper_binary="$binary_dir/libexec/rmux/rmux"
+daemon_binary="$binary_dir/rmux-daemon"
+
 if [ "$skip_build" -eq 0 ]; then
-    cargo build --locked --release
+    cargo build --locked --release --package rmux --bin rmux
+    mkdir -p "$(dirname "$helper_binary")"
+    install -m 0755 "$cargo_binary" "$helper_binary"
+    cargo build --locked --release --package rmux --bin rmux-daemon
+    if [ "$daemon_binary" != "$cargo_daemon" ]; then
+        install -m 0755 "$cargo_daemon" "$daemon_binary"
+    fi
+    cargo build --locked --release --package rmux --features tiny-cli --bin rmux
+    if [ "$binary" != "$cargo_binary" ]; then
+        install -m 0755 "$cargo_binary" "$binary"
+    fi
 fi
 
 if [ ! -x "$binary" ]; then
     echo "rmux binary was not found or is not executable: $binary" >&2
     exit 1
 fi
+if [ ! -x "$helper_binary" ]; then
+    echo "rmux private helper was not found or is not executable: $helper_binary" >&2
+    exit 1
+fi
+if [ ! -x "$daemon_binary" ]; then
+    echo "rmux daemon was not found or is not executable: $daemon_binary" >&2
+    exit 1
+fi
+case "$binary" in
+    */release/rmux|*/release/*/rmux) ;;
+    *)
+        echo "perf bench requires the release-profile rmux binary, got: $binary" >&2
+        exit 2
+        ;;
+esac
 
-binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+rmux_perf_capture_current_identity "$binary" "$skip_build"
+git_commit="$RMUX_PERF_GIT_COMMIT"
+git_describe="$RMUX_PERF_GIT_DESCRIBE"
+platform="$RMUX_PERF_PLATFORM"
+machine="$RMUX_PERF_MACHINE"
+host_fingerprint="$RMUX_PERF_HOST_FINGERPRINT_VALUE"
+expected_git_commit="$RMUX_PERF_EXPECTED_COMMIT_VALUE"
+expected_platform="$RMUX_PERF_EXPECTED_PLATFORM_VALUE"
+provenance_invocation="$RMUX_PERF_PROVENANCE_VALUE"
+binary_sha256="$RMUX_PERF_BINARY_SHA256"
+binary_version="$RMUX_PERF_BINARY_VERSION"
+build_mode="$RMUX_PERF_BUILD_MODE"
+binary_size_bytes="$(wc -c <"$binary" | tr -d ' ')"
+helper_binary_sha256="$(sha256_file "$helper_binary")"
+helper_binary_size_bytes="$(wc -c <"$helper_binary" | tr -d ' ')"
+daemon_binary_sha256="$(sha256_file "$daemon_binary")"
+daemon_binary_size_bytes="$(wc -c <"$daemon_binary" | tr -d ' ')"
 mkdir -p "$output_dir"
 
 metric_names=()
@@ -157,7 +229,7 @@ max_value() {
 
 new_line_script() {
     local path
-    path="$(mktemp "${TMPDIR:-/tmp}/rmux-perf-lines.XXXXXX.sh")"
+    path="$(mktemp "${TMPDIR:-/tmp}/rmux-perf-lines.XXXXXX")"
     cat >"$path" <<SCRIPT
 #!/bin/sh
 i=1
@@ -169,6 +241,32 @@ sleep 30
 SCRIPT
     chmod +x "$path"
     printf '%s' "$path"
+}
+
+new_large_source_file() {
+    local path
+    path="$(mktemp "${TMPDIR:-/tmp}/rmux-perf-source.XXXXXX")"
+    for ((index = 1; index <= source_command_count; index++)); do
+        printf 'set-option -g @perf-source-%05d value-%05d\n' "$index" "$index"
+    done >"$path"
+    printf '%s' "$path"
+}
+
+new_hook_storm_source_file() {
+    local path
+    path="$(mktemp "${TMPDIR:-/tmp}/rmux-perf-hooks.XXXXXX")"
+    for ((index = 1; index <= hook_storm_events; index++)); do
+        printf 'set-option -g @perf-hook-storm-%03d value-%03d\n' "$index" "$index"
+    done >"$path"
+    printf '%s' "$path"
+}
+
+heavy_status_format() {
+    local format=""
+    for ((index = 1; index <= 80; index++)); do
+        format="${format}#{session_name}:#{window_index}:#{pane_index}:#{window_panes}:#{?pane_active,active,inactive}|"
+    done
+    printf '%s' "$format"
 }
 
 wait_for_line_marker() {
@@ -276,6 +374,147 @@ sample_capture_pane() {
     printf '%s' "$ms"
 }
 
+sample_attach_render() {
+    local socket output_file script marker ms status
+    socket="$(unique_socket attach-render)"
+    output_file="$(mktemp)"
+    script="$(new_line_script)"
+    marker="rmux-perf-line-$line_count"
+    "$binary" -L "$socket" new-session -d -s perf /bin/sh "$script" >/dev/null
+    wait_for_line_marker "$socket" "$output_file"
+    set +e
+    ms="$(
+        python3 - "$binary" "$socket" "$marker" <<'PY'
+import fcntl
+import os
+import pty
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+
+rmux, socket, marker = sys.argv[1], sys.argv[2], sys.argv[3].encode()
+env = os.environ.copy()
+env.setdefault("TERM", "xterm-256color")
+env["COLUMNS"] = "80"
+env["LINES"] = "24"
+started = time.perf_counter()
+pid, fd = pty.fork()
+if pid == 0:
+    os.execve(rmux, [rmux, "-L", socket, "attach-session", "-t", "perf"], env)
+
+try:
+    winsize = struct.pack("HHHH", 24, 80, 0, 0)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+    tail = bytearray()
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if fd not in readable:
+            continue
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        tail.extend(data)
+        if len(tail) > 65536:
+            del tail[:-65536]
+        if marker in tail:
+            print(f"{(time.perf_counter() - started) * 1000.0:.3f}")
+            raise SystemExit(0)
+    raise SystemExit("attach render marker was not observed")
+finally:
+    try:
+        os.write(fd, b"\x02d")
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+PY
+    )"
+    status=$?
+    set -e
+    cleanup_socket "$socket"
+    rm -f "$output_file" "$script"
+    if [ "$status" -ne 0 ]; then
+        exit "$status"
+    fi
+    printf '%s' "$ms"
+}
+
+sample_source_file_large() {
+    local socket output_file source_file
+    socket="$(unique_socket source-large)"
+    output_file="$(mktemp)"
+    source_file="$(new_large_source_file)"
+    "$binary" -L "$socket" new-session -d -s perf /bin/sh >/dev/null
+    run_timed_ms "$output_file" -L "$socket" source-file "$source_file"
+    cleanup_socket "$socket"
+    rm -f "$output_file" "$source_file"
+}
+
+sample_status_format_heavy() {
+    local socket output_file format
+    socket="$(unique_socket status-format)"
+    output_file="$(mktemp)"
+    format="$(heavy_status_format)"
+    "$binary" -L "$socket" new-session -d -s perf /bin/sh >/dev/null
+    run_timed_ms "$output_file" -L "$socket" display-message -p -F "$format" -t perf
+    cleanup_socket "$socket"
+    rm -f "$output_file"
+}
+
+sample_hook_storm() {
+    local socket output_file source_file
+    socket="$(unique_socket hook-storm)"
+    output_file="$(mktemp)"
+    source_file="$(new_hook_storm_source_file)"
+    "$binary" -L "$socket" new-session -d -s perf /bin/sh >/dev/null
+    "$binary" -L "$socket" set-hook -g after-set-option 'display-message -p "#{hook}:#{option_name}"' >/dev/null
+    run_timed_ms "$output_file" -L "$socket" source-file "$source_file"
+    cleanup_socket "$socket"
+    rm -f "$output_file" "$source_file"
+}
+
+sample_daemon_churn() {
+    local root start_ns end_ns status socket
+    root="$(mktemp -d "${TMPDIR:-/tmp}/rmux-perf-daemon-churn.XXXXXX")"
+    status=0
+    start_ns="$(date +%s%N)"
+    for ((index = 1; index <= daemon_churn_cycles; index++)); do
+        socket="$root/churn-$index.sock"
+        "$binary" -S "$socket" new-session -d -s "churn$index" /bin/sh >/dev/null 2>&1 || {
+            status=$?
+            break
+        }
+        "$binary" -S "$socket" kill-server >/dev/null 2>&1 || {
+            status=$?
+            break
+        }
+    done
+    end_ns="$(date +%s%N)"
+    rm -rf "$root"
+    if [ "$status" -ne 0 ]; then
+        echo "daemon churn failed with exit code $status" >&2
+        exit "$status"
+    fi
+    awk -v start="$start_ns" -v end="$end_ns" 'BEGIN { printf "%.3f", (end - start) / 1000000 }'
+}
+
 record_metric() {
     local name="$1"
     local budget="$2"
@@ -309,14 +548,19 @@ record_metric() {
     metric_samples+=("$(IFS=,; echo "${samples[*]}")")
 }
 
-record_metric "diagnose_json_cold" "null" sample_diagnose
+record_metric "diagnose_json_cold" "250" sample_diagnose
 record_metric "daemon_startup" "750" sample_daemon_startup
 record_metric "new_session_detached_sh" "500" sample_new_session_sh
 record_metric "split_window_detached_sh" "150" sample_split_window_sh
-record_metric "send_keys_detached_round_trip" "20" sample_send_keys
+record_metric "send_keys_detached_round_trip" "50" sample_send_keys
 record_metric "resize_pane_round_trip" "100" sample_resize_pane
-record_metric "pane_output_${line_count}_lines_ready" "null" sample_pane_output_ready
+record_metric "pane_output_${line_count}_lines_ready" "3000" sample_pane_output_ready
 record_metric "capture_pane_${line_count}_lines" "75" sample_capture_pane
+record_metric "attach_render_${line_count}_line_scrollback" "1000" sample_attach_render
+record_metric "source_file_${source_command_count}_commands" "2000" sample_source_file_large
+record_metric "status_format_heavy_expand" "250" sample_status_format_heavy
+record_metric "hook_storm_${hook_storm_events}_after_set_option" "500" sample_hook_storm
+record_metric "daemon_churn_${daemon_churn_cycles}_create_kill" "5000" sample_daemon_churn
 
 timestamp="$(date -u +%Y%m%d-%H%M%S)"
 json_path="$output_dir/unix-$timestamp.json"
@@ -324,12 +568,24 @@ markdown_path="$output_dir/unix-$timestamp.txt"
 
 {
     printf '{\n'
-    printf '  "schema": 1,\n'
-    printf '  "timestamp": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '  "platform": "%s",\n' "$(uname -s | tr '[:upper:]' '[:lower:]')"
-    printf '  "binary": "%s",\n' "$binary"
-    printf '  "iterations": %s,\n' "$iterations"
-    printf '  "line_count": %s,\n' "$line_count"
+    printf '  "schema": 2,\n'
+    printf '  "kind": "rmux-perf-current",\n'
+    printf '  "timestamp": %s,\n' "$(json_string "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+    printf '  "git": {"commit":%s,"describe":%s,"dirty":false},\n' \
+        "$(json_string "$git_commit")" "$(json_string "$git_describe")"
+    printf '  "environment": {"platform":%s,"machine":%s,"host_fingerprint":%s},\n' \
+        "$(json_string "$platform")" "$(json_string "$machine")" "$(json_string "$host_fingerprint")"
+    printf '  "binary": {"path":%s,"sha256":%s,"size_bytes":%s,"version":%s,"configuration":"release"},\n' \
+        "$(json_string "$binary")" "$(json_string "$binary_sha256")" "$binary_size_bytes" "$(json_string "$binary_version")"
+    printf '  "layout": {"schema":1,"public":{"path":%s,"sha256":%s,"size_bytes":%s},"helper":{"path":%s,"sha256":%s,"size_bytes":%s},"daemon":{"path":%s,"sha256":%s,"size_bytes":%s}},\n' \
+        "$(json_string "$binary")" "$(json_string "$binary_sha256")" "$binary_size_bytes" \
+        "$(json_string "$helper_binary")" "$(json_string "$helper_binary_sha256")" "$helper_binary_size_bytes" \
+        "$(json_string "$daemon_binary")" "$(json_string "$daemon_binary_sha256")" "$daemon_binary_size_bytes"
+    printf '  "provenance": {"generator":"scripts/perf-bench.sh","invocation":%s,"expected_git_commit":%s,"expected_platform":%s,"build_mode":%s},\n' \
+        "$(json_string "$provenance_invocation")" "$(json_string "$expected_git_commit")" \
+        "$(json_string "$expected_platform")" "$(json_string "$build_mode")"
+    printf '  "parameters": {"iterations":%s,"line_count":%s,"source_command_count":%s,"hook_storm_events":%s,"daemon_churn_cycles":%s},\n' \
+        "$iterations" "$line_count" "$source_command_count" "$hook_storm_events" "$daemon_churn_cycles"
     printf '  "metrics": [\n'
     for ((i = 0; i < ${#metric_names[@]}; i++)); do
         [ "$i" -gt 0 ] && printf ',\n'
@@ -345,6 +601,11 @@ markdown_path="$output_dir/unix-$timestamp.txt"
 {
     printf '# RMUX Unix Performance Bench\n\n'
     printf -- '- Binary: `%s`\n' "$binary"
+    printf -- '- Binary SHA-256: `%s`\n' "$binary_sha256"
+    printf -- '- Private helper SHA-256: `%s`\n' "$helper_binary_sha256"
+    printf -- '- Daemon SHA-256: `%s`\n' "$daemon_binary_sha256"
+    printf -- '- Git commit: `%s`\n' "$git_commit"
+    printf -- '- Provenance: `%s`\n' "$provenance_invocation"
     printf -- '- Iterations: `%s`\n' "$iterations"
     printf -- '- Line count: `%s`\n\n' "$line_count"
     printf '| Metric | p50 ms | p95 ms | Budget p95 ms | Status |\n'

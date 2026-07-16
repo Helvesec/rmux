@@ -28,6 +28,8 @@ mod variables;
 #[path = "format_runtime/window.rs"]
 mod window;
 
+pub(crate) use path::pane_path_from_osc7;
+
 pub(crate) struct RuntimeFormatContext<'a> {
     base: FormatContext,
     state: Option<&'a HandlerState>,

@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn source_file_recovers_lookup_parse_errors_and_continues_other_paths() {
+async fn source_file_lookup_parse_errors_skip_bad_file_and_continue_other_paths() {
     let handler = RequestHandler::new();
     let root = temp_root("multi-path-parse-error");
     let bad = root.join("bad.conf");
@@ -31,16 +31,16 @@ async fn source_file_recovers_lookup_parse_errors_and_continues_other_paths() {
         "unexpected source-file parse error: {error:?}"
     );
     for name in ["before-error", "after-error"] {
-        assert_eq!(
-            handler
-                .handle(Request::ShowBuffer(ShowBufferRequest {
-                    name: Some(name.to_owned()),
-                }))
-                .await
-                .command_output()
-                .expect("recovered command should run")
-                .stdout(),
-            b"ok"
+        assert!(
+            matches!(
+                handler
+                    .handle(Request::ShowBuffer(ShowBufferRequest {
+                        name: Some(name.to_owned()),
+                    }))
+                    .await,
+                Response::Error(_)
+            ),
+            "{name} should not run when the source file has a lookup parse error"
         );
     }
     assert_eq!(
@@ -57,7 +57,7 @@ async fn source_file_recovers_lookup_parse_errors_and_continues_other_paths() {
 }
 
 #[tokio::test]
-async fn source_file_lookup_error_inside_block_does_not_corrupt_recovery() {
+async fn source_file_lookup_error_inside_block_stops_file_without_brace_noise() {
     let handler = RequestHandler::new();
     let root = temp_root("block-parse-error-recovery");
     let config = root.join("block.conf");
@@ -82,12 +82,12 @@ async fn source_file_lookup_error_inside_block_does_not_corrupt_recovery() {
         "unexpected source-file parse error: {message}"
     );
     assert!(
-        message.contains("block.conf:5: unknown command: second-bogus"),
-        "recovered suffix diagnostics must keep physical source lines: {message}"
+        !message.contains("second-bogus"),
+        "tmux stops a source file at the first lookup parse error: {message}"
     );
     assert!(
         !message.contains("missing }") && !message.contains("unmatched }"),
-        "lookup recovery must not invent structural brace errors: {message}"
+        "lookup stop must not invent structural brace errors: {message}"
     );
     assert!(
         matches!(
@@ -100,21 +100,21 @@ async fn source_file_lookup_error_inside_block_does_not_corrupt_recovery() {
         ),
         "the corrupt block should be skipped instead of partially executed"
     );
-    assert_eq!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("after-block".to_owned()),
-            }))
-            .await
-            .command_output()
-            .expect("command after corrupt block should run")
-            .stdout(),
-        b"yes"
+    assert!(
+        matches!(
+            handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some("after-block".to_owned()),
+                }))
+                .await,
+            Response::Error(_)
+        ),
+        "commands after the first lookup parse error should not run"
     );
 }
 
 #[tokio::test]
-async fn nested_source_file_continues_after_recoverable_lookup_parse_errors() {
+async fn nested_source_file_lookup_parse_error_skips_child_but_outer_continues() {
     let handler = RequestHandler::new();
     let root = temp_root("nested-source-parse-error");
     write_config(
@@ -144,16 +144,16 @@ async fn nested_source_file_continues_after_recoverable_lookup_parse_errors() {
         ),
         "unexpected nested source-file parse error: {error:?}"
     );
-    assert_eq!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("nested-after".to_owned()),
-            }))
-            .await
-            .command_output()
-            .expect("nested command after lookup parse error should run")
-            .stdout(),
-        b"yes"
+    assert!(
+        matches!(
+            handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some("nested-after".to_owned()),
+                }))
+                .await,
+            Response::Error(_)
+        ),
+        "nested command after lookup parse error should not run"
     );
     assert_eq!(
         handler
@@ -337,12 +337,16 @@ async fn source_file_stdin_dash_without_stdin_returns_error() {
         })))
         .await;
 
-    let Response::Error(error) = response else {
+    let Response::SourceFile(response) = response else {
         panic!("source-file should report missing stdin, got {response:?}");
     };
+    assert_eq!(response.exit_status(), Some(1));
     assert!(
-        matches!(error.error, rmux_proto::RmuxError::Server(ref message) if message.contains("stdin")),
-        "expected stdin error, got {error:?}"
+        std::str::from_utf8(response.stderr())
+            .expect("stderr is UTF-8")
+            .contains("stdin"),
+        "expected stdin error, got {:?}",
+        response.stderr()
     );
 }
 
@@ -388,6 +392,7 @@ async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
             value_only: true,
             include_inherited: false,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     assert_eq!(
@@ -427,7 +432,7 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
                 "set-option -s message-limit 77\n\
 set -gq status off\n\
 set -gw pane-border-style fg=colour3\n\
-set-window-option -gw pane-active-border-style fg=colour5\n\
+set-window-option -g pane-active-border-style fg=colour5\n\
 set -gw copy-mode-selection-style bg=cyan,fg=black\n\
 set-option -ag status-left append\n\
 	show-options -gqsv -t alpha message-limit\n\

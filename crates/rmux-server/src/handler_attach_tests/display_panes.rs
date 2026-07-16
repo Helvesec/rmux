@@ -183,6 +183,47 @@ async fn attached_prefix_q_emits_a_display_panes_overlay_when_prefix_and_q_arriv
 }
 
 #[tokio::test]
+async fn display_panes_target_client_does_not_fan_out_within_the_session() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("display-panes-target-client");
+    let mut first_rx = create_attached_session(&handler, 101, &alpha).await;
+    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+    handler.register_attach(202, alpha.clone(), second_tx).await;
+    drain_attach_controls(&mut first_rx);
+    drain_attach_controls(&mut second_rx);
+
+    let response = handler
+        .dispatch(
+            303,
+            Request::DisplayPanes(Box::new(rmux_proto::DisplayPanesRequest {
+                target: alpha,
+                duration_ms: Some(5_000),
+                non_blocking: true,
+                no_command: true,
+                template: None,
+                target_client: Some("202".to_owned()),
+            })),
+        )
+        .await
+        .response;
+
+    assert!(matches!(response, Response::DisplayPanes(_)));
+    while let Ok(control) = first_rx.try_recv() {
+        assert!(
+            !matches!(control, AttachControl::Overlay(_)),
+            "non-target client must not receive the display-panes overlay"
+        );
+    }
+    let _ = recv_matching_attach_control(&mut second_rx, "targeted display-panes", |control| {
+        matches!(control, AttachControl::Overlay(_))
+    })
+    .await;
+    let active = handler.active_attach.lock().await;
+    assert!(active.by_pid[&101].display_panes.is_none());
+    assert!(active.by_pid[&202].display_panes.is_some());
+}
+
+#[tokio::test]
 async fn display_panes_input_uses_visible_pane_base_index_labels() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();

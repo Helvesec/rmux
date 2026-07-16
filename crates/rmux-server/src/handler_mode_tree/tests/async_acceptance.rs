@@ -77,8 +77,8 @@ async fn choose_client_from_unattached_request_activates_mode_tree_on_all_attach
         Response::NewSession(_)
     ));
 
-    let (first_tx, _first_rx) = mpsc::unbounded_channel();
-    let (second_tx, _second_rx) = mpsc::unbounded_channel();
+    let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
     let first_pid = std::process::id();
     let second_pid = first_pid.saturating_add(1);
     let _ = handler
@@ -113,6 +113,39 @@ async fn choose_client_from_unattached_request_activates_mode_tree_on_all_attach
         .get(&second_pid)
         .and_then(|active| active.mode_tree.as_ref())
         .is_some());
+    drop(active_attach);
+
+    let first_overlay = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let Some(control) = first_rx.recv().await else {
+                panic!("first attach control channel closed before choose-client overlay");
+            };
+            if matches!(control, crate::pane_io::AttachControl::Overlay(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        first_overlay.is_ok(),
+        "first attach did not receive choose-client overlay"
+    );
+
+    let second_overlay = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let Some(control) = second_rx.recv().await else {
+                panic!("second attach control channel closed before choose-client overlay");
+            };
+            if matches!(control, crate::pane_io::AttachControl::Overlay(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        second_overlay.is_ok(),
+        "second attach did not receive choose-client overlay"
+    );
 }
 
 #[tokio::test]
@@ -141,13 +174,14 @@ async fn mode_tree_commands_without_attached_client_mark_target_pane_mode() {
         if needs_buffer {
             assert!(matches!(
                 handler
-                    .handle(Request::SetBuffer(rmux_proto::SetBufferRequest {
+                    .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
                         name: Some("buf".to_owned()),
                         content: b"hello".to_vec(),
                         append: false,
                         new_name: None,
                         set_clipboard: false,
-                    }))
+                        target_client: None,
+                    })))
                     .await,
                 Response::SetBuffer(_)
             ));

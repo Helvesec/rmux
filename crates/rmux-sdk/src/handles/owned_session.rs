@@ -497,6 +497,7 @@ impl Drop for OwnedSession {
                 target: session.name().clone(),
                 kill_all_except_target: false,
                 clear_alerts: false,
+                kill_group: false,
             }),
         );
         drop(guard);

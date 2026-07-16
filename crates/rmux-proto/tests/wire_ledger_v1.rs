@@ -11,7 +11,7 @@
 //! 2. The checked-in ledger fixtures under
 //!    `tests/wire-fixtures/ledger-v1-current-wire/`
 //!    decode through both `decode_frame` and `FrameDecoder` using the current
-//!    wire envelope (currently `RMUX_WIRE_VERSION = 3`), asserting stable
+//!    wire envelope, asserting stable
 //!    semantic fields rather than enum source order. Encoding canonical inputs
 //!    reproduces each fixture byte-for-byte to guard against silent codec drift.
 
@@ -22,22 +22,28 @@ use rmux_proto::{
     AttachSessionExt2Request, AttachSessionExt3Request, BindKeyRequest, CancelSdkWaitRequest,
     CancelSdkWaitResponse, CapturePaneRequest, CapturePaneTargetActionRequest,
     ClientTerminalContext, ClockModeRequest, ControlMode, ControlModeRequest, ControlModeResponse,
-    DetachClientRequest, DisplayMessageExtRequest, ErrorResponse, FrameDecoder, FrameDirection,
-    FrameFeature, FrameKind, FrameStatus, HandshakeRequest, HandshakeResponse, HasSessionRequest,
+    DetachClientRequest, DisplayMessageExtRequest, ErrorResponse, ForegroundFieldSource,
+    ForegroundSourcesDto, ForegroundStateDto, FrameDecoder, FrameDirection, FrameFeature,
+    FrameKind, FrameStatus, HandshakeRequest, HandshakeResponse, HasSessionRequest,
     HasSessionResponse, HookLifecycle, HookName, KillServerResponse, KillSessionRequest,
-    ListBuffersRequest, NewSessionResponse, OptionName, PaneId, PaneInputRequest, PaneKillRequest,
+    ListBuffersRequest, NewSessionResponse, OptionName, PaneForegroundStateRequest,
+    PaneForegroundStateResponse, PaneId, PaneInputRequest, PaneKillRequest, PaneOptionEntry,
+    PaneOptionGetRequest, PaneOptionGetResponse, PaneOptionSetRequest, PaneOptionSetResponse,
     PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent,
     PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
     PaneOutputSubscriptionStart, PaneRecentOutput, PaneResizeRequest, PaneRespawnRequest,
     PaneSelectRequest, PaneSnapshotCursor, PaneSnapshotRefRequest, PaneSnapshotResponse,
-    PaneTarget, PaneTargetRef, Request, ResizePaneAdjustment, ResizePaneTargetActionRequest,
-    ResolveTargetRequest, ResolveTargetType, Response, RmuxError, ScopeSelector,
-    SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId,
-    SdkWaitOutcome, SdkWaitOwnerId, SendKeysExt2Request, SendKeysRequest, SendKeysResponse,
-    SessionName, SetHookRequest, SetOptionMode, SetOptionRequest, SplitDirection,
-    SplitWindowTargetActionRequest, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
-    SubscribePaneOutputResponse, TerminalSize, UnsubscribePaneOutputRequest,
-    UnsubscribePaneOutputResponse, WebShareConfigRequest, WebShareListener, WebShareRequest,
+    PaneStateClosedReason, PaneStateCursorRequest, PaneStateCursorResponse, PaneStateEventDto,
+    PaneStateLagResponse, PaneStateSnapshot, PaneStateSubscriptionId, PaneTarget, PaneTargetRef,
+    Request, ResizePaneAdjustment, ResizePaneTargetActionRequest, ResolveTargetRequest,
+    ResolveTargetType, Response, RmuxError, ScopeSelector, SdkWaitForOutputRefRequest,
+    SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId,
+    SendKeysExt2Request, SendKeysRequest, SendKeysResponse, SessionName, SetHookRequest,
+    SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowTargetActionRequest,
+    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
+    SubscribePaneStateRequest, SubscribePaneStateResponse, TerminalSize,
+    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse, UnsubscribePaneStateRequest,
+    UnsubscribePaneStateResponse, WebShareConfigRequest, WebShareListener, WebShareRequest,
     WebShareResponse, WindowTarget, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
 
@@ -85,6 +91,7 @@ fn fixtures() -> Vec<FullFrameFixture> {
         target: alpha(),
         kill_all_except_target: false,
         clear_alerts: false,
+        kill_group: false,
     });
     let send_keys = Request::SendKeys(SendKeysRequest {
         target: pane_alpha_2(),
@@ -99,6 +106,9 @@ fn fixtures() -> Vec<FullFrameFixture> {
         alternate: false,
         escape_ansi: false,
         escape_sequences: false,
+        include_format: false,
+        hyperlinks: false,
+        line_numbers: false,
         join_wrapped: false,
         use_mode_screen: false,
         preserve_trailing_spaces: false,
@@ -111,6 +121,7 @@ fn fixtures() -> Vec<FullFrameFixture> {
     let control_mode = Request::ControlMode(ControlModeRequest {
         mode: ControlMode::ControlControl,
         client_terminal: ClientTerminalContext::default(),
+        initial_command_count: 2,
     });
     let split_target_action =
         Request::SplitWindowTargetAction(Box::new(SplitWindowTargetActionRequest {
@@ -142,6 +153,9 @@ fn fixtures() -> Vec<FullFrameFixture> {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -151,6 +165,58 @@ fn fixtures() -> Vec<FullFrameFixture> {
             start_is_absolute: false,
             end_is_absolute: false,
         }));
+    let pane_ref = PaneTargetRef::by_id(alpha(), PaneId::new(42));
+    let pane_state_subscription = PaneStateSubscriptionId::new(7);
+    let foreground = ForegroundStateDto {
+        pid: Some(4242),
+        command: Some("pwsh".to_owned()),
+        cwd: Some(r"C:\work\rmux".to_owned()),
+        exe: Some(r"C:\Program Files\PowerShell\7\pwsh.exe".to_owned()),
+        sources: ForegroundSourcesDto {
+            pid: Some(ForegroundFieldSource::RootProcess),
+            command: Some(ForegroundFieldSource::RootProcess),
+            cwd: Some(ForegroundFieldSource::Osc7),
+            exe: Some(ForegroundFieldSource::Process),
+        },
+    };
+    let pane_state_snapshot = PaneStateSnapshot {
+        revision: 11,
+        title: Some("agent".to_owned()),
+        options: vec![PaneOptionEntry {
+            name: "@agent.kind".to_owned(),
+            value: "assistant".to_owned(),
+        }],
+        foreground: Some(foreground.clone()),
+    };
+    let pane_option_set = Request::PaneOptionSet(PaneOptionSetRequest {
+        target: pane_ref.clone(),
+        name: "@agent.kind".to_owned(),
+        value: Some("assistant".to_owned()),
+        mode: SetOptionMode::Replace,
+        unset: false,
+    });
+    let pane_option_get = Request::PaneOptionGet(PaneOptionGetRequest {
+        target: pane_ref.clone(),
+        name: "@agent.kind".to_owned(),
+    });
+    let subscribe_pane_state = Request::SubscribePaneState(SubscribePaneStateRequest {
+        target: pane_ref.clone(),
+        include_title: true,
+        include_options: true,
+        include_foreground: true,
+    });
+    let pane_state_cursor = Request::PaneStateCursor(PaneStateCursorRequest {
+        subscription_id: pane_state_subscription,
+        after_revision: 10,
+        wait: true,
+        max_events: Some(8),
+    });
+    let unsubscribe_pane_state = Request::UnsubscribePaneState(UnsubscribePaneStateRequest {
+        subscription_id: pane_state_subscription,
+    });
+    let pane_foreground_state = Request::PaneForegroundState(PaneForegroundStateRequest {
+        target: pane_ref.clone(),
+    });
     let new_session_response = Response::NewSession(NewSessionResponse {
         session_name: alpha(),
         detached: true,
@@ -159,6 +225,59 @@ fn fixtures() -> Vec<FullFrameFixture> {
     let error_response = Response::Error(ErrorResponse {
         error: RmuxError::SessionNotFound("gone".to_owned()),
     });
+    let pane_option_set_response = Response::PaneOptionSet(Box::new(PaneOptionSetResponse {
+        pane_id: PaneId::new(42),
+        name: "@agent.kind".to_owned(),
+        old_value: None,
+        new_value: Some("assistant".to_owned()),
+        changed: true,
+    }));
+    let pane_option_get_response = Response::PaneOptionGet(PaneOptionGetResponse {
+        pane_id: PaneId::new(42),
+        name: "@agent.kind".to_owned(),
+        value: Some("assistant".to_owned()),
+    });
+    let subscribe_pane_state_response =
+        Response::SubscribePaneState(Box::new(SubscribePaneStateResponse {
+            subscription_id: pane_state_subscription,
+            pane_id: PaneId::new(42),
+            snapshot: pane_state_snapshot.clone(),
+        }));
+    let pane_state_cursor_response = Response::PaneStateCursor(PaneStateCursorResponse {
+        subscription_id: pane_state_subscription,
+        events: vec![
+            PaneStateEventDto::OptionSet {
+                revision: 12,
+                pane_id: PaneId::new(42),
+                name: "@agent.kind".to_owned(),
+                old_value: None,
+                new_value: "assistant".to_owned(),
+            },
+            PaneStateEventDto::Closed {
+                revision: 13,
+                pane_id: PaneId::new(42),
+                reason: PaneStateClosedReason::Killed,
+            },
+        ],
+        next_revision: 13,
+    });
+    let pane_state_lag_response = Response::PaneStateLag(Box::new(PaneStateLagResponse {
+        subscription_id: pane_state_subscription,
+        missed_from_revision: 3,
+        resume_revision: 9,
+        snapshot: pane_state_snapshot,
+    }));
+    let unsubscribe_pane_state_response =
+        Response::UnsubscribePaneState(UnsubscribePaneStateResponse {
+            subscription_id: pane_state_subscription,
+            removed: true,
+        });
+    let pane_foreground_state_response =
+        Response::PaneForegroundState(Box::new(PaneForegroundStateResponse {
+            pane_id: PaneId::new(42),
+            revision: 11,
+            state: Some(foreground),
+        }));
 
     vec![
         FullFrameFixture {
@@ -218,6 +337,48 @@ fn fixtures() -> Vec<FullFrameFixture> {
             encode: Frame::Request(capture_target_action),
         },
         FullFrameFixture {
+            name: "pane_option_set_request",
+            kind: frame_kind_for_request(&pane_option_set),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(pane_option_set),
+        },
+        FullFrameFixture {
+            name: "pane_option_get_request",
+            kind: frame_kind_for_request(&pane_option_get),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(pane_option_get),
+        },
+        FullFrameFixture {
+            name: "subscribe_pane_state_request",
+            kind: frame_kind_for_request(&subscribe_pane_state),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(subscribe_pane_state),
+        },
+        FullFrameFixture {
+            name: "pane_state_cursor_request",
+            kind: frame_kind_for_request(&pane_state_cursor),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(pane_state_cursor),
+        },
+        FullFrameFixture {
+            name: "unsubscribe_pane_state_request",
+            kind: frame_kind_for_request(&unsubscribe_pane_state),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(unsubscribe_pane_state),
+        },
+        FullFrameFixture {
+            name: "pane_foreground_state_request",
+            kind: frame_kind_for_request(&pane_foreground_state),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(pane_foreground_state),
+        },
+        FullFrameFixture {
             name: "new_session_response",
             kind: frame_kind_for_response(&new_session_response),
             direction: FrameDirection::ServerToClient,
@@ -230,6 +391,55 @@ fn fixtures() -> Vec<FullFrameFixture> {
             direction: FrameDirection::ServerToClient,
             feature: FrameFeature::Errors,
             encode: Frame::Response(error_response),
+        },
+        FullFrameFixture {
+            name: "pane_option_set_response",
+            kind: frame_kind_for_response(&pane_option_set_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(pane_option_set_response),
+        },
+        FullFrameFixture {
+            name: "pane_option_get_response",
+            kind: frame_kind_for_response(&pane_option_get_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(pane_option_get_response),
+        },
+        FullFrameFixture {
+            name: "subscribe_pane_state_response",
+            kind: frame_kind_for_response(&subscribe_pane_state_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(subscribe_pane_state_response),
+        },
+        FullFrameFixture {
+            name: "pane_state_cursor_response",
+            kind: frame_kind_for_response(&pane_state_cursor_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(pane_state_cursor_response),
+        },
+        FullFrameFixture {
+            name: "pane_state_lag_response",
+            kind: frame_kind_for_response(&pane_state_lag_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(pane_state_lag_response),
+        },
+        FullFrameFixture {
+            name: "unsubscribe_pane_state_response",
+            kind: frame_kind_for_response(&unsubscribe_pane_state_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(unsubscribe_pane_state_response),
+        },
+        FullFrameFixture {
+            name: "pane_foreground_state_response",
+            kind: frame_kind_for_response(&pane_foreground_state_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(pane_foreground_state_response),
         },
     ]
 }
@@ -245,8 +455,8 @@ fn encode_fixture(fixture: &FullFrameFixture) -> Vec<u8> {
 fn fixture_count_matches_manifest() {
     assert_eq!(
         fixtures().len(),
-        10,
-        "Milestone 3 mandates ten ledger fixtures"
+        23,
+        "ledger fixture manifest must stay explicit"
     );
 }
 
@@ -503,6 +713,7 @@ fn cross_section_requests() -> Vec<Request> {
             target: alpha.clone(),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
         Request::DetachClient(DetachClientRequest),
         Request::SendKeys(SendKeysRequest {
@@ -525,6 +736,7 @@ fn cross_section_requests() -> Vec<Request> {
         Request::ControlMode(ControlModeRequest {
             mode: ControlMode::Plain,
             client_terminal: ClientTerminalContext::default(),
+            initial_command_count: 0,
         }),
         Request::ClockMode(ClockModeRequest {
             target: Some(pane.clone()),
@@ -538,6 +750,9 @@ fn cross_section_requests() -> Vec<Request> {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -862,8 +1077,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 121 Request variants + 94 Response variants.
-    assert_eq!(active_count, 121 + 94, "active ledger size mismatch");
+    // Active entries = 127 Request variants + 101 Response variants.
+    assert_eq!(active_count, 127 + 101, "active ledger size mismatch");
 }
 
 #[test]
@@ -1050,6 +1265,24 @@ fn assert_request_semantic_equal(actual: &Request, expected: &Request, label: &s
             assert_eq!(actual.end, expected.end, "{label}");
             assert_eq!(actual.print, expected.print, "{label}");
         }
+        (Request::PaneOptionSet(actual), Request::PaneOptionSet(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::PaneOptionGet(actual), Request::PaneOptionGet(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::SubscribePaneState(actual), Request::SubscribePaneState(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::PaneStateCursor(actual), Request::PaneStateCursor(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::UnsubscribePaneState(actual), Request::UnsubscribePaneState(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Request::PaneForegroundState(actual), Request::PaneForegroundState(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
         (Request::NewSession(actual), Request::NewSession(expected)) => {
             assert_eq!(
                 actual.session_name.as_str(),
@@ -1085,6 +1318,27 @@ fn assert_response_semantic_equal(actual: &Response, expected: &Response, label:
                 expected.error.to_string(),
                 "{label}"
             );
+        }
+        (Response::PaneOptionSet(actual), Response::PaneOptionSet(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::PaneOptionGet(actual), Response::PaneOptionGet(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::SubscribePaneState(actual), Response::SubscribePaneState(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::PaneStateCursor(actual), Response::PaneStateCursor(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::PaneStateLag(actual), Response::PaneStateLag(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::UnsubscribePaneState(actual), Response::UnsubscribePaneState(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::PaneForegroundState(actual), Response::PaneForegroundState(expected)) => {
+            assert_eq!(actual, expected, "{label}");
         }
         (actual, expected) => {
             panic!("{label}: variant mismatch — got {actual:?}, expected {expected:?}")
@@ -1443,8 +1697,21 @@ fn fixture_set_kinds_match_manifest_table() {
         ("split_window_target_action_request", 0x0076),
         ("resize_pane_target_action_request", 0x0077),
         ("capture_pane_target_action_request", 0x0078),
+        ("pane_option_set_request", 0x0079),
+        ("pane_option_get_request", 0x007A),
+        ("subscribe_pane_state_request", 0x007B),
+        ("pane_state_cursor_request", 0x007C),
+        ("unsubscribe_pane_state_request", 0x007D),
+        ("pane_foreground_state_request", 0x007E),
         ("new_session_response", 0x8000),
         ("error_response", 0x801F),
+        ("pane_option_set_response", 0x805E),
+        ("pane_option_get_response", 0x805F),
+        ("subscribe_pane_state_response", 0x8060),
+        ("pane_state_cursor_response", 0x8061),
+        ("pane_state_lag_response", 0x8062),
+        ("unsubscribe_pane_state_response", 0x8063),
+        ("pane_foreground_state_response", 0x8064),
     ];
     let mut by_name: std::collections::HashMap<&str, u16> = std::collections::HashMap::new();
     for entry in V1_FRAME_LEDGER {

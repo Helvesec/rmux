@@ -50,6 +50,9 @@ pub struct ServerAccessRequest {
     /// Whether the resulting entry should be read-write.
     #[serde(default)]
     pub write: bool,
+    /// Optional pane target accepted for tmux CLI compatibility.
+    #[serde(default)]
+    pub target: Option<String>,
     /// The optional username argument.
     #[serde(default)]
     pub user: Option<String>,

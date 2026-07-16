@@ -10,6 +10,7 @@ Verify that release-facing versions agree:
   - every RMUX workspace crate version from cargo metadata
   - snap/snapcraft.yaml, when present
   - rmux.1 release-facing version
+  - Windows application manifest assembly version
   - SECURITY.md signed-checksum verification regex
   - optional rmux -V output
 USAGE
@@ -42,6 +43,17 @@ snap_version() {
   ' snap/snapcraft.yaml
 }
 
+root_package_publish() {
+  awk '
+    /^\[package\]$/ { in_package = 1; next }
+    /^\[/ { in_package = 0 }
+    in_package && $1 == "publish" {
+      print $3
+      exit
+    }
+  ' Cargo.toml
+}
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 binary=""
 
@@ -66,6 +78,10 @@ cd "$repo_root"
 
 version="$(workspace_version)"
 [ -n "$version" ] || die "unable to read workspace.package.version"
+root_publish="$(root_package_publish)"
+[ "$root_publish" = "true" ] ||
+  die "root rmux package must keep publish=true for cargo install rmux"
+printf 'root-publish=true\n'
 
 metadata_dir="$(mktemp -d "${TMPDIR:-/tmp}/rmux-metadata.XXXXXX")"
 metadata="$metadata_dir/metadata.json"
@@ -137,6 +153,23 @@ if re.fullmatch(identity_re, identity) is None:
     )
     sys.exit(1)
 print(f"security-regex v{version}")
+
+manifest_path = Path("resources/windows/rmux.exe.manifest")
+if manifest_path.exists():
+    manifest = manifest_path.read_text(encoding="utf-8")
+    expected_manifest_version = f'{version}.0'
+    match = re.search(r'<assemblyIdentity\b[^>]*\bversion="([^"]+)"', manifest, re.S)
+    if match is None:
+        print("Windows manifest is missing assemblyIdentity version", file=sys.stderr)
+        sys.exit(1)
+    if match.group(1) != expected_manifest_version:
+        print(
+            "Windows manifest version does not match workspace "
+            f"{version}: {match.group(1)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"windows-manifest {expected_manifest_version}")
 PY
 
 if [ -n "$binary" ]; then

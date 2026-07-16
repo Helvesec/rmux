@@ -9,6 +9,7 @@ use rmux_proto::{CommandOutput, ErrorResponse, Request, Response, RmuxError, Tar
 
 use crate::mouse::AttachedMouseEvent;
 
+use super::list_commands_runtime::ParsedListCommandsCommand;
 use super::list_parse::ParsedListPanesAllCommand;
 use super::pane_parse::ParsedSplitWindowCommand;
 use super::prompt_parse::{
@@ -129,14 +130,47 @@ pub(in crate::handler) enum QueueCommandAction {
     Normal {
         output: Option<CommandOutput>,
         error: Option<RmuxError>,
+        source_file_error: Option<RmuxError>,
         exit_status: Option<i32>,
     },
     InsertAfter {
         batches: Vec<(ParsedCommands, QueueExecutionContext)>,
         output: Option<CommandOutput>,
         error: Option<RmuxError>,
+        source_file_error: Option<RmuxError>,
         exit_status: Option<i32>,
     },
+}
+
+impl QueueCommandAction {
+    pub(super) fn without_output(self) -> Self {
+        match self {
+            Self::Normal {
+                error,
+                source_file_error,
+                exit_status,
+                ..
+            } => Self::Normal {
+                output: None,
+                error,
+                source_file_error,
+                exit_status,
+            },
+            Self::InsertAfter {
+                batches,
+                error,
+                source_file_error,
+                exit_status,
+                ..
+            } => Self::InsertAfter {
+                batches,
+                output: None,
+                error,
+                source_file_error,
+                exit_status,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +184,7 @@ pub(super) enum QueueInvocation {
     Request(Request),
     NoOp,
     StartServer,
+    ListCommands(ParsedListCommandsCommand),
     NewWindow(ParsedNewWindowCommand),
     IfShell(ParsedIfShellCommand),
     SourceFile(ParsedSourceFileCommand),
@@ -188,6 +223,7 @@ pub(super) fn queue_action_from_response(
                 .filter(|output| !output.stdout().is_empty())
                 .cloned(),
             error: None,
+            source_file_error: None,
             exit_status: response.exit_status(),
         }),
         response => Ok(QueueCommandAction::Normal {
@@ -196,6 +232,7 @@ pub(super) fn queue_action_from_response(
                 .filter(|output| !output.stdout().is_empty())
                 .cloned(),
             error: None,
+            source_file_error: None,
             exit_status: None,
         }),
     }
@@ -209,11 +246,13 @@ pub(super) fn prompt_queue_action_from_result(
             batches: vec![(parsed, context)],
             output: None,
             error: result.error,
+            source_file_error: None,
             exit_status: None,
         },
         None => QueueCommandAction::Normal {
             output: None,
             error: result.error,
+            source_file_error: None,
             exit_status: None,
         },
     }

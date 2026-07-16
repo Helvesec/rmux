@@ -7,12 +7,12 @@ use super::values::unsupported_flag;
 pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut source = None;
-    let page_down = false;
+    let mut page_down = false;
     let mut exit_on_scroll = false;
     let mut hide_position = false;
     let mut mouse_drag_start = false;
     let mut cancel_mode = false;
-    let scrollbar_scroll = false;
+    let mut scrollbar_scroll = false;
     let mut page_up = false;
 
     while let Some(token) = args.peek() {
@@ -21,7 +21,10 @@ pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 break;
             }
-            "-d" => return Err(unsupported_flag("copy-mode", "-d")),
+            "-d" => {
+                let _ = args.optional();
+                page_down = true;
+            }
             "-e" => {
                 let _ = args.optional();
                 exit_on_scroll = true;
@@ -38,7 +41,10 @@ pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 cancel_mode = true;
             }
-            "-S" => return Err(unsupported_flag("copy-mode", "-S")),
+            "-S" => {
+                let _ = args.optional();
+                scrollbar_scroll = true;
+            }
             "-s" => {
                 let _ = args.optional();
                 source = Some(parse_pane_target(
@@ -61,12 +67,12 @@ pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 for flag in cluster {
                     match flag {
-                        CompactFlag::Bare('d') => return Err(unsupported_flag("copy-mode", "-d")),
+                        CompactFlag::Bare('d') => page_down = true,
                         CompactFlag::Bare('e') => exit_on_scroll = true,
                         CompactFlag::Bare('H') => hide_position = true,
                         CompactFlag::Bare('M') => mouse_drag_start = true,
                         CompactFlag::Bare('q') => cancel_mode = true,
-                        CompactFlag::Bare('S') => return Err(unsupported_flag("copy-mode", "-S")),
+                        CompactFlag::Bare('S') => scrollbar_scroll = true,
                         compact_flag @ CompactFlag::Value { flag: 's', .. } => {
                             source = Some(parse_pane_target(
                                 "copy-mode",

@@ -111,6 +111,15 @@ impl TransportClient {
             .map_err(|_| self.closed_error(TRANSPORT_SHUTDOWN_OPERATION))?
     }
 
+    /// Immediately tears down a dedicated transport without waiting for any
+    /// outstanding long-poll response.
+    pub(crate) fn abort(&self) {
+        if self.state.terminal_failure().is_some() {
+            return;
+        }
+        let _ = self.commands.try_send(ActorMessage::Abort);
+    }
+
     fn try_send_best_effort(&self, request: Request) {
         if self.state.terminal_failure().is_some() {
             return;
@@ -221,6 +230,7 @@ enum ActorMessage {
     Shutdown {
         reply: oneshot::Sender<Result<()>>,
     },
+    Abort,
 }
 
 enum ActorEvent {
@@ -324,6 +334,13 @@ where
                             }
                         }
                     }
+                    ActorMessage::Abort => {
+                        let failure = TransportFailure::actor_closed();
+                        let _ = writer.shutdown().await;
+                        fail_shutdown(&mut shutdown_reply, &failure);
+                        fail_transport(&mut pending, &state, failure);
+                        break;
+                    }
                 }
             }
             ActorEvent::CommandsClosed => {
@@ -398,6 +415,7 @@ fn reject_command_after_shutdown(message: ActorMessage) {
             let failure = TransportFailure::actor_closed();
             let _ = reply.send(Err(failure.to_error(TRANSPORT_SHUTDOWN_OPERATION)));
         }
+        ActorMessage::Abort => {}
     }
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::ControlServerEvent;
+use crate::control::{ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 
 #[tokio::test]
 async fn attached_client_flags_keep_tmux_order_for_extended_flag_sets() {
@@ -74,11 +74,12 @@ async fn control_client_flags_keep_tmux_order_for_extended_flag_sets() {
         .await;
     assert!(matches!(created, Response::NewSession(_)));
 
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: ControlMode::Plain,
                 terminal_context: crate::outer_terminal::OuterTerminalContext::default()
                     .with_client_terminal(&rmux_proto::ClientTerminalContext {
@@ -133,11 +134,12 @@ async fn refresh_client_control_size_resizes_real_control_session() {
         .await;
     assert!(matches!(created, Response::NewSession(_)));
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: ControlMode::Plain,
                 terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
             },
@@ -230,11 +232,12 @@ async fn refresh_client_control_size_resizes_real_control_session() {
 async fn control_client_flags_without_session_emit_only_control_mode() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: ControlMode::Plain,
                 terminal_context: crate::outer_terminal::OuterTerminalContext::default()
                     .with_client_terminal(&rmux_proto::ClientTerminalContext {
@@ -278,11 +281,12 @@ async fn detach_client_target_session_detaches_control_clients() {
 
     let mut event_receivers = Vec::new();
     for (pid, session_name) in [(101, &alpha), (102, &alpha), (201, &beta)] {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
         let _control_id = handler
             .register_control_with_closing(
                 pid,
                 ControlModeUpgrade {
+                    initial_command_count: 0,
                     mode: ControlMode::Plain,
                     terminal_context: crate::outer_terminal::OuterTerminalContext::default()
                         .with_client_terminal(&rmux_proto::ClientTerminalContext {
@@ -339,11 +343,12 @@ async fn control_mode_attach_session_tracks_the_control_clients_session() {
         .await;
     assert!(matches!(response, Response::NewSession(_)));
 
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let (event_tx, _event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: ControlMode::Plain,
                 terminal_context: crate::outer_terminal::OuterTerminalContext::default()
                     .with_client_terminal(&rmux_proto::ClientTerminalContext {

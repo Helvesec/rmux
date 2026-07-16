@@ -26,8 +26,11 @@ fn show_options_lines_render_names_or_values_for_the_selected_scope() {
             Some("terminal-overrides"),
             false,
         )
-        .expect("show empty option succeeds");
-    assert_eq!(server_lines, vec!["terminal-overrides".to_owned()]);
+        .expect("show terminal-overrides succeeds");
+    assert_eq!(
+        server_lines,
+        vec!["terminal-overrides[0] linux*:AX@".to_owned()]
+    );
 
     let values = store
         .show_options_lines(&OptionScopeSelector::Session(alpha), true)
@@ -56,6 +59,64 @@ fn show_options_quotes_whitespace_and_renders_array_indexes() {
         .show_options_lines_filtered(&OptionScopeSelector::SessionGlobal, Some("@path"), false)
         .expect("user option show succeeds");
     assert_eq!(user_path, vec!["@path \"\\$HOME/bin\"".to_owned()]);
+
+    store
+        .set_by_name(
+            OptionScopeSelector::SessionGlobal,
+            "@tilde",
+            Some("~/bin".to_owned()),
+            rmux_proto::SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("tilde user option set succeeds");
+    assert_eq!(
+        store
+            .show_options_lines_filtered(&OptionScopeSelector::SessionGlobal, Some("@tilde"), false)
+            .expect("tilde user option show succeeds"),
+        vec!["@tilde \\~/bin".to_owned()]
+    );
+
+    store
+        .set_by_name(
+            OptionScopeSelector::SessionGlobal,
+            "@quote",
+            Some("has\"quote".to_owned()),
+            rmux_proto::SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("quote user option set succeeds");
+    assert_eq!(
+        store
+            .show_options_lines_filtered(&OptionScopeSelector::SessionGlobal, Some("@quote"), false)
+            .expect("quote user option show succeeds"),
+        vec!["@quote 'has\"quote'".to_owned()]
+    );
+
+    store
+        .set_by_name(
+            OptionScopeSelector::SessionGlobal,
+            "@control",
+            Some("line1\nline2\tbell\u{7}".to_owned()),
+            rmux_proto::SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("control user option set succeeds");
+    assert_eq!(
+        store
+            .show_options_lines_filtered(
+                &OptionScopeSelector::SessionGlobal,
+                Some("@control"),
+                false
+            )
+            .expect("control user option show succeeds"),
+        vec!["@control line1\\nline2\\tbell\\a".to_owned()]
+    );
 
     let status_left = store
         .show_options_lines_filtered(
@@ -163,6 +224,83 @@ fn show_options_quotes_whitespace_and_renders_array_indexes() {
 }
 
 #[test]
+fn show_options_matches_tmux37_quote_and_dollar_rules() {
+    let mut store = OptionStore::new();
+
+    for (name, value, expected) in [
+        ("@semi", "a;b", "@semi \"a;b\""),
+        ("@brace", "a}b", "@brace \"a}b\""),
+        ("@percent", "a%b", "@percent \"a%b\""),
+        ("@quote", "a'b", "@quote \"a'b\""),
+        ("@digit", "x$1y", "@digit \"x$1y\""),
+        ("@space", "x$ y", "@space \"x$ y\""),
+        ("@final", "x$", "@final \"x$\""),
+        ("@bracevar", "x${z}", "@bracevar \"x\\${z}\""),
+        ("@namevar", "x$_y", "@namevar \"x\\$_y\""),
+    ] {
+        store
+            .set_by_name(
+                OptionScopeSelector::SessionGlobal,
+                name,
+                Some(value.to_owned()),
+                rmux_proto::SetOptionMode::Replace,
+                false,
+                false,
+                false,
+            )
+            .expect("user option set succeeds");
+        let lines = store
+            .show_options_lines_filtered(&OptionScopeSelector::SessionGlobal, Some(name), false)
+            .expect("user option show succeeds");
+        assert_eq!(lines, vec![expected.to_owned()], "{name}");
+    }
+
+    let word_separators = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::SessionGlobal,
+            Some("word-separators"),
+            false,
+        )
+        .expect("word-separators show succeeds");
+    assert_eq!(
+        word_separators,
+        vec!["word-separators \"!\\\"#$%&'()*+,-./:;<=>?@[\\\\]^`{|}~\"".to_owned()]
+    );
+}
+
+#[test]
+fn show_options_lists_user_options_before_builtin_options_like_tmux() {
+    let mut store = OptionStore::new();
+
+    for (name, value) in [("@z", "1"), ("@a", "2")] {
+        store
+            .set_by_name(
+                OptionScopeSelector::SessionGlobal,
+                name,
+                Some(value.to_owned()),
+                rmux_proto::SetOptionMode::Replace,
+                false,
+                false,
+                false,
+            )
+            .expect("user option set succeeds");
+    }
+
+    let lines = store
+        .show_options_lines(&OptionScopeSelector::SessionGlobal, false)
+        .expect("show-options succeeds");
+    assert_eq!(lines[0], "@a 2");
+    assert_eq!(lines[1], "@z 1");
+    assert!(
+        lines
+            .iter()
+            .position(|line| line.starts_with("activity-action "))
+            .is_some_and(|index| index > 1),
+        "built-in options should follow user options: {lines:?}"
+    );
+}
+
+#[test]
 fn numeric_and_flag_values_are_canonicalized_before_storage() {
     let mut store = OptionStore::new();
     let alpha = session_name("alpha");
@@ -203,10 +341,10 @@ fn numeric_and_flag_values_are_canonicalized_before_storage() {
 }
 
 #[test]
-fn input_buffer_size_can_be_lowered_below_default() {
+fn input_buffer_size_rejects_values_below_tmux_minimum() {
     let mut store = OptionStore::new();
 
-    store
+    let error = store
         .set_by_name(
             OptionScopeSelector::ServerGlobal,
             "input-buffer-size",
@@ -216,16 +354,35 @@ fn input_buffer_size_can_be_lowered_below_default() {
             false,
             false,
         )
-        .expect("input-buffer-size accepts tmux-compatible zero minimum");
+        .expect_err("input-buffer-size rejects values below tmux minimum");
+    assert_eq!(
+        error.to_string(),
+        "invalid set-option request: value is too small: 0"
+    );
 
-    assert_eq!(store.global_value(OptionName::InputBufferSize), Some("0"));
+    store
+        .set_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "input-buffer-size",
+            Some("1048576".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("input-buffer-size accepts tmux minimum");
+
+    assert_eq!(
+        store.global_value(OptionName::InputBufferSize),
+        Some("1048576")
+    );
 }
 
 #[test]
-fn bare_non_flag_choice_options_are_rejected() {
+fn bare_choice_options_toggle_by_choice_index_like_tmux() {
     let mut store = OptionStore::new();
 
-    let error = store
+    store
         .set_by_name(
             OptionScopeSelector::WindowGlobal,
             "mode-keys",
@@ -235,12 +392,162 @@ fn bare_non_flag_choice_options_are_rejected() {
             false,
             false,
         )
-        .expect_err("bare mode-keys must not toggle between emacs and vi");
+        .expect("bare mode-keys toggles index 0 to index 1");
+    assert_eq!(store.global_value(OptionName::ModeKeys), Some("vi"));
 
-    assert!(
-        error.to_string().contains("empty value"),
-        "unexpected error: {error}"
+    store
+        .set_by_name(
+            OptionScopeSelector::SessionGlobal,
+            "status-position",
+            None,
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("bare status-position toggles index 1 to index 0");
+    assert_eq!(store.global_value(OptionName::StatusPosition), Some("top"));
+
+    store
+        .set_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "set-clipboard",
+            Some("external".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("set-clipboard external set succeeds");
+    store
+        .set_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "set-clipboard",
+            None,
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("bare set-clipboard toggles index 1 to index 0");
+    assert_eq!(store.global_value(OptionName::SetClipboard), Some("off"));
+
+    store
+        .set_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "set-clipboard",
+            Some("on".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("set-clipboard on set succeeds");
+    store
+        .set_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "set-clipboard",
+            None,
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("bare set-clipboard leaves index >=2 unchanged");
+    assert_eq!(store.global_value(OptionName::SetClipboard), Some("on"));
+}
+
+#[test]
+fn explicit_window_and_pane_scopes_store_known_options_even_when_registry_scope_differs() {
+    let mut store = OptionStore::new();
+    let alpha = session_name("alpha");
+    let window = WindowTarget::with_window(alpha.clone(), 0);
+    let pane = PaneTarget::with_window(alpha.clone(), 0, 0);
+
+    store
+        .set_by_name(
+            OptionScopeSelector::Window(window.clone()),
+            "status",
+            Some("off".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("session-scoped option can be stored at explicit window scope");
+    store
+        .set_by_name(
+            OptionScopeSelector::Pane(pane.clone()),
+            "message-limit",
+            Some("77".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("server-scoped option can be stored at explicit pane scope");
+
+    assert_eq!(store.window_value(&window, OptionName::Status), Some("off"));
+    assert_eq!(
+        store.pane_value(&pane, OptionName::MessageLimit),
+        Some("77")
     );
+    assert_eq!(
+        store.resolve_for_window(&alpha, 0, OptionName::Status),
+        Some("off")
+    );
+    assert_eq!(
+        store.resolve_for_pane(&alpha, 0, 0, OptionName::MessageLimit),
+        Some("77")
+    );
+
+    let shown_window = store
+        .show_options_lines_filtered(&OptionScopeSelector::Window(window), Some("status"), true)
+        .expect("window-scoped status show succeeds");
+    assert_eq!(shown_window, vec!["off".to_owned()]);
+    let shown_pane = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::Pane(pane),
+            Some("message-limit"),
+            true,
+        )
+        .expect("pane-scoped message-limit show succeeds");
+    assert_eq!(shown_pane, vec!["77".to_owned()]);
+}
+
+#[test]
+fn named_local_show_queries_fall_back_to_natural_global_defaults() {
+    let store = OptionStore::new();
+    let alpha = session_name("alpha");
+    let window = WindowTarget::with_window(alpha.clone(), 0);
+    let pane = PaneTarget::with_window(alpha, 0, 0);
+
+    let session_server_option = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::Session(session_name("beta")),
+            Some("buffer-limit"),
+            false,
+        )
+        .expect("session-scoped server-table query succeeds");
+    assert_eq!(session_server_option, vec!["buffer-limit 50".to_owned()]);
+
+    let window_server_option = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::Window(window),
+            Some("message-limit"),
+            false,
+        )
+        .expect("window-scoped server-table query succeeds");
+    assert_eq!(window_server_option, vec!["message-limit 1000".to_owned()]);
+
+    let pane_server_option = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::Pane(pane),
+            Some("message-limit"),
+            true,
+        )
+        .expect("pane-scoped server-table value query succeeds");
+    assert_eq!(pane_server_option, vec!["1000".to_owned()]);
 }
 
 #[test]

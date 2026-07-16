@@ -8,6 +8,9 @@ mod pane_attached_key_dispatch;
 mod pane_broadcast;
 #[path = "handler_pane/by_id.rs"]
 mod pane_by_id;
+#[cfg(windows)]
+#[path = "handler_pane/deferred_wait.rs"]
+mod pane_deferred_wait;
 #[path = "handler_pane/display_panes.rs"]
 mod pane_display_panes;
 #[path = "handler_pane/inspection.rs"]
@@ -41,16 +44,17 @@ mod pane_windows_console_sequence;
 pub(super) use pane_attached_input::retain_partial_attached_control_input;
 pub(super) use pane_by_id::resolve_pane_target_ref;
 #[cfg(windows)]
-pub(in crate::handler) use pane_inspection::format_references_pane_pid;
+pub(in crate::handler) use pane_deferred_wait::format_references_pane_pid;
 pub(super) use pane_inspection::{
     attached_status_message_for_error, command_output_from_lines, display_time,
 };
-pub(super) use pane_io_encoding::write_bracketed_pane_payload;
 use pane_io_encoding::{
     encode_key_for_target, encode_mouse_for_target, encode_tokens_for_target,
-    expand_send_key_tokens, pane_id_for_input_target, prepare_pane_input_write,
-    prepare_synchronized_pane_input_writes, write_bytes_to_target, write_bytes_to_target_io,
-    write_bytes_to_targets, PaneInputWrite,
+    expand_send_key_tokens, pane_id_for_input_target, prepare_synchronized_pane_input_writes,
+    write_bytes_to_target, write_bytes_to_targets, PaneInputWrite,
+};
+pub(super) use pane_io_encoding::{
+    prepare_pane_input_write, write_bytes_to_target_io, PaneInputLiveness,
 };
 pub(in crate::handler) use pane_management::SplitWindowParts;
 pub(super) use pane_prompt_input::decode_prompt_input_event;

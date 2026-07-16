@@ -2,7 +2,7 @@ use rmux_proto::RmuxError;
 
 use super::text::{owner_positions, scrollbar_slider_height, WordBoundary};
 use super::types::CopyPosition;
-use super::CopyModeState;
+use super::{CopyModeState, RecentreTopBottomPosition, RecentreTopBottomState};
 
 impl CopyModeState {
     pub(super) fn cmd_cursor_down(&mut self) -> Result<(), RmuxError> {
@@ -176,6 +176,25 @@ impl CopyModeState {
             .saturating_sub(rows)
             .min(self.bottom_top_line());
         self.sync_selection_with_cursor();
+        Ok(())
+    }
+
+    pub(super) fn cmd_recentre_top_bottom(&mut self) -> Result<(), RmuxError> {
+        let line = self.cursor.y;
+        let position = match self.recentre_top_bottom {
+            Some(state) if state.line == line => state.next,
+            _ => RecentreTopBottomPosition::Middle,
+        };
+
+        match position {
+            RecentreTopBottomPosition::Middle => self.cmd_scroll_middle()?,
+            RecentreTopBottomPosition::Top => self.cmd_scroll_top()?,
+            RecentreTopBottomPosition::Bottom => self.cmd_scroll_bottom()?,
+        }
+        self.recentre_top_bottom = Some(RecentreTopBottomState {
+            line,
+            next: position.next(),
+        });
         Ok(())
     }
 

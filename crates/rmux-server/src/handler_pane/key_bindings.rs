@@ -126,7 +126,7 @@ impl RequestHandler {
                 Some(value) => value,
                 None => {
                     return Response::Error(ErrorResponse {
-                        error: RmuxError::Server(format!("invalid sort order: {value}")),
+                        error: RmuxError::Server(rmux_core::INVALID_SORT_ORDER.to_owned()),
                     });
                 }
             },
@@ -139,7 +139,7 @@ impl RequestHandler {
                 }
                 _ => {
                     return Response::Error(ErrorResponse {
-                        error: RmuxError::Server(format!("unknown key: {key}")),
+                        error: RmuxError::Server(format!("invalid key: {key}")),
                     });
                 }
             },
@@ -147,13 +147,13 @@ impl RequestHandler {
         };
         let mut bindings = list_key_bindings(&state, &request, sort_order);
         if let Some(filter_key) = filter_key {
-            bindings.retain(|binding| key_code_lookup_bits(binding.binding().key()) == filter_key);
-            if bindings.is_empty() {
-                let key = request.key.as_deref().unwrap_or_default();
-                return Response::Error(ErrorResponse {
-                    error: RmuxError::Message(format!("unknown key: {key}")),
+            if request.table_name.is_some() {
+                return Response::ListKeys(ListKeysResponse {
+                    match_count: 0,
+                    output: command_output_from_lines(&[]),
                 });
             }
+            bindings.retain(|binding| key_code_lookup_bits(binding.binding().key()) == filter_key);
         }
         if request.notes && !request.include_unnoted {
             bindings.retain(|binding| binding.binding().note().is_some());
@@ -196,19 +196,18 @@ fn list_key_bindings(
     request: &rmux_proto::ListKeysRequest,
     sort_order: KeyBindingSortOrder,
 ) -> Vec<KeyBindingDisplay> {
+    let reversed = request.reversed && request.sort_order.is_some();
     if request.notes && request.table_name.is_none() {
         state
             .key_bindings
-            .list_bindings(None, sort_order, request.reversed)
+            .list_bindings(None, sort_order, reversed)
             .into_iter()
             .filter(|binding| matches!(binding.table_name(), "prefix" | "root"))
             .collect()
     } else {
-        state.key_bindings.list_bindings(
-            request.table_name.as_deref(),
-            sort_order,
-            request.reversed,
-        )
+        state
+            .key_bindings
+            .list_bindings(request.table_name.as_deref(), sort_order, reversed)
     }
 }
 
@@ -229,6 +228,7 @@ fn render_list_keys_output(
     let lines = bindings
         .iter()
         .map(|binding| {
+            let default_template = request.format.is_none();
             if request.format.is_none() && request.notes {
                 return render_notes_binding_line(
                     binding,
@@ -238,9 +238,16 @@ fn render_list_keys_output(
                     notes_key_width,
                 );
             }
-            if request.format.is_none() && request.key.is_some() && !request.notes {
-                return render_key_filtered_binding_line(binding, render_metrics);
-            }
+            let key_string = if default_template {
+                list_keys_command_key(binding.key_string())
+            } else {
+                binding.key_string().to_owned()
+            };
+            let key_string_width = if default_template {
+                render_metrics.escaped_key_string_width
+            } else {
+                render_metrics.key_string_width
+            };
             let key_has_repeat = if request.key.is_some() {
                 binding.binding().repeat()
             } else {
@@ -260,14 +267,11 @@ fn render_list_keys_output(
                     ),
                 )
                 .with_named_value("key_table", binding.table_name())
-                .with_named_value("key_string", binding.key_string())
+                .with_named_value("key_string", key_string)
                 .with_named_value("key_command", binding.command_string())
                 .with_named_value("notes_only", bool_string(request.notes))
                 .with_named_value("key_has_repeat", bool_string(key_has_repeat))
-                .with_named_value(
-                    "key_string_width",
-                    render_metrics.key_string_width.to_string(),
-                )
+                .with_named_value("key_string_width", key_string_width.to_string())
                 .with_named_value(
                     "key_table_width",
                     render_metrics.key_table_width.to_string(),
@@ -315,28 +319,21 @@ fn list_keys_note_key(key: &str) -> &str {
         .unwrap_or(key)
 }
 
-fn render_key_filtered_binding_line(
-    binding: &KeyBindingDisplay,
-    render_metrics: ListKeysRenderMetrics,
-) -> String {
-    let repeat = if binding.binding().repeat() {
-        " -r"
-    } else {
-        ""
-    };
-    format!(
-        "bind-key{repeat} -T {table:<table_width$} {key:<key_width$} {command}",
-        table = binding.table_name(),
-        table_width = render_metrics.key_table_width,
-        key = binding.key_string(),
-        key_width = render_metrics.key_string_width,
-        command = binding.command_string()
-    )
+fn list_keys_command_key(key: &str) -> String {
+    let mut escaped = String::new();
+    for ch in key.chars() {
+        if matches!(ch, '"' | '#' | '$' | '%' | '\'' | ';' | '{' | '}' | '~') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ListKeysRenderMetrics {
     key_string_width: usize,
+    escaped_key_string_width: usize,
     key_table_width: usize,
     has_repeat: bool,
 }
@@ -345,6 +342,11 @@ impl ListKeysRenderMetrics {
     fn from_bindings(bindings: &[KeyBindingDisplay]) -> Self {
         Self {
             key_string_width: rmux_core::KeyBindingStore::key_string_width(bindings),
+            escaped_key_string_width: bindings
+                .iter()
+                .map(|binding| list_keys_command_key(binding.key_string()).len())
+                .max()
+                .unwrap_or(0),
             key_table_width: rmux_core::KeyBindingStore::key_table_width(bindings),
             has_repeat: rmux_core::KeyBindingStore::has_repeat(bindings),
         }

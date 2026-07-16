@@ -424,6 +424,9 @@ fn wait_for_pane_capture(
                 alternate: false,
                 escape_ansi: false,
                 escape_sequences: false,
+                include_format: false,
+                hyperlinks: false,
+                line_numbers: false,
                 join_wrapped: false,
                 use_mode_screen: false,
                 preserve_trailing_spaces: false,
@@ -579,6 +582,7 @@ fn shutdown_removes_socket_files_after_all_sessions_are_killed() -> Result<(), B
         target: session_name.clone(),
         kill_all_except_target: false,
         clear_alerts: false,
+        kill_group: false,
     }));
     match killed {
         Ok(killed) => assert_eq!(

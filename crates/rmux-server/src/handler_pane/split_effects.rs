@@ -5,7 +5,6 @@ use crate::pane_terminals::HandlerState;
 #[derive(Debug, Clone)]
 pub(super) struct SplitWindowEffects {
     pub(super) detached_anchor: Option<PaneTarget>,
-    detached_restore: Option<PaneTarget>,
     pub(super) size: Option<u32>,
 }
 
@@ -33,7 +32,6 @@ pub(super) fn split_window_effects(
             "pane index does not exist in session",
         )
     })?;
-    let active_before = window.active_pane_index();
     let split_size = size
         .map(|size| split_size_cells(size, direction, pane.geometry()))
         .transpose()?;
@@ -41,8 +39,6 @@ pub(super) fn split_window_effects(
     Ok(SplitWindowEffects {
         detached_anchor: detached
             .then(|| PaneTarget::with_window(session_name.clone(), window_index, pane_index)),
-        detached_restore: detached
-            .then(|| PaneTarget::with_window(session_name, window_index, active_before)),
         size: split_size,
     })
 }
@@ -56,27 +52,32 @@ pub(super) fn apply_split_window_effects(
     if preserve_zoom {
         let zoom_target = effects.detached_anchor.as_ref().unwrap_or(pane);
         let session_name = zoom_target.session_name().clone();
+        let detached = effects.detached_anchor.is_some();
         state.mutate_session_and_resize_terminals(&session_name, |session| {
-            let should_zoom = session
-                .window_at(zoom_target.window_index())
-                .is_some_and(|window| !window.is_zoomed());
-            if should_zoom {
-                session.resize_pane_in_window(
-                    zoom_target.window_index(),
-                    zoom_target.pane_index(),
-                    ResizePaneAdjustment::Zoom,
-                )?;
+            let window_index = zoom_target.window_index();
+            let Some(window) = session.window_at(window_index) else {
+                return Ok(());
+            };
+            if window.is_zoomed() {
+                return Ok(());
             }
+            // tmux `split-window -d -Z` zooms the window around the pane
+            // that is already active; only a non-detached -Z zooms (and
+            // activates) the new pane. Zooming the anchor target here used
+            // to re-select it, re-introducing the active/last/active_point
+            // side effects a detached split must not have.
+            let zoom_pane_index = if detached {
+                window.active_pane_index()
+            } else {
+                zoom_target.pane_index()
+            };
+            session.resize_pane_in_window(
+                window_index,
+                zoom_pane_index,
+                ResizePaneAdjustment::Zoom,
+            )?;
             Ok(())
         })?;
-    }
-
-    if let Some(restore) = effects.detached_restore {
-        state
-            .sessions
-            .session_mut(restore.session_name())
-            .ok_or_else(|| RmuxError::SessionNotFound(restore.session_name().to_string()))?
-            .select_pane_in_window(restore.window_index(), restore.pane_index())?;
     }
 
     Ok(())

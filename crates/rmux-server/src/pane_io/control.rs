@@ -20,7 +20,7 @@ use super::persistent_overlay::{
 use super::types::{AttachControl, AttachTarget, OpenAttachTarget, OverlayFrame};
 use super::wire::{
     emit_attach_bytes, emit_attach_message, emit_attach_stop, emit_detached_attach_stop,
-    emit_exited_attach_stop, emit_render_frame, open_attach_target,
+    emit_render_frame, open_attach_target,
 };
 
 pub(super) fn should_emit_overlay(
@@ -28,7 +28,7 @@ pub(super) fn should_emit_overlay(
     current_overlay_generation: &mut u64,
     overlay: &OverlayFrame,
 ) -> bool {
-    if overlay.render_generation != render_generation {
+    if overlay.render_generation < render_generation {
         return false;
     }
     if overlay.overlay_generation < *current_overlay_generation {
@@ -203,7 +203,6 @@ pub(super) async fn apply_pending_attach_controls(
                 ));
             }
             Ok(AttachControl::Exited) => {
-                emit_exited_attach_stop(stream, current_target).await?;
                 return Ok(PendingAttachAction::Exit(
                     AttachExitReason::AttachControlExited,
                 ));
@@ -372,11 +371,13 @@ pub(super) async fn apply_pending_attach_controls(
             }
             Ok(AttachControl::LockShellCommand(command)) => {
                 *locked = true;
+                emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::LockShellCommand(command)).await?;
                 should_drop_output = true;
             }
             Ok(AttachControl::Suspend) => {
                 *locked = true;
+                emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::Suspend).await?;
                 should_drop_output = true;
             }

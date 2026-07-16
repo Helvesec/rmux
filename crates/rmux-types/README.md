@@ -1,6 +1,6 @@
 # rmux-types
 
-Shared platform-neutral value types for the [RMUX](https://github.com/helvesec/rmux) terminal multiplexer workspace.
+Shared platform-neutral value types for the [RMUX](https://github.com/Helvesec/rmux) terminal multiplexer workspace.
 
 This crate holds the small, dependency-free primitives used across the RMUX
 workspace — terminal sizes and other low-level value types that need to be

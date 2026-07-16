@@ -112,6 +112,7 @@ fn kill_session_destroys_existing_session() -> Result<(), Box<dyn Error>> {
         target: session_name("gamma"),
         kill_all_except_target: false,
         clear_alerts: false,
+        kill_group: false,
     }))?;
     drop(connection);
 
@@ -136,6 +137,7 @@ fn kill_session_is_idempotent_for_missing_session() -> Result<(), Box<dyn Error>
             target: session_name("nonexistent"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )?;
 

@@ -6,11 +6,15 @@ param(
     [switch]$RunDaemonSmoke,
     [switch]$RunSdkSmoke,
     [switch]$RunMouseBorderSmoke,
-    [switch]$RequireReleaseArtifact
+    [switch]$RunCtrlMatrixSmoke,
+    [switch]$RequireReleaseArtifact,
+    [string]$ExpectedGitSha = $env:RMUX_EXPECTED_GIT_SHA,
+    [string]$CtrlMatrixEvidence = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$assertCargoFilter = Join-Path $PSScriptRoot "assert-cargo-filter-nonempty.ps1"
 
 function Fail([string]$Message) {
     Write-Error "error: $Message"
@@ -32,6 +36,14 @@ function Invoke-NativeCapture([string]$Program, [string[]]$Arguments) {
     [pscustomobject]@{
         Output = $output
         Status = $status
+    }
+}
+
+function Assert-CargoFilter([int]$MinTests, [string[]]$CargoArguments) {
+    $arguments = @([string]$MinTests, "--") + $CargoArguments
+    & $assertCargoFilter @arguments
+    if ($LASTEXITCODE -ne 0) {
+        Fail "cargo filter check failed for cargo $($CargoArguments -join ' ')"
     }
 }
 
@@ -100,17 +112,14 @@ function NewPortableAliasSmoke([string]$Binary, [string]$Root) {
     try {
         New-Item -ItemType SymbolicLink -Path $alias -Target $Binary -ErrorAction Stop | Out-Null
     } catch {
-        Copy-Item -LiteralPath (Split-Path -Parent $Binary) -Destination $links -Recurse -Force
-        $copied = Join-Path $links (Join-Path ([System.IO.Path]::GetFileName((Split-Path -Parent $Binary))) ([System.IO.Path]::GetFileName($Binary)))
-        if (-not (Test-Path -LiteralPath $copied -PathType Leaf)) {
-            Fail "failed to create portable alias smoke copy after symlink failure: $_"
-        }
-        $alias = $copied
+        Fail "portable alias smoke requires a symlink alias and could not create one. Enable Windows Developer Mode or rerun from an elevated PowerShell before using -RunBinary/-RunDaemonSmoke. Original error: $($_.Exception.Message)"
     }
 
     [pscustomobject]@{
+        Available = $true
         Binary = $alias
         Directory = Split-Path -Parent $alias
+        Reason = ""
     }
 }
 
@@ -164,6 +173,15 @@ function InvokeSdkWindowsSmoke([string]$Binary) {
     $previousBinary = $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN
     try {
         $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
+        Assert-CargoFilter 1 @(
+            "test",
+            "--locked",
+            "-p",
+            "rmux-sdk",
+            "--test",
+            "smoke_v1_windows",
+            "daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon"
+        )
         & cargo @(
             "test",
             "--locked",
@@ -209,6 +227,40 @@ function InvokeMouseBorderSmoke([string]$Binary) {
     }
 }
 
+function InvokeCtrlMatrixSmoke([string]$Binary, [string]$GitSha, [string]$Evidence) {
+    if ($GitSha -notmatch '^[0-9a-fA-F]{40}$') {
+        Fail "Windows Ctrl matrix package smoke requires a full expected Git SHA"
+    }
+    $outDir = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-package-ctrl-matrix-$PID-$([guid]::NewGuid().ToString('N'))"
+    try {
+        $global:LASTEXITCODE = 0
+        $arguments = @(
+            "-Rmux", [System.IO.Path]::GetFullPath($Binary),
+            "-OutDir", $outDir,
+            "-PortableSmokeOnly",
+            "-ExpectedGitSha", $GitSha
+        )
+        if (-not [string]::IsNullOrWhiteSpace($Evidence)) {
+            $arguments += @("-EvidencePath", [System.IO.Path]::GetFullPath($Evidence))
+        }
+        & (Join-Path $PSScriptRoot "windows_ctrl_matrix.ps1") @arguments
+        if ($LASTEXITCODE -ne 0) {
+            Fail "Windows Ctrl matrix package smoke failed with exit code $LASTEXITCODE"
+        }
+        $resultEvidence = Join-Path $outDir "portable-smoke.evidence.json"
+        if (-not (Test-Path -LiteralPath $resultEvidence -PathType Leaf)) {
+            Fail "Windows Ctrl matrix package smoke produced no passing evidence"
+        }
+        $payload = Get-Content -LiteralPath $resultEvidence -Raw | ConvertFrom-Json
+        if ($payload.status -ne "passed" -or $payload.git_commit -ne $GitSha.ToLowerInvariant()) {
+            Fail "Windows Ctrl matrix package evidence is not a passing result for $GitSha"
+        }
+        return "passed"
+    } finally {
+        Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function VerifyChecksumManifest([string]$Root, [string]$Manifest) {
     $rootFull = [System.IO.Path]::GetFullPath($Root)
     foreach ($line in Get-Content -LiteralPath $Manifest) {
@@ -231,6 +283,29 @@ function VerifyChecksumManifest([string]$Root, [string]$Manifest) {
         $actual = Sha256File $path
         if ($actual -ne $expected) {
             Fail "checksum mismatch for $relative"
+        }
+    }
+}
+
+function AssertPackageHygiene([string]$Root) {
+    [char[]]$separators = @(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd($separators)
+    foreach ($entry in Get-ChildItem -LiteralPath $rootFull -Force -Recurse) {
+        $relative = $entry.FullName.Substring($rootFull.Length).TrimStart($separators)
+        $portable = $relative -replace '\\', '/'
+        $segments = $portable -split '/'
+        if ($segments -contains ".claude" -or $segments -contains ".codex") {
+            Fail "forbidden package entry: $portable"
+        }
+        if ($entry.Name -like "*.sock" -or
+            $entry.Name -like "*.tmp" -or
+            $entry.Name -like "*.bak" -or
+            $entry.Name -like "*.orig" -or
+            $entry.Name -like "*~") {
+            Fail "forbidden package entry: $portable"
         }
     }
 }
@@ -276,6 +351,7 @@ try {
     if (-not (Test-Path -LiteralPath $packageRoot -PathType Container)) {
         Fail "archive root directory is missing: $([System.IO.Path]::GetFileNameWithoutExtension($archiveName))"
     }
+    AssertPackageHygiene $packageRoot
 
     foreach ($required in @("rmux.exe", "libexec/rmux/rmux.exe", "rmux-daemon.exe", "SHA256SUMS.txt", "share/rmux/artifact-metadata.json", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1")) {
         if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $required))) {
@@ -299,6 +375,9 @@ try {
             $metadata.release_artifact -ne $true) {
             Fail "metadata release_artifact is not true"
         }
+        if ($metadata.configuration -ne "release") {
+            Fail "release artifact metadata configuration is not release"
+        }
     }
     $packagedBinaryHash = Sha256File $binary
     if ($metadata.binary_sha256.ToLowerInvariant() -ne $packagedBinaryHash) {
@@ -318,6 +397,9 @@ try {
     $portableAlias = $null
     if ($RunBinary -or $RunDaemonSmoke) {
         $portableAlias = NewPortableAliasSmoke $binary $tmpRoot
+        if (-not $portableAlias.Available) {
+            Fail "portable alias smoke unexpectedly returned unavailable: $($portableAlias.Reason)"
+        }
     }
 
     if ($RunBinary) {
@@ -326,12 +408,14 @@ try {
         AssertSuccess $helperBinary @("-V") | Out-Null
         AssertDaemonBinary $daemonBinary
         AssertSuccess $binary @("diagnose", "--json") | Out-Null
-        AssertSuccess $portableAlias.Binary @("-V") | Out-Null
-        AssertHelperFallback $portableAlias.Binary
-        AssertSuccess $portableAlias.Binary @("diagnose", "--json") | Out-Null
-        InvokeWithPathPrefix $portableAlias.Directory {
-            AssertHelperFallback "rmux"
-            AssertSuccess "rmux" @("diagnose", "--json") | Out-Null
+        if ($portableAlias.Available) {
+            AssertSuccess $portableAlias.Binary @("-V") | Out-Null
+            AssertHelperFallback $portableAlias.Binary
+            AssertSuccess $portableAlias.Binary @("diagnose", "--json") | Out-Null
+            InvokeWithPathPrefix $portableAlias.Directory {
+                AssertHelperFallback "rmux"
+                AssertSuccess "rmux" @("diagnose", "--json") | Out-Null
+            }
         }
         InvokeWithPackageOnlyPath $packageRoot {
             AssertSuccess "rmux" @("-V") | Out-Null
@@ -394,18 +478,20 @@ try {
             & $binary "-L" $fallbackLabel "kill-server" | Out-Null
         }
 
-        $portableAliasLabel = "package-alias-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-        try {
-            InvokeWithPathPrefix $portableAlias.Directory {
-                AssertSuccessNoCapture "rmux" @("-L", $portableAliasLabel, "new-session", "-d", "-s", "package_alias_smoke", "cmd.exe", "/d", "/q", "/k")
-                $sessions = AssertSuccess "rmux" @("-L", $portableAliasLabel, "list-sessions", "-F", "#{session_name}")
-                if (($sessions -join "`n") -notmatch 'package_alias_smoke') {
-                    Fail "portable alias daemon smoke did not list package_alias_smoke session"
+        if ($portableAlias.Available) {
+            $portableAliasLabel = "package-alias-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+            try {
+                InvokeWithPathPrefix $portableAlias.Directory {
+                    AssertSuccessNoCapture "rmux" @("-L", $portableAliasLabel, "new-session", "-d", "-s", "package_alias_smoke", "cmd.exe", "/d", "/q", "/k")
+                    $sessions = AssertSuccess "rmux" @("-L", $portableAliasLabel, "list-sessions", "-F", "#{session_name}")
+                    if (($sessions -join "`n") -notmatch 'package_alias_smoke') {
+                        Fail "portable alias daemon smoke did not list package_alias_smoke session"
+                    }
                 }
-            }
-        } finally {
-            InvokeWithPathPrefix $portableAlias.Directory {
-                & "rmux" "-L" $portableAliasLabel "kill-server" | Out-Null
+            } finally {
+                InvokeWithPathPrefix $portableAlias.Directory {
+                    & "rmux" "-L" $portableAliasLabel "kill-server" | Out-Null
+                }
             }
         }
     }
@@ -418,6 +504,11 @@ try {
         InvokeMouseBorderSmoke $binary
     }
 
+    $ctrlMatrixStatus = "not-requested"
+    if ($RunCtrlMatrixSmoke) {
+        $ctrlMatrixStatus = InvokeCtrlMatrixSmoke $binary $ExpectedGitSha $CtrlMatrixEvidence
+    }
+
     Write-Output "archive=$archiveFull"
     Write-Output "sha256=$actualHash"
     Write-Output "binary_sha256=$packagedBinaryHash"
@@ -427,6 +518,8 @@ try {
     Write-Output "run_daemon_smoke=$($RunDaemonSmoke.ToString().ToLowerInvariant())"
     Write-Output "run_sdk_smoke=$($RunSdkSmoke.ToString().ToLowerInvariant())"
     Write-Output "run_mouse_border_smoke=$($RunMouseBorderSmoke.ToString().ToLowerInvariant())"
+    Write-Output "run_ctrl_matrix_smoke=$($RunCtrlMatrixSmoke.ToString().ToLowerInvariant())"
+    Write-Output "ctrl_matrix_status=$ctrlMatrixStatus"
     Write-Output "require_release_artifact=$($RequireReleaseArtifact.ToString().ToLowerInvariant())"
 } finally {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue

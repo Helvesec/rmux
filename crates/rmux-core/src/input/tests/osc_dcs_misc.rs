@@ -51,6 +51,37 @@ fn dcs_passthrough_tmux_prefix_decodes_doubled_inner_escape() {
 }
 
 #[test]
+fn dcs_tmux_wrapped_osc_bel_without_outer_st_recovers_to_ground() {
+    let (p, w) = parse(b"\x1bPtmux;\x1b]4;0;?\x07AFTER");
+    assert_eq!(p.state(), InputState::Ground);
+    assert!(w.has_call("dcs_passthrough(\"\\u{1b}]4;0;?\\u{7}\")"));
+    assert_eq!(w.chars, vec!['A', 'F', 'T', 'E', 'R']);
+}
+
+#[test]
+fn dcs_tmux_wrapped_osc_bel_recovers_after_doubled_inner_escape() {
+    let (p, w) = parse(b"\x1bPtmux;\x1b\x1b]4;0;?\x07AFTER");
+    assert_eq!(p.state(), InputState::Ground);
+    assert!(w.has_call("dcs_passthrough(\"\\u{1b}]4;0;?\\u{7}\")"));
+    assert_eq!(w.chars, vec!['A', 'F', 'T', 'E', 'R']);
+}
+
+#[test]
+fn dcs_tmux_bel_does_not_terminate_non_osc_passthrough() {
+    let mut parser = InputParser::new();
+    let mut writer = RecordingWriter::new(80, 24);
+
+    parser.parse(b"\x1bPtmux;not-osc\x07AFTER", &mut writer);
+    assert_eq!(parser.state(), InputState::DcsHandler);
+    assert!(!writer.has_call("dcs_passthrough"));
+    assert!(writer.chars.is_empty());
+
+    parser.parse(b"\x1b\\", &mut writer);
+    assert_eq!(parser.state(), InputState::Ground);
+    assert!(writer.has_call("dcs_passthrough(\"not-osc\\u{7}AFTER\")"));
+}
+
+#[test]
 fn dcs_sixel_uses_passthrough() {
     let (_p, w) = parse(b"\x1bPq\"1;1;2;2#0!10~\x1b\\");
     assert!(w.has_call("sixel_passthrough(\"q\\\"1;1;2;2#0!10~\")"));

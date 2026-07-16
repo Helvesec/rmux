@@ -180,6 +180,7 @@ async fn kill_session_is_live_then_idempotent() -> Result<(), Box<dyn Error>> {
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -194,6 +195,7 @@ async fn kill_session_is_live_then_idempotent() -> Result<(), Box<dyn Error>> {
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -469,6 +471,7 @@ async fn persistent_connection_handles_multiple_requests() -> Result<(), Box<dyn
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await?;
     assert_eq!(

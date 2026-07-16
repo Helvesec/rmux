@@ -185,38 +185,12 @@ fn environment_rmux_socket_matches(
     let Some(inherited_socket) = rmux_socket_path_from_env(value) else {
         return false;
     };
-    socket_paths_match(&inherited_socket, server_socket_path)
+    rmux_os::path::socket_paths_match(&inherited_socket, server_socket_path)
 }
 
 fn rmux_socket_path_from_env(value: &str) -> Option<PathBuf> {
     let path = value.split_once(',').map_or(value, |(path, _)| path);
     (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-fn socket_paths_match(left: &Path, right: &Path) -> bool {
-    let left = canonical_socket_path(left);
-    let right = canonical_socket_path(right);
-    #[cfg(windows)]
-    {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
-}
-
-fn canonical_socket_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
-    }
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
-            .map(|canonical_parent| canonical_parent.join(file_name))
-            .unwrap_or_else(|_| path.to_path_buf()),
-        _ => path.to_path_buf(),
-    }
 }
 
 pub(in crate::handler) fn with_visible_pane_bases(

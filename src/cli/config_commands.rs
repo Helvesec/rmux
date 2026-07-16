@@ -107,13 +107,15 @@ pub(crate) fn run_show_options(
         Err(error) => return Err(error),
     };
     let include_inherited = args.include_inherited;
+    let include_hooks = args.include_hooks;
     let response = connection
-        .show_options(
+        .show_options_extended(
             scope,
             args.name,
             args.value_only,
             include_inherited,
             args.quiet,
+            include_hooks,
         )
         .map_err(show_options_exit_failure)?;
     match response {
@@ -252,7 +254,7 @@ mod tests {
         parse_target_spec, SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind,
         ShowOptionsArgs, ShowOptionsCommandKind, TargetSpec,
     };
-    use rmux_proto::{OptionScopeSelector, SessionName, WindowTarget};
+    use rmux_proto::{OptionScopeSelector, PaneTarget, SessionName, WindowTarget};
     use std::path::Path;
 
     fn target_spec(value: &str) -> TargetSpec {
@@ -280,6 +282,7 @@ mod tests {
     fn show_global_args(name: Option<&str>) -> ShowOptionsArgs {
         ShowOptionsArgs {
             include_inherited: false,
+            include_hooks: false,
             global: true,
             server: false,
             window: false,
@@ -301,13 +304,6 @@ mod tests {
                 panic!("expected set-option to resolve to a request")
             }
         }
-    }
-
-    fn resolve_set_option_noop(command: SetOptionCommandKind, args: SetOptionArgs) {
-        assert_eq!(
-            resolve_set_option_command(command, args).expect("set-option resolves"),
-            ResolvedSetOptionCommand::NoOp
-        );
     }
 
     #[test]
@@ -380,6 +376,38 @@ mod tests {
     }
 
     #[test]
+    fn set_option_unset_pane_overrides_implies_unset_at_session_scope() {
+        // Oracle probe 2026-07-09: plain `set -U` unsets the session copy
+        // only; the pane-override sweep applies only when -w selects a
+        // window scope.
+        let session = SessionName::new("alpha").expect("valid session");
+        let resolved = resolve_set_option_args(
+            SetOptionCommandKind::SetOption,
+            SetOptionArgs {
+                global: false,
+                server: false,
+                window: false,
+                pane: false,
+                quiet: false,
+                append: false,
+                format: false,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: true,
+                target: Some(target_spec("alpha:0.1")),
+                option: "@agent.state".to_owned(),
+                value: None,
+            },
+        )
+        .expect("set-option -U resolves without requiring a value");
+
+        assert_eq!(resolved.scope, OptionScopeSelector::Session(session));
+        assert!(resolved.unset);
+        assert!(resolved.unset_pane_overrides);
+        assert_eq!(resolved.value, None);
+    }
+
+    #[test]
     fn set_option_global_flag_uses_the_named_option_global_root() {
         for (option, value, expected) in [
             ("message-limit", "77", OptionScopeSelector::ServerGlobal),
@@ -406,16 +434,18 @@ mod tests {
     }
 
     #[test]
-    fn set_option_server_flag_ignores_non_server_options_like_tmux() {
-        resolve_set_option_noop(
+    fn set_option_server_flag_is_ignored_for_non_server_options_like_tmux() {
+        let resolved = resolve_set_option_args(
             SetOptionCommandKind::SetOption,
             SetOptionArgs {
                 server: true,
                 ..global_set_args("mode-style", "fg=black,bg=red")
             },
-        );
+        )
+        .expect("window global set-option resolves");
+        assert_eq!(resolved.scope, OptionScopeSelector::WindowGlobal);
 
-        resolve_set_option_noop(
+        let resolved = resolve_set_option_args(
             SetOptionCommandKind::SetOption,
             SetOptionArgs {
                 global: false,
@@ -426,6 +456,11 @@ mod tests {
                 value: Some("append".to_owned()),
                 ..global_set_args("status-left", "append")
             },
+        )
+        .expect("targeted session set-option resolves");
+        assert_eq!(
+            resolved.scope,
+            OptionScopeSelector::Session(SessionName::new("alpha").expect("valid session name"))
         );
     }
 
@@ -441,6 +476,95 @@ mod tests {
         .expect("set-option -gw resolves");
 
         assert_eq!(resolved.scope, OptionScopeSelector::WindowGlobal);
+    }
+
+    #[test]
+    fn set_option_global_with_scope_flag_uses_named_option_global_root() {
+        for (server, window, pane) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let resolved = resolve_set_option_args(
+                SetOptionCommandKind::SetOption,
+                SetOptionArgs {
+                    server,
+                    window,
+                    pane,
+                    ..global_set_args("status", "off")
+                },
+            )
+            .expect("set-option -g plus scope flag resolves");
+
+            assert_eq!(resolved.scope, OptionScopeSelector::SessionGlobal);
+        }
+    }
+
+    #[test]
+    fn set_option_explicit_pane_scope_wins_for_pane_capable_known_options() {
+        let session = SessionName::new("alpha").expect("valid session");
+        let resolved = resolve_set_option_args(
+            SetOptionCommandKind::SetOption,
+            SetOptionArgs {
+                global: false,
+                server: false,
+                window: false,
+                pane: true,
+                quiet: false,
+                append: false,
+                format: false,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                target: Some(target_spec("alpha:0.1")),
+                option: "window-style".to_owned(),
+                value: Some("bg=red".to_owned()),
+            },
+        )
+        .expect("set-option -p resolves to a pane scope");
+
+        assert_eq!(
+            resolved.scope,
+            OptionScopeSelector::Pane(PaneTarget::with_window(session, 0, 1))
+        );
+    }
+
+    #[test]
+    fn set_window_option_uses_natural_scope_for_session_options() {
+        let resolved = resolve_set_option_args(
+            SetOptionCommandKind::SetWindowOption,
+            SetOptionArgs {
+                global: false,
+                server: false,
+                window: false,
+                pane: false,
+                quiet: false,
+                append: false,
+                format: false,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                target: Some(target_spec("alpha")),
+                option: "status".to_owned(),
+                value: Some("off".to_owned()),
+            },
+        )
+        .expect("set-window-option session option resolves");
+
+        assert_eq!(
+            resolved.scope,
+            OptionScopeSelector::Session(SessionName::new("alpha").expect("valid session"))
+        );
+
+        let resolved = resolve_set_option_args(
+            SetOptionCommandKind::SetWindowOption,
+            SetOptionArgs {
+                ..global_set_args("history-limit", "1234")
+            },
+        )
+        .expect("set-window-option -g session option resolves");
+
+        assert_eq!(resolved.scope, OptionScopeSelector::SessionGlobal);
     }
 
     #[test]
@@ -600,6 +724,7 @@ mod tests {
             ShowOptionsCommandKind::ShowWindowOptions,
             &ShowOptionsArgs {
                 include_inherited: false,
+                include_hooks: false,
                 global: false,
                 server: false,
                 window: false,
@@ -627,6 +752,7 @@ mod tests {
             ShowOptionsCommandKind::ShowWindowOptions,
             &ShowOptionsArgs {
                 include_inherited: false,
+                include_hooks: false,
                 global: true,
                 server: false,
                 window: false,
@@ -651,6 +777,7 @@ mod tests {
             ShowOptionsCommandKind::ShowOptions,
             &ShowOptionsArgs {
                 include_inherited: false,
+                include_hooks: false,
                 global: true,
                 server: true,
                 window: false,
@@ -675,6 +802,7 @@ mod tests {
             ShowOptionsCommandKind::ShowWindowOptions,
             &ShowOptionsArgs {
                 include_inherited: false,
+                include_hooks: false,
                 global: true,
                 server: false,
                 window: false,
