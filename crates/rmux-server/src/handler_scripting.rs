@@ -21,6 +21,7 @@ use super::{
     rebase_expected_attach_session_after_switch, validate_expected_attach_identity, RequestHandler,
 };
 use crate::control::ControlCommandResult;
+use crate::hook_runtime::capture_inline_hooks;
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 
 #[path = "handler_scripting/buffer_parse.rs"]
@@ -349,6 +350,7 @@ impl RequestHandler {
                 mouse_target: context.mouse_target.as_ref(),
                 marked_target: marked_target.as_ref(),
             });
+            let run_shell_canfail_fallback_target = context.run_shell_canfail_fallback_target();
             parse_queue_invocation(
                 command,
                 context.caller_cwd.as_deref(),
@@ -356,6 +358,7 @@ impl RequestHandler {
                 &state.options,
                 &find_context,
                 context.canfail_fallback_target(),
+                run_shell_canfail_fallback_target,
             )
         }?;
 
@@ -636,7 +639,8 @@ impl RequestHandler {
                         break 'command_queue;
                     }
                     inserted_command_count = next_inserted_count;
-                    for (commands, context) in batches.into_iter().rev() {
+                    let mut insertable_batches = Vec::with_capacity(batches.len());
+                    for (commands, context) in batches {
                         if let Err(error) = self
                             .apply_parse_time_assignments(
                                 requester_pid,
@@ -650,6 +654,9 @@ impl RequestHandler {
                             exit_status = Some(1);
                             continue;
                         }
+                        insertable_batches.push((commands, context));
+                    }
+                    for (commands, context) in insertable_batches.into_iter().rev() {
                         let inserted = commands.commands().len();
                         queue.insert_after_current(commands);
                         for _ in 0..inserted {
@@ -734,6 +741,12 @@ impl RequestHandler {
                 mouse_target: context.mouse_target.as_ref(),
                 marked_target: marked_target.as_ref(),
             });
+            let run_shell_canfail_fallback_target =
+                context.run_shell_canfail_fallback_target().or_else(|| {
+                    (mode == QueueMode::Control)
+                        .then(|| find_context.current())
+                        .flatten()
+                });
             parse_queue_invocation(
                 command,
                 context.caller_cwd.as_deref(),
@@ -741,6 +754,7 @@ impl RequestHandler {
                 &state.options,
                 &find_context,
                 context.canfail_fallback_target(),
+                run_shell_canfail_fallback_target,
             )
         };
         let invocation = match invocation {
@@ -767,6 +781,7 @@ impl RequestHandler {
         let request_invocation = matches!(
             &invocation,
             QueueInvocation::Request(_)
+                | QueueInvocation::RunShell(_)
                 | QueueInvocation::NewWindow(_)
                 | QueueInvocation::SplitWindow(_)
         );
@@ -791,7 +806,7 @@ impl RequestHandler {
                         .map(|pane_id| (target, pane_id)),
                     None => None,
                 };
-                let request = apply_queue_context_to_request(request, context);
+                let request = apply_queue_context_to_request(request, context, false);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
                 let request_for_hooks = request.clone();
                 let captures_client_transition = captures_attached_client_transition(&request);
@@ -826,6 +841,83 @@ impl RequestHandler {
                         .await?;
                     }
                 }
+                let targeted_output_delivered =
+                    if let Some((target, pane_id)) = explicit_target_run_shell.as_ref() {
+                        self.deliver_targeted_run_shell_output(
+                            requester_pid,
+                            target,
+                            *pane_id,
+                            &outcome.response,
+                        )
+                        .await
+                    } else {
+                        false
+                    };
+                let inline_hook_names = inline_hooks
+                    .iter()
+                    .map(|pending| pending.hook)
+                    .collect::<Vec<_>>();
+                self.run_inline_hooks(requester_pid, inline_hooks, Some(&command_for_hooks))
+                    .await;
+                self.run_request_hooks(
+                    requester_pid,
+                    &request_for_hooks,
+                    &outcome.response,
+                    Some(&command_for_hooks),
+                    &inline_hook_names,
+                )
+                .await;
+                let action = match mode {
+                    QueueMode::Detached => queue_action_from_response(outcome.response),
+                    QueueMode::Control => {
+                        self.control_queue_action_from_outcome(
+                            requester_pid,
+                            expected_control_id.expect("control queues capture a client identity"),
+                            request_for_hooks,
+                            outcome,
+                        )
+                        .await
+                    }
+                };
+                if targeted_output_delivered {
+                    action.map(QueueCommandAction::without_output)
+                } else {
+                    action
+                }
+            }
+            QueueInvocation::RunShell(command) => {
+                let target_missing_canfail = command.target_missing_canfail;
+                let explicit_target_run_shell = command.request.target.clone();
+                let request = Request::RunShell(Box::new(command.request));
+                let explicit_target_run_shell = match explicit_target_run_shell {
+                    Some(target) => self
+                        .pane_id_for_slot_target(&target)
+                        .await
+                        .map(|pane_id| (target, pane_id)),
+                    None => None,
+                };
+                let request =
+                    apply_queue_context_to_request(request, context, target_missing_canfail);
+                let request = crate::server_access::apply_access_policy(request, can_write)?;
+                let request_for_hooks = request.clone();
+                let Request::RunShell(request) = request else {
+                    return Err(RmuxError::Server(
+                        "queued run-shell lost its request payload".to_owned(),
+                    ));
+                };
+                let client_name = context.client_name.clone();
+                let (outcome, inline_hooks) = capture_inline_hooks(async {
+                    crate::pane_io::HandleOutcome::response(
+                        self.handle_queued_run_shell_with_client_name(
+                            requester_pid,
+                            *request,
+                            client_name,
+                            target_missing_canfail,
+                        )
+                        .await,
+                    )
+                })
+                .await;
                 let targeted_output_delivered =
                     if let Some((target, pane_id)) = explicit_target_run_shell.as_ref() {
                         self.deliver_targeted_run_shell_output(
@@ -1167,6 +1259,7 @@ fn queue_invocation_allowed_for_read_only(invocation: &QueueInvocation) -> bool 
     matches!(
         invocation,
         QueueInvocation::Request(_)
+            | QueueInvocation::RunShell(_)
             | QueueInvocation::NoOp
             | QueueInvocation::StartServer
             | QueueInvocation::ListCommands(_)
@@ -1288,13 +1381,17 @@ fn source_file_context_error(
 fn apply_queue_context_to_request(
     mut request: Request,
     context: &QueueExecutionContext,
+    run_shell_target_missing_canfail: bool,
 ) -> Request {
     match &mut request {
         Request::RunShell(run_shell) => {
             let follows_attached_registration = run_shell.background
                 && current_expected_attach_identity().is_some()
                 && !context.uses_explicit_current_target();
-            if run_shell.target.is_none() && !follows_attached_registration {
+            if run_shell.target.is_none()
+                && !run_shell_target_missing_canfail
+                && !follows_attached_registration
+            {
                 if let Some(Target::Pane(target)) = context.current_target() {
                     run_shell.target = Some(target.clone());
                 }

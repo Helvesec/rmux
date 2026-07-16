@@ -6,13 +6,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+use rmux_os::process_tree::ProcessTreeChild;
 use rmux_proto::{RmuxError, DEFAULT_MAX_FRAME_LENGTH};
-#[cfg(unix)]
-use rustix::process::{kill_process_group, Pid, Signal};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, Command};
+use tokio::process::{ChildStderr, ChildStdout};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::super::shell_processes::{
+    ShellProcessGuard, ShellProcessRegistrationError, ShellProcessRegistry,
+};
 use crate::terminal::TerminalProfile;
 
 const RUN_SHELL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -90,8 +92,16 @@ pub(super) async fn run_shell_foreground(
     command: String,
     profile: &TerminalProfile,
     show_stderr: bool,
+    shell_processes: Option<Arc<ShellProcessRegistry>>,
 ) -> Result<Output, RmuxError> {
-    run_shell_foreground_with_timeout(command, profile, show_stderr, RUN_SHELL_TIMEOUT).await
+    run_shell_foreground_with_timeout(
+        command,
+        profile,
+        show_stderr,
+        RUN_SHELL_TIMEOUT,
+        shell_processes,
+    )
+    .await
 }
 
 async fn run_shell_foreground_with_timeout(
@@ -99,22 +109,25 @@ async fn run_shell_foreground_with_timeout(
     profile: &TerminalProfile,
     show_stderr: bool,
     timeout: Duration,
+    shell_processes: Option<Arc<ShellProcessRegistry>>,
 ) -> Result<Output, RmuxError> {
     let profile = ShellTaskProfile::from_terminal_profile(profile);
-    run_shell_foreground_async(command, profile, show_stderr, timeout).await
+    run_shell_foreground_async(command, profile, show_stderr, timeout, shell_processes).await
 }
 
 pub(super) async fn shell_condition_is_true(
     command: String,
     profile: &TerminalProfile,
+    shell_processes: Option<Arc<ShellProcessRegistry>>,
 ) -> Result<bool, RmuxError> {
-    shell_condition_is_true_with_timeout(command, profile, RUN_SHELL_TIMEOUT).await
+    shell_condition_is_true_with_timeout(command, profile, RUN_SHELL_TIMEOUT, shell_processes).await
 }
 
 async fn shell_condition_is_true_with_timeout(
     command: String,
     profile: &TerminalProfile,
     timeout: Duration,
+    shell_processes: Option<Arc<ShellProcessRegistry>>,
 ) -> Result<bool, RmuxError> {
     #[cfg(windows)]
     match command.trim() {
@@ -124,18 +137,8 @@ async fn shell_condition_is_true_with_timeout(
     }
 
     let profile = ShellTaskProfile::from_terminal_profile(profile);
-    shell_condition_is_true_async(command, profile, timeout).await
+    shell_condition_is_true_async(command, profile, timeout, shell_processes).await
 }
-
-#[cfg(unix)]
-fn configure_shell_task_process(command: &mut StdCommand) {
-    use std::os::unix::process::CommandExt as _;
-
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_shell_task_process(_: &mut StdCommand) {}
 
 struct ShellTaskProfile {
     shell: PathBuf,
@@ -158,7 +161,6 @@ impl ShellTaskProfile {
     fn shell_command(&self, command: &str) -> StdCommand {
         let mut child = crate::terminal::shell_std_command(&self.shell, &self.cwd, command);
         child.current_dir(&self.cwd).env_clear();
-        configure_shell_task_process(&mut child);
         for (name, value) in &self.raw_environment {
             child.env(name, value);
         }
@@ -181,35 +183,42 @@ async fn run_shell_foreground_async(
     profile: ShellTaskProfile,
     show_stderr: bool,
     timeout: Duration,
+    shell_processes: Option<Arc<ShellProcessRegistry>>,
 ) -> Result<Output, RmuxError> {
     let mut command_builder = profile.shell_command(&command);
     command_builder
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut command_builder = Command::from(command_builder);
-    command_builder.kill_on_drop(true);
-    let mut child = command_builder
-        .spawn()
+    let mut child = ProcessTreeChild::spawn(&mut command_builder)
         .map_err(|error| RmuxError::Server(format!("failed to run shell command: {error}")))?;
-    let process_group = ShellTaskProcessGroup::from_child(&child);
+    let registration_guard = register_shell_process(&mut child, shell_processes.as_ref())?;
     let stdout_task = child
+        .child_mut()
         .stdout
         .take()
+        .map(ChildStdout::from_std)
+        .transpose()
+        .map_err(|error| RmuxError::Server(format!("failed to capture shell stdout: {error}")))?
         .map(|pipe| spawn_pipe_reader(pipe, RUN_SHELL_OUTPUT_LIMIT));
     let stderr_task = child
+        .child_mut()
         .stderr
         .take()
+        .map(ChildStderr::from_std)
+        .transpose()
+        .map_err(|error| RmuxError::Server(format!("failed to capture shell stderr: {error}")))?
         .map(|pipe| spawn_pipe_reader(pipe, RUN_SHELL_OUTPUT_LIMIT));
-    let status = match wait_child_with_timeout(
+    let status_result = wait_child_with_timeout(
         &mut child,
-        process_group,
+        registration_guard.as_ref(),
         timeout,
         "run-shell",
         "shell command",
     )
-    .await
-    {
+    .await;
+    drop(registration_guard);
+    let status = match status_result {
         Ok(status) => status,
         Err(error) => {
             let _ = finish_pipe_task(stdout_task, "stdout").await;
@@ -233,26 +242,25 @@ async fn shell_condition_is_true_async(
     command: String,
     profile: ShellTaskProfile,
     timeout: Duration,
+    shell_processes: Option<Arc<ShellProcessRegistry>>,
 ) -> Result<bool, RmuxError> {
     let mut command_builder = profile.shell_command(&command);
     command_builder
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut command_builder = Command::from(command_builder);
-    command_builder.kill_on_drop(true);
-    let mut child = command_builder
-        .spawn()
+    let mut child = ProcessTreeChild::spawn(&mut command_builder)
         .map_err(|error| RmuxError::Server(format!("failed to run if-shell condition: {error}")))?;
-    let process_group = ShellTaskProcessGroup::from_child(&child);
+    let registration_guard = register_shell_process(&mut child, shell_processes.as_ref())?;
     let status = wait_child_with_timeout(
         &mut child,
-        process_group,
+        registration_guard.as_ref(),
         timeout,
         "if-shell",
         "if-shell condition",
     )
     .await?;
+    drop(registration_guard);
     Ok(status.success())
 }
 
@@ -263,26 +271,38 @@ pub(super) fn run_shell_delay_duration(seconds: f64) -> Result<Duration, RmuxErr
 }
 
 async fn wait_child_with_timeout(
-    child: &mut Child,
-    process_group: ShellTaskProcessGroup,
+    child: &mut ProcessTreeChild,
+    registration_guard: Option<&ShellProcessGuard>,
     timeout: Duration,
     command_name: &str,
     wait_label: &str,
 ) -> Result<std::process::ExitStatus, RmuxError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
+        match child.has_exited() {
+            Ok(true) => {
+                return child.wait().map_err(|error| {
+                    RmuxError::Server(format!("failed to wait for {wait_label}: {error}"))
+                });
+            }
+            Ok(false) => {}
             Err(error) => {
+                terminate_shell_task(child).await;
                 return Err(RmuxError::Server(format!(
                     "failed to wait for {wait_label}: {error}"
                 )));
             }
         }
 
+        if registration_guard.is_some_and(ShellProcessGuard::shutdown_started) {
+            terminate_shell_task(child).await;
+            return Err(RmuxError::Server(format!(
+                "{command_name} interrupted by server shutdown"
+            )));
+        }
+
         if tokio::time::Instant::now() >= deadline {
-            terminate_shell_task(child, process_group).await;
+            terminate_shell_task(child).await;
             return Err(RmuxError::Server(format!(
                 "{command_name} timed out after {}s",
                 timeout.as_secs()
@@ -291,6 +311,32 @@ async fn wait_child_with_timeout(
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
+    }
+}
+
+fn register_shell_process(
+    child: &mut ProcessTreeChild,
+    shell_processes: Option<&Arc<ShellProcessRegistry>>,
+) -> Result<Option<ShellProcessGuard>, RmuxError> {
+    let Some(shell_processes) = shell_processes else {
+        return Ok(None);
+    };
+    match shell_processes.register(child.controller()) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(ShellProcessRegistrationError::Closing) => {
+            let _ = child.terminate();
+            let _ = child.wait();
+            Err(RmuxError::Server(
+                "shell command interrupted by server shutdown".to_owned(),
+            ))
+        }
+        Err(ShellProcessRegistrationError::LimitReached { limit }) => {
+            let _ = child.terminate();
+            let _ = child.wait();
+            Err(RmuxError::Server(format!(
+                "too many active shell process groups; limit is {limit}"
+            )))
+        }
     }
 }
 
@@ -375,71 +421,20 @@ fn lock_pipe_output(output: &Arc<Mutex<PipeOutput>>) -> MutexGuard<'_, PipeOutpu
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(unix)]
-#[derive(Clone, Copy)]
-struct ShellTaskProcessGroup(Option<Pid>);
-
-#[cfg(unix)]
-impl ShellTaskProcessGroup {
-    fn from_child(child: &Child) -> Self {
-        Self(
-            child
-                .id()
-                .and_then(|id| i32::try_from(id).ok())
-                .and_then(Pid::from_raw),
-        )
-    }
-
-    fn terminate(self) {
-        if let Some(pid) = self.0 {
-            let _ = kill_process_group(pid, Signal::KILL);
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct ShellTaskProcessGroup;
-
-#[cfg(not(any(unix, windows)))]
-impl ShellTaskProcessGroup {
-    fn from_child(_: &Child) -> Self {
-        Self
-    }
-
-    fn terminate(self) {}
-}
-
-#[cfg(windows)]
-struct ShellTaskProcessGroup {
-    job: Option<rmux_os::process::ProcessJob>,
-}
-
-#[cfg(windows)]
-impl ShellTaskProcessGroup {
-    fn from_child(child: &Child) -> Self {
-        Self {
-            job: child
-                .raw_handle()
-                .and_then(|handle| rmux_os::process::ProcessJob::for_raw_handle(handle).ok()),
-        }
-    }
-
-    fn terminate(self) {
-        if let Some(job) = self.job {
-            let _ = job.terminate(1);
-        }
-    }
-}
-
-async fn terminate_shell_task(child: &mut Child, process_group: ShellTaskProcessGroup) {
-    process_group.terminate();
-    let _ = child.start_kill();
+async fn terminate_shell_task(child: &mut ProcessTreeChild) {
+    let _ = child.terminate();
     let deadline = tokio::time::Instant::now() + RUN_SHELL_TERMINATE_REAP_TIMEOUT;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
-            Err(_) => return,
+        match child.has_exited() {
+            Ok(true) => {
+                let _ = child.wait();
+                return;
+            }
+            Ok(false) => {}
+            Err(_) => {
+                let _ = child.wait();
+                return;
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return;
@@ -515,6 +510,7 @@ mod tests {
     };
     use crate::terminal::TerminalProfile;
     use rmux_core::{EnvironmentStore, OptionStore};
+    use rmux_os::process_tree::ProcessTreeChild;
     use rmux_proto::{OptionName, ScopeSelector, SetOptionMode};
     use rustix::process::{kill_process, Pid, Signal};
     use std::path::{Path, PathBuf};
@@ -574,15 +570,12 @@ mod tests {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let mut command = tokio::process::Command::from(command);
-        command.kill_on_drop(true);
-        let mut child = command.spawn().expect("spawn short-lived child");
-        let process_group = super::ShellTaskProcessGroup::from_child(&child);
+        let mut child = ProcessTreeChild::spawn(&mut command).expect("spawn short-lived child");
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         let status = wait_child_with_timeout(
             &mut child,
-            process_group,
+            None,
             Duration::from_secs(1),
             "run-shell",
             "already-exited shell",
@@ -604,9 +597,14 @@ mod tests {
         );
         let profile = test_profile(root.path());
 
-        let result =
-            run_shell_foreground_with_timeout(command, &profile, false, Duration::from_millis(200))
-                .await;
+        let result = run_shell_foreground_with_timeout(
+            command,
+            &profile,
+            false,
+            Duration::from_millis(200),
+            None,
+        )
+        .await;
 
         assert!(
             result

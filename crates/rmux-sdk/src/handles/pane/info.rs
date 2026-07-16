@@ -11,9 +11,12 @@ use rmux_proto::{ListPanesRequest, ListSessionsRequest, ListWindowsRequest, Requ
 
 use super::target::{is_already_closed_error, parse_error};
 
+#[path = "info/identity.rs"]
+mod identity;
 #[path = "info/parse.rs"]
 mod parse;
 
+pub(super) use identity::{pane_info_snapshot_for_id, pane_info_snapshot_for_slot};
 pub(super) use parse::parse_details_line;
 use parse::{parse_pane_id, parse_pane_list_line, parse_session_line, parse_window_id};
 
@@ -52,6 +55,20 @@ struct ListedWindow {
     size: TerminalSizeSpec,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PaneInfoParentIdentity {
+    session_id: SessionId,
+    window_id: WindowId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PaneInfoLocation {
+    window_index: u32,
+    pane_index: u32,
+    pane_id: PaneId,
+    parent: PaneInfoParentIdentity,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct LiveDetails {
     pub(super) pane_id: Option<PaneId>,
@@ -74,7 +91,7 @@ pub(super) struct LiveDetails {
     pub(super) current_path: Option<String>,
 }
 
-pub(super) async fn pane_info_snapshot(
+pub(super) async fn pane_info_snapshot_for_absent_slot(
     client: &TransportClient,
     target: &PaneRef,
 ) -> Result<InfoSnapshot> {
@@ -101,21 +118,56 @@ pub(super) async fn pane_info_snapshot(
         ..WindowInfo::new(window.id, session_id)
     };
 
-    let pane_entry = current_pane_entry(client, target).await?;
-    let Some(pane) = pane_entry else {
-        return Ok(InfoSnapshot::new(
-            vec![SessionInfo::new(session_id, session.name.clone())],
-            vec![window_info],
-            Vec::new(),
-        ));
+    Ok(InfoSnapshot::new(
+        vec![SessionInfo::new(session_id, session.name)],
+        vec![window_info],
+        Vec::new(),
+    ))
+}
+
+async fn pane_info_snapshot_at_target(
+    client: &TransportClient,
+    target: &PaneRef,
+    expected_pane_id: PaneId,
+) -> Result<Option<InfoSnapshot>> {
+    let Some(session) = current_session_info(client, &target.session_name).await? else {
+        return Ok(None);
+    };
+    let session_id = session.id;
+
+    let Some(window) = current_window_entry(client, target).await? else {
+        return Ok(None);
+    };
+    let window_info = WindowInfo {
+        id: window.id,
+        session_id,
+        index: window.index,
+        name: window.name.clone(),
+        size: window.size,
+        ..WindowInfo::new(window.id, session_id)
     };
 
-    let details = match fetch_live_details_by_id(client, &target.session_name, pane.pane_id).await {
-        Ok(details) => details,
-        Err(error) if is_already_closed_error(&error, target) => LiveDetails::default(),
-        Err(error) => return Err(error),
+    let Some(pane) = current_pane_entry(client, target).await? else {
+        return Ok(None);
     };
-    let mut pane_info = PaneInfo::new(pane.pane_id, window.id, session_id);
+    if pane.pane_id != expected_pane_id {
+        return Ok(None);
+    }
+
+    let details =
+        match fetch_live_details_by_id(client, &target.session_name, expected_pane_id).await {
+            Ok(details) if details.pane_id == Some(expected_pane_id) => details,
+            Ok(_) => return Ok(None),
+            Err(error) if is_already_closed_error(&error, target) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    if !pane_info_identity_is_current(client, target, session_id, window.id, expected_pane_id)
+        .await?
+    {
+        return Ok(None);
+    }
+
+    let mut pane_info = PaneInfo::new(expected_pane_id, window.id, session_id);
     pane_info.index = target.pane_index;
     pane_info.size = pane_size_from_details(&details, &window.size);
     pane_info.process = derive_process_state(&details);
@@ -130,11 +182,37 @@ pub(super) async fn pane_info_snapshot(
     };
     pane_info.output_sequence = details.output_sequence;
 
-    Ok(InfoSnapshot::new(
+    Ok(Some(InfoSnapshot::new(
         vec![SessionInfo::new(session_id, session.name.clone())],
         vec![window_info],
         vec![pane_info],
-    ))
+    )))
+}
+
+async fn pane_info_identity_is_current(
+    client: &TransportClient,
+    target: &PaneRef,
+    expected_session_id: SessionId,
+    expected_window_id: WindowId,
+    expected_pane_id: PaneId,
+) -> Result<bool> {
+    let Some(session) = current_session_info(client, &target.session_name).await? else {
+        return Ok(false);
+    };
+    if session.id != expected_session_id {
+        return Ok(false);
+    }
+
+    let Some(window) = current_window_entry(client, target).await? else {
+        return Ok(false);
+    };
+    if window.id != expected_window_id {
+        return Ok(false);
+    }
+
+    Ok(current_pane_entry(client, target)
+        .await?
+        .is_some_and(|pane| pane.pane_id == expected_pane_id))
 }
 
 pub(super) fn pane_size_from_details(
@@ -207,6 +285,16 @@ async fn current_session_info(
         .find(|session| &session.name == session_name))
 }
 
+async fn current_session_info_for_id(
+    client: &TransportClient,
+    session_id: SessionId,
+) -> Result<Option<ListedSession>> {
+    Ok(list_session_entries(client)
+        .await?
+        .into_iter()
+        .find(|session| session.id == session_id))
+}
+
 async fn list_session_entries(client: &TransportClient) -> Result<Vec<ListedSession>> {
     let response = client
         .request(Request::ListSessions(ListSessionsRequest {
@@ -240,6 +328,20 @@ async fn current_window_entry(
             .into_iter()
             .find(|entry| entry.index == target.window_index)),
         Err(error) if is_already_closed_error(&error, target) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn current_window_entry_for_id(
+    client: &TransportClient,
+    session_name: &rmux_proto::SessionName,
+    window_id: WindowId,
+) -> Result<Option<ListedWindow>> {
+    match list_window_entries(client, session_name).await {
+        Ok(entries) => Ok(entries.into_iter().find(|entry| entry.id == window_id)),
+        Err(RmuxError::Protocol {
+            source: rmux_proto::RmuxError::SessionNotFound(missing),
+        }) if missing == session_name.as_str() => Ok(None),
         Err(error) => Err(error),
     }
 }

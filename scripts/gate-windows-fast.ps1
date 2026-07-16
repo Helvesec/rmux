@@ -53,6 +53,7 @@ Set-Location $repoRoot
 $assertCargoFilter = Join-Path $PSScriptRoot "assert-cargo-filter-nonempty.ps1"
 
 Remove-Item Env:\RUST_TEST_THREADS -ErrorAction SilentlyContinue
+$env:RUST_MIN_STACK = "8388608"
 if (-not $env:CARGO_INCREMENTAL) {
     $env:CARGO_INCREMENTAL = "1"
 }
@@ -69,6 +70,7 @@ if ($InstallNextest -and -not (Has-Nextest)) {
 
 Write-Host "[gate] target=$Target"
 Write-Host "[gate] test_threads=$TestThreads"
+Write-Host "[gate] rust_min_stack=$env:RUST_MIN_STACK"
 Write-Host "[gate] cargo_build_jobs=$env:CARGO_BUILD_JOBS"
 Write-Host "[gate] cargo_incremental=$env:CARGO_INCREMENTAL"
 

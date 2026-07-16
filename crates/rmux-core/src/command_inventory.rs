@@ -119,6 +119,12 @@ impl CommandShortOptionSpec {
             self.add_boolean(flag);
         }
     }
+
+    fn add_internal_value_flags(&mut self, flags: &str) {
+        for flag in flags.chars() {
+            self.add_value(flag);
+        }
+    }
 }
 
 fn add_internal_short_options(command_name: &str, spec: &mut CommandShortOptionSpec) {
@@ -126,6 +132,7 @@ fn add_internal_short_options(command_name: &str, spec: &mut CommandShortOptionS
     // `list-commands`. Keep normalization metadata separate so the public
     // inventory remains oracle-exact.
     match command_name {
+        "join-pane" | "move-pane" => spec.add_internal_value_flags("p"),
         "list-buffers" => spec.add_internal_boolean_flags("r"),
         "load-buffer" => spec.add_internal_boolean_flags("w"),
         _ => {}

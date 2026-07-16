@@ -106,6 +106,79 @@ async fn close_all_keeps_the_observed_pane_after_slot_replacement() {
 }
 
 #[tokio::test]
+async fn close_all_preflights_every_slot_before_reindexing_mutations() {
+    let (panes, mut server_stream) = pane_set_for_slots(&[(0, 0), (0, 1)]).await;
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            serve_pane_listing(
+                &mut server_stream,
+                &session_name(),
+                Some(0),
+                "0:0:%1\n0:1:%2\n",
+            )
+            .await;
+        }
+
+        serve_pane_listing(
+            &mut server_stream,
+            &session_name(),
+            None,
+            "0:0:%1\n0:1:%2\n",
+        )
+        .await;
+        let Request::PaneKill(first) = read_request(&mut server_stream).await else {
+            panic!("expected first pane close");
+        };
+        assert_eq!(
+            first.target,
+            PaneTargetRef::by_id(session_name(), PaneId::new(1))
+        );
+        write_response(
+            &mut server_stream,
+            Response::KillPane(KillPaneResponse {
+                target: PaneTarget::with_window(session_name(), 0, 0),
+                window_destroyed: false,
+            }),
+        )
+        .await;
+
+        serve_pane_listing(&mut server_stream, &session_name(), None, "0:0:%2\n").await;
+        let Request::PaneKill(second) = read_request(&mut server_stream).await else {
+            panic!("expected second pane close");
+        };
+        assert_eq!(
+            second.target,
+            PaneTargetRef::by_id(session_name(), PaneId::new(2))
+        );
+        write_response(
+            &mut server_stream,
+            Response::KillPane(KillPaneResponse {
+                target: PaneTarget::with_window(session_name(), 0, 0),
+                window_destroyed: true,
+            }),
+        )
+        .await;
+    });
+
+    let outcome = panes.close_all().await;
+    server.await.expect("server task");
+
+    assert!(outcome.is_success(), "close batch: {outcome:?}");
+    assert_eq!(
+        outcome
+            .successes()
+            .iter()
+            .map(|success| success.pane_id())
+            .collect::<Vec<_>>(),
+        vec![Some(PaneId::new(1)), Some(PaneId::new(2))]
+    );
+    assert!(outcome
+        .successes()
+        .iter()
+        .all(|success| matches!(success.value(), crate::PaneCloseOutcome::Closed { .. })));
+}
+
+#[tokio::test]
 async fn client_broadcast_keeps_the_observed_pane_after_slot_replacement() {
     let (panes, server) = observed_pane_replacement_fixture(ReplacementRequest::Input).await;
 
@@ -327,21 +400,30 @@ async fn assert_replacement_wait_keeps_observed_pane(any: bool) {
 }
 
 async fn pane_set_fixture() -> (PaneSet, tokio::io::DuplexStream) {
+    pane_set_for_slots(&[(0, 0)]).await
+}
+
+async fn pane_set_for_slots(slots: &[(u32, u32)]) -> (PaneSet, tokio::io::DuplexStream) {
     let (client_stream, server_stream) = tokio::io::duplex(4096);
     let transport = TransportClient::spawn(client_stream);
-    let pane = Pane::new(
-        PaneRef::new(session_name(), 0, 0),
-        RmuxEndpoint::Default,
-        Some(Duration::from_secs(1)),
-        transport.clone(),
-    );
+    let panes = slots
+        .iter()
+        .map(|(window_index, pane_index)| {
+            Pane::new(
+                PaneRef::new(session_name(), *window_index, *pane_index),
+                RmuxEndpoint::Default,
+                Some(Duration::from_secs(1)),
+                transport.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
     transport
         .cache_capabilities(vec![
             CAPABILITY_HANDSHAKE.to_owned(),
             CAPABILITY_SDK_PANE_BY_ID.to_owned(),
         ])
         .await;
-    (PaneSet::new([pane]), server_stream)
+    (PaneSet::new(panes), server_stream)
 }
 
 #[derive(Clone, Copy)]

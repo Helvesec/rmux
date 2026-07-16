@@ -457,9 +457,10 @@ impl HandlerState {
 
         // Without -k, reject if any pane terminal is still present (i.e. process may be running).
         if !kill
-            && pane_ids
-                .iter()
-                .any(|id| self.ensure_panes_exist(&session_name, &[*id]).is_ok())
+            && pane_ids.iter().any(|id| {
+                self.ensure_window_panes_exist(&session_name, window_index, &[*id])
+                    .is_ok()
+            })
         {
             return Err(RmuxError::Server(
                 "window still active; use -k to force respawn".to_owned(),

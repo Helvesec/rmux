@@ -248,6 +248,17 @@ impl Pane {
         pane
     }
 
+    pub(crate) async fn begin_pinned_operation_handle(&self) -> Result<(Self, Option<PaneId>)> {
+        self.begin_operation_handle()
+            .pin_to_current_identity()
+            .await
+    }
+
+    pub(crate) fn into_reusable_handle(mut self) -> Self {
+        self.transport = self.transport.reusable();
+        self
+    }
+
     pub(crate) fn with_operation_deadline(&self, deadline: OperationDeadline) -> Self {
         let mut pane = self.clone();
         pane.transport = pane.transport.with_operation_deadline(deadline);
@@ -346,7 +357,8 @@ impl Pane {
     /// linked panes, borders, and neighboring panes can constrain the final
     /// geometry. No pane identity is cached by this handle.
     pub async fn resize(&self, size: TerminalSizeSpec) -> Result<()> {
-        resize_to_size(&self.begin_operation_handle(), size).await
+        let (pane, _) = self.begin_pinned_operation_handle().await?;
+        resize_to_size(&pane, size).await
     }
 
     /// Sets this pane's UX title label.

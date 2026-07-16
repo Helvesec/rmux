@@ -269,6 +269,45 @@ pub(super) fn resolve_queue_target_argument(
     resolve_target_argument_with_spec(value, spec, sessions, find_context)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum QueueTargetArgumentResolution {
+    Resolved(String),
+    CanFail,
+}
+
+pub(super) fn resolve_queue_target_argument_typed(
+    command_name: &str,
+    flag: char,
+    value: String,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<QueueTargetArgumentResolution, RmuxError> {
+    let Some(spec) = target_spec_for_flag(command_name, flag) else {
+        return Ok(QueueTargetArgumentResolution::Resolved(value));
+    };
+    resolve_target_argument_with_spec_typed(value, spec, sessions, find_context)
+}
+
+fn resolve_target_argument_with_spec_typed(
+    value: String,
+    spec: CommandTargetSpec,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<QueueTargetArgumentResolution, RmuxError> {
+    match sessions.resolve_unresolved_target(
+        &UnresolvedTarget::new(value),
+        spec.find_type,
+        spec.flags,
+        find_context,
+    ) {
+        Ok(target) => Ok(QueueTargetArgumentResolution::Resolved(target.to_string())),
+        Err(_) if spec.flags.contains(TargetFindFlags::CANFAIL) => {
+            Ok(QueueTargetArgumentResolution::CanFail)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn resolve_target_argument_with_spec(
     value: String,
     spec: CommandTargetSpec,
@@ -996,6 +1035,88 @@ mod tests {
     }
 
     #[test]
+    fn queue_resolves_set_window_option_targets_like_set_option_window_scope() {
+        let mut sessions = session_store_with_alpha_beta();
+        let (window_index, _) = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created");
+        sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .rename_window(window_index, "named".to_owned())
+            .expect("second alpha window can be named");
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        for (command_name, arguments, expected) in [
+            (
+                "set-window-option",
+                vec!["-t", "+", "automatic-rename", "off"],
+                vec!["-t", "alpha:1", "automatic-rename", "off"],
+            ),
+            (
+                "set-window-option",
+                vec!["-t", "named", "synchronize-panes", "on"],
+                vec!["-t", "alpha:1", "synchronize-panes", "on"],
+            ),
+            (
+                "set-option",
+                vec!["-w", "-t", "+", "automatic-rename", "off"],
+                vec!["-w", "-t", "alpha:1", "automatic-rename", "off"],
+            ),
+        ] {
+            let resolved = resolve_queue_target_arguments(
+                command_name,
+                arguments.into_iter().map(str::to_owned).collect(),
+                &sessions,
+                &context,
+            )
+            .expect("set-window-option queue target resolves");
+
+            assert_eq!(resolved, expected);
+        }
+    }
+
+    #[test]
+    fn queue_rejects_missing_set_window_option_target_like_set_option_window_scope() {
+        let sessions = session_store_with_alpha_beta();
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        let alias = resolve_queue_target_arguments(
+            "set-window-option",
+            ["-t", "nosuch", "automatic-rename", "off"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            &sessions,
+            &context,
+        )
+        .expect_err("missing alias window target should fail");
+        let canonical = resolve_queue_target_arguments(
+            "set-option",
+            ["-w", "-t", "nosuch", "automatic-rename", "off"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            &sessions,
+            &context,
+        )
+        .expect_err("missing canonical window target should fail");
+
+        assert_eq!(alias.to_string(), canonical.to_string());
+        assert!(alias.to_string().contains("nosuch"));
+    }
+
+    #[test]
     fn queue_resolves_default_mouse_binding_compact_copy_mode_target() {
         let sessions = session_store_with_alpha_beta();
         let mouse_target = Target::Pane(PaneTarget::with_window(session_name("alpha"), 0, 0));
@@ -1027,6 +1148,52 @@ mod tests {
         .expect("send-keys mouse target resolves");
 
         assert_eq!(resolved, ["-X", "-t", "alpha:0.0", "select-word"]);
+    }
+
+    #[test]
+    fn typed_queue_target_resolution_canonicalizes_run_shell_pane_id() {
+        let sessions = session_store_with_alpha_beta();
+        let pane_id = sessions
+            .session(&session_name("alpha"))
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id().to_string())
+            .expect("alpha pane id exists");
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("beta"),
+            0,
+            0,
+        ))));
+
+        let resolved =
+            resolve_queue_target_argument_typed("run-shell", 't', pane_id, &sessions, &context)
+                .expect("run-shell pane id resolves");
+
+        assert_eq!(
+            resolved,
+            QueueTargetArgumentResolution::Resolved("alpha:0.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn typed_queue_target_resolution_reports_run_shell_canfail_target() {
+        let sessions = session_store_with_alpha_beta();
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        let resolved = resolve_queue_target_argument_typed(
+            "run-shell",
+            't',
+            "%9999".to_owned(),
+            &sessions,
+            &context,
+        )
+        .expect("run-shell missing pane id is CANFAIL");
+
+        assert_eq!(resolved, QueueTargetArgumentResolution::CanFail);
     }
 
     #[test]

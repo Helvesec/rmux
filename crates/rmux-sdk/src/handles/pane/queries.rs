@@ -1,7 +1,10 @@
 use crate::{InfoSnapshot, PaneId, PaneSnapshot, PaneTextMatch, Result};
 
 use super::capture_pane::PaneCaptureBuilder;
-use super::info::{current_pane_entry, current_pane_ref_for_id, pane_info_snapshot};
+use super::info::{
+    current_pane_entry, current_pane_ref_for_id, pane_info_snapshot_for_absent_slot,
+    pane_info_snapshot_for_id, pane_info_snapshot_for_slot,
+};
 use super::snapshot::pane_snapshot;
 use super::Pane;
 
@@ -47,15 +50,12 @@ impl Pane {
         let pane = self.begin_operation_handle();
         match pane.stable_id {
             Some(pane_id) => {
-                let Some(target) =
-                    current_pane_ref_for_id(&pane.transport, &pane.target.session_name, pane_id)
-                        .await?
-                else {
-                    return Ok(InfoSnapshot::default());
-                };
-                pane_info_snapshot(&pane.transport, &target).await
+                pane_info_snapshot_for_id(&pane.transport, &pane.target.session_name, pane_id).await
             }
-            None => pane_info_snapshot(&pane.transport, &pane.target).await,
+            None if pane.identity_preflight == super::PaneIdentityPreflight::Absent => {
+                pane_info_snapshot_for_absent_slot(&pane.transport, &pane.target).await
+            }
+            None => pane_info_snapshot_for_slot(&pane.transport, &pane.target).await,
         }
     }
 

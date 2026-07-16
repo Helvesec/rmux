@@ -152,11 +152,11 @@ pub(crate) async fn wait_for_text(pane: &Pane, text: String) -> Result<()> {
     }
 
     let timeout = resolved_wait_timeout(pane.configured_default_timeout());
-    with_wait_timeout(
-        WAIT_FOR_TEXT_OPERATION,
-        timeout,
-        wait_for_text_without_timeout(pane, text),
-    )
+    let pane = pane.begin_operation_handle();
+    with_wait_timeout(WAIT_FOR_TEXT_OPERATION, timeout, async move {
+        let (pane, _) = pane.pin_to_current_identity().await?;
+        wait_for_text_without_timeout(&pane, text).await
+    })
     .await
 }
 
@@ -179,11 +179,11 @@ pub(crate) async fn wait_for_text_next(pane: &Pane, text: String) -> Result<Arme
 
 pub(crate) async fn wait_exit(pane: &Pane) -> Result<Option<crate::PaneExitState>> {
     let timeout = resolved_wait_timeout(pane.configured_default_timeout());
-    with_wait_timeout(
-        WAIT_FOR_EXIT_OPERATION,
-        timeout,
-        wait_exit_without_timeout(pane),
-    )
+    let pane = pane.begin_operation_handle();
+    with_wait_timeout(WAIT_FOR_EXIT_OPERATION, timeout, async move {
+        let (pane, _) = pane.pin_to_current_identity().await?;
+        wait_exit_without_timeout(&pane).await
+    })
     .await
 }
 

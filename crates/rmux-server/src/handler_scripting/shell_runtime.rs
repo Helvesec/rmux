@@ -102,11 +102,43 @@ impl RequestHandler {
     pub(in crate::handler) async fn handle_run_shell_with_client_name(
         &self,
         requester_pid: u32,
-        mut request: RunShellRequest,
+        request: RunShellRequest,
         client_name: Option<String>,
     ) -> Response {
-        let target_was_captured = request.target.is_some();
-        if request.target.is_none() {
+        self.handle_run_shell_with_client_name_and_target_state(
+            requester_pid,
+            request,
+            client_name,
+            false,
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn handle_queued_run_shell_with_client_name(
+        &self,
+        requester_pid: u32,
+        request: RunShellRequest,
+        client_name: Option<String>,
+        target_missing_canfail: bool,
+    ) -> Response {
+        self.handle_run_shell_with_client_name_and_target_state(
+            requester_pid,
+            request,
+            client_name,
+            target_missing_canfail,
+        )
+        .await
+    }
+
+    async fn handle_run_shell_with_client_name_and_target_state(
+        &self,
+        requester_pid: u32,
+        mut request: RunShellRequest,
+        client_name: Option<String>,
+        target_missing_canfail: bool,
+    ) -> Response {
+        let target_was_captured = request.target.is_some() || target_missing_canfail;
+        if request.target.is_none() && !target_missing_canfail {
             request.target = self.inherited_run_shell_target(requester_pid).await;
         }
         if request.background {
@@ -137,7 +169,13 @@ impl RequestHandler {
                     let _detached_request_guard = detached_request_guard;
                     let _requester_access_guard = requester_access_guard;
                     let _ = handler
-                        .run_shell_task(requester_pid, request, client_name, target_policy)
+                        .run_shell_task(
+                            requester_pid,
+                            request,
+                            client_name,
+                            target_policy,
+                            target_missing_canfail,
+                        )
                         .await;
                 };
                 with_background_client_identities(control_identity, attach_identity, async move {
@@ -160,6 +198,7 @@ impl RequestHandler {
                 request,
                 client_name,
                 ShellTargetPolicy::Fixed,
+                target_missing_canfail,
             )
             .await
         {
@@ -278,6 +317,7 @@ impl RequestHandler {
         mut request: RunShellRequest,
         client_name: Option<String>,
         target_policy: ShellTargetPolicy,
+        target_missing_canfail: bool,
     ) -> Result<RunShellTaskOutput, RmuxError> {
         if let Some(delay_seconds) = request.delay_seconds {
             tokio::time::sleep(run_shell_delay_duration(delay_seconds.as_secs_f64())?).await;
@@ -305,7 +345,7 @@ impl RequestHandler {
         if request.as_commands {
             let has_fixed_target = request.target.is_some();
             let command = self
-                .expand_run_shell_command(&request, client_name.as_deref())
+                .expand_run_shell_command(&request, client_name.as_deref(), target_missing_canfail)
                 .await?;
             let parsed = self.parse_command_string_one_group(&command).await?;
             if parsed_contains_attach_session(&parsed) {
@@ -313,9 +353,12 @@ impl RequestHandler {
                     "open terminal failed: not a terminal".to_owned(),
                 ));
             }
-            let current_target = self
-                .run_shell_commands_current_target(requester_pid, request.target)
-                .await;
+            let current_target = if target_missing_canfail {
+                None
+            } else {
+                self.run_shell_commands_current_target(requester_pid, request.target)
+                    .await
+            };
             let context = QueueExecutionContext::new(request.start_directory.clone());
             let context = match target_policy {
                 ShellTargetPolicy::FollowAttachedSession => context
@@ -343,9 +386,15 @@ impl RequestHandler {
 
         let profile = self.run_shell_profile(&request).await?;
         let command = self
-            .expand_run_shell_command(&request, client_name.as_deref())
+            .expand_run_shell_command(&request, client_name.as_deref(), target_missing_canfail)
             .await?;
-        let output = run_shell_foreground(command.clone(), &profile, request.show_stderr).await?;
+        let output = run_shell_foreground(
+            command.clone(),
+            &profile,
+            request.show_stderr,
+            Some(self.shell_processes.clone()),
+        )
+        .await?;
         let exit_status = shell_exit_status(&output.status);
         let stdout = run_shell_stdout_for_response(
             output.stdout,
@@ -421,7 +470,12 @@ impl RequestHandler {
             if_shell_format_condition_is_true(&expanded_condition)
         } else {
             let profile = self.if_shell_profile(&request).await?;
-            shell_condition_is_true(expanded_condition, &profile).await?
+            shell_condition_is_true(
+                expanded_condition,
+                &profile,
+                Some(self.shell_processes.clone()),
+            )
+            .await?
         };
 
         let selected_command = if condition_is_true {
@@ -458,6 +512,7 @@ impl RequestHandler {
         &self,
         request: &RunShellRequest,
         client_name: Option<&str>,
+        target_missing_canfail: bool,
     ) -> Result<String, RmuxError> {
         #[cfg(windows)]
         if format_references_pane_pid(Some(&request.command)) {
@@ -481,7 +536,7 @@ impl RequestHandler {
                 &socket_path,
             )
             .unwrap_or_else(|_| global_format_context(&state, &socket_path)),
-            None => match hook_formats
+            None if !target_missing_canfail => match hook_formats
                 .iter()
                 .rev()
                 .find(|(name, _)| name == "hook_session_name")
@@ -493,6 +548,7 @@ impl RequestHandler {
                 }
                 None => global_format_context(&state, &socket_path),
             },
+            None => global_format_context(&state, &socket_path),
         };
         let context = match client_name {
             Some(client_name) => context.with_named_value("client_name", client_name.to_owned()),
@@ -738,6 +794,7 @@ impl RequestHandler {
                 profile
                     .as_ref()
                     .expect("profile exists for shell-mode if-shell"),
+                Some(self.shell_processes.clone()),
             )
             .await?
         };
@@ -825,6 +882,7 @@ impl RequestHandler {
                 profile
                     .as_ref()
                     .expect("profile exists for shell-mode if-shell"),
+                Some(self.shell_processes.clone()),
             )
             .await?
         };

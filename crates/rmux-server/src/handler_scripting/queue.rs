@@ -19,6 +19,7 @@ use super::prompt_parse::{
     ParsedCommandPromptCommand, ParsedConfirmBeforeCommand, ParsedPromptHistoryCommand,
 };
 use super::queue_parse::{ParsedIfShellCommand, ParsedNewWindowCommand};
+use super::shell_parse::ParsedRunShellCommand;
 use super::source_files::ParsedSourceFileCommand;
 
 #[derive(Debug, Clone)]
@@ -28,6 +29,7 @@ pub(in crate::handler) struct QueueExecutionContext {
     pub(super) current_file: Option<String>,
     pub(super) current_target: Option<Target>,
     pub(super) current_target_allows_canfail_fallback: bool,
+    run_shell_canfail_fallback_target: bool,
     pub(super) follows_attached_session: bool,
     pub(super) client_name: Option<String>,
     pub(super) mouse_target: Option<Target>,
@@ -42,6 +44,7 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            run_shell_canfail_fallback_target: false,
             follows_attached_session: false,
             client_name: None,
             mouse_target: None,
@@ -56,6 +59,7 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            run_shell_canfail_fallback_target: false,
             follows_attached_session: false,
             client_name: None,
             mouse_target: None,
@@ -74,6 +78,7 @@ impl QueueExecutionContext {
             current_file,
             current_target: self.current_target.clone(),
             current_target_allows_canfail_fallback: self.current_target_allows_canfail_fallback,
+            run_shell_canfail_fallback_target: self.run_shell_canfail_fallback_target,
             follows_attached_session: self.follows_attached_session,
             client_name: self.client_name.clone(),
             mouse_target: self.mouse_target.clone(),
@@ -97,6 +102,11 @@ impl QueueExecutionContext {
     ) -> Self {
         self.current_target = current_target;
         self.current_target_allows_canfail_fallback = false;
+        self
+    }
+
+    pub(in crate::handler) fn with_run_shell_canfail_fallback_target(mut self) -> Self {
+        self.run_shell_canfail_fallback_target = self.current_target.is_some();
         self
     }
 
@@ -146,6 +156,12 @@ impl QueueExecutionContext {
 
     pub(in crate::handler) fn canfail_fallback_target(&self) -> Option<&Target> {
         self.current_target_allows_canfail_fallback
+            .then_some(self.current_target.as_ref())
+            .flatten()
+    }
+
+    pub(in crate::handler) fn run_shell_canfail_fallback_target(&self) -> Option<&Target> {
+        self.run_shell_canfail_fallback_target
             .then_some(self.current_target.as_ref())
             .flatten()
     }
@@ -263,6 +279,7 @@ pub(super) enum QueueMode {
 #[derive(Debug, Clone)]
 pub(super) enum QueueInvocation {
     Request(Request),
+    RunShell(ParsedRunShellCommand),
     NoOp,
     StartServer,
     ListCommands(ParsedListCommandsCommand),

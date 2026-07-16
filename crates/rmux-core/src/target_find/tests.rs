@@ -630,4 +630,16 @@ fn command_metadata_captures_find_type_and_flags() {
         respawn_window.target.expect("target spec").find_type,
         TargetFindType::Window
     );
+
+    let set_option = command_target_metadata("set-option").expect("metadata exists");
+    let set_option_target = set_option.target.expect("target spec");
+    assert_eq!(set_option_target.find_type, TargetFindType::Session);
+    assert!(set_option_target.flags.contains(TargetFindFlags::CANFAIL));
+
+    let set_window_option = command_target_metadata("set-window-option").expect("metadata exists");
+    let set_window_option_target = set_window_option.target.expect("target spec");
+    assert_eq!(set_window_option_target.find_type, TargetFindType::Window);
+    assert!(set_window_option_target
+        .flags
+        .contains(TargetFindFlags::CANFAIL));
 }

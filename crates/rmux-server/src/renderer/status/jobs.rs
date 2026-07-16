@@ -1,17 +1,15 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
-use std::process::Child;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rmux_os::process_tree::{ProcessTreeChild, ProcessTreeController};
 #[cfg(unix)]
-use rustix::process::{kill_process_group, Pid, Signal};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use rustix::process::Signal;
 
 use crate::terminal::TerminalProfile;
 
@@ -20,6 +18,10 @@ const STATUS_JOB_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
 const STATUS_JOB_TIMEOUT: Duration = Duration::from_millis(750);
 const STATUS_JOB_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(unix)]
+const STATUS_JOB_TERMINATION_GRACE: Duration = Duration::from_millis(100);
+#[cfg(not(unix))]
+const STATUS_JOB_TERMINATION_GRACE: Duration = Duration::ZERO;
 const STATUS_JOB_CACHE_LIMIT: usize = 256;
 const STATUS_JOB_OUTPUT_LIMIT: usize = 64 * 1024;
 const STATUS_JOB_ACTIVE_LIMIT: usize = 32;
@@ -254,25 +256,16 @@ fn ensure_status_job_cache_capacity(
 
 fn run_status_job(command: &str, profile: Option<&TerminalProfile>) -> String {
     let mut process = status_job_command(command, profile);
-    configure_status_job_process(&mut process);
-    let Ok(mut child) = process
+    process
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
+        .stderr(Stdio::null());
+    let Ok(mut child) = ProcessTreeChild::spawn(&mut process) else {
         return String::new();
     };
-    let process_group = match StatusJobProcessGroup::from_child(&child) {
-        Ok(process_group) => process_group,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return String::new();
-        }
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        terminate_status_job(&mut child, process_group);
+    let process_group = child.controller();
+    let Some(mut stdout) = child.child_mut().stdout.take() else {
+        terminate_status_job(child, &process_group);
         return String::new();
     };
     let (stdout_sender, stdout_receiver) = mpsc::channel();
@@ -298,94 +291,55 @@ fn run_status_job(command: &str, profile: Option<&TerminalProfile>) -> String {
     });
 
     let started = Instant::now();
+    let mut stdout = None;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let _ = child.wait();
-                let remaining = STATUS_JOB_TIMEOUT
-                    .checked_sub(started.elapsed())
-                    .unwrap_or_default();
-                return match stdout_receiver.recv_timeout(remaining) {
-                    Ok(stdout) => {
-                        let _ = stdout_reader.join();
-                        status_job_stdout(stdout)
-                    }
-                    Err(_) => {
-                        terminate_status_job(&mut child, process_group);
-                        String::new()
-                    }
-                };
+        if stdout.is_none() {
+            match stdout_receiver.try_recv() {
+                Ok(output) => stdout = Some(output),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => stdout = Some(Vec::new()),
             }
-            Ok(None) if started.elapsed() < STATUS_JOB_TIMEOUT => {
-                thread::sleep(STATUS_JOB_POLL_INTERVAL);
-            }
-            Ok(None) | Err(_) => {
-                terminate_status_job(&mut child, process_group);
+        }
+
+        let child_exited = match child.has_exited() {
+            Ok(exited) => exited,
+            Err(_) => {
+                terminate_status_job(child, &process_group);
+                let _ = stdout_reader.join();
                 return String::new();
             }
+        };
+        if child_exited {
+            if let Some(stdout) = stdout.take() {
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                return status_job_stdout(stdout);
+            }
         }
-    }
-}
 
-#[cfg(unix)]
-#[derive(Clone, Copy)]
-struct StatusJobProcessGroup(Pid);
-
-#[cfg(unix)]
-impl StatusJobProcessGroup {
-    fn from_child(child: &Child) -> std::io::Result<Self> {
-        Ok(Self(Pid::from_child(child)))
-    }
-
-    fn terminate(self) {
-        let _ = kill_process_group(self.0, Signal::TERM);
-    }
-}
-
-#[cfg(windows)]
-struct StatusJobProcessGroup {
-    job: Option<rmux_os::process::ProcessJob>,
-}
-
-#[cfg(windows)]
-impl StatusJobProcessGroup {
-    fn from_child(child: &Child) -> std::io::Result<Self> {
-        Ok(Self {
-            job: Some(rmux_os::process::ProcessJob::for_child(child)?),
-        })
-    }
-
-    fn terminate(self) {
-        if let Some(job) = self.job {
-            let _ = job.terminate(1);
+        if started.elapsed() >= STATUS_JOB_TIMEOUT {
+            terminate_status_job(child, &process_group);
+            let _ = stdout_reader.join();
+            return String::new();
         }
+
+        thread::sleep(STATUS_JOB_POLL_INTERVAL);
     }
-}
-
-#[cfg(not(any(unix, windows)))]
-#[derive(Clone, Copy)]
-struct StatusJobProcessGroup;
-
-#[cfg(not(any(unix, windows)))]
-impl StatusJobProcessGroup {
-    fn from_child(_: &Child) -> std::io::Result<Self> {
-        Ok(Self)
-    }
-
-    fn terminate(self) {}
 }
 
 #[cfg(unix)]
-fn configure_status_job_process(command: &mut Command) {
-    command.process_group(0);
+fn request_status_job_stop(child: &mut ProcessTreeChild) {
+    let _ = child.forward_signal(Signal::TERM.as_raw());
 }
 
 #[cfg(not(unix))]
-fn configure_status_job_process(_: &mut Command) {}
+fn request_status_job_stop(_: &mut ProcessTreeChild) {}
 
-fn terminate_status_job(child: &mut std::process::Child, process_group: StatusJobProcessGroup) {
-    process_group.terminate();
-    let _ = child.kill();
+fn terminate_status_job(mut child: ProcessTreeChild, process_group: &ProcessTreeController) {
+    request_status_job_stop(&mut child);
+    thread::sleep(STATUS_JOB_TERMINATION_GRACE);
+    let _ = process_group.terminate();
+    let _ = child.terminate();
     let _ = child.wait();
 }
 
@@ -478,10 +432,14 @@ mod tests {
         StatusJobCacheEntry, StatusJobKey, StatusJobSlot, STATUS_JOB_CACHE, STATUS_JOB_CACHE_LIMIT,
     };
     #[cfg(unix)]
-    use super::{test_profile, STATUS_JOB_OUTPUT_LIMIT};
+    use super::{run_status_job, test_profile, STATUS_JOB_OUTPUT_LIMIT};
     use std::collections::HashMap;
+    #[cfg(unix)]
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn status_jobs_replace_stdout_and_trim_trailing_newlines_from_cache() {
@@ -653,6 +611,84 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn status_job_timeout_force_kills_term_ignoring_descendants() {
+        let probe = StatusJobProcessProbe::new("term-resistant");
+        let started = Instant::now();
+
+        let output = run_status_job(&probe.command(), None);
+
+        assert_eq!(output, "");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "status job should escalate promptly after its TERM grace"
+        );
+        let descendants = probe.wait_for_descendant_count(1);
+        assert!(
+            descendants
+                .iter()
+                .all(|pid| !rmux_os::process::is_live(*pid)),
+            "TERM-resistant status descendants survived cleanup: {descendants:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_job_cache_releases_only_after_process_tree_cleanup() {
+        let probe = StatusJobProcessProbe::new("cache-cleanup");
+        let command = probe.command();
+        let template = format!("#({command})");
+        let key = StatusJobKey::new(&command, None);
+
+        let _ = render_template_with_status_jobs(
+            &template,
+            None,
+            Duration::ZERO,
+            str::to_owned,
+            str::to_owned,
+        );
+        let first_generation = probe.wait_for_descendant_count(1);
+        wait_for_status_job_in_flight(&key, false);
+        assert!(
+            first_generation
+                .iter()
+                .all(|pid| !rmux_os::process::is_live(*pid)),
+            "cache entry was released before first tree cleanup: {first_generation:?}"
+        );
+
+        let _ = render_template_with_status_jobs(
+            &template,
+            None,
+            Duration::ZERO,
+            str::to_owned,
+            str::to_owned,
+        );
+        let second_generation = probe.wait_for_descendant_count(2);
+        let live = second_generation
+            .iter()
+            .filter(|pid| rmux_os::process::is_live(**pid))
+            .count();
+        assert!(
+            live <= 1,
+            "status refresh accumulated {live} live TERM-resistant descendants: \
+             {second_generation:?}"
+        );
+
+        wait_for_status_job_in_flight(&key, false);
+        assert!(
+            second_generation
+                .iter()
+                .all(|pid| !rmux_os::process::is_live(*pid)),
+            "status tree remained live after in-flight cleanup: {second_generation:?}"
+        );
+        STATUS_JOB_CACHE
+            .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+            .lock()
+            .expect("status job cache mutex poisoned")
+            .remove(&key);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn status_job_uses_profile_environment() {
         let profile = test_profile(&[
             ("RMUX_STATUS_PROBE", "from-profile"),
@@ -677,6 +713,117 @@ mod tests {
             StatusJobKey::new("printf probe", Some(&first)),
             StatusJobKey::new("printf probe", Some(&second))
         );
+    }
+
+    #[cfg(unix)]
+    struct StatusJobProcessProbe {
+        root: PathBuf,
+        process_groups: PathBuf,
+        descendants: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl StatusJobProcessProbe {
+        fn new(label: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time after Unix epoch")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "rmux-status-job-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("create status job probe root");
+            Self {
+                process_groups: root.join("groups.pid"),
+                descendants: root.join("descendants.pid"),
+                root,
+            }
+        }
+
+        fn command(&self) -> String {
+            format!(
+                "printf '%s\\n' \"$$\" >> {}; \
+                 sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" >> \"$1\"; \
+                 while :; do sleep 30; done' sh {} & wait",
+                shell_quote_path(&self.process_groups),
+                shell_quote_path(&self.descendants),
+            )
+        }
+
+        fn wait_for_descendant_count(&self, expected: usize) -> Vec<u32> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let descendants = read_probe_pids(&self.descendants);
+                if descendants.len() >= expected {
+                    return descendants;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "status job did not record {expected} descendant pids; got {descendants:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StatusJobProcessProbe {
+        fn drop(&mut self) {
+            use rustix::process::{kill_process, kill_process_group, Pid, Signal};
+
+            for process_group in read_probe_pids(&self.process_groups) {
+                if let Some(process_group) =
+                    i32::try_from(process_group).ok().and_then(Pid::from_raw)
+                {
+                    let _ = kill_process_group(process_group, Signal::KILL);
+                }
+            }
+            for descendant in read_probe_pids(&self.descendants) {
+                if let Some(descendant) = i32::try_from(descendant).ok().and_then(Pid::from_raw) {
+                    let _ = kill_process(descendant, Signal::KILL);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_probe_pids(path: &Path) -> Vec<u32> {
+        let mut pids = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+
+    #[cfg(unix)]
+    fn shell_quote_path(path: &Path) -> String {
+        format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
+    }
+
+    #[cfg(unix)]
+    fn wait_for_status_job_in_flight(key: &StatusJobKey, expected: bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let in_flight = STATUS_JOB_CACHE
+                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                .lock()
+                .expect("status job cache mutex poisoned")
+                .get(key)
+                .is_some_and(|entry| entry.in_flight);
+            if in_flight == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "status job in-flight state did not become {expected}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn render_alpha(segment: &str) -> String {

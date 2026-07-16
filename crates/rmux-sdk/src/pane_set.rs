@@ -124,14 +124,22 @@ impl PaneSet {
 }
 
 async fn close_all_in_order(panes: Vec<Pane>) -> PaneSetBatch<PaneCloseOutcome> {
-    let mut successes = Vec::new();
-    let mut failures = Vec::new();
+    let mut prepared = Vec::with_capacity(panes.len());
     for pane in panes {
         let target = pane.target().clone();
-        let (pane, pane_id) = match pane.pin_to_current_identity().await {
-            Ok(identity) => identity,
-            Err(error) => {
-                failures.push(PaneSetFailure::new(target, None, error));
+        match pane.pin_to_current_identity().await {
+            Ok((pane, pane_id)) => prepared.push(Ok((target, pane, pane_id))),
+            Err(error) => prepared.push(Err(PaneSetFailure::new(target, None, error))),
+        }
+    }
+
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    for outcome in prepared {
+        let (target, pane, pane_id) = match outcome {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                failures.push(failure);
                 continue;
             }
         };

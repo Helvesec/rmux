@@ -67,6 +67,26 @@ fn source_file_request(paths: Vec<String>, cwd: Option<PathBuf>) -> Request {
     }))
 }
 
+fn source_file_stdout_failure(response: Response) -> String {
+    let Response::SourceFile(response) = response else {
+        panic!("expected source-file failure response, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert!(
+        response.stderr().is_empty(),
+        "source-file parse diagnostics must stay on stdout: {:?}",
+        response.stderr()
+    );
+    String::from_utf8(
+        response
+            .command_output()
+            .expect("source-file failure should include stdout diagnostics")
+            .stdout()
+            .to_vec(),
+    )
+    .expect("source-file stdout diagnostic is UTF-8")
+}
+
 fn temp_root(label: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)

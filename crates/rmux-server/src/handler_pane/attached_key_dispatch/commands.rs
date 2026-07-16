@@ -74,6 +74,7 @@ pub(super) async fn execute_attached_binding_commands(
 
     let context = QueueExecutionContext::without_caller_cwd()
         .with_implicit_current_target(Some(dispatch_target.clone()))
+        .with_run_shell_canfail_fallback_target()
         .with_client_name(Some(attached_client_name(attach_pid)))
         .with_mouse_target(mouse_target)
         .with_mouse_event(mouse_event);

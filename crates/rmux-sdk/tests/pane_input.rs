@@ -550,21 +550,25 @@ async fn wait_for_render_text(
     stream: &mut rmux_sdk::PaneRenderStream,
     marker: &str,
 ) -> TestResult<rmux_sdk::RenderUpdate> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Ok(Some(update))) => {
-                if update.snapshot().visible_text().contains(marker) {
-                    return Ok(update);
+    match tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match stream.next().await {
+                Ok(Some(update)) => {
+                    if update.snapshot().visible_text().contains(marker) {
+                        return Ok(update);
+                    }
                 }
+                Ok(None) => {
+                    return Err::<_, Box<dyn Error>>("render stream closed before marker".into());
+                }
+                Err(error) => return Err(error.into()),
             }
-            Ok(Ok(None)) => return Err("render stream closed before marker".into()),
-            Ok(Err(error)) => return Err(error.into()),
-            Err(_) => {}
         }
-        if Instant::now() >= deadline {
-            return Err(format!("render stream did not emit {marker:?} within deadline").into());
-        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!("render stream did not emit {marker:?} within deadline").into()),
     }
 }
 

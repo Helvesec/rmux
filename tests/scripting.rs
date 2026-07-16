@@ -400,6 +400,166 @@ fn control_mode_targeted_run_shell_follows_the_stable_pane_after_move() -> Resul
 }
 
 #[test]
+fn queued_run_shell_percent_target_formats_are_canonicalized() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("queued-run-shell-percent-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep 30"])?);
+
+    let pane = harness.run(&["display-message", "-p", "-t", "alpha:0.0", "#{pane_id}"])?;
+    assert_eq!(pane.status.code(), Some(0));
+    assert!(stderr(&pane).is_empty());
+    let pane = stdout(&pane).trim().to_owned();
+    assert!(
+        pane.starts_with('%'),
+        "expected tmux-style pane id, got {pane:?}"
+    );
+
+    let output_path = harness.tmpdir().join("queued-run-shell-targets.txt");
+    let source_config = harness.tmpdir().join("queued-run-shell-targets.conf");
+    let source_command = format_marker_command("source", &output_path);
+    fs::write(
+        &source_config,
+        format!("run-shell -t {pane} {}\n", shell_quote_str(&source_command)),
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        source_config.to_str().expect("utf-8 config path"),
+    ])?);
+    wait_for_file_text(&output_path, "source:alpha:0.0\n")?;
+
+    let control_command = format_marker_command("control", &output_path);
+    let mut control = harness
+        .base_command()
+        .arg("-C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    writeln!(
+        control.stdin.as_mut().expect("control stdin"),
+        "run-shell -t {pane} {}",
+        shell_quote_str(&control_command)
+    )?;
+    drop(control.stdin.take());
+    let control_output = control.wait_with_output()?;
+    assert_eq!(control_output.status.code(), Some(0));
+    assert!(stderr(&control_output).is_empty());
+    wait_for_file_text(&output_path, "source:alpha:0.0\ncontrol:alpha:0.0\n")?;
+
+    let mut attach =
+        AttachedSession::spawn(&harness, "alpha", TerminalSize { cols: 80, rows: 12 })?;
+    attach.wait_for_raw_mode(Duration::from_secs(5))?;
+    let _ = read_until_contains(attach.master_mut(), "[alpha]", Duration::from_secs(5))?;
+    let binding_command = format_marker_command("binding", &output_path);
+    assert_success(&harness.run(&[
+        "bind-key",
+        "-T",
+        "prefix",
+        "X",
+        "run-shell",
+        "-t",
+        &pane,
+        &binding_command,
+    ])?);
+    attach.send_bytes(b"\x02X")?;
+    wait_for_file_text(
+        &output_path,
+        "source:alpha:0.0\ncontrol:alpha:0.0\nbinding:alpha:0.0\n",
+    )?;
+
+    let hook_command = format_marker_command("hook", &output_path);
+    let hook_queue = format!("run-shell -t {pane} {}", shell_quote_str(&hook_command));
+    assert_success(&harness.run(&["set-hook", "-g", "after-new-window", &hook_queue])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha"])?);
+    wait_for_file_text(
+        &output_path,
+        "source:alpha:0.0\ncontrol:alpha:0.0\nbinding:alpha:0.0\nhook:alpha:0.0\n",
+    )?;
+
+    attach.send_bytes(b"\x02d")?;
+    assert!(attach.wait_for_exit(Duration::from_secs(5))?.success());
+    Ok(())
+}
+
+#[test]
+fn queued_run_shell_missing_canfail_target_preserves_entry_contexts() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("queued-run-shell-missing-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep 30"])?);
+
+    let output_path = harness.tmpdir().join("queued-run-shell-missing.txt");
+    let source_config = harness.tmpdir().join("queued-run-shell-missing.conf");
+    let source_command = format_marker_command("source", &output_path);
+    fs::write(
+        &source_config,
+        format!("run-shell -t %9999 {}\n", shell_quote_str(&source_command)),
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        source_config.to_str().expect("utf-8 config path"),
+    ])?);
+    wait_for_file_text(&output_path, "source::.\n")?;
+
+    let control_command = format_marker_command("control", &output_path);
+    let mut control = harness
+        .base_command()
+        .arg("-C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut control_stdin = control.stdin.take().expect("control stdin");
+    writeln!(control_stdin, "attach-session -t alpha")?;
+    writeln!(
+        control_stdin,
+        "run-shell -t %9999 {}",
+        shell_quote_str(&control_command)
+    )?;
+    control_stdin.flush()?;
+    wait_for_file_text(&output_path, "source::.\ncontrol:alpha:0.0\n")?;
+    writeln!(control_stdin, "detach-client")?;
+    drop(control_stdin);
+    let control_output = control.wait_with_output()?;
+    assert_eq!(control_output.status.code(), Some(0));
+    assert!(stderr(&control_output).is_empty());
+
+    let mut attach =
+        AttachedSession::spawn(&harness, "alpha", TerminalSize { cols: 80, rows: 12 })?;
+    attach.wait_for_raw_mode(Duration::from_secs(5))?;
+    let _ = read_until_contains(attach.master_mut(), "[alpha]", Duration::from_secs(5))?;
+    let binding_command = format_marker_command("binding", &output_path);
+    assert_success(&harness.run(&[
+        "bind-key",
+        "-T",
+        "prefix",
+        "X",
+        "run-shell",
+        "-t",
+        "%9999",
+        &binding_command,
+    ])?);
+    attach.send_bytes(b"\x02X")?;
+    wait_for_file_text(
+        &output_path,
+        "source::.\ncontrol:alpha:0.0\nbinding:alpha:0.0\n",
+    )?;
+
+    let hook_command = format_marker_command("hook", &output_path);
+    let hook_queue = format!("run-shell -t %9999 {}", shell_quote_str(&hook_command));
+    assert_success(&harness.run(&["set-hook", "-g", "after-new-window", &hook_queue])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha"])?);
+    wait_for_file_text(
+        &output_path,
+        "source::.\ncontrol:alpha:0.0\nbinding:alpha:0.0\nhook::.\n",
+    )?;
+
+    attach.send_bytes(b"\x02d")?;
+    assert!(attach.wait_for_exit(Duration::from_secs(5))?.success());
+    Ok(())
+}
+
+#[test]
 fn run_shell_exports_tmux_env_matching_mux_socket() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-tmux-env")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -3679,6 +3839,14 @@ fn make_executable(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
 
 fn shell_quote(path: &std::path::Path) -> String {
     shell_quote_str(&path.display().to_string())
+}
+
+fn format_marker_command(label: &str, path: &std::path::Path) -> String {
+    format!(
+        "printf '%s\\n' '{}:#{{session_name}}:#{{window_index}}.#{{pane_index}}' >> {}",
+        label,
+        shell_quote(path)
+    )
 }
 
 fn shell_quote_str(value: &str) -> String {

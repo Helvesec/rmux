@@ -36,6 +36,7 @@ use legacy_shutdown::{
 };
 
 const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+const LIFECYCLE_HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const DETACHED_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Accept loop: spawns a per-connection task for each incoming client.
@@ -87,7 +88,7 @@ pub(crate) async fn serve(
     let (hook_shutdown, hook_shutdown_rx) = oneshot::channel();
     let mut connection_tasks = JoinSet::new();
     let hook_handler = Arc::clone(&handler);
-    let hook_task = tokio::spawn(async move {
+    let mut hook_task = tokio::spawn(async move {
         hook_handler
             .consume_lifecycle_hooks(lifecycle_events, hook_shutdown_rx)
             .await;
@@ -165,8 +166,22 @@ pub(crate) async fn serve(
     drain_connection_tasks_for_shutdown(&mut connection_tasks).await;
     handler.shutdown_wait_for();
     let _ = hook_shutdown.send(());
-    if let Err(error) = hook_task.await {
-        warn!("lifecycle hook task failed: {error}");
+    // Keep shell registration open while already accepted lifecycle hooks drain. The
+    // shared deadline also bounds older background jobs before the final tree cleanup.
+    let hook_result = tokio::time::timeout(LIFECYCLE_HOOK_SHUTDOWN_GRACE, &mut hook_task).await;
+    handler.shutdown_shell_processes();
+    match hook_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("lifecycle hook task failed: {error}"),
+        Err(_) => {
+            warn!("aborting lifecycle hooks that did not drain during daemon shutdown");
+            hook_task.abort();
+            match hook_task.await {
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => warn!("lifecycle hook task failed after abort: {error}"),
+                Ok(()) => {}
+            }
+        }
     }
 
     Ok(())

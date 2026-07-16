@@ -1,7 +1,7 @@
 use crate::{PaneId, Result, RmuxError, SessionId, WindowId};
 
 use super::super::target::parse_error;
-use super::{ListedPane, ListedSession, LiveDetails};
+use super::{ListedPane, ListedSession, LiveDetails, PaneInfoLocation, PaneInfoParentIdentity};
 
 pub(crate) fn parse_details_line(line: &str) -> Result<LiveDetails> {
     if line.is_empty() {
@@ -76,6 +76,38 @@ pub(super) fn parse_pane_list_line(line: &str) -> Result<ListedPane> {
         window_index,
         pane_index: parse_u32(pane_index, "pane index")?,
         pane_id: parse_pane_id(pane_id)?,
+    })
+}
+
+pub(super) fn parse_pane_info_location_line(line: &str) -> Result<PaneInfoLocation> {
+    let mut fields = line.split('\t');
+    let window_index = fields
+        .next()
+        .ok_or_else(|| parse_error("pane info location omitted window index"))?;
+    let pane_index = fields
+        .next()
+        .ok_or_else(|| parse_error("pane info location omitted pane index"))?;
+    let pane_id = fields
+        .next()
+        .ok_or_else(|| parse_error("pane info location omitted pane id"))?;
+    let session_id = fields
+        .next()
+        .ok_or_else(|| parse_error("pane info location omitted session id"))?;
+    let window_id = fields
+        .next()
+        .ok_or_else(|| parse_error("pane info location omitted window id"))?;
+    if fields.next().is_some() {
+        return Err(parse_error("pane info location had trailing fields"));
+    }
+
+    Ok(PaneInfoLocation {
+        window_index: parse_u32(window_index, "pane info location window index")?,
+        pane_index: parse_u32(pane_index, "pane info location pane index")?,
+        pane_id: parse_pane_id(pane_id)?,
+        parent: PaneInfoParentIdentity {
+            session_id: parse_session_id(session_id)?,
+            window_id: parse_window_id(window_id)?,
+        },
     })
 }
 

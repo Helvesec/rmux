@@ -60,6 +60,10 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             None,
             Some(spec('t', Type::Session, Flags::CANFAIL)),
         )),
+        "set-window-option" => Some(metadata(
+            None,
+            Some(spec('t', Type::Window, Flags::CANFAIL)),
+        )),
         _ => None,
     }
 }

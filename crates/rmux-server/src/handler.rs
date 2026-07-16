@@ -66,6 +66,8 @@ mod server_access_support;
 mod session_lease_support;
 #[path = "handler_session.rs"]
 mod session_support;
+#[path = "handler_shell_processes.rs"]
+mod shell_processes;
 #[path = "handler_shutdown.rs"]
 mod shutdown_support;
 #[path = "handler/web_request_identity.rs"]
@@ -233,6 +235,7 @@ pub(crate) struct RequestHandler {
     active_detached_connections: Arc<StdMutex<HashSet<u64>>>,
     active_detached_requester_access: Arc<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Arc<AtomicUsize>,
+    shell_processes: Arc<shell_processes::ShellProcessRegistry>,
     shutdown_handle: Arc<StdMutex<Option<ShutdownHandle>>>,
     config_loading_depth: Arc<AtomicUsize>,
     next_connection_id: Arc<AtomicU64>,
@@ -316,6 +319,7 @@ impl Clone for RequestHandler {
             active_detached_connections: self.active_detached_connections.clone(),
             active_detached_requester_access: self.active_detached_requester_access.clone(),
             active_detached_requests: self.active_detached_requests.clone(),
+            shell_processes: self.shell_processes.clone(),
             shutdown_handle: self.shutdown_handle.clone(),
             config_loading_depth: self.config_loading_depth.clone(),
             next_connection_id: self.next_connection_id.clone(),
@@ -388,6 +392,7 @@ pub(crate) struct WeakRequestHandler {
     active_detached_connections: Weak<StdMutex<HashSet<u64>>>,
     active_detached_requester_access: Weak<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Weak<AtomicUsize>,
+    shell_processes: Weak<shell_processes::ShellProcessRegistry>,
     shutdown_handle: Weak<StdMutex<Option<ShutdownHandle>>>,
     config_loading_depth: Weak<AtomicUsize>,
     next_connection_id: Weak<AtomicU64>,
@@ -436,6 +441,7 @@ impl WeakRequestHandler {
             active_detached_connections: self.active_detached_connections.upgrade()?,
             active_detached_requester_access: self.active_detached_requester_access.upgrade()?,
             active_detached_requests: self.active_detached_requests.upgrade()?,
+            shell_processes: self.shell_processes.upgrade()?,
             shutdown_handle: self.shutdown_handle.upgrade()?,
             config_loading_depth: self.config_loading_depth.upgrade()?,
             next_connection_id: self.next_connection_id.upgrade()?,
@@ -592,6 +598,7 @@ impl Drop for RequestHandler {
         if !self.cleanup_on_drop {
             return;
         }
+        self.shell_processes.close_and_terminate();
         if let Ok(mut state) = self.state.try_lock() {
             state.shutdown_terminals_for_test();
         }
@@ -704,6 +711,7 @@ impl RequestHandler {
             active_detached_connections: Arc::new(StdMutex::new(HashSet::new())),
             active_detached_requester_access: Arc::new(StdMutex::new(HashMap::new())),
             active_detached_requests: Arc::new(AtomicUsize::new(0)),
+            shell_processes: Arc::new(shell_processes::ShellProcessRegistry::new()),
             shutdown_handle: Arc::new(StdMutex::new(None)),
             config_loading_depth: Arc::new(AtomicUsize::new(0)),
             next_connection_id: Arc::new(AtomicU64::new(1)),
@@ -786,6 +794,7 @@ impl RequestHandler {
                 &self.active_detached_requester_access,
             ),
             active_detached_requests: Arc::downgrade(&self.active_detached_requests),
+            shell_processes: Arc::downgrade(&self.shell_processes),
             shutdown_handle: Arc::downgrade(&self.shutdown_handle),
             config_loading_depth: Arc::downgrade(&self.config_loading_depth),
             next_connection_id: Arc::downgrade(&self.next_connection_id),
@@ -860,6 +869,10 @@ impl RequestHandler {
             .shutdown_handle
             .lock()
             .expect("shutdown handle mutex must not be poisoned") = Some(shutdown_handle);
+    }
+
+    pub(crate) fn shutdown_shell_processes(&self) {
+        self.shell_processes.close_and_terminate();
     }
 
     pub(crate) fn access_mode_for_peer(&self, peer: &PeerIdentity) -> Option<AccessMode> {

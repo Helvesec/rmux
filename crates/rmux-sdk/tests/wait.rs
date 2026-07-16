@@ -816,7 +816,10 @@ async fn expect_list_panes(peer: &mut Peer) -> TestResult {
         panic!("snapshot wait must list panes before capture, got {request:?}");
     };
     assert_eq!(request.target, session_name());
-    assert_eq!(request.target_window_index, Some(0));
+    assert!(
+        matches!(request.target_window_index, Some(0) | None),
+        "snapshot identity lookup must stay in the target session"
+    );
 
     peer.write_response(Response::ListPanes(ListPanesResponse {
         output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
@@ -828,6 +831,15 @@ async fn expect_snapshot(peer: &mut Peer, text: &str, revision: u64) -> TestResu
     // Slot snapshots probe capabilities once per transport and then route
     // through the pane id resolved by the preceding list (issue #94).
     let mut request = peer.expect_request().await?;
+    if let Request::ListPanes(list) = &request {
+        assert_eq!(list.target, session_name());
+        assert_eq!(list.target_window_index, None);
+        peer.write_response(Response::ListPanes(ListPanesResponse {
+            output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
+        }))
+        .await?;
+        request = peer.expect_request().await?;
+    }
     if matches!(request, Request::Handshake(_)) {
         peer.write_response(Response::Handshake(rmux_proto::HandshakeResponse::current()))
             .await?;
@@ -849,6 +861,15 @@ async fn hold_first_snapshot_response(listener: UnixListener) -> TestResult {
     let mut peer = accept_peer(&listener).await?;
     expect_list_panes(&mut peer).await?;
     let mut request = peer.expect_request().await?;
+    if let Request::ListPanes(list) = &request {
+        assert_eq!(list.target, session_name());
+        assert_eq!(list.target_window_index, None);
+        peer.write_response(Response::ListPanes(ListPanesResponse {
+            output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
+        }))
+        .await?;
+        request = peer.expect_request().await?;
+    }
     if matches!(request, Request::Handshake(_)) {
         peer.write_response(Response::Handshake(HandshakeResponse::current()))
             .await?;

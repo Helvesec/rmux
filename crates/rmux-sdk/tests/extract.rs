@@ -145,7 +145,8 @@ async fn wait_exit_returns_retained_exit_state() -> TestResult {
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
         let mut peer = accept_peer(&listener).await?;
-        expect_info_probe(&mut peer, exited_details_line(7)).await?;
+        expect_list_panes(&mut peer).await?;
+        expect_stable_info_probe(&mut peer, exited_details_line(7)).await?;
         TestResult::Ok(())
     });
 
@@ -557,6 +558,17 @@ async fn expect_list_panes(peer: &mut Peer) -> TestResult {
 }
 
 async fn expect_info_probe(peer: &mut Peer, details_line: String) -> TestResult {
+    expect_info_location(peer, Some(0), "0\t0\t%1\t$1\t@1\n").await?;
+    expect_info_location(peer, None, "0\t0\t%1\t$1\t@1\n").await?;
+    expect_info_body(peer, details_line).await
+}
+
+async fn expect_stable_info_probe(peer: &mut Peer, details_line: String) -> TestResult {
+    expect_info_location(peer, None, "0\t0\t%1\t$1\t@1\n").await?;
+    expect_info_body(peer, details_line).await
+}
+
+async fn expect_info_body(peer: &mut Peer, details_line: String) -> TestResult {
     expect_list_sessions(peer).await?;
     expect_list_windows(peer).await?;
     expect_list_panes(peer).await?;
@@ -580,10 +592,24 @@ async fn expect_info_probe(peer: &mut Peer, details_line: String) -> TestResult 
     peer.write_response(Response::ListPanes(ListPanesResponse {
         output: CommandOutput::from_stdout(details_line),
     }))
-    .await
+    .await?;
+    expect_list_sessions(peer).await?;
+    expect_list_windows(peer).await?;
+    expect_list_panes(peer).await
 }
 
 async fn expect_empty_session_probe(peer: &mut Peer) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::ListPanes(request) = request else {
+        panic!("stale exit probe must preflight the pane slot, got {request:?}");
+    };
+    assert_eq!(request.target, session_name());
+    assert_eq!(request.target_window_index, Some(0));
+    peer.write_response(Response::ListPanes(ListPanesResponse {
+        output: CommandOutput::from_stdout(Vec::new()),
+    }))
+    .await?;
+
     let request = peer.expect_request().await?;
     let Request::ListSessions(request) = request else {
         panic!("stale exit probe must list sessions, got {request:?}");
@@ -633,6 +659,27 @@ async fn expect_list_windows(peer: &mut Peer) -> TestResult {
             rendered: String::new(),
         }],
         output: CommandOutput::from_stdout(Vec::new()),
+    }))
+    .await
+}
+
+async fn expect_info_location(
+    peer: &mut Peer,
+    target_window_index: Option<u32>,
+    output: &str,
+) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::ListPanes(request) = request else {
+        panic!("pane info identity lookup must list panes, got {request:?}");
+    };
+    assert_eq!(request.target, session_name());
+    assert_eq!(request.target_window_index, target_window_index);
+    assert_eq!(
+        request.format.as_deref(),
+        Some("#{window_index}\t#{pane_index}\t#{pane_id}\t#{session_id}\t#{window_id}")
+    );
+    peer.write_response(Response::ListPanes(ListPanesResponse {
+        output: CommandOutput::from_stdout(output.as_bytes().to_vec()),
     }))
     .await
 }

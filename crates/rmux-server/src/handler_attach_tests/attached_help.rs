@@ -103,7 +103,7 @@ async fn attached_help_scrolls_a_short_terminal_from_first_to_last_line() {
     let handler = RequestHandler::new();
     let attach_pid = std::process::id();
     let alpha = session_name("help-scroll");
-    let mut control_rx = create_attached_session(&handler, attach_pid, &alpha).await;
+    let mut control_rx = create_quiet_attached_session(&handler, attach_pid, &alpha).await;
     handler
         .handle_attached_resize(attach_pid, TerminalSize { cols: 160, rows: 8 })
         .await

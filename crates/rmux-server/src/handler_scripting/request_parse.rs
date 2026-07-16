@@ -52,7 +52,7 @@ use super::session_parse::{
     parse_attach_session, parse_kill_session, parse_new_session, parse_rename_session,
     parse_session_request,
 };
-use super::shell_parse::{parse_if_shell, parse_run_shell, parse_wait_for};
+use super::shell_parse::{parse_if_shell, parse_queued_run_shell, parse_run_shell, parse_wait_for};
 use super::targets::resolve_queue_target_arguments;
 use super::tokens::{normalize_compact_short_options, CommandTokens};
 use super::window_parse::{
@@ -69,6 +69,7 @@ pub(super) fn parse_queue_invocation(
     options: &OptionStore,
     find_context: &TargetFindContext,
     queue_current_target: Option<&Target>,
+    run_shell_canfail_fallback_target: Option<&Target>,
 ) -> Result<QueueInvocation, RmuxError> {
     if command.name() == "new-window" {
         return parse_queued_new_window(command, sessions, find_context)
@@ -81,6 +82,20 @@ pub(super) fn parse_queue_invocation(
     if command.name() == "source-file" {
         return parse_queued_source_file(command, caller_cwd, sessions, find_context)
             .map(QueueInvocation::SourceFile);
+    }
+    if command.name() == "run-shell" {
+        let arguments = normalize_compact_short_options(
+            command.name(),
+            command_arguments_as_strings(command.name(), command.arguments())?,
+        );
+        let arguments = tmux_precedence::normalize_tmux_precedence(command.name(), arguments);
+        return parse_queued_run_shell(
+            CommandTokens::new(arguments),
+            sessions,
+            find_context,
+            run_shell_canfail_fallback_target,
+        )
+        .map(QueueInvocation::RunShell);
     }
     if command.name() == "list-commands" {
         return parse_queued_list_commands(command).map(QueueInvocation::ListCommands);
@@ -380,6 +395,7 @@ mod tests {
                 session_name.clone(),
                 0,
             )))),
+            None,
             None,
         )
     }

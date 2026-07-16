@@ -1,6 +1,6 @@
 //! Screen state and `ScreenWriter` implementation backed by [`Grid`].
 
-use crate::grid::{Grid, GridCell, GridCellFlags, GridLine};
+use crate::grid::{Grid, GridCell, GridCellFlags, GridLine, GridPhysicalCursor};
 use crate::hyperlinks::Hyperlinks;
 use crate::input::{mode, CellState, SavedState, ScreenWriter, COLOUR_DEFAULT};
 use crate::terminal_passthrough::{TerminalPassthrough, MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES};
@@ -347,7 +347,22 @@ impl Screen {
         let cols = u32::from(size.cols.max(1));
         let rows = u32::from(size.rows.max(1));
         if cols != self.grid.sx() {
-            self.grid.resize_width(cols, COLOUR_DEFAULT);
+            let remapped = if self.is_alternate() {
+                self.grid.resize_visible_width_preserving_cursor(
+                    cols,
+                    COLOUR_DEFAULT,
+                    self.cursor_y,
+                    self.cursor_x,
+                    self.pending_wrap,
+                )
+            } else {
+                let cursor =
+                    self.grid
+                        .logical_cursor(self.cursor_y, self.cursor_x, self.pending_wrap);
+                self.grid
+                    .resize_width_remapping_cursor(cols, COLOUR_DEFAULT, cursor)
+            };
+            self.apply_grid_cursor(remapped);
             self.reset_tabs();
         }
         if rows != self.grid.sy() {
@@ -357,7 +372,9 @@ impl Screen {
         self.rupper = 0;
         self.rlower = rows.saturating_sub(1);
         self.cursor_x = self.cursor_x.min(self.max_cursor_x());
-        self.pending_wrap &= self.cursor_x == self.max_cursor_x();
+        self.pending_wrap = self.pending_wrap
+            && (self.mode & mode::MODE_WRAP) != 0
+            && self.cursor_x == self.max_cursor_x();
     }
 
     /// Clears history and optionally resets stored hyperlinks.
@@ -384,6 +401,20 @@ impl Screen {
         self.cursor_x.min(self.max_cursor_x())
     }
 
+    fn logical_insert_column(&self) -> u32 {
+        let x = self.cursor_column();
+        let Some(line) = self.grid.visible_line(self.cursor_y) else {
+            return x;
+        };
+        let Some(owner_x) = line.owning_cell_x(x).filter(|owner_x| *owner_x != x) else {
+            return x;
+        };
+        let width = line
+            .cell(owner_x)
+            .map_or(1, |cell| u32::from(cell.width()).max(1));
+        owner_x.saturating_add(width)
+    }
+
     fn current_line_mut(&mut self) -> Option<&mut GridLine> {
         self.grid.visible_line_mut(self.cursor_y)
     }
@@ -396,6 +427,18 @@ impl Screen {
         self.cursor_x = x.min(self.max_cursor_x());
         self.cursor_y = y.min(self.grid.sy().saturating_sub(1));
         self.pending_wrap = pending_wrap
+            && (self.mode & mode::MODE_WRAP) != 0
+            && self.cursor_x == self.max_cursor_x();
+    }
+
+    fn apply_grid_cursor(&mut self, cursor: GridPhysicalCursor) {
+        let history_size = self.grid.hsize();
+        self.cursor_x = cursor.x.min(self.max_cursor_x());
+        self.cursor_y = cursor
+            .absolute_y
+            .saturating_sub(history_size)
+            .min(self.grid.sy().saturating_sub(1) as usize) as u32;
+        self.pending_wrap = cursor.pending_wrap
             && (self.mode & mode::MODE_WRAP) != 0
             && self.cursor_x == self.max_cursor_x();
     }
@@ -553,24 +596,46 @@ impl Screen {
         // than creating an out-of-bounds wide owner.
         let width = requested_width.clamp(1, self.grid.sx());
 
-        let automatic_wrap_continuation = self.pending_wrap && (self.mode & mode::MODE_WRAP) != 0;
+        let wrap_enabled = (self.mode & mode::MODE_WRAP) != 0;
+        let automatic_wrap_continuation = self.pending_wrap && wrap_enabled;
         self.apply_pending_wrap();
 
-        if (self.mode & mode::MODE_WRAP) != 0
-            && self.cursor_x > self.grid.sx().saturating_sub(width)
-        {
+        let mut insert_padding_wrap = false;
+        if (self.mode & mode::MODE_INSERT) != 0 {
+            let insert_x = self.logical_insert_column();
+            if insert_x >= self.grid.sx() {
+                if !wrap_enabled {
+                    return;
+                }
+                if let Some(line) = self.current_line_mut() {
+                    line.set_wrapped(true);
+                }
+                self.linefeed(false, COLOUR_DEFAULT);
+                self.cursor_x = 0;
+                insert_padding_wrap = true;
+            } else {
+                self.cursor_x = insert_x;
+            }
+        }
+
+        let write_would_cross_right_edge =
+            width > self.grid.sx() || self.cursor_x > self.grid.sx().saturating_sub(width);
+        if !wrap_enabled && width > 1 && write_would_cross_right_edge {
+            return;
+        }
+
+        // tmux shifts the current row before an auto-wrapped wide glyph moves
+        // to the next row; the no-wrap rejection above must leave it untouched.
+        if (self.mode & mode::MODE_INSERT) != 0 {
+            <Self as ScreenWriter>::insert_character(self, width, cell.bg());
+        }
+
+        if wrap_enabled && write_would_cross_right_edge {
             if let Some(line) = self.current_line_mut() {
                 line.set_wrapped(true);
             }
             self.linefeed(false, COLOUR_DEFAULT);
             self.cursor_x = 0;
-        }
-
-        if (self.mode & mode::MODE_WRAP) == 0
-            && width > 1
-            && (width > self.grid.sx() || self.cursor_x > self.grid.sx().saturating_sub(width))
-        {
-            return;
         }
 
         if self.cursor_y >= self.grid.sy()
@@ -580,7 +645,7 @@ impl Screen {
         }
 
         let x = self.cursor_column();
-        if x == 0 && !automatic_wrap_continuation {
+        if x == 0 && !automatic_wrap_continuation && !insert_padding_wrap {
             self.break_previous_wrapped_line();
         }
         self.overwrite_for_write(x, width);
@@ -601,7 +666,7 @@ impl Screen {
             line.touch();
         }
 
-        if (self.mode & mode::MODE_WRAP) != 0 && x + width >= self.grid.sx() {
+        if wrap_enabled && x + width >= self.grid.sx() {
             self.cursor_x = self.max_cursor_x();
             self.pending_wrap = true;
         } else {
@@ -615,6 +680,7 @@ impl Screen {
             return true;
         }
         if acs
+            || (self.mode & mode::MODE_INSERT) != 0
             || cell.attr() != 0
             || cell.fg() != COLOUR_DEFAULT
             || cell.bg() != COLOUR_DEFAULT

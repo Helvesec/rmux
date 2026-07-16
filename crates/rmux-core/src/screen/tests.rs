@@ -13,6 +13,13 @@ fn new_screen(cols: u16, rows: u16, history: usize) -> Screen {
     Screen::new(TerminalSize { cols, rows }, history)
 }
 
+fn reflow_overflow_screen(history_limit: usize) -> Screen {
+    let mut screen = new_screen(20, 1, history_limit);
+    parse(&mut screen, b"abcdefghijklmnopqrst");
+    screen.resize(TerminalSize { cols: 2, rows: 1 });
+    screen
+}
+
 #[test]
 fn visit_visible_line_cells_returns_exact_padded_row() {
     let mut screen = new_screen(4, 1, 10);
@@ -548,6 +555,773 @@ fn writing_at_line_start_breaks_previous_wrapped_line_before_reflow() {
 }
 
 #[test]
+fn width_resize_widen_remaps_cursor_after_soft_wrap() {
+    let mut screen = new_screen(5, 4, 10);
+    parse(&mut screen, b"abcdef");
+
+    screen.resize(TerminalSize { cols: 10, rows: 4 });
+    parse(&mut screen, b"X");
+
+    assert_eq!(screen.cursor_position(), (7, 0));
+    assert!(!screen.pending_wrap);
+    assert_eq!(screen.capture_grid(true).lines[0], "abcdefX");
+}
+
+#[test]
+fn width_resize_widen_remaps_and_clears_pending_wrap_at_logical_end() {
+    let mut screen = new_screen(5, 4, 10);
+    parse(&mut screen, b"abcde");
+    assert!(screen.pending_wrap);
+
+    screen.resize(TerminalSize { cols: 10, rows: 4 });
+    assert_eq!(screen.cursor_position(), (5, 0));
+    assert!(!screen.pending_wrap);
+
+    parse(&mut screen, b"X");
+
+    assert_eq!(screen.cursor_position(), (6, 0));
+    assert_eq!(screen.capture_grid(true).lines[0], "abcdeX");
+}
+
+#[test]
+fn width_resize_widen_remaps_middle_cursor_by_logical_column() {
+    let mut screen = new_screen(5, 4, 10);
+    parse(&mut screen, b"abcdef\x1b[1;4H");
+
+    screen.resize(TerminalSize { cols: 10, rows: 4 });
+    parse(&mut screen, b"X");
+
+    assert_eq!(screen.cursor_position(), (4, 0));
+    assert_eq!(screen.capture_grid(true).lines[0], "abcXef");
+}
+
+#[test]
+fn width_resize_narrow_remaps_cursor_into_reflowed_scrollback() {
+    let mut screen = new_screen(10, 4, 10);
+    parse(&mut screen, b"abcdef");
+
+    screen.resize(TerminalSize { cols: 5, rows: 4 });
+
+    assert_eq!(screen.history_size(), 1);
+    assert_eq!(screen.cursor_position(), (1, 0));
+    assert!(!screen.pending_wrap);
+
+    parse(&mut screen, b"X");
+
+    assert_eq!(screen.cursor_position(), (2, 0));
+    assert_eq!(screen.capture_grid(true).lines[0], "abcdefX");
+}
+
+#[test]
+fn width_resize_narrow_remaps_pending_wrap_to_new_edge() {
+    let mut screen = new_screen(10, 5, 10);
+    parse(&mut screen, b"abcdefghij");
+    assert!(screen.pending_wrap);
+
+    screen.resize(TerminalSize { cols: 5, rows: 5 });
+
+    assert_eq!(screen.history_size(), 1);
+    assert_eq!(screen.cursor_position(), (4, 0));
+    assert!(screen.pending_wrap);
+
+    parse(&mut screen, b"X");
+
+    assert_eq!(screen.cursor_position(), (1, 1));
+    assert_eq!(screen.capture_grid(true).lines[0], "abcdefghijX");
+}
+
+#[test]
+fn width_resize_keeps_hard_line_break_separate_from_soft_wraps() {
+    let mut screen = new_screen(5, 4, 10);
+    parse(&mut screen, b"abcde\r\nfg");
+
+    screen.resize(TerminalSize { cols: 10, rows: 4 });
+    parse(&mut screen, b"X");
+
+    let lines = screen.capture_grid(true).lines;
+    assert_eq!(&lines[..2], &["abcde", "fgX"]);
+    assert_eq!(screen.cursor_position(), (3, 1));
+}
+
+#[test]
+fn width_resize_remaps_cursor_with_wide_cells() {
+    let mut screen = new_screen(5, 4, 10);
+    parse(&mut screen, "ab表c".as_bytes());
+    assert!(screen.pending_wrap);
+
+    screen.resize(TerminalSize { cols: 10, rows: 4 });
+    parse(&mut screen, b"X");
+
+    assert_no_wide_cell_fragments(&screen);
+    assert_eq!(screen.cursor_position(), (6, 0));
+    assert_eq!(screen.capture_grid(true).lines[0], "ab表cX");
+}
+
+#[test]
+fn width_resize_maps_cursor_by_consumed_columns_across_wide_wrap_gaps() {
+    let mut end_cursor = new_screen(10, 4, 10);
+    parse(&mut end_cursor, "abc表d".as_bytes());
+
+    end_cursor.resize(TerminalSize { cols: 4, rows: 4 });
+    parse(&mut end_cursor, b"X");
+
+    assert_no_wide_cell_fragments(&end_cursor);
+    assert_eq!(end_cursor.cursor_position(), (3, 0));
+    assert_eq!(end_cursor.capture_grid(true).lines[0], "abc表dX");
+
+    let mut overwrite_cursor = new_screen(10, 4, 10);
+    parse(&mut overwrite_cursor, "abc表d\x1b[1;6H".as_bytes());
+
+    overwrite_cursor.resize(TerminalSize { cols: 4, rows: 4 });
+    parse(&mut overwrite_cursor, b"X");
+
+    assert_no_wide_cell_fragments(&overwrite_cursor);
+    assert_eq!(overwrite_cursor.cursor_position(), (3, 0));
+    assert_eq!(overwrite_cursor.capture_grid(true).lines[0], "abc表X");
+}
+
+#[test]
+fn width_resize_cycle_does_not_import_wide_placement_gap_as_text() {
+    let mut screen = new_screen(20, 3, 100);
+    parse(&mut screen, "abc表defghijklmnop".as_bytes());
+
+    screen.resize(TerminalSize { cols: 2, rows: 3 });
+    let total_lines = screen.history_size() + usize::from(screen.size().rows);
+    assert!(
+        (0..total_lines)
+            .filter_map(|absolute_y| screen.grid().absolute_line(absolute_y))
+            .flat_map(|line| line.cells())
+            .any(|cell| cell.is_reflow_gap()),
+        "placement metadata must survive compacted history rows"
+    );
+    screen.resize(TerminalSize { cols: 7, rows: 3 });
+
+    // tmux 3.7b restores this exact logical text after the 20 -> 2 -> 7 cycle;
+    // the unused physical cell before the wide glyph is not captured as data.
+    assert_no_wide_cell_fragments(&screen);
+    assert_eq!(screen.capture_grid(true).lines[0], "abc表defghijklmnop");
+    parse(&mut screen, b"X");
+    assert_eq!(screen.cursor_position(), (5, 0));
+    assert_eq!(screen.capture_grid(true).lines[0], "abc表defghijklmnopX");
+}
+
+#[test]
+fn width_resize_cycles_preserve_multiple_wide_cells_and_explicit_spaces() {
+    for expected in ["ab表cd界efgh", "abc 表def", "abc表 def", "ab 表 cd界 ef"] {
+        let mut screen = new_screen(20, 4, 100);
+        parse(&mut screen, expected.as_bytes());
+        for cols in [3, 5, 7, 4, 20] {
+            screen.resize(TerminalSize { cols, rows: 4 });
+            assert_no_wide_cell_fragments(&screen);
+        }
+
+        assert_eq!(
+            screen.capture_grid(true).lines[0],
+            expected,
+            "resize must discard only physical placement gaps"
+        );
+    }
+}
+
+#[test]
+fn width_resize_cycle_preserves_wide_styles_and_pending_wrap() {
+    let mut styled = new_screen(20, 4, 100);
+    parse(
+        &mut styled,
+        "\x1b[31mabc表\x1b[32mdefghijklmnop\x1b[0m".as_bytes(),
+    );
+    styled.resize(TerminalSize { cols: 2, rows: 4 });
+    styled.resize(TerminalSize { cols: 20, rows: 4 });
+
+    let capture = styled.capture_transcript(
+        full_range(),
+        GridRenderOptions {
+            join_wrapped: true,
+            with_sequences: true,
+            ..GridRenderOptions::default()
+        },
+    );
+    let rendered = String::from_utf8(capture).expect("capture must be UTF-8");
+    assert!(
+        rendered.contains("\x1b[31mabc表\x1b[32mdefghijklmnop"),
+        "wide reflow must retain cell styles without importing its placement gap: {rendered:?}"
+    );
+
+    let mut pending = new_screen(20, 4, 100);
+    parse(&mut pending, "abc表d".as_bytes());
+    pending.resize(TerminalSize { cols: 4, rows: 4 });
+    pending.resize(TerminalSize { cols: 6, rows: 4 });
+
+    assert_eq!(pending.cursor_position(), (5, 0));
+    assert!(pending.pending_wrap);
+    parse(&mut pending, b"X");
+    assert_eq!(pending.cursor_position(), (1, 1));
+    assert_eq!(pending.capture_grid(true).lines[0], "abc表dX");
+}
+
+#[test]
+fn width_resize_line_edits_materialize_a_wide_placement_gap_as_space() {
+    for (label, edit, expected) in [
+        ("dch", b"\x1b[2;1H\x1b[P".as_slice(), "ab 表def"),
+        ("ich-last-column", b"\x1b[2;2H\x1b[@".as_slice(), "abc表def"),
+        (
+            "dch-ich-plain",
+            b"\x1b[2;1H\x1b[P\x1b[@A".as_slice(),
+            "A 表def",
+        ),
+        (
+            "dch-ich-styled",
+            b"\x1b[2;1H\x1b[P\x1b[@\x1b[31mA\x1b[0m".as_slice(),
+            "A 表def",
+        ),
+    ] {
+        let mut screen = new_screen(20, 10, 100);
+        parse(&mut screen, "abc表def\x1b[1;1H".as_bytes());
+        screen.resize(TerminalSize { cols: 2, rows: 10 });
+
+        parse(&mut screen, edit);
+        screen.resize(TerminalSize { cols: 20, rows: 10 });
+
+        // tmux 3.7b preserves the physical blank as logical data once DCH/ICH
+        // explicitly edits the placement-gap row.
+        assert_no_wide_cell_fragments(&screen);
+        assert!(
+            screen
+                .capture_grid(true)
+                .lines
+                .iter()
+                .any(|line| line == expected),
+            "{label} edit must preserve the measured placement-gap semantics"
+        );
+
+        if label == "dch-ich-styled" {
+            let capture = screen.capture_transcript(
+                full_range(),
+                GridRenderOptions {
+                    join_wrapped: true,
+                    with_sequences: true,
+                    ..GridRenderOptions::default()
+                },
+            );
+            let rendered = String::from_utf8(capture).expect("capture must be UTF-8");
+            assert!(
+                rendered.contains("\x1b[31mA"),
+                "styled edit must retain the red cell: {rendered:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn insert_character_full_suffix_clears_requested_cells_product_divergence() {
+    let mut screen = new_screen(20, 10, 100);
+    parse(&mut screen, "abc表def\x1b[1;1H".as_bytes());
+    screen.resize(TerminalSize { cols: 2, rows: 10 });
+
+    parse(&mut screen, b"\x1b[2;1H\x1b[2@");
+    screen.resize(TerminalSize { cols: 20, rows: 10 });
+
+    // tmux 3.7b treats ICH covering the complete remaining row as a no-op.
+    // RMUX keeps the terminal operation meaningful: two blanks are inserted
+    // and the previous suffix is truncated before the wrapped continuation.
+    assert_eq!(screen.capture_grid(true).lines[0], "ab  表def");
+}
+
+#[test]
+fn width_resize_derives_pending_wrap_at_the_destination_edge() {
+    let mut screen = new_screen(10, 4, 10);
+    parse(&mut screen, b"abcde");
+    assert!(!screen.pending_wrap);
+
+    screen.resize(TerminalSize { cols: 5, rows: 4 });
+
+    assert_eq!(screen.cursor_position(), (4, 0));
+    assert!(screen.pending_wrap);
+    parse(&mut screen, b"X");
+
+    assert_eq!(screen.cursor_position(), (1, 1));
+    assert_eq!(screen.capture_grid(true).lines[0], "abcdeX");
+}
+
+#[test]
+fn width_resize_keeps_cursor_content_visible_when_only_empty_tail_rows_move_product_divergence() {
+    let mut screen = new_screen(10, 4, 10);
+    parse(&mut screen, b"abcdef\x1b[1;3H");
+
+    screen.resize(TerminalSize { cols: 5, rows: 4 });
+    parse(&mut screen, b"X");
+
+    // tmux 3.7b keeps "abcde" in history and overwrites the leading "f"
+    // after this resize. RMUX keeps the addressed logical cursor row visible
+    // by consuming an otherwise empty trailing row.
+    assert_eq!(screen.history_size(), 0);
+    assert_eq!(screen.cursor_position(), (3, 0));
+    assert_eq!(&screen.capture_grid(false).lines[..2], &["abXde", "f"]);
+}
+
+#[test]
+fn width_resize_preserves_used_rows_below_a_nonbottom_cursor() {
+    let mut screen = new_screen(10, 4, 20);
+    parse(
+        &mut screen,
+        b"abcdef\r\nLOWER1\r\nLOWER2\r\nLOWER3\x1b[1;3H",
+    );
+
+    screen.resize(TerminalSize { cols: 5, rows: 4 });
+    parse(&mut screen, b"X");
+
+    let lines = screen.capture_grid(true).lines;
+    for expected in ["abcdef", "LOWER1", "XOWER2", "LOWER3"] {
+        assert!(
+            lines.iter().any(|line| line == expected),
+            "resize must retain used content below the cursor: {lines:?}"
+        );
+    }
+    assert_eq!(screen.cursor_position(), (1, 0));
+}
+
+#[test]
+fn width_resize_cursor_anchor_respects_zero_and_small_history_limits() {
+    let mut no_history = new_screen(10, 3, 0);
+    parse(&mut no_history, b"abcdef\x1b[1;3H");
+    no_history.resize(TerminalSize { cols: 5, rows: 3 });
+    parse(&mut no_history, b"X");
+
+    assert_eq!(no_history.history_size(), 0);
+    assert_eq!(&no_history.capture_grid(false).lines[..2], &["abXde", "f"]);
+
+    let mut small_history = new_screen(10, 3, 1);
+    parse(&mut small_history, b"abcdefghijklmno");
+    small_history.resize(TerminalSize { cols: 5, rows: 3 });
+    parse(&mut small_history, b"X");
+
+    assert_eq!(small_history.history_size(), 1);
+    assert_eq!(
+        small_history.capture_grid(true).lines[0],
+        "abcdefghijklmnoX"
+    );
+
+    let mut reflow_over_limit = reflow_overflow_screen(1);
+
+    // tmux 3.7b allows width reflow to retain rows beyond history-limit so
+    // resizing alone never discards pane contents.
+    assert_eq!(reflow_over_limit.history_size(), 9);
+    assert_eq!(
+        reflow_over_limit.capture_grid(true).lines[0],
+        "abcdefghijklmnopqrst"
+    );
+    parse(&mut reflow_over_limit, b"X");
+    assert_eq!(
+        reflow_over_limit.history_size(),
+        9,
+        "new scrolls must rotate preserved reflow overflow without growing it"
+    );
+    assert_eq!(
+        reflow_over_limit.capture_grid(true).lines[0],
+        "cdefghijklmnopqrstX"
+    );
+}
+
+#[test]
+fn width_resize_reflow_overflow_round_trips_height_and_explicit_history_mutations() {
+    for history_limit in [0, 1, 3] {
+        let mut screen = reflow_overflow_screen(history_limit);
+        assert_eq!(screen.history_size(), 9);
+        assert_eq!(screen.capture_grid(true).lines[0], "abcdefghijklmnopqrst");
+
+        screen.resize(TerminalSize { cols: 2, rows: 5 });
+        let expected_grown_history = if history_limit == 0 { 9 } else { 5 };
+        let expected_grown_cursor_y = if history_limit == 0 { 0 } else { 4 };
+        assert_eq!(screen.history_size(), expected_grown_history);
+        assert_eq!(screen.cursor_position(), (1, expected_grown_cursor_y));
+        assert_eq!(screen.capture_grid(true).lines[0], "abcdefghijklmnopqrst");
+
+        screen.resize(TerminalSize { cols: 2, rows: 1 });
+        assert_eq!(screen.history_size(), 9);
+        assert_eq!(screen.cursor_position(), (1, 0));
+        assert_eq!(screen.capture_grid(true).lines[0], "abcdefghijklmnopqrst");
+
+        parse(&mut screen, b"X");
+        assert_eq!(
+            screen.history_size(),
+            9,
+            "new output must not grow reflow overflow for history-limit={history_limit}"
+        );
+    }
+
+    for history_limit in [1, 3] {
+        let mut direct_scroll = reflow_overflow_screen(history_limit);
+        parse(&mut direct_scroll, b"X");
+        assert_eq!(direct_scroll.history_size(), 9);
+        assert_eq!(
+            direct_scroll.capture_grid(true).lines[0],
+            "cdefghijklmnopqrstX"
+        );
+
+        let mut trimmed = reflow_overflow_screen(history_limit);
+        assert!(trimmed.trim_below_cursor());
+        assert_eq!(trimmed.history_size(), 9);
+        assert_eq!(trimmed.capture_grid(true).lines[0], "abcdefghijklmnopqrst");
+
+        let mut widened = reflow_overflow_screen(history_limit);
+        widened.resize(TerminalSize { cols: 20, rows: 1 });
+        assert_eq!(widened.history_size(), 0);
+        assert_eq!(widened.capture_grid(true).lines[0], "abcdefghijklmnopqrst");
+
+        let mut cleared = reflow_overflow_screen(history_limit);
+        cleared.clear_history_and_hyperlinks(false);
+        assert_eq!(cleared.history_size(), 0);
+        parse(&mut cleared, b"X");
+        assert_eq!(
+            cleared.history_size(),
+            usize::from(history_limit > 0),
+            "clear-history must discard the temporary reflow capacity"
+        );
+    }
+
+    let mut reset_limit = reflow_overflow_screen(1);
+    reset_limit.set_history_limit(3);
+    assert_eq!(reset_limit.history_limit(), 3);
+    assert_eq!(reset_limit.history_size(), 3);
+    parse(&mut reset_limit, b"X");
+    assert_eq!(reset_limit.history_size(), 3);
+}
+
+#[test]
+fn zero_history_reflow_overflow_never_becomes_scrollable_history_product_divergence() {
+    let mut screen = reflow_overflow_screen(0);
+    assert_eq!(screen.history_size(), 9);
+    assert_eq!(screen.grid().hscrolled(), 0);
+
+    parse(&mut screen, b"X");
+
+    // tmux 3.7b retains the final old cell while RMUX's bounded pending-wrap
+    // representation drops that physical edge row. Both keep the overflow
+    // frozen: history-limit=0 must not rotate it or make it height-scrollable.
+    assert_eq!(screen.history_size(), 9);
+    assert_eq!(screen.grid().hscrolled(), 0);
+    assert!(screen.capture_grid(true).lines[0].starts_with("abcdefghijklmnopqr"));
+
+    screen.resize(TerminalSize { cols: 2, rows: 5 });
+    assert_eq!(screen.history_size(), 9);
+    assert_eq!(screen.cursor_position(), (1, 0));
+    assert_eq!(screen.grid().hscrolled(), 0);
+
+    for _ in 0..8 {
+        parse(&mut screen, b"\r\nZ");
+    }
+    assert_eq!(screen.history_size(), 9);
+    assert_eq!(screen.grid().hscrolled(), 0);
+    screen.resize(TerminalSize { cols: 2, rows: 1 });
+    assert_eq!(screen.history_size(), 9);
+    assert_eq!(screen.cursor_position(), (1, 0));
+    assert_eq!(screen.grid().hscrolled(), 0);
+}
+
+#[test]
+fn reflow_overflow_capacity_freezes_on_normal_output_after_growth_product_divergence() {
+    for history_limit in [1, 3] {
+        let mut partial = reflow_overflow_screen(history_limit);
+        partial.resize(TerminalSize { cols: 2, rows: 5 });
+        assert_eq!(partial.history_size(), 5);
+        assert_eq!(partial.grid().hscrolled(), 5);
+
+        for _ in 0..8 {
+            parse(&mut partial, b"\r\nZ");
+        }
+        assert_eq!(
+            partial.history_size(),
+            5,
+            "normal output must freeze the temporary capacity at the retained history"
+        );
+        assert_eq!(partial.grid().hscrolled(), 5);
+
+        // tmux 3.7b lets this height shrink recreate the original overflow.
+        // RMUX deliberately keeps the post-output bound so old capacity cannot
+        // be resurrected after the reflow contents have been superseded.
+        partial.resize(TerminalSize { cols: 2, rows: 1 });
+        assert_eq!(partial.history_size(), 5);
+        partial.resize(TerminalSize { cols: 2, rows: 5 });
+        assert_eq!(partial.history_size(), 1);
+        assert_eq!(partial.cursor_position(), (1, 4));
+
+        let mut fully_pulled = reflow_overflow_screen(history_limit);
+        fully_pulled.resize(TerminalSize { cols: 2, rows: 20 });
+        assert_eq!(fully_pulled.history_size(), 0);
+        assert_eq!(fully_pulled.grid().hscrolled(), 0);
+
+        for _ in 0..30 {
+            parse(&mut fully_pulled, b"\r\nZ");
+        }
+        assert_eq!(fully_pulled.history_size(), history_limit);
+        assert_eq!(fully_pulled.grid().hscrolled(), history_limit);
+
+        fully_pulled.resize(TerminalSize { cols: 2, rows: 1 });
+        assert_eq!(
+            fully_pulled.history_size(),
+            history_limit,
+            "height shrink after output must not restore consumed reflow capacity"
+        );
+    }
+}
+
+#[test]
+fn reflow_overflow_height_shrink_without_output_restores_original_capacity() {
+    for history_limit in [1, 3] {
+        for grown_rows in [5, 20] {
+            let mut screen = reflow_overflow_screen(history_limit);
+            screen.resize(TerminalSize {
+                cols: 2,
+                rows: grown_rows,
+            });
+            screen.resize(TerminalSize { cols: 2, rows: 1 });
+
+            assert_eq!(screen.history_size(), 9);
+            assert_eq!(screen.cursor_position(), (1, 0));
+            assert_eq!(screen.capture_grid(true).lines[0], "abcdefghijklmnopqrst");
+        }
+    }
+}
+
+#[test]
+fn reflow_overflow_explicit_line_removal_reduces_future_capacity() {
+    let mut screen = reflow_overflow_screen(1);
+    assert!(screen.delete_absolute_line(0));
+    assert_eq!(screen.history_size(), 8);
+
+    parse(&mut screen, b"X");
+
+    assert_eq!(screen.history_size(), 8);
+    assert_eq!(screen.grid().hscrolled(), 8);
+}
+
+#[test]
+fn width_resize_narrow_remaps_cursor_with_wide_cells_without_copying_tmux_gap() {
+    let mut screen = new_screen(10, 4, 10);
+    parse(&mut screen, "ab表cdef".as_bytes());
+
+    screen.resize(TerminalSize { cols: 5, rows: 4 });
+    parse(&mut screen, b"X");
+
+    // tmux 3.7b leaves the spare cell after a wide glyph empty when this
+    // narrows to five columns ("ab表" / "cdefX"). RMUX keeps the existing
+    // fuller physical reflow while preserving the joined logical text.
+    assert_no_wide_cell_fragments(&screen);
+    assert_eq!(screen.capture_grid(true).lines[0], "ab表cdefX");
+}
+
+#[test]
+fn width_resize_remaps_cursor_and_preserves_styles() {
+    let mut screen = new_screen(5, 4, 10);
+    let mut parser = InputParser::new();
+    parser.parse(b"\x1b[31mabcde\x1b[32mf", &mut screen);
+
+    screen.resize(TerminalSize { cols: 10, rows: 4 });
+    parser.parse(b"X", &mut screen);
+
+    let capture = screen.capture_transcript(
+        full_range(),
+        GridRenderOptions {
+            join_wrapped: true,
+            with_sequences: true,
+            ..GridRenderOptions::default()
+        },
+    );
+    let rendered = String::from_utf8(capture).expect("capture must be UTF-8");
+    assert!(
+        rendered.contains("\x1b[31mabcde\x1b[32mfX"),
+        "styled reflow must preserve red/green cells and write X at the logical cursor: {rendered:?}"
+    );
+}
+
+#[test]
+fn alternate_screen_restore_remaps_saved_main_cursor_after_resize() {
+    let mut screen = new_screen(5, 4, 10);
+    parse(&mut screen, b"abcdef");
+    parse(&mut screen, b"\x1b[?1049hALT");
+
+    screen.resize(TerminalSize { cols: 10, rows: 4 });
+    parse(&mut screen, b"\x1b[?1049lX");
+
+    assert_eq!(screen.cursor_position(), (7, 0));
+    assert_eq!(screen.capture_grid(true).lines[0], "abcdefX");
+}
+
+#[test]
+fn alternate_screen_restore_remaps_saved_cursor_after_width_and_height_resize() {
+    let mut screen = new_screen(5, 4, 10);
+    parse(&mut screen, b"abcdef\x1b[?1049hALT");
+
+    screen.resize(TerminalSize { cols: 10, rows: 5 });
+    parse(&mut screen, b"\x1b[?1049lX");
+
+    assert_eq!(screen.cursor_position(), (7, 0));
+    assert_eq!(screen.capture_grid(true).lines[0], "abcdefX");
+}
+
+#[test]
+fn alternate_screen_restore_without_saved_cursor_still_restores_resized_main_view() {
+    let mut screen = new_screen(5, 4, 10);
+    parse(&mut screen, b"abcdef");
+    parse(&mut screen, b"\x1b[?1047hALT");
+
+    screen.resize(TerminalSize { cols: 10, rows: 4 });
+    parse(&mut screen, b"\x1b[?1047l");
+
+    let lines = screen.capture_grid(true).lines;
+    assert_eq!(lines[0], "abcdef");
+    assert!(lines.iter().all(|line| !line.contains("ALT")));
+}
+
+#[test]
+fn alternate_screen_width_resize_preserves_physical_cursor_product_divergence() {
+    let mut screen = new_screen(5, 3, 10);
+    parse(&mut screen, b"MAIN\r\n12345\x1b[H");
+    parse(&mut screen, b"\x1b[?1047h\x1b[Habcdef");
+    assert_eq!(screen.cursor_position(), (1, 1));
+
+    screen.resize(TerminalSize { cols: 10, rows: 3 });
+
+    // tmux 3.7b preserves both the physical row split and cursor. RMUX keeps
+    // its lossless alternate-screen content reflow, but the cursor remains at
+    // the same physical coordinate so a live application can redraw from the
+    // position it owned before SIGWINCH.
+    assert_eq!(screen.cursor_position(), (1, 1));
+    assert!(!screen.pending_wrap);
+    parse(&mut screen, b"X");
+    assert_eq!(&screen.capture_grid(false).lines[..2], &["abcdef", " X"]);
+
+    parse(&mut screen, b"\x1b[?1047l");
+    assert_eq!(screen.cursor_position(), (2, 1));
+    parse(&mut screen, b"Y");
+    assert_eq!(screen.cursor_position(), (3, 1));
+    let lines = screen.capture_grid(false).lines;
+    assert_eq!(&lines[..2], &["MAIN", "12Y45"]);
+    assert!(lines.iter().all(|line| !line.contains("abcdef")));
+    assert!(lines.iter().all(|line| !line.contains('X')));
+}
+
+#[test]
+fn alternate_screen_narrow_resize_clamps_cursor_with_pending_wrap_product_divergence() {
+    let mut screen = new_screen(10, 3, 10);
+    parse(&mut screen, b"\x1b[?1047h\x1b[Habcdefgh");
+    assert_eq!(screen.cursor_position(), (8, 0));
+
+    screen.resize(TerminalSize { cols: 5, rows: 3 });
+
+    // tmux 3.7b retains an out-of-bounds virtual x=8 and wraps the next
+    // printable byte. RMUX represents the same next-write behavior with its
+    // bounded cursor plus pending-wrap state.
+    assert_eq!(screen.cursor_position(), (4, 0));
+    assert!(screen.pending_wrap);
+    parse(&mut screen, b"X");
+    assert_eq!(&screen.capture_grid(false).lines[..2], &["abcde", "Xgh"]);
+}
+
+#[test]
+fn alternate_screen_resize_remaps_pending_wrap_by_physical_column_product_divergence() {
+    let mut widened = new_screen(5, 3, 10);
+    parse(&mut widened, b"\x1b[?1047h\x1b[Habcde");
+    assert!(widened.pending_wrap);
+
+    widened.resize(TerminalSize { cols: 10, rows: 3 });
+
+    assert_eq!(widened.cursor_position(), (5, 0));
+    assert!(!widened.pending_wrap);
+    parse(&mut widened, b"X");
+    assert_eq!(widened.capture_grid(false).lines[0], "abcdeX");
+
+    let mut narrowed = new_screen(10, 3, 10);
+    parse(&mut narrowed, b"\x1b[?1047h\x1b[Habcdefghij");
+    assert!(narrowed.pending_wrap);
+
+    narrowed.resize(TerminalSize { cols: 5, rows: 3 });
+
+    assert_eq!(narrowed.cursor_position(), (4, 0));
+    assert!(narrowed.pending_wrap);
+    parse(&mut narrowed, b"X");
+    assert_eq!(
+        &narrowed.capture_grid(false).lines[..2],
+        &["abcde", "Xghij"]
+    );
+}
+
+#[test]
+fn alternate_screen_width_and_height_resize_preserves_physical_cursor_product_divergence() {
+    let mut screen = new_screen(5, 3, 10);
+    parse(&mut screen, b"\x1b[?1047h\x1b[Habcdef");
+
+    screen.resize(TerminalSize { cols: 10, rows: 5 });
+
+    assert_eq!(screen.cursor_position(), (1, 1));
+    assert!(!screen.pending_wrap);
+    parse(&mut screen, b"X");
+    assert_eq!(&screen.capture_grid(false).lines[..2], &["abcdef", " X"]);
+}
+
+#[test]
+fn alternate_screen_height_shrink_clamps_physical_cursor() {
+    let mut screen = new_screen(5, 4, 10);
+    parse(&mut screen, b"\x1b[?1047h\x1b[4;4H");
+    assert_eq!(screen.cursor_position(), (3, 3));
+
+    screen.resize(TerminalSize { cols: 5, rows: 2 });
+
+    assert_eq!(screen.cursor_position(), (3, 1));
+    assert!(!screen.pending_wrap);
+    parse(&mut screen, b"X");
+    assert_eq!(screen.capture_grid(false).lines[1], "   X");
+}
+
+#[test]
+fn alternate_screen_wide_reflow_preserves_physical_cursor_without_fragments_product_divergence() {
+    let mut screen = new_screen(10, 3, 10);
+    parse(&mut screen, "\x1b[?1047h\x1b[Hab表cdef".as_bytes());
+    assert_eq!(screen.cursor_position(), (8, 0));
+
+    screen.resize(TerminalSize { cols: 5, rows: 3 });
+
+    assert_eq!(screen.cursor_position(), (4, 0));
+    assert!(screen.pending_wrap);
+    parse(&mut screen, b"X");
+    assert_no_wide_cell_fragments(&screen);
+    assert_eq!(&screen.capture_grid(false).lines[..2], &["ab表c", "Xef"]);
+}
+
+#[test]
+fn alternate_screen_full_viewport_truncates_each_hard_line_before_tail_rows_product_divergence() {
+    let mut screen = new_screen(10, 2, 10);
+    parse(
+        &mut screen,
+        b"\x1b[?1047h\x1b[Habcdefghij\x1b[2;1HKLMNOPQRST",
+    );
+
+    screen.resize(TerminalSize { cols: 5, rows: 2 });
+
+    // With no spare viewport row, tmux 3.7b keeps the leading columns of
+    // every physical hard line rather than letting the first line's reflow
+    // displace later rows.
+    assert_eq!(screen.capture_grid(false).lines, vec!["abcde", "KLMNO"]);
+    assert_eq!(screen.cursor_position(), (4, 1));
+    assert!(screen.pending_wrap);
+    parse(&mut screen, b"X");
+    assert_eq!(screen.capture_grid(false).lines, vec!["KLMNO", "X"]);
+}
+
+#[test]
+fn alternate_screen_physical_cursor_resize_does_not_change_1049_restore() {
+    let mut screen = new_screen(5, 3, 10);
+    screen.set_preserve_alternate_screen_cursor(true);
+    parse(&mut screen, b"abcdef\x1b[?1049h\x1b[3;4HALT");
+
+    screen.resize(TerminalSize { cols: 10, rows: 5 });
+    parse(&mut screen, b"\x1b[?1049lX");
+
+    assert_eq!(screen.cursor_position(), (7, 0));
+    assert_eq!(screen.capture_grid(true).lines[0], "abcdefX");
+}
+
+#[test]
 fn height_growth_keeps_cursor_on_content_when_history_is_pulled_into_view() {
     let mut screen = new_screen(20, 3, 10);
     parse(&mut screen, b"h0\r\nh1\r\np$ echo A0\r\nA0\r\np$ ");
@@ -701,15 +1475,15 @@ fn alternate_screen_restore_preserves_wrapped_rows() {
 fn alternate_screen_restore_after_width_resize_preserves_history_and_main_view() {
     let mut screen = new_screen(3, 2, 20);
     parse(&mut screen, b"hist0\r\nhist1\r\nabcdef");
+    let history_before_alternate = screen.history_size();
     parse(&mut screen, b"\x1b[?1049h");
     parse(&mut screen, b"ALT");
     screen.resize(TerminalSize { cols: 5, rows: 2 });
-    let history_after_alt_resize = screen.history_size();
+    assert_eq!(screen.history_size(), history_before_alternate);
 
     parse(&mut screen, b"\x1b[?1049l");
 
     assert_eq!(screen.grid().size(), TerminalSize { cols: 5, rows: 2 });
-    assert_eq!(screen.history_size(), history_after_alt_resize);
     let lines = screen.capture_grid(true).lines;
     assert!(
         lines.iter().any(|line| line.contains("abcdef")),
@@ -722,12 +1496,76 @@ fn alternate_screen_restore_after_width_resize_preserves_history_and_main_view()
 }
 
 #[test]
+fn alternate_screen_resize_preserves_main_history_product_divergence() {
+    let mut screen = new_screen(5, 2, 20);
+    parse(&mut screen, b"abcdefghijk");
+    assert_eq!(screen.history_size(), 1);
+
+    parse(&mut screen, b"\x1b[?1049hALT");
+    screen.resize(TerminalSize { cols: 10, rows: 2 });
+    assert_eq!(
+        screen.history_size(),
+        1,
+        "alternate resize must not mutate main-screen history"
+    );
+    parse(&mut screen, b"\x1b[?1049lX");
+
+    // tmux 3.7b retains the same bytes but keeps the old history boundary as
+    // a hard split ("abcde" / "fghijkX"). RMUX deliberately reflows the
+    // original soft-wrapped logical line after restoring the main screen.
+    assert_eq!(screen.history_size(), 0);
+    assert_eq!(screen.capture_grid(true).lines[0], "abcdefghijkX");
+    assert!(screen
+        .capture_grid(true)
+        .lines
+        .iter()
+        .all(|line| !line.contains("ALT")));
+}
+
+#[test]
 fn insert_and_delete_line_ignore_rows_outside_scroll_region() {
     let mut screen = new_screen(4, 4, 10);
     parse(&mut screen, b"1\r\n2\r\n3\r\n4");
     parse(&mut screen, b"\x1b[2;3r\x1b[1;1H\x1b[L\x1b[M");
 
     assert_eq!(screen.capture_grid(false).lines, vec!["1", "2", "3", "4"]);
+}
+
+#[test]
+fn vertical_cursor_commands_respect_scroll_region_boundaries() {
+    type CursorCase = (&'static str, u8, &'static [u8], (u32, u32));
+
+    let cases: &[CursorCase] = &[
+        // Inside the region, relative vertical movement stops at the margins.
+        ("CUU inside", 3, b"\x1b[5A", (2, 1)),
+        ("CUD inside", 3, b"\x1b[5B", (2, 3)),
+        ("CNL inside", 3, b"\x1b[5E", (0, 3)),
+        ("CPL inside", 3, b"\x1b[5F", (0, 1)),
+        // The margins themselves remain stable under outward movement.
+        ("CUU at top margin", 2, b"\x1b[5A", (2, 1)),
+        ("CUD at bottom margin", 4, b"\x1b[5B", (2, 3)),
+        ("CPL at top margin", 2, b"\x1b[5F", (0, 1)),
+        ("CNL at bottom margin", 4, b"\x1b[5E", (0, 3)),
+        // Movement away from a region keeps the full-screen boundary.
+        ("CUU above region", 1, b"\x1b[5A", (2, 0)),
+        ("CPL above region", 1, b"\x1b[5F", (0, 0)),
+        ("CUD below region", 5, b"\x1b[5B", (2, 4)),
+        ("CNL below region", 5, b"\x1b[5E", (0, 4)),
+        // Movement toward a region may enter it but cannot cross its far margin.
+        ("CUD above region", 1, b"\x1b[5B", (2, 3)),
+        ("CNL above region", 1, b"\x1b[5E", (0, 3)),
+        ("CUU below region", 5, b"\x1b[5A", (2, 1)),
+        ("CPL below region", 5, b"\x1b[5F", (0, 1)),
+    ];
+
+    for &(name, start_row, command, expected_cursor) in cases {
+        let mut screen = new_screen(5, 5, 10);
+        parse(&mut screen, b"\x1b[2;4r");
+        parse(&mut screen, format!("\x1b[{start_row};3H").as_bytes());
+        parse(&mut screen, command);
+
+        assert_eq!(screen.cursor_position(), expected_cursor, "{name}");
+    }
 }
 
 #[test]
@@ -1080,6 +1918,176 @@ fn csi_cursor_backward_uses_columns_for_cjk_text() {
     assert_eq!(first_line(&screen), "你好世界");
     assert_eq!(screen.cursor_position(), (6, 0));
     assert_no_wide_cell_fragments(&screen);
+}
+
+#[test]
+fn insert_mode_shifts_ascii_and_reset_restores_overwrite() {
+    let mut screen = new_screen(10, 1, 10);
+    parse(&mut screen, b"abcdef\x1b[1;3H\x1b[4hXY\x1b[4lZ");
+
+    assert_eq!(first_line(&screen), "abXYZdef");
+    assert_eq!(screen.cursor_position(), (5, 0));
+}
+
+#[test]
+fn insert_mode_preserves_shifted_styles() {
+    let mut screen = new_screen(10, 1, 10);
+    parse(
+        &mut screen,
+        b"\x1b[31mabcdef\x1b[0m\x1b[1;3H\x1b[34m\x1b[4hX\x1b[4l\x1b[0m",
+    );
+
+    assert_eq!(first_line(&screen), "abXcdef");
+    let line = screen.grid().visible_line(0).expect("visible line");
+    assert_eq!(line.cell(0).expect("red a").fg(), 1);
+    assert_eq!(line.cell(1).expect("red b").fg(), 1);
+    assert_eq!(line.cell(2).expect("blue X").fg(), 4);
+    for x in 3..7 {
+        assert_eq!(line.cell(x).expect("shifted red cell").fg(), 1);
+    }
+}
+
+#[test]
+fn insert_mode_shifts_for_wide_characters_without_padding_fragments() {
+    let mut screen = new_screen(10, 1, 10);
+    parse(&mut screen, "abcdef\x1b[1;3H\x1b[4h界\x1b[4l".as_bytes());
+
+    assert_eq!(first_line(&screen), "ab界cdef");
+    assert_eq!(screen.cursor_position(), (4, 0));
+    assert_no_wide_cell_fragments(&screen);
+
+    let mut shifted = new_screen(10, 1, 10);
+    parse(&mut shifted, "ab界cd\x1b[1;3H\x1b[4hX\x1b[4l".as_bytes());
+    assert_eq!(first_line(&shifted), "abX界cd");
+    assert_no_wide_cell_fragments(&shifted);
+}
+
+#[test]
+fn insert_character_on_wide_padding_uses_the_next_logical_boundary_product_divergence() {
+    let mut screen = new_screen(12, 1, 10);
+    parse(&mut screen, "ab界cd\x1b[1;4H\x1b[@X".as_bytes());
+
+    // tmux 3.7b keeps its cursor on the padding column and renders an
+    // overlapping cell plus the inserted blank ("ab界X cd"). RMUX keeps a
+    // valid owner/padding pair and advances to the next logical boundary.
+    assert_eq!(first_line(&screen), "ab界Xcd");
+    assert_eq!(screen.cursor_position(), (5, 0));
+    assert_no_wide_cell_fragments(&screen);
+}
+
+#[test]
+fn insert_mode_on_wide_padding_preserves_valid_cells_product_divergence() {
+    let mut ascii = new_screen(12, 1, 10);
+    parse(&mut ascii, "ab界cd\x1b[1;4H\x1b[4hX\x1b[4l".as_bytes());
+    assert_eq!(first_line(&ascii), "ab界Xcd");
+    assert_eq!(ascii.cursor_position(), (5, 0));
+    assert_no_wide_cell_fragments(&ascii);
+
+    let mut wide = new_screen(12, 1, 10);
+    parse(&mut wide, "ab界cd\x1b[1;4H\x1b[4h好\x1b[4l".as_bytes());
+    // tmux 3.7b leaves an extra blank after the inserted wide glyph because
+    // it retains an overlapping padding cursor. RMUX deliberately keeps the
+    // compact logical row while preserving both wide owner/padding pairs.
+    assert_eq!(first_line(&wide), "ab界好cd");
+    assert_eq!(wide.cursor_position(), (6, 0));
+    assert_no_wide_cell_fragments(&wide);
+
+    let mut adjacent_wide = new_screen(12, 1, 10);
+    parse(
+        &mut adjacent_wide,
+        "ab界好cd\x1b[1;4H\x1b[4hX\x1b[4l".as_bytes(),
+    );
+    assert_eq!(first_line(&adjacent_wide), "ab界X好cd");
+    assert_eq!(adjacent_wide.cursor_position(), (5, 0));
+    assert_no_wide_cell_fragments(&adjacent_wide);
+}
+
+#[test]
+fn insert_mode_on_wide_padding_handles_edges_product_divergence() {
+    let mut no_wrap = new_screen(12, 1, 10);
+    parse(
+        &mut no_wrap,
+        "ab界cd\x1b[1;4H\x1b[?7l\x1b[4hX\x1b[4l".as_bytes(),
+    );
+    assert_eq!(first_line(&no_wrap), "ab界Xcd");
+    assert_eq!(no_wrap.cursor_position(), (5, 0));
+    assert_no_wide_cell_fragments(&no_wrap);
+
+    let mut edge_wrap = new_screen(8, 2, 10);
+    parse(
+        &mut edge_wrap,
+        "abcdef界\x1b[1;8H\x1b[4hX\x1b[4l".as_bytes(),
+    );
+    assert_eq!(edge_wrap.capture_grid(false).lines, vec!["abcdef界", "X"]);
+    assert_eq!(edge_wrap.cursor_position(), (1, 1));
+    assert_no_wide_cell_fragments(&edge_wrap);
+
+    let mut edge_no_wrap = new_screen(8, 1, 10);
+    parse(
+        &mut edge_no_wrap,
+        "abcdef界\x1b[1;8H\x1b[?7l\x1b[4hX\x1b[4l".as_bytes(),
+    );
+    assert_eq!(first_line(&edge_no_wrap), "abcdef界");
+    assert_eq!(edge_no_wrap.cursor_position(), (7, 0));
+    assert_no_wide_cell_fragments(&edge_no_wrap);
+
+    let mut scroll_region = new_screen(8, 4, 10);
+    parse(
+        &mut scroll_region,
+        "\x1b[1;1H11111111\x1b[2;1H22222222\x1b[3;1Habcdef界\
+         \x1b[4;1H44444444\x1b[2;3r\x1b[3;8H\x1b[4hX\x1b[4l"
+            .as_bytes(),
+    );
+    assert_eq!(
+        scroll_region.capture_grid(false).lines,
+        vec!["11111111", "abcdef界", "X", "44444444"]
+    );
+    assert_eq!(scroll_region.cursor_position(), (1, 2));
+    assert_no_wide_cell_fragments(&scroll_region);
+}
+
+#[test]
+fn insert_mode_on_styled_wide_padding_preserves_shifted_cell_styles() {
+    let mut screen = new_screen(12, 1, 10);
+    parse(
+        &mut screen,
+        "\x1b[31mab界cd\x1b[0m\x1b[1;4H\x1b[34m\x1b[4hX\x1b[4l\x1b[0m".as_bytes(),
+    );
+
+    assert_eq!(first_line(&screen), "ab界Xcd");
+    let line = screen.grid().visible_line(0).expect("visible line");
+    for x in [0, 1, 2, 3, 5, 6] {
+        assert_eq!(line.cell(x).expect("shifted red cell").fg(), 1);
+    }
+    assert_eq!(line.cell(4).expect("blue inserted cell").fg(), 4);
+    assert_no_wide_cell_fragments(&screen);
+}
+
+#[test]
+fn insert_mode_matches_tmux_at_the_right_edge() {
+    let mut ascii = new_screen(8, 2, 10);
+    parse(&mut ascii, b"abcdefgh\x1b[1;8H\x1b[4hX");
+    assert_eq!(first_line(&ascii), "abcdefgX");
+    parse(&mut ascii, b"\x1b[4lY");
+    assert_eq!(ascii.capture_grid(false).lines, vec!["abcdefgX", "Y"]);
+
+    let mut wide_wrap = new_screen(8, 3, 10);
+    parse(
+        &mut wide_wrap,
+        "\x1b[1;1Habcdefgh\x1b[2;1H12345678\x1b[1;8H\x1b[4h界\x1b[4l".as_bytes(),
+    );
+    let wrapped_lines = wide_wrap.capture_grid(false).lines;
+    assert_eq!(wrapped_lines.first().map(String::as_str), Some("abcdefg"));
+    assert_eq!(wrapped_lines.get(1).map(String::as_str), Some("界345678"));
+    assert_no_wide_cell_fragments(&wide_wrap);
+
+    let mut no_wrap = new_screen(8, 1, 10);
+    parse(
+        &mut no_wrap,
+        "abcdefgh\x1b[1;8H\x1b[?7l\x1b[4h界\x1b[4l".as_bytes(),
+    );
+    assert_eq!(first_line(&no_wrap), "abcdefgh");
+    assert_no_wide_cell_fragments(&no_wrap);
 }
 
 #[test]

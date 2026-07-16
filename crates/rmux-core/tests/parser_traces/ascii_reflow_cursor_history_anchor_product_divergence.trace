@@ -1,55 +1,54 @@
 # rmux-core parser trace
 # regenerate with: RMUX_REGEN_PARSER_TRACES=1 cargo test --package rmux-core --test parser_traces -- --nocapture
-fixture: ascii_break_previous_wrap_then_widen
+fixture: ascii_reflow_cursor_history_anchor_product_divergence
 feeds: 1
-size: cols=3 rows=4 history=10
-resize_after: cols=6 rows=4
-input_length: 15
-input_hex: 61 62 63 64 65 66 1b 5b 32 3b 31 48 58 59 5a
+size: cols=10 rows=4 history=10
+resize_after: cols=5 rows=4
+input_length: 12
+input_hex: 61 62 63 64 65 66 1b 5b 31 3b 33 48
 parser_state: Ground
 parser_pending_hex: (empty)
 parser_replies_hex: (empty)
 parser_ground_timer_active: false
 mode_bits: 0x00000011
 cursor_style: 0
-cursor: x=3 y=1
-cursor_absolute_y: 1
+cursor: x=2 y=0
+cursor_absolute_y: 0
 alternate: false
 history_size: 0
 history_bytes: 0
 bell_count: 0
 title: ""
 path: ""
-size_runtime: cols=6 rows=4
+size_runtime: cols=5 rows=4
 absolute_line_count: 4
 --- visible_lines ---
-[v=0] flags=- cells=6
+[v=0] flags=WRAPPED cells=5
   c  0 . text="a" w=1 attr=0x0000 fg=default bg=default us=default link=0
   c  1 . text="b" w=1 attr=0x0000 fg=default bg=default us=default link=0
   c  2 . text="c" w=1 attr=0x0000 fg=default bg=default us=default link=0
-[v=1] flags=- cells=6
-  c  0 . text="X" w=1 attr=0x0000 fg=default bg=default us=default link=0
-  c  1 . text="Y" w=1 attr=0x0000 fg=default bg=default us=default link=0
-  c  2 . text="Z" w=1 attr=0x0000 fg=default bg=default us=default link=0
-[v=2] flags=- cells=6
+  c  3 . text="d" w=1 attr=0x0000 fg=default bg=default us=default link=0
+  c  4 . text="e" w=1 attr=0x0000 fg=default bg=default us=default link=0
+[v=1] flags=- cells=5
+  c  0 . text="f" w=1 attr=0x0000 fg=default bg=default us=default link=0
+[v=2] flags=- cells=5
   (blank)
-[v=3] flags=- cells=6
+[v=3] flags=- cells=5
   (blank)
 --- history_lines ---
 (empty)
 --- transcript ---
-| abc
-| XYZ
+| abcde
+| f
 |
 |
 --- transcript_joined ---
-| abc
-| XYZ
+| abcdef
 |
 |
 --- transcript_with_sequences ---
-| abc
-| XYZ
+| abcde
+| f
 |
 |
 --- saved_transcript ---

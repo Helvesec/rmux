@@ -171,6 +171,44 @@ async fn pane_set_close_all_reports_per_pane_outcomes() -> TestResult {
 }
 
 #[tokio::test]
+async fn pane_set_close_all_preflights_slot_handles_before_reindexing() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("pane-set-slot-close").await?;
+    let rmux = harness.rmux();
+    let session = EnsureSession::named(session_name("sdkpanesetslotclose"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    session
+        .pane(0, 0)
+        .split(rmux_sdk::SplitDirection::Right)
+        .await?;
+
+    let closed = PaneSet::new([session.pane(0, 0), session.pane(0, 1)])
+        .close_all()
+        .await;
+
+    assert!(closed.is_success(), "slot close_all failed: {closed:?}");
+    assert_eq!(closed.successes().len(), 2);
+    assert!(closed
+        .successes()
+        .iter()
+        .all(|success| matches!(success.value(), PaneCloseOutcome::Closed { .. })));
+    assert!(
+        matches!(
+            closed.successes()[1].value(),
+            PaneCloseOutcome::Closed {
+                window_destroyed: true,
+                ..
+            }
+        ),
+        "the second preflighted identity must close the final pane/window"
+    );
+
+    harness.finish().await
+}
+
+#[tokio::test]
 async fn pane_set_expect_any_timeout_bounds_stalled_identity_rpc() -> TestResult {
     let root = TestRoot::new("expect-any-stalled-id");
     std::fs::create_dir_all(root.path())?;

@@ -105,16 +105,10 @@ async fn source_file_rejects_unimplemented_display_message_flags() {
         .await;
     fs::remove_dir_all(root).expect("remove display-message source root");
 
-    let Response::Error(error) = response else {
-        panic!("source-file should reject inert display-message flags: {response:?}");
-    };
+    let diagnostic = source_file_stdout_failure(response);
     assert!(
-        error
-            .error
-            .to_string()
-            .contains("display.conf:1: command display-message: unknown flag -d"),
-        "unexpected source error: {}",
-        error.error
+        diagnostic.contains("display.conf:1: command display-message: unknown flag -d"),
+        "unexpected source diagnostic: {diagnostic}"
     );
 }
 
@@ -177,7 +171,7 @@ async fn source_file_preserves_target_client_and_show_hooks_flags() {
     let response = handler
         .handle(source_file_request(
             vec!["flags.conf".to_owned()],
-            Some(root),
+            Some(root.clone()),
         ))
         .await;
     let output = response
@@ -254,15 +248,12 @@ async fn source_file_show_window_options_rejects_h() {
     let response = handler
         .handle(source_file_request(vec!["bad.conf".to_owned()], Some(root)))
         .await;
-    let Response::Error(response) = response else {
-        panic!("expected source-file flag error");
-    };
     assert_eq!(
-        response.error,
-        rmux_proto::RmuxError::Server(format!(
-            "{}:1: command show-window-options: unknown flag -H",
+        source_file_stdout_failure(response),
+        format!(
+            "{}:1: command show-window-options: unknown flag -H\n",
             config.display()
-        ))
+        )
     );
 }
 
@@ -326,12 +317,10 @@ async fn source_file_rejects_refresh_client_unsupported_fields() {
                 Some(root.clone()),
             ))
             .await;
-        let Response::Error(response) = response else {
-            panic!("expected source-file to reject {command:?}");
-        };
         assert_eq!(
-            response.error,
-            rmux_proto::RmuxError::Server(format!("{}:1: {expected}", config.display()))
+            source_file_stdout_failure(response),
+            format!("{}:1: {expected}\n", config.display()),
+            "source-file should reject {command:?}"
         );
     }
 
@@ -389,15 +378,12 @@ async fn source_file_rejects_unknown_options_before_command_tails() {
         .await
         .unwrap_or_else(|_| panic!("source-file {label} validation must not block"));
 
-        let Response::Error(response) = response else {
-            panic!("source-file should reject {label} unknown option: {response:?}");
-        };
         assert_eq!(
-            response.error,
-            rmux_proto::RmuxError::Server(format!(
-                "{}:1: command {expected_command}: unknown flag {expected_flag}",
+            source_file_stdout_failure(response),
+            format!(
+                "{}:1: command {expected_command}: unknown flag {expected_flag}\n",
                 config.display()
-            )),
+            ),
             "source-file accepted an unknown option before {label}'s positional tail"
         );
         assert!(
@@ -1528,6 +1514,82 @@ async fn queued_source_file_accepts_compact_format_target_with_attached_value() 
 }
 
 #[tokio::test]
+async fn queued_source_file_preserves_assignment_order_across_multi_paths() {
+    let handler = RequestHandler::new();
+    let root = temp_root("queued-multi-path-assignments-order");
+    write_config(&root.join("first.conf"), "QUEUE_ORDER=from-first\n");
+    write_config(
+        &root.join("bad.conf"),
+        "QUEUE_ORDER=from-bad\ndefinitely-not-a-command\nset-option -g @queued_must_not_run yes\n",
+    );
+    write_config(
+        &root.join("third.conf"),
+        "set-option -g @queued_order \"$QUEUE_ORDER\"\n",
+    );
+    let parsed = CommandParser::new()
+        .parse("source-file first.conf bad.conf third.conf")
+        .expect("queued source-file parses");
+
+    let error = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::new(Some(root.clone())),
+        )
+        .await
+        .expect_err("queued source-file should retain the intermediate parse error");
+
+    assert!(
+        error
+            .to_string()
+            .contains("bad.conf:2: unknown command: definitely-not-a-command"),
+        "expected queued source-file error, got {error}"
+    );
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.environment.global_value("QUEUE_ORDER"),
+            Some("from-bad"),
+            "queued source-file assignments must apply in source order"
+        );
+    }
+    assert_eq!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::SessionGlobal,
+                name: Some("@queued_order".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: false,
+                include_hooks: false,
+            }))
+            .await
+            .command_output()
+            .expect("queued source option output")
+            .stdout(),
+        b"from-bad\n"
+    );
+    assert!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::SessionGlobal,
+                name: Some("@queued_must_not_run".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: true,
+                include_hooks: false,
+            }))
+            .await
+            .command_output()
+            .expect("queued quiet show-options output")
+            .stdout()
+            .is_empty(),
+        "commands after a fatal queued source-file parse error must not execute"
+    );
+    fs::remove_dir_all(root).expect("remove queued assignment config root");
+}
+
+#[tokio::test]
 async fn queued_display_message_accepts_compact_print_and_commands_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("display-compact-pc");
@@ -1557,6 +1619,132 @@ async fn queued_display_message_accepts_compact_print_and_commands_flags() {
         .expect("display-message -pC should execute");
 
     assert_eq!(output.stdout(), b"display-compact-pc\n");
+}
+
+#[tokio::test]
+async fn source_file_set_window_option_alias_uses_explicit_window_target_metadata() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    for session in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+    for (session, name) in [(&alpha, "one"), (&alpha, "named"), (&beta, "other")] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                    target: session.clone(),
+                    name: Some(name.to_owned()),
+                    detached: true,
+                    start_directory: None,
+                    environment: None,
+                    command: None,
+                    process_command: None,
+                    target_window_index: None,
+                    insert_at_target: false,
+                })))
+                .await,
+            Response::NewWindow(_)
+        ));
+    }
+
+    let root = temp_root("source-set-window-option-alias");
+    write_config(
+        &root.join("options.conf"),
+        "set-window-option -t:+ aggressive-resize on\n\
+         set-option -w -t:named synchronize-panes on\n",
+    );
+    let parsed = CommandParser::new()
+        .parse("source-file -t alpha:0.0 options.conf")
+        .expect("source-file target command parses");
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::new(Some(root.clone())).with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(beta.clone(), 0, 0),
+            ))),
+        )
+        .await
+        .expect("source-file set-window-option alias should execute");
+
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state.options.window_value(
+                &WindowTarget::with_window(alpha.clone(), 1),
+                OptionName::AggressiveResize
+            ),
+            Some("on")
+        );
+        assert_eq!(
+            state.options.window_value(
+                &WindowTarget::with_window(alpha.clone(), 2),
+                OptionName::SynchronizePanes
+            ),
+            Some("on")
+        );
+        assert_eq!(
+            state.options.window_value(
+                &WindowTarget::with_window(beta.clone(), 1),
+                OptionName::AggressiveResize
+            ),
+            None
+        );
+    }
+
+    write_config(
+        &root.join("missing-alias.conf"),
+        "set-window-option -t nosuch automatic-rename off\n",
+    );
+    write_config(
+        &root.join("missing-canonical.conf"),
+        "set-option -w -t nosuch automatic-rename off\n",
+    );
+    let missing_source_request = |path: &str| {
+        Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![path.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: Some(PaneTarget::with_window(alpha.clone(), 0, 0)),
+            caller_cwd: Some(root.clone()),
+            stdin: None,
+        }))
+    };
+
+    let Response::SourceFile(alias_response) = handler
+        .handle(missing_source_request("missing-alias.conf"))
+        .await
+    else {
+        panic!("missing alias target should return a source-file response");
+    };
+    let Response::SourceFile(canonical_response) = handler
+        .handle(missing_source_request("missing-canonical.conf"))
+        .await
+    else {
+        panic!("missing canonical target should return a source-file response");
+    };
+    assert_eq!(alias_response.exit_status(), Some(1));
+    assert_eq!(canonical_response.exit_status(), Some(1));
+    for stderr in [alias_response.stderr(), canonical_response.stderr()] {
+        let stderr = std::str::from_utf8(stderr).expect("source-file stderr is UTF-8");
+        assert!(stderr.contains("nosuch"), "{stderr}");
+        assert!(stderr.contains("window"), "{stderr}");
+    }
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -1736,7 +1924,7 @@ async fn source_file_continues_after_missing_paths_and_reports_one_clean_error_p
                 "b.conf".to_owned(),
                 "missing-b.conf".to_owned(),
             ],
-            Some(root),
+            Some(root.clone()),
         ))
         .await;
 
@@ -1812,6 +2000,86 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
             .stdout(),
         b"yes\n"
     );
+}
+
+#[tokio::test]
+async fn source_file_multi_paths_carry_assignments_and_continue_after_file_error() {
+    let handler = RequestHandler::new();
+    let root = temp_root("multi-path-assignments-order");
+    write_config(&root.join("first.conf"), "SOURCE_ORDER=from-first\n");
+    write_config(
+        &root.join("bad.conf"),
+        "BROKEN_ORDER=from-bad\ndefinitely-not-a-command\nset-option -g @must_not_run yes\n",
+    );
+    write_config(
+        &root.join("third.conf"),
+        "set-option -g @source_order \"$SOURCE_ORDER\"\n\
+         set-option -g @after_bad \"$BROKEN_ORDER\"\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec![
+                "first.conf".to_owned(),
+                "bad.conf".to_owned(),
+                "third.conf".to_owned(),
+            ],
+            Some(root.clone()),
+        ))
+        .await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should report the intermediate parse error, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    let mut diagnostics = String::new();
+    if let Some(output) = response.command_output() {
+        diagnostics.push_str(&String::from_utf8_lossy(output.stdout()));
+    }
+    diagnostics.push_str(&String::from_utf8_lossy(response.stderr()));
+    assert!(
+        diagnostics.contains("bad.conf:2: unknown command: definitely-not-a-command"),
+        "source-file should report the bad file and line, got {diagnostics}"
+    );
+    for (name, value) in [
+        ("@source_order", "from-first\n"),
+        ("@after_bad", "from-bad\n"),
+    ] {
+        assert_eq!(
+            handler
+                .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                    scope: OptionScopeSelector::SessionGlobal,
+                    name: Some(name.to_owned()),
+                    value_only: true,
+                    include_inherited: false,
+                    quiet: false,
+                    include_hooks: false,
+                }))
+                .await
+                .command_output()
+                .expect("show-options output")
+                .stdout(),
+            value.as_bytes()
+        );
+    }
+    assert!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::SessionGlobal,
+                name: Some("@must_not_run".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: true,
+                include_hooks: false,
+            }))
+            .await
+            .command_output()
+            .expect("quiet show-options output")
+            .stdout()
+            .is_empty(),
+        "commands after a fatal parse error in the same file must not execute"
+    );
+    fs::remove_dir_all(root).expect("remove multi-path assignment config root");
 }
 
 #[tokio::test]

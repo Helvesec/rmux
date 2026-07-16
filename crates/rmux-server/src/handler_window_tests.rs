@@ -327,3 +327,6 @@ mod resize_respawn;
 
 #[path = "handler_window_tests/respawn_linked_refresh.rs"]
 mod respawn_linked_refresh;
+
+#[path = "handler_window_tests/respawn_linked_guard.rs"]
+mod respawn_linked_guard;

@@ -1,8 +1,11 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::terminal::shell_std_command;
+use rmux_os::process_tree::{ConsoleWindowBehavior, ProcessTreeChild, ProcessTreeController};
 use rmux_proto::RmuxError;
 
 use super::args::{
@@ -415,9 +418,15 @@ pub(crate) async fn run_pipe_command(
         .cloned()
         .unwrap_or_else(|| PathBuf::from("."));
     let data = data.to_vec();
-    tokio::task::spawn_blocking(move || run_pipe_command_blocking(shell, command, cwd, data))
-        .await
-        .map_err(|error| RmuxError::Server(format!("pipe command task failed: {error}")))?
+    let guard = PipeCommandGuard::new();
+    let guard_state = guard.state();
+    let result = tokio::task::spawn_blocking(move || {
+        run_pipe_command_blocking(shell, command, cwd, data, guard_state)
+    })
+    .await
+    .map_err(|error| RmuxError::Server(format!("pipe command task failed: {error}")))?;
+    guard.disarm();
+    result
 }
 
 fn run_pipe_command_blocking(
@@ -425,14 +434,25 @@ fn run_pipe_command_blocking(
     command: String,
     working_directory: PathBuf,
     data: Vec<u8>,
+    guard_state: Arc<PipeCommandGuardState>,
 ) -> Result<(), RmuxError> {
     let mut child = shell_std_command(&shell, &working_directory, &command);
     child.stdin(Stdio::piped());
     child.current_dir(&working_directory);
-    let mut child = child.spawn().map_err(|error| {
-        RmuxError::Server(format!("failed to spawn pipe command '{command}': {error}"))
-    })?;
-    if let Some(mut stdin) = child.stdin.take() {
+    let mut child =
+        ProcessTreeChild::spawn_with_console_window(&mut child, ConsoleWindowBehavior::Suppress)
+            .map_err(|error| {
+                RmuxError::Server(format!("failed to spawn pipe command '{command}': {error}"))
+            })?;
+    let controller = child.controller();
+    if let Err(controller) = guard_state.handoff(controller) {
+        let _ = controller.terminate();
+        let _ = child.wait();
+        return Err(RmuxError::Server(format!(
+            "pipe command '{command}' was cancelled before wait started"
+        )));
+    }
+    if let Some(mut stdin) = child.child_mut().stdin.take() {
         stdin.write_all(&data).map_err(|error| {
             RmuxError::Server(format!("failed to write selection to '{command}': {error}"))
         })?;
@@ -448,6 +468,85 @@ fn run_pipe_command_blocking(
         Err(RmuxError::Server(format!(
             "pipe command '{command}' exited with status {status}"
         )))
+    }
+}
+
+struct PipeCommandGuard {
+    state: Arc<PipeCommandGuardState>,
+}
+
+impl PipeCommandGuard {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(PipeCommandGuardState::new()),
+        }
+    }
+
+    fn state(&self) -> Arc<PipeCommandGuardState> {
+        Arc::clone(&self.state)
+    }
+
+    fn disarm(self) {
+        self.state.disarm();
+    }
+}
+
+impl Drop for PipeCommandGuard {
+    fn drop(&mut self) {
+        self.state.terminate();
+    }
+}
+
+struct PipeCommandGuardState {
+    armed: AtomicBool,
+    controller: Mutex<Option<ProcessTreeController>>,
+}
+
+impl PipeCommandGuardState {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(true),
+            controller: Mutex::new(None),
+        }
+    }
+
+    fn handoff(&self, controller: ProcessTreeController) -> Result<(), ProcessTreeController> {
+        if !self.armed.load(Ordering::SeqCst) {
+            return Err(controller);
+        }
+
+        let mut slot = self
+            .controller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.armed.load(Ordering::SeqCst) {
+            return Err(controller);
+        }
+
+        *slot = Some(controller);
+        Ok(())
+    }
+
+    fn terminate(&self) {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+
+        if let Some(controller) = self.take_controller() {
+            let _ = controller.terminate();
+        }
+    }
+
+    fn disarm(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+        let _ = self.take_controller();
+    }
+
+    fn take_controller(&self) -> Option<ProcessTreeController> {
+        self.controller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 

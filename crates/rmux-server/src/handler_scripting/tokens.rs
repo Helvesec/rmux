@@ -336,6 +336,14 @@ mod tests {
     #[test]
     fn compact_short_options_include_hidden_tmux_flags_without_public_inventory_churn() {
         assert_eq!(
+            normalize_compact_short_options("join-pane", args(&["-p35", "-s", "%1", "-t", "%0"]),),
+            args(&["-p", "35", "-s", "%1", "-t", "%0"])
+        );
+        assert_eq!(
+            normalize_compact_short_options("move-pane", args(&["-p35", "-s", "%1", "-t", "%0"]),),
+            args(&["-p", "35", "-s", "%1", "-t", "%0"])
+        );
+        assert_eq!(
             normalize_compact_short_options("load-buffer", args(&["-wbclip", "/tmp/input"])),
             args(&["-w", "-b", "clip", "/tmp/input"])
         );
