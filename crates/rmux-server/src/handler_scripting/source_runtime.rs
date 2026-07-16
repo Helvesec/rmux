@@ -72,6 +72,7 @@ impl RequestHandler {
                 Vec::new(),
             ),
         };
+        self.record_startup_config_files(&paths).await;
 
         let command = ParsedSourceFileCommand {
             paths,
@@ -97,6 +98,7 @@ impl RequestHandler {
         let should_load_tmux_fallback =
             !loaded.loaded_any_file() && !loaded.has_errors() && !tmux_fallback_paths.is_empty();
         let mut loaded = if should_load_tmux_fallback {
+            self.record_startup_config_files(&tmux_fallback_paths).await;
             let fallback_command = ParsedSourceFileCommand {
                 paths: tmux_fallback_paths,
                 quiet: true,
@@ -138,6 +140,10 @@ impl RequestHandler {
         if let Some(error) = super::aggregate_rmux_errors(errors) {
             self.record_config_error(error).await;
         }
+    }
+
+    async fn record_startup_config_files(&self, paths: &[String]) {
+        self.state.lock().await.set_startup_config_files(paths);
     }
 
     async fn execute_startup_source_file(
@@ -1625,8 +1631,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::super::super::RequestHandler;
+    use super::super::format_context::global_format_context;
+    use super::super::source_files::{default_config_paths, default_tmux_fallback_paths};
     use crate::test_env::EnvVarGuard;
     use crate::DaemonConfig;
+    use rmux_core::formats::FormatVariables;
     use rmux_proto::OptionName;
 
     #[test]
@@ -1665,6 +1674,114 @@ mod tests {
             !handler.config_loading_active(),
             "dropping guard should clear startup config loading"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_startup_config_files_preserve_selection_order_and_spelling() {
+        let root = unique_temp_root("explicit-config-files-format");
+        write_test_config(root.join("first.conf"), "set -g status on\n");
+        write_test_config(root.join("second.conf"), "set -g status off\n");
+        let handler = RequestHandler::new();
+        let config = DaemonConfig::new(root.join("rmux.sock")).with_config_files(
+            vec![
+                PathBuf::from("first.conf"),
+                PathBuf::from("missing.conf"),
+                PathBuf::from("second.conf"),
+            ],
+            false,
+            Some(root.clone()),
+        );
+
+        handler
+            .load_startup_config(config.config_load().clone())
+            .await;
+
+        let state = handler.state.lock().await;
+        let runtime = global_format_context(&state, config.socket_path());
+        assert_eq!(
+            runtime.format_value_by_name("config_files").as_deref(),
+            Some("first.conf,missing.conf,second.conf")
+        );
+        drop(state);
+
+        write_test_config(root.join("later.conf"), "set -g status on\n");
+        handler
+            .load_source_file_command_inner(
+                &super::ParsedSourceFileCommand {
+                    paths: vec!["later.conf".to_owned()],
+                    quiet: false,
+                    parse_only: false,
+                    verbose: false,
+                    expand_paths: false,
+                    target: None,
+                    caller_cwd: Some(root.clone()),
+                    stdin: None,
+                    current_file: None,
+                    syntax: super::SourceSyntax::Rmux,
+                },
+                1,
+            )
+            .await
+            .expect("later source-file should load");
+        let state = handler.state.lock().await;
+        let runtime = global_format_context(&state, config.socket_path());
+        assert_eq!(
+            runtime.format_value_by_name("config_files").as_deref(),
+            Some("first.conf,missing.conf,second.conf"),
+            "later source-file must not rewrite startup selection"
+        );
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn default_startup_config_files_report_rmux_search_selection() {
+        let _lock = crate::test_env::lock_async().await;
+        let root = unique_temp_root("default-config-files-format");
+        let (home, xdg, appdata) = create_test_config_dirs(&root);
+        write_test_config(rmux_user_config_path(&home), "set -g status off\n");
+        let _env = TestConfigEnv::install(&home, &xdg, &appdata, None);
+        let expected = default_config_paths().join(",");
+        let handler = RequestHandler::new();
+        let config = DaemonConfig::new(root.join("rmux.sock")).with_default_config_load(true, None);
+
+        handler
+            .load_startup_config(config.config_load().clone())
+            .await;
+
+        let state = handler.state.lock().await;
+        let runtime = global_format_context(&state, config.socket_path());
+        assert_eq!(
+            runtime.format_value_by_name("config_files").as_deref(),
+            Some(expected.as_str())
+        );
+        drop(state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tmux_fallback_updates_the_reported_startup_selection() {
+        let _lock = crate::test_env::lock_async().await;
+        let root = unique_temp_root("fallback-config-files-format");
+        let (home, xdg, appdata) = create_test_config_dirs(&root);
+        write_test_config(tmux_user_config_path(&home), "set -g status off\n");
+        let _env = TestConfigEnv::install(&home, &xdg, &appdata, None);
+        let expected = default_tmux_fallback_paths().join(",");
+        let handler = RequestHandler::new();
+        let config = DaemonConfig::new(root.join("rmux.sock")).with_default_config_load(true, None);
+
+        handler
+            .load_startup_config(config.config_load().clone())
+            .await;
+
+        let state = handler.state.lock().await;
+        let runtime = global_format_context(&state, config.socket_path());
+        assert_eq!(
+            runtime.format_value_by_name("config_files").as_deref(),
+            Some(expected.as_str())
+        );
+        drop(state);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

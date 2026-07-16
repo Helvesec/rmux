@@ -22,19 +22,19 @@ pub(super) async fn wait_visible_text_for_pane(
         pane.configured_default_timeout(),
     );
     let deadline = crate::wait::wait_deadline(timeout);
-    let pane_id = match crate::wait::with_wait_deadline(
+    let (pane, pane_id) = match crate::wait::with_wait_deadline(
         crate::wait::WAIT_FOR_TEXT_OPERATION,
         timeout,
         deadline,
-        pane.id(),
+        pane.pin_to_current_identity(),
     )
     .await
     {
-        Ok(pane_id) => pane_id,
+        Ok(identity) => identity,
         Err(error) if crate::wait::is_wait_deadline_error(&error) => {
             return (target, None, Err(error));
         }
-        Err(_) => None,
+        Err(error) => return (target, None, Err(error)),
     };
     let result = wait_visible_text(pane, matcher, timeout, deadline, poll_interval).await;
     (target, pane_id, result)

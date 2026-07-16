@@ -29,6 +29,7 @@ use super::key_parse::{
 };
 use super::layout_parse::{
     parse_display_panes, parse_resize_pane, parse_resize_pane_mouse_target, parse_select_layout,
+    ParsedSelectLayout,
 };
 use super::list_commands_runtime::parse_queued_list_commands;
 use super::list_parse::{
@@ -188,6 +189,12 @@ pub(super) fn parse_queue_invocation(
         args.no_extra("start-server")?;
         return Ok(QueueInvocation::StartServer);
     }
+    if command_name == "select-layout" {
+        return match parse_select_layout(CommandTokens::new(arguments), sessions, find_context)? {
+            ParsedSelectLayout::NoOp => Ok(QueueInvocation::NoOp),
+            ParsedSelectLayout::Request(request) => Ok(QueueInvocation::Request(request)),
+        };
+    }
     parse_request_from_parts(
         command_name,
         arguments,
@@ -275,7 +282,6 @@ pub(crate) fn parse_request_from_parts(
         "pipe-pane" => parse_pipe_pane(args, sessions, find_context),
         "kill-pane" => parse_pane_request(args, "kill-pane", sessions, find_context),
         "respawn-pane" => parse_respawn_pane(args, sessions, find_context),
-        "select-layout" => parse_select_layout(args, sessions, find_context),
         "next-layout" => parse_window_request(args, "next-layout", sessions, find_context),
         "previous-layout" => parse_window_request(args, "previous-layout", sessions, find_context),
         "resize-pane" => parse_resize_pane(args, sessions, find_context),
@@ -315,7 +321,10 @@ fn parse_no_argument_request(args: CommandTokens, command: &str) -> Result<Reque
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmux_proto::{PaneTarget, ScopeSelector, SessionName, SetEnvironmentMode, TerminalSize};
+    use rmux_core::command_parser::CommandParser;
+    use rmux_proto::{
+        PaneTarget, ScopeSelector, SessionName, SetEnvironmentMode, TerminalSize, WindowTarget,
+    };
 
     fn parse_request(command: &str, args: &[&str]) -> Request {
         parse_request_with_sessions(command, args, &SessionStore::default())
@@ -342,6 +351,150 @@ mod tests {
             &OptionStore::default(),
             &TargetFindContext::new(None),
         )
+    }
+
+    fn select_layout_sessions() -> (SessionStore, SessionName) {
+        let session_name = SessionName::new("alpha").expect("valid session name");
+        let mut sessions = SessionStore::new();
+        sessions
+            .create_session(session_name.clone(), TerminalSize { cols: 80, rows: 24 })
+            .expect("session creation succeeds");
+        (sessions, session_name)
+    }
+
+    fn parse_select_layout_invocation(
+        command: &str,
+        sessions: &SessionStore,
+        session_name: &SessionName,
+    ) -> Result<QueueInvocation, RmuxError> {
+        let parsed = CommandParser::new()
+            .parse(command)
+            .expect("select-layout command parses");
+        assert_eq!(parsed.commands().len(), 1);
+        parse_queue_invocation(
+            parsed.commands()[0].clone(),
+            None,
+            sessions,
+            &OptionStore::default(),
+            &TargetFindContext::new(Some(Target::Window(WindowTarget::with_window(
+                session_name.clone(),
+                0,
+            )))),
+            None,
+        )
+    }
+
+    fn parse_select_layout_request(
+        command: &str,
+        sessions: &SessionStore,
+        session_name: &SessionName,
+    ) -> Request {
+        let invocation = parse_select_layout_invocation(command, sessions, session_name)
+            .unwrap_or_else(|error| panic!("{command} should parse: {error}"));
+        let QueueInvocation::Request(request) = invocation else {
+            panic!("{command} should produce a request, got {invocation:?}");
+        };
+        request
+    }
+
+    #[test]
+    fn queued_select_layout_navigation_uses_existing_layout_cycle_requests() {
+        let (sessions, session_name) = select_layout_sessions();
+
+        let next =
+            parse_select_layout_invocation("select-layout -n -t alpha:0", &sessions, &session_name)
+                .expect("next layout parses");
+        let QueueInvocation::Request(Request::NextLayout(request)) = next else {
+            panic!("expected next-layout request, got {next:?}");
+        };
+        assert_eq!(
+            request.target,
+            WindowTarget::with_window(session_name.clone(), 0)
+        );
+
+        let previous =
+            parse_select_layout_invocation("select-layout -ptalpha:0", &sessions, &session_name)
+                .expect("previous layout compact flags parse");
+        let QueueInvocation::Request(Request::PreviousLayout(request)) = previous else {
+            panic!("expected previous-layout request, got {previous:?}");
+        };
+        assert_eq!(request.target, WindowTarget::with_window(session_name, 0));
+    }
+
+    #[test]
+    fn queued_select_layout_without_layout_is_a_validated_noop() {
+        let (sessions, session_name) = select_layout_sessions();
+
+        for command in ["select-layout", "select-layout -t alpha:0"] {
+            let invocation = parse_select_layout_invocation(command, &sessions, &session_name)
+                .unwrap_or_else(|error| panic!("{command} should parse: {error}"));
+            assert!(
+                matches!(invocation, QueueInvocation::NoOp),
+                "{command} should be a no-op, got {invocation:?}"
+            );
+        }
+
+        let error =
+            parse_select_layout_invocation("select-layout -t missing:0", &sessions, &session_name)
+                .expect_err("a no-op must still validate its target");
+        assert!(
+            error.to_string().contains("can't find session: missing"),
+            "unexpected missing target error: {error}"
+        );
+    }
+
+    #[test]
+    fn queued_select_layout_preserves_existing_modes_and_rejects_cli_conflicts() {
+        let (sessions, session_name) = select_layout_sessions();
+        assert!(matches!(
+            parse_select_layout_request("select-layout -E -t alpha:0", &sessions, &session_name),
+            Request::SpreadLayout(_)
+        ));
+        assert!(matches!(
+            parse_select_layout_request("select-layout -o -t alpha:0", &sessions, &session_name),
+            Request::SelectOldLayout(_)
+        ));
+        assert!(matches!(
+            parse_select_layout_request(
+                "select-layout -t alpha:0 even-horizontal",
+                &sessions,
+                &session_name
+            ),
+            Request::SelectLayout(_)
+        ));
+        assert!(matches!(
+            parse_select_layout_request(
+                "select-layout -t alpha:0 '89f5,80x24,0,0{39x24,0,0,0,40x24,40,0,1}'",
+                &sessions,
+                &session_name
+            ),
+            Request::SelectCustomLayout(_)
+        ));
+
+        for command in [
+            "select-layout -n -p -t alpha:0",
+            "select-layout -E -n -t alpha:0",
+        ] {
+            let error = parse_select_layout_invocation(command, &sessions, &session_name)
+                .expect_err("multiple mode flags must be rejected like the direct CLI");
+            assert_eq!(
+                error,
+                RmuxError::Server("select-layout accepts only one mode flag".to_owned())
+            );
+        }
+
+        let error = parse_select_layout_invocation(
+            "select-layout -n -t alpha:0 tiled",
+            &sessions,
+            &session_name,
+        )
+        .expect_err("a mode flag and layout must conflict like the direct CLI");
+        assert_eq!(
+            error,
+            RmuxError::Server(
+                "command select-layout: too many arguments (need at most 0)".to_owned()
+            )
+        );
     }
 
     #[test]
@@ -530,6 +683,24 @@ mod tests {
             Some("alpha:0.0")
         );
         assert_eq!(request.command, "printf compact");
+    }
+
+    #[test]
+    fn compact_hidden_buffer_flags_reach_server_request_parsers() {
+        let Request::LoadBuffer(request) = parse_request("load-buffer", &["-wbclip", "/tmp/input"])
+        else {
+            panic!("load-buffer hidden compact flags should parse as LoadBuffer");
+        };
+        assert!(request.set_clipboard);
+        assert_eq!(request.name.as_deref(), Some("clip"));
+        assert_eq!(request.path, "/tmp/input");
+
+        let Request::ListBuffers(request) = parse_request("list-buffers", &["-rF#{buffer_name}"])
+        else {
+            panic!("list-buffers hidden compact flag should parse as ListBuffers");
+        };
+        assert!(request.reversed);
+        assert_eq!(request.format.as_deref(), Some("#{buffer_name}"));
     }
 
     #[test]

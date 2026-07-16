@@ -202,6 +202,8 @@ run_rmux_smoke() {
   local cold_new_sock="tiny-cold-new-$$"
   local cold_start_sock="tiny-cold-start-$$"
   local cold_attach_sock="tiny-cold-attach-$$"
+  local empty="tiny-empty-$$"
+  local preexisting_empty="tiny-preexisting-empty-$$"
   local cold_alias_config="$XDG_CONFIG_HOME/rmux/rmux.conf"
   local real="$SMOKE_ROOT/real.sock"
   local link="$SMOKE_ROOT/link.sock"
@@ -216,6 +218,8 @@ run_rmux_smoke() {
     "$RMUX" -L "$cold_new_sock" kill-server >/dev/null 2>&1 || true
     "$RMUX" -L "$cold_start_sock" kill-server >/dev/null 2>&1 || true
     "$RMUX" -L "$cold_attach_sock" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$empty" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$preexisting_empty" kill-server >/dev/null 2>&1 || true
     "$RMUX" -S "$real" kill-server >/dev/null 2>&1 || true
     rm -f "$cold_alias_config"
   }
@@ -469,7 +473,6 @@ EOF
   grep -Fq "refused to follow symlink" "$SMOKE_ROOT/symlink_new.err" ||
     die "symlink startup did not report refusal"
 
-  local empty="tiny-empty-$$"
   run_capture empty_attach -L "$empty" attach-session
   [ "$(cat "$SMOKE_ROOT/empty_attach.rc")" != "0" ] || die "empty attach succeeded"
   grep -Fq "no sessions" "$SMOKE_ROOT/empty_attach.err" ||
@@ -478,6 +481,18 @@ EOF
     "$RMUX" -L "$empty" kill-server >/dev/null 2>&1 || true
     die "empty attach left a usable daemon"
   fi
+
+  "$RMUX" -L "$preexisting_empty" start-server >/dev/null
+  "$RMUX" -L "$preexisting_empty" set-buffer -b tiny-empty-sentinel alive >/dev/null
+  run_capture preexisting_empty_attach -L "$preexisting_empty" attach-session
+  [ "$(cat "$SMOKE_ROOT/preexisting_empty_attach.rc")" != "0" ] ||
+    die "preexisting empty attach succeeded"
+  assert_trace preexisting_empty_attach "rmux tiny: direct: attach-session"
+  grep -Fq "no sessions" "$SMOKE_ROOT/preexisting_empty_attach.err" ||
+    die "preexisting empty attach did not report no sessions"
+  [ "$("$RMUX" -L "$preexisting_empty" show-buffer -b tiny-empty-sentinel)" = "alive" ] ||
+    die "preexisting empty attach destroyed daemon state"
+  "$RMUX" -L "$preexisting_empty" kill-server >/dev/null
 
   set +e
   RMUX_DISABLE_CLI_TARGET_ACTIONS=1 RMUX_TINY_TRACE=1 \

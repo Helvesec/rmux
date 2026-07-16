@@ -1282,11 +1282,24 @@ async fn parsed_queue_compact_client_and_overlay_flags_preserve_their_meaning() 
     assert!(request.all_other_clients);
     assert!(request.kill_on_detach);
 
-    let Request::RefreshClient(request) = parse("refresh-client", &["-cL"]) else {
+    let Request::RefreshClient(request) = parse(
+        "refresh-client",
+        &[
+            "-lS",
+            "-C80x24",
+            "-factive-pane",
+            "-Fno-detach-on-destroy",
+            "-t=",
+        ],
+    ) else {
         panic!("expected refresh-client request");
     };
-    assert!(request.clear_pan);
-    assert!(request.pan_left);
+    assert!(request.clipboard_query);
+    assert!(request.status_only);
+    assert_eq!(request.control_size.as_deref(), Some("80x24"));
+    assert_eq!(request.flags.as_deref(), Some("active-pane"));
+    assert_eq!(request.flags_alias.as_deref(), Some("no-detach-on-destroy"));
+    assert_eq!(request.target_client.as_deref(), Some("="));
 
     let Request::SwitchClientExt3(request) = parse("switch-client", &["-Er"]) else {
         panic!("expected switch-client request");
@@ -1320,12 +1333,45 @@ async fn parsed_queue_compact_client_and_overlay_flags_preserve_their_meaning() 
 }
 
 #[tokio::test]
-async fn parsed_queue_refresh_client_reserved_wire_flags_are_unknown() {
+async fn parsed_queue_refresh_client_unsupported_fields_are_rejected() {
     let handler = RequestHandler::new();
-    for (command, flag) in [
-        ("refresh-client -A pane:on", "-A"),
-        ("refresh-client -B name:pane:format", "-B"),
-        ("refresh-client -r pane:rgb", "-r"),
+    for (command, expected) in [
+        (
+            "refresh-client -A pane:on",
+            "command refresh-client: unknown flag -A",
+        ),
+        (
+            "refresh-client -B name:pane:format",
+            "command refresh-client: unknown flag -B",
+        ),
+        (
+            "refresh-client -r pane:rgb",
+            "command refresh-client: unknown flag -r",
+        ),
+        (
+            "refresh-client -c",
+            "command refresh-client: unknown flag -c",
+        ),
+        (
+            "refresh-client -D",
+            "command refresh-client: unknown flag -D",
+        ),
+        (
+            "refresh-client -L",
+            "command refresh-client: unknown flag -L",
+        ),
+        (
+            "refresh-client -R",
+            "command refresh-client: unknown flag -R",
+        ),
+        (
+            "refresh-client -U",
+            "command refresh-client: unknown flag -U",
+        ),
+        (
+            "refresh-client 10",
+            "unexpected argument '10' for refresh-client",
+        ),
     ] {
         let parsed = CommandParser::new()
             .parse(command)
@@ -1336,10 +1382,57 @@ async fn parsed_queue_refresh_client_reserved_wire_flags_are_unknown() {
             .await
             .expect_err("reserved refresh-client flag must fail during request parsing");
 
+        assert_eq!(error, rmux_proto::RmuxError::Server(expected.to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn control_queue_refresh_client_pan_fields_fail_closed() {
+    let handler = RequestHandler::new();
+    let requester_pid = 42_006;
+    let _control_events = register_control_client(&handler, requester_pid, true).await;
+
+    for (command, expected) in [
+        (
+            "refresh-client -c",
+            "server error: command refresh-client: unknown flag -c",
+        ),
+        (
+            "refresh-client -D",
+            "server error: command refresh-client: unknown flag -D",
+        ),
+        (
+            "refresh-client -L",
+            "server error: command refresh-client: unknown flag -L",
+        ),
+        (
+            "refresh-client -R",
+            "server error: command refresh-client: unknown flag -R",
+        ),
+        (
+            "refresh-client -U",
+            "server error: command refresh-client: unknown flag -U",
+        ),
+        (
+            "refresh-client 10",
+            "server error: unexpected argument '10' for refresh-client",
+        ),
+    ] {
+        let parsed = CommandParser::new()
+            .parse(command)
+            .expect("generic command parser preserves command arguments");
+        let result = handler
+            .execute_control_commands(requester_pid, parsed)
+            .await;
+
         assert_eq!(
-            error,
-            rmux_proto::RmuxError::Server(format!("command refresh-client: unknown flag {flag}"))
+            result
+                .error
+                .unwrap_or_else(|| panic!("{command} must fail in control queue"))
+                .to_string(),
+            expected
         );
+        assert_eq!(result.exit_status, None);
     }
 }
 

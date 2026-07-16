@@ -189,6 +189,19 @@ fn json_conflicts_with_format_strings() -> Result<(), Box<dyn Error>> {
         "unexpected stderr: {}",
         stderr(&output)
     );
+
+    for incompatible in ["-a", "-I", "-l", "-v"] {
+        let output =
+            harness.run(&["display-message", "--json", incompatible, "#{session_name}"])?;
+
+        assert_eq!(output.status.code(), Some(1), "flag {incompatible}");
+        assert!(stdout(&output).is_empty(), "flag {incompatible}");
+        assert!(
+            stderr(&output).contains("cannot be used with"),
+            "unexpected stderr for {incompatible}: {}",
+            stderr(&output)
+        );
+    }
     Ok(())
 }
 

@@ -1785,9 +1785,6 @@ mod tests {
             last_session: None,
             last_session_id: None,
             flags: ClientFlags::default(),
-            pan_window: Some(2),
-            pan_ox: 3,
-            pan_oy: 4,
             control_tx: crate::pane_io::AttachControlSender::new(
                 control_tx,
                 Arc::clone(&control_backlog),

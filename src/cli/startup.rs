@@ -1,6 +1,10 @@
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
-use rmux_client::AutoStartConfig;
+use rmux_client::{
+    AutoStartConfig, Connection, EnsuredServerConnection, ServerConnectionProvenance,
+};
 use rmux_server::{DaemonConfig, ServerDaemon};
 
 use crate::cli_args::{Cli, Command, ConfigFileSelection, StartServerArgs, TopLevelCommandScan};
@@ -8,10 +12,55 @@ use crate::server_runtime::build_daemon_runtime;
 
 use super::ExitFailure;
 
+#[derive(Debug)]
+pub(in crate::cli) struct PrestartedServerConnection {
+    pub(in crate::cli) connection: Connection,
+    pub(in crate::cli) provenance: ServerConnectionProvenance,
+}
+
+/// A single prestarted connection shared by cloned per-command startup options.
+///
+/// Runtime alias resolution borrows this connection first. The first attach
+/// command then consumes the same connection, so an idle-only shutdown does
+/// not mistake a separate keepalive connection for concurrent activity.
+#[derive(Debug, Clone)]
+pub(in crate::cli) struct PrestartedConnection {
+    inner: Rc<RefCell<Option<PrestartedServerConnection>>>,
+}
+
+impl PrestartedConnection {
+    pub(in crate::cli) fn new(outcome: EnsuredServerConnection) -> Self {
+        let provenance = outcome.provenance();
+        let connection = outcome.into_connection();
+        Self {
+            inner: Rc::new(RefCell::new(Some(PrestartedServerConnection {
+                connection,
+                provenance,
+            }))),
+        }
+    }
+
+    pub(in crate::cli) fn with_connection_mut<T>(
+        &self,
+        use_connection: impl FnOnce(&mut Connection) -> T,
+    ) -> T {
+        let mut inner = self.inner.borrow_mut();
+        let prestarted = inner
+            .as_mut()
+            .expect("prestarted connection must exist during alias resolution");
+        use_connection(&mut prestarted.connection)
+    }
+
+    pub(in crate::cli) fn take(&self) -> Option<PrestartedServerConnection> {
+        self.inner.borrow_mut().take()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::cli) struct StartupOptions {
     pub(in crate::cli) no_start_server: bool,
     pub(in crate::cli) config: AutoStartConfig,
+    pub(in crate::cli) prestarted_connection: Option<PrestartedConnection>,
 }
 
 impl StartupOptions {
@@ -19,7 +68,16 @@ impl StartupOptions {
         Self {
             no_start_server,
             config,
+            prestarted_connection: None,
         }
+    }
+
+    pub(in crate::cli) fn with_prestarted_connection(
+        mut self,
+        connection: Option<PrestartedConnection>,
+    ) -> Self {
+        self.prestarted_connection = connection;
+        self
     }
 
     pub(in crate::cli) fn for_command(
@@ -39,6 +97,7 @@ impl StartupOptions {
         Self {
             no_start_server: self.no_start_server || !command_has_start_server_flag,
             config,
+            prestarted_connection: self.prestarted_connection.clone(),
         }
     }
 }

@@ -81,6 +81,110 @@ fn source_file_parse_only_does_not_execute_shell_or_apply_options() -> Result<()
     Ok(())
 }
 
+#[test]
+fn option_like_set_option_values_match_tmux_oracle() -> Result<(), Box<dyn Error>> {
+    let tmux = match FrozenTmuxBinary::discover() {
+        FrozenTmuxBinary::Available(path) => path,
+        FrozenTmuxBinary::Unavailable {
+            checked_path,
+            reason,
+        } => {
+            eprintln!(
+                "runtime skip: tmux 3.7b oracle unavailable via {TMUX_ORACLE_ENV}/{FROZEN_TMUX_ENV} or default '{}': {reason}",
+                checked_path.display()
+            );
+            return Ok(());
+        }
+    };
+    let harness = SourceFileOracleHarness::new("option-like-values")?;
+    harness.rmux_success(["-f", "/dev/null", "new-session", "-d", "-s", "s"])?;
+    harness.tmux_success(&tmux, ["-f", "/dev/null", "new-session", "-d", "-s", "s"])?;
+
+    harness.rmux_success(["set-option", "-g", "@direct", "-tfoo"])?;
+    harness.tmux_success(&tmux, ["set-option", "-g", "@direct", "-tfoo"])?;
+    let rmux_direct = harness.rmux_output(["show-options", "-gqv"], "@direct")?;
+    let tmux_direct = harness.tmux_output(&tmux, ["show-options", "-gqv"], "@direct")?;
+    assert_eq!(rmux_direct.status.code(), tmux_direct.status.code());
+    assert_eq!(rmux_direct.stdout, tmux_direct.stdout);
+    assert_eq!(rmux_direct.stderr, tmux_direct.stderr);
+
+    let config = harness.tmpdir().join("option-like.conf");
+    fs::write(&config, "set-option -g @source -tfoo\n")?;
+    harness.rmux_success_with_path(["source-file"], &config)?;
+    let tmux_source_file = harness.tmux_output(&tmux, ["source-file"], &config)?;
+    assert_success("tmux", &tmux_source_file)?;
+    let rmux_source = harness.rmux_output(["show-options", "-gqv"], "@source")?;
+    let tmux_source = harness.tmux_output(&tmux, ["show-options", "-gqv"], "@source")?;
+    assert_eq!(rmux_source.status.code(), tmux_source.status.code());
+    assert_eq!(rmux_source.stdout, tmux_source.stdout);
+    assert_eq!(rmux_source.stderr, tmux_source.stderr);
+
+    Ok(())
+}
+
+#[test]
+fn required_option_values_match_tmux_oracle() -> Result<(), Box<dyn Error>> {
+    let tmux = match FrozenTmuxBinary::discover() {
+        FrozenTmuxBinary::Available(path) => path,
+        FrozenTmuxBinary::Unavailable {
+            checked_path,
+            reason,
+        } => {
+            eprintln!(
+                "runtime skip: tmux 3.7b oracle unavailable via {TMUX_ORACLE_ENV}/{FROZEN_TMUX_ENV} or default '{}': {reason}",
+                checked_path.display()
+            );
+            return Ok(());
+        }
+    };
+    let harness = SourceFileOracleHarness::new("required-option-values")?;
+    for session in ["alpha", "beta"] {
+        harness.rmux_success(["-f", "/dev/null", "new-session", "-d", "-s", session])?;
+        harness.tmux_success(
+            &tmux,
+            ["-f", "/dev/null", "new-session", "-d", "-s", session],
+        )?;
+    }
+    harness.rmux_success(["set-buffer", "-b", "audit", "payload"])?;
+    harness.tmux_success(&tmux, ["set-buffer", "-b", "audit", "payload"])?;
+    harness.rmux_success(["split-window", "-d", "-t", "alpha:0"])?;
+    harness.tmux_success(&tmux, ["split-window", "-d", "-t", "alpha:0"])?;
+
+    for arguments in [
+        &["list-windows", "-F", "-tfoo", "-t", "beta"][..],
+        &["list-windows", "-F", "--", "-t", "beta"][..],
+        &["list-sessions", "-F", "-Q", "-r"][..],
+        &["list-panes", "-F", "--", "-t", "beta"][..],
+        &["list-buffers", "-F", "-tfoo", "-r"][..],
+        &[
+            "break-pane",
+            "-d",
+            "-P",
+            "-F",
+            "-Q",
+            "-s",
+            "alpha:0.1",
+            "-t",
+            "beta:",
+        ][..],
+    ] {
+        let rmux_output = harness.rmux_output(arguments.iter().copied(), "")?;
+        let tmux_output = harness.tmux_output(&tmux, arguments.iter().copied(), Path::new(""))?;
+        assert_success("rmux", &rmux_output)?;
+        assert_success("tmux", &tmux_output)?;
+        assert_eq!(
+            rmux_output.stdout, tmux_output.stdout,
+            "stdout diverged for {arguments:?}"
+        );
+        assert_eq!(
+            rmux_output.stderr, tmux_output.stderr,
+            "stderr diverged for {arguments:?}"
+        );
+    }
+
+    Ok(())
+}
+
 struct SourceFileOracleHarness {
     rmux_label: String,
     tmux_socket: PathBuf,

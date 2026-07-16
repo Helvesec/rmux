@@ -836,6 +836,96 @@ fn list_commands_is_client_local_and_supports_formatting() -> Result<(), Box<dyn
 }
 
 #[test]
+fn list_formats_and_filters_receive_the_selected_socket_path() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("list-socket-path-formats")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep", "60"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "sentinel", "alive"])?);
+
+    let socket_path = harness.socket_path().to_string_lossy();
+    let expected_line = format!("{socket_path}\n");
+    let socket_filter = format!("#{{==:#{{socket_path}},{socket_path}}}");
+    for (command, args) in [
+        (
+            "list-sessions",
+            vec![
+                "list-sessions",
+                "-F",
+                "#{socket_path}",
+                "-f",
+                socket_filter.as_str(),
+            ],
+        ),
+        (
+            "list-windows",
+            vec![
+                "list-windows",
+                "-t",
+                "alpha",
+                "-F",
+                "#{socket_path}",
+                "-f",
+                socket_filter.as_str(),
+            ],
+        ),
+        (
+            "list-panes",
+            vec![
+                "list-panes",
+                "-t",
+                "alpha",
+                "-F",
+                "#{socket_path}",
+                "-f",
+                socket_filter.as_str(),
+            ],
+        ),
+        (
+            "list-buffers",
+            vec![
+                "list-buffers",
+                "-F",
+                "#{socket_path}",
+                "-f",
+                socket_filter.as_str(),
+            ],
+        ),
+        ("list-keys", vec!["list-keys", "-1", "-F", "#{socket_path}"]),
+    ] {
+        let output = harness.run(&args)?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{command} failed: {}",
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), expected_line, "{command}");
+        assert!(stderr(&output).is_empty(), "{command}");
+    }
+
+    let direct = harness.run(&["list-commands", "-F", "#{socket_path}", "new-window"])?;
+    assert_eq!(direct.status.code(), Some(0));
+    assert_eq!(stdout(&direct), expected_line);
+    assert!(stderr(&direct).is_empty());
+
+    let queued = harness.run(&[
+        "list-commands",
+        "-F",
+        "#{socket_path}",
+        "new-window",
+        ";",
+        "display-message",
+        "-p",
+        "queued",
+    ])?;
+    assert_eq!(queued.status.code(), Some(0));
+    assert_eq!(stdout(&queued), format!("{socket_path}\nqueued\n"));
+    assert!(stderr(&queued).is_empty());
+
+    Ok(())
+}
+
+#[test]
 fn list_keys_uses_default_table_without_server() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("list-keys-defaults-without-server")?;
     let output = harness.run(&["list-keys", "-T", "prefix"])?;
@@ -855,6 +945,15 @@ fn list_keys_uses_default_table_without_server() -> Result<(), Box<dyn Error>> {
     assert!(stdout(&output).contains("bind-key    -T prefix \\\"      split-window"));
     assert!(stdout(&output).contains("bind-key    -T prefix \\~      show-messages"));
     assert!(stderr(&output).is_empty());
+    assert!(!harness.socket_path().exists());
+
+    let formatted = harness.run(&["list-keys", "-1", "-F", "#{socket_path}"])?;
+    assert_eq!(formatted.status.code(), Some(0));
+    assert_eq!(
+        stdout(&formatted),
+        format!("{}\n", harness.socket_path().display())
+    );
+    assert!(stderr(&formatted).is_empty());
     assert!(!harness.socket_path().exists());
     Ok(())
 }
@@ -1621,6 +1720,74 @@ fn attach_session_is_a_start_server_command() -> Result<(), Box<dyn Error>> {
     assert_eq!(stderr(&output).trim(), "no sessions");
     assert!(harness.pid_path().exists());
     wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_cleans_up_daemon_started_by_command() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("queued-attach-start-server")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &["attach-session", "-t", "alpha", ";", "list-sessions"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output).trim(), "no sessions");
+    assert!(harness.pid_path().exists());
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn earlier_queued_command_does_not_consume_attach_startup_connection() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("queued-command-before-attach")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &["start-server", ";", "attach-session", "-t", "alpha"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output).trim(), "no sessions");
+    assert!(harness.pid_path().exists());
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn attach_session_preserves_preexisting_empty_daemon_and_state() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("attach-preexisting-empty")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-buffer", "-b", "sentinel", "alive"])?);
+
+    for args in [
+        &["attach-session"][..],
+        &["attach-session", ";", "list-sessions"][..],
+    ] {
+        let output = harness.run(args)?;
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(stderr(&output).trim(), "no sessions");
+        assert!(
+            daemon.child_mut().try_wait()?.is_none(),
+            "attach-session must not stop a preexisting empty daemon"
+        );
+
+        let buffer = harness.run(&["show-buffer", "-b", "sentinel"])?;
+        assert_eq!(buffer.status.code(), Some(0));
+        assert!(stderr(&buffer).is_empty());
+        assert_eq!(stdout(&buffer).trim(), "alive");
+    }
+
+    assert_success(&harness.run(&["kill-server"])?);
     Ok(())
 }
 

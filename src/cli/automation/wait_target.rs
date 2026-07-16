@@ -7,7 +7,7 @@ use rmux_proto::{
 use crate::cli_args::TargetSpec;
 use crate::cli_response::tmux_cli_error_message;
 
-use super::super::ExitFailure;
+use super::super::{listed_pane_index_matches_target, ExitFailure};
 use super::common::{pane_snapshot, resolve_pane_slot};
 use super::pane_exit::PaneExitStatus;
 
@@ -180,7 +180,7 @@ fn pane_identity_for_slot(
         .list_panes_in_window(
             target.session_name().clone(),
             Some(target.window_index()),
-            Some("#{pane_index}\t#{pane_id}\t#{session_id}\n".to_owned()),
+            Some("#{pane_index}\t#{pane-base-index}\t#{pane_id}\t#{session_id}\n".to_owned()),
         )
         .map_err(ExitFailure::from_client)?;
     let output = match response {
@@ -193,10 +193,14 @@ fn pane_identity_for_slot(
         }
         other => return Err(unexpected_response(&other, "resolving pane wait identity")),
     };
-    let expected_index = target.pane_index().to_string();
-    for line in String::from_utf8_lossy(output.stdout()).lines() {
+    let text = String::from_utf8_lossy(output.stdout());
+    for line in text.lines() {
         let mut fields = line.split('\t');
-        if fields.next() != Some(expected_index.as_str()) {
+        if !listed_pane_index_matches_target(
+            target,
+            fields.next().unwrap_or_default(),
+            fields.next().unwrap_or_default(),
+        ) {
             continue;
         }
         if let Some((pane_id, session_id)) = fields

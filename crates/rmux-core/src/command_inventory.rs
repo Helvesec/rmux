@@ -12,10 +12,11 @@ mod signatures;
 
 use signatures::LIST_COMMAND_SIGNATURES;
 
-/// Typed short-option metadata derived from the public command signature.
+/// Typed short-option metadata used by internal command normalization.
 ///
-/// This keeps non-Clap command paths on the same option boundary rules as the
-/// command inventory instead of maintaining a second per-command flag table.
+/// Public options are derived from the frozen `list-commands` signature. A
+/// small internal supplement carries implemented tmux options that tmux itself
+/// intentionally omits from `list-commands`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandShortOptionSpec {
     boolean_flags: String,
@@ -112,6 +113,23 @@ impl CommandShortOptionSpec {
             self.add_boolean(flag);
         }
     }
+
+    fn add_internal_boolean_flags(&mut self, flags: &str) {
+        for flag in flags.chars() {
+            self.add_boolean(flag);
+        }
+    }
+}
+
+fn add_internal_short_options(command_name: &str, spec: &mut CommandShortOptionSpec) {
+    // tmux 3.7b accepts these flags but does not render them in
+    // `list-commands`. Keep normalization metadata separate so the public
+    // inventory remains oracle-exact.
+    match command_name {
+        "list-buffers" => spec.add_internal_boolean_flags("r"),
+        "load-buffer" => spec.add_internal_boolean_flags("w"),
+        _ => {}
+    }
 }
 
 /// Returns typed short-option metadata for a public command.
@@ -126,7 +144,11 @@ pub fn command_short_option_spec(command_name: &str) -> Option<&'static CommandS
         .get_or_init(|| {
             LIST_COMMAND_SIGNATURES
                 .iter()
-                .map(|(name, usage)| (*name, CommandShortOptionSpec::from_usage(usage)))
+                .map(|(name, usage)| {
+                    let mut spec = CommandShortOptionSpec::from_usage(usage);
+                    add_internal_short_options(name, &mut spec);
+                    (*name, spec)
+                })
                 .collect()
         })
         .iter()
@@ -232,6 +254,23 @@ pub fn render_list_commands(
     format: Option<&str>,
     requested_command: Option<&str>,
 ) -> Result<Vec<String>, ListCommandsError> {
+    render_list_commands_with_optional_socket_path(format, requested_command, None)
+}
+
+/// Renders the selected command inventory with the selected server socket available to formats.
+pub fn render_list_commands_for_socket(
+    format: Option<&str>,
+    requested_command: Option<&str>,
+    socket_path: &str,
+) -> Result<Vec<String>, ListCommandsError> {
+    render_list_commands_with_optional_socket_path(format, requested_command, Some(socket_path))
+}
+
+fn render_list_commands_with_optional_socket_path(
+    format: Option<&str>,
+    requested_command: Option<&str>,
+    socket_path: Option<&str>,
+) -> Result<Vec<String>, ListCommandsError> {
     let requested = requested_command
         .map(resolve_list_commands_target)
         .transpose()?;
@@ -243,7 +282,12 @@ pub fn render_list_commands(
             Some(requested_name) => *name == requested_name,
         })
         .filter_map(|(name, _)| {
-            let line = render_list_commands_line(format, name, list_command_alias(name));
+            let line = render_list_commands_line_with_optional_socket_path(
+                format,
+                name,
+                list_command_alias(name),
+                socket_path,
+            );
             if format.is_some() && line.is_empty() {
                 None
             } else {
@@ -256,11 +300,20 @@ pub fn render_list_commands(
 /// Renders one command inventory line with tmux command-list format fields.
 #[must_use]
 pub fn render_list_commands_line(format: Option<&str>, name: &str, alias: Option<&str>) -> String {
+    render_list_commands_line_with_optional_socket_path(format, name, alias, None)
+}
+
+fn render_list_commands_line_with_optional_socket_path(
+    format: Option<&str>,
+    name: &str,
+    alias: Option<&str>,
+    socket_path: Option<&str>,
+) -> String {
     let alias = alias.unwrap_or("");
     match format {
         Some(template) => {
             let usage = list_command_usage_without_alias(name);
-            render_list_commands_template(template, name, alias, usage.as_ref())
+            render_list_commands_template(template, name, alias, usage.as_ref(), socket_path)
         }
         None => format!("{name} {}", list_command_usage(name)),
     }
@@ -330,11 +383,20 @@ fn is_rmux_extension(name: &str) -> bool {
         .any(|entry| entry.name == name)
 }
 
-fn render_list_commands_template(template: &str, name: &str, alias: &str, usage: &str) -> String {
-    let variables = FormatContext::new()
+fn render_list_commands_template(
+    template: &str,
+    name: &str,
+    alias: &str,
+    usage: &str,
+    socket_path: Option<&str>,
+) -> String {
+    let mut variables = FormatContext::new()
         .with_named_value("command_list_name", name)
         .with_named_value("command_list_alias", alias)
         .with_named_value("command_list_usage", usage);
+    if let Some(socket_path) = socket_path {
+        variables = variables.with_named_value("socket_path", socket_path);
+    }
     render_template(template, &variables)
 }
 
@@ -414,7 +476,30 @@ mod tests {
         assert!(split_window.takes_value('p'));
         assert!(!split_window.is_boolean('e'));
         assert!(!split_window.is_boolean('p'));
+
+        let load_buffer = command_short_option_spec("load-buffer").expect("load-buffer signature");
+        assert!(load_buffer.is_boolean('w'));
+        assert!(load_buffer.takes_value('b'));
+
+        let list_buffers =
+            command_short_option_spec("list-buffers").expect("list-buffers signature");
+        assert!(list_buffers.is_boolean('r'));
         assert!(command_short_option_spec("not-a-command").is_none());
+    }
+
+    #[test]
+    fn internal_short_options_do_not_change_public_signatures() {
+        let load_buffer = LIST_COMMAND_SIGNATURES
+            .iter()
+            .find_map(|(name, usage)| (*name == "load-buffer").then_some(*usage))
+            .expect("load-buffer public signature");
+        let list_buffers = LIST_COMMAND_SIGNATURES
+            .iter()
+            .find_map(|(name, usage)| (*name == "list-buffers").then_some(*usage))
+            .expect("list-buffers public signature");
+
+        assert!(!load_buffer.contains("-w"));
+        assert!(!list_buffers.contains("-r"));
     }
 
     #[test]

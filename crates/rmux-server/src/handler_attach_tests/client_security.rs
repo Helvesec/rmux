@@ -514,46 +514,58 @@ async fn refresh_client_reserved_wire_fields_from_old_clients_are_rejected() {
         .register_attach(std::process::id(), alpha, control_tx)
         .await;
 
-    for (subscriptions, subscriptions_format, colour_report, expected) in [
-        (
-            vec!["%0:on".to_owned()],
-            Vec::new(),
-            None,
-            "refresh-client -A is not supported",
-        ),
-        (
-            Vec::new(),
-            vec!["name:%0:#{pane_id}".to_owned()],
-            None,
-            "refresh-client -B is not supported",
-        ),
-        (
-            Vec::new(),
-            Vec::new(),
-            Some("%0".to_owned()),
-            "refresh-client -r is not supported",
-        ),
+    let base_request = || RefreshClientRequest {
+        target_client: None,
+        adjustment: None,
+        clear_pan: false,
+        pan_left: false,
+        pan_right: false,
+        pan_up: false,
+        pan_down: false,
+        status_only: false,
+        clipboard_query: false,
+        flags: None,
+        flags_alias: None,
+        subscriptions: Vec::new(),
+        subscriptions_format: Vec::new(),
+        control_size: Some("80x24".to_owned()),
+        colour_report: None,
+    };
+
+    let mut clear_pan = base_request();
+    clear_pan.clear_pan = true;
+    let mut pan_down = base_request();
+    pan_down.pan_down = true;
+    let mut pan_left = base_request();
+    pan_left.pan_left = true;
+    let mut pan_right = base_request();
+    pan_right.pan_right = true;
+    let mut pan_up = base_request();
+    pan_up.pan_up = true;
+    let mut adjustment = base_request();
+    adjustment.adjustment = Some(10);
+    let mut subscriptions = base_request();
+    subscriptions.subscriptions = vec!["%0:on".to_owned()];
+    let mut subscriptions_format = base_request();
+    subscriptions_format.subscriptions_format = vec!["name:%0:#{pane_id}".to_owned()];
+    let mut colour_report = base_request();
+    colour_report.colour_report = Some("%0".to_owned());
+
+    for (request, expected) in [
+        (clear_pan, "refresh-client -c is not supported"),
+        (pan_down, "refresh-client -D is not supported"),
+        (pan_left, "refresh-client -L is not supported"),
+        (pan_right, "refresh-client -R is not supported"),
+        (pan_up, "refresh-client -U is not supported"),
+        (adjustment, "refresh-client adjustment is not supported"),
+        (subscriptions, "refresh-client -A is not supported"),
+        (subscriptions_format, "refresh-client -B is not supported"),
+        (colour_report, "refresh-client -r is not supported"),
     ] {
         let response = handler
             .dispatch(
                 std::process::id(),
-                Request::RefreshClient(Box::new(RefreshClientRequest {
-                    target_client: None,
-                    adjustment: None,
-                    clear_pan: false,
-                    pan_left: false,
-                    pan_right: false,
-                    pan_up: false,
-                    pan_down: false,
-                    status_only: false,
-                    clipboard_query: false,
-                    flags: None,
-                    flags_alias: None,
-                    subscriptions,
-                    subscriptions_format,
-                    control_size: Some("80x24".to_owned()),
-                    colour_report,
-                })),
+                Request::RefreshClient(Box::new(request)),
             )
             .await
             .response;

@@ -35,6 +35,23 @@ async fn runtime_command_alias_option_drives_command_string_parser() {
 }
 
 #[tokio::test]
+async fn runtime_command_alias_preserves_option_like_positional_values() {
+    let handler = RequestHandler::new();
+    set_command_alias(&handler, "literal=set-option -g @alias-value").await;
+
+    let parsed = handler
+        .parse_command_string_one_group("literal -tfoo ; show-options -gqv @alias-value")
+        .await
+        .expect("runtime alias should preserve its option-like appended argument");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("runtime alias should execute");
+
+    assert_eq!(output.stdout(), b"-tfoo\n");
+}
+
+#[tokio::test]
 async fn runtime_command_alias_option_drives_source_file_parser() {
     let handler = RequestHandler::new();
     set_command_alias(&handler, "sbuf=set-buffer -b aliased").await;

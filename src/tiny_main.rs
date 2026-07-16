@@ -15,9 +15,10 @@ use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
 #[cfg(windows)]
 use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
 use rmux_client::{
-    connect, connect_or_absent, ensure_server_running_with_config, resolve_socket_path,
+    connect, connect_or_absent, ensure_server_running_with_config_outcome, resolve_socket_path,
     resolve_tmux_compatible_socket_path, AttachTransition, AutoStartConfig, ClientError,
-    ConnectResult, Connection, StartServerError,
+    ConnectResult, Connection, EnsuredServerConnection, ServerConnectionProvenance,
+    StartServerError,
 };
 use rmux_core::formats::{DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT};
 use rmux_core::{
@@ -1401,13 +1402,18 @@ fn run_attach_session(
     socket_path: &Path,
     request: AttachSessionExt2Request,
 ) -> Result<i32, String> {
-    let mut connection = match connect_with_validated_startup(socket_path) {
-        Ok(connection) => connection,
+    let connection_outcome = match connect_with_validated_startup_outcome(socket_path) {
+        Ok(outcome) => outcome,
         Err(_) => return exec_full_helper(original_args),
     };
+    let started_by_caller =
+        connection_outcome.provenance() == ServerConnectionProvenance::StartedByCaller;
+    let mut connection = connection_outcome.into_connection();
     if !server_has_sessions(&mut connection)? {
-        let _ = connection.kill_server();
-        wait_for_killed_server_socket_cleanup(socket_path);
+        if started_by_caller {
+            let _ = connection.shutdown_if_idle();
+            wait_for_killed_server_socket_cleanup(socket_path);
+        }
         return Err("no sessions".to_owned());
     }
 
@@ -1502,7 +1508,14 @@ fn run_target_action(
 }
 
 fn connect_with_validated_startup(socket_path: &Path) -> Result<Connection, String> {
-    ensure_server_running_with_config(socket_path, default_auto_start_config()?)
+    connect_with_validated_startup_outcome(socket_path)
+        .map(EnsuredServerConnection::into_connection)
+}
+
+fn connect_with_validated_startup_outcome(
+    socket_path: &Path,
+) -> Result<EnsuredServerConnection, String> {
+    ensure_server_running_with_config_outcome(socket_path, default_auto_start_config()?)
         .map_err(|error| error.to_string())
 }
 

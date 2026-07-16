@@ -12,22 +12,22 @@ pub(crate) struct DisplayMessageArgs {
     pub(crate) delay: Option<String>,
     #[arg(short = 'F', allow_hyphen_values = true)]
     pub(crate) format: Option<String>,
-    #[arg(short = 'a', action = ArgAction::SetTrue)]
+    #[arg(short = 'a', action = ArgAction::SetTrue, conflicts_with = "json")]
     pub(crate) all_formats: bool,
     /// tmux's `-C` keeps pane updates flowing while the message is displayed.
     /// RMUX does not freeze pane output for status messages, so this flag is
     /// accepted for compatibility and has no additional runtime effect.
     #[arg(short = 'C', action = ArgAction::SetTrue)]
     pub(crate) no_freeze: bool,
-    #[arg(short = 'I', action = ArgAction::SetTrue)]
+    #[arg(short = 'I', action = ArgAction::SetTrue, conflicts_with = "json")]
     pub(crate) stdin: bool,
-    #[arg(short = 'l', action = ArgAction::SetTrue)]
+    #[arg(short = 'l', action = ArgAction::SetTrue, conflicts_with = "json")]
     pub(crate) literal: bool,
     #[arg(short = 'N', action = ArgAction::SetTrue, hide = true)]
     pub(crate) no_format: bool,
     #[arg(short = 'p', action = ArgAction::SetTrue, conflicts_with = "json")]
     pub(crate) print: bool,
-    #[arg(short = 'v', action = ArgAction::SetTrue)]
+    #[arg(short = 'v', action = ArgAction::SetTrue, conflicts_with = "json")]
     pub(crate) verbose: bool,
     #[arg(long = "json", action = ArgAction::SetTrue)]
     pub(crate) json: bool,

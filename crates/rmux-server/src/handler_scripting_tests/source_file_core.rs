@@ -267,14 +267,56 @@ async fn source_file_show_window_options_rejects_h() {
 }
 
 #[tokio::test]
-async fn source_file_rejects_refresh_client_reserved_wire_flags() {
+async fn source_file_rejects_refresh_client_unsupported_fields() {
     let handler = RequestHandler::new();
-    let root = temp_root("refresh-client-reserved-flags");
+    let root = temp_root("refresh-client-unsupported-fields");
 
-    for (name, command, flag) in [
-        ("a.conf", "refresh-client -A pane:on\n", "-A"),
-        ("b.conf", "refresh-client -B name:pane:format\n", "-B"),
-        ("r.conf", "refresh-client -r pane:rgb\n", "-r"),
+    for (name, command, expected) in [
+        (
+            "a.conf",
+            "refresh-client -A pane:on\n",
+            "command refresh-client: unknown flag -A",
+        ),
+        (
+            "b.conf",
+            "refresh-client -B name:pane:format\n",
+            "command refresh-client: unknown flag -B",
+        ),
+        (
+            "r.conf",
+            "refresh-client -r pane:rgb\n",
+            "command refresh-client: unknown flag -r",
+        ),
+        (
+            "c.conf",
+            "refresh-client -c\n",
+            "command refresh-client: unknown flag -c",
+        ),
+        (
+            "d.conf",
+            "refresh-client -D\n",
+            "command refresh-client: unknown flag -D",
+        ),
+        (
+            "l.conf",
+            "refresh-client -L\n",
+            "command refresh-client: unknown flag -L",
+        ),
+        (
+            "rr.conf",
+            "refresh-client -R\n",
+            "command refresh-client: unknown flag -R",
+        ),
+        (
+            "u.conf",
+            "refresh-client -U\n",
+            "command refresh-client: unknown flag -U",
+        ),
+        (
+            "adjustment.conf",
+            "refresh-client 10\n",
+            "unexpected argument '10' for refresh-client",
+        ),
     ] {
         let config = root.join(name);
         write_config(&config, command);
@@ -285,14 +327,11 @@ async fn source_file_rejects_refresh_client_reserved_wire_flags() {
             ))
             .await;
         let Response::Error(response) = response else {
-            panic!("expected source-file to reject {flag}");
+            panic!("expected source-file to reject {command:?}");
         };
         assert_eq!(
             response.error,
-            rmux_proto::RmuxError::Server(format!(
-                "{}:1: command refresh-client: unknown flag {flag}",
-                config.display()
-            ))
+            rmux_proto::RmuxError::Server(format!("{}:1: {expected}", config.display()))
         );
     }
 

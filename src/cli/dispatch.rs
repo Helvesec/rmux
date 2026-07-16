@@ -526,7 +526,7 @@ fn dispatch(
         Command::SendKeys(args) => run_send_keys(args, socket_path),
         Command::BindKey(args) => run_bind_key(args, socket_path),
         Command::UnbindKey(args) => run_unbind_key(args, socket_path),
-        Command::ListCommands(args) => run_list_commands(args),
+        Command::ListCommands(args) => run_list_commands(args, socket_path),
         Command::ListKeys(args) => run_list_keys(args, socket_path),
         Command::SendPrefix(args) => run_send_prefix(args, socket_path),
         Command::Prompt(args) => {

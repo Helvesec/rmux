@@ -539,6 +539,93 @@ fn source_file_commands_follow_implicit_selected_window_context() -> Result<(), 
 }
 
 #[test]
+fn source_file_select_layout_supports_navigation_noop_and_target_validation(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-select-layout-modes")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-d", "-t", "alpha:0"])?);
+    assert_success(&harness.run(&["select-layout", "-t", "alpha:0", "even-horizontal"])?);
+
+    let baseline =
+        stdout(&harness.run(&["display-message", "-p", "-t", "alpha:0", "#{window_layout}"])?);
+    let navigation = harness.tmpdir().join("select-layout-navigation.conf");
+    fs::write(
+        &navigation,
+        "select-layout -n -t alpha:0\n\
+         display-message -p -t alpha:0 '#{window_layout}'\n\
+         select-layout -p -t alpha:0\n\
+         display-message -p -t alpha:0 '#{window_layout}'\n",
+    )?;
+
+    assert_success(&harness.run(&[
+        "source-file",
+        "-n",
+        navigation.to_str().expect("utf-8 config path"),
+    ])?);
+
+    let output = harness.run(&[
+        "source-file",
+        navigation.to_str().expect("utf-8 config path"),
+    ])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    let layouts = stdout(&output)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        layouts.len(),
+        2,
+        "unexpected source-file output: {output:?}"
+    );
+    assert_ne!(
+        layouts[0],
+        baseline.trim_end(),
+        "-n must advance the layout"
+    );
+    assert_eq!(
+        layouts[1],
+        baseline.trim_end(),
+        "-p must return to the prior layout"
+    );
+
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-select-layout",
+        "set-buffer -b select-layout-noop-hook fired",
+    ])?);
+    let noop = harness.tmpdir().join("select-layout-noop.conf");
+    fs::write(
+        &noop,
+        "select-layout -t alpha:0\n\
+         display-message -p -t alpha:0 '#{window_layout}'\n",
+    )?;
+    let output = harness.run(&["source-file", noop.to_str().expect("utf-8 config path")])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), baseline);
+    assert!(stderr(&output).is_empty());
+    let hook_marker = harness.run(&["show-buffer", "-b", "select-layout-noop-hook"])?;
+    assert_eq!(
+        hook_marker.status.code(),
+        Some(1),
+        "a no-op must preserve the direct CLI hook behavior"
+    );
+
+    let missing = harness.tmpdir().join("select-layout-missing-target.conf");
+    fs::write(&missing, "select-layout -t missing:0\n")?;
+    let output = harness.run(&["source-file", missing.to_str().expect("utf-8 config path")])?;
+    assert_eq!(output.status.code(), Some(1));
+    let rendered = format!("{}{}", stdout(&output), stderr(&output));
+    assert!(
+        rendered.contains("can't find session: missing"),
+        "a no-op must still validate its target: {rendered:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn run_shell_dash_e_merges_stderr_like_tmux37() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-stderr")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -2437,6 +2524,19 @@ fn if_shell_supports_representative_public_commands() -> Result<(), Box<dyn Erro
         "89f5,80x24,0,0{39x24,0,0,0,40x24,40,0,1}\n"
     );
     assert!(stderr(&windows).is_empty());
+
+    let baseline_layout = stdout(&windows);
+    assert_success(&harness.run(&["if-shell", "-F", "1", "select-layout -n -t alpha:0"])?);
+    let next_layout =
+        harness.run(&["display-message", "-p", "-t", "alpha:0", "#{window_layout}"])?;
+    assert_ne!(stdout(&next_layout), baseline_layout);
+    assert!(stderr(&next_layout).is_empty());
+
+    assert_success(&harness.run(&["if-shell", "-F", "1", "select-layout -p -t alpha:0"])?);
+    let previous_layout =
+        harness.run(&["display-message", "-p", "-t", "alpha:0", "#{window_layout}"])?;
+    assert_eq!(stdout(&previous_layout), baseline_layout);
+    assert!(stderr(&previous_layout).is_empty());
 
     assert_success(&harness.run(&["if-shell", "-F", "1", "select-pane -t alpha:0.1"])?);
 

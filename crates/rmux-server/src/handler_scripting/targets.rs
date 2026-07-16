@@ -10,6 +10,7 @@ use rmux_proto::{
 };
 
 use super::super::{switch_client_target_find_type, target_support::pane_id_target};
+use super::tokens::{short_option_prefix_len, short_option_takes_next_value};
 use super::values::{missing_argument, parse_u32};
 
 pub(super) fn resolve_queue_target_arguments(
@@ -24,7 +25,9 @@ pub(super) fn resolve_queue_target_arguments(
 
     let mut resolved = Vec::with_capacity(arguments.len());
     let all_arguments = arguments.clone();
-    let mut arguments = VecDeque::from(arguments);
+    let option_prefix_len = short_option_prefix_len(command_name, &arguments);
+    let positional_arguments = arguments[option_prefix_len..].to_vec();
+    let mut arguments = VecDeque::from(arguments[..option_prefix_len].to_vec());
     while let Some(argument) = arguments.pop_front() {
         if argument == "--" {
             resolved.push(argument);
@@ -117,9 +120,16 @@ pub(super) fn resolve_queue_target_arguments(
                 find_context,
             )?);
         } else {
+            let takes_next_value = short_option_takes_next_value(command_name, &argument);
             resolved.push(argument);
+            if takes_next_value {
+                if let Some(value) = arguments.pop_front() {
+                    resolved.push(value);
+                }
+            }
         }
     }
+    resolved.extend(positional_arguments);
 
     Ok(resolved)
 }
@@ -949,6 +959,40 @@ mod tests {
         .expect("queue targets resolve");
 
         assert_eq!(resolved, ["-s", "alpha:0", "-t", "beta"]);
+    }
+
+    #[test]
+    fn queue_stops_target_resolution_at_the_first_positional() {
+        let sessions = session_store_with_alpha_beta();
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        let resolved = resolve_queue_target_arguments(
+            "set-option",
+            ["-g", "@compact", "-tfoo"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            &sessions,
+            &context,
+        )
+        .expect("option-like value after the option name stays positional");
+        assert_eq!(resolved, ["-g", "@compact", "-tfoo"]);
+
+        let resolved = resolve_queue_target_arguments(
+            "list-windows",
+            ["-F", "-tfoo", "-t", "beta"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            &sessions,
+            &context,
+        )
+        .expect("option values are consumed before finding the positional boundary");
+        assert_eq!(resolved, ["-F", "-tfoo", "-t", "beta"]);
     }
 
     #[test]

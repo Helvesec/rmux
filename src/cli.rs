@@ -97,8 +97,8 @@ use dispatch::default_client_command;
 use dispatch::{command_has_start_server_flag, dispatch_command_queue};
 pub(crate) use error::{ExitFailure, ExitMessageTermination};
 use rmux_client::{
-    connect, ensure_server_running_with_config, resolve_socket_path,
-    resolve_tmux_compatible_socket_path, Connection,
+    connect, ensure_server_running_with_config, ensure_server_running_with_config_outcome,
+    resolve_socket_path, resolve_tmux_compatible_socket_path, Connection,
 };
 use shell_startup::run_shell_startup;
 #[cfg(test)]
@@ -107,13 +107,14 @@ use shell_startup::{same_file_identity_for_paths, usable_shell_path};
 use startup::ServerStartupConfig;
 use startup::{
     run_foreground_server, startup_config_from_cli, startup_config_from_top_level_scan,
-    StartupOptions,
+    PrestartedConnection, PrestartedServerConnection, StartupOptions,
 };
 use target_resolution::{
-    list_session_names, resolve_current_pane_target, resolve_current_session_target,
-    resolve_existing_window_target_or_current, resolve_pane_target_or_current,
-    resolve_pane_target_spec, resolve_session_listing_target, resolve_session_target_or_current,
-    resolve_session_target_spec, resolve_split_window_target_spec, resolve_target_spec,
+    list_session_names, listed_pane_index_matches_target, resolve_current_pane_target,
+    resolve_current_session_target, resolve_existing_window_target_or_current,
+    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_session_listing_target,
+    resolve_session_target_or_current, resolve_session_target_spec,
+    resolve_split_window_target_spec, resolve_target_spec,
     resolve_window_index_target_or_current_session, resolve_window_target_or_current,
     resolve_window_target_spec, response_name_for_target,
 };
@@ -188,7 +189,7 @@ where
                     return parse_failure_or_absent_server(&args, error);
                 }
                 ColdAliasParseOutcome::Parsed(cold_cli, connection) => {
-                    startup_connection = Some(*connection);
+                    startup_connection = Some(connection);
                     *cold_cli
                 }
                 ColdAliasParseOutcome::Dispatched(exit_code) => return Ok(exit_code),
@@ -228,18 +229,21 @@ where
             .as_ref()
             .is_some_and(command_has_start_server_flag)
     {
-        startup_connection = Some(
-            ensure_server_running_with_config(&socket_path, startup_config.auto_start.clone())
-                .map_err(ExitFailure::from_auto_start)
-                .map_err(|error| error.with_socket_context(&socket_path))?,
-        );
-        let cold_resolution = alias_fallback::runtime_command_resolution_after_startup(
-            &args,
+        let outcome = ensure_server_running_with_config_outcome(
             &socket_path,
-            startup_connection
-                .as_mut()
-                .expect("startup connection was just stored"),
-        )?;
+            startup_config.auto_start.clone(),
+        )
+        .map_err(ExitFailure::from_auto_start)
+        .map_err(|error| error.with_socket_context(&socket_path))?;
+        let connection = PrestartedConnection::new(outcome);
+        let cold_resolution = connection.with_connection_mut(|connection| {
+            alias_fallback::runtime_command_resolution_after_startup(
+                &args,
+                &socket_path,
+                connection,
+            )
+        })?;
+        startup_connection = Some(connection);
         if let Some(alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(exit_code)) =
             cold_resolution.as_ref()
         {
@@ -270,22 +274,21 @@ where
         return run_foreground_server(&socket_path, &startup_config);
     }
 
-    let startup = StartupOptions::new(cli.no_start_server, startup_config.auto_start);
+    let startup = StartupOptions::new(cli.no_start_server, startup_config.auto_start)
+        .with_prestarted_connection(startup_connection);
     if cli.control_mode != 0 {
         return run_control_mode(&cli, &socket_path, startup)
             .map_err(|error| error.with_socket_context(&socket_path));
     }
     let client_terminal = client_terminal_context_from_cli(&cli);
     let commands = cli.into_command_queue();
-    let result = dispatch_command_queue(commands, &socket_path, startup, client_terminal)
-        .map_err(|error| error.with_socket_context(&socket_path));
-    drop(startup_connection);
-    result
+    dispatch_command_queue(commands, &socket_path, startup, client_terminal)
+        .map_err(|error| error.with_socket_context(&socket_path))
 }
 
 enum ColdAliasParseOutcome {
     NotApplicable(clap::Error),
-    Parsed(Box<Cli>, Box<Connection>),
+    Parsed(Box<Cli>, PrestartedConnection),
     Dispatched(i32),
 }
 
@@ -323,14 +326,14 @@ fn parse_cold_alias_queue_after_startup(
     }
     .map_err(ExitFailure::from_client)?;
     let startup_config = startup_config_from_top_level_scan(&scan, &first_command);
-    let mut connection = ensure_server_running_with_config(&socket_path, startup_config.auto_start)
-        .map_err(ExitFailure::from_auto_start)
-        .map_err(|error| error.with_socket_context(&socket_path))?;
-    let resolution = alias_fallback::runtime_command_resolution_after_startup(
-        args,
-        &socket_path,
-        &mut connection,
-    )?;
+    let outcome =
+        ensure_server_running_with_config_outcome(&socket_path, startup_config.auto_start)
+            .map_err(ExitFailure::from_auto_start)
+            .map_err(|error| error.with_socket_context(&socket_path))?;
+    let connection = PrestartedConnection::new(outcome);
+    let resolution = connection.with_connection_mut(|connection| {
+        alias_fallback::runtime_command_resolution_after_startup(args, &socket_path, connection)
+    })?;
     let Some(resolution) = resolution else {
         return Err(ExitFailure::from_clap(original_error));
     };
@@ -339,10 +342,7 @@ fn parse_cold_alias_queue_after_startup(
     }
     let cli =
         parse_with_runtime_resolution(args, Some(&resolution)).map_err(ExitFailure::from_clap)?;
-    Ok(ColdAliasParseOutcome::Parsed(
-        Box::new(cli),
-        Box::new(connection),
-    ))
+    Ok(ColdAliasParseOutcome::Parsed(Box::new(cli), connection))
 }
 
 fn parse_with_runtime_resolution(
@@ -511,6 +511,41 @@ fn connect_with_startserver(
     } else {
         ensure_server_running_with_config(socket_path, startup.config)
             .map_err(ExitFailure::from_auto_start)
+    }
+}
+
+impl PrestartedServerConnection {
+    fn into_connection(self) -> Connection {
+        self.connection
+    }
+}
+
+fn connect_with_startserver_outcome(
+    socket_path: &Path,
+    startup: StartupOptions,
+) -> Result<PrestartedServerConnection, ExitFailure> {
+    if startup.no_start_server {
+        let connection = connect(socket_path)
+            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+        Ok(PrestartedServerConnection {
+            connection,
+            provenance: rmux_client::ServerConnectionProvenance::JoinedExisting,
+        })
+    } else {
+        if let Some(prestarted) = startup
+            .prestarted_connection
+            .as_ref()
+            .and_then(PrestartedConnection::take)
+        {
+            return Ok(prestarted);
+        }
+        let outcome = ensure_server_running_with_config_outcome(socket_path, startup.config)
+            .map_err(ExitFailure::from_auto_start)?;
+        let provenance = outcome.provenance();
+        Ok(PrestartedServerConnection {
+            connection: outcome.into_connection(),
+            provenance,
+        })
     }
 }
 

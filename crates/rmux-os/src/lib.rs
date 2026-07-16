@@ -5,6 +5,8 @@
 //! This crate is intentionally narrow. Add modules only when a real migrated
 //! call site consumes them in the same change.
 
+#[cfg(windows)]
+pub mod command;
 pub mod daemon;
 pub mod host;
 pub mod identity;

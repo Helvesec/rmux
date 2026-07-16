@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::path::Path;
 
 use rmux_core::{
     formats::{is_truthy, render_list_windows_line, FormatContext},
@@ -26,6 +27,16 @@ use crate::terminal::validate_process_command;
 
 #[path = "pane_terminals/window_removal.rs"]
 mod window_removal;
+
+pub(crate) struct ListWindowsSelection<'a> {
+    pub(crate) session_name: &'a SessionName,
+    pub(crate) socket_path: &'a Path,
+    pub(crate) format: Option<&'a str>,
+    pub(crate) attached_count: usize,
+    pub(crate) filter: Option<&'a str>,
+    pub(crate) sort_order: Option<&'a str>,
+    pub(crate) reversed: bool,
+}
 
 use window_removal::build_window_removal_plan;
 pub(super) use window_removal::window_pane_ids;
@@ -617,13 +628,17 @@ impl HandlerState {
 
     pub(crate) fn list_windows(
         &self,
-        session_name: &SessionName,
-        format: Option<&str>,
-        attached_count: usize,
-        filter: Option<&str>,
-        sort_order: Option<&str>,
-        reversed: bool,
+        selection: ListWindowsSelection<'_>,
     ) -> Result<ListWindowsResponse, RmuxError> {
+        let ListWindowsSelection {
+            session_name,
+            socket_path,
+            format,
+            attached_count,
+            filter,
+            sort_order,
+            reversed,
+        } = selection;
         let session = self
             .sessions
             .session(session_name)
@@ -635,8 +650,15 @@ impl HandlerState {
             }
             None => WindowListSortOrder::Index,
         };
-        let mut rows =
-            collect_window_entries(self, session, session_name, format, attached_count, filter);
+        let mut rows = collect_window_entries(
+            self,
+            session,
+            session_name,
+            socket_path,
+            format,
+            attached_count,
+            filter,
+        );
         if sort_order != WindowListSortOrder::Index || reversed && sort_order.is_explicit() {
             sort_window_entries(&mut rows, sort_order, reversed);
         }
@@ -715,6 +737,7 @@ fn collect_window_entries(
     state: &HandlerState,
     session: &Session,
     session_name: &SessionName,
+    socket_path: &Path,
     format: Option<&str>,
     attached_count: usize,
     filter: Option<&str>,
@@ -739,6 +762,7 @@ fn collect_window_entries(
             }
             let mut runtime = RuntimeFormatContext::new(context)
                 .with_state(state)
+                .with_socket_path(socket_path)
                 .with_session(session)
                 .with_window(*window_index, window);
             if let Some(pane) = window.active_pane() {

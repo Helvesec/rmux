@@ -89,6 +89,142 @@ fn direct_cli_rejects_unknown_options_before_command_tails() {
     }
 }
 
+#[test]
+fn direct_cli_stops_parsing_options_after_the_first_positional() {
+    for arguments in [
+        &["rename-session", "renamed", "-t", "audit"][..],
+        &["set-buffer", "payload", "-b", "named"][..],
+        &["set-option", "status", "off", "-g"][..],
+        &["set-environment", "FOO", "BAR", "-g"][..],
+        &["list-commands", "list-windows", "-F", "format"][..],
+    ] {
+        let error = parse_args(arguments).expect_err("post-positional option must be rejected");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::TooManyValues,
+            "unexpected error kind for {arguments:?}: {error}"
+        );
+        assert!(
+            error.to_string().contains("too many arguments"),
+            "unexpected direct CLI error for {arguments:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn direct_cli_consumes_option_like_required_option_values() {
+    let cli = parse_args(&["list-windows", "-F", "-tfoo", "-t", "beta"])
+        .expect("list-windows must consume a hyphenated format before its target");
+    let super::Command::ListWindows(args) = cli.command.expect("list-windows command") else {
+        panic!("expected list-windows command");
+    };
+    assert_eq!(args.format.as_deref(), Some("-tfoo"));
+    assert_eq!(target_text(&args.target), "beta");
+
+    let cli = parse_args(&["list-panes", "-F", "--", "-t", "beta:0"])
+        .expect("list-panes must consume a literal separator as its format");
+    let super::Command::ListPanes(args) = cli.command.expect("list-panes command") else {
+        panic!("expected list-panes command");
+    };
+    assert_eq!(args.format.as_deref(), Some("--"));
+    assert_eq!(target_text(&args.target), "beta:0");
+
+    let cli = parse_args(&["list-sessions", "-F", "-Q", "-r"])
+        .expect("list-sessions must consume an unknown-looking format token");
+    let super::Command::ListSessions(args) = cli.command.expect("list-sessions command") else {
+        panic!("expected list-sessions command");
+    };
+    assert_eq!(args.format.as_deref(), Some("-Q"));
+    assert!(args.reversed);
+
+    let cli = parse_args(&["list-buffers", "-F", "-tfoo", "-r"])
+        .expect("list-buffers must consume its hyphenated format before later flags");
+    let super::Command::ListBuffers(args) = cli.command.expect("list-buffers command") else {
+        panic!("expected list-buffers command");
+    };
+    assert_eq!(args.format.as_deref(), Some("-tfoo"));
+    assert!(args.reversed);
+
+    let cli = parse_args(&["break-pane", "-F", "-Q", "-s", "alpha:0.0", "-t", "beta:0"])
+        .expect("break-pane must consume its option-like format before source and target flags");
+    let super::Command::BreakPane(args) = cli.command.expect("break-pane command") else {
+        panic!("expected break-pane command");
+    };
+    assert_eq!(args.format.as_deref(), Some("-Q"));
+    assert_eq!(target_text(&args.source), "alpha:0.0");
+    assert_eq!(target_text(&args.target), "beta:0");
+
+    let error = parse_args(&["list-windows", "-Q"])
+        .expect_err("an option-like token outside a value position must remain invalid");
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
+#[test]
+fn direct_cli_keeps_optional_option_values_separate_from_following_flags() {
+    let cli = parse_args(&["resize-pane", "-D", "-t", "beta:0.0"])
+        .expect("an optional resize delta must not consume the following target flag");
+    let super::Command::ResizePane(args) = cli.command.expect("resize-pane command") else {
+        panic!("expected resize-pane command");
+    };
+    assert_eq!(args.down, Some(1));
+    assert_eq!(target_text(&args.target), "beta:0.0");
+}
+
+#[test]
+fn direct_cli_keeps_option_prefix_and_command_tail_semantics() {
+    for arguments in [
+        &["rename-session", "-t", "audit", "renamed"][..],
+        &["set-buffer", "-b", "named", "payload"][..],
+        &["set-option", "-g", "status", "off"][..],
+        &["set-environment", "-g", "FOO", "BAR"][..],
+    ] {
+        parse_args(arguments).unwrap_or_else(|error| {
+            panic!("valid option prefix failed for {arguments:?}: {error}")
+        });
+    }
+
+    let cli = parse_args(&["new-session", "-d", "sh", "-c", "printf ok"])
+        .expect("child command flags must remain positional tail values");
+    let super::Command::NewSession(args) = cli.command.expect("new-session command") else {
+        panic!("expected new-session command");
+    };
+    assert_eq!(args.command, ["sh", "-c", "printf ok"]);
+
+    let cli = parse_args(&["set-option", "@tail-value", "-g"])
+        .expect("recognized flag text after an option name must stay a value");
+    let super::Command::SetOption(args) = cli.command.expect("set-option command") else {
+        panic!("expected set-option command");
+    };
+    assert!(!args.global);
+    assert_eq!(args.value.as_deref(), Some("-g"));
+
+    let cli = parse_args(&["set-environment", "TAIL_VALUE", "-g"])
+        .expect("recognized flag text after an environment name must stay a value");
+    let super::Command::SetEnvironment(args) = cli.command.expect("set-environment command") else {
+        panic!("expected set-environment command");
+    };
+    assert!(!args.global);
+    assert_eq!(args.value.as_deref(), Some("-g"));
+
+    let cli = parse_args(&["set-option", "-g", "@compact", "-tfoo"])
+        .expect("an option-like value after the option name must stay positional");
+    let super::Command::SetOption(args) = cli.command.expect("set-option command") else {
+        panic!("expected set-option command");
+    };
+    assert!(args.global);
+    assert!(args.target.is_none());
+    assert_eq!(args.option, "@compact");
+    assert_eq!(args.value.as_deref(), Some("-tfoo"));
+
+    let cli = parse_args(&["source-file", "missing.conf", "-tfoo"])
+        .expect("an option-like path after the first path must stay positional");
+    let super::Command::SourceFile(args) = cli.command.expect("source-file command") else {
+        panic!("expected source-file command");
+    };
+    assert!(args.target.is_none());
+    assert_eq!(args.paths, ["missing.conf", "-tfoo"]);
+}
+
 #[path = "cli_args_tests/session_and_top_level.rs"]
 mod session_and_top_level;
 

@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use rmux_core::{
     formats::{
         is_truthy, render_list_panes_line, FormatContext, DEFAULT_DISPLAY_MESSAGE_FORMAT,
@@ -388,6 +390,7 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ListPanesRequest,
     ) -> Response {
+        let socket_path = self.socket_path();
         if let Some(response) = self.handle_internal_pane_exit_probe(&request).await {
             return response;
         }
@@ -430,6 +433,7 @@ impl RequestHandler {
         let output = match collect_list_pane_output_with_selection(ListPaneOutputSelection {
             state: &state,
             session,
+            socket_path: &socket_path,
             attached_count,
             target_window_index: request.target_window_index,
             format: request.format.as_deref(),
@@ -679,6 +683,7 @@ pub(in crate::handler) fn attached_status_message_for_error(error: &RmuxError) -
 struct ListPaneOutputSelection<'a> {
     state: &'a HandlerState,
     session: &'a rmux_core::Session,
+    socket_path: &'a Path,
     attached_count: usize,
     target_window_index: Option<u32>,
     format: Option<&'a str>,
@@ -693,6 +698,7 @@ fn collect_list_pane_output_with_selection(
     let ListPaneOutputSelection {
         state,
         session,
+        socket_path,
         attached_count,
         target_window_index,
         format,
@@ -763,6 +769,7 @@ fn collect_list_pane_output_with_selection(
             let context = window_context.clone().with_pane(pane, pane_active);
             let mut runtime = RuntimeFormatContext::new(context)
                 .with_state(state)
+                .with_socket_path(socket_path)
                 .with_session(session)
                 .with_window(*window_index, window)
                 .with_pane(pane);

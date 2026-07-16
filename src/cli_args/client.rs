@@ -4,30 +4,18 @@ use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RefreshClientArgs {
-    #[arg(short = 'c', action = ArgAction::SetTrue)]
-    pub(crate) clear_pan: bool,
     #[arg(short = 'C')]
     pub(crate) control_size: Option<String>,
-    #[arg(short = 'D', action = ArgAction::SetTrue)]
-    pub(crate) pan_down: bool,
     #[arg(short = 'f')]
     pub(crate) flags: Option<String>,
     #[arg(short = 'F')]
     pub(crate) flags_alias: Option<String>,
     #[arg(short = 'l', action = ArgAction::SetTrue)]
     pub(crate) clipboard_query: bool,
-    #[arg(short = 'L', action = ArgAction::SetTrue)]
-    pub(crate) pan_left: bool,
-    #[arg(short = 'R', action = ArgAction::SetTrue)]
-    pub(crate) pan_right: bool,
     #[arg(short = 'S', action = ArgAction::SetTrue)]
     pub(crate) status_only: bool,
     #[arg(short = 't', allow_hyphen_values = true)]
     pub(crate) target_client: Option<String>,
-    #[arg(short = 'U', action = ArgAction::SetTrue)]
-    pub(crate) pan_up: bool,
-    #[arg(allow_hyphen_values = true)]
-    pub(crate) adjustment: Option<u32>,
 }
 
 #[derive(Debug, Clone, Args)]

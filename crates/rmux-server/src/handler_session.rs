@@ -1583,6 +1583,7 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ListSessionsRequest,
     ) -> Response {
+        let socket_path = self.socket_path();
         let has_explicit_sort = request.sort_order.is_some();
         let sort_order = match parse_session_sort_order(request.sort_order.as_deref()) {
             Some(sort_order) => sort_order,
@@ -1635,6 +1636,7 @@ impl RequestHandler {
                 }
                 let mut runtime = RuntimeFormatContext::new(context)
                     .with_state(&state)
+                    .with_socket_path(&socket_path)
                     .with_session(session)
                     .with_window(active_window_index, active_window);
                 if let Some(pane) = active_window.active_pane() {

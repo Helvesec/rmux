@@ -697,6 +697,34 @@ show-options -gqv extended-keys\n"
 }
 
 #[tokio::test]
+async fn source_file_preserves_option_like_set_option_values_after_the_option_name() {
+    let handler = RequestHandler::new();
+    let root = temp_root("set-option-option-like-value");
+    fs::create_dir_all(&root).expect("create temp root");
+
+    let response = handler
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec!["-".to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: Some(root),
+            stdin: Some("set-option -g @compact -tfoo\nshow-options -gqv @compact\n".to_owned()),
+        })))
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .unwrap_or_else(|| panic!("queued show-options output, got {response:?}"))
+            .stdout(),
+        b"-tfoo\n"
+    );
+}
+
+#[tokio::test]
 async fn source_file_without_target_routes_append_to_default_global_scope() {
     let handler = RequestHandler::new();
     let root = temp_root("set-option-append-no-target");

@@ -67,6 +67,76 @@ fn cli_acceptance_matrix_exercises_real_daemon_state() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn required_option_values_keep_option_like_tokens_on_the_direct_cli() -> Result<(), Box<dyn Error>>
+{
+    let harness = AcceptanceHarness::new("required-option-values")?;
+    harness.success(["new-session", "-d", "-s", "required-values"])?;
+    harness.success(["set-buffer", "-b", "required-values", "payload"])?;
+
+    assert_eq!(
+        harness.stdout(["list-windows", "-F", "-tfoo", "-t", "required-values",])?,
+        "-tfoo\n"
+    );
+    assert_eq!(harness.stdout(["list-sessions", "-F", "--"])?, "--\n");
+    assert_eq!(
+        harness.stdout(["list-panes", "-F", "-Q", "-t", "required-values",])?,
+        "-Q\n"
+    );
+    assert_eq!(
+        harness.stdout(["list-buffers", "-F", "-tfoo", "-r"])?,
+        "-tfoo\n"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn post_positional_options_fail_without_mutating_daemon_state() -> Result<(), Box<dyn Error>> {
+    let harness = AcceptanceHarness::new("post-positional-options")?;
+    harness.success(["new-session", "-d", "-s", "audit"])?;
+    harness.success(["set-buffer", "-b", "named", "stable"])?;
+    harness.success(["set-option", "-g", "status", "on"])?;
+    harness.success(["set-environment", "-g", "FOO", "stable"])?;
+
+    for arguments in [
+        &["rename-session", "renamed", "-t", "audit"][..],
+        &["set-buffer", "payload", "-b", "named"][..],
+        &["set-option", "status", "off", "-g"][..],
+        &["set-environment", "FOO", "BAR", "-g"][..],
+    ] {
+        let output = harness.run(arguments.iter().copied())?;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "post-positional option unexpectedly succeeded for {arguments:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("too many arguments"),
+            "unexpected error for {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    assert_eq!(
+        harness
+            .stdout(["list-sessions", "-F", "#{session_name}"])?
+            .trim(),
+        "audit"
+    );
+    assert_eq!(harness.stdout(["show-buffer", "-b", "named"])?, "stable");
+    assert_eq!(
+        harness.stdout(["show-options", "-gqv", "status"])?.trim(),
+        "on"
+    );
+    assert_eq!(
+        harness.stdout(["show-environment", "-g", "FOO"])?.trim(),
+        "FOO=stable"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn runtime_command_aliases_override_direct_builtin_commands() -> Result<(), Box<dyn Error>> {
     let harness = AcceptanceHarness::new("direct-runtime-command-alias")?;
     harness.success(["new-session", "-d", "-s", "alpha"])?;

@@ -1,7 +1,8 @@
 use rmux_core::LifecycleEvent;
 use rmux_proto::request::RefreshClientRequest;
 use rmux_proto::{
-    ErrorResponse, RefreshClientResponse, Response, RmuxError, TerminalSize, WindowTarget,
+    ErrorResponse, RefreshClientResponse, Response, RmuxError, SessionId, TerminalSize,
+    WindowTarget,
 };
 
 use crate::handler_support::attached_client_required;
@@ -19,9 +20,6 @@ impl RequestHandler {
         requester_pid: u32,
         request: RefreshClientRequest,
     ) -> Response {
-        if let Err(error) = validate_refresh_pan_request(&request) {
-            return Response::Error(ErrorResponse { error });
-        }
         if let Err(error) = validate_refresh_supported_request(&request) {
             return Response::Error(ErrorResponse { error });
         }
@@ -60,7 +58,7 @@ impl RequestHandler {
     ) -> Response {
         let mut needs_full_refresh = !request.status_only;
         let clipboard_query = request.clipboard_query;
-        let session_name = {
+        let (session_name, session_id, size_eligibility_changed) = {
             let mut active_attach = self.active_attach.lock().await;
             let Some(active) = active_attach.by_pid.get_mut(&attach_pid).filter(|active| {
                 active.id == expected_attach_id
@@ -71,6 +69,7 @@ impl RequestHandler {
                 });
             };
 
+            let ignored_size_before = active.flags.contains(super::ClientFlags::IGNORESIZE);
             let raw_flag = request.flags.as_deref().or(request.flags_alias.as_deref());
             if let Some(raw) = raw_flag {
                 let mut merged_flags = active.flags;
@@ -84,29 +83,31 @@ impl RequestHandler {
                 }
                 active.flags = merged_flags;
             }
-
-            let adjustment = request.adjustment.unwrap_or(1);
-            if request.clear_pan {
-                active.pan_window = None;
-                active.pan_ox = 0;
-                active.pan_oy = 0;
-            } else if request.pan_left || request.pan_right || request.pan_up || request.pan_down {
-                active.pan_window = Some(active.pan_window.unwrap_or(0));
-                if request.pan_left {
-                    active.pan_ox = active.pan_ox.saturating_sub(adjustment);
-                }
-                if request.pan_right {
-                    active.pan_ox = active.pan_ox.saturating_add(adjustment);
-                }
-                if request.pan_up {
-                    active.pan_oy = active.pan_oy.saturating_sub(adjustment);
-                }
-                if request.pan_down {
-                    active.pan_oy = active.pan_oy.saturating_add(adjustment);
-                }
+            let size_eligibility_changed =
+                ignored_size_before != active.flags.contains(super::ClientFlags::IGNORESIZE);
+            if size_eligibility_changed {
+                self.bump_active_attach_epoch();
             }
-            active.session_name.clone()
+
+            (
+                active.session_name.clone(),
+                active.session_id,
+                size_eligibility_changed,
+            )
         };
+
+        if size_eligibility_changed {
+            if let Err(error) = self
+                .reconcile_refresh_size_eligibility_transition(
+                    attach_pid,
+                    expected_attach_id,
+                    session_id,
+                )
+                .await
+            {
+                return Response::Error(ErrorResponse { error });
+            }
+        }
 
         if request.status_only {
             if let Err(error) = self
@@ -151,6 +152,27 @@ impl RequestHandler {
         Response::RefreshClient(RefreshClientResponse {
             target_client: attach_pid.to_string(),
         })
+    }
+
+    async fn reconcile_refresh_size_eligibility_transition(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        expected_session_id: SessionId,
+    ) -> Result<(), RmuxError> {
+        let identity_is_current = {
+            let active_attach = self.active_attach.lock().await;
+            active_attach.by_pid.get(&attach_pid).is_some_and(|active| {
+                active.id == expected_attach_id
+                    && active.session_id == expected_session_id
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+        };
+        if !identity_is_current {
+            return Err(attached_client_required("refresh-client"));
+        }
+        self.reconcile_attached_session_identity_size_and_emit(expected_session_id)
+            .await
     }
 
     async fn handle_refresh_control_client(
@@ -247,39 +269,33 @@ trait RefreshClientControlScope {
 
 impl RefreshClientControlScope for RefreshClientRequest {
     fn has_attach_only_effects(&self) -> bool {
-        self.clear_pan
-            || self.pan_left
-            || self.pan_right
-            || self.pan_up
-            || self.pan_down
-            || self.status_only
+        self.status_only
             || self.clipboard_query
             || self.flags.is_some()
             || self.flags_alias.is_some()
     }
 }
 
-fn validate_refresh_pan_request(request: &RefreshClientRequest) -> Result<(), RmuxError> {
-    let pan_actions = usize::from(request.clear_pan)
-        + usize::from(request.pan_left)
-        + usize::from(request.pan_right)
-        + usize::from(request.pan_up)
-        + usize::from(request.pan_down);
-    if pan_actions > 1 {
-        return Err(RmuxError::Server(
-            "refresh-client accepts only one of -c, -L, -R, -U, or -D".to_owned(),
-        ));
-    }
-    if request.adjustment.is_some() && pan_actions == 0 {
-        return Err(RmuxError::Server(
-            "refresh-client adjustment requires a pan direction".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
 fn validate_refresh_supported_request(request: &RefreshClientRequest) -> Result<(), RmuxError> {
     let mut unsupported = Vec::new();
+    if request.clear_pan {
+        unsupported.push("-c");
+    }
+    if request.pan_down {
+        unsupported.push("-D");
+    }
+    if request.pan_left {
+        unsupported.push("-L");
+    }
+    if request.pan_right {
+        unsupported.push("-R");
+    }
+    if request.pan_up {
+        unsupported.push("-U");
+    }
+    if request.adjustment.is_some() {
+        unsupported.push("adjustment");
+    }
     if !request.subscriptions.is_empty() {
         unsupported.push("-A");
     }

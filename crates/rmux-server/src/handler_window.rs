@@ -14,8 +14,8 @@ use super::{
 };
 use crate::hook_runtime::{hooks_disabled, PendingInlineHookFormat};
 use crate::pane_terminals::{
-    resolve_new_pane_process_command, HandlerState, NewWindowOptions, RespawnWindowOptions,
-    WindowSpawnOptions,
+    resolve_new_pane_process_command, HandlerState, ListWindowsSelection, NewWindowOptions,
+    RespawnWindowOptions, WindowSpawnOptions,
 };
 
 #[path = "handler_window/move_window_effects.rs"]
@@ -667,6 +667,7 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ListWindowsRequest,
     ) -> Response {
+        let socket_path = self.socket_path();
         let attached_count = {
             let active_attach = self.active_attach.lock().await;
             active_attach.attached_count(&request.target)
@@ -678,14 +679,15 @@ impl RequestHandler {
             self.wait_for_windows_deferred_all_pane_pids().await;
         }
         let state = self.state.lock().await;
-        match state.list_windows(
-            &request.target,
-            request.format.as_deref(),
+        match state.list_windows(ListWindowsSelection {
+            session_name: &request.target,
+            socket_path: &socket_path,
+            format: request.format.as_deref(),
             attached_count,
-            request.filter.as_deref(),
-            request.sort_order.as_deref(),
-            request.reversed,
-        ) {
+            filter: request.filter.as_deref(),
+            sort_order: request.sort_order.as_deref(),
+            reversed: request.reversed,
+        }) {
             Ok(response) => Response::ListWindows(response),
             Err(error) => Response::Error(ErrorResponse { error }),
         }

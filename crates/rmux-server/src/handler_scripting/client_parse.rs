@@ -207,16 +207,11 @@ pub(super) fn parse_detach_client(mut args: CommandTokens) -> Result<Request, Rm
 
 pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut target_client = None;
-    let mut clear_pan = false;
     let mut control_size = None;
-    let mut pan_down = false;
     let mut flags = None;
     let mut flags_alias = None;
     let mut clipboard_query = false;
-    let mut pan_left = false;
-    let mut pan_right = false;
     let mut status_only = false;
-    let mut pan_up = false;
 
     while let Some(token) = args.peek().map(str::to_owned) {
         match token.as_str() {
@@ -224,17 +219,9 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
                 let _ = args.optional();
                 break;
             }
-            "-c" => {
-                let _ = args.optional();
-                clear_pan = true;
-            }
             "-C" => {
                 let _ = args.optional();
                 control_size = Some(args.required("-C widthxheight")?);
-            }
-            "-D" => {
-                let _ = args.optional();
-                pan_down = true;
             }
             "-f" => {
                 let _ = args.optional();
@@ -248,14 +235,6 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
                 let _ = args.optional();
                 clipboard_query = true;
             }
-            "-L" => {
-                let _ = args.optional();
-                pan_left = true;
-            }
-            "-R" => {
-                let _ = args.optional();
-                pan_right = true;
-            }
             "-S" => {
                 let _ = args.optional();
                 status_only = true;
@@ -264,12 +243,8 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
                 let _ = args.optional();
                 target_client = Some(args.required("-t target-client")?);
             }
-            "-U" => {
-                let _ = args.optional();
-                pan_up = true;
-            }
             _ => {
-                let Some(cluster) = parse_compact_flag_cluster(&token, "cDlLRSU", "CfFt") else {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "lS", "CfFt") else {
                     if token.starts_with('-') {
                         return Err(unsupported_flag("refresh-client", &token));
                     }
@@ -278,13 +253,8 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
                 let _ = args.optional();
                 for flag in cluster {
                     match flag {
-                        CompactFlag::Bare('c') => clear_pan = true,
-                        CompactFlag::Bare('D') => pan_down = true,
                         CompactFlag::Bare('l') => clipboard_query = true,
-                        CompactFlag::Bare('L') => pan_left = true,
-                        CompactFlag::Bare('R') => pan_right = true,
                         CompactFlag::Bare('S') => status_only = true,
-                        CompactFlag::Bare('U') => pan_up = true,
                         compact_flag @ CompactFlag::Value { flag: 'C', .. } => {
                             control_size =
                                 Some(compact_flag.value_or_next(&mut args, "-C widthxheight")?);
@@ -306,24 +276,16 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
         }
     }
 
-    let adjustment = args
-        .optional()
-        .map(|value| {
-            value.parse::<u32>().map_err(|_| {
-                RmuxError::Server(format!("invalid refresh-client adjustment '{value}'"))
-            })
-        })
-        .transpose()?;
     args.no_extra("refresh-client")?;
 
     Ok(Request::RefreshClient(Box::new(RefreshClientRequest {
         target_client,
-        adjustment,
-        clear_pan,
-        pan_left,
-        pan_right,
-        pan_up,
-        pan_down,
+        adjustment: None,
+        clear_pan: false,
+        pan_left: false,
+        pan_right: false,
+        pan_up: false,
+        pan_down: false,
         status_only,
         clipboard_query,
         flags,

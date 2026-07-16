@@ -332,6 +332,7 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ListBuffersRequest,
     ) -> Response {
+        let socket_path = self.socket_path();
         let state = self.state.lock().await;
         let sort_order = match BufferSortOrder::parse(request.sort_order.as_deref()) {
             Some(order) => order,
@@ -350,7 +351,7 @@ impl RequestHandler {
         );
         let lines = entries
             .into_iter()
-            .filter_map(|entry| render_list_buffer_line(&state, &request, entry))
+            .filter_map(|entry| render_list_buffer_line(&state, &socket_path, &request, entry))
             .collect::<Vec<_>>();
 
         Response::ListBuffers(ListBuffersResponse {

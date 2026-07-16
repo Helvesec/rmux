@@ -202,21 +202,42 @@ fn split_window_percentage_is_public_and_value_taking_everywhere() {
 }
 
 #[test]
-fn refresh_client_unsupported_wire_flags_are_absent_from_cli_and_help() {
+fn refresh_client_unsupported_fields_are_absent_from_cli_help_and_completion() {
     for arguments in [
         &["refresh-client", "-A", "%0:on"][..],
         &["refresh-client", "-B", "name:%0:#{pane_id}"][..],
         &["refresh-client", "-r", "%0:rgb"][..],
+        &["refresh-client", "-c"][..],
+        &["refresh-client", "-D"][..],
+        &["refresh-client", "-L"][..],
+        &["refresh-client", "-R"][..],
+        &["refresh-client", "-U"][..],
+        &["refresh-client", "10"][..],
     ] {
-        let error = super::parse_args(arguments).expect_err("reserved flag must not parse");
+        let error = super::parse_args(arguments).expect_err("unsupported field must not parse");
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    for arguments in [
+        &["refresh-client", "-C", "80x24"][..],
+        &["refresh-client", "-f", "active-pane"][..],
+        &["refresh-client", "-F", "active-pane"][..],
+        &["refresh-client", "-l"][..],
+        &["refresh-client", "-S"][..],
+        &["refresh-client", "-t", "="][..],
+    ] {
+        super::parse_args(arguments).expect("supported refresh-client field parses");
     }
 
     let help =
         super::parse_args(&["refresh-client", "--help"]).expect_err("--help renders command help");
     assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
     let help = help.to_string();
-    for unsupported in ["-A", "-B", "-r"] {
+    assert!(
+        !help.contains("adjustment"),
+        "refresh-client help advertised unsupported adjustment: {help}"
+    );
+    for unsupported in ["-A", "-B", "-r", "-c", "-D", "-L", "-R", "-U"] {
         assert!(
             !help
                 .lines()
@@ -234,15 +255,30 @@ fn refresh_client_unsupported_wire_flags_are_absent_from_cli_and_help() {
         .get_arguments()
         .filter_map(|argument| argument.get_short())
         .collect::<BTreeSet<_>>();
-    for unsupported in ['A', 'B', 'r'] {
+    assert!(
+        refresh
+            .get_arguments()
+            .all(|argument| argument.get_id() != "adjustment"),
+        "refresh-client completion advertised unsupported adjustment"
+    );
+    for unsupported in ['A', 'B', 'D', 'L', 'R', 'U', 'c', 'r'] {
         assert!(!shorts.contains(&unsupported));
     }
-    for supported in ['C', 'D', 'L', 'R', 'S', 'U', 'c', 'f', 'l', 't'] {
+    for supported in ['C', 'F', 'S', 'f', 'l', 't'] {
         assert!(
             shorts.contains(&supported),
             "missing supported -{supported}"
         );
     }
+
+    assert_eq!(
+        rmux_core::command_inventory::render_list_commands_line(
+            None,
+            "refresh-client",
+            Some("refresh"),
+        ),
+        "refresh-client (refresh) [-lS] [-C XxY] [-f flags] [-F flags] [-t target-client]"
+    );
 }
 
 #[test]

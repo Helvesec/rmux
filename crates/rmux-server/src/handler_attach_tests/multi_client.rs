@@ -212,6 +212,144 @@ async fn window_size_policy_reconciles_attached_client_sizes() {
 }
 
 #[tokio::test]
+async fn refresh_client_ignore_size_transitions_reconcile_largest_policy() {
+    let handler = RequestHandler::new();
+    let session = session_name("refresh-ignore-size-largest");
+    create_session_with_size(
+        &handler,
+        session.clone(),
+        TerminalSize {
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await;
+
+    let (_large_id, _large_rx) = register_sized_attach(
+        &handler,
+        101,
+        &session,
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    )
+    .await;
+    let (_small_id, _small_rx) =
+        register_sized_attach(&handler, 202, &session, TerminalSize { cols: 80, rows: 20 }).await;
+    set_window_size_policy(&handler, &session, "largest").await;
+    assert_eq!(
+        attached_session_size(&handler, &session).await,
+        TerminalSize {
+            cols: 120,
+            rows: 40
+        }
+    );
+
+    let ignored = handler
+        .handle(refresh_client_flags_request(101, Some("ignore-size"), None))
+        .await;
+    assert!(matches!(ignored, Response::RefreshClient(_)), "{ignored:?}");
+    assert_eq!(
+        attached_session_size(&handler, &session).await,
+        TerminalSize { cols: 80, rows: 20 },
+        "adding ignore-size must immediately remove the client from largest-policy candidates"
+    );
+
+    let restored = handler
+        .handle(refresh_client_flags_request(
+            101,
+            None,
+            Some("!ignore-size"),
+        ))
+        .await;
+    assert!(
+        matches!(restored, Response::RefreshClient(_)),
+        "{restored:?}"
+    );
+    assert_eq!(
+        attached_session_size(&handler, &session).await,
+        TerminalSize {
+            cols: 120,
+            rows: 40
+        },
+        "removing ignore-size through the -F alias must restore the client as a candidate"
+    );
+}
+
+#[tokio::test]
+async fn refresh_client_ignore_size_reconcile_preserves_same_pid_replacement_identity() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("refresh-ignore-size-race-alpha");
+    let beta = session_name("refresh-ignore-size-race-beta");
+    create_session_with_size(
+        &handler,
+        alpha.clone(),
+        TerminalSize {
+            cols: 100,
+            rows: 30,
+        },
+    )
+    .await;
+    create_session_with_size(&handler, beta.clone(), TerminalSize { cols: 90, rows: 25 }).await;
+
+    let (original_id, _original_rx) = register_sized_attach(
+        &handler,
+        303,
+        &alpha,
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    )
+    .await;
+    let (_small_id, _small_rx) =
+        register_sized_attach(&handler, 404, &alpha, TerminalSize { cols: 80, rows: 20 }).await;
+    set_window_size_policy(&handler, &alpha, "largest").await;
+
+    let pause = handler.install_attached_size_selection_pause();
+    let refresh_handler = handler.clone();
+    let refresh = tokio::spawn(async move {
+        refresh_handler
+            .handle(refresh_client_flags_request(303, Some("ignore-size"), None))
+            .await
+    });
+    tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, pause.reached.notified())
+        .await
+        .expect("refresh-client reaches identity-safe size selection");
+
+    let (replacement_id, _replacement_rx) =
+        register_sized_attach(&handler, 303, &beta, TerminalSize { cols: 95, rows: 26 }).await;
+    assert_ne!(replacement_id, original_id);
+    pause.release.notify_one();
+
+    assert!(matches!(
+        refresh.await.expect("refresh-client task joins"),
+        Response::Error(_)
+    ));
+    assert_eq!(
+        attached_session_size(&handler, &alpha).await,
+        TerminalSize { cols: 80, rows: 20 },
+        "the original session must reconcile after its large client is replaced"
+    );
+    assert_eq!(
+        attached_session_size(&handler, &beta).await,
+        TerminalSize { cols: 95, rows: 26 },
+        "the stale refresh must never resize the replacement client's session"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = active_attach
+        .by_pid
+        .get(&303)
+        .expect("same-pid replacement survives");
+    assert_eq!(replacement.id, replacement_id);
+    assert_eq!(replacement.session_name, beta);
+    assert!(!replacement
+        .flags
+        .contains(super::super::attach_support::ClientFlags::IGNORESIZE));
+}
+
+#[tokio::test]
 async fn largest_and_smallest_window_size_policies_compose_dimensions_like_tmux() {
     let handler = RequestHandler::new();
     let session = session_name("resize-policy-dimensions");
@@ -1445,6 +1583,30 @@ async fn register_sized_attach_with_flags(
         .await
         .expect("initial attached client size is accepted");
     (attach_id, control_rx)
+}
+
+fn refresh_client_flags_request(
+    target_pid: u32,
+    flags: Option<&str>,
+    flags_alias: Option<&str>,
+) -> Request {
+    Request::RefreshClient(Box::new(rmux_proto::request::RefreshClientRequest {
+        target_client: Some(target_pid.to_string()),
+        adjustment: None,
+        clear_pan: false,
+        pan_left: false,
+        pan_right: false,
+        pan_up: false,
+        pan_down: false,
+        status_only: false,
+        clipboard_query: false,
+        flags: flags.map(str::to_owned),
+        flags_alias: flags_alias.map(str::to_owned),
+        subscriptions: Vec::new(),
+        subscriptions_format: Vec::new(),
+        control_size: None,
+        colour_report: None,
+    }))
 }
 
 async fn set_window_size_policy(handler: &RequestHandler, session: &SessionName, value: &str) {

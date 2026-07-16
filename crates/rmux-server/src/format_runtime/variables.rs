@@ -262,7 +262,11 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "client_height" => self.client_size.map(|size| size.rows.to_string()),
             "client_width" => self.client_size.map(|size| size.cols.to_string()),
             "command" => Some("display-message".to_owned()),
-            "config_files" => Some("/dev/null".to_owned()),
+            "config_files" => Some(
+                self.state
+                    .map(|state| state.startup_config_files().to_owned())
+                    .unwrap_or_default(),
+            ),
             "cursor_character" => Some(" ".to_owned()),
             "cursor_flag" => Some("1".to_owned()),
             "cursor_x" => self
@@ -347,7 +351,10 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             }),
             "pane_format" => Some(bool_string(self.pane.is_some())),
             "pane_in_mode" => Some(bool_string(self.pane_in_mode())),
-            "pane_input_off" => Some("0".to_owned()),
+            "pane_input_off" => Some(bool_string(self.pane.is_some_and(|pane| {
+                self.state
+                    .is_some_and(|state| state.pane_input_is_disabled(pane.id()))
+            }))),
             "pane_marked" => self.pane_marked(),
             "pane_marked_set" => Some(bool_string(self.marked_pane_set())),
             "pane_last" => self.pane.map(|pane| {

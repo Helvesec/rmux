@@ -418,9 +418,12 @@ fn status_job_profile_command(command: &str, profile: &TerminalProfile) -> Comma
 fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt as _;
+
         let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
         let mut process = Command::new(shell);
-        process.arg("/D").arg("/S").arg("/C").arg(command);
+        process.arg("/D").arg("/S").arg("/C");
+        process.raw_arg(rmux_os::command::cmd_c_verbatim_tail(command));
         process
     }
 
@@ -499,6 +502,15 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_status_job_preserves_quoted_command_arguments() {
+        assert_eq!(
+            super::run_status_job(r#"echo "RMUX STATUS JOB""#, None),
+            r#""RMUX STATUS JOB""#
+        );
     }
 
     #[test]

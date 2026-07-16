@@ -226,9 +226,13 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "broadcast-keys" => parse_command_args::<BroadcastKeysArgs>("broadcast-keys", arguments)
             .and_then(BroadcastKeysArgs::validate)
             .map(Command::BroadcastKeys),
-        "with-session" => parse_command_args::<WithSessionArgs>("with-session", arguments)
-            .and_then(WithSessionArgs::validate)
-            .map(Command::WithSession),
+        "with-session" => parse_command_args_with_policy::<WithSessionArgs>(
+            "with-session",
+            arguments,
+            PositionalOptionPolicy::InterspersedBeforeSeparator,
+        )
+        .and_then(WithSessionArgs::validate)
+        .map(Command::WithSession),
         "send-keys" => parse_send_keys_args(arguments).map(Command::SendKeys),
         "bind-key" => parse_command_args("bind-key", arguments).map(Command::BindKey),
         "unbind-key" => parse_command_args("unbind-key", arguments).map(Command::UnbindKey),

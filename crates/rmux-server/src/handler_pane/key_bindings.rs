@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use rmux_core::{
     formats::FormatContext, key_code_lookup_bits, key_string_lookup_key, key_string_lookup_string,
     parse_binding_command_tokens_with_parser, KeyBindingDisplay, KeyBindingSortOrder, KEYC_NONE,
@@ -117,6 +119,7 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ListKeysRequest,
     ) -> Response {
+        let socket_path = self.socket_path();
         let state = self.state.lock().await;
         if let Some(table_name) = request.table_name.as_deref() {
             if state.key_bindings.table(table_name).is_none() {
@@ -168,8 +171,14 @@ impl RequestHandler {
             bindings.truncate(1);
         }
 
-        let output =
-            render_list_keys_output(&state, &bindings, &request, render_metrics, notes_key_width);
+        let output = render_list_keys_output(
+            &state,
+            &socket_path,
+            &bindings,
+            &request,
+            render_metrics,
+            notes_key_width,
+        );
         Response::ListKeys(ListKeysResponse {
             match_count: bindings.len(),
             output,
@@ -217,6 +226,7 @@ fn list_key_bindings(
 
 fn render_list_keys_output(
     state: &HandlerState,
+    socket_path: &Path,
     bindings: &[KeyBindingDisplay],
     request: &rmux_proto::ListKeysRequest,
     render_metrics: ListKeysRenderMetrics,
@@ -259,6 +269,7 @@ fn render_list_keys_output(
             };
             let context = RuntimeFormatContext::new(FormatContext::new())
                 .with_state(state)
+                .with_socket_path(socket_path)
                 .with_named_value("key_repeat", bool_string(binding.binding().repeat()))
                 .with_named_value("key_note", binding.binding().note().unwrap_or_default())
                 .with_named_value(

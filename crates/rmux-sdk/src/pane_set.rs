@@ -74,7 +74,10 @@ impl PaneSet {
     pub async fn snapshot_all(&self) -> PaneSetBatch<PaneSnapshot> {
         run_all(operation_panes(&self.panes, None), |pane| async move {
             let target = pane.target().clone();
-            let pane_id = pane.id().await.ok().flatten();
+            let (pane, pane_id) = match pane.pin_to_current_identity().await {
+                Ok(identity) => identity,
+                Err(error) => return (target, None, Err(error)),
+            };
             let result = pane.snapshot().await;
             (target, pane_id, result)
         })
@@ -125,10 +128,12 @@ async fn close_all_in_order(panes: Vec<Pane>) -> PaneSetBatch<PaneCloseOutcome> 
     let mut failures = Vec::new();
     for pane in panes {
         let target = pane.target().clone();
-        let pane_id = pane.id().await.ok().flatten();
-        let pane = match pane_id {
-            Some(pane_id) => pane.pin_to_id(pane_id),
-            None => pane,
+        let (pane, pane_id) = match pane.pin_to_current_identity().await {
+            Ok(identity) => identity,
+            Err(error) => {
+                failures.push(PaneSetFailure::new(target, None, error));
+                continue;
+            }
         };
         match pane.close().await {
             Ok(value) => successes.push(PaneSetSuccess::new(target, pane_id, value)),

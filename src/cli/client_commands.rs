@@ -15,9 +15,10 @@ use super::attach_transport::{
 };
 use super::json_output::{list_clients_json_format, write_list_clients_json};
 use super::{
-    connect_with_startserver, current_terminal_size, expect_command_success,
-    finish_command_success, list_session_names, resolve_session_target_spec, run_command,
-    run_payload_command_resolved, unexpected_response, ExitFailure, StartupOptions,
+    connect_with_startserver, connect_with_startserver_outcome, current_terminal_size,
+    expect_command_success, finish_command_success, list_session_names,
+    resolve_session_target_spec, run_command, run_payload_command_resolved, unexpected_response,
+    ExitFailure, StartupOptions,
 };
 use crate::cli_args::{
     AttachSessionArgs, Cli, DetachClientArgs, ListClientsArgs, RefreshClientArgs,
@@ -99,9 +100,14 @@ fn prepare_attach_session(
     let target_spec = args.target.as_ref().map(ToString::to_string);
     let nested_skip_environment_update = args.skip_environment_update;
     let nested_toggle_read_only = args.read_only;
-    let mut connection = connect_with_startserver(socket_path, startup)?;
+    let outcome = connect_with_startserver_outcome(socket_path, startup)?;
+    let started_by_caller =
+        outcome.provenance == rmux_client::ServerConnectionProvenance::StartedByCaller;
+    let mut connection = outcome.into_connection();
     if list_session_names(&mut connection)?.is_empty() {
-        let _ = connection.kill_server();
+        if started_by_caller {
+            let _ = connection.shutdown_if_idle();
+        }
         return Err(ExitFailure::new(1, "no sessions"));
     }
     let target = args
@@ -296,12 +302,12 @@ pub(super) fn run_refresh_client(
     run_command(socket_path, "refresh-client", move |connection| {
         connection.refresh_client(RefreshClientRequest {
             target_client: args.target_client,
-            adjustment: args.adjustment,
-            clear_pan: args.clear_pan,
-            pan_left: args.pan_left,
-            pan_right: args.pan_right,
-            pan_up: args.pan_up,
-            pan_down: args.pan_down,
+            adjustment: None,
+            clear_pan: false,
+            pan_left: false,
+            pan_right: false,
+            pan_up: false,
+            pan_down: false,
             status_only: args.status_only,
             clipboard_query: args.clipboard_query,
             flags: args.flags,

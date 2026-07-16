@@ -191,6 +191,87 @@ fn display_message_keeps_pane_zoomed_flag_empty_for_tmux34() -> Result<(), Box<d
 }
 
 #[test]
+fn display_message_reports_pane_input_disabled_state() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("display-message-pane-input-off")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let enabled = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{pane_input_off}",
+    ])?;
+    assert_eq!(enabled.status.code(), Some(0));
+    assert_eq!(stdout(&enabled), "0\n");
+    assert!(stderr(&enabled).is_empty());
+
+    assert_success(&harness.run(&["select-pane", "-d", "-t", "alpha:0.0"])?);
+
+    let disabled = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{pane_input_off}",
+    ])?;
+    assert_eq!(disabled.status.code(), Some(0));
+    assert_eq!(stdout(&disabled), "1\n");
+    assert!(stderr(&disabled).is_empty());
+
+    let listed = harness.run(&["list-panes", "-t", "alpha", "-F", "#{pane_input_off}"])?;
+    assert_eq!(listed.status.code(), Some(0));
+    assert_eq!(stdout(&listed), "1\n");
+    assert!(stderr(&listed).is_empty());
+
+    assert_success(&harness.run(&[
+        "if-shell",
+        "-F",
+        "-t",
+        "alpha:0.0",
+        "#{pane_input_off}",
+        "set-buffer -b pane-input-state disabled",
+        "set-buffer -b pane-input-state enabled",
+    ])?);
+    let selected = harness.run(&["show-buffer", "-b", "pane-input-state"])?;
+    assert_eq!(selected.status.code(), Some(0));
+    assert_eq!(stdout(&selected), "disabled");
+    assert!(stderr(&selected).is_empty());
+
+    assert_success(&harness.run(&["select-pane", "-e", "-t", "alpha:0.0"])?);
+    let config = harness.tmpdir().join("pane-input-off.conf");
+    std::fs::write(
+        &config,
+        "select-pane -d -t alpha:0.0\n\
+         if-shell -F -t alpha:0.0 '#{pane_input_off}' \
+         'set-buffer -b sourced-pane-input-state disabled' \
+         'set-buffer -b sourced-pane-input-state enabled'\n",
+    )?;
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?);
+    let sourced = harness.run(&["show-buffer", "-b", "sourced-pane-input-state"])?;
+    assert_eq!(sourced.status.code(), Some(0));
+    assert_eq!(stdout(&sourced), "disabled");
+    assert!(stderr(&sourced).is_empty());
+
+    assert_success(&harness.run(&["select-pane", "-e", "-t", "alpha:0.0"])?);
+    let reenabled = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{pane_input_off}",
+    ])?;
+    assert_eq!(reenabled.status.code(), Some(0));
+    assert_eq!(stdout(&reenabled), "0\n");
+    assert!(stderr(&reenabled).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn display_message_all_formats_prints_without_print_flag() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("display-message-all-formats")?;
     let mut daemon = harness.start_hidden_daemon()?;

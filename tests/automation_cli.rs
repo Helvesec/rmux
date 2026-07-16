@@ -86,6 +86,109 @@ fn wait_snapshot_and_locator_commands_work_end_to_end() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn nonzero_pane_base_index_preserves_targeted_automation_and_percent_resize(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-pane-base-index")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-x", "80", "-y", "24"])?);
+    assert_success(&harness.run(&[
+        "set-window-option",
+        "-t",
+        "alpha:0",
+        "pane-base-index",
+        "1",
+    ])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "alpha:0.1"])?);
+
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.1",
+        "printf PANE_ONE_MARKER",
+        "Enter",
+    ])?);
+    assert_success(&harness.run(&[
+        "wait-pane",
+        "-t",
+        "alpha:0.1",
+        "--text",
+        "PANE_ONE_MARKER",
+        "--timeout",
+        "5s",
+    ])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.2",
+        "--wait-next-text",
+        "PANE_TWO_MARKER",
+        "--timeout",
+        "5s",
+        "--",
+        "printf PANE_TWO_MARKER",
+        "Enter",
+    ])?);
+
+    let pane_one = run_json(&harness, &["pane-snapshot", "-t", "alpha:0.1", "--json"])?;
+    let pane_two = run_json(&harness, &["pane-snapshot", "-t", "alpha:0.2", "--json"])?;
+    let pane_one_text = pane_one["text"].as_str().expect("pane one snapshot text");
+    let pane_two_text = pane_two["text"].as_str().expect("pane two snapshot text");
+    assert!(pane_one_text.contains("PANE_ONE_MARKER"), "{pane_one}");
+    assert!(!pane_one_text.contains("PANE_TWO_MARKER"), "{pane_one}");
+    assert!(pane_two_text.contains("PANE_TWO_MARKER"), "{pane_two}");
+    assert!(!pane_two_text.contains("PANE_ONE_MARKER"), "{pane_two}");
+
+    assert_success(&harness.run(&["resize-pane", "-t", "alpha:0.1", "-x", "60%"])?);
+    let panes = harness.run(&[
+        "list-panes",
+        "-t",
+        "alpha:0",
+        "-F",
+        "#{pane_index}:#{pane_width}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    assert!(stderr(&panes).is_empty());
+    let panes = stdout(&panes);
+    let pane_one_width = pane_width(&panes, 1)?;
+    let pane_two_width = pane_width(&panes, 2)?;
+    assert_eq!(pane_one_width, 48, "unexpected pane widths: {panes:?}");
+    assert_ne!(pane_two_width, 48, "resize targeted wrong pane: {panes:?}");
+
+    Ok(())
+}
+
+#[test]
+fn automation_slot_lookup_preserves_list_panes_hook_family() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-slot-lookup-hook")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "slot-lookup-hook", "seed"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-list-panes",
+        "set-buffer -b slot-lookup-hook list-panes",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-display-message",
+        "set-buffer -b slot-lookup-hook display-message",
+    ])?);
+
+    let snapshot = run_json(&harness, &["pane-snapshot", "-t", "alpha:0.0", "--json"])?;
+    assert_eq!(snapshot["ok"], true);
+    let hook_family = harness.run(&["show-buffer", "-b", "slot-lookup-hook"])?;
+    assert_eq!(hook_family.status.code(), Some(0));
+    assert_eq!(stdout(&hook_family), "list-panes");
+    assert!(stderr(&hook_family).is_empty());
+
+    Ok(())
+}
+
+#[test]
 fn wait_next_text_times_out_without_history_match() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("automation-next-text-timeout")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -950,6 +1053,15 @@ fn with_session_kill_on_owner_exit_releases_name_immediately() -> Result<(), Box
     ])?);
     assert_success(&harness.run(&["new-session", "-d", "-s", "owned", "sleep", "60"])?);
     Ok(())
+}
+
+fn pane_width(output: &str, pane_index: u32) -> Result<u16, Box<dyn Error>> {
+    let prefix = format!("{pane_index}:");
+    let width = output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .ok_or_else(|| format!("pane {pane_index} missing from {output:?}"))?;
+    Ok(width.parse()?)
 }
 
 fn run_json(harness: &CliHarness, args: &[&str]) -> Result<Value, Box<dyn Error>> {

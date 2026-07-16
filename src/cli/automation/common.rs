@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use crate::cli_args::TargetSpec;
 use crate::cli_response::tmux_cli_error_message;
 
-use super::super::{resolve_pane_target_or_current, ExitFailure};
+use super::super::{listed_pane_index_matches_target, resolve_pane_target_or_current, ExitFailure};
 use super::pane_exit::PaneExitStatus;
 
 pub(super) const SCHEMA_VERSION: u8 = 1;
@@ -434,7 +434,7 @@ fn pane_id_for_slot(
         .list_panes_in_window(
             target.session_name().clone(),
             Some(target.window_index()),
-            Some("#{pane_index}\t#{pane_id}\n".to_owned()),
+            Some("#{pane_index}\t#{pane-base-index}\t#{pane_id}\n".to_owned()),
         )
         .map_err(ExitFailure::from_client)?;
     let output = match response {
@@ -455,14 +455,16 @@ fn pane_id_for_slot(
             ));
         }
     };
-    let pane_index = target.pane_index().to_string();
-    let text = String::from_utf8_lossy(output.stdout());
-    for line in text.lines() {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.first().copied() != Some(pane_index.as_str()) {
+    for line in String::from_utf8_lossy(output.stdout()).lines() {
+        let mut fields = line.split('\t');
+        if !listed_pane_index_matches_target(
+            target,
+            fields.next().unwrap_or_default(),
+            fields.next().unwrap_or_default(),
+        ) {
             continue;
         }
-        if let Some(pane_id) = fields.get(1).and_then(|value| parse_pane_id(value)) {
+        if let Some(pane_id) = fields.next().and_then(parse_pane_id) {
             return Ok(pane_id);
         }
         break;
@@ -482,7 +484,7 @@ fn pane_process_state_for_slot(
             target.session_name().clone(),
             Some(target.window_index()),
             Some(
-                "#{pane_index}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\n"
+                "#{pane_index}\t#{pane-base-index}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\n"
                     .to_owned(),
             ),
         )
@@ -504,14 +506,18 @@ fn pane_process_state_for_slot(
     };
     let text = String::from_utf8_lossy(output.stdout());
     for line in text.lines() {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.first().copied() != Some(&target.pane_index().to_string()) {
+        let mut fields = line.split('\t');
+        if !listed_pane_index_matches_target(
+            target,
+            fields.next().unwrap_or_default(),
+            fields.next().unwrap_or_default(),
+        ) {
             continue;
         }
-        if fields.get(1).copied() == Some("1") {
+        if fields.next() == Some("1") {
             return Ok(PaneProcessState::Exited(PaneExitStatus::known(
-                parse_i32_field(fields.get(2).copied()),
-                parse_i32_field(fields.get(3).copied()),
+                parse_i32_field(fields.next()),
+                parse_i32_field(fields.next()),
             )));
         }
         return Ok(PaneProcessState::Alive);

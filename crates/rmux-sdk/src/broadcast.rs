@@ -439,10 +439,15 @@ fn is_daemon_broadcast_unavailable(error: &RmuxError) -> bool {
 
 async fn send_one(pane: Pane, input: OwnedInput) -> PaneBroadcastOutcome {
     let target = pane.target().clone();
-    let pane_id = pane.id().await.ok().flatten();
-    let pane = match pane_id {
-        Some(pane_id) => pane.pin_to_id(pane_id),
-        None => pane,
+    let (pane, pane_id) = match pane.pin_to_current_identity().await {
+        Ok(identity) => identity,
+        Err(error) => {
+            return PaneBroadcastOutcome::Failure(BroadcastPaneFailure {
+                target,
+                pane_id: None,
+                error,
+            });
+        }
     };
     let result = match input {
         OwnedInput::Text(text) => pane.send_text(text).await,

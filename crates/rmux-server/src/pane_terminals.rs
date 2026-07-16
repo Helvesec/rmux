@@ -70,6 +70,7 @@ mod window_link_runtime;
 mod window_links;
 #[path = "pane_terminals_window.rs"]
 mod window_support;
+pub(crate) use window_support::ListWindowsSelection;
 
 #[cfg(test)]
 pub(crate) use lifecycle_state::PaneLifecycleProcessState;
@@ -239,6 +240,7 @@ pub(crate) struct HandlerState {
     pub(crate) buffers: BufferStore,
     pub(crate) key_bindings: KeyBindingStore,
     pub(crate) message_log: VecDeque<MessageEntry>,
+    startup_config_files: String,
     next_message_number: u64,
     terminals: PaneTerminalStore,
     #[cfg(windows)]
@@ -336,6 +338,14 @@ pub(crate) struct UnlinkedWindowResult {
 }
 
 impl HandlerState {
+    pub(crate) fn set_startup_config_files(&mut self, paths: &[String]) {
+        self.startup_config_files = paths.join(",");
+    }
+
+    pub(crate) fn startup_config_files(&self) -> &str {
+        &self.startup_config_files
+    }
+
     #[cfg(unix)]
     pub(crate) fn set_pane_reader_runtime(&mut self, runtime: PaneReaderRuntime) {
         self.pane_reader_runtime = Some(runtime);

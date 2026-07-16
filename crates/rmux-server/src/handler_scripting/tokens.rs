@@ -10,13 +10,13 @@ pub(super) fn normalize_compact_short_options(
     let Some(spec) = command_short_option_spec(command_name) else {
         return arguments;
     };
+    let option_prefix_len = short_option_prefix_len_with_spec(&arguments, spec);
 
     let mut normalized = Vec::with_capacity(arguments.len());
-    let mut parsing_options = true;
     let mut expects_value = false;
 
-    for argument in arguments {
-        if !parsing_options {
+    for (index, argument) in arguments.into_iter().enumerate() {
+        if index >= option_prefix_len {
             normalized.push(argument);
             continue;
         }
@@ -25,34 +25,14 @@ pub(super) fn normalize_compact_short_options(
             expects_value = false;
             continue;
         }
-        if argument == "--" {
-            normalized.push(argument);
-            parsing_options = false;
-            continue;
-        }
-        if argument == "-" || !argument.starts_with('-') || argument.starts_with("--") {
-            parsing_options = false;
-            normalized.push(argument);
-            continue;
-        }
         let mut short_flags = argument[1..].chars();
         if let (Some(flag), None) = (short_flags.next(), short_flags.next()) {
             expects_value = spec.takes_value(flag);
-            if !expects_value && !spec.is_boolean(flag) {
-                parsing_options = false;
-            }
             normalized.push(argument);
             continue;
         }
 
         let Some((parts, needs_next_value)) = normalize_short_option_token(&argument, spec) else {
-            if argument[1..]
-                .chars()
-                .next()
-                .is_some_and(|flag| !spec.is_boolean(flag) && !spec.takes_value(flag))
-            {
-                parsing_options = false;
-            }
             normalized.push(argument);
             continue;
         };
@@ -61,6 +41,61 @@ pub(super) fn normalize_compact_short_options(
     }
 
     normalized
+}
+
+pub(super) fn short_option_prefix_len(command_name: &str, arguments: &[String]) -> usize {
+    command_short_option_spec(command_name)
+        .map_or(0, |spec| short_option_prefix_len_with_spec(arguments, spec))
+}
+
+pub(super) fn short_option_takes_next_value(command_name: &str, argument: &str) -> bool {
+    command_short_option_spec(command_name)
+        .is_some_and(|spec| short_option_token_needs_next_value(argument, spec) == Some(true))
+}
+
+fn short_option_prefix_len_with_spec(arguments: &[String], spec: &CommandShortOptionSpec) -> usize {
+    let mut expects_value = false;
+
+    for (index, argument) in arguments.iter().enumerate() {
+        if expects_value {
+            expects_value = false;
+            continue;
+        }
+        if argument == "--"
+            || argument == "-"
+            || !argument.starts_with('-')
+            || argument.starts_with("--")
+        {
+            return index;
+        }
+        let Some(needs_next_value) = short_option_token_needs_next_value(argument, spec) else {
+            return index;
+        };
+        expects_value = needs_next_value;
+    }
+
+    arguments.len()
+}
+
+fn short_option_token_needs_next_value(
+    argument: &str,
+    spec: &CommandShortOptionSpec,
+) -> Option<bool> {
+    let flags = argument.strip_prefix('-')?;
+    if flags.is_empty() || flags.starts_with('-') {
+        return None;
+    }
+
+    for (index, flag) in flags.char_indices() {
+        if spec.takes_value(flag) {
+            return Some(index + flag.len_utf8() == flags.len());
+        }
+        if !spec.is_boolean(flag) {
+            return None;
+        }
+    }
+
+    Some(false)
 }
 
 fn normalize_short_option_token(
@@ -243,7 +278,7 @@ impl CommandTokens {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_compact_short_options;
+    use super::{normalize_compact_short_options, short_option_prefix_len};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -269,6 +304,17 @@ mod tests {
             normalize_compact_short_options("run-shell", args(&["--", "-JT"])),
             args(&["--", "-JT"])
         );
+        assert_eq!(
+            short_option_prefix_len("set-option", &args(&["-g", "@compact", "-tfoo"])),
+            1
+        );
+        assert_eq!(
+            short_option_prefix_len(
+                "list-windows",
+                &args(&["-F", "-tfoo", "-t", "alpha", "message"]),
+            ),
+            4
+        );
     }
 
     #[test]
@@ -284,6 +330,18 @@ mod tests {
         assert_eq!(
             normalize_compact_short_options("resize-pane", args(&["-D5", "-Z"])),
             args(&["-D5", "-Z"])
+        );
+    }
+
+    #[test]
+    fn compact_short_options_include_hidden_tmux_flags_without_public_inventory_churn() {
+        assert_eq!(
+            normalize_compact_short_options("load-buffer", args(&["-wbclip", "/tmp/input"])),
+            args(&["-w", "-b", "clip", "/tmp/input"])
+        );
+        assert_eq!(
+            normalize_compact_short_options("list-buffers", args(&["-rF#{buffer_name}"])),
+            args(&["-r", "-F", "#{buffer_name}"])
         );
     }
 

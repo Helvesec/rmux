@@ -689,6 +689,8 @@ async fn control_mode_attach_session_tracks_the_control_clients_session() {
 #[tokio::test]
 async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients() {
     let handler = RequestHandler::new();
+    let socket_path = "/tmp/rmux-list-clients-format.sock";
+    handler.set_socket_path(socket_path);
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
 
@@ -706,15 +708,22 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
     handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
+    let config_files = "/tmp/rmux-list-clients.conf";
+    handler
+        .state
+        .lock()
+        .await
+        .set_startup_config_files(&[config_files.to_owned()]);
 
     let response = handler
         .handle(Request::ListClients(Box::new(
             rmux_proto::ListClientsRequest {
                 format: Some(
-                    "#{client_name}|#{client_pid}|#{client_tty}|#{client_session}".to_owned(),
+                    "#{client_name}|#{client_pid}|#{client_tty}|#{client_session}|#{socket_path}|#{config_files}"
+                        .to_owned(),
                 ),
                 target_session: None,
-                filter: None,
+                filter: Some(format!("#{{==:#{{socket_path}},{socket_path}}}")),
                 sort_order: None,
                 reversed: false,
             },
@@ -726,9 +735,11 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
     let output = String::from_utf8(response.output.stdout().to_vec()).expect("utf-8");
     let line = output.lines().next().expect("client line");
     let parts = line.split('|').collect::<Vec<_>>();
-    assert_eq!(parts.len(), 4);
+    assert_eq!(parts.len(), 6);
     assert_eq!(parts[1], requester_pid.to_string());
     assert_eq!(parts[3], "alpha");
+    assert_eq!(parts[4], socket_path);
+    assert_eq!(parts[5], config_files);
     #[cfg(unix)]
     assert!(!parts[2].is_empty(), "client_tty should be populated");
     #[cfg(windows)]

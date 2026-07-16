@@ -110,6 +110,59 @@ fn startup_config_accepts_clustered_scripting_flags() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn option_like_values_after_positionals_survive_all_command_entry_paths(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("option-like-positional-values")?;
+    harness.success(["new-session", "-d", "-s", "anchor"])?;
+
+    harness.success(["set-option", "-g", "@direct", "-tfoo"])?;
+    assert_option(&harness, "@direct", "-tfoo")?;
+
+    let source = harness.tmpdir().join("source.conf");
+    fs::write(&source, "set-option -g @source -tfoo\n")?;
+    harness.success([OsStr::new("source-file"), source.as_os_str()])?;
+    assert_option(&harness, "@source", "-tfoo")?;
+
+    let first_path = harness.tmpdir().join("first.conf");
+    let option_like_path = harness.tmpdir().join("-tfoo");
+    fs::write(&first_path, "set-option -g @first-path loaded\n")?;
+    fs::write(
+        &option_like_path,
+        "set-option -g @option-like-path loaded\n",
+    )?;
+    let mut source_paths = harness.command(["source-file", "first.conf", "-tfoo"]);
+    source_paths.current_dir(harness.tmpdir());
+    assert_success(&source_paths.output()?)?;
+    assert_option(&harness, "@first-path", "loaded")?;
+    assert_option(&harness, "@option-like-path", "loaded")?;
+
+    harness.success([
+        "set-option",
+        "-s",
+        "command-alias",
+        "literal=set-option -g @alias",
+    ])?;
+    harness.success(["literal", "-tfoo"])?;
+    assert_option(&harness, "@alias", "-tfoo")?;
+
+    harness.success(["-C", "set-option", "-g", "@control", "-tfoo"])?;
+    assert_option(&harness, "@control", "-tfoo")?;
+
+    let startup = CrossPlatformHarness::new("startup-option-like-positional")?;
+    let startup_config = startup.tmpdir().join("startup.conf");
+    fs::write(&startup_config, "set-option -g @startup -tfoo\n")?;
+    startup.success([
+        OsStr::new("-f"),
+        startup_config.as_os_str(),
+        OsStr::new("new-session"),
+        OsStr::new("-d"),
+        OsStr::new("-s"),
+        OsStr::new("startup"),
+    ])?;
+    assert_option(&startup, "@startup", "-tfoo")
+}
+
+#[test]
 fn source_file_parse_only_accepts_remaining_compact_flag_families() -> Result<(), Box<dyn Error>> {
     let harness = CrossPlatformHarness::new("source-remaining-compact-flags")?;
     harness.success(["new-session", "-d", "-s", "anchor"])?;
@@ -117,7 +170,7 @@ fn source_file_parse_only_accepts_remaining_compact_flag_families() -> Result<()
     fs::write(
         &config,
         "detach-client -aP\n\
-         refresh-client -cL\n\
+         refresh-client -lS\n\
          switch-client -Er\n\
          list-clients -rF client\n\
          server-access -lr\n\

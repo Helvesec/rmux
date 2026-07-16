@@ -1,4 +1,4 @@
-use rmux_core::command_inventory::render_list_commands;
+use rmux_core::command_inventory::render_list_commands_for_socket;
 use rmux_core::command_parser::ParsedCommand;
 use rmux_proto::{CommandOutput, RmuxError};
 
@@ -58,8 +58,14 @@ impl RequestHandler {
         &self,
         command: ParsedListCommandsCommand,
     ) -> Result<QueueCommandAction, RmuxError> {
-        let lines = render_list_commands(command.format.as_deref(), command.command.as_deref())
-            .map_err(|error| RmuxError::Server(error.to_string()))?;
+        let socket_path = self.socket_path();
+        let socket_path = socket_path.to_string_lossy();
+        let lines = render_list_commands_for_socket(
+            command.format.as_deref(),
+            command.command.as_deref(),
+            &socket_path,
+        )
+        .map_err(|error| RmuxError::Server(error.to_string()))?;
         let stdout = if lines.is_empty() {
             Vec::new()
         } else {

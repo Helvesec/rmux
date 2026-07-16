@@ -33,6 +33,17 @@ fn standalone_argv_semicolon_builds_an_ordered_command_queue() {
 }
 
 #[test]
+fn argv_command_queue_rejects_refresh_client_pan_fields() {
+    for args in [
+        &["list-sessions", ";", "refresh-client", "-L", "10"][..],
+        &["list-sessions", ";", "refresh-client", "10"][..],
+    ] {
+        let error = parse_args(args).expect_err("refresh-client pan field must fail in argv queue");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+}
+
+#[test]
 fn target_client_and_hook_flags_survive_argv_queue_parsing() {
     let cli = parse_args(&[
         "load-buffer",

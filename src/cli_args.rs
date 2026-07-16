@@ -521,6 +521,27 @@ fn parse_command_args<T>(
 where
     T: Args + FromArgMatches,
 {
+    parse_command_args_with_policy(
+        command_name,
+        arguments,
+        PositionalOptionPolicy::StopAtFirstPositional,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PositionalOptionPolicy {
+    StopAtFirstPositional,
+    InterspersedBeforeSeparator,
+}
+
+fn parse_command_args_with_policy<T>(
+    command_name: &'static str,
+    arguments: Vec<String>,
+    positional_option_policy: PositionalOptionPolicy,
+) -> Result<T, clap::Error>
+where
+    T: Args + FromArgMatches,
+{
     let command = T::augment_args(
         clap::Command::new(command_name)
             .no_binary_name(true)
@@ -533,19 +554,35 @@ where
             .long("help")
             .action(ArgAction::Help)
             .help("Print help"),
-    );
+    )
+    .mut_args(|argument| {
+        if argument_requires_value(&argument)
+            && (argument.get_short().is_some() || argument.get_long().is_some())
+        {
+            // tmux consumes the next token as a required option value even
+            // when it looks like another option or is the literal `--`.
+            argument.allow_hyphen_values(true)
+        } else {
+            argument
+        }
+    });
     let arguments = normalize_attached_short_values(&command, arguments);
     let arguments = tmux_precedence::normalize_tmux_precedence(command_name, arguments);
-    validate_options_before_positionals(command_name, &command, &arguments)?;
+    let arguments = match positional_option_policy {
+        PositionalOptionPolicy::StopAtFirstPositional => {
+            delimit_options_before_positionals(command_name, &command, arguments)?
+        }
+        PositionalOptionPolicy::InterspersedBeforeSeparator => arguments,
+    };
     let matches = command.try_get_matches_from(arguments)?;
     T::from_arg_matches(&matches)
 }
 
-fn validate_options_before_positionals(
+fn delimit_options_before_positionals(
     command_name: &'static str,
     command: &clap::Command,
-    arguments: &[String],
-) -> Result<(), clap::Error> {
+    mut arguments: Vec<String>,
+) -> Result<Vec<String>, clap::Error> {
     let positionals_allow_hyphen = command
         .get_positionals()
         .any(|argument| argument.is_allow_hyphen_values_set());
@@ -570,7 +607,8 @@ fn validate_options_before_positionals(
         .collect::<std::collections::BTreeSet<_>>();
 
     let mut expected_value_flag = None::<String>;
-    for argument in arguments {
+    let mut first_positional = None;
+    for (index, argument) in arguments.iter().enumerate() {
         if expected_value_flag.take().is_some() {
             continue;
         }
@@ -578,6 +616,7 @@ fn validate_options_before_positionals(
             break;
         }
         if !argument.starts_with('-') || argument == "-" {
+            first_positional = Some(index);
             break;
         }
         if let Some(long) = argument.strip_prefix("--") {
@@ -615,7 +654,34 @@ fn validate_options_before_positionals(
         return Err(missing_value_error(command_name, flag));
     }
 
-    Ok(())
+    if let Some(index) = first_positional {
+        let positional_limit = command
+            .get_positionals()
+            .map(|argument| {
+                argument
+                    .get_num_args()
+                    .map_or(1, |range| range.max_values())
+            })
+            .fold(0_usize, usize::saturating_add);
+        if positional_limit == 0 {
+            return Ok(arguments);
+        }
+        if arguments.len() - index > positional_limit {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::TooManyValues,
+                format!(
+                    "command {command_name}: too many arguments (need at most {positional_limit})"
+                ),
+            ));
+        }
+
+        // tmux stops option parsing at the first positional. Clap otherwise
+        // accepts recognized flags later in the argv and can silently change
+        // a command's target or scope instead of rejecting the extra tail.
+        arguments.insert(index, "--".to_owned());
+    }
+
+    Ok(arguments)
 }
 
 fn argument_requires_value(argument: &clap::Arg) -> bool {
@@ -640,14 +706,21 @@ fn missing_value_error(command_name: &'static str, flag: String) -> clap::Error 
 }
 
 fn normalize_attached_short_values(command: &clap::Command, arguments: Vec<String>) -> Vec<String> {
+    let boolean_flags = command
+        .get_arguments()
+        .filter(|argument| {
+            matches!(
+                argument.get_action(),
+                ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count
+            )
+        })
+        .filter_map(clap::Arg::get_short)
+        .collect::<std::collections::BTreeSet<_>>();
     let value_flags = command
         .get_arguments()
         .filter(|argument| argument_requires_value(argument))
         .filter_map(clap::Arg::get_short)
         .collect::<std::collections::BTreeSet<_>>();
-    let has_trailing_position = command
-        .get_positionals()
-        .any(clap::Arg::is_trailing_var_arg_set);
     let repeat_last_wins_flags = if command.get_name() == "new-window" {
         command
             .get_arguments()
@@ -683,15 +756,17 @@ fn normalize_attached_short_values(command: &clap::Command, arguments: Vec<Strin
             continue;
         }
 
-        if has_trailing_position && is_trailing_position_start(&argument) {
+        if is_positional_start(&argument) {
             trailing_values.push(argument);
             trailing_values.extend(arguments);
             break;
         }
 
-        if let Some((flag, value)) = attached_short_value(&argument, &value_flags) {
-            normalized_options.push(format!("-{flag}"));
-            normalized_options.push(value.to_owned());
+        if let Some((parts, needs_next_value)) =
+            normalize_compact_short_value_token(&argument, &boolean_flags, &value_flags)
+        {
+            normalized_options.extend(parts);
+            expect_next_value = needs_next_value;
         } else if exact_short_flag(&argument, &value_flags).is_some() {
             expect_next_value = true;
             normalized_options.push(argument);
@@ -706,22 +781,43 @@ fn normalize_attached_short_values(command: &clap::Command, arguments: Vec<Strin
     normalized
 }
 
-fn is_trailing_position_start(argument: &str) -> bool {
+fn is_positional_start(argument: &str) -> bool {
     !argument.starts_with('-') || argument == "-"
 }
 
-fn attached_short_value<'a>(
-    argument: &'a str,
+fn normalize_compact_short_value_token(
+    argument: &str,
+    boolean_flags: &std::collections::BTreeSet<char>,
     value_flags: &std::collections::BTreeSet<char>,
-) -> Option<(char, &'a str)> {
-    let mut chars = argument.chars();
-    if chars.next()? != '-' || chars.as_str().starts_with('-') {
+) -> Option<(Vec<String>, bool)> {
+    let flags = argument.strip_prefix('-')?;
+    if flags.is_empty() || flags.starts_with('-') {
         return None;
     }
 
-    let flag = chars.next()?;
-    let value = chars.as_str();
-    (!value.is_empty() && value_flags.contains(&flag)).then_some((flag, value))
+    let mut chars = flags.char_indices().peekable();
+    let first = chars.next()?;
+    chars.peek()?;
+
+    let mut parts = Vec::new();
+    for (index, flag) in std::iter::once(first).chain(chars.by_ref()) {
+        if boolean_flags.contains(&flag) {
+            parts.push(format!("-{flag}"));
+            continue;
+        }
+        if value_flags.contains(&flag) {
+            parts.push(format!("-{flag}"));
+            let value_start = index + flag.len_utf8();
+            if value_start < flags.len() {
+                parts.push(flags[value_start..].to_owned());
+                return Some((parts, false));
+            }
+            return Some((parts, true));
+        }
+        return None;
+    }
+
+    Some((parts, false))
 }
 
 fn collapse_repeated_short_values(

@@ -561,6 +561,7 @@ impl RequestHandler {
         requester_pid: u32,
         request: ListClientsRequest,
     ) -> Response {
+        let socket_path = self.socket_path();
         let requester_uid = self.requester_uid(requester_pid).await;
         let mut clients = self.list_clients_snapshot().await;
         if let Some(target_session) = request.target_session.as_ref() {
@@ -572,10 +573,13 @@ impl RequestHandler {
             request.reversed,
         );
 
+        let state = self.state.lock().await;
         let lines = clients
             .iter()
             .filter_map(|client| {
                 let context = RuntimeFormatContext::new(FormatContext::new())
+                    .with_state(&state)
+                    .with_socket_path(&socket_path)
                     .with_named_value("client_name", client.name.clone())
                     .with_named_value("client_pid", client.pid.to_string())
                     .with_named_value("client_tty", client.tty.clone())

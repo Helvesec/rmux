@@ -60,7 +60,7 @@ async fn pane_index_formats_use_window_local_pane_base_index() {
         .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha.clone(),
             target_window_index: Some(0),
-            format: Some("#{pane_index}".to_owned()),
+            format: Some("#{pane_index}:#{pane-base-index}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
@@ -69,7 +69,7 @@ async fn pane_index_formats_use_window_local_pane_base_index() {
     let Response::ListPanes(list) = list else {
         panic!("list-panes should succeed, got {list:?}");
     };
-    assert_eq!(stdout_string(&list.output), "10\n11\n");
+    assert_eq!(stdout_string(&list.output), "10:10\n11:10\n");
 
     for (format, expected) in [
         (None, vec!["10", "11"]),
@@ -153,7 +153,7 @@ async fn default_list_panes_uses_global_pane_base_index_without_window_override(
 
     let list = handler
         .handle(Request::ListPanes(Box::new(ListPanesRequest {
-            target: beta,
+            target: beta.clone(),
             target_window_index: Some(0),
             format: None,
             filter: None,
@@ -165,6 +165,21 @@ async fn default_list_panes_uses_global_pane_base_index_without_window_override(
         panic!("default list-panes should succeed, got {list:?}");
     };
     assert_eq!(default_list_pane_labels(&list.output), ["7", "8"]);
+
+    let list = handler
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
+            target: beta,
+            target_window_index: Some(0),
+            format: Some("#{pane_index}:#{pane-base-index}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
+        .await;
+    let Response::ListPanes(list) = list else {
+        panic!("list-panes option format should succeed, got {list:?}");
+    };
+    assert_eq!(stdout_string(&list.output), "7:7\n8:7\n");
 }
 
 #[tokio::test]

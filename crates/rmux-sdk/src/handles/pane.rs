@@ -142,9 +142,22 @@ pub struct PaneOptionMutation {
 pub struct Pane {
     target: PaneRef,
     stable_id: Option<PaneId>,
+    identity_preflight: PaneIdentityPreflight,
     endpoint: RmuxEndpoint,
     default_timeout: Option<Duration>,
     transport: TransportClient,
+}
+
+/// Identity state captured at the start of one composite SDK operation.
+///
+/// `Absent` is deliberately sticky: once a slot was observed as vacant, the
+/// remainder of that operation must not resolve the same coordinates again
+/// and accidentally adopt a replacement pane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PaneIdentityPreflight {
+    #[default]
+    Unresolved,
+    Absent,
 }
 
 impl Pane {
@@ -160,6 +173,7 @@ impl Pane {
         Self {
             target,
             stable_id: None,
+            identity_preflight: PaneIdentityPreflight::Unresolved,
             endpoint,
             default_timeout,
             transport,
@@ -179,6 +193,7 @@ impl Pane {
         Self {
             target,
             stable_id: Some(pane_id),
+            identity_preflight: PaneIdentityPreflight::Unresolved,
             endpoint,
             default_timeout,
             transport,
@@ -251,6 +266,9 @@ impl Pane {
     pub(crate) async fn resolved_proto_target_ref(
         &self,
     ) -> Result<Option<rmux_proto::PaneTargetRef>> {
+        if self.identity_preflight == PaneIdentityPreflight::Absent {
+            return Ok(None);
+        }
         if let Some(pane_id) = self.stable_id {
             return Ok(current_pane_ref_for_id(
                 &self.transport,
@@ -282,7 +300,24 @@ impl Pane {
 
     pub(crate) fn pin_to_id(mut self, pane_id: PaneId) -> Self {
         self.stable_id = Some(pane_id);
+        self.identity_preflight = PaneIdentityPreflight::Unresolved;
         self
+    }
+
+    /// Captures the pane identity resolved at the start of a composite SDK
+    /// operation. A vacant slot remains vacant for the rest of that operation
+    /// instead of being resolved a second time after slot reuse.
+    pub(crate) async fn pin_to_current_identity(self) -> Result<(Self, Option<PaneId>)> {
+        let pane_id = self.id().await?;
+        let mut pane = self;
+        match pane_id {
+            Some(pane_id) => pane = pane.pin_to_id(pane_id),
+            None if pane.stable_id.is_none() => {
+                pane.identity_preflight = PaneIdentityPreflight::Absent;
+            }
+            None => {}
+        }
+        Ok((pane, pane_id))
     }
 
     /// Sends literal UTF-8 text bytes to this pane through the daemon.

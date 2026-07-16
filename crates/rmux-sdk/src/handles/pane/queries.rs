@@ -13,6 +13,9 @@ impl Pane {
     /// the [`Window`](super::super::Window)-handle stale-slot semantics.
     pub async fn id(&self) -> Result<Option<PaneId>> {
         let pane = self.begin_operation_handle();
+        if pane.identity_preflight == super::PaneIdentityPreflight::Absent {
+            return Ok(None);
+        }
         if let Some(pane_id) = pane.stable_id {
             let current =
                 current_pane_ref_for_id(&pane.transport, &pane.target.session_name, pane_id)
