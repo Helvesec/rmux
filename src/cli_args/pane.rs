@@ -452,7 +452,7 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) start_directory: Option<PathBuf>,
     #[arg(short = 'l', allow_hyphen_values = true, group = "size_spec")]
     pub(crate) size: Option<String>,
-    #[arg(short = 'p', hide = true, allow_hyphen_values = true)]
+    #[arg(short = 'p', allow_hyphen_values = true)]
     pub(crate) percentage: Option<String>,
     #[arg(short = 'F', allow_hyphen_values = true)]
     pub(crate) format: Option<String>,
@@ -462,6 +462,8 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) preserve_zoom: bool,
     #[arg(short = 'I', action = ArgAction::SetTrue)]
     pub(crate) stdin: bool,
+    #[arg(short = 'k', action = ArgAction::SetTrue)]
+    pub(crate) keep_alive_on_exit: bool,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -610,16 +612,10 @@ impl SelectLayoutArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("input")
-        .required(false)
-        .multiple(false)
-        .args(["disable_input", "enable_input"])
-))]
 pub(crate) struct LastPaneArgs {
-    #[arg(short = 'd', action = ArgAction::SetTrue, group = "input")]
+    #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) disable_input: bool,
-    #[arg(short = 'e', action = ArgAction::SetTrue, group = "input")]
+    #[arg(short = 'e', action = ArgAction::SetTrue)]
     pub(crate) enable_input: bool,
     #[arg(short = 'Z', action = ArgAction::SetTrue)]
     pub(crate) keep_zoom: bool,

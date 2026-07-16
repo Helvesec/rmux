@@ -1,3 +1,4 @@
+use super::attach_support::ActiveAttachIdentity;
 use super::pane_support::resolve_input_target;
 use super::prompt_support::PromptInputEvent;
 use super::RequestHandler;
@@ -20,8 +21,13 @@ use rmux_proto::{
 mod input;
 #[path = "handler_copy_mode/key_binding.rs"]
 pub(in crate::handler) mod key_binding;
+#[path = "handler_copy_mode/refresh_fanout.rs"]
+mod refresh_fanout;
 #[path = "handler_copy_mode/search.rs"]
 mod search;
+
+#[cfg(test)]
+pub(in crate::handler) use refresh_fanout::install_copy_mode_mutation_pause;
 
 use input::{attached_copy_mode_input_action, AttachedCopyModeInputAction};
 
@@ -35,12 +41,26 @@ impl RequestHandler {
             let active_attach = self.active_attach.lock().await;
             active_attach.current_session_candidate(requester_pid)
         };
-        let target = {
+        let (target, target_session_id) = {
             let state = self.state.lock().await;
-            match resolve_input_target(&state, request.target.as_ref(), attached_session.as_ref()) {
+            let target = match resolve_input_target(
+                &state,
+                request.target.as_ref(),
+                attached_session.as_ref(),
+            ) {
                 Ok(target) => target,
                 Err(error) => return Response::Error(ErrorResponse { error }),
-            }
+            };
+            let Some(session_id) = state
+                .sessions
+                .session(target.session_name())
+                .map(rmux_core::Session::id)
+            else {
+                return Response::Error(ErrorResponse {
+                    error: RmuxError::Server("copy-mode target session disappeared".to_owned()),
+                });
+            };
+            (target, session_id)
         };
 
         if request.cancel_mode {
@@ -56,11 +76,14 @@ impl RequestHandler {
                 .expect("pane transcript mutex must not be poisoned")
                 .clear_copy_mode();
             if cleared {
-                self.emit(LifecycleEvent::PaneModeChanged {
-                    target: target.clone(),
-                })
-                .await;
-                self.refresh_attached_session(target.session_name()).await;
+                let identities = match self
+                    .prepare_copy_mode_refresh_fanout(&target, target_session_id, true)
+                    .await
+                {
+                    Ok(identities) => identities,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
+                self.refresh_copy_mode_session_identities(identities).await;
             }
             return Response::CopyMode(CopyModeResponse {
                 target,
@@ -177,13 +200,14 @@ impl RequestHandler {
             }
         };
 
-        if mode_changed {
-            self.emit(LifecycleEvent::PaneModeChanged {
-                target: target.clone(),
-            })
-            .await;
-        }
-        self.refresh_attached_session(target.session_name()).await;
+        let identities = match self
+            .prepare_copy_mode_refresh_fanout(&target, target_session_id, mode_changed)
+            .await
+        {
+            Ok(identities) => identities,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
+        self.refresh_copy_mode_session_identities(identities).await;
 
         Response::CopyMode(CopyModeResponse {
             target,
@@ -218,25 +242,48 @@ impl RequestHandler {
         }
     }
 
-    pub(super) async fn handle_attached_copy_mode_key_event(
+    pub(super) async fn handle_attached_copy_mode_key_event_for_identity(
         &self,
-        attach_pid: u32,
+        identity: ActiveAttachIdentity,
         target: PaneTarget,
         event: PromptInputEvent,
     ) -> Result<bool, RmuxError> {
-        self.handle_copy_mode_key_event(attach_pid, target, event, true)
+        self.handle_copy_mode_key_event(identity.attach_pid(), Some(identity), target, event, true)
             .await
     }
 
     async fn handle_copy_mode_key_event(
         &self,
         requester_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
         target: PaneTarget,
         event: PromptInputEvent,
         allow_prompt: bool,
     ) -> Result<bool, RmuxError> {
+        let expected_session_id = match identity {
+            Some(identity) => {
+                let (session_name, session_id) = self
+                    .attached_session_identity_for_identity(identity)
+                    .await?;
+                if target.session_name() != &session_name {
+                    return Err(RmuxError::Server(
+                        "attached copy-mode target changed session".to_owned(),
+                    ));
+                }
+                Some(session_id)
+            }
+            None => None,
+        };
         let mode_keys = {
             let state = self.state.lock().await;
+            if expected_session_id.is_some_and(|session_id| {
+                state
+                    .sessions
+                    .session(target.session_name())
+                    .is_none_or(|session| session.id() != session_id)
+            }) {
+                return Err(RmuxError::Server("attached session disappeared".to_owned()));
+            }
             if !target_is_in_copy_mode(&state, &target) {
                 return Ok(false);
             }
@@ -248,13 +295,29 @@ impl RequestHandler {
                 if !allow_prompt {
                     return Ok(false);
                 }
-                self.start_copy_mode_search_prompt(requester_pid, target, direction)
-                    .await?;
+                match identity {
+                    Some(identity) => {
+                        self.start_copy_mode_search_prompt_for_identity(
+                            identity, target, direction,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        self.start_copy_mode_search_prompt(requester_pid, target, direction)
+                            .await?;
+                    }
+                }
             }
-            AttachedCopyModeInputAction::Command(command) => {
-                self.execute_copy_mode_command(requester_pid, target, command, &[], 1)
-                    .await?;
-            }
+            AttachedCopyModeInputAction::Command(command) => match identity {
+                Some(identity) => {
+                    self.execute_copy_mode_command_for_identity(identity, target, command, &[], 1)
+                        .await?;
+                }
+                None => {
+                    self.execute_copy_mode_command(requester_pid, target, command, &[], 1)
+                        .await?;
+                }
+            },
             AttachedCopyModeInputAction::Ignore => return Ok(false),
         }
         Ok(true)
@@ -276,8 +339,71 @@ impl RequestHandler {
         args: &[String],
         repeat_count: usize,
     ) -> Result<(), RmuxError> {
+        self.execute_copy_mode_command_with_identity(
+            requester_pid,
+            None,
+            target,
+            command,
+            args,
+            repeat_count,
+        )
+        .await
+    }
+
+    pub(super) async fn execute_copy_mode_command_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        target: PaneTarget,
+        command: &str,
+        args: &[String],
+        repeat_count: usize,
+    ) -> Result<(), RmuxError> {
+        self.execute_copy_mode_command_with_identity(
+            identity.attach_pid(),
+            Some(identity),
+            target,
+            command,
+            args,
+            repeat_count,
+        )
+        .await
+    }
+
+    async fn execute_copy_mode_command_with_identity(
+        &self,
+        requester_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+        target: PaneTarget,
+        command: &str,
+        args: &[String],
+        repeat_count: usize,
+    ) -> Result<(), RmuxError> {
+        let expected_session_id = match identity {
+            Some(identity) => {
+                let (session_name, session_id) = self
+                    .attached_session_identity_for_identity(identity)
+                    .await?;
+                if target.session_name() != &session_name {
+                    return Err(RmuxError::Server(
+                        "attached copy-mode target changed session".to_owned(),
+                    ));
+                }
+                session_id
+            }
+            None => {
+                let state = self.state.lock().await;
+                state
+                    .sessions
+                    .session(target.session_name())
+                    .map(rmux_core::Session::id)
+                    .ok_or_else(|| {
+                        RmuxError::Server("copy-mode target session disappeared".to_owned())
+                    })?
+            }
+        };
         let target_transcript = {
             let state = self.state.lock().await;
+            ensure_copy_mode_session_identity(&state, &target, Some(expected_session_id))?;
             match state.transcript_handle(&target) {
                 Ok(transcript) => transcript,
                 Err(error) => return Err(error),
@@ -297,6 +423,7 @@ impl RequestHandler {
                     .unwrap_or_else(|| target.clone())
             };
             let state = self.state.lock().await;
+            ensure_copy_mode_session_identity(&state, &target, Some(expected_session_id))?;
             match clone_screen_for_target(&state, &source_target) {
                 Ok(screen) => Some(screen),
                 Err(error) => return Err(error),
@@ -309,12 +436,13 @@ impl RequestHandler {
             command,
             "begin-selection" | "scroll-to-mouse" | "select-line" | "select-word"
         ) {
-            attached_mouse_context(self, requester_pid, &target).await
+            attached_mouse_context(self, requester_pid, identity, &target).await
         } else {
             None
         };
         let context = {
             let state = self.state.lock().await;
+            ensure_copy_mode_session_identity(&state, &target, Some(expected_session_id))?;
             copy_mode_context(&state, &target, refresh_screen, attached_mouse)
         };
 
@@ -356,7 +484,7 @@ impl RequestHandler {
                 }
             };
             if let Some(transfer) = outcome.transfer {
-                self.apply_copy_mode_transfer(requester_pid, &context, transfer)
+                self.apply_copy_mode_transfer(requester_pid, identity, &context, transfer)
                     .await?;
             }
             if outcome.cancel || stop_repeats {
@@ -364,13 +492,14 @@ impl RequestHandler {
             }
         }
 
-        if mode_changed {
-            self.emit(LifecycleEvent::PaneModeChanged {
-                target: target.clone(),
-            })
+        #[cfg(test)]
+        refresh_fanout::pause_after_copy_mode_mutation(requester_pid).await;
+
+        let refresh_identities = self
+            .prepare_copy_mode_refresh_fanout(&target, expected_session_id, mode_changed)
+            .await?;
+        self.refresh_copy_mode_session_identities(refresh_identities)
             .await;
-        }
-        self.refresh_attached_session(target.session_name()).await;
 
         Ok(())
     }
@@ -378,6 +507,7 @@ impl RequestHandler {
     async fn apply_copy_mode_transfer(
         &self,
         requester_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
         context: &CopyModeCommandContext,
         transfer: CopyModeTransfer,
     ) -> Result<(), RmuxError> {
@@ -387,8 +517,19 @@ impl RequestHandler {
                 .await?;
         }
         if writes_buffer {
-            self.copy_mode_bytes_to_attached_clipboard(requester_pid, &transfer.data)
-                .await;
+            match identity {
+                Some(identity) => {
+                    self.copy_mode_bytes_to_attached_clipboard_for_identity(
+                        identity,
+                        &transfer.data,
+                    )
+                    .await;
+                }
+                None => {
+                    self.copy_mode_bytes_to_attached_clipboard(requester_pid, &transfer.data)
+                        .await;
+                }
+            }
         }
         if let Some(command) = self
             .resolve_copy_mode_pipe_command(transfer.pipe_command.as_ref())
@@ -420,7 +561,44 @@ impl RequestHandler {
             return;
         };
         let _ = self
-            .send_attach_control(attach_pid, AttachControl::Write(payload), "copy-mode", None)
+            .send_attach_control(attach_pid, AttachControl::Write(payload), "copy-mode")
+            .await;
+    }
+
+    async fn copy_mode_bytes_to_attached_clipboard_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        bytes: &[u8],
+    ) {
+        let (terminal_context, session_id) = {
+            let active_attach = self.active_attach.lock().await;
+            let Some(active) = active_attach
+                .by_pid
+                .get(&identity.attach_pid())
+                .filter(|active| {
+                    identity.matches_active(active)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            else {
+                return;
+            };
+            (active.terminal_context.clone(), active.session_id)
+        };
+        let payload = {
+            let state = self.state.lock().await;
+            OuterTerminal::resolve(&state.options, terminal_context).encode_clipboard_set(bytes)
+        };
+        let Some(payload) = payload else {
+            return;
+        };
+        let _ = self
+            .send_attach_control_for_client_current_session_identity(
+                identity.attach_pid(),
+                identity.attach_id(),
+                session_id,
+                AttachControl::Write(payload),
+                "copy-mode",
+            )
             .await;
     }
 
@@ -502,19 +680,33 @@ impl RequestHandler {
 async fn attached_mouse_context(
     handler: &RequestHandler,
     requester_pid: u32,
+    identity: Option<ActiveAttachIdentity>,
     target: &PaneTarget,
 ) -> Option<crate::copy_mode::CopyModeMouseContext> {
-    let attach_pid = handler
-        .resolve_attached_client_pid(requester_pid, "send-keys")
-        .await
-        .ok()?;
-    let (event, slider_mpos) = {
+    let attach_pid = match identity {
+        Some(identity) => identity.attach_pid(),
+        None => handler
+            .resolve_attached_client_pid(requester_pid, "send-keys")
+            .await
+            .ok()?,
+    };
+    let (event, slider_mpos, expected_session_id) = {
         let active_attach = handler.active_attach.lock().await;
-        let active = active_attach.by_pid.get(&attach_pid)?;
+        let active = active_attach.by_pid.get(&attach_pid).filter(|active| {
+            identity.is_none_or(|identity| {
+                identity.matches_active(active)
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+        })?;
         let event = active.mouse.current_event.as_ref()?.clone();
-        (event, active.mouse.slider_mpos)
+        (
+            event,
+            active.mouse.slider_mpos,
+            identity.map(|_| active.session_id),
+        )
     };
     let state = handler.state.lock().await;
+    ensure_copy_mode_session_identity(&state, target, expected_session_id).ok()?;
     state
         .sessions
         .session(target.session_name())
@@ -546,6 +738,22 @@ fn target_is_in_copy_mode(state: &HandlerState, target: &PaneTarget) -> bool {
                 .copy_mode_state()
                 .is_some()
         })
+}
+
+fn ensure_copy_mode_session_identity(
+    state: &HandlerState,
+    target: &PaneTarget,
+    expected_session_id: Option<rmux_proto::SessionId>,
+) -> Result<(), RmuxError> {
+    if expected_session_id.is_some_and(|session_id| {
+        state
+            .sessions
+            .session(target.session_name())
+            .is_none_or(|session| session.id() != session_id)
+    }) {
+        return Err(RmuxError::Server("attached session disappeared".to_owned()));
+    }
+    Ok(())
 }
 
 fn copy_mode_context(

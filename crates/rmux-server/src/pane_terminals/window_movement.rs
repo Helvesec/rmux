@@ -1,9 +1,8 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
-use rmux_core::{HookStore, OptionStore, Session};
 use rmux_proto::{
-    MoveWindowRequest, MoveWindowResponse, MoveWindowTarget, OptionName, RmuxError,
-    RotateWindowDirection, RotateWindowResponse, SessionName, SwapWindowResponse, WindowTarget,
+    MoveWindowRequest, MoveWindowResponse, MoveWindowTarget, RmuxError, RotateWindowDirection,
+    RotateWindowResponse, SessionName, SwapWindowResponse, WindowTarget,
 };
 
 use super::{
@@ -14,6 +13,8 @@ use crate::pane_terminals::MovedWindowResult;
 
 #[path = "window_movement/cross_session.rs"]
 mod cross_session;
+#[path = "window_movement/relative.rs"]
+mod relative;
 
 impl HandlerState {
     fn reject_window_move_between_grouped_sessions(
@@ -111,27 +112,35 @@ impl HandlerState {
         }
 
         if source.session_name() == target.session_name() {
+            let winlink_alert_map =
+                BTreeMap::from([(source.window_index(), target.window_index())]);
             return self.move_window_within_session(
                 source,
                 target.window_index(),
                 request.kill_destination,
                 request.detached,
+                &winlink_alert_map,
             );
         }
 
-        self.move_window_across_sessions(source, target, request.kill_destination, request.detached)
+        self.move_window_across_sessions(
+            source,
+            target,
+            request.kill_destination,
+            request.detached,
+            None,
+        )
     }
 
-    fn first_available_window_index(&self, session_name: &SessionName) -> Result<u32, RmuxError> {
+    pub(in crate::pane_terminals) fn first_available_window_index(
+        &self,
+        session_name: &SessionName,
+    ) -> Result<u32, RmuxError> {
         let session = self
             .sessions
             .session(session_name)
             .ok_or_else(|| session_not_found(session_name))?;
-        let base_index = self
-            .options
-            .resolve(Some(session_name), OptionName::BaseIndex)
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
+        let base_index = self.session_base_index(session_name);
         let mut index = base_index;
         loop {
             if session.window_at(index).is_none() {
@@ -143,210 +152,6 @@ impl HandlerState {
                 ))
             })?;
         }
-    }
-
-    fn move_window_relative(
-        &mut self,
-        request: MoveWindowRequest,
-    ) -> Result<MoveWindowResponse, RmuxError> {
-        if request.renumber {
-            return Err(RmuxError::Server(
-                "move-window -r does not accept -a or -b".to_owned(),
-            ));
-        }
-        let source = request.source.ok_or_else(|| {
-            RmuxError::Server("move-window -a/-b requires a source window".to_owned())
-        })?;
-        let MoveWindowTarget::Window(target) = request.target else {
-            return Err(RmuxError::invalid_target(
-                source.session_name().to_string(),
-                "move-window -a/-b requires a destination window target",
-            ));
-        };
-
-        if source.session_name() == target.session_name() {
-            return self.move_window_relative_within_session(
-                source,
-                target,
-                request.after,
-                request.before,
-                request.detached,
-            );
-        }
-
-        self.move_window_relative_across_sessions(
-            source,
-            target,
-            request.after,
-            request.before,
-            request.detached,
-        )
-    }
-
-    fn move_window_relative_across_sessions(
-        &mut self,
-        source: WindowTarget,
-        target: WindowTarget,
-        after: bool,
-        before: bool,
-        detached: bool,
-    ) -> Result<MoveWindowResponse, RmuxError> {
-        let source_session_name = source.session_name().clone();
-        let target_session_name = target.session_name().clone();
-        self.reject_window_move_between_grouped_sessions(
-            &source_session_name,
-            &target_session_name,
-        )?;
-        let previous_source_session = self
-            .sessions
-            .session(&source_session_name)
-            .cloned()
-            .ok_or_else(|| session_not_found(&source_session_name))?;
-        let previous_target_session = self
-            .sessions
-            .session(&target_session_name)
-            .cloned()
-            .ok_or_else(|| session_not_found(&target_session_name))?;
-        let rollback_state = MoveWindowRelativeCrossSessionRollbackState {
-            source_session: previous_source_session.clone(),
-            target_session: previous_target_session.clone(),
-            options: self.options.clone(),
-            hooks: self.hooks.clone(),
-            auto_named_windows: self.auto_named_windows.clone(),
-            window_link_slots: self.window_link_slots.clone(),
-            window_link_groups: self.window_link_groups.clone(),
-        };
-
-        ensure_session_panes_exist(self, &source_session_name, &previous_source_session)?;
-        ensure_session_panes_exist(self, &target_session_name, &previous_target_session)?;
-        let destination_index = link_window_destination_index(
-            &previous_target_session,
-            target.window_index(),
-            after,
-            before,
-        )?;
-
-        let index_map = {
-            let session = self
-                .sessions
-                .session_mut(&target_session_name)
-                .ok_or_else(|| session_not_found(&target_session_name))?;
-            let index_by_window_id = window_indices_by_id(session);
-            session.make_room_for_window(destination_index)?;
-            window_index_map_after_reindex(&index_by_window_id, session)
-        };
-
-        if let Err(error) = self.remap_reindexed_window_metadata(&target_session_name, &index_map) {
-            self.restore_move_window_relative_cross_session_state(
-                &source_session_name,
-                &target_session_name,
-                rollback_state,
-            )?;
-            return Err(error);
-        }
-
-        let destination = WindowTarget::with_window(target_session_name.clone(), destination_index);
-        match self.move_window_across_sessions(source, destination, false, detached) {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                self.restore_move_window_relative_cross_session_state(
-                    &source_session_name,
-                    &target_session_name,
-                    rollback_state,
-                )?;
-                Err(error)
-            }
-        }
-    }
-
-    fn move_window_relative_within_session(
-        &mut self,
-        source: WindowTarget,
-        target: WindowTarget,
-        after: bool,
-        before: bool,
-        detached: bool,
-    ) -> Result<MoveWindowResponse, RmuxError> {
-        let session_name = source.session_name().clone();
-        let previous_session = self
-            .sessions
-            .session(&session_name)
-            .cloned()
-            .ok_or_else(|| session_not_found(&session_name))?;
-        let rollback_state = MoveWindowRelativeRollbackState {
-            session: previous_session.clone(),
-            options: self.options.clone(),
-            hooks: self.hooks.clone(),
-            auto_named_windows: self.auto_named_windows.clone(),
-            window_link_slots: self.window_link_slots.clone(),
-            window_link_groups: self.window_link_groups.clone(),
-        };
-
-        ensure_session_panes_exist(self, &session_name, &previous_session)?;
-        let destination_index =
-            link_window_destination_index(&previous_session, target.window_index(), after, before)?;
-
-        let (index_map, adjusted_source_index) = {
-            let session = self
-                .sessions
-                .session_mut(&session_name)
-                .ok_or_else(|| session_not_found(&session_name))?;
-            let index_by_window_id = window_indices_by_id(session);
-            session.make_room_for_window(destination_index)?;
-            let index_map = window_index_map_after_reindex(&index_by_window_id, session);
-            let adjusted_source_index = index_map
-                .get(&source.window_index())
-                .copied()
-                .unwrap_or(source.window_index());
-            (index_map, adjusted_source_index)
-        };
-
-        let remap_result = self.remap_reindexed_window_metadata(&session_name, &index_map);
-        if let Err(error) = remap_result {
-            self.restore_move_window_relative_state(&session_name, rollback_state)?;
-            return Err(error);
-        }
-
-        let adjusted_source =
-            WindowTarget::with_window(session_name.clone(), adjusted_source_index);
-        let response =
-            self.move_window_within_session(adjusted_source, destination_index, false, detached);
-        if let Err(error) = response {
-            self.restore_move_window_relative_state(&session_name, rollback_state)?;
-            return Err(error);
-        }
-
-        response
-    }
-
-    fn restore_move_window_relative_cross_session_state(
-        &mut self,
-        source_session_name: &SessionName,
-        target_session_name: &SessionName,
-        rollback_state: MoveWindowRelativeCrossSessionRollbackState,
-    ) -> Result<(), RmuxError> {
-        self.replace_session(source_session_name, rollback_state.source_session)?;
-        self.replace_session(target_session_name, rollback_state.target_session)?;
-        self.options = rollback_state.options;
-        self.hooks = rollback_state.hooks;
-        self.auto_named_windows = rollback_state.auto_named_windows;
-        self.window_link_slots = rollback_state.window_link_slots;
-        self.window_link_groups = rollback_state.window_link_groups;
-        Ok(())
-    }
-
-    fn restore_move_window_relative_state(
-        &mut self,
-        session_name: &SessionName,
-        rollback_state: MoveWindowRelativeRollbackState,
-    ) -> Result<(), RmuxError> {
-        self.replace_session(session_name, rollback_state.session)?;
-        self.options = rollback_state.options;
-        self.hooks = rollback_state.hooks;
-        self.auto_named_windows = rollback_state.auto_named_windows;
-        self.window_link_slots = rollback_state.window_link_slots;
-        self.window_link_groups = rollback_state.window_link_groups;
-        Ok(())
     }
 
     pub(crate) fn swap_window(
@@ -374,6 +179,7 @@ impl HandlerState {
             let previous_auto_named_windows = self.auto_named_windows.clone();
             let previous_window_link_slots = self.window_link_slots.clone();
             let previous_window_link_groups = self.window_link_groups.clone();
+            let previous_window_link_occurrences = self.window_link_occurrences.clone();
             ensure_session_panes_exist(self, &session_name, &previous_session)?;
 
             {
@@ -413,10 +219,20 @@ impl HandlerState {
                 self.auto_named_windows = previous_auto_named_windows;
                 self.window_link_slots = previous_window_link_slots;
                 self.window_link_groups = previous_window_link_groups;
+                self.window_link_occurrences = previous_window_link_occurrences;
                 self.restore_session_after_resize_error(&session_name, previous_session, &error)?;
                 return Err(error);
             }
-            self.synchronize_session_group_from(&session_name)?;
+            let window_selection_map = BTreeMap::new();
+            let winlink_alert_map = BTreeMap::from([
+                (source.window_index(), target.window_index()),
+                (target.window_index(), source.window_index()),
+            ]);
+            self.synchronize_session_group_from_with_window_selection_and_winlink_alert_maps(
+                &session_name,
+                &window_selection_map,
+                &winlink_alert_map,
+            )?;
 
             return Ok(SwapWindowResponse { source, target });
         }
@@ -433,14 +249,20 @@ impl HandlerState {
         let session_name = target.session_name().clone();
         let window_index = target.window_index();
 
-        self.mutate_session_and_resize_terminals(&session_name, |session| {
+        let response = self.mutate_session_and_resize_terminals(&session_name, |session| {
             if restore_zoom {
                 session.rotate_window_with_zoom(window_index, direction, true)?;
             } else {
                 session.rotate_window(window_index, direction)?;
             }
             Ok(RotateWindowResponse { target })
-        })
+        })?;
+        let synchronized =
+            self.synchronize_linked_window_family_from_slot(&session_name, window_index)?;
+        for session_name in synchronized {
+            self.sync_pane_lifecycle_dimensions_for_session(&session_name);
+        }
+        Ok(response)
     }
 
     fn reindex_windows(
@@ -470,8 +292,9 @@ impl HandlerState {
         let previous_auto_named_windows = self.auto_named_windows.clone();
         let previous_window_link_slots = self.window_link_slots.clone();
         let previous_window_link_groups = self.window_link_groups.clone();
+        let previous_window_link_occurrences = self.window_link_occurrences.clone();
 
-        self.reindex_windows_from_base(&session_name)?;
+        let winlink_alert_map = self.reindex_windows_from_base(&session_name)?;
         if let Err(error) = self.resize_terminals(&session_name) {
             self.replace_session(&session_name, previous_session)?;
             self.options = previous_options;
@@ -479,10 +302,14 @@ impl HandlerState {
             self.auto_named_windows = previous_auto_named_windows;
             self.window_link_slots = previous_window_link_slots;
             self.window_link_groups = previous_window_link_groups;
+            self.window_link_occurrences = previous_window_link_occurrences;
             return Err(error);
         }
 
-        self.synchronize_session_group_from(&session_name)?;
+        self.synchronize_session_group_from_with_winlink_alert_map(
+            &session_name,
+            &winlink_alert_map,
+        )?;
         self.sync_pane_lifecycle_dimensions_for_session(&session_name);
 
         Ok(MoveWindowResponse {
@@ -497,6 +324,7 @@ impl HandlerState {
         destination_index: u32,
         kill_destination: bool,
         detached: bool,
+        group_winlink_alert_map: &BTreeMap<u32, u32>,
     ) -> Result<MoveWindowResponse, RmuxError> {
         let session_name = source.session_name().clone();
         let previous_session = self
@@ -509,6 +337,7 @@ impl HandlerState {
         let previous_auto_named_windows = self.auto_named_windows.clone();
         let previous_window_link_slots = self.window_link_slots.clone();
         let previous_window_link_groups = self.window_link_groups.clone();
+        let previous_window_link_occurrences = self.window_link_occurrences.clone();
         ensure_session_panes_exist(self, &session_name, &previous_session)?;
         let target_link_runtime_transfer_slot = if kill_destination
             && source.window_index() != destination_index
@@ -590,6 +419,7 @@ impl HandlerState {
                     self.auto_named_windows = previous_auto_named_windows;
                     self.window_link_slots = previous_window_link_slots;
                     self.window_link_groups = previous_window_link_groups;
+                    self.window_link_occurrences = previous_window_link_occurrences;
                     self.replace_session(&session_name, previous_session)?;
                     return Err(error);
                 }
@@ -612,6 +442,7 @@ impl HandlerState {
                     self.auto_named_windows = previous_auto_named_windows;
                     self.window_link_slots = previous_window_link_slots;
                     self.window_link_groups = previous_window_link_groups;
+                    self.window_link_occurrences = previous_window_link_occurrences;
                     self.restore_session_after_resize_error(
                         &session_name,
                         previous_session.clone(),
@@ -630,6 +461,7 @@ impl HandlerState {
             self.auto_named_windows = previous_auto_named_windows;
             self.window_link_slots = previous_window_link_slots;
             self.window_link_groups = previous_window_link_groups;
+            self.window_link_occurrences = previous_window_link_occurrences;
             self.replace_session(&session_name, previous_session)?;
             if !removed_terminals.is_empty() {
                 self.terminals
@@ -645,7 +477,10 @@ impl HandlerState {
             return Err(error);
         }
         removed_outputs.abort_output_readers();
-        self.synchronize_session_group_from(&session_name)?;
+        self.synchronize_session_group_from_with_winlink_alert_map(
+            &session_name,
+            group_winlink_alert_map,
+        )?;
         self.remove_pane_lifecycles(&removed_pane_ids);
         self.sync_pane_lifecycle_dimensions_for_session(&session_name);
 
@@ -694,46 +529,4 @@ fn move_window_replaced_pane_ids(
         .and_then(|session| session.window_at(target.window_index()))
         .map(|window| window.panes().iter().map(|pane| pane.id()).collect())
         .unwrap_or_default()
-}
-
-struct MoveWindowRelativeRollbackState {
-    session: Session,
-    options: OptionStore,
-    hooks: HookStore,
-    auto_named_windows: HashSet<(SessionName, u32)>,
-    window_link_slots: HashMap<crate::pane_terminals::WindowLinkSlot, u64>,
-    window_link_groups: HashMap<u64, crate::pane_terminals::WindowLinkGroup>,
-}
-
-struct MoveWindowRelativeCrossSessionRollbackState {
-    source_session: Session,
-    target_session: Session,
-    options: OptionStore,
-    hooks: HookStore,
-    auto_named_windows: HashSet<(SessionName, u32)>,
-    window_link_slots: HashMap<crate::pane_terminals::WindowLinkSlot, u64>,
-    window_link_groups: HashMap<u64, crate::pane_terminals::WindowLinkGroup>,
-}
-
-fn window_indices_by_id(session: &Session) -> BTreeMap<u32, u32> {
-    session
-        .windows()
-        .iter()
-        .map(|(index, window)| (window.id().as_u32(), *index))
-        .collect()
-}
-
-fn window_index_map_after_reindex(
-    previous_indices: &BTreeMap<u32, u32>,
-    session: &Session,
-) -> BTreeMap<u32, u32> {
-    session
-        .windows()
-        .iter()
-        .filter_map(|(new_index, window)| {
-            previous_indices
-                .get(&window.id().as_u32())
-                .map(|old_index| (*old_index, *new_index))
-        })
-        .collect()
 }

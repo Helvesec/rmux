@@ -7,32 +7,62 @@ use crate::input_keys::MouseForwardEvent;
 use super::super::prompt_support::PromptInputEvent;
 use super::super::RequestHandler;
 use super::mode_tree_model::{
-    ModeTreeBuild, ModeTreeClientState, ModeTreeDeferredAction, ModeTreeKind,
-    ModeTreePromptCallback, SearchDirection,
+    ModeTreeAction, ModeTreeActionIdentity, ModeTreeBuild, ModeTreeClientState,
+    ModeTreeDeferredAction, ModeTreeKind, ModeTreePromptCallback, SearchDirection,
 };
 use super::mode_tree_render::{mode_tree_list_rows, sanitize_overlay_text};
 use super::mode_tree_selection::{
-    collapse_or_parent, current_tree_kill_prompt, cycle_sort, expand_or_child, move_selection,
-    repeat_search, select_edge, tag_all, tagged_tree_kill_prompt, toggle_tag,
+    collapse_or_parent, current_selected_item, current_tree_kill_prompt, cycle_sort,
+    expand_or_child, move_selection, repeat_search, select_edge, selected_items, tag_all,
+    tagged_tree_kill_prompt, toggle_tag,
 };
 
 impl RequestHandler {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::handler) async fn handle_mode_tree_key_event(
         &self,
         attach_pid: u32,
         event: PromptInputEvent,
     ) -> Result<bool, RmuxError> {
-        let mut mode = {
+        self.handle_mode_tree_key_event_with_identity(attach_pid, None, event)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_mode_tree_key_event_for_identity(
+        &self,
+        identity: super::super::attach_support::ActiveAttachIdentity,
+        event: PromptInputEvent,
+    ) -> Result<bool, RmuxError> {
+        self.handle_mode_tree_key_event_with_identity(identity.attach_pid(), Some(identity), event)
+            .await
+    }
+
+    async fn handle_mode_tree_key_event_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<super::super::attach_support::ActiveAttachIdentity>,
+        event: PromptInputEvent,
+    ) -> Result<bool, RmuxError> {
+        let (mut mode, action_identity) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
+                .filter(|active| {
+                    identity.is_none_or(|identity| identity.matches_active(active))
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             let Some(mode) = active.mode_tree.clone() else {
                 return Ok(false);
             };
-            mode
+            (
+                mode,
+                ModeTreeActionIdentity::new(attach_pid, active.id, active.mode_tree_state_id),
+            )
         };
+        let had_tagged_items_before_rebuild = !mode.tagged.is_empty();
+        let selected_id_before_rebuild = mode.selected_id.clone();
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
         if build.visible.is_empty() {
             if matches!(
@@ -43,6 +73,24 @@ impl RequestHandler {
                 return Ok(true);
             }
             return Ok(false);
+        }
+        let all_tagged_items_disappeared =
+            had_tagged_items_before_rebuild && mode.tagged.is_empty();
+        let current_selection_disappeared = selected_id_before_rebuild
+            .as_ref()
+            .is_some_and(|selected_id| !build.items.contains_key(selected_id));
+        let event_uses_current_selection = matches!(
+            (&event, mode.kind),
+            (PromptInputEvent::Char('x'), ModeTreeKind::Tree)
+        ) || (!had_tagged_items_before_rebuild
+            && event_uses_tagged_or_current_selection(&event, mode.kind));
+        if (all_tagged_items_disappeared
+            || (current_selection_disappeared && event_uses_current_selection))
+            && event_uses_tagged_or_current_selection(&event, mode.kind)
+        {
+            self.store_mode_tree_state(attach_pid, mode).await?;
+            self.refresh_mode_tree_overlay_if_active(attach_pid).await?;
+            return Ok(true);
         }
 
         match event {
@@ -115,15 +163,21 @@ impl RequestHandler {
                 if matches!(mode.kind, ModeTreeKind::Buffer) =>
             {
                 let delete_after = matches!(event, PromptInputEvent::Char('P'));
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.perform_buffer_paste(attach_pid, delete_after).await?;
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.perform_buffer_paste_for_identity(action_identity, delete_after)
+                    .await?;
                 return Ok(true);
             }
             PromptInputEvent::Char('d') | PromptInputEvent::Char('D')
                 if matches!(mode.kind, ModeTreeKind::Buffer) =>
             {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.perform_buffer_delete(attach_pid).await?;
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.perform_buffer_delete_for_identity(action_identity)
+                    .await?;
                 return Ok(true);
             }
             PromptInputEvent::Char('d') | PromptInputEvent::Char('D')
@@ -145,8 +199,17 @@ impl RequestHandler {
                     return Ok(false);
                 };
                 let action = match event {
-                    PromptInputEvent::Char('x') => ModeTreeDeferredAction::KillCurrentTreeSelection,
-                    PromptInputEvent::Char('X') => ModeTreeDeferredAction::KillTaggedTreeSelections,
+                    PromptInputEvent::Char('x') => {
+                        let targets = current_selected_item(&mode, &build)
+                            .map(|item| vec![item.action.clone()])
+                            .unwrap_or_default();
+                        ModeTreeDeferredAction::KillCurrentTreeSelection { targets }
+                    }
+                    PromptInputEvent::Char('X') => {
+                        ModeTreeDeferredAction::KillTaggedTreeSelections {
+                            targets: selected_mode_tree_actions(&mode, &build),
+                        }
+                    }
                     _ => unreachable!("tree kill prompt only binds x/X"),
                 };
                 self.store_mode_tree_state(attach_pid, mode).await?;
@@ -157,11 +220,12 @@ impl RequestHandler {
             PromptInputEvent::Char('x') | PromptInputEvent::Char('X')
                 if matches!(mode.kind, ModeTreeKind::Buffer) =>
             {
+                let targets = selected_mode_tree_actions(&mode, &build);
                 self.store_mode_tree_state(attach_pid, mode).await?;
                 self.confirm_mode_tree_action(
                     attach_pid,
                     "delete selected buffers?".to_owned(),
-                    ModeTreeDeferredAction::DeleteBuffers,
+                    ModeTreeDeferredAction::DeleteBuffers { targets },
                 )
                 .await?;
                 return Ok(true);
@@ -169,11 +233,12 @@ impl RequestHandler {
             PromptInputEvent::Char('x') | PromptInputEvent::Char('X')
                 if matches!(mode.kind, ModeTreeKind::Client) =>
             {
+                let targets = selected_mode_tree_actions(&mode, &build);
                 self.store_mode_tree_state(attach_pid, mode).await?;
                 self.confirm_mode_tree_action(
                     attach_pid,
                     "detach selected clients?".to_owned(),
-                    ModeTreeDeferredAction::DetachClients,
+                    ModeTreeDeferredAction::DetachClients { targets },
                 )
                 .await?;
                 return Ok(true);
@@ -219,9 +284,80 @@ impl RequestHandler {
         Ok(true)
     }
 
+    async fn store_mode_tree_state_for_action_identity(
+        &self,
+        identity: ModeTreeActionIdentity,
+        mode: ModeTreeClientState,
+    ) -> Result<ModeTreeActionIdentity, RmuxError> {
+        let mut active_attach = self.active_attach.lock().await;
+        let requester_is_current = active_attach
+            .by_pid
+            .get(&identity.attach_pid())
+            .is_some_and(|active| {
+                active.id == identity.attach_id()
+                    && active.mode_tree_state_id == identity.state_id()
+                    && active.mode_tree.is_some()
+                    && active.session_name == mode.session_name
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            });
+        if !requester_is_current {
+            return Err(crate::handler_support::attached_client_required(
+                mode.kind.command_name(),
+            ));
+        }
+
+        let mut requester_state_id = None;
+        for (attach_pid, active) in &mut active_attach.by_pid {
+            if active.session_name != mode.session_name || active.mode_tree.is_none() {
+                continue;
+            }
+            active.mode_tree_state_id = active.mode_tree_state_id.saturating_add(1);
+            active.persistent_overlay_epoch.store(
+                active.mode_tree_state_id,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            active.mode_tree = Some(mode.clone());
+            if *attach_pid == identity.attach_pid() {
+                requester_state_id = Some(active.mode_tree_state_id);
+            }
+        }
+
+        requester_state_id
+            .map(|state_id| {
+                ModeTreeActionIdentity::new(identity.attach_pid(), identity.attach_id(), state_id)
+            })
+            .ok_or_else(|| {
+                crate::handler_support::attached_client_required(mode.kind.command_name())
+            })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::handler) async fn handle_mode_tree_mouse_event(
         &self,
         attach_pid: u32,
+        event: MouseForwardEvent,
+    ) -> Result<bool, RmuxError> {
+        self.handle_mode_tree_mouse_event_with_identity(attach_pid, None, event)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_mode_tree_mouse_event_for_identity(
+        &self,
+        identity: super::super::attach_support::ActiveAttachIdentity,
+        event: MouseForwardEvent,
+    ) -> Result<bool, RmuxError> {
+        self.handle_mode_tree_mouse_event_with_identity(
+            identity.attach_pid(),
+            Some(identity),
+            event,
+        )
+        .await
+    }
+
+    async fn handle_mode_tree_mouse_event_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<super::super::attach_support::ActiveAttachIdentity>,
         event: MouseForwardEvent,
     ) -> Result<bool, RmuxError> {
         let mut mode = {
@@ -229,6 +365,7 @@ impl RequestHandler {
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
+                .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             let Some(mode) = active.mode_tree.clone() else {
                 return Ok(false);
@@ -240,9 +377,17 @@ impl RequestHandler {
             return Ok(false);
         }
 
-        let rows = self.mode_tree_content_rows(&mode).await?;
+        let geometry = self.mode_tree_status_geometry(&mode).await?;
+        let rows = geometry.content_rows();
         let list_rows = mode_tree_list_rows(rows, build.visible.len(), mode.preview_mode);
-        let y = usize::from(event.y);
+        let Some(content_y) = event
+            .y
+            .checked_sub(geometry.content_y_offset())
+            .filter(|content_y| *content_y < rows)
+        else {
+            return Ok(false);
+        };
+        let y = usize::from(content_y);
         if y < usize::from(list_rows) {
             let index = mode.scroll + y;
             if let Some(id) = build.visible.get(index) {
@@ -257,6 +402,36 @@ impl RequestHandler {
             }
         }
         Ok(false)
+    }
+}
+
+fn selected_mode_tree_actions(
+    mode: &ModeTreeClientState,
+    build: &ModeTreeBuild,
+) -> Vec<ModeTreeAction> {
+    selected_items(mode, build)
+        .into_iter()
+        .map(|item| item.action.clone())
+        .collect()
+}
+
+fn event_uses_tagged_or_current_selection(event: &PromptInputEvent, kind: ModeTreeKind) -> bool {
+    match event {
+        PromptInputEvent::Enter | PromptInputEvent::Char(':') => true,
+        PromptInputEvent::Char('p' | 'P') => matches!(kind, ModeTreeKind::Buffer),
+        PromptInputEvent::Char('d' | 'D') => {
+            matches!(kind, ModeTreeKind::Buffer | ModeTreeKind::Client)
+        }
+        PromptInputEvent::Char('x' | 'X') => {
+            matches!(
+                kind,
+                ModeTreeKind::Tree | ModeTreeKind::Buffer | ModeTreeKind::Client
+            )
+        }
+        PromptInputEvent::Char('s' | 'u') | PromptInputEvent::Ctrl('x') => {
+            matches!(kind, ModeTreeKind::Customize)
+        }
+        _ => false,
     }
 }
 

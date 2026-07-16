@@ -60,6 +60,14 @@ impl CrossPlatformHarness {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        Ok(self.command(args).output()?)
+    }
+
+    pub(crate) fn command<I, S>(&self, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut command = Command::new(rmux_binary());
         command.arg("-L").arg(&self.label).args(args);
         command.env("HOME", self.tmpdir.join("home"));
@@ -69,7 +77,7 @@ impl CrossPlatformHarness {
         command.env_remove("RMUX");
         command.env_remove("TMUX");
         command.env_remove("RMUX_INTERNAL_BINARY_PATH");
-        Ok(command.output()?)
+        command
     }
 
     pub(crate) fn wait_for_capture_contains(

@@ -43,7 +43,12 @@ impl RequestHandler {
                     PendingInlineHookFormat::AfterCommand,
                 );
             }
-            self.refresh_attached_session(&session_name).await;
+            // See handle_select_pane below: skip refresh on a session with no
+            // attached/control client so an unrelated deferred pane wait cannot
+            // stall a detached select.
+            if self.attached_count(&session_name).await > 0 {
+                self.refresh_attached_session(&session_name).await;
+            }
         }
 
         response
@@ -86,8 +91,8 @@ impl RequestHandler {
                     if let Some((old, new)) = state.set_pane_title(&request.target, title)? {
                         title_changed_target = Some(request.target.clone());
                         if let Some(pane_id) = pane_id_for_select_target(&state, &request.target) {
-                            let generation = state
-                                .pane_output_generation(request.target.session_name(), pane_id);
+                            let generation =
+                                state.pane_output_generation_for_target(&request.target, pane_id);
                             title_state_event = Some((pane_id, generation, old, new));
                         }
                     }
@@ -124,8 +129,8 @@ impl RequestHandler {
                     state.synchronize_pane_alias_options_from_target(&request.target)?;
                     if outcome.changed {
                         if let Some(pane_id) = pane_id_for_select_target(&state, &request.target) {
-                            let generation = state
-                                .pane_output_generation(request.target.session_name(), pane_id);
+                            let generation =
+                                state.pane_output_generation_for_target(&request.target, pane_id);
                             pane_option_event = Some((pane_id, generation, outcome));
                         }
                     }
@@ -181,7 +186,14 @@ impl RequestHandler {
                     PendingInlineHookFormat::AfterCommand,
                 );
             }
-            self.refresh_attached_session(&session_name).await;
+            // A select-pane on a session with no attached or control client has
+            // nothing to draw, so skip the refresh — and, on Windows, its
+            // deferred-pane wait — instead of stalling ~2s on the session's own
+            // just-spawned pane while it is still starting
+            // (unrelated_starting_pane_does_not_block_a_stable_session_refresh).
+            if self.attached_count(&session_name).await > 0 {
+                self.refresh_attached_session(&session_name).await;
+            }
         }
 
         response
@@ -236,7 +248,9 @@ impl RequestHandler {
                 })
                 .await;
             }
-            self.refresh_attached_session(&session_name).await;
+            if self.attached_count(&session_name).await > 0 {
+                self.refresh_attached_session(&session_name).await;
+            }
         }
 
         response
@@ -257,8 +271,8 @@ impl RequestHandler {
                     if let Some((old, new)) = state.set_pane_title(&request.target, title)? {
                         title_changed_target = Some(request.target.clone());
                         if let Some(pane_id) = pane_id_for_select_target(&state, &request.target) {
-                            let generation = state
-                                .pane_output_generation(request.target.session_name(), pane_id);
+                            let generation =
+                                state.pane_output_generation_for_target(&request.target, pane_id);
                             title_state_event = Some((pane_id, generation, old, new));
                         }
                     }
@@ -311,7 +325,9 @@ impl RequestHandler {
             if let Some(target) = title_changed_target {
                 self.emit(LifecycleEvent::PaneTitleChanged { target }).await;
             }
-            self.refresh_attached_session(&session_name).await;
+            if self.attached_count(&session_name).await > 0 {
+                self.refresh_attached_session(&session_name).await;
+            }
             self.refresh_control_session(&session_name).await;
         }
 

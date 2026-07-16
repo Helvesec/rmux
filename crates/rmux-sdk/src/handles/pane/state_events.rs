@@ -2,15 +2,16 @@ use std::collections::VecDeque;
 
 use crate::handles::connect_transport_to_endpoint;
 use crate::handles::session::unexpected_response;
-use crate::transport::TransportClient;
-use crate::{Pane, PaneId, Result};
+use crate::transport::{OperationDeadline, TransportClient};
+use crate::{Pane, PaneId, Result, RmuxError};
 use rmux_proto::{
     PaneOptionEntry as ProtoPaneOptionEntry, PaneStateCursorRequest, PaneStateEventDto,
     PaneStateSnapshot, PaneStateSubscriptionId, Request, Response, SubscribePaneStateRequest,
-    CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_STATE_EVENTS,
+    CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_STATE_EVENTS,
 };
 
 use super::foreground::ForegroundState;
+use super::target::{is_stale_pane_id_target_error, stale_slot_error};
 
 pub use rmux_proto::PaneStateClosedReason;
 
@@ -140,19 +141,49 @@ pub struct PaneStateEventStream {
 
 impl PaneStateEventStream {
     pub(super) async fn open(pane: &Pane, options: PaneStateEventsOptions) -> Result<Self> {
+        let Some(target) = pane.resolved_proto_target_ref().await? else {
+            return Err(stale_slot_error(pane.target()));
+        };
         let timeout = crate::wait::resolved_wait_timeout(pane.configured_default_timeout());
-        let cursor_transport = connect_transport_to_endpoint(pane.endpoint(), timeout).await?;
-        Self::open_with_cursor_transport(pane, options, cursor_transport).await
+        let deadline = pane
+            .transport()
+            .operation_deadline()
+            .unwrap_or_else(|| OperationDeadline::from_timeout(timeout));
+        let cursor_transport =
+            connect_transport_to_endpoint(pane.endpoint(), deadline.remaining_timeout())
+                .await?
+                .with_default_timeout(timeout)
+                .with_operation_deadline(deadline);
+        Self::open_with_cursor_transport_and_target(pane, options, cursor_transport, target).await
     }
 
+    #[cfg(test)]
     pub(super) async fn open_with_cursor_transport(
         pane: &Pane,
         options: PaneStateEventsOptions,
         cursor_transport: TransportClient,
     ) -> Result<Self> {
+        Self::open_with_cursor_transport_and_target(
+            pane,
+            options,
+            cursor_transport,
+            pane.proto_target_ref(),
+        )
+        .await
+    }
+
+    async fn open_with_cursor_transport_and_target(
+        pane: &Pane,
+        options: PaneStateEventsOptions,
+        cursor_transport: TransportClient,
+        target: rmux_proto::PaneTargetRef,
+    ) -> Result<Self> {
         let mut capabilities = vec![CAPABILITY_SDK_PANE_STATE_EVENTS];
         if options.include_foreground {
             capabilities.push(CAPABILITY_SDK_PANE_FOREGROUND);
+        }
+        if matches!(target, rmux_proto::PaneTargetRef::Id { .. }) {
+            capabilities.push(CAPABILITY_SDK_PANE_BY_ID);
         }
         crate::capabilities::require(pane.transport(), &capabilities).await?;
         crate::capabilities::require_with_handshake(
@@ -162,14 +193,20 @@ impl PaneStateEventStream {
         )
         .await?;
 
-        let response = cursor_transport
-            .request(Request::SubscribePaneState(SubscribePaneStateRequest {
-                target: pane.proto_target_ref(),
-                include_title: options.include_title,
-                include_options: options.include_options,
-                include_foreground: options.include_foreground,
-            }))
-            .await?;
+        let response = match subscribe_pane_state(&cursor_transport, target.clone(), options).await
+        {
+            Ok(response) => response,
+            Err(error) if pane.is_stable_id() && is_stale_pane_id_target_error(&error, &target) => {
+                let pane_id = pane
+                    .stable_id
+                    .expect("stable-id state stream retry requires a stable pane id");
+                let retry_target = pane.resolved_proto_target_ref().await?.ok_or_else(|| {
+                    RmuxError::pane_not_found(pane.target().session_name.clone(), pane_id)
+                })?;
+                subscribe_pane_state(&cursor_transport, retry_target, options).await?
+            }
+            Err(error) => return Err(error),
+        };
 
         let response = match response {
             Response::SubscribePaneState(response) => *response,
@@ -179,7 +216,9 @@ impl PaneStateEventStream {
         pending.push_back(snapshot_event(response.pane_id, response.snapshot));
 
         Ok(Self {
-            cursor_transport,
+            // Cursor requests intentionally long-poll while the stream is
+            // idle. Only setup uses the public operation deadline.
+            cursor_transport: cursor_transport.with_default_timeout(None),
             subscription_id: response.subscription_id,
             pane_id: response.pane_id,
             next_revision: 0,
@@ -265,6 +304,21 @@ impl PaneStateEventStream {
             self.pending.clear();
         }
     }
+}
+
+async fn subscribe_pane_state(
+    transport: &TransportClient,
+    target: rmux_proto::PaneTargetRef,
+    options: PaneStateEventsOptions,
+) -> Result<Response> {
+    transport
+        .request(Request::SubscribePaneState(SubscribePaneStateRequest {
+            target,
+            include_title: options.include_title,
+            include_options: options.include_options,
+            include_foreground: options.include_foreground,
+        }))
+        .await
 }
 
 impl Drop for PaneStateEventStream {

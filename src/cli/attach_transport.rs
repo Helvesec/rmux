@@ -1,4 +1,3 @@
-use std::io::IsTerminal;
 use std::path::Path;
 
 #[cfg(unix)]
@@ -16,6 +15,8 @@ use rmux_proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
 use rmux_proto::{
     ErrorResponse, Response, CAPABILITY_ATTACH_RENDER, CAPABILITY_ATTACH_RESIZE_GEOMETRY,
 };
+
+use crate::client_terminal::ATTACH_TERMINAL_REQUIRED_MESSAGE;
 
 use super::{expect_command_success, unexpected_response, ExitFailure};
 
@@ -45,9 +46,7 @@ pub(super) fn begin_queued_attach(
     connection: Connection,
     request: AttachSessionExt2Request,
 ) -> Result<QueuedAttachSessionResult, ExitFailure> {
-    if !std::io::stdin().is_terminal() {
-        return Err(ExitFailure::new(1, "open terminal failed: not a terminal"));
-    }
+    require_attach_terminal()?;
     let (transition, capabilities) = begin_attach(connection, request)?;
     match transition {
         AttachTransition::Upgraded(upgrade) => Ok(QueuedAttachSessionResult::Detached(Box::new(
@@ -102,6 +101,7 @@ pub(super) fn attach_with_connection(
     connection: Connection,
     request: AttachSessionExt2Request,
 ) -> Result<i32, ExitFailure> {
+    require_attach_terminal()?;
     let (transition, capabilities) = begin_attach(connection, request)?;
     match transition {
         AttachTransition::Upgraded(upgrade) => run_attach_upgrade(upgrade, capabilities),
@@ -110,6 +110,11 @@ pub(super) fn attach_with_connection(
             Ok(0)
         }
     }
+}
+
+pub(super) fn require_attach_terminal() -> Result<(), ExitFailure> {
+    crate::client_terminal::require_attach_terminal()
+        .map_err(|message| ExitFailure::new(1, message))
 }
 
 fn begin_attach(
@@ -190,7 +195,7 @@ fn run_attach_upgrade(
 
 fn attach_terminal_exit_failure(error: ClientError) -> ExitFailure {
     if attach_terminal_failed_because_stdio_is_not_terminal(&error) {
-        ExitFailure::new(1, "open terminal failed: not a terminal")
+        ExitFailure::new(1, ATTACH_TERMINAL_REQUIRED_MESSAGE)
     } else {
         ExitFailure::from_client(error)
     }

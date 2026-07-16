@@ -671,3 +671,29 @@ fn break_pane_moves_a_single_pane_window_without_recreating_it() {
     assert_eq!(moved_window.name(), Some("moved"));
     assert!(session.window_at(2).is_none());
 }
+
+#[test]
+fn join_pane_clears_alert_flags_for_a_destroyed_source_window() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    session
+        .insert_window_with_initial_pane(1, TerminalSize { cols: 90, rows: 30 })
+        .expect("window 1 insert succeeds");
+    let _ = session.add_winlink_alert_flags(1, crate::WINLINK_ACTIVITY);
+
+    session
+        .join_pane(
+            SessionPaneTarget::new(1, 0),
+            SessionPaneTarget::new(0, 0),
+            PaneJoinOptions::new(SplitDirection::Vertical, true, false, false, None),
+        )
+        .expect("join succeeds");
+
+    assert!(session.window_at(1).is_none());
+    assert!(session.winlink_alert_flags(1).is_empty());
+}

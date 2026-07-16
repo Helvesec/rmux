@@ -11,6 +11,8 @@ use super::sgr;
 use super::tables;
 use super::{InputEndType, InputParser, OscColourSlot, INPUT_LAST};
 
+const XTVERSION_REPLY: &str = concat!("\x1bP>|rmux ", env!("CARGO_PKG_VERSION"), "\x1b\\");
+
 // ─── C0 dispatch ───────────────────────────────────────────────────
 
 pub(crate) fn dispatch_c0<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
@@ -400,27 +402,15 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
                 _ => {}
             }
         }
-        CsiCommand::KittyKeyboardSet | CsiCommand::KittyKeyboardPush => {
-            let flags = parser.param_list.get(0, 0, 0);
-            let apply_mode = parser.param_list.get(1, 1, 1);
-            if flags <= 0 || apply_mode == 3 {
-                writer.mode_clear(mode::MODE_KEYS_KITTY | mode::MODE_KEYS_EXTENDED_2);
-            } else {
-                writer.mode_clear(mode::EXTENDED_KEY_MODES);
-                writer.mode_set(mode::MODE_KEYS_EXTENDED_2 | mode::MODE_KEYS_KITTY);
-            }
-        }
-        CsiCommand::KittyKeyboardPop => {
-            writer.mode_clear(mode::MODE_KEYS_KITTY | mode::MODE_KEYS_EXTENDED_2);
-        }
-        CsiCommand::KittyKeyboardQuery => {
-            let flags = if (writer.current_mode() & mode::MODE_KEYS_KITTY) != 0 {
-                1
-            } else {
-                0
-            };
-            parser.reply(&format!("\x1b[?{flags}u"));
-        }
+        // RMUX 0.9 does not implement the complete Kitty keyboard protocol.
+        // Consume every negotiation form without replying or changing the
+        // pane's key mode: accepting Set/Push while ignoring Query advertises
+        // a partial protocol that applications cannot use losslessly, and Pop
+        // must not clear an independently enabled xterm extended-key mode.
+        CsiCommand::KittyKeyboardSet
+        | CsiCommand::KittyKeyboardPush
+        | CsiCommand::KittyKeyboardPop
+        | CsiCommand::KittyKeyboardQuery => {}
         CsiCommand::Modoff => {
             let n = parser.param_list.get(0, 0, 0);
             if n != 4 {
@@ -458,9 +448,7 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         CsiCommand::Xda => {
             let n = parser.param_list.get(0, 0, 0);
             if n == 0 {
-                let version = env!("CARGO_PKG_VERSION");
-                let reply = format!("\x1bP>|tmux {version}\x1b\\");
-                parser.reply(&reply);
+                parser.reply(XTVERSION_REPLY);
             }
         }
         CsiCommand::Winops => dispatch_winops(parser, writer),
@@ -567,11 +555,11 @@ pub(crate) fn dispatch_dcs<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
     }
 }
 
-/// Answers an OSC 10/11/12 colour QUERY (`?` payload) from the emulator, the
-/// way an attached terminal would (`OSC <n>;rgb:RRRR/GGGG/BBBB`, terminated
-/// like the query). Detached sessions have no terminal to forward the query
-/// to, and theme-detecting TUIs otherwise mis-render. Returns false for
-/// set-colour payloads, which callers handle as before.
+/// Answers an OSC 10/11/12 colour query only when the application previously
+/// set that exact per-pane slot. RMUX cannot observe the attached terminal's
+/// palette, so an unknown value must remain unanswered rather than
+/// impersonating a confidently wrong theme. Returns false for set-colour
+/// payloads, which callers handle as before.
 fn answer_osc_colour_query(
     parser: &mut InputParser,
     slot: OscColourSlot,
@@ -582,15 +570,17 @@ fn answer_osc_colour_query(
         return false;
     }
 
-    let reply = format!(
-        "\x1b]{};{}{}",
-        slot.osc_number(),
-        parser.osc_colour(slot),
-        match end {
-            InputEndType::Bel => "\x07",
-            InputEndType::St => "\x1b\\",
-        }
-    );
-    parser.reply(&reply);
+    if let Some(colour) = parser.osc_colour(slot) {
+        let reply = format!(
+            "\x1b]{};{}{}",
+            slot.osc_number(),
+            colour,
+            match end {
+                InputEndType::Bel => "\x07",
+                InputEndType::St => "\x1b\\",
+            }
+        );
+        parser.reply(&reply);
+    }
     true
 }

@@ -471,7 +471,10 @@ fn extract_match_variant_commands(
 }
 
 fn is_internal_command_variant(variant: &str) -> bool {
-    matches!(variant, "Noop" | "Unsupported")
+    matches!(
+        variant,
+        "Noop" | "Unsupported" | "ApplyParseTimeAssignments"
+    )
 }
 
 fn extract_list_commands(output: &str) -> BTreeSet<String> {

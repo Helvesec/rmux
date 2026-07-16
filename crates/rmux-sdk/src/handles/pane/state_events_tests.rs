@@ -288,6 +288,21 @@ async fn cursor_long_poll_uses_dedicated_transport_without_blocking_main_request
         answer_handshake(&mut main_server_stream, capabilities).await;
 
         match read_request(&mut main_server_stream).await {
+            Request::ListPanes(request) => {
+                assert_eq!(request.target, alpha());
+                assert_eq!(request.target_window_index, Some(0));
+            }
+            request => panic!("expected pane-id lookup on main transport, got {request:?}"),
+        }
+        write_response(
+            &mut main_server_stream,
+            Response::ListPanes(rmux_proto::ListPanesResponse {
+                output: rmux_proto::CommandOutput::from_stdout("0:0:%42\n"),
+            }),
+        )
+        .await;
+
+        match read_request(&mut main_server_stream).await {
             Request::PaneOptionGet(request) => {
                 assert_eq!(request.name, "@agent.kind");
             }

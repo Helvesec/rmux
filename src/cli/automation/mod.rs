@@ -1,9 +1,11 @@
 mod common;
 mod discovery;
+mod pane_exit;
 mod session;
 mod snapshot;
 mod stream;
 mod wait;
+mod wait_target;
 
 pub(crate) use discovery::{
     run_broadcast_keys, run_expect_pane, run_find_panes, run_find_sessions, run_locator,

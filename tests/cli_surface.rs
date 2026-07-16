@@ -5,9 +5,10 @@ mod common;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixListener;
-use std::path::Path;
-use std::process::{Child, ExitStatus, Output, Stdio};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,8 +23,10 @@ use common::{
 use rmux_client::INTERNAL_DAEMON_FLAG;
 use rmux_core::command_parser::COMMAND_TABLE;
 use rmux_proto::{
-    encode_frame, ErrorResponse, FrameDecoder, Request, Response, RmuxError, CONTROL_CONTROL_END,
-    CONTROL_CONTROL_START, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
+    encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse,
+    ListSessionsResponse, OptionScopeSelector, Request, Response, RmuxError, ShowOptionsResponse,
+    SourceFileResponse, CONTROL_CONTROL_END, CONTROL_CONTROL_START, RMUX_FRAME_MAGIC,
+    RMUX_WIRE_VERSION,
 };
 use rmux_pty::TerminalSize;
 
@@ -65,10 +68,16 @@ fn assert_absent_server_error(output: &Output, harness: &CliHarness, command_nam
     );
 }
 
+fn prepare_fake_server_socket_parent(socket_path: &Path) -> io::Result<()> {
+    let Some(parent) = socket_path.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+}
+
 fn spawn_incompatible_wire_server(socket_path: &Path) -> io::Result<JoinHandle<io::Result<()>>> {
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    prepare_fake_server_socket_parent(socket_path)?;
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     let handle = thread::spawn(move || {
@@ -123,43 +132,40 @@ fn write_legacy_incompatible_wire_response(
 }
 
 fn spawn_wire_v3_kill_server(socket_path: &Path) -> io::Result<JoinHandle<io::Result<()>>> {
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    spawn_wire_v3_kill_server_after_parse_probes(socket_path, 1)
+}
+
+fn spawn_wire_v3_kill_server_after_parse_probes(
+    socket_path: &Path,
+    capability_probe_count: usize,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    prepare_fake_server_socket_parent(socket_path)?;
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept()?;
-        let mut decoder = FrameDecoder::new();
-        let mut buffer = [0_u8; 1024];
-        loop {
-            match decoder.next_frame::<Request>() {
-                Ok(Some(Request::KillServer(_))) => break,
-                Ok(Some(request)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("expected kill-server request, got {request:?}"),
-                    ));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, error));
-                }
-            }
-
-            let bytes_read = stream.read(&mut buffer)?;
-            if bytes_read == 0 {
+        for _ in 0..capability_probe_count {
+            let (mut stream, request) = accept_current_wire_request(&listener)?;
+            if !matches!(request, Request::Handshake(_)) {
                 return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "client closed before sending first kill-server request",
+                    io::ErrorKind::InvalidData,
+                    format!("expected capability handshake, got {request:?}"),
                 ));
             }
-            decoder.push_bytes(&buffer[..bytes_read]);
+            write_legacy_incompatible_wire_response(&mut stream, 3)?;
+        }
+
+        let (mut stream, request) = accept_current_wire_request(&listener)?;
+        if !matches!(request, Request::KillServer(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected kill-server request, got {request:?}"),
+            ));
         }
         write_legacy_incompatible_wire_response(&mut stream, 3)?;
         drop(stream);
 
         let (mut stream, _) = listener.accept()?;
+        let mut buffer = [0_u8; 1024];
         let bytes_read = stream.read(&mut buffer)?;
         if bytes_read < 10 {
             return Err(io::Error::new(
@@ -193,10 +199,159 @@ fn spawn_wire_v3_kill_server(socket_path: &Path) -> io::Result<JoinHandle<io::Re
     Ok(handle)
 }
 
+fn accept_current_wire_request(listener: &UnixListener) -> io::Result<(UnixStream, Request)> {
+    let (mut stream, _) = listener.accept()?;
+    let request = read_current_wire_request(&mut stream)?;
+    Ok((stream, request))
+}
+
+fn read_current_wire_request(stream: &mut UnixStream) -> io::Result<Request> {
+    let mut decoder = FrameDecoder::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        match decoder.next_frame::<Request>() {
+            Ok(Some(request)) => return Ok(request),
+            Ok(None) => {}
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        }
+
+        let bytes_read = stream.read(&mut buffer)?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client closed before sending a complete request",
+            ));
+        }
+        decoder.push_bytes(&buffer[..bytes_read]);
+    }
+}
+
+fn serve_same_wire_handshake_and_alias_snapshot(
+    listener: &UnixListener,
+    alias_snapshot: impl Into<Vec<u8>>,
+) -> io::Result<UnixStream> {
+    let (mut stream, request) = accept_current_wire_request(listener)?;
+    if !matches!(request, Request::Handshake(_)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected capability handshake, got {request:?}"),
+        ));
+    }
+    stream.write_all(
+        &encode_frame(&Response::Handshake(HandshakeResponse {
+            wire_version: RMUX_WIRE_VERSION,
+            capabilities: vec!["protocol.capabilities".to_owned()],
+        }))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    )?;
+
+    let request = read_current_wire_request(&mut stream)?;
+    if !matches!(request, Request::ShowOptions(_)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected legacy command-alias snapshot, got {request:?}"),
+        ));
+    }
+    stream.write_all(
+        &encode_frame(&Response::ShowOptions(ShowOptionsResponse {
+            scope: OptionScopeSelector::ServerGlobal,
+            output: CommandOutput::from_stdout(alias_snapshot),
+        }))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+    )?;
+    Ok(stream)
+}
+
 fn spawn_alias_fallback_incompatible_wire_server(
     socket_path: &Path,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
     spawn_incompatible_wire_server(socket_path)
+}
+
+fn spawn_same_wire_server_without_runtime_expansion(
+    socket_path: &Path,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    prepare_fake_server_socket_parent(socket_path)?;
+    let _ = fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    Ok(thread::spawn(move || {
+        drop(serve_same_wire_handshake_and_alias_snapshot(
+            &listener,
+            Vec::new(),
+        )?);
+
+        let (mut command_stream, request) = accept_current_wire_request(&listener)?;
+        if !matches!(request, Request::ListSessions(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected direct list-sessions request, got {request:?}"),
+            ));
+        }
+        command_stream.write_all(
+            &encode_frame(&Response::ListSessions(ListSessionsResponse {
+                output: CommandOutput::from_stdout("legacy-compatible\n"),
+            }))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )?;
+        Ok(())
+    }))
+}
+
+fn spawn_same_wire_server_without_runtime_expansion_or_alias(
+    socket_path: &Path,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    prepare_fake_server_socket_parent(socket_path)?;
+    let _ = fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    Ok(thread::spawn(move || {
+        drop(serve_same_wire_handshake_and_alias_snapshot(
+            &listener,
+            Vec::new(),
+        )?);
+        Ok(())
+    }))
+}
+
+fn spawn_same_wire_server_expecting_raw_alias(
+    socket_path: &Path,
+    alias_snapshot: &'static [u8],
+    expected_stdin: &'static str,
+    response_stdout: &'static str,
+) -> io::Result<JoinHandle<io::Result<()>>> {
+    prepare_fake_server_socket_parent(socket_path)?;
+    let _ = fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    Ok(thread::spawn(move || {
+        let mut command_stream =
+            serve_same_wire_handshake_and_alias_snapshot(&listener, alias_snapshot.to_vec())?;
+        let request = read_current_wire_request(&mut command_stream)?;
+        let Request::SourceFile(request) = request else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected one raw source-file request, got {request:?}"),
+            ));
+        };
+        if request.paths != ["-"] || request.stdin.as_deref() != Some(expected_stdin) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected unexpanded argv {expected_stdin:?}, got {request:?}"),
+            ));
+        }
+        command_stream.write_all(
+            &encode_frame(&Response::SourceFile(SourceFileResponse::from_output(
+                CommandOutput::from_stdout(response_stdout),
+            )))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        )?;
+        let mut trailing = [0_u8; 1];
+        if command_stream.read(&mut trailing)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy alias fallback sent more than one raw request",
+            ));
+        }
+        Ok(())
+    }))
 }
 
 #[test]
@@ -243,6 +398,150 @@ fn incompatible_wire_error_uses_simple_default_kill_server_command() -> Result<(
     server
         .join()
         .expect("fake incompatible server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_keeps_direct_cli_compatible(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-before-runtime-expansion")?;
+    let server = spawn_same_wire_server_without_runtime_expansion(harness.socket_path())?;
+
+    let output = harness.run(&["list-sessions"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(stdout(&output), "legacy-compatible\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_keeps_canonical_alias_override(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-canonical-alias")?;
+    let server = spawn_same_wire_server_expecting_raw_alias(
+        harness.socket_path(),
+        b"command-alias[20] \"list-sessions=list-sessions -F alias-marker\"\n",
+        "list-sessions",
+        "legacy-alias\n",
+    )?;
+
+    let output = harness.run(&["list-sessions"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(stdout(&output), "legacy-alias\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_expands_queue_alias_once(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-single-alias-expansion")?;
+    let server = spawn_same_wire_server_expecting_raw_alias(
+        harness.socket_path(),
+        b"command-alias[20] \"probe=clear-prompt-history\"\ncommand-alias[21] \"clear-prompt-history=display-message -p SECOND\"\n",
+        "display-message -p 'literal value' ; probe",
+        "single-expansion\n",
+    )?;
+
+    let output = harness.run(&["display-message", "-p", "literal value", ";", "probe"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(stdout(&output), "single-expansion\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_preserves_alias_assignment(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-alias-assignment")?;
+    let server = spawn_same_wire_server_expecting_raw_alias(
+        harness.socket_path(),
+        b"command-alias[20] \"assign=FOO=bar display-message -p '$FOO'\"\n",
+        "assign",
+        "bar\n",
+    )?;
+
+    let output = harness.run(&["assign"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(stdout(&output), "bar\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_preserves_assignment_before_alias(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("same-wire-assignment-before-alias")?;
+    let server = spawn_same_wire_server_expecting_raw_alias(
+        harness.socket_path(),
+        b"command-alias[20] \"probe=display-message -p '$FOO'\"\n",
+        "FOO=x probe",
+        "x\n",
+    )?;
+
+    let output = harness.run(&["FOO=x", "probe"])?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(stdout(&output), "x\n");
+    assert!(stderr(&output).is_empty());
+    server.join().expect("fake same-wire server should exit")?;
+    Ok(())
+}
+
+#[test]
+fn same_wire_daemon_without_runtime_expansion_rejects_source_syntax() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("same-wire-source-syntax")?;
+    let server = spawn_same_wire_server_without_runtime_expansion_or_alias(harness.socket_path())?;
+
+    let output = harness.run(&["FOO=bar", "display-message", "-p", "hi"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert!(
+        stderr(&output).contains("unknown command: FOO=bar"),
+        "unexpected stderr: {:?}",
+        stderr(&output)
+    );
+    server.join().expect("fake same-wire server should exit")?;
     Ok(())
 }
 
@@ -332,6 +631,27 @@ fn unknown_subcommand_fallback_rejects_source_syntax() -> Result<(), Box<dyn Err
     let environment = harness.run(&["show-environment", "-g", "FOO"])?;
     assert_eq!(environment.status.code(), Some(1));
     assert!(stdout(&environment).is_empty());
+    Ok(())
+}
+
+#[test]
+fn runtime_alias_fallback_preserves_assignment_before_alias_product_divergence(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("runtime-alias-leading-assignment")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "set-option",
+        "-s",
+        "command-alias[7]",
+        "probe=display-message -p \"$CLI_ALIAS_VALUE\"",
+    ])?);
+
+    let output = harness.run(&["CLI_ALIAS_VALUE=preserved", "probe"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "preserved\n");
+    assert!(stderr(&output).is_empty());
     Ok(())
 }
 
@@ -501,7 +821,7 @@ fn list_commands_is_client_local_and_supports_formatting() -> Result<(), Box<dyn
     assert_eq!(split_signature.status.code(), Some(0));
     assert_eq!(
         stdout(&split_signature),
-        "split-window (splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]\n"
+        "split-window (splitw) [-bdefhIklPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane] [shell-command [argument ...]]\n"
     );
     assert!(stderr(&split_signature).is_empty());
 
@@ -511,6 +831,132 @@ fn list_commands_is_client_local_and_supports_formatting() -> Result<(), Box<dyn
     assert!(stderr(&start_signature).is_empty());
 
     assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn list_commands_does_not_probe_an_existing_socket() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("list-commands-no-socket-probe")?;
+    prepare_fake_server_socket_parent(harness.socket_path())?;
+    let listener = UnixListener::bind(harness.socket_path())?;
+    listener.set_nonblocking(true)?;
+    let accept_probe = thread::spawn(move || -> io::Result<bool> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match listener.accept() {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    });
+
+    let output = harness.run(&["list-commands", "new-window"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout(&output).contains("new-window"));
+    assert!(stderr(&output).is_empty());
+    assert!(
+        !accept_probe
+            .join()
+            .expect("socket accept probe should join")?,
+        "list-commands must remain local even when a socket endpoint exists"
+    );
+    Ok(())
+}
+
+#[test]
+fn list_formats_and_filters_receive_the_selected_socket_path() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("list-socket-path-formats")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep", "60"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "sentinel", "alive"])?);
+
+    let socket_path = harness.socket_path().to_string_lossy();
+    let expected_line = format!("{socket_path}\n");
+    let socket_filter = format!("#{{==:#{{socket_path}},{socket_path}}}");
+    for (command, args) in [
+        (
+            "list-sessions",
+            vec![
+                "list-sessions",
+                "-F",
+                "#{socket_path}",
+                "-f",
+                socket_filter.as_str(),
+            ],
+        ),
+        (
+            "list-windows",
+            vec![
+                "list-windows",
+                "-t",
+                "alpha",
+                "-F",
+                "#{socket_path}",
+                "-f",
+                socket_filter.as_str(),
+            ],
+        ),
+        (
+            "list-panes",
+            vec![
+                "list-panes",
+                "-t",
+                "alpha",
+                "-F",
+                "#{socket_path}",
+                "-f",
+                socket_filter.as_str(),
+            ],
+        ),
+        (
+            "list-buffers",
+            vec![
+                "list-buffers",
+                "-F",
+                "#{socket_path}",
+                "-f",
+                socket_filter.as_str(),
+            ],
+        ),
+        ("list-keys", vec!["list-keys", "-1", "-F", "#{socket_path}"]),
+    ] {
+        let output = harness.run(&args)?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{command} failed: {}",
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), expected_line, "{command}");
+        assert!(stderr(&output).is_empty(), "{command}");
+    }
+
+    let direct = harness.run(&["list-commands", "-F", "#{socket_path}", "new-window"])?;
+    assert_eq!(direct.status.code(), Some(0));
+    assert_eq!(stdout(&direct), expected_line);
+    assert!(stderr(&direct).is_empty());
+
+    let queued = harness.run(&[
+        "list-commands",
+        "-F",
+        "#{socket_path}",
+        "new-window",
+        ";",
+        "display-message",
+        "-p",
+        "queued",
+    ])?;
+    assert_eq!(queued.status.code(), Some(0));
+    assert_eq!(stdout(&queued), format!("{socket_path}\nqueued\n"));
+    assert!(stderr(&queued).is_empty());
+
     Ok(())
 }
 
@@ -534,6 +980,15 @@ fn list_keys_uses_default_table_without_server() -> Result<(), Box<dyn Error>> {
     assert!(stdout(&output).contains("bind-key    -T prefix \\\"      split-window"));
     assert!(stdout(&output).contains("bind-key    -T prefix \\~      show-messages"));
     assert!(stderr(&output).is_empty());
+    assert!(!harness.socket_path().exists());
+
+    let formatted = harness.run(&["list-keys", "-1", "-F", "#{socket_path}"])?;
+    assert_eq!(formatted.status.code(), Some(0));
+    assert_eq!(
+        stdout(&formatted),
+        format!("{}\n", harness.socket_path().display())
+    );
+    assert!(stderr(&formatted).is_empty());
     assert!(!harness.socket_path().exists());
     Ok(())
 }
@@ -818,6 +1273,34 @@ fn list_commands_filters_by_name_alias_or_unique_prefix() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn server_access_inventory_omits_dead_target_flag_product_divergence() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("server-access-honest-inventory")?;
+
+    let inventory = harness.run(&["list-commands", "server-access"])?;
+    assert_eq!(inventory.status.code(), Some(0));
+    assert_eq!(stdout(&inventory), "server-access [-adlrw] [user]\n");
+    assert!(stderr(&inventory).is_empty());
+
+    let help = harness.run(&["server-access", "--help"])?;
+    assert_eq!(help.status.code(), Some(0));
+    assert!(stderr(&help).is_empty());
+    let help = stdout(&help);
+    assert!(help.lines().any(|line| line.trim_start().starts_with("-a")));
+    assert!(help.lines().any(|line| line.trim_start().starts_with("-w")));
+    assert!(
+        !help.lines().any(|line| line.trim_start().starts_with("-t")),
+        "server-access help advertised rejected -t: {help}"
+    );
+
+    let rejected = harness.run(&["server-access", "-t", "%0", "-l"])?;
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(stdout(&rejected).is_empty());
+    assert!(stderr(&rejected).contains("command server-access: unknown flag -t"));
+    Ok(())
+}
+
+#[test]
 fn list_commands_matches_tmux_3_7b_signatures_for_optional_arguments() -> Result<(), Box<dyn Error>>
 {
     let harness = CliHarness::new("list-commands-signatures")?;
@@ -1054,6 +1537,29 @@ fn kill_server_falls_back_to_wire_v3_shutdown_for_0_8_daemon() -> Result<(), Box
 }
 
 #[test]
+fn queued_kill_server_tolerates_parse_probe_against_wire_v3_daemon() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("queued-kill-server-wire-v3-fallback")?;
+    let server = spawn_wire_v3_kill_server_after_parse_probes(harness.socket_path(), 1)?;
+
+    let output = harness.run(&[
+        "kill-server",
+        ";",
+        "new-session",
+        "-d",
+        "-s",
+        "must-not-start",
+    ])?;
+
+    assert_success(&output);
+    server.join().expect("fake wire-v3 server should exit")?;
+    assert!(!harness
+        .run(&["has-session", "-t", "must-not-start"])?
+        .status
+        .success());
+    Ok(())
+}
+
+#[test]
 fn server_access_list_succeeds_against_running_server() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("server-access-list")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -1082,14 +1588,15 @@ fn server_access_missing_user_is_reported_like_tmux() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn server_access_target_flag_is_accepted_like_tmux() -> Result<(), Box<dyn Error>> {
+fn server_access_target_flag_is_rejected_like_tmux_runtime() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("server-access-target-flag")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     let output = harness.run(&["server-access", "-t", "%0", "-l", "ignored-user"])?;
 
-    assert_eq!(output.status.code(), Some(0));
-    assert!(stderr(&output).is_empty());
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("command server-access: unknown flag -t"));
     Ok(())
 }
 
@@ -1248,6 +1755,74 @@ fn attach_session_is_a_start_server_command() -> Result<(), Box<dyn Error>> {
     assert_eq!(stderr(&output).trim(), "no sessions");
     assert!(harness.pid_path().exists());
     wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_cleans_up_daemon_started_by_command() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("queued-attach-start-server")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &["attach-session", "-t", "alpha", ";", "list-sessions"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output).trim(), "no sessions");
+    assert!(harness.pid_path().exists());
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn earlier_queued_command_does_not_consume_attach_startup_connection() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("queued-command-before-attach")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &["start-server", ";", "attach-session", "-t", "alpha"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output).trim(), "no sessions");
+    assert!(harness.pid_path().exists());
+    wait_for_socket_cleanup(harness.socket_path())?;
+    Ok(())
+}
+
+#[test]
+fn attach_session_preserves_preexisting_empty_daemon_and_state() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("attach-preexisting-empty")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-buffer", "-b", "sentinel", "alive"])?);
+
+    for args in [
+        &["attach-session"][..],
+        &["attach-session", ";", "list-sessions"][..],
+    ] {
+        let output = harness.run(args)?;
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(stderr(&output).trim(), "no sessions");
+        assert!(
+            daemon.child_mut().try_wait()?.is_none(),
+            "attach-session must not stop a preexisting empty daemon"
+        );
+
+        let buffer = harness.run(&["show-buffer", "-b", "sentinel"])?;
+        assert_eq!(buffer.status.code(), Some(0));
+        assert!(stderr(&buffer).is_empty());
+        assert_eq!(stdout(&buffer).trim(), "alive");
+    }
+
+    assert_success(&harness.run(&["kill-server"])?);
     Ok(())
 }
 
@@ -1468,6 +2043,143 @@ fn control_mode_argv_command_uses_initial_flags_zero_frame() -> Result<(), Box<d
 }
 
 #[test]
+fn control_control_eof_waits_for_new_session_output() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("control-control-new-session-eof")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run_with(
+        &[
+            "-CC",
+            "new-session",
+            "-A",
+            "-s",
+            "alpha",
+            "--",
+            "sh",
+            "-c",
+            "sleep 0.2; printf control-eof-child; sleep 0.1",
+        ],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    let rendered = stdout(&output);
+    assert!(rendered.starts_with(CONTROL_CONTROL_START));
+    assert!(
+        rendered.contains("%output %") && rendered.contains("control-eof-child"),
+        "control-control EOF must not overtake the created pane's output: {rendered:?}"
+    );
+    assert!(rendered.contains("%exit"), "rendered={rendered:?}");
+    assert!(rendered.ends_with(CONTROL_CONTROL_END));
+    Ok(())
+}
+
+#[test]
+fn control_attach_existing_starts_at_current_pane_output_cursor() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("control-existing-output-cursor")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "printf EXISTING-BACKLOG",
+        "Enter",
+    ])?);
+
+    let deadline = Instant::now() + ATTACH_TIMEOUT;
+    loop {
+        let captured = harness.run(&["capture-pane", "-p", "-t", "alpha:0.0"])?;
+        assert_eq!(captured.status.code(), Some(0));
+        assert!(
+            stderr(&captured).is_empty(),
+            "capture stderr={:?}",
+            stderr(&captured)
+        );
+        if stdout(&captured).contains("EXISTING-BACKLOG") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("existing pane output was not captured before control attach".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    for command in [
+        vec!["-C", "attach-session", "-t", "alpha"],
+        vec!["-C", "new-session", "-A", "-s", "alpha"],
+    ] {
+        let output = harness.run(&command)?;
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+        let rendered = stdout(&output);
+        assert!(
+            rendered.contains("%session-changed"),
+            "rendered={rendered:?}"
+        );
+        assert!(
+            !rendered.contains("EXISTING-BACKLOG"),
+            "plain control attach replayed historical output: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("%window-add"),
+            "attaching an existing session must not announce its old window as new: {rendered:?}"
+        );
+    }
+
+    let mut child = harness
+        .base_command()
+        .args(["-CC", "attach-session", "-t", "alpha"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("control stdout");
+    let stderr = child.stderr.take().expect("control stderr");
+    let (stdout_buffer, stdout_thread) = spawn_pipe_collector(stdout);
+    let (_stderr_buffer, stderr_thread) = spawn_pipe_collector(stderr);
+    wait_for_output_condition(
+        &stdout_buffer,
+        ATTACH_TIMEOUT,
+        "control-control existing session attach",
+        |rendered| rendered.contains("%session-changed"),
+    )?;
+    assert!(
+        !String::from_utf8_lossy(&stdout_buffer.lock().expect("control stdout buffer lock"))
+            .contains("EXISTING-BACKLOG"),
+        "control-control attach replayed historical output"
+    );
+
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "printf LIVE-AFTER-ATTACH",
+        "Enter",
+    ])?);
+    wait_for_output_condition(
+        &stdout_buffer,
+        ATTACH_TIMEOUT,
+        "live pane output after control attach",
+        |rendered| rendered.contains("LIVE-AFTER-ATTACH"),
+    )?;
+    assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
+
+    let status = child.wait()?;
+    let rendered = String::from_utf8(read_pipe_output(stdout_thread, "stdout")?)?;
+    let stderr = String::from_utf8(read_pipe_output(stderr_thread, "stderr")?)?;
+    assert_eq!(status.code(), Some(0));
+    assert!(stderr.is_empty(), "stderr={stderr:?}");
+    assert!(!rendered.contains("EXISTING-BACKLOG"), "{rendered:?}");
+    assert!(rendered.contains("LIVE-AFTER-ATTACH"), "{rendered:?}");
+    assert!(rendered.ends_with(CONTROL_CONTROL_END), "{rendered:?}");
+    Ok(())
+}
+
+#[test]
 fn control_stdin_queue_routes_named_inventory_start_server_and_new_window_flags(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("control-queue-inventory-new-window")?;
@@ -1482,7 +2194,12 @@ fn control_stdin_queue_routes_named_inventory_start_server_and_new_window_flags(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    child.stdin.take().expect("control stdin").write_all(
+    let mut stdin = child.stdin.take().expect("control stdin");
+    let stdout = child.stdout.take().expect("control stdout");
+    let stderr = child.stderr.take().expect("control stderr");
+    let (stdout_buffer, stdout_thread) = spawn_pipe_collector(stdout);
+    let (_stderr_buffer, stderr_thread) = spawn_pipe_collector(stderr);
+    stdin.write_all(
         concat!(
             "start-server\n",
             "list-commands -F '#{command_list_name}|#{command_list_usage}' send-keys\n",
@@ -1501,11 +2218,20 @@ fn control_stdin_queue_routes_named_inventory_start_server_and_new_window_flags(
         )
         .as_bytes(),
     )?;
-    let output = child.wait_with_output()?;
+    stdin.flush()?;
+    wait_for_output_condition(
+        &stdout_buffer,
+        ATTACH_TIMEOUT,
+        "control queue explicit exit",
+        |rendered| rendered.contains("%exit\n"),
+    )?;
+    drop(stdin);
+    let status = wait_for_child_status(&mut child, ATTACH_TIMEOUT)?;
+    let rendered = String::from_utf8(read_pipe_output(stdout_thread, "stdout")?)?;
+    let stderr = String::from_utf8(read_pipe_output(stderr_thread, "stderr")?)?;
 
-    assert_eq!(output.status.code(), Some(0));
-    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
-    let rendered = stdout(&output);
+    assert_eq!(status.code(), Some(0));
+    assert!(stderr.is_empty(), "stderr={stderr:?}");
     for expected in [
         "send-keys|[-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]",
         "set-buffer|[-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]",
@@ -1621,23 +2347,77 @@ fn new_session_detached_auto_starts_and_then_has_session_succeeds() -> Result<()
 }
 
 #[test]
-fn new_session_auto_start_survives_immediate_restart_after_kill_server(
+fn new_session_auto_start_waits_for_old_generation_hook_before_restart(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("new-session-restart-after-kill")?;
     let _cleanup = harness.auto_start_cleanup()?;
+    let hook_path = harness.tmpdir().join("old-generation-hook.sh");
+    let hook_started = harness.tmpdir().join("old-generation-hook.started");
+    let hook_release = harness.tmpdir().join("old-generation-hook.release");
+    let hook_finished = harness.tmpdir().join("old-generation-hook.finished");
+    // Bound the nested client so this test exercises the generation handoff
+    // without waiting for the daemon's five-second hook cancellation deadline.
+    fs::write(
+        &hook_path,
+        format!(
+            "#!/bin/sh\n\
+             printf 'started\\n' > {started}\n\
+             while [ ! -f {release} ]; do sleep 0.01; done\n\
+             tmux kill-server >/dev/null 2>&1 &\n\
+             child=$!\n\
+             sleep 0.2\n\
+             kill \"$child\" >/dev/null 2>&1 || true\n\
+             wait \"$child\" >/dev/null 2>&1 || true\n\
+             printf 'finished\\n' > {finished}\n",
+            started = shell_quote(&hook_started),
+            release = shell_quote(&hook_release),
+            finished = shell_quote(&hook_finished),
+        ),
+    )?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&hook_path)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&hook_path, permissions)?;
+    }
 
     let first = harness.run_with(&["new-session", "-d", "-s", "alpha"], |command| {
         command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
     })?;
     assert_success(&first);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "session-closed",
+        &format!("run-shell {}", shell_quote(&hook_path)),
+    ])?);
 
-    let kill = harness.run(&["kill-server"])?;
+    let mut kill_command = harness.base_command();
+    let kill_child = kill_command
+        .arg("kill-server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_for_file_contents(&hook_started, "started\n", ATTACH_TIMEOUT)?;
+
+    let endpoint_reserved = harness.socket_path().exists();
+    fs::write(&hook_release, b"release\n")?;
+
+    let kill = kill_child.wait_with_output()?;
     assert_success(&kill);
+    assert!(
+        endpoint_reserved,
+        "the old endpoint must remain reserved while an accepted shutdown hook is pending"
+    );
+    assert_eq!(fs::read_to_string(&hook_finished)?, "finished\n");
 
     let second = harness.run_with(&["new-session", "-d", "-s", "beta"], |command| {
         command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
     })?;
     assert_success(&second);
+    thread::sleep(Duration::from_secs(1));
     assert_success(&harness.run(&["has-session", "-t", "beta"])?);
     Ok(())
 }
@@ -1928,7 +2708,7 @@ fn nested_cli_commands_inherit_calling_pane_target() -> Result<(), Box<dyn Error
     let binary = shell_quote_str(env!("CARGO_BIN_EXE_rmux"));
     let command = format!(
         "sleep 1; {binary} display-message -p '#{{session_name}}:#{{pane_id}}' > {} 2>/dev/null; \
-         {binary} split-window -d \"sh -c 'printf nested > {}; sleep 2'\"; sleep 2",
+         {binary} split-window -d \"sh -c 'printf nested > {}; sleep 30'\"; sleep 30",
         shell_quote(&display_path),
         shell_quote(&split_marker)
     );
@@ -2297,7 +3077,25 @@ fn show_options_h_uses_full_helper_while_plain_g_remains_tiny() -> Result<(), Bo
 fn show_options_default_shell_preserves_explicit_value() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("show-options-default-shell-explicit")?;
     let _daemon = harness.start_hidden_daemon()?;
-    let expected_shell = "/tmp/rmux-explicit-shell";
+    let expected_shell = std::env::var_os("SHELL")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([PathBuf::from("/bin/sh"), PathBuf::from("/usr/bin/sh")])
+        .find(|candidate| {
+            candidate.is_absolute()
+                && candidate.is_file()
+                && Command::new(candidate)
+                    .args(["-c", "exit 0"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success())
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no suitable test shell"))?;
+    let expected_shell = expected_shell
+        .to_str()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "test shell is not UTF-8"))?;
 
     assert_success(&harness.run(&["set-option", "-g", "default-shell", expected_shell])?);
 

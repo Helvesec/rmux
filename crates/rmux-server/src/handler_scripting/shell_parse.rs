@@ -1,21 +1,85 @@
 use std::path::{Path, PathBuf};
 
+use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{
-    IfShellRequest, Request, RmuxError, RunShellDelaySeconds, RunShellRequest, WaitForMode,
-    WaitForRequest,
+    IfShellRequest, PaneTarget, Request, RmuxError, RunShellDelaySeconds, RunShellRequest,
+    WaitForMode, WaitForRequest,
 };
 
+use super::targets::{resolve_queue_target_argument_typed, QueueTargetArgumentResolution};
 use super::tokens::{rebuild_shell_command, CommandTokens};
-use super::values::parse_non_negative_f64;
+use super::values::{parse_non_negative_f64, reject_unknown_option_before_positional};
 use super::{parse_pane_target, parse_target_arg};
 
-pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxError> {
+#[derive(Debug, Clone)]
+pub(super) struct ParsedRunShellCommand {
+    pub(super) request: RunShellRequest,
+    pub(super) target_missing_canfail: bool,
+}
+
+pub(super) fn parse_run_shell(args: CommandTokens) -> Result<Request, RmuxError> {
+    parse_run_shell_with_target_resolver(args, |value| {
+        parse_pane_target("run-shell", value).map(ParsedRunShellTarget::target)
+    })
+    .map(|command| Request::RunShell(Box::new(command.request)))
+}
+
+pub(super) fn parse_queued_run_shell(
+    args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+    canfail_fallback_target: Option<&rmux_proto::Target>,
+) -> Result<ParsedRunShellCommand, RmuxError> {
+    parse_run_shell_with_target_resolver(args, |value| {
+        match resolve_queue_target_argument_typed("run-shell", 't', value, sessions, find_context)?
+        {
+            QueueTargetArgumentResolution::Resolved(value) => {
+                parse_pane_target("run-shell", value).map(ParsedRunShellTarget::target)
+            }
+            QueueTargetArgumentResolution::CanFail => match canfail_fallback_target {
+                Some(rmux_proto::Target::Pane(target)) => {
+                    Ok(ParsedRunShellTarget::target(target.clone()))
+                }
+                Some(rmux_proto::Target::Session(_) | rmux_proto::Target::Window(_)) | None => {
+                    Ok(ParsedRunShellTarget::missing_canfail())
+                }
+            },
+        }
+    })
+}
+
+struct ParsedRunShellTarget {
+    target: Option<PaneTarget>,
+    missing_canfail: bool,
+}
+
+impl ParsedRunShellTarget {
+    fn target(target: PaneTarget) -> Self {
+        Self {
+            target: Some(target),
+            missing_canfail: false,
+        }
+    }
+
+    fn missing_canfail() -> Self {
+        Self {
+            target: None,
+            missing_canfail: true,
+        }
+    }
+}
+
+fn parse_run_shell_with_target_resolver(
+    mut args: CommandTokens,
+    mut resolve_target: impl FnMut(String) -> Result<ParsedRunShellTarget, RmuxError>,
+) -> Result<ParsedRunShellCommand, RmuxError> {
     let mut background = false;
     let mut as_commands = false;
     let mut show_stderr = false;
     let mut delay_seconds = None;
     let mut start_directory = None;
     let mut target = None;
+    let mut target_missing_canfail = false;
 
     while let Some(token) = args.peek().map(str::to_owned) {
         if let Some(flags) = args.optional_compact_flags("bCE") {
@@ -66,9 +130,14 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
             }
             "-t" => {
                 let _ = args.optional();
-                target = Some(parse_pane_target("run-shell", args.required("-t target")?)?);
+                let resolved = resolve_target(args.required("-t target")?)?;
+                target = resolved.target;
+                target_missing_canfail = resolved.missing_canfail;
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("run-shell", token)?;
+                break;
+            }
         }
     }
     let command_parts = args.remaining();
@@ -88,17 +157,20 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
         (command, command_parts.collect())
     };
 
-    Ok(Request::RunShell(Box::new(RunShellRequest {
-        command,
-        arguments,
-        background,
-        as_commands,
-        show_stderr,
-        delay_seconds: delay_seconds.map(RunShellDelaySeconds),
-        start_directory,
-        target,
-        source_depth: None,
-    })))
+    Ok(ParsedRunShellCommand {
+        request: RunShellRequest {
+            command,
+            arguments,
+            background,
+            as_commands,
+            show_stderr,
+            delay_seconds: delay_seconds.map(RunShellDelaySeconds),
+            start_directory,
+            target,
+            source_depth: None,
+        },
+        target_missing_canfail,
+    })
 }
 
 pub(super) fn parse_if_shell(
@@ -127,7 +199,10 @@ pub(super) fn parse_if_shell(
                 let _ = args.optional();
                 target = Some(parse_target_arg("if-shell", args.required("-t target")?)?);
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("if-shell", token)?;
+                break;
+            }
         }
     }
 
@@ -155,7 +230,10 @@ pub(super) fn parse_wait_for(mut args: CommandTokens) -> Result<Request, RmuxErr
             "-S" => WaitForMode::Signal,
             "-L" => WaitForMode::Lock,
             "-U" => WaitForMode::Unlock,
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("wait-for", token)?;
+                break;
+            }
         };
         let _ = args.optional();
         if mode != WaitForMode::Wait {

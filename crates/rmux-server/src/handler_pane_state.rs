@@ -74,8 +74,19 @@ impl RequestHandler {
         generation: u64,
         state: ForegroundStateDto,
     ) -> Option<(u64, ForegroundStateDto)> {
-        self.lock_foreground_state_cache()
-            .insert(pane_id, (generation, state))
+        let mut cache = self.lock_foreground_state_cache();
+        match cache.entry(pane_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((generation, state));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry)
+                if generation >= entry.get().0 =>
+            {
+                Some(entry.insert((generation, state)))
+            }
+            std::collections::hash_map::Entry::Occupied(_) => None,
+        }
     }
 
     fn remove_foreground_state_cache(&self, pane_id: PaneId) {
@@ -106,34 +117,46 @@ impl RequestHandler {
                 Ok(pane_id) => pane_id,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            let generation = state
-                .pane_lifecycle(pane_id)
-                .map(|lifecycle| lifecycle.generation)
-                .unwrap_or_else(|| state.pane_output_generation(target.session_name(), pane_id));
-            let mut journal = self.lock_pane_state_journal();
-            let revision = journal.current_revision();
-            let subscription_id = match journal.subscribe_at_generation(
-                connection_id,
-                pane_id,
-                include,
-                Some(generation),
-            ) {
-                Ok(subscription_id) => subscription_id,
-                Err(error) => {
-                    return Response::Error(ErrorResponse {
-                        error: pane_state_subscription_error(error),
-                    });
-                }
-            };
-            let (snapshot, foreground_seed) =
-                match pane_state_snapshot_locked(&state, &target, pane_id, include, revision) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        let _ = journal.unsubscribe(connection_id, subscription_id);
-                        return Response::Error(ErrorResponse { error });
-                    }
+            // Pane-state producers are driven by pane output and stamp this
+            // generation. Lifecycle generations also advance on exit, so
+            // mixing the two domains would strand subscriptions after a
+            // kept-dead pane is respawned.
+            let generation = state.pane_output_generation_for_target(&target, pane_id);
+            loop {
+                let (subscription_id, revision) = {
+                    let mut journal = self.lock_pane_state_journal();
+                    let revision = journal.current_revision();
+                    let subscription_id = match journal.subscribe_at_generation(
+                        connection_id,
+                        pane_id,
+                        include,
+                        Some(generation),
+                    ) {
+                        Ok(subscription_id) => subscription_id,
+                        Err(error) => {
+                            return Response::Error(ErrorResponse {
+                                error: pane_state_subscription_error(error),
+                            });
+                        }
+                    };
+                    (subscription_id, revision)
                 };
-            (subscription_id, pane_id, snapshot, foreground_seed)
+                let (snapshot, foreground_seed) =
+                    match pane_state_snapshot_locked(&state, &target, pane_id, include, revision) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            let _ = self
+                                .lock_pane_state_journal()
+                                .unsubscribe(connection_id, subscription_id);
+                            return Response::Error(ErrorResponse { error });
+                        }
+                    };
+                let mut journal = self.lock_pane_state_journal();
+                if journal.current_revision() == revision {
+                    break (subscription_id, pane_id, snapshot, foreground_seed);
+                }
+                let _ = journal.unsubscribe(connection_id, subscription_id);
+            }
         };
 
         if let Some(seed) = foreground_seed {
@@ -505,28 +528,54 @@ impl RequestHandler {
             // order. Reading both while state is held prevents a kill from
             // leaving an open subscription paired with an already-removed
             // pane during lag rebase.
-            let (info, revision) = {
-                let journal = self.lock_pane_state_journal();
-                let info = journal
-                    .subscription_info(connection_id, subscription_id)
-                    .map_err(|message| RmuxError::Server(message.to_owned()))?
-                    .ok_or_else(|| RmuxError::Server("subscription not found".to_owned()))?;
-                (info, journal.current_revision())
-            };
-            let closed_snapshot_revision = info
-                .closed
-                .then(|| info.closed_revision.unwrap_or(revision).saturating_sub(1));
+            loop {
+                let (info, revision) = {
+                    let journal = self.lock_pane_state_journal();
+                    let info = journal
+                        .subscription_info(connection_id, subscription_id)
+                        .map_err(|message| RmuxError::Server(message.to_owned()))?
+                        .ok_or_else(|| RmuxError::Server("subscription not found".to_owned()))?;
+                    (info, journal.current_revision())
+                };
+                let closed_snapshot_revision = info
+                    .closed
+                    .then(|| info.closed_revision.unwrap_or(revision).saturating_sub(1));
 
-            match pane_target_for_pane_id(&state, info.pane_id) {
-                Some(_)
-                    if info.closed
-                        && info.generation.is_some()
-                        && info.generation
-                            != state
-                                .pane_lifecycle(info.pane_id)
-                                .map(|lifecycle| lifecycle.generation) =>
-                {
-                    (
+                let snapshot = match pane_target_for_pane_id(&state, info.pane_id) {
+                    Some(target)
+                        if info.closed
+                            && info.generation.is_some_and(|generation| {
+                                generation
+                                    != state
+                                        .pane_output_generation_for_target(&target, info.pane_id)
+                            }) =>
+                    {
+                        (
+                            PaneStateSnapshot {
+                                revision: closed_snapshot_revision.unwrap_or(revision),
+                                title: info.include.title.then(String::new),
+                                options: Vec::new(),
+                                foreground: None,
+                            },
+                            None,
+                        )
+                    }
+                    Some(target) => {
+                        let (mut snapshot, foreground_seed) = pane_state_snapshot_locked(
+                            &state,
+                            &target,
+                            info.pane_id,
+                            info.include,
+                            closed_snapshot_revision.unwrap_or(revision),
+                        )?;
+                        if info.closed {
+                            snapshot.foreground = None;
+                            (snapshot, None)
+                        } else {
+                            (snapshot, foreground_seed)
+                        }
+                    }
+                    None if info.closed => (
                         PaneStateSnapshot {
                             revision: closed_snapshot_revision.unwrap_or(revision),
                             title: info.include.title.then(String::new),
@@ -534,37 +583,16 @@ impl RequestHandler {
                             foreground: None,
                         },
                         None,
-                    )
-                }
-                Some(target) => {
-                    let (mut snapshot, foreground_seed) = pane_state_snapshot_locked(
-                        &state,
-                        &target,
-                        info.pane_id,
-                        info.include,
-                        closed_snapshot_revision.unwrap_or(revision),
-                    )?;
-                    if info.closed {
-                        snapshot.foreground = None;
-                        (snapshot, None)
-                    } else {
-                        (snapshot, foreground_seed)
+                    ),
+                    None => {
+                        return Err(RmuxError::Server(format!(
+                            "pane {} not found",
+                            info.pane_id.as_u32()
+                        )))
                     }
-                }
-                None if info.closed => (
-                    PaneStateSnapshot {
-                        revision: closed_snapshot_revision.unwrap_or(revision),
-                        title: info.include.title.then(String::new),
-                        options: Vec::new(),
-                        foreground: None,
-                    },
-                    None,
-                ),
-                None => {
-                    return Err(RmuxError::Server(format!(
-                        "pane {} not found",
-                        info.pane_id.as_u32()
-                    )))
+                };
+                if info.closed || self.lock_pane_state_journal().current_revision() == revision {
+                    break snapshot;
                 }
             }
         };
@@ -824,6 +852,61 @@ mod tests {
             .expect("newer baseline should survive stale seed");
 
         assert_eq!(previous, (5, new_state));
+    }
+
+    #[test]
+    fn stale_foreground_replace_does_not_overwrite_newer_generation() {
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(9);
+        let stale_state = foreground_state(10, "cmd", "C:/stale");
+        let current_state = foreground_state(11, "cmd", "C:/current");
+
+        handler.seed_foreground_state_cache(pane_id, 5, current_state.clone());
+        let previous = handler.replace_foreground_state_cache(pane_id, 4, stale_state);
+
+        assert_eq!(previous, None);
+        assert_eq!(
+            handler.lock_foreground_state_cache().get(&pane_id).cloned(),
+            Some((5, current_state))
+        );
+    }
+
+    #[test]
+    fn same_generation_foreground_replace_updates_cache() {
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(10);
+        let old_state = foreground_state(10, "cmd", "C:/old");
+        let next_state = foreground_state(10, "cmd", "C:/next");
+
+        handler.seed_foreground_state_cache(pane_id, 5, old_state.clone());
+        let previous = handler.replace_foreground_state_cache(pane_id, 5, next_state.clone());
+
+        assert_eq!(previous, Some((5, old_state)));
+        assert_eq!(
+            handler.lock_foreground_state_cache().get(&pane_id).cloned(),
+            Some((5, next_state))
+        );
+    }
+
+    #[test]
+    fn newer_generation_foreground_replace_advances_cache_without_transition() {
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(11);
+        let old_state = foreground_state(10, "cmd", "C:/old");
+        let next_state = foreground_state(11, "cmd", "C:/next");
+
+        handler.seed_foreground_state_cache(pane_id, 5, old_state.clone());
+        let previous = handler.replace_foreground_state_cache(pane_id, 6, next_state.clone());
+
+        assert_eq!(previous, Some((5, old_state)));
+        assert_eq!(
+            foreground_change_from_previous(previous, 6, &next_state),
+            None
+        );
+        assert_eq!(
+            handler.lock_foreground_state_cache().get(&pane_id).cloned(),
+            Some((6, next_state))
+        );
     }
 
     #[test]

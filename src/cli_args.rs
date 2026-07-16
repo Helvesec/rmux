@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser};
 use rmux_core::{
+    command_inventory::RMUX_EXTENSION_COMMANDS,
     command_parser::{CommandEntry, ParsedCommands, COMMAND_TABLE},
     tmux_precedence,
 };
@@ -29,9 +30,13 @@ mod config;
 #[cfg(test)]
 pub(crate) use config::build_scope;
 pub(crate) use config::{
-    SetEnvironmentArgs, SetHookArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs,
-    ShowHooksArgs, ShowOptionsArgs, ShowOptionsCommandKind,
+    SetEnvironmentArgs, SetHookArgs, SetOptionArgs, SetOptionCommandKind, SetWindowOptionArgs,
+    ShowEnvironmentArgs, ShowHooksArgs, ShowOptionsArgs, ShowOptionsCommandKind,
+    ShowWindowOptionsArgs,
 };
+#[path = "cli_args/control.rs"]
+mod control;
+use control::render_control_command_lines;
 #[path = "cli_args/automation.rs"]
 mod automation;
 pub(crate) use automation::{
@@ -59,7 +64,7 @@ mod prompt;
 pub(crate) use prompt::{ConfirmBeforeArgs, PromptArgs, PromptHistoryArgs};
 #[path = "cli_args/queue.rs"]
 mod queue;
-use queue::{command_from_parsed, parse_command_queue};
+use queue::{command_from_parsed, parse_command_queue, parse_runtime_command_groups};
 #[path = "cli_args/script.rs"]
 mod script;
 use script::parse_source_file_args;
@@ -69,7 +74,7 @@ mod overlay;
 pub(crate) use overlay::{DisplayMenuArgs, DisplayPopupArgs};
 #[path = "cli_args/targets.rs"]
 mod targets;
-use targets::{parse_session_name, parse_target};
+use targets::parse_session_name;
 pub(crate) use targets::{parse_target_spec, TargetSpec};
 #[path = "cli_args/pane.rs"]
 mod pane;
@@ -121,70 +126,56 @@ static IMPLEMENTED_COMMAND_SURFACE: OnceLock<Vec<&'static CommandEntry>> = OnceL
 
 static IMPLEMENTED_COMMAND_HELP: OnceLock<String> = OnceLock::new();
 
-const RMUX_EXTENSION_COMMANDS: &[CommandEntry] = &[
-    CommandEntry {
-        name: "capabilities",
-        alias: None,
-    },
-    CommandEntry {
-        name: "claude",
-        alias: None,
-    },
-    CommandEntry {
-        name: "doctor",
-        alias: None,
-    },
-    CommandEntry {
-        name: "setup",
-        alias: None,
-    },
-    CommandEntry {
-        name: "wait-pane",
-        alias: None,
-    },
-    CommandEntry {
-        name: "pane-snapshot",
-        alias: None,
-    },
-    CommandEntry {
-        name: "stream-pane",
-        alias: None,
-    },
-    CommandEntry {
-        name: "collect-pane-output",
-        alias: None,
-    },
-    CommandEntry {
-        name: "locator",
-        alias: None,
-    },
-    CommandEntry {
-        name: "expect-pane",
-        alias: None,
-    },
-    CommandEntry {
-        name: "find-panes",
-        alias: None,
-    },
-    CommandEntry {
-        name: "find-sessions",
-        alias: None,
-    },
-    CommandEntry {
-        name: "broadcast-keys",
-        alias: None,
-    },
-    CommandEntry {
-        name: "with-session",
-        alias: None,
-    },
-    CommandEntry {
-        name: "web-share",
-        alias: None,
-    },
-];
-
 pub(crate) fn parse<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let raw = parse_raw_cli(args)?;
+    if raw.control_mode != 0 {
+        return Cli::from_raw_control(raw);
+    }
+    let parsed_commands = parse_command_queue(&raw.command)?;
+    reject_parse_time_assignments_without_runtime_bridge(&parsed_commands)?;
+    Cli::from_raw(raw, parsed_commands, false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RuntimeCommandGroup {
+    Canonical(String),
+}
+
+fn reject_parse_time_assignments_without_runtime_bridge(
+    parsed_commands: &ParsedCommands,
+) -> Result<(), clap::Error> {
+    let Some(assignment) = parsed_commands.assignments().first() else {
+        return Ok(());
+    };
+    let token = format!("{}={}", assignment.name(), assignment.value());
+    let token = token
+        .chars()
+        .flat_map(char::escape_default)
+        .collect::<String>();
+    Err(clap::Error::raw(
+        clap::error::ErrorKind::InvalidSubcommand,
+        format!("unknown command: {token}"),
+    ))
+}
+
+pub(crate) fn parse_with_runtime_command_groups<I, T>(
+    args: I,
+    runtime_groups: &[RuntimeCommandGroup],
+) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let raw = parse_raw_cli(args)?;
+    let parsed_commands = parse_runtime_command_groups(runtime_groups)?;
+    Cli::from_raw(raw, parsed_commands, true)
+}
+
+fn parse_raw_cli<I, T>(args: I) -> Result<RawCli, clap::Error>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -193,9 +184,53 @@ where
     let mut command = RawCli::command();
     command = command.after_help(implemented_command_help());
     let matches = command.try_get_matches_from(args)?;
+    RawCli::from_arg_matches(&matches)
+}
+
+/// Result of parsing only the clap-owned top-level prefix and opaque command
+/// tail. Extensions use this before command-queue parsing so they share the
+/// exact same short-option cluster and value-boundary rules as the main CLI.
+#[derive(Debug)]
+pub(crate) struct TopLevelCommandScan {
+    pub(crate) assume_256_colors: bool,
+    pub(crate) control_mode: u8,
+    pub(crate) no_fork: bool,
+    pub(crate) shell_command: Option<String>,
+    pub(crate) config_files: Vec<PathBuf>,
+    pub(crate) login_shell: bool,
+    pub(crate) socket_name: Option<OsString>,
+    pub(crate) no_start_server: bool,
+    pub(crate) socket_path: Option<OsString>,
+    pub(crate) terminal_features: Vec<String>,
+    pub(crate) utf8: bool,
+    pub(crate) verbose: u8,
+    pub(crate) command: Vec<OsString>,
+}
+
+pub(crate) fn scan_top_level_command(
+    arguments: &[OsString],
+) -> Result<TopLevelCommandScan, clap::Error> {
+    let args = std::iter::once(OsString::from("rmux"))
+        .chain(arguments.iter().cloned())
+        .collect::<Vec<_>>();
+    let args = normalize_top_level_attached_short_values(args);
+    let matches = RawCli::command().try_get_matches_from(args)?;
     let raw = RawCli::from_arg_matches(&matches)?;
-    let parsed_commands = parse_command_queue(&raw.command)?;
-    Cli::from_raw(raw, parsed_commands)
+    Ok(TopLevelCommandScan {
+        assume_256_colors: raw.assume_256_colors,
+        control_mode: raw.control_mode,
+        no_fork: raw.no_fork,
+        shell_command: raw.shell_command,
+        config_files: raw.config_files,
+        login_shell: raw.login_shell,
+        socket_name: raw.socket_name,
+        no_start_server: raw.no_start_server,
+        socket_path: raw.socket_path,
+        terminal_features: raw.terminal_features,
+        utf8: raw.utf8,
+        verbose: raw.verbose,
+        command: raw.command,
+    })
 }
 
 fn normalize_top_level_attached_short_values<I>(args: I) -> Vec<OsString>
@@ -210,8 +245,14 @@ where
     normalized.push(binary);
 
     let mut passthrough = false;
+    let mut preserve_hyphen_value = false;
     for argument in args {
         if passthrough {
+            normalized.push(argument);
+            continue;
+        }
+        if preserve_hyphen_value {
+            preserve_hyphen_value = false;
             normalized.push(argument);
             continue;
         }
@@ -226,6 +267,11 @@ where
         }
         if !value.starts_with('-') || value == "-" {
             passthrough = true;
+            normalized.push(argument);
+            continue;
+        }
+        if matches!(value, "-L" | "-S" | "-T") {
+            preserve_hyphen_value = true;
             normalized.push(argument);
             continue;
         }
@@ -357,17 +403,36 @@ struct RawCli {
 }
 
 impl Cli {
-    fn from_raw(raw: RawCli, parsed_commands: ParsedCommands) -> Result<Self, clap::Error> {
+    fn from_raw_control(raw: RawCli) -> Result<Self, clap::Error> {
         let explicit_command_args = !raw.command.is_empty();
-        let control_command_lines = if parsed_commands.is_empty() {
+        let control_command_lines = render_control_command_lines(&raw.command)?;
+        let command_queue = explicit_command_args
+            .then_some(Command::Noop)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let primary_command = command_queue.first().cloned();
+        Ok(Self::from_raw_queue(
+            raw,
+            primary_command,
+            command_queue,
+            control_command_lines,
+        ))
+    }
+
+    fn from_raw(
+        raw: RawCli,
+        parsed_commands: ParsedCommands,
+        apply_runtime_assignments: bool,
+    ) -> Result<Self, clap::Error> {
+        let explicit_command_args = !raw.command.is_empty();
+        let control_command_lines = if raw.control_mode == 0 {
             Vec::new()
         } else {
-            parsed_commands
-                .commands()
-                .iter()
-                .map(rmux_core::command_parser::ParsedCommand::to_tmux_string)
-                .collect()
+            render_control_command_lines(&raw.command)?
         };
+        let runtime_assignments = apply_runtime_assignments
+            .then(|| parsed_commands.assignments_to_tmux_reparse_string())
+            .filter(|assignments| !assignments.is_empty());
         let mut command_queue = parsed_commands
             .into_commands()
             .into_iter()
@@ -376,7 +441,27 @@ impl Cli {
         if command_queue.is_empty() && explicit_command_args {
             command_queue.push(Command::Noop);
         }
-        Ok(Self {
+        let primary_command = command_queue.first().cloned();
+        if raw.control_mode == 0 {
+            if let Some(assignments) = runtime_assignments {
+                command_queue.insert(0, Command::ApplyParseTimeAssignments(assignments));
+            }
+        }
+        Ok(Self::from_raw_queue(
+            raw,
+            primary_command,
+            command_queue,
+            control_command_lines,
+        ))
+    }
+
+    fn from_raw_queue(
+        raw: RawCli,
+        primary_command: Option<Command>,
+        command_queue: Vec<Command>,
+        control_command_lines: Vec<String>,
+    ) -> Self {
+        Self {
             assume_256_colors: raw.assume_256_colors,
             control_mode: raw.control_mode,
             no_fork: raw.no_fork,
@@ -389,10 +474,10 @@ impl Cli {
             terminal_features: raw.terminal_features,
             utf8: raw.utf8,
             verbose: raw.verbose,
-            command: command_queue.first().cloned(),
+            command: primary_command,
             command_queue,
             control_command_lines,
-        })
+        }
     }
 
     pub(crate) fn socket_name(&self) -> Option<&std::ffi::OsStr> {
@@ -436,6 +521,27 @@ fn parse_command_args<T>(
 where
     T: Args + FromArgMatches,
 {
+    parse_command_args_with_policy(
+        command_name,
+        arguments,
+        PositionalOptionPolicy::StopAtFirstPositional,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PositionalOptionPolicy {
+    StopAtFirstPositional,
+    InterspersedBeforeSeparator,
+}
+
+fn parse_command_args_with_policy<T>(
+    command_name: &'static str,
+    arguments: Vec<String>,
+    positional_option_policy: PositionalOptionPolicy,
+) -> Result<T, clap::Error>
+where
+    T: Args + FromArgMatches,
+{
     let command = T::augment_args(
         clap::Command::new(command_name)
             .no_binary_name(true)
@@ -448,19 +554,35 @@ where
             .long("help")
             .action(ArgAction::Help)
             .help("Print help"),
-    );
+    )
+    .mut_args(|argument| {
+        if argument_requires_value(&argument)
+            && (argument.get_short().is_some() || argument.get_long().is_some())
+        {
+            // tmux consumes the next token as a required option value even
+            // when it looks like another option or is the literal `--`.
+            argument.allow_hyphen_values(true)
+        } else {
+            argument
+        }
+    });
     let arguments = normalize_attached_short_values(&command, arguments);
     let arguments = tmux_precedence::normalize_tmux_precedence(command_name, arguments);
-    validate_options_before_positionals(command_name, &command, &arguments)?;
+    let arguments = match positional_option_policy {
+        PositionalOptionPolicy::StopAtFirstPositional => {
+            delimit_options_before_positionals(command_name, &command, arguments)?
+        }
+        PositionalOptionPolicy::InterspersedBeforeSeparator => arguments,
+    };
     let matches = command.try_get_matches_from(arguments)?;
     T::from_arg_matches(&matches)
 }
 
-fn validate_options_before_positionals(
+fn delimit_options_before_positionals(
     command_name: &'static str,
     command: &clap::Command,
-    arguments: &[String],
-) -> Result<(), clap::Error> {
+    mut arguments: Vec<String>,
+) -> Result<Vec<String>, clap::Error> {
     let positionals_allow_hyphen = command
         .get_positionals()
         .any(|argument| argument.is_allow_hyphen_values_set());
@@ -485,7 +607,8 @@ fn validate_options_before_positionals(
         .collect::<std::collections::BTreeSet<_>>();
 
     let mut expected_value_flag = None::<String>;
-    for argument in arguments {
+    let mut first_positional = None;
+    for (index, argument) in arguments.iter().enumerate() {
         if expected_value_flag.take().is_some() {
             continue;
         }
@@ -493,6 +616,7 @@ fn validate_options_before_positionals(
             break;
         }
         if !argument.starts_with('-') || argument == "-" {
+            first_positional = Some(index);
             break;
         }
         if let Some(long) = argument.strip_prefix("--") {
@@ -530,7 +654,34 @@ fn validate_options_before_positionals(
         return Err(missing_value_error(command_name, flag));
     }
 
-    Ok(())
+    if let Some(index) = first_positional {
+        let positional_limit = command
+            .get_positionals()
+            .map(|argument| {
+                argument
+                    .get_num_args()
+                    .map_or(1, |range| range.max_values())
+            })
+            .fold(0_usize, usize::saturating_add);
+        if positional_limit == 0 {
+            return Ok(arguments);
+        }
+        if arguments.len() - index > positional_limit {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::TooManyValues,
+                format!(
+                    "command {command_name}: too many arguments (need at most {positional_limit})"
+                ),
+            ));
+        }
+
+        // tmux stops option parsing at the first positional. Clap otherwise
+        // accepts recognized flags later in the argv and can silently change
+        // a command's target or scope instead of rejecting the extra tail.
+        arguments.insert(index, "--".to_owned());
+    }
+
+    Ok(arguments)
 }
 
 fn argument_requires_value(argument: &clap::Arg) -> bool {
@@ -555,14 +706,21 @@ fn missing_value_error(command_name: &'static str, flag: String) -> clap::Error 
 }
 
 fn normalize_attached_short_values(command: &clap::Command, arguments: Vec<String>) -> Vec<String> {
+    let boolean_flags = command
+        .get_arguments()
+        .filter(|argument| {
+            matches!(
+                argument.get_action(),
+                ArgAction::SetTrue | ArgAction::SetFalse | ArgAction::Count
+            )
+        })
+        .filter_map(clap::Arg::get_short)
+        .collect::<std::collections::BTreeSet<_>>();
     let value_flags = command
         .get_arguments()
         .filter(|argument| argument_requires_value(argument))
         .filter_map(clap::Arg::get_short)
         .collect::<std::collections::BTreeSet<_>>();
-    let has_trailing_position = command
-        .get_positionals()
-        .any(clap::Arg::is_trailing_var_arg_set);
     let repeat_last_wins_flags = if command.get_name() == "new-window" {
         command
             .get_arguments()
@@ -598,15 +756,17 @@ fn normalize_attached_short_values(command: &clap::Command, arguments: Vec<Strin
             continue;
         }
 
-        if has_trailing_position && is_trailing_position_start(&argument) {
+        if is_positional_start(&argument) {
             trailing_values.push(argument);
             trailing_values.extend(arguments);
             break;
         }
 
-        if let Some((flag, value)) = attached_short_value(&argument, &value_flags) {
-            normalized_options.push(format!("-{flag}"));
-            normalized_options.push(value.to_owned());
+        if let Some((parts, needs_next_value)) =
+            normalize_compact_short_value_token(&argument, &boolean_flags, &value_flags)
+        {
+            normalized_options.extend(parts);
+            expect_next_value = needs_next_value;
         } else if exact_short_flag(&argument, &value_flags).is_some() {
             expect_next_value = true;
             normalized_options.push(argument);
@@ -621,22 +781,43 @@ fn normalize_attached_short_values(command: &clap::Command, arguments: Vec<Strin
     normalized
 }
 
-fn is_trailing_position_start(argument: &str) -> bool {
+fn is_positional_start(argument: &str) -> bool {
     !argument.starts_with('-') || argument == "-"
 }
 
-fn attached_short_value<'a>(
-    argument: &'a str,
+fn normalize_compact_short_value_token(
+    argument: &str,
+    boolean_flags: &std::collections::BTreeSet<char>,
     value_flags: &std::collections::BTreeSet<char>,
-) -> Option<(char, &'a str)> {
-    let mut chars = argument.chars();
-    if chars.next()? != '-' || chars.as_str().starts_with('-') {
+) -> Option<(Vec<String>, bool)> {
+    let flags = argument.strip_prefix('-')?;
+    if flags.is_empty() || flags.starts_with('-') {
         return None;
     }
 
-    let flag = chars.next()?;
-    let value = chars.as_str();
-    (!value.is_empty() && value_flags.contains(&flag)).then_some((flag, value))
+    let mut chars = flags.char_indices().peekable();
+    let first = chars.next()?;
+    chars.peek()?;
+
+    let mut parts = Vec::new();
+    for (index, flag) in std::iter::once(first).chain(chars.by_ref()) {
+        if boolean_flags.contains(&flag) {
+            parts.push(format!("-{flag}"));
+            continue;
+        }
+        if value_flags.contains(&flag) {
+            parts.push(format!("-{flag}"));
+            let value_start = index + flag.len_utf8();
+            if value_start < flags.len() {
+                parts.push(flags[value_start..].to_owned());
+                return Some((parts, false));
+            }
+            return Some((parts, true));
+        }
+        return None;
+    }
+
+    Some((parts, false))
 }
 
 fn collapse_repeated_short_values(
@@ -692,6 +873,7 @@ fn exact_short_flag(argument: &str, flags: &std::collections::BTreeSet<char>) ->
 #[derive(Debug, Clone)]
 pub(crate) enum Command {
     Noop,
+    ApplyParseTimeAssignments(String),
     NewSession(NewSessionArgs),
     StartServer(StartServerArgs),
     KillServer,

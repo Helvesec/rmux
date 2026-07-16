@@ -5,7 +5,10 @@ mod common;
 mod windows {
     use super::common;
 
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::Duration;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use common::windows_smoke::{
         cmd_echo_text, cmd_interactive_command, session_name, wait_for_daemon_unavailable,
@@ -19,6 +22,62 @@ mod windows {
     use tokio::time::{sleep, timeout, Instant};
 
     const MARKER: &str = "RMUX_SDK_SMOKE_V1_WINDOWS_OK";
+
+    #[tokio::test]
+    async fn sdk_cmd_can_cold_start_an_independent_windows_daemon() -> TestResult {
+        let _lock = LIVE_DAEMON_LOCK.lock().await;
+        let session_name = session_name("sdkwincmdcold");
+        let harness = Harness::start_via_cmd("cmdcold", &session_name).await?;
+        let pipe_name = harness.pipe_name().to_owned();
+
+        assert!(
+            harness
+                .rmux()
+                .list_sessions()
+                .await?
+                .iter()
+                .any(|session| session == &session_name),
+            "the command-started daemon must retain the requested session"
+        );
+
+        harness.finish().await?;
+        wait_for_daemon_unavailable(&pipe_name).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sdk_autostart_loads_default_config_from_the_exact_windows_caller_cwd() -> TestResult {
+        let _lock = LIVE_DAEMON_LOCK.lock().await;
+        let root = windows_config_root()?;
+        let cleanup = TempRoot::new(root.clone());
+        let appdata = root.join("app data-é");
+        let caller_cwd = root.join("caller dir-é");
+        let config_path = appdata.join("rmux/rmux.conf");
+        let relative_path = caller_cwd.join("sdk-relative.conf");
+        let sentinel = session_name("sdkwinconfig");
+
+        fs::create_dir_all(config_path.parent().expect("config path has parent"))?;
+        fs::create_dir_all(&caller_cwd)?;
+        fs::write(&config_path, b"source-file sdk-relative.conf\n")?;
+        fs::write(
+            &relative_path,
+            format!("new-session -d -s {}\n", sentinel.as_str()),
+        )?;
+
+        let harness =
+            Harness::start_with_default_config_environment("configcwd", &appdata, &caller_cwd)
+                .await?;
+        let first_sessions = harness.rmux().list_sessions().await?;
+        assert!(
+            first_sessions.iter().any(|session| session == &sentinel),
+            "the first SDK request after connect_or_start must observe the config-created session"
+        );
+
+        harness.finish().await?;
+        fs::remove_dir_all(&root)?;
+        cleanup.disarm();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon() -> TestResult
@@ -221,6 +280,37 @@ mod windows {
         format!(
             "powershell.exe -NoProfile -Command \"Write-Output ([string]::Concat([char[]]@({codepoints})))\"\r"
         )
+    }
+
+    fn windows_config_root() -> TestResult<PathBuf> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        Ok(std::env::temp_dir().join(format!(
+            "rmux-sdk-windows-config-{}-{nonce}",
+            std::process::id()
+        )))
+    }
+
+    struct TempRoot {
+        path: PathBuf,
+        armed: bool,
+    }
+
+    impl TempRoot {
+        fn new(path: PathBuf) -> Self {
+            Self { path, armed: true }
+        }
+
+        fn disarm(mut self) {
+            self.armed = false;
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
     }
 }
 

@@ -60,6 +60,7 @@ fn exit_signal(_status: ExitStatus) -> Option<i32> {
 
 #[derive(Debug, Default)]
 pub(super) struct RemovedPaneOutputs {
+    dead_panes: HashMap<PaneId, PaneExitMetadata>,
     transcripts: HashMap<PaneId, SharedPaneTranscript>,
     pane_outputs: HashMap<PaneId, PaneOutputSender>,
     #[cfg(unix)]
@@ -69,6 +70,13 @@ pub(super) struct RemovedPaneOutputs {
 }
 
 impl RemovedPaneOutputs {
+    pub(in crate::pane_terminals) fn pane_output_sender(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<PaneOutputSender> {
+        self.pane_outputs.get(&pane_id).cloned()
+    }
+
     pub(in crate::pane_terminals) fn abort_output_readers(&mut self) {
         #[cfg(unix)]
         for (_, reader) in self.pane_output_readers.drain() {
@@ -203,6 +211,15 @@ impl HandlerState {
         ))
     }
 
+    pub(crate) fn pane_output_subscription_key_for_pane_id(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<PaneOutputSubscriptionKey> {
+        self.pane_alias_targets(pane_id)
+            .into_iter()
+            .find_map(|target| self.pane_output_subscription_key_for_target(&target).ok())
+    }
+
     pub(crate) fn pane_output_subscription_keys_for_kill(
         &self,
         target: &rmux_proto::PaneTarget,
@@ -299,12 +316,13 @@ impl HandlerState {
         &mut self,
         session_name: &SessionName,
     ) -> RemovedPaneOutputs {
-        let _ = self.dead_panes.remove(session_name);
+        let dead_panes = self.dead_panes.remove(session_name).unwrap_or_default();
         let attached_submitted_rows = self
             .attached_submitted_rows
             .remove(session_name)
             .unwrap_or_default();
         RemovedPaneOutputs {
+            dead_panes,
             transcripts: self.transcripts.remove(session_name).unwrap_or_default(),
             pane_outputs: self.pane_outputs.remove(session_name).unwrap_or_default(),
             #[cfg(unix)]
@@ -362,8 +380,12 @@ impl HandlerState {
     ) -> RemovedPaneOutputs {
         let mut removed = RemovedPaneOutputs::default();
         for pane_id in pane_ids {
-            if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
-                let _ = dead_panes.remove(pane_id);
+            if let Some(metadata) = self
+                .dead_panes
+                .get_mut(session_name)
+                .and_then(|dead_panes| dead_panes.remove(pane_id))
+            {
+                removed.dead_panes.insert(*pane_id, metadata);
             }
             if let Some(absolute_y) = self.take_attached_submitted_line(session_name, *pane_id) {
                 removed.attached_submitted_rows.insert(*pane_id, absolute_y);
@@ -406,6 +428,10 @@ impl HandlerState {
         session_name: &SessionName,
         removed_outputs: RemovedPaneOutputs,
     ) {
+        self.dead_panes
+            .entry(session_name.clone())
+            .or_default()
+            .extend(removed_outputs.dead_panes);
         self.attached_submitted_rows
             .entry(session_name.clone())
             .or_default()
@@ -457,6 +483,16 @@ impl HandlerState {
             .and_then(|panes| panes.get(&pane_id))
             .copied()
             .unwrap_or(0)
+    }
+
+    pub(crate) fn pane_output_generation_for_target(
+        &self,
+        target: &PaneTarget,
+        pane_id: PaneId,
+    ) -> u64 {
+        let runtime_session_name =
+            self.runtime_session_name_for_window(target.session_name(), target.window_index());
+        self.pane_output_generation(&runtime_session_name, pane_id)
     }
 
     pub(in crate::pane_terminals) fn seed_pane_output_generation(

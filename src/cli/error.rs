@@ -10,7 +10,14 @@ pub(crate) struct ExitFailure {
     exit_code: i32,
     message: String,
     use_stderr: bool,
+    message_termination: ExitMessageTermination,
     kind: ExitFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitMessageTermination {
+    Line,
+    Exact,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,12 +41,20 @@ impl ExitFailure {
         self.use_stderr
     }
 
+    pub(crate) fn message_termination(&self) -> ExitMessageTermination {
+        self.message_termination
+    }
+
     pub(super) fn is_ambiguous_target(&self) -> bool {
         self.kind == ExitFailureKind::AmbiguousTarget
     }
 
     pub(super) fn is_server_absent(&self) -> bool {
         self.kind == ExitFailureKind::ServerAbsent
+    }
+
+    pub(super) fn is_unsupported_wire_version(&self) -> bool {
+        self.kind == ExitFailureKind::UnsupportedWireVersion
     }
 
     pub(crate) fn new(exit_code: i32, message: impl Into<String>) -> Self {
@@ -55,6 +70,7 @@ impl ExitFailure {
             exit_code,
             message: message.into(),
             use_stderr: true,
+            message_termination: ExitMessageTermination::Line,
             kind,
         }
     }
@@ -64,6 +80,17 @@ impl ExitFailure {
             exit_code,
             message: message.into(),
             use_stderr: false,
+            message_termination: ExitMessageTermination::Line,
+            kind: ExitFailureKind::Generic,
+        }
+    }
+
+    pub(super) fn new_stdout_exact(exit_code: i32, message: impl Into<String>) -> Self {
+        Self {
+            exit_code,
+            message: message.into(),
+            use_stderr: false,
+            message_termination: ExitMessageTermination::Exact,
             kind: ExitFailureKind::Generic,
         }
     }
@@ -79,6 +106,7 @@ impl ExitFailure {
             exit_code,
             message,
             use_stderr: error.use_stderr(),
+            message_termination: ExitMessageTermination::Line,
             kind: ExitFailureKind::Generic,
         }
     }

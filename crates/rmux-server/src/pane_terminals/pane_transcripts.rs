@@ -460,6 +460,23 @@ impl HandlerState {
             .copy_mode_render_screen()
     }
 
+    pub(crate) fn pane_copy_mode_render_snapshot(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<crate::copy_mode::CopyModeRenderSnapshot> {
+        let window_index = self
+            .sessions
+            .session(session_name)?
+            .window_index_for_pane_id(pane_id)?;
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
+        transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned")
+            .copy_mode_render_snapshot()
+    }
+
     pub(crate) fn with_pane_screen<R>(
         &self,
         session_name: &SessionName,

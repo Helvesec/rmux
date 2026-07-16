@@ -51,10 +51,11 @@ pub struct PaneRenderStream {
 
 impl PaneRenderStream {
     pub(crate) async fn open(pane: Pane) -> Result<Self> {
-        let output = pane.output_stream().await?;
-        let baseline = pane.snapshot().await?;
+        let (operation_pane, _) = pane.begin_pinned_operation_handle().await?;
+        let output = operation_pane.output_stream().await?;
+        let baseline = operation_pane.snapshot().await?;
         Ok(Self {
-            pane,
+            pane: operation_pane.into_reusable_handle(),
             output,
             debounce: DEFAULT_RENDER_DEBOUNCE,
             last_revision: Some(baseline.revision),

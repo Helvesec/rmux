@@ -20,6 +20,8 @@ use super::{
     FormattedLine, RenderedPrompt,
 };
 
+#[path = "status/component.rs"]
+mod component;
 #[path = "status/geometry.rs"]
 mod geometry;
 #[path = "status/jobs.rs"]
@@ -33,11 +35,12 @@ mod runs;
 #[path = "status/status_format.rs"]
 mod status_format;
 
-pub(super) use geometry::StatusGeometry;
+pub(crate) use geometry::StatusGeometry;
 pub(super) use message::format_status_message_line;
 pub(super) use prompt::prompt_status_runs;
 pub(super) use runs::{sanitize_status_text, status_runs_width, StatusRun};
 
+use component::truncate_status_component;
 use jobs::render_template_with_status_jobs;
 use prompt::prompt_status_layout;
 use runs::{push_spaces, push_status_run, render_status_runs, truncate_status_runs, StatusStyle};
@@ -366,18 +369,21 @@ fn status_bar_line_with_pane_title(
     let left_limit = option_usize(options, session_name, OptionName::StatusLeftLength);
     let right_limit = option_usize(options, session_name, OptionName::StatusRightLength);
     let status_job_ttl = status_job_cache_ttl(options, session_name);
-    let left = sanitize_status_text(tmux_truncate_to_width(
-        &render_status_template_jobs(left_template, &runtime, status_job_ttl),
-        left_limit.min(width),
-        &utf8_config,
+    let left_rendered = sanitize_status_text(render_status_template_jobs(
+        left_template,
+        &runtime,
+        status_job_ttl,
     ));
-    let left_width = tmux_text_width(&left, &utf8_config);
+    let left = truncate_status_component(&left_rendered, left_limit.min(width), &utf8_config);
+    let left_width = left.width;
     let right_room = width.saturating_sub(left_width);
-    let right = sanitize_status_text(tmux_truncate_to_width(
-        &render_status_template_jobs(right_template, &runtime, status_job_ttl),
-        right_limit.min(right_room),
-        &utf8_config,
+    let right_rendered = sanitize_status_text(render_status_template_jobs(
+        right_template,
+        &runtime,
+        status_job_ttl,
     ));
+    let right =
+        truncate_status_component(&right_rendered, right_limit.min(right_room), &utf8_config);
 
     let left_style = apply_runtime_style_overlay(
         &base_style,
@@ -391,11 +397,11 @@ fn status_bar_line_with_pane_title(
     );
 
     let mut expanded = String::new();
-    if !left.is_empty() {
+    if !left.expanded.is_empty() {
         expanded.push_str(&format!(
             "#[align=left range=left {}]{}#[norange default]",
             rmux_core::style_tostring(&left_style),
-            left
+            left.expanded
         ));
     }
 
@@ -415,11 +421,11 @@ fn status_bar_line_with_pane_title(
     ));
     expanded.push_str("#[nolist]");
 
-    if !right.is_empty() {
+    if !right.expanded.is_empty() {
         expanded.push_str(&format!(
             "#[align=right range=right {}]{}#[norange default]",
             rmux_core::style_tostring(&right_style),
-            right
+            right.expanded
         ));
     }
 

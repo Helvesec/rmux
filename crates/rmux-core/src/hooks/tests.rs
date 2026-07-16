@@ -1,7 +1,11 @@
 use super::{
-    validate_hook_registration, validate_hook_scope, HookGlobalRoot, HookSetOptions, HookStore,
+    hook_explicit_scope_for_target, hook_natural_scope_for_session_target,
+    hook_natural_scope_for_target, validate_hook_registration, validate_hook_scope, HookGlobalRoot,
+    HookSetOptions, HookStore,
 };
-use rmux_proto::{HookLifecycle, HookName, ScopeSelector, SessionName, WindowTarget};
+use rmux_proto::{
+    HookLifecycle, HookName, PaneTarget, ScopeSelector, SessionName, Target, WindowTarget,
+};
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
@@ -647,6 +651,44 @@ fn new_hook_scope_classes_match_tmux_inventory() {
         validate_hook_scope(HookName::PaneTitleChanged, &ScopeSelector::Window(window)).is_ok()
     );
     assert!(validate_hook_scope(HookName::PaneTitleChanged, &ScopeSelector::Pane(pane)).is_ok());
+}
+
+#[test]
+fn hook_scope_normalization_matches_tmux_measured_matrix() {
+    let alpha = session_name("alpha");
+    let window = WindowTarget::with_window(alpha.clone(), 1);
+    let pane = PaneTarget::with_window(alpha.clone(), 1, 2);
+
+    for (hook, natural, explicit) in [
+        (
+            HookName::SessionRenamed,
+            ScopeSelector::Session(alpha.clone()),
+            ScopeSelector::Session(alpha.clone()),
+        ),
+        (
+            HookName::WindowLayoutChanged,
+            ScopeSelector::Window(window.clone()),
+            ScopeSelector::Window(window.clone()),
+        ),
+        (
+            HookName::PaneModeChanged,
+            ScopeSelector::Window(window.clone()),
+            ScopeSelector::Pane(pane.clone()),
+        ),
+    ] {
+        assert_eq!(
+            hook_natural_scope_for_target(hook, Target::Pane(pane.clone())),
+            natural.clone()
+        );
+        assert_eq!(
+            hook_natural_scope_for_session_target(hook, alpha.clone(), 1, 2),
+            natural
+        );
+        assert_eq!(
+            hook_explicit_scope_for_target(hook, Target::Pane(pane.clone())),
+            explicit
+        );
+    }
 }
 
 #[test]

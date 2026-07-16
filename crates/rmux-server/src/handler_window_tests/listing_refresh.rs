@@ -1,6 +1,64 @@
 use super::*;
 
 #[tokio::test]
+async fn list_windows_size_sort_uses_area_and_preserves_equal_area_order() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("list-windows-area-sort");
+    create_session(&handler, "list-windows-area-sort").await;
+    for window_index in 1..=3 {
+        insert_window(&handler, &alpha, window_index).await;
+    }
+
+    for (window_index, name, cols, rows) in [
+        (0, "z-equal-first", 21, 10),
+        (1, "a-equal-second", 10, 21),
+        (2, "middle", 59, 5),
+        (3, "large", 20, 24),
+    ] {
+        assert!(matches!(
+            handler
+                .handle(Request::RenameWindow(RenameWindowRequest {
+                    target: WindowTarget::with_window(alpha.clone(), window_index),
+                    name: name.to_owned(),
+                }))
+                .await,
+            Response::RenameWindow(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::ResizeWindow(ResizeWindowRequest {
+                    target: WindowTarget::with_window(alpha.clone(), window_index),
+                    width: Some(cols),
+                    height: Some(rows),
+                    adjustment: None,
+                }))
+                .await,
+            Response::ResizeWindow(_)
+        ));
+    }
+
+    let list = |reversed| {
+        Request::ListWindows(Box::new(ListWindowsRequest {
+            target: alpha.clone(),
+            format: Some("#{window_index}".to_owned()),
+            filter: None,
+            sort_order: Some("size".to_owned()),
+            reversed,
+        }))
+    };
+
+    let Response::ListWindows(ascending) = handler.handle(list(false)).await else {
+        panic!("expected ascending list-windows response");
+    };
+    assert_eq!(ascending.output.stdout(), b"0\n1\n2\n3\n");
+
+    let Response::ListWindows(descending) = handler.handle(list(true)).await else {
+        panic!("expected descending list-windows response");
+    };
+    assert_eq!(descending.output.stdout(), b"3\n2\n0\n1\n");
+}
+
+#[tokio::test]
 async fn navigation_commands_wrap_and_remain_session_scoped() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

@@ -46,7 +46,10 @@ fn search_application_path(command: &ChildCommand) -> Option<PathBuf> {
     let path_value = effective_env_value(command, "PATH")?;
     let pathext = effective_env_value(command, "PATHEXT");
     let extensions = executable_extensions(&command.program, pathext.as_deref());
-    let current_dir = env::current_dir().ok();
+    let current_dir = command
+        .current_dir
+        .clone()
+        .or_else(|| env::current_dir().ok());
     for directory in env::split_paths(&path_value) {
         let directory = if directory.is_absolute() {
             directory
@@ -205,6 +208,30 @@ mod tests {
         assert!(
             !resolved.to_string_lossy().starts_with(r"\\?\"),
             "ConPTY application paths should avoid verbatim prefixes unless the caller supplied one"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolves_relative_path_entry_against_child_current_dir() {
+        let root = temp_root("relative-path-entry");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("create bin");
+        let executable = bin.join("tool.EXE");
+        fs::write(&executable, b"").expect("create executable placeholder");
+
+        let command = ChildCommand::new("tool")
+            .current_dir(root.clone())
+            .clear_env()
+            .env("PATH", "bin")
+            .env("PATHEXT", ".EXE");
+        let resolved = resolve_application_path(&command).expect("program resolves");
+
+        assert!(
+            resolved
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&executable.to_string_lossy()),
+            "expected {resolved:?} to resolve to {executable:?}"
         );
         let _ = fs::remove_dir_all(root);
     }

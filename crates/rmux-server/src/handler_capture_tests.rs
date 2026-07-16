@@ -4,6 +4,8 @@ use std::time::{Duration, Instant};
 use super::RequestHandler;
 use rmux_core::{input::InputParser, Screen};
 use rmux_proto::types::OptionScopeSelector;
+#[cfg(unix)]
+use rmux_proto::ListBuffersRequest;
 use rmux_proto::{
     CapturePaneRequest, CapturePaneTargetActionRequest, LoadBufferRequest, NewSessionRequest,
     PaneTarget, Request, Response, SaveBufferRequest, SendKeysRequest, SetBufferRequest,
@@ -387,6 +389,52 @@ async fn load_buffer_reads_server_file() {
     let _ = std::fs::remove_file(path);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn load_buffer_waiting_on_fifo_does_not_block_other_requests() {
+    let handler = RequestHandler::new();
+    let path = temp_path("load-fifo");
+    let output = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .output()
+        .expect("run mkfifo");
+    assert!(
+        output.status.success(),
+        "mkfifo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let writer_path = path.clone();
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        std::fs::write(writer_path, b"fifo data").expect("write fifo");
+    });
+    let load_handler = handler.clone();
+    let load_path = path.clone();
+    let load = tokio::spawn(async move {
+        load_handler
+            .handle(Request::LoadBuffer(Box::new(load_buffer_request(
+                &load_path, None, "fifo",
+            ))))
+            .await
+    });
+
+    let concurrent_response = tokio::time::timeout(Duration::from_millis(500), async {
+        tokio::task::yield_now().await;
+        handler
+            .handle(Request::ListBuffers(ListBuffersRequest::default()))
+            .await
+    })
+    .await
+    .expect("a blocked FIFO read must not stall unrelated daemon requests");
+    assert!(matches!(concurrent_response, Response::ListBuffers(_)));
+
+    let load_response = load.await.expect("load-buffer task should finish");
+    assert!(matches!(load_response, Response::LoadBuffer(_)));
+    writer.join().expect("FIFO writer should finish");
+    let _ = std::fs::remove_file(path);
+}
+
 #[tokio::test]
 async fn load_buffer_failure_does_not_mutate_existing_buffer() {
     let handler = RequestHandler::new();
@@ -479,6 +527,66 @@ async fn save_buffer_writes_server_file() {
     assert_eq!(std::fs::read(&path).expect("read saved file"), b"save me");
 
     let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn save_buffer_waiting_on_fifo_does_not_block_other_requests() {
+    for append in [false, true] {
+        let handler = RequestHandler::new();
+        let path = temp_path(if append {
+            "save-append-fifo"
+        } else {
+            "save-overwrite-fifo"
+        });
+        let output = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .output()
+            .expect("run mkfifo");
+        assert!(
+            output.status.success(),
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        handler
+            .handle(Request::SetBuffer(Box::new(set_buffer_request(
+                "saved",
+                b"fifo data",
+            ))))
+            .await;
+
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            std::fs::read(reader_path).expect("read fifo")
+        });
+        let save_handler = handler.clone();
+        let save_path = path.clone();
+        let save = tokio::spawn(async move {
+            let mut request = save_buffer_request(&save_path, None, "saved");
+            request.append = append;
+            save_handler.handle(Request::SaveBuffer(request)).await
+        });
+
+        let concurrent_response = tokio::time::timeout(Duration::from_millis(500), async {
+            tokio::task::yield_now().await;
+            handler
+                .handle(Request::ListBuffers(ListBuffersRequest::default()))
+                .await
+        })
+        .await
+        .expect("a blocked FIFO write must not stall unrelated daemon requests");
+        assert!(matches!(concurrent_response, Response::ListBuffers(_)));
+
+        let save_response = save.await.expect("save-buffer task should finish");
+        assert!(matches!(save_response, Response::SaveBuffer(_)));
+        assert_eq!(
+            reader.join().expect("FIFO reader should finish"),
+            b"fifo data"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[tokio::test]

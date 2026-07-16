@@ -10,11 +10,11 @@ use std::thread;
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, RmuxError,
-    TerminalSize,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke,
+    AttachedWindowsConsoleKey, RmuxError, TerminalSize,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, STILL_ACTIVE,
@@ -30,9 +30,10 @@ use crate::ClientError;
 
 use super::action::{AttachAction, AttachActionOutcome};
 use super::metrics::AttachMetricsRecorder;
-use super::screen::{AttachScreenTracker, AttachStopDetector};
+use super::screen::{AttachScreenTracker, AttachStopDetector, AttachStopGeneration};
 #[cfg(test)]
 use super::screen::{ALT_SCREEN_EXIT_FALLBACK, DETACHED_BANNER_PREFIX, EXITED_BANNER};
+use super::terminal;
 use crate::attach_lock_state::AttachLockState;
 
 const ATTACH_OUTPUT_QUEUE_CAPACITY: usize = 64;
@@ -44,6 +45,24 @@ const ATTACH_OUTPUT_BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
 const ATTACH_OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const ATTACH_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_RENDER_MAX_PENDING: Duration = Duration::from_millis(8);
+
+struct PendingRepeatedAttachInput {
+    input: super::input::AttachInput,
+    remaining: u16,
+}
+
+impl PendingRepeatedAttachInput {
+    fn new(input: super::input::AttachInput) -> Self {
+        let remaining = input.repeat_count();
+        debug_assert!(remaining > 1);
+        Self { input, remaining }
+    }
+
+    fn consume_one(&mut self) -> bool {
+        self.remaining -= 1;
+        self.remaining == 0
+    }
+}
 
 pub(super) async fn drive_async_attach<Reader, Writer, Output>(
     reader: Reader,
@@ -89,11 +108,13 @@ where
 {
     let AttachAsyncChannels {
         mut input_rx,
+        mut input_completion_rx,
         mut resize_rx,
         action_tx,
         mut action_completion_rx,
         locked,
         windows_console_key_enabled,
+        error_cleanup,
     } = channels;
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&initial_bytes);
@@ -101,13 +122,22 @@ where
     let mut stop_detector = AttachStopDetector::new(screen_tracker.clone());
     let mut mouse_tracker = WindowsConsoleMouseTracker::default();
     let mut pending_actions = 0_usize;
+    let mut pending_resume_generations = VecDeque::new();
     let mut input_open = true;
     let mut resize_open = true;
+    let mut pending_repeated_input: Option<PendingRepeatedAttachInput> = None;
     let mut output = AttachOutputQueue::spawn(output);
     let mut output_failure_rx = output.take_failure_notifications();
 
     let attach_result = async {
         loop {
+        // The worker publishes completion only after dropping its input sender.
+        // A fatal completion invalidates any still-buffered keystrokes, so poll
+        // it before processing input instead of letting `select!` choose the
+        // outcome nondeterministically. Normal EOF still drains the channel.
+        if let Some(completion) = take_ready_input_worker_completion(&mut input_completion_rx) {
+            completion?;
+        }
         output.flush_pending()?;
         drain_attach_messages(
             &mut decoder,
@@ -118,6 +148,7 @@ where
                 action_tx: &action_tx,
                 locked: &locked,
                 pending_actions: &mut pending_actions,
+                pending_resume_generations: &mut pending_resume_generations,
                 metrics,
             },
         )?;
@@ -135,7 +166,31 @@ where
                 }
                 output.check_failure()?;
             }
-            input = input_rx.recv(), if input_open => {
+            _ = std::future::ready(()), if pending_repeated_input.is_some() => {
+                if let Some(completion) = take_ready_input_worker_completion(&mut input_completion_rx) {
+                    completion?;
+                }
+                if locked.is_locked() {
+                    pending_repeated_input = None;
+                    continue;
+                }
+                let pending = pending_repeated_input
+                    .as_mut()
+                    .expect("guarded repeated attach input remains present");
+                write_attach_input_once(
+                    &mut writer,
+                    &pending.input,
+                    windows_console_key_enabled,
+                )
+                .await?;
+                if pending.consume_one() {
+                    pending_repeated_input = None;
+                }
+            }
+            input = input_rx.recv(), if input_open && pending_repeated_input.is_none() => {
+                if let Some(completion) = take_ready_input_worker_completion(&mut input_completion_rx) {
+                    completion?;
+                }
                 let Some(input) = input else {
                     input_open = false;
                     continue;
@@ -143,23 +198,29 @@ where
                 if locked.is_locked() {
                     continue;
                 }
-                let input_bytes = input.payload();
-                let windows_console_key = if windows_console_key_enabled {
-                    input.windows_console_key()
+                if input.repeat_count() > 1 {
+                    pending_repeated_input = Some(PendingRepeatedAttachInput::new(input));
                 } else {
-                    None
-                };
-                for chunk in super::input::attach_input_chunks(input_bytes) {
-                    let mut keystroke = AttachedKeystroke::new(chunk.to_vec());
-                    if chunk.len() == input_bytes.len() {
-                        if let Some(key) = windows_console_key {
-                            keystroke = keystroke.with_windows_console_key(key);
-                        }
-                    }
-                    write_async_attach_message(
+                    write_attach_input_once(
                         &mut writer,
-                        AttachMessage::Keystroke(keystroke),
-                    ).await?;
+                        &input,
+                        windows_console_key_enabled,
+                    )
+                    .await?;
+                }
+            }
+            completion = await_input_worker_completion(&mut input_completion_rx), if input_completion_rx.is_some() => {
+                input_completion_rx = None;
+                match completion {
+                    Ok(Ok(())) => {
+                        // `input_loop` drops its sender before publishing normal
+                        // completion. Keep receiving until `input_rx` has drained
+                        // any final queued input and reports closure itself.
+                    }
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err(input_worker_stopped_error());
+                    }
                 }
             }
             size = resize_rx.recv(), if resize_open => {
@@ -180,20 +241,61 @@ where
                 };
                 match completion {
                     Ok(AttachActionOutcome::Unlock) => {
+                        let stop_generation = pending_resume_generations.pop_front().ok_or_else(|| {
+                            ClientError::Io(io::Error::other(
+                                "attach action worker returned an unmatched unlock",
+                            ))
+                        })?;
                         pending_actions = pending_actions.saturating_sub(1);
-                        let unlock_result =
-                            write_async_attach_message(&mut writer, AttachMessage::Unlock).await;
                         if pending_actions == 0 {
+                            // The action worker cannot complete an exclusive
+                            // action until the input-loop lease is idle. Drop
+                            // everything that lease queued before the lock;
+                            // otherwise select scheduling could forward stale
+                            // input only after the attach is unlocked.
+                            pending_repeated_input = None;
+                            while input_rx.try_recv().is_ok() {}
+                        }
+                        // Rearm only the stop published by this lock/suspend
+                        // prelude. A newer stop belongs to a concurrent detach
+                        // or session exit and remains authoritative.
+                        if let Some(generation) = stop_generation {
+                            screen_tracker.rearm_if_current(generation);
+                        }
+                        // Always acknowledge the completed resumable action.
+                        // A newer stop remains authoritative because the
+                        // generation-scoped rearm above cannot consume it, but
+                        // it must not strand the server-side attach lock while
+                        // a later detach frame is still in flight.
+                        if let Err(error) =
+                            write_async_attach_message(&mut writer, AttachMessage::Unlock).await
+                        {
+                            if matches!(
+                                &error,
+                                ClientError::Io(error)
+                                    if screen_tracker.was_stopped()
+                                        && matches!(
+                                            error.kind(),
+                                            io::ErrorKind::ConnectionReset
+                                                | io::ErrorKind::BrokenPipe
+                                        )
+                            ) {
+                                terminal::resume_ctrl_c_input();
+                                locked.unlock();
+                                return Ok(());
+                            }
+                            return Err(error);
+                        }
+                        if pending_actions == 0 {
+                            terminal::resume_ctrl_c_input();
                             locked.unlock();
                         }
-                        unlock_result?;
                     }
                     Ok(AttachActionOutcome::Continue) => {}
                     Ok(AttachActionOutcome::Exit) => {
                         return Ok(());
                     }
                     Err(error) => {
-                        locked.unlock();
                         return Err(error);
                     }
                 }
@@ -229,11 +331,84 @@ where
     }
     .await;
 
+    let cleanup_result = if attach_result.is_err() && !screen_tracker.was_stopped() {
+        match error_cleanup {
+            Some(bytes) => output.write_frame(bytes),
+            None => Ok(()),
+        }
+    } else {
+        Ok(())
+    };
     let drain_result = finish_attach_output(output).await;
-    match (attach_result, drain_result) {
-        (_, Err(error)) => Err(error),
-        (result, Ok(())) => result,
+    match (attach_result, cleanup_result, drain_result) {
+        (_, _, Err(error)) | (_, Err(error), Ok(())) => Err(error),
+        (result, Ok(()), Ok(())) => result,
     }
+}
+
+fn take_ready_input_worker_completion(
+    completion_rx: &mut Option<oneshot::Receiver<std::result::Result<(), ClientError>>>,
+) -> Option<std::result::Result<(), ClientError>> {
+    let completion = match completion_rx.as_mut()?.try_recv() {
+        Ok(completion) => completion,
+        Err(oneshot::error::TryRecvError::Empty) => return None,
+        Err(oneshot::error::TryRecvError::Closed) => Err(input_worker_stopped_error()),
+    };
+    *completion_rx = None;
+    Some(completion)
+}
+
+fn input_worker_stopped_error() -> ClientError {
+    ClientError::Io(io::Error::other(
+        "attach input worker stopped before reporting completion",
+    ))
+}
+
+async fn await_input_worker_completion(
+    completion_rx: &mut Option<oneshot::Receiver<std::result::Result<(), ClientError>>>,
+) -> std::result::Result<std::result::Result<(), ClientError>, oneshot::error::RecvError> {
+    completion_rx
+        .as_mut()
+        .expect("guarded attach input completion receiver remains present")
+        .await
+}
+
+async fn write_attach_input_once<Writer>(
+    writer: &mut Writer,
+    input: &super::input::AttachInput,
+    windows_console_key_enabled: bool,
+) -> std::result::Result<(), ClientError>
+where
+    Writer: tokio::io::AsyncWrite + Unpin,
+{
+    let input_bytes = input.payload();
+    let windows_console_key = if windows_console_key_enabled {
+        input
+            .windows_console_key()
+            .map(single_repeat_windows_console_key)
+    } else {
+        None
+    };
+    for chunk in super::input::attach_input_chunks(input_bytes) {
+        let mut keystroke = AttachedKeystroke::new(chunk.to_vec());
+        if chunk.len() == input_bytes.len() {
+            if let Some(key) = windows_console_key {
+                keystroke = keystroke.with_windows_console_key(key);
+            }
+        }
+        write_async_attach_message(&mut *writer, AttachMessage::Keystroke(keystroke)).await?;
+    }
+    Ok(())
+}
+
+fn single_repeat_windows_console_key(key: AttachedWindowsConsoleKey) -> AttachedWindowsConsoleKey {
+    AttachedWindowsConsoleKey::new(
+        key.virtual_key_code(),
+        key.virtual_scan_code(),
+        key.unicode_char(),
+        key.control_key_state(),
+        1,
+    )
 }
 
 async fn finish_attach_output(
@@ -259,6 +434,7 @@ fn drain_attach_messages(
         action_tx,
         locked,
         pending_actions,
+        pending_resume_generations,
         metrics,
     } = context;
     while let Some(message) = decoder.next_message().map_err(ClientError::from)? {
@@ -287,34 +463,58 @@ fn drain_attach_messages(
             }
             AttachMessage::KeyDispatched(_) => {}
             AttachMessage::DetachKill => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::DetachKill)?;
-                *pending_actions += 1;
+                send_exclusive_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    AttachAction::DetachKill,
+                )?;
             }
             AttachMessage::DetachExec(command) => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::LegacyDetachExec(command))?;
-                *pending_actions += 1;
+                send_exclusive_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    AttachAction::LegacyDetachExec(command),
+                )?;
             }
             AttachMessage::DetachExecShellCommand(command) => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::DetachExec(command))?;
-                *pending_actions += 1;
+                send_exclusive_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    AttachAction::DetachExec(command),
+                )?;
             }
             AttachMessage::Lock(command) => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::LegacyLock(command))?;
-                *pending_actions += 1;
+                send_resumable_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    pending_resume_generations,
+                    stop_detector.current_stop_generation(),
+                    AttachAction::LegacyLock(command),
+                )?;
             }
             AttachMessage::LockShellCommand(command) => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::Lock(command))?;
-                *pending_actions += 1;
+                send_resumable_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    pending_resume_generations,
+                    stop_detector.current_stop_generation(),
+                    AttachAction::Lock(command),
+                )?;
             }
             AttachMessage::Suspend => {
-                locked.lock();
-                send_attach_action(action_tx, AttachAction::Suspend)?;
-                *pending_actions += 1;
+                send_resumable_attach_action(
+                    action_tx,
+                    locked,
+                    pending_actions,
+                    pending_resume_generations,
+                    stop_detector.current_stop_generation(),
+                    AttachAction::Suspend,
+                )?;
             }
             AttachMessage::Resize(_) | AttachMessage::ResizeGeometry(_) => {
                 return Err(ClientError::Protocol(RmuxError::Decode(
@@ -1035,12 +1235,14 @@ impl Drop for AttachOutputQueue {
 
 pub(super) struct AttachAsyncChannels {
     input_rx: mpsc::Receiver<super::input::AttachInput>,
+    input_completion_rx: Option<oneshot::Receiver<std::result::Result<(), ClientError>>>,
     resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
     action_tx: std_mpsc::Sender<AttachAction>,
     action_completion_rx:
         mpsc::UnboundedReceiver<std::result::Result<AttachActionOutcome, ClientError>>,
     locked: Arc<AttachLockState>,
     windows_console_key_enabled: bool,
+    error_cleanup: Option<Vec<u8>>,
 }
 
 impl AttachAsyncChannels {
@@ -1056,12 +1258,27 @@ impl AttachAsyncChannels {
     ) -> Self {
         Self {
             input_rx,
+            input_completion_rx: None,
             resize_rx,
             action_tx,
             action_completion_rx,
             locked,
             windows_console_key_enabled,
+            error_cleanup: None,
         }
+    }
+
+    pub(super) fn with_input_completion(
+        mut self,
+        completion_rx: oneshot::Receiver<std::result::Result<(), ClientError>>,
+    ) -> Self {
+        self.input_completion_rx = Some(completion_rx);
+        self
+    }
+
+    pub(super) fn with_error_cleanup(mut self, error_cleanup: Option<Vec<u8>>) -> Self {
+        self.error_cleanup = error_cleanup;
+        self
     }
 }
 
@@ -1071,6 +1288,7 @@ struct DrainContext<'context> {
     action_tx: &'context std_mpsc::Sender<AttachAction>,
     locked: &'context Arc<AttachLockState>,
     pending_actions: &'context mut usize,
+    pending_resume_generations: &'context mut VecDeque<Option<AttachStopGeneration>>,
     metrics: &'context mut AttachMetricsRecorder,
 }
 
@@ -1147,6 +1365,36 @@ fn send_attach_action(
     action_tx
         .send(action)
         .map_err(|_| ClientError::Io(io::Error::other("attach action worker stopped")))
+}
+
+fn send_exclusive_attach_action(
+    action_tx: &std_mpsc::Sender<AttachAction>,
+    locked: &Arc<AttachLockState>,
+    pending_actions: &mut usize,
+    action: AttachAction,
+) -> std::result::Result<(), ClientError> {
+    // Suppression is process-wide because Win32 console-control callbacks are
+    // process-wide. It is armed before the attach input lock; any callback
+    // racing this transition is either consumed by an already-active input
+    // read or discarded, never retained across the lock boundary.
+    terminal::suppress_ctrl_c_input();
+    locked.lock();
+    send_attach_action(action_tx, action)?;
+    *pending_actions += 1;
+    Ok(())
+}
+
+fn send_resumable_attach_action(
+    action_tx: &std_mpsc::Sender<AttachAction>,
+    locked: &Arc<AttachLockState>,
+    pending_actions: &mut usize,
+    pending_resume_generations: &mut VecDeque<Option<AttachStopGeneration>>,
+    stop_generation: Option<AttachStopGeneration>,
+    action: AttachAction,
+) -> std::result::Result<(), ClientError> {
+    send_exclusive_attach_action(action_tx, locked, pending_actions, action)?;
+    pending_resume_generations.push_back(stop_generation);
+    Ok(())
 }
 
 async fn write_async_attach_message<Writer>(

@@ -1,14 +1,36 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use rmux_client::Connection;
-use rmux_core::command_inventory::has_tmux_command_candidate;
+use rmux_client::{connect, resolve_socket_path, resolve_tmux_compatible_socket_path, Connection};
+use rmux_core::{
+    command_inventory::{has_tmux_command_candidate, RMUX_EXTENSION_COMMANDS},
+    command_parser::{is_parse_time_assignment, lookup_command, CommandParser},
+};
 use rmux_proto::OptionScopeSelector;
 
+use crate::cli_args::{
+    parse, scan_top_level_command, Command, RuntimeCommandGroup, TopLevelCommandScan,
+};
 use crate::cli_response::expect_command_output;
+use crate::command_alias_snapshot::{decode_command_alias_definitions, definition_matches_name};
+use crate::runtime_command_expansion::{
+    expand_runtime_command_segment, RuntimeCommandExpansionError,
+};
 
 use super::command_runner::run_queued_server_command_with_connection;
 use super::ExitFailure;
+
+pub(super) enum RuntimeCommandResolution {
+    Canonical(Vec<RuntimeCommandGroup>),
+    LegacyDirect,
+    LegacyServerDispatch(i32),
+}
+
+struct RuntimeCommandInvocation {
+    arguments: Vec<String>,
+    groups: Vec<Vec<String>>,
+    control_mode: u8,
+}
 
 pub(super) fn run_unknown_command_through_server_aliases(
     args: &[OsString],
@@ -29,6 +51,14 @@ pub(super) fn run_unknown_command_through_server_aliases(
             format!("unknown command: {command_name}"),
         ));
     }
+    run_raw_command_through_server(&command_args, socket_path, connection)
+}
+
+fn run_raw_command_through_server(
+    command_args: &[String],
+    socket_path: &Path,
+    connection: &mut Connection,
+) -> Result<i32, ExitFailure> {
     let queue_command = command_args
         .iter()
         .map(|argument| tmux_quote_argument(argument))
@@ -42,27 +72,291 @@ fn server_has_command_alias(
     connection: &mut Connection,
     command_name: &str,
 ) -> Result<bool, ExitFailure> {
+    Ok(server_command_alias_definitions(connection)?
+        .iter()
+        .any(|definition| definition_matches_name(definition, command_name)))
+}
+
+fn server_command_alias_definitions(
+    connection: &mut Connection,
+) -> Result<Vec<String>, ExitFailure> {
     let response = connection
         .show_options(
             OptionScopeSelector::ServerGlobal,
             Some("command-alias".to_owned()),
-            true,
+            false,
             false,
             true,
         )
         .map_err(ExitFailure::from_client)?;
     let output = expect_command_output(&response, "show-options")?;
-    let definitions = std::str::from_utf8(output.stdout())
-        .map_err(|_| ExitFailure::new(1, "invalid UTF-8 in command-alias options".to_owned()))?;
-    Ok(command_alias_output_contains(definitions, command_name))
+    decode_command_alias_definitions(output.stdout())
+        .map_err(|error| ExitFailure::new(1, error.to_string()))
 }
 
-fn command_alias_output_contains(definitions: &str, command_name: &str) -> bool {
-    definitions.lines().any(|definition| {
-        definition
-            .split_once('=')
-            .is_some_and(|(name, _)| name == command_name)
+pub(super) fn runtime_command_resolution_for_invocation(
+    args: &[OsString],
+    invoked_as_tmux: bool,
+) -> Result<Option<RuntimeCommandResolution>, ExitFailure> {
+    let Some((scan, invocation)) = prepare_runtime_command_invocation(args) else {
+        return Ok(None);
+    };
+    if invocation_is_intrinsically_local(&invocation) {
+        return Ok(None);
+    }
+    let socket_path = if invoked_as_tmux {
+        resolve_tmux_compatible_socket_path(
+            scan.socket_name.as_deref(),
+            scan.socket_path.as_deref().map(Path::new),
+        )
+    } else {
+        resolve_socket_path(
+            scan.socket_name.as_deref(),
+            scan.socket_path.as_deref().map(Path::new),
+        )
+    };
+    let Some(socket_path) = socket_path.ok() else {
+        return Ok(None);
+    };
+    let mut connection = match connect(&socket_path) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let failure = ExitFailure::from_client_connect(&socket_path, error);
+            if failure.is_server_absent() {
+                return Ok(None);
+            }
+            return Err(failure.with_socket_context(&socket_path));
+        }
+    };
+
+    resolve_runtime_command_with_connection(&mut connection, &socket_path, invocation)
+}
+
+pub(super) fn runtime_command_resolution_after_startup(
+    args: &[OsString],
+    socket_path: &Path,
+    connection: &mut Connection,
+) -> Result<Option<RuntimeCommandResolution>, ExitFailure> {
+    let Some((_, invocation)) = prepare_runtime_command_invocation(args) else {
+        return Ok(None);
+    };
+    resolve_runtime_command_with_connection(connection, socket_path, invocation)
+}
+
+/// Parses only the first argv command group so a cold daemon can load aliases
+/// used by later groups before the complete queue is parsed.
+pub(super) fn first_cold_start_command(args: &[OsString]) -> Option<Command> {
+    let (_, invocation) = prepare_runtime_command_invocation(args)?;
+    let first_group = first_raw_command_group(&invocation.arguments);
+    let assignment_count = first_group
+        .iter()
+        .take_while(|argument| is_parse_time_assignment(argument))
+        .count();
+    let first_group = first_group.get(assignment_count..)?;
+    if first_group.is_empty() {
+        return None;
+    }
+    let first_args =
+        std::iter::once(OsString::from("rmux")).chain(first_group.iter().map(OsString::from));
+    parse(first_args).ok()?.command
+}
+
+fn first_raw_command_group(arguments: &[String]) -> &[String] {
+    let end = arguments
+        .iter()
+        .position(|argument| {
+            argument
+                .strip_suffix(';')
+                .is_some_and(|base| !base.ends_with('\\'))
+        })
+        .map_or(arguments.len(), |index| index + 1);
+    &arguments[..end]
+}
+
+fn prepare_runtime_command_invocation(
+    args: &[OsString],
+) -> Option<(TopLevelCommandScan, RuntimeCommandInvocation)> {
+    let scan = scan_top_level_command(args.get(1..).unwrap_or(&[])).ok()?;
+    if scan.no_fork || scan.shell_command.is_some() || scan.command.is_empty() {
+        return None;
+    }
+    let arguments = args_to_strings(&scan.command)?;
+    if arguments.is_empty() {
+        return None;
+    }
+    let groups = split_literal_command_groups(&scan.command)?;
+    let control_mode = scan.control_mode;
+    Some((
+        scan,
+        RuntimeCommandInvocation {
+            arguments,
+            groups,
+            control_mode,
+        },
+    ))
+}
+
+fn invocation_is_intrinsically_local(invocation: &RuntimeCommandInvocation) -> bool {
+    if invocation.control_mode != 0 || invocation.groups.len() != 1 {
+        return false;
+    }
+    let Some(command_name) = invocation.groups[0]
+        .iter()
+        .find(|argument| !is_parse_time_assignment(argument))
+    else {
+        return false;
+    };
+    lookup_command(command_name).is_ok_and(|entry| entry.name == "list-commands")
+}
+
+fn resolve_runtime_command_with_connection(
+    connection: &mut Connection,
+    socket_path: &Path,
+    invocation: RuntimeCommandInvocation,
+) -> Result<Option<RuntimeCommandResolution>, ExitFailure> {
+    let RuntimeCommandInvocation {
+        arguments,
+        groups,
+        control_mode,
+    } = invocation;
+    let legacy_kill_fallback = queue_starts_with_kill_server(&groups);
+
+    let canonical = match expand_runtime_command_segment(connection, &arguments) {
+        Ok(Some(canonical)) => canonical,
+        Ok(None) if control_mode != 0 => return Ok(None),
+        Ok(None) => {
+            let aliases = server_command_alias_definitions(connection)
+                .map_err(|error| error.with_socket_context(socket_path))?;
+            if !queue_uses_server_alias(&groups, &aliases) {
+                return Ok(Some(RuntimeCommandResolution::LegacyDirect));
+            }
+            let exit_code = run_raw_command_through_server(&arguments, socket_path, connection)
+                .map_err(|error| error.with_socket_context(socket_path))?;
+            return Ok(Some(RuntimeCommandResolution::LegacyServerDispatch(
+                exit_code,
+            )));
+        }
+        Err(error) if legacy_kill_fallback && error.previous_wire_version().is_some() => {
+            return Ok(None);
+        }
+        Err(error) => {
+            let failure = match error {
+                RuntimeCommandExpansionError::Client(error) => ExitFailure::from_client(error),
+                RuntimeCommandExpansionError::Server(error) => {
+                    ExitFailure::from_client(rmux_client::ClientError::Protocol(error))
+                }
+                RuntimeCommandExpansionError::Protocol(message) => ExitFailure::new(1, message),
+            };
+            let failure = if control_mode == 0 || failure.is_unsupported_wire_version() {
+                failure
+            } else {
+                super::control_mode_error::exit_failure_for_count(
+                    failure.exit_code(),
+                    failure.message(),
+                    control_mode,
+                )
+            };
+            return Err(failure.with_socket_context(socket_path));
+        }
+    };
+
+    if queue_has_builtin_after_parse_time_assignment(&groups) {
+        let aliases = server_command_alias_definitions(connection)
+            .map_err(|error| error.with_socket_context(socket_path))?;
+        if queue_requires_direct_parse_for_builtin_assignment(&groups, &aliases) {
+            return Ok(Some(RuntimeCommandResolution::LegacyDirect));
+        }
+    }
+
+    Ok(Some(RuntimeCommandResolution::Canonical(vec![
+        RuntimeCommandGroup::Canonical(canonical),
+    ])))
+}
+
+/// Mirrors `CommandParser::parse_arguments`: argv is already tokenized, and
+/// only an unescaped trailing semicolon terminates a command group.
+fn split_literal_command_groups(arguments: &[OsString]) -> Option<Vec<Vec<String>>> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+
+    for argument in arguments {
+        let mut value = argument.to_str()?.to_owned();
+        let mut ends_command = false;
+        if value.ends_with(';') {
+            value.pop();
+            if value.ends_with('\\') {
+                value.pop();
+                value.push(';');
+            } else {
+                ends_command = true;
+            }
+        }
+
+        if !ends_command || !value.is_empty() {
+            current.push(value);
+        }
+        if ends_command && !current.is_empty() {
+            groups.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    Some(groups)
+}
+
+fn queue_starts_with_kill_server(groups: &[Vec<String>]) -> bool {
+    let Some(group) = groups.first() else {
+        return false;
+    };
+    let parser = CommandParser::new()
+        .with_command_aliases(std::iter::empty::<String>())
+        .with_exact_commands(RMUX_EXTENSION_COMMANDS);
+    let Ok(parsed) = parser.parse_arguments(group) else {
+        return false;
+    };
+    matches!(parsed.commands(), [command] if command.name() == "kill-server" && command.arguments().is_empty())
+}
+
+fn queue_uses_server_alias(groups: &[Vec<String>], aliases: &[String]) -> bool {
+    groups
+        .iter()
+        .filter_map(|group| alias_lookup_command_name(group))
+        .any(|name| {
+            aliases
+                .iter()
+                .any(|definition| definition_matches_name(definition, name))
+        })
+}
+
+fn queue_has_builtin_after_parse_time_assignment(groups: &[Vec<String>]) -> bool {
+    groups.iter().any(|group| {
+        let Some(first) = group.first() else {
+            return false;
+        };
+        if !is_parse_time_assignment(first) {
+            return false;
+        }
+        let Some(command_name) = alias_lookup_command_name(group) else {
+            return true;
+        };
+        has_tmux_command_candidate(command_name)
     })
+}
+
+fn queue_requires_direct_parse_for_builtin_assignment(
+    groups: &[Vec<String>],
+    aliases: &[String],
+) -> bool {
+    queue_has_builtin_after_parse_time_assignment(groups)
+        && !queue_uses_server_alias(groups, aliases)
+}
+
+fn alias_lookup_command_name(group: &[String]) -> Option<&str> {
+    group
+        .iter()
+        .find(|argument| !is_parse_time_assignment(argument))
+        .map(String::as_str)
 }
 
 fn normalize_alias_fallback_error(error: ExitFailure) -> ExitFailure {
@@ -103,11 +397,9 @@ fn command_arguments(args: &[OsString]) -> Option<Vec<String>> {
 }
 
 fn args_to_strings(args: &[OsString]) -> Option<Vec<String>> {
-    args.iter().map(os_string_to_string).collect()
-}
-
-fn os_string_to_string(value: &OsString) -> Option<String> {
-    value.to_str().map(str::to_owned)
+    args.iter()
+        .map(|value| value.to_str().map(str::to_owned))
+        .collect()
 }
 
 fn tmux_quote_argument(argument: &str) -> String {
@@ -138,8 +430,9 @@ fn tmux_quote_value(argument: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::ffi::OsStr;
+
+    use super::*;
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsStr::new).map(OsString::from).collect()
@@ -158,31 +451,239 @@ mod tests {
     }
 
     #[test]
+    fn argv_groups_preserve_escaped_semicolon_literals() {
+        assert_eq!(
+            split_literal_command_groups(&args(&[
+                "display-message",
+                "literal\\;",
+                ";",
+                "list-sessions;",
+            ])),
+            Some(vec![
+                vec!["display-message".to_owned(), "literal;".to_owned()],
+                vec!["list-sessions".to_owned()],
+            ])
+        );
+    }
+
+    #[test]
+    fn only_single_non_control_list_commands_invocations_are_intrinsically_local() {
+        let local = RuntimeCommandInvocation {
+            arguments: vec!["list-commands".to_owned()],
+            groups: vec![vec!["FOO=bar".to_owned(), "list-commands".to_owned()]],
+            control_mode: 0,
+        };
+        assert!(invocation_is_intrinsically_local(&local));
+
+        let alias = RuntimeCommandInvocation {
+            arguments: vec!["lscm".to_owned()],
+            groups: vec![vec!["lscm".to_owned()]],
+            control_mode: 0,
+        };
+        assert!(invocation_is_intrinsically_local(&alias));
+
+        let unique_prefix = RuntimeCommandInvocation {
+            arguments: vec!["list-com".to_owned()],
+            groups: vec![vec!["list-com".to_owned()]],
+            control_mode: 0,
+        };
+        assert!(invocation_is_intrinsically_local(&unique_prefix));
+
+        let control = RuntimeCommandInvocation {
+            arguments: vec!["list-commands".to_owned()],
+            groups: vec![vec!["list-commands".to_owned()]],
+            control_mode: 1,
+        };
+        assert!(!invocation_is_intrinsically_local(&control));
+
+        let queue = RuntimeCommandInvocation {
+            arguments: vec![
+                "list-commands".to_owned(),
+                ";".to_owned(),
+                "list-sessions".to_owned(),
+            ],
+            groups: vec![
+                vec!["list-commands".to_owned()],
+                vec!["list-sessions".to_owned()],
+            ],
+            control_mode: 0,
+        };
+        assert!(!invocation_is_intrinsically_local(&queue));
+    }
+
+    #[test]
     fn tmux_quote_preserves_command_separators_and_quotes_values() {
         assert_eq!(tmux_quote_argument(""), "''");
         assert_eq!(tmux_quote_argument(";"), ";");
         assert_eq!(tmux_quote_argument("xyz;"), "xyz;");
         assert_eq!(tmux_quote_argument("hello world;"), "'hello world';");
         assert_eq!(tmux_quote_argument("xyz\\;"), "'xyz;'");
-        assert_eq!(tmux_quote_argument("display-message"), "display-message");
-        assert_eq!(tmux_quote_argument("hello world"), "'hello world'");
         assert_eq!(tmux_quote_argument("semi;colon"), "'semi;colon'");
         assert_eq!(tmux_quote_argument("it's"), "'it'\\''s'");
     }
 
     #[test]
-    fn alias_output_lookup_requires_an_exact_alias_name() {
-        let definitions = "say=display-message -p\nstatus=show-messages -JT\n";
-        assert!(command_alias_output_contains(definitions, "say"));
-        assert!(!command_alias_output_contains(definitions, "sa"));
-        assert!(!command_alias_output_contains(definitions, "FOO=bar"));
+    fn legacy_fallback_accepts_canonical_and_unambiguous_kill_server_prefixes() {
+        assert!(queue_starts_with_kill_server(&[vec![
+            "kill-server".to_owned(),
+        ]]));
+        assert!(queue_starts_with_kill_server(&[vec![
+            "kill-serv".to_owned(),
+        ]]));
+        assert!(queue_starts_with_kill_server(&[
+            vec!["kill-server".to_owned()],
+            vec!["new-session".to_owned()],
+        ]));
+        assert!(!queue_starts_with_kill_server(&[vec![
+            "kill-server".to_owned(),
+            "unexpected".to_owned(),
+        ]]));
+        assert!(!queue_starts_with_kill_server(&[
+            vec!["display-message".to_owned()],
+            vec!["kill-server".to_owned()],
+        ]));
     }
 
     #[test]
-    fn builtin_candidate_lookup_preserves_parser_diagnostics() {
-        assert!(has_tmux_command_candidate("list"));
-        assert!(has_tmux_command_candidate("send-keys"));
-        assert!(!has_tmux_command_candidate("FOO=bar"));
+    fn cold_start_probe_parses_only_the_first_command_group() {
+        let invocation = args(&[
+            "rmux",
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            ";",
+            "runtime-alias",
+        ]);
+        assert!(matches!(
+            first_cold_start_command(&invocation),
+            Some(Command::NewSession(_))
+        ));
+
+        let invalid_first = args(&["rmux", "not-a-command", ";", "new-session", "-d"]);
+        assert!(first_cold_start_command(&invalid_first).is_none());
+    }
+
+    #[test]
+    fn cold_start_probe_accepts_parse_time_assignment_before_first_command() {
+        let invocation = args(&[
+            "rmux",
+            "FOO=x",
+            "BAR=y",
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            ";",
+            "runtime-alias",
+        ]);
+
+        assert!(matches!(
+            first_cold_start_command(&invocation),
+            Some(Command::NewSession(_))
+        ));
+    }
+
+    #[test]
+    fn cold_start_probe_preserves_escaped_semicolon_arguments() {
+        let invocation = args(&[
+            "rmux",
+            "FOO=x",
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "shell\\;",
+            ";",
+            "runtime-alias",
+        ]);
+
+        let Some(Command::NewSession(command)) = first_cold_start_command(&invocation) else {
+            panic!("first command should remain new-session");
+        };
+        assert_eq!(command.command, ["shell;"]);
+    }
+
+    #[test]
+    fn legacy_fallback_detects_aliases_in_any_command_group() {
+        let groups = vec![
+            vec!["list-sessions".to_owned()],
+            vec!["probe".to_owned(), "argument".to_owned()],
+        ];
+        let aliases = vec!["probe=display-message -p ok".to_owned()];
+
+        assert!(queue_uses_server_alias(&groups, &aliases));
+        assert!(!queue_uses_server_alias(
+            &[vec!["list-sessions".to_owned()]],
+            &aliases,
+        ));
+    }
+
+    #[test]
+    fn legacy_fallback_detects_alias_after_parse_time_assignment() {
+        let groups = vec![vec!["FOO=x".to_owned(), "probe".to_owned()]];
+        let aliases = vec!["probe=display-message -p $FOO".to_owned()];
+
+        assert!(queue_uses_server_alias(&groups, &aliases));
+        assert_eq!(alias_lookup_command_name(&groups[0]), Some("probe"));
+        assert!(is_parse_time_assignment("FOO=x"));
+        assert!(is_parse_time_assignment("_FOO=x=y"));
+        assert!(!is_parse_time_assignment("1FOO=x"));
+        assert!(!is_parse_time_assignment("FOO-BAR=x"));
+    }
+
+    #[test]
+    fn builtin_cli_assignments_do_not_enter_the_runtime_source_bridge() {
+        let alias_only = vec![vec!["FOO=x".to_owned(), "probe".to_owned()]];
+        let builtin_only = vec![vec![
+            "FOO=x".to_owned(),
+            "BAR=y".to_owned(),
+            "display-message".to_owned(),
+        ]];
+        assert!(!queue_has_builtin_after_parse_time_assignment(&alias_only));
+        assert!(queue_has_builtin_after_parse_time_assignment(&builtin_only));
+        assert!(queue_has_builtin_after_parse_time_assignment(&[vec![
+            "FOO=x".to_owned(),
+        ]]));
+        assert!(queue_requires_direct_parse_for_builtin_assignment(
+            &builtin_only,
+            &[]
+        ));
+
+        let builtin_then_alias = vec![
+            vec!["FOO=x".to_owned(), "new-session".to_owned()],
+            vec!["probe".to_owned()],
+        ];
+        let aliases = vec!["probe=display-message -p $FOO".to_owned()];
+        assert!(queue_has_builtin_after_parse_time_assignment(
+            &builtin_then_alias
+        ));
+        assert!(!queue_requires_direct_parse_for_builtin_assignment(
+            &builtin_then_alias,
+            &aliases
+        ));
+    }
+
+    #[test]
+    fn legacy_fallback_keeps_nested_commands_and_builtin_abbreviations_server_owned() {
+        let aliases = vec![
+            "nested=display-message -p nested".to_owned(),
+            "list-sessions=display-message -p override".to_owned(),
+        ];
+
+        assert!(!queue_uses_server_alias(
+            &[vec![
+                "if-shell".to_owned(),
+                "-F".to_owned(),
+                "1".to_owned(),
+                "nested".to_owned(),
+            ]],
+            &aliases,
+        ));
+        assert!(!queue_uses_server_alias(
+            &[vec!["list-sess".to_owned()]],
+            &aliases,
+        ));
     }
 
     #[test]

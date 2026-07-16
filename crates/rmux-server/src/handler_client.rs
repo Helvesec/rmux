@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use rmux_core::formats::{is_truthy, FormatContext};
 use rmux_proto::request::{ListClientsRequest, SuspendClientRequest};
@@ -13,9 +14,11 @@ use crate::pane_io::AttachControl;
 use crate::pane_terminals::session_not_found;
 
 use super::{
-    attach_support::ClientFlags, attached_client_matches_target, command_output_from_lines,
-    control_support::ManagedClient, format_client_uid, format_client_user, format_requester_uid,
-    normalize_target_client, session_selection_prefers_live_process, sort_list_clients,
+    attach_support::ClientFlags,
+    attached_client_matches_target, command_output_from_lines,
+    control_support::{current_control_queue_identity, ManagedClient},
+    format_client_uid, format_client_user, format_requester_uid, normalize_target_client,
+    session_selection_prefers_live_process, sort_list_clients, validate_expected_attach_identity,
     RequestHandler, LIST_CLIENTS_TEMPLATE,
 };
 
@@ -25,33 +28,118 @@ mod attach;
 mod detach;
 #[path = "handler_client/refresh.rs"]
 mod refresh;
+#[cfg(test)]
+#[path = "handler_client/switch_atomicity_tests.rs"]
+mod switch_atomicity_tests;
 #[path = "handler_client/switching.rs"]
 mod switching;
 
+pub(in crate::handler) use switching::{
+    capture_switch_client_target_identity, SwitchManagedClientIdentity, SwitchTargetSelection,
+};
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct ManagedClientResolutionPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static MANAGED_CLIENT_RESOLUTION_PAUSE: std::sync::Mutex<
+    Option<(u32, std::sync::Arc<ManagedClientResolutionPause>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(in crate::handler) fn install_managed_client_resolution_pause(
+    pid: u32,
+) -> std::sync::Arc<ManagedClientResolutionPause> {
+    let pause = std::sync::Arc::new(ManagedClientResolutionPause::default());
+    *MANAGED_CLIENT_RESOLUTION_PAUSE
+        .lock()
+        .expect("managed client resolution pause lock") = Some((pid, pause.clone()));
+    pause
+}
+
+#[cfg(test)]
+async fn pause_after_managed_client_resolution(client: ManagedClient) {
+    let pid = match client {
+        ManagedClient::Attach { pid, .. } => pid,
+        ManagedClient::Control(identity) => identity.requester_pid(),
+    };
+    let pause = {
+        let mut installed = MANAGED_CLIENT_RESOLUTION_PAUSE
+            .lock()
+            .expect("managed client resolution pause lock");
+        let matches_pid = installed
+            .as_ref()
+            .is_some_and(|(paused_pid, _)| *paused_pid == pid);
+        matches_pid.then(|| {
+            installed
+                .take()
+                .expect("matching managed client resolution pause remains installed")
+                .1
+        })
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
+
+#[cfg(not(test))]
+async fn pause_after_managed_client_resolution(_client: ManagedClient) {}
+
 impl RequestHandler {
-    async fn managed_client_for_pid(&self, requester_pid: u32) -> Option<ManagedClient> {
+    async fn managed_client_for_pid(
+        &self,
+        requester_pid: u32,
+    ) -> Option<switching::SwitchManagedClientIdentity> {
+        if let Some(identity) = current_control_queue_identity(requester_pid) {
+            let active_control = self.active_control.lock().await;
+            return active_control
+                .by_pid
+                .get(&requester_pid)
+                .filter(|active| {
+                    active.id == identity.control_id() && !active.closing.load(Ordering::SeqCst)
+                })
+                .map(|active| switching::SwitchManagedClientIdentity::Control {
+                    pid: requester_pid,
+                    control_id: active.id,
+                });
+        }
         {
             let active_attach = self.active_attach.lock().await;
-            if active_attach.by_pid.contains_key(&requester_pid) {
-                return Some(ManagedClient::Attach(requester_pid));
+            if let Some(active) = active_attach.by_pid.get(&requester_pid) {
+                return Some(switching::SwitchManagedClientIdentity::Attach {
+                    pid: requester_pid,
+                    attach_id: active.id,
+                });
             }
         }
         let active_control = self.active_control.lock().await;
         active_control
             .by_pid
-            .contains_key(&requester_pid)
-            .then_some(ManagedClient::Control(requester_pid))
+            .get(&requester_pid)
+            .filter(|active| !active.closing.load(Ordering::SeqCst))
+            .map(|active| switching::SwitchManagedClientIdentity::Control {
+                pid: requester_pid,
+                control_id: active.id,
+            })
     }
 
     async fn set_attached_client_flags(
         &self,
         attach_pid: u32,
+        expected_attach_id: u64,
         mut flags: ClientFlags,
     ) -> Result<(), RmuxError> {
         let mut active_attach = self.active_attach.lock().await;
         let active = active_attach
             .by_pid
             .get_mut(&attach_pid)
+            .filter(|active| active.id == expected_attach_id)
             .ok_or_else(|| attached_client_required("attach-session"))?;
         if !active.can_write {
             flags = flags.with_read_only();
@@ -66,37 +154,86 @@ impl RequestHandler {
         target_client: Option<&str>,
         command_name: &str,
     ) -> Result<ManagedClient, RmuxError> {
+        let expected_attach = validate_expected_attach_identity(self, requester_pid).await?;
+        if let Some(identity) = current_control_queue_identity(requester_pid) {
+            self.validate_control_queue_session_identity(requester_pid, identity.control_id())
+                .await?;
+        }
+
         let Some(target_client) = target_client.map(normalize_target_client) else {
-            return self
-                .resolve_managed_client(requester_pid, command_name)
-                .await;
+            let client = match expected_attach {
+                Some(identity) => ManagedClient::Attach {
+                    pid: identity.attach_pid(),
+                    attach_id: identity.attach_id(),
+                },
+                None => {
+                    self.resolve_managed_client(requester_pid, command_name)
+                        .await?
+                }
+            };
+            pause_after_managed_client_resolution(client).await;
+            return Ok(client);
         };
         if target_client == "=" {
-            return self
-                .resolve_managed_client(requester_pid, command_name)
-                .await;
+            let client = match expected_attach {
+                Some(identity) => ManagedClient::Attach {
+                    pid: identity.attach_pid(),
+                    attach_id: identity.attach_id(),
+                },
+                None => {
+                    self.resolve_managed_client(requester_pid, command_name)
+                        .await?
+                }
+            };
+            pause_after_managed_client_resolution(client).await;
+            return Ok(client);
         }
 
-        {
+        let attach_client = {
             let active_attach = self.active_attach.lock().await;
             if let Ok(pid) = target_client.parse::<u32>() {
-                if active_attach.by_pid.contains_key(&pid) {
-                    return Ok(ManagedClient::Attach(pid));
-                }
-            } else if let Some((&pid, _)) = active_attach
-                .by_pid
-                .iter()
-                .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
-            {
-                return Ok(ManagedClient::Attach(pid));
+                active_attach
+                    .by_pid
+                    .get(&pid)
+                    .filter(|active| !active.closing.load(Ordering::SeqCst))
+                    .map(|active| ManagedClient::Attach {
+                        pid,
+                        attach_id: active.id,
+                    })
+            } else {
+                active_attach
+                    .by_pid
+                    .iter()
+                    .filter(|(_, active)| !active.closing.load(Ordering::SeqCst))
+                    .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
+                    .map(|(&pid, active)| ManagedClient::Attach {
+                        pid,
+                        attach_id: active.id,
+                    })
             }
+        };
+        if let Some(client) = attach_client {
+            pause_after_managed_client_resolution(client).await;
+            return Ok(client);
         }
 
-        let active_control = self.active_control.lock().await;
-        if let Ok(pid) = target_client.parse::<u32>() {
-            if active_control.by_pid.contains_key(&pid) {
-                return Ok(ManagedClient::Control(pid));
-            }
+        let control_client = if let Ok(pid) = target_client.parse::<u32>() {
+            let active_control = self.active_control.lock().await;
+            active_control
+                .by_pid
+                .get(&pid)
+                .filter(|active| !active.closing.load(Ordering::SeqCst))
+                .map(|active| {
+                    ManagedClient::Control(super::control_support::ControlClientIdentity::new(
+                        pid, active.id,
+                    ))
+                })
+        } else {
+            None
+        };
+        if let Some(client) = control_client {
+            pause_after_managed_client_resolution(client).await;
+            return Ok(client);
         }
 
         Err(RmuxError::Server(format!(
@@ -155,7 +292,9 @@ impl RequestHandler {
             .resolve_target_managed_client(requester_pid, target_client, command_name)
             .await?
         {
-            ManagedClient::Attach(attach_pid) => Ok(attach_pid),
+            ManagedClient::Attach {
+                pid: attach_pid, ..
+            } => Ok(attach_pid),
             ManagedClient::Control(_) => Err(RmuxError::Server(format!(
                 "{command_name} requires an attached client"
             ))),
@@ -284,6 +423,9 @@ impl RequestHandler {
             session_name,
             client_size.map(TerminalGeometry::from_size),
             client_flags,
+            None,
+            None,
+            None,
         )
         .await
     }
@@ -293,7 +435,20 @@ impl RequestHandler {
         session_name: &rmux_proto::SessionName,
         client_geometry: Option<TerminalGeometry>,
         client_flags: ClientFlags,
+        expected_session_id: Option<rmux_proto::SessionId>,
+        expected_attach_identity: Option<(u32, u64)>,
+        expected_switch_target: Option<&SwitchTargetSelection>,
     ) -> Result<(), RmuxError> {
+        if let Some((attach_pid, attach_id)) = expected_attach_identity {
+            let active_attach = self.active_attach.lock().await;
+            if active_attach
+                .by_pid
+                .get(&attach_pid)
+                .is_none_or(|active| active.id != attach_id)
+            {
+                return Err(attached_client_required("switch-client"));
+            }
+        }
         let Some(client_geometry) =
             client_geometry.filter(|geometry| geometry.size.cols > 0 && geometry.size.rows > 0)
         else {
@@ -303,20 +458,102 @@ impl RequestHandler {
 
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
-        let selected_size = self
-            .selected_attached_session_size_for_new_client(session_name, client_size, client_flags)
-            .await?;
-        let mut state = self.state.lock().await;
-        if !client_flags.contains(ClientFlags::IGNORESIZE) {
-            state.set_attached_terminal_pixels(session_name, client_geometry.pixels);
-        }
-        state.mutate_session_and_resize_terminals(session_name, |session| {
-            session.touch_attached();
-            if let Some(selected_size) = selected_size {
-                session.resize_terminal(selected_size);
+        let switch_window_target = expected_switch_target.map(SwitchTargetSelection::window_target);
+        for _ in 0..4 {
+            if let Some((attach_pid, attach_id)) = expected_attach_identity {
+                let active_attach = self.active_attach.lock().await;
+                if active_attach
+                    .by_pid
+                    .get(&attach_pid)
+                    .is_none_or(|active| active.id != attach_id)
+                {
+                    return Err(attached_client_required("switch-client"));
+                }
             }
-            Ok(())
-        })
+            let selection = match switch_window_target.as_ref() {
+                Some(target) => {
+                    let incoming_client_size =
+                        (!client_flags.contains(ClientFlags::IGNORESIZE)).then_some(client_size);
+                    self.selected_attached_window_size(target, incoming_client_size)
+                        .await?
+                }
+                None => {
+                    self.selected_attached_session_size_for_new_client(
+                        session_name,
+                        client_size,
+                        client_flags,
+                    )
+                    .await?
+                }
+            };
+            self.pause_after_attached_size_selection().await;
+            if expected_session_id.is_some_and(|expected| selection.session_id != expected) {
+                return Err(crate::pane_terminals::session_not_found(session_name));
+            }
+            let mut state = self.state.lock().await;
+            if state.sessions.session(session_name).is_none() {
+                return Err(crate::pane_terminals::session_not_found(session_name));
+            }
+            let active_attach = self.active_attach.lock().await;
+            if let Some((attach_pid, attach_id)) = expected_attach_identity {
+                if active_attach
+                    .by_pid
+                    .get(&attach_pid)
+                    .is_none_or(|active| active.id != attach_id)
+                {
+                    return Err(attached_client_required("switch-client"));
+                }
+            }
+            if !self.attached_size_selection_is_current(
+                &state,
+                &active_attach,
+                session_name,
+                &selection,
+                switch_window_target.is_none(),
+            ) {
+                continue;
+            }
+            if let Some(selection) = expected_switch_target {
+                let expected_session_id = expected_session_id
+                    .expect("a switch target selection carries a stable session identity");
+                selection.validate_for_session_identity(
+                    &state,
+                    session_name,
+                    expected_session_id,
+                )?;
+            }
+            if !client_flags.contains(ClientFlags::IGNORESIZE) {
+                state.set_attached_terminal_pixels(session_name, client_geometry.pixels);
+            }
+            let result = match switch_window_target.as_ref() {
+                Some(target) => state.mutate_session_and_resize_window_terminal(
+                    session_name,
+                    target.window_index(),
+                    |session| {
+                        session.touch_attached();
+                        if let Some(selected_size) = selection.selected_size {
+                            session.resize_window(target.window_index(), selected_size)?;
+                        }
+                        Ok(())
+                    },
+                ),
+                None => state.mutate_session_and_resize_active_window_terminal(
+                    session_name,
+                    |session| {
+                        session.touch_attached();
+                        if let Some(selected_size) = selection.selected_size {
+                            session.resize_active_window_terminal(selected_size);
+                        }
+                        Ok(())
+                    },
+                ),
+            };
+            drop(active_attach);
+            return result;
+        }
+        Err(RmuxError::Server(format!(
+            "session {session_name} active window changed during attached-size selection"
+        )))
     }
 
     pub(in crate::handler) async fn handle_list_clients(
@@ -324,6 +561,7 @@ impl RequestHandler {
         requester_pid: u32,
         request: ListClientsRequest,
     ) -> Response {
+        let socket_path = self.socket_path();
         let requester_uid = self.requester_uid(requester_pid).await;
         let mut clients = self.list_clients_snapshot().await;
         if let Some(target_session) = request.target_session.as_ref() {
@@ -335,10 +573,13 @@ impl RequestHandler {
             request.reversed,
         );
 
+        let state = self.state.lock().await;
         let lines = clients
             .iter()
             .filter_map(|client| {
                 let context = RuntimeFormatContext::new(FormatContext::new())
+                    .with_state(&state)
+                    .with_socket_path(&socket_path)
                     .with_named_value("client_name", client.name.clone())
                     .with_named_value("client_pid", client.pid.to_string())
                     .with_named_value("client_tty", client.tty.clone())
@@ -420,11 +661,15 @@ impl RequestHandler {
         };
         active.suspended = true;
         let session_name = active.session_name.clone();
-        let remove = active.control_tx.send(AttachControl::Suspend).is_err();
+        let stale_client = active
+            .control_tx
+            .send(AttachControl::Suspend)
+            .is_err()
+            .then(|| active.identity(attach_pid));
         drop(active_attach);
-        if remove {
+        if let Some(stale_client) = stale_client {
             let removed_stale_clients = self
-                .remove_attached_clients_for_session(&session_name, vec![attach_pid])
+                .remove_attached_clients_for_session(&session_name, vec![stale_client])
                 .await;
             if !removed_stale_clients.is_empty() {
                 let _ = self

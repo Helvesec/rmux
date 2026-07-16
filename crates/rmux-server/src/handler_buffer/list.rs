@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use rmux_core::{
     formats::{is_truthy, FormatContext},
     BufferView,
@@ -11,11 +13,13 @@ const DEFAULT_LIST_BUFFERS_TEMPLATE: &str =
 
 pub(super) fn render_list_buffer_line(
     state: &crate::pane_terminals::HandlerState,
+    socket_path: &Path,
     request: &rmux_proto::ListBuffersRequest,
     entry: BufferView<'_>,
 ) -> Option<String> {
     let context = RuntimeFormatContext::new(FormatContext::new())
         .with_state(state)
+        .with_socket_path(socket_path)
         .with_named_value("buffer_name", entry.name())
         .with_named_value("buffer_size", entry.size().to_string())
         .with_named_value("buffer_sample", entry.sample())

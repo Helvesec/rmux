@@ -1,3 +1,4 @@
+use super::buffer_support::{install_paste_buffer_identity_pause, OrderedPasteBufferResult};
 use super::RequestHandler;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
@@ -5,7 +6,7 @@ use rmux_proto::{
     DeleteBufferRequest, ErrorResponse, ListBuffersRequest, LoadBufferRequest, NewSessionRequest,
     OptionName, PaneTarget, PasteBufferRequest, Request, RespawnPaneRequest, Response, RmuxError,
     ScopeSelector, SetBufferRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
-    TerminalSize,
+    SwapPaneRequest, TerminalSize,
 };
 use std::fs;
 use std::sync::Arc;
@@ -395,6 +396,136 @@ async fn paste_buffer_writes_to_pty() {
     assert!(matches!(show, Response::ShowBuffer(_)));
 }
 
+async fn assert_paste_buffer_rejects_same_slot_replacement(original_bracketed_mode: bool) {
+    let handler = Arc::new(RequestHandler::new());
+    let original_name = if original_bracketed_mode {
+        "paste-bracketed-original"
+    } else {
+        "paste-plain-original"
+    };
+    let replacement_name = if original_bracketed_mode {
+        "paste-plain-replacement"
+    } else {
+        "paste-bracketed-replacement"
+    };
+    let original = session_name(original_name);
+    let replacement = session_name(replacement_name);
+    create_session(handler.as_ref(), original_name).await;
+    create_session(handler.as_ref(), replacement_name).await;
+
+    handler
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            Some("identity-race"),
+            b"must-not-be-written",
+        ))))
+        .await;
+
+    let original_target = PaneTarget::with_window(original.clone(), 0, 0);
+    let replacement_target = PaneTarget::with_window(replacement.clone(), 0, 0);
+    let (original_pane_id, replacement_pane_id) = {
+        let mut state = handler.state.lock().await;
+        if original_bracketed_mode {
+            state
+                .append_bytes_to_pane_transcript_for_test(&original, 0, 0, b"\x1b[?2004h")
+                .expect("original pane enables bracketed paste mode");
+        } else {
+            state
+                .append_bytes_to_pane_transcript_for_test(&replacement, 0, 0, b"\x1b[?2004h")
+                .expect("replacement pane enables bracketed paste mode");
+        }
+        let original_pane_id = state
+            .sessions
+            .session(&original)
+            .and_then(|session| session.pane_id_in_window(0, 0))
+            .expect("original pane identity exists");
+        let replacement_pane_id = state
+            .sessions
+            .session(&replacement)
+            .and_then(|session| session.pane_id_in_window(0, 0))
+            .expect("replacement pane identity exists");
+        let mode_is_bracketed = |session_name, pane_id| {
+            state
+                .pane_screen_state(session_name, pane_id)
+                .is_some_and(|screen| screen.mode & rmux_core::input::mode::MODE_BRACKETPASTE != 0)
+        };
+        assert_eq!(
+            mode_is_bracketed(&original, original_pane_id),
+            original_bracketed_mode
+        );
+        assert_eq!(
+            mode_is_bracketed(&replacement, replacement_pane_id),
+            !original_bracketed_mode
+        );
+        state.start_pane_input_capture_for_test(&original_target);
+        state.start_pane_input_capture_for_test(&replacement_target);
+        (original_pane_id, replacement_pane_id)
+    };
+    assert_ne!(original_pane_id, replacement_pane_id);
+
+    let pause = install_paste_buffer_identity_pause(original.clone());
+    let paste_handler = Arc::clone(&handler);
+    let paste_target = original_target.clone();
+    let paste = tokio::spawn(async move {
+        let mut request = paste_buffer_request(Some("identity-race"), paste_target, false);
+        request.bracketed = true;
+        paste_handler
+            .handle(Request::PasteBuffer(Box::new(request)))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), pause.wait_until_reached())
+        .await
+        .expect("paste-buffer should pause after capturing pane identity");
+
+    let swapped = handler
+        .handle(Request::SwapPane(SwapPaneRequest {
+            source: original_target.clone(),
+            target: replacement_target.clone(),
+            direction: None,
+            detached: true,
+            preserve_zoom: false,
+        }))
+        .await;
+    assert!(matches!(swapped, Response::SwapPane(_)), "{swapped:?}");
+    pause.release();
+
+    let response = paste.await.expect("paste-buffer task should join");
+    assert!(
+        matches!(&response, Response::Error(ErrorResponse { error }) if error.to_string().contains("pane identity changed before paste-buffer write")),
+        "same-slot replacement must fail closed, got {response:?}"
+    );
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&original)
+            .and_then(|session| session.pane_id_in_window(0, 0)),
+        Some(replacement_pane_id),
+        "the target slot must contain the replacement pane"
+    );
+    assert_eq!(
+        state.pane_input_capture_for_test(&original_target),
+        Some(Vec::new()),
+        "paste-buffer must not write to the replacement pane"
+    );
+    assert_eq!(
+        state.pane_input_capture_for_test(&replacement_target),
+        Some(Vec::new()),
+        "paste-buffer must not retarget the write to the moved original pane"
+    );
+}
+
+#[tokio::test]
+async fn paste_buffer_bracketed_mode_snapshot_rejects_same_slot_replacement() {
+    assert_paste_buffer_rejects_same_slot_replacement(true).await;
+}
+
+#[tokio::test]
+async fn paste_buffer_plain_mode_snapshot_rejects_same_slot_replacement() {
+    assert_paste_buffer_rejects_same_slot_replacement(false).await;
+}
+
 #[tokio::test]
 async fn paste_buffer_with_delete_removes_buffer_after_write() {
     let handler = RequestHandler::new();
@@ -512,7 +643,90 @@ async fn paste_buffer_empty_store_is_successful_noop() {
         ))))
         .await;
 
-    assert!(matches!(response, Response::PasteBuffer(_)));
+    assert!(matches!(
+        response,
+        Response::PasteBuffer(rmux_proto::PasteBufferResponse { buffer_name })
+            if buffer_name.is_empty()
+    ));
+
+    let ordered = handler
+        .handle_paste_buffer_for_order(
+            paste_buffer_request(None, PaneTarget::new(session_name("alpha"), 0), false),
+            u64::MAX,
+        )
+        .await;
+    assert!(
+        matches!(
+            ordered,
+            OrderedPasteBufferResult::Completed(Response::PasteBuffer(
+                rmux_proto::PasteBufferResponse { buffer_name }
+            )) if buffer_name.is_empty()
+        ),
+        "the legitimate empty-name success must remain a completed response"
+    );
+}
+
+#[tokio::test]
+async fn ordered_paste_reports_stale_identity_without_wire_sentinel() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "ordered-paste-stale").await;
+    let set = handler
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            Some("shared"),
+            b"old",
+        ))))
+        .await;
+    assert!(matches!(set, Response::SetBuffer(_)), "{set:?}");
+    let captured_order = handler
+        .state
+        .lock()
+        .await
+        .buffers
+        .show_with_order(Some("shared"))
+        .expect("captured buffer exists")
+        .2;
+
+    let deleted = handler
+        .handle(Request::DeleteBuffer(DeleteBufferRequest {
+            name: Some("shared".to_owned()),
+        }))
+        .await;
+    assert!(matches!(deleted, Response::DeleteBuffer(_)), "{deleted:?}");
+    let replacement = handler
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            Some("shared"),
+            b"replacement",
+        ))))
+        .await;
+    assert!(
+        matches!(replacement, Response::SetBuffer(_)),
+        "{replacement:?}"
+    );
+
+    let result = handler
+        .handle_paste_buffer_for_order(
+            paste_buffer_request(
+                Some("shared"),
+                PaneTarget::new(session_name("ordered-paste-stale"), 0),
+                true,
+            ),
+            captured_order,
+        )
+        .await;
+    assert!(matches!(result, OrderedPasteBufferResult::StaleIdentity));
+
+    let replacement = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("shared".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        replacement
+            .command_output()
+            .expect("stale paste must preserve the replacement")
+            .stdout(),
+        b"replacement"
+    );
 }
 
 #[tokio::test]

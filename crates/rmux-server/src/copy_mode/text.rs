@@ -34,6 +34,12 @@ pub(super) struct LineTextMap {
     spans: Vec<(Range<usize>, u32)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LowercaseTextMap {
+    pub(super) text: String,
+    spans: Vec<(Range<usize>, Range<usize>)>,
+}
+
 impl LineTextMap {
     pub(super) fn new(line: &ScreenLineView) -> Self {
         let mut text = String::new();
@@ -73,6 +79,42 @@ impl LineTextMap {
             end: CopyPosition { x: end_x, y },
             text: self.text.get(range)?.to_owned(),
         })
+    }
+
+    pub(super) fn lowercase(&self) -> LowercaseTextMap {
+        LowercaseTextMap::new(&self.text)
+    }
+}
+
+impl LowercaseTextMap {
+    fn new(original: &str) -> Self {
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        for (original_start, ch) in original.char_indices() {
+            let folded_start = text.len();
+            text.extend(ch.to_lowercase());
+            let folded_end = text.len();
+            spans.push((
+                folded_start..folded_end,
+                original_start..original_start + ch.len_utf8(),
+            ));
+        }
+        Self { text, spans }
+    }
+
+    pub(super) fn original_range(&self, range: Range<usize>) -> Option<Range<usize>> {
+        let start = self
+            .spans
+            .iter()
+            .find(|(folded, _)| folded.start <= range.start && range.start < folded.end)
+            .map(|(_, original)| original.start)?;
+        let end = self
+            .spans
+            .iter()
+            .rev()
+            .find(|(folded, _)| folded.start < range.end && range.end <= folded.end)
+            .map(|(_, original)| original.end)?;
+        Some(start..end)
     }
 }
 

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rmux_core::alternate_screen_exit_sequence;
@@ -10,18 +10,56 @@ pub(super) const DETACHED_BANNER_PREFIX: &[u8] = b"[detached (from session ";
 pub(super) const EXITED_BANNER: &[u8] = b"[exited]\r\n";
 const STACK_STOP_SCAN_BYTES: usize = 128;
 
-#[derive(Clone, Debug, Default)]
+const ATTACH_SCREEN_STOPPED_BIT: u64 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AttachStopGeneration(u64);
+
+#[derive(Clone, Debug)]
 pub(super) struct AttachScreenTracker {
-    stopped: Arc<AtomicBool>,
+    state: Arc<AtomicU64>,
+}
+
+impl Default for AttachScreenTracker {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 impl AttachScreenTracker {
-    pub(super) fn mark_stopped(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
+    pub(super) fn mark_stopped(&self) -> AttachStopGeneration {
+        let state = self
+            .state
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_add(2) | ATTACH_SCREEN_STOPPED_BIT)
+            })
+            .expect("attach screen generation update is infallible");
+        AttachStopGeneration(state.saturating_add(2) | ATTACH_SCREEN_STOPPED_BIT)
+    }
+
+    pub(super) fn current_stop_generation(&self) -> Option<AttachStopGeneration> {
+        let state = self.state.load(Ordering::SeqCst);
+        (state & ATTACH_SCREEN_STOPPED_BIT != 0).then_some(AttachStopGeneration(state))
+    }
+
+    pub(super) fn rearm_if_current(&self, generation: AttachStopGeneration) -> bool {
+        if generation.0 == u64::MAX {
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                generation.0,
+                generation.0 & !ATTACH_SCREEN_STOPPED_BIT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
     pub(super) fn was_stopped(&self) -> bool {
-        self.stopped.load(Ordering::SeqCst)
+        self.state.load(Ordering::SeqCst) & ATTACH_SCREEN_STOPPED_BIT != 0
     }
 }
 
@@ -44,6 +82,11 @@ impl AttachStopDetector {
         }
     }
 
+    #[cfg(windows)]
+    pub(super) fn current_stop_generation(&self) -> Option<AttachStopGeneration> {
+        self.tracker.current_stop_generation()
+    }
+
     pub(super) fn observe(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -58,6 +101,7 @@ impl AttachStopDetector {
 
         if contains_stop_marker(bytes, &self.marker) {
             self.tracker.mark_stopped();
+            self.tail.clear();
             return;
         }
 
@@ -74,6 +118,7 @@ impl AttachStopDetector {
             let combined = &combined[..combined_len];
             if contains_stop_marker(combined, &self.marker) {
                 self.tracker.mark_stopped();
+                self.tail.clear();
                 return;
             }
             self.update_tail(combined);
@@ -86,6 +131,7 @@ impl AttachStopDetector {
 
         if contains_stop_marker(&combined, &self.marker) {
             self.tracker.mark_stopped();
+            self.tail.clear();
             return;
         }
 
@@ -165,6 +211,57 @@ mod tests {
         detector.observe(ALT_SCREEN_EXIT_FALLBACK);
 
         assert!(tracker.was_stopped());
+    }
+
+    #[test]
+    fn stopped_screen_can_be_rearmed_for_resumed_attach() {
+        let tracker = AttachScreenTracker::default();
+
+        let generation = tracker.mark_stopped();
+        assert!(tracker.was_stopped());
+
+        assert!(tracker.rearm_if_current(generation));
+        assert!(
+            !tracker.was_stopped(),
+            "a resumed attach must treat a later EOF as abnormal"
+        );
+    }
+
+    #[test]
+    fn later_stop_prevents_stale_resume_from_rearming_attach() {
+        let tracker = AttachScreenTracker::default();
+        let lock_prelude = tracker.mark_stopped();
+
+        let final_stop = tracker.mark_stopped();
+
+        assert_ne!(lock_prelude, final_stop);
+        assert!(
+            !tracker.rearm_if_current(lock_prelude),
+            "a completed lock must not erase a later detach or exit stop"
+        );
+        assert!(tracker.was_stopped());
+        assert_eq!(tracker.current_stop_generation(), Some(final_stop));
+    }
+
+    #[test]
+    fn rearmed_detector_does_not_reuse_stale_split_marker_prefix() {
+        let tracker = AttachScreenTracker::default();
+        let mut detector = AttachStopDetector::new(tracker.clone());
+        let split = ALT_SCREEN_EXIT_FALLBACK.len() - 2;
+
+        detector.observe(&ALT_SCREEN_EXIT_FALLBACK[..split]);
+        detector.observe(&ALT_SCREEN_EXIT_FALLBACK[split..]);
+        assert!(tracker.was_stopped());
+
+        let generation = tracker
+            .current_stop_generation()
+            .expect("detector should publish a stop generation");
+        assert!(tracker.rearm_if_current(generation));
+        detector.observe(&ALT_SCREEN_EXIT_FALLBACK[split..]);
+        assert!(
+            !tracker.was_stopped(),
+            "rearm must start a fresh stop-marker observation window"
+        );
     }
 
     #[test]

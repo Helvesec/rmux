@@ -265,12 +265,16 @@ function AssertArchiveInstaller([string]$InstallScript, [string]$Root) {
     $installRoot = Join-Path $Root "installed-rmux"
     $installBin = Join-Path $installRoot "bin"
 
+    $global:LASTEXITCODE = 0
     & $InstallScript -InstallDir $installBin
-    if (-not $?) {
-        Fail "archive install.ps1 failed"
+    if ($LASTEXITCODE -ne 0) {
+        Fail "archive install.ps1 failed with exit code $LASTEXITCODE"
     }
 
-    foreach ($required in @("bin\rmux.exe", "libexec\rmux\rmux.exe", "rmux-daemon.exe", "share\rmux\artifact-metadata.json")) {
+    # rmux-daemon.exe is checked next to the installed rmux.exe (bin\), where the
+    # hidden-daemon resolver looks for it; checking it at the install root would
+    # pass even when the daemon is unreachable at runtime.
+    foreach ($required in @("bin\rmux.exe", "libexec\rmux\rmux.exe", "bin\rmux-daemon.exe", "share\rmux\artifact-metadata.json")) {
         if (-not (Test-Path -LiteralPath (Join-Path $installRoot $required) -PathType Leaf)) {
             Fail "install.ps1 did not install required file: $required"
         }
@@ -279,6 +283,299 @@ function AssertArchiveInstaller([string]$InstallScript, [string]$Root) {
     $installedBinary = Join-Path $installBin "rmux.exe"
     AssertSuccess $installedBinary @("-V") | Out-Null
     AssertHelperFallback $installedBinary
+}
+
+function Wait-BinaryReplaceable([string]$Path, [int]$TimeoutMilliseconds) {
+    $deadline = [System.DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        $stream = $null
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            return
+        } catch {
+            Start-Sleep -Milliseconds 50
+        } finally {
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            }
+        }
+    } while ([System.DateTime]::UtcNow -lt $deadline)
+
+    Fail "timed out waiting for binary to become replaceable: $Path"
+}
+
+function AssertArchiveInstallerTransaction([string]$InstallScript, [string]$PackageRoot, [string]$Root) {
+    $installRoot = Join-Path $Root "installed-rmux"
+    $installBin = Join-Path $installRoot "bin"
+    $installedBinary = Join-Path $installBin "rmux.exe"
+    $installedHelper = Join-Path $installRoot "libexec\rmux\rmux.exe"
+    $installedDaemon = Join-Path $installBin "rmux-daemon.exe"
+    $installedReadme = Join-Path $installRoot "README.md"
+    $packageHelper = Join-Path $PackageRoot "libexec\rmux\rmux.exe"
+    $packageReadme = Join-Path $PackageRoot "README.md"
+    $helperBackup = Join-Path $Root "package-helper-backup.exe"
+    $readmeBackup = Join-Path $Root "package-readme-backup.md"
+    $label = "package-installer-transaction-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $daemonStarted = $false
+
+    Copy-Item -LiteralPath $packageHelper -Destination $helperBackup
+    Copy-Item -LiteralPath $packageReadme -Destination $readmeBackup
+    try {
+        AssertSuccessNoCapture $installedBinary @(
+            "-L", $label, "new-session", "-d", "-s", "installer_transaction", "cmd.exe", "/d", "/q", "/k"
+        )
+        $daemonStarted = $true
+
+        $before = @{
+            Rmux = Sha256File $installedBinary
+            Helper = Sha256File $installedHelper
+            Daemon = Sha256File $installedDaemon
+            Readme = Sha256File $installedReadme
+        }
+        [System.IO.File]::WriteAllText(
+            $packageHelper,
+            "rmux installer transaction marker $label",
+            [System.Text.Encoding]::ASCII
+        )
+        [System.IO.File]::WriteAllText(
+            $packageReadme,
+            "rmux installer asset transaction marker $label",
+            [System.Text.Encoding]::ASCII
+        )
+
+        $powerShell = (Get-Process -Id $PID).Path
+        $result = Invoke-NativeCapture $powerShell @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $InstallScript,
+            "-InstallDir", $installBin, "-NoVerify"
+        )
+        $failureOutput = $result.Output -join "`n"
+        if ($result.Status -eq 0) {
+            Fail "install.ps1 unexpectedly upgraded a layout whose daemon was running"
+        }
+        if ($failureOutput -notmatch 'destination file is in use or cannot be replaced safely') {
+            Fail "install.ps1 failed for an unexpected reason while the daemon was running`n$failureOutput"
+        }
+        if ((Sha256File $installedBinary) -ne $before.Rmux -or
+            (Sha256File $installedHelper) -ne $before.Helper -or
+            (Sha256File $installedDaemon) -ne $before.Daemon -or
+            (Sha256File $installedReadme) -ne $before.Readme) {
+            Fail "install.ps1 left a mixed package after the locked-daemon failure"
+        }
+
+        AssertSuccessNoCapture $helperBackup @("-L", $label, "kill-server")
+        $daemonStarted = $false
+        Wait-BinaryReplaceable $installedDaemon 5000
+
+        $rollback = Invoke-NativeCapture $powerShell @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $InstallScript,
+            "-InstallDir", $installBin
+        )
+        $rollbackOutput = $rollback.Output -join "`n"
+        if ($rollback.Status -eq 0 -or $rollbackOutput -notmatch 'previous package restored') {
+            Fail "install.ps1 did not report a verified rollback for an invalid helper`n$rollbackOutput"
+        }
+        if ((Sha256File $installedBinary) -ne $before.Rmux -or
+            (Sha256File $installedHelper) -ne $before.Helper -or
+            (Sha256File $installedDaemon) -ne $before.Daemon -or
+            (Sha256File $installedReadme) -ne $before.Readme) {
+            Fail "install.ps1 did not restore the existing package after verification failed"
+        }
+
+        $freshRoot = Join-Path $Root "fresh-rollback-rmux"
+        $freshBin = Join-Path $freshRoot "bin"
+        $freshRollback = Invoke-NativeCapture $powerShell @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $InstallScript,
+            "-InstallDir", $freshBin
+        )
+        if ($freshRollback.Status -eq 0) {
+            Fail "install.ps1 unexpectedly committed an invalid helper into a fresh layout"
+        }
+        foreach ($unexpected in @(
+            (Join-Path $freshBin "rmux.exe"),
+            (Join-Path $freshBin "rmux-daemon.exe"),
+            (Join-Path $freshRoot "libexec\rmux\rmux.exe"),
+            (Join-Path $freshRoot "README.md")
+        )) {
+            if (Test-Path -LiteralPath $unexpected) {
+                Fail "install.ps1 left a new package file behind after fresh-layout rollback: $unexpected"
+            }
+        }
+
+        Copy-Item -Force -LiteralPath $helperBackup -Destination $packageHelper
+        Copy-Item -Force -LiteralPath $readmeBackup -Destination $packageReadme
+
+        $previousFailAt = $env:RMUX_INSTALL_TEST_FAIL_AT
+        try {
+            $env:RMUX_INSTALL_TEST_FAIL_AT = "after-copy-package"
+            [System.IO.File]::WriteAllText(
+                $packageReadme,
+                "rmux late package failure marker $label",
+                [System.Text.Encoding]::ASCII
+            )
+            $lateFailure = Invoke-NativeCapture $powerShell @(
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $InstallScript,
+                "-InstallDir", $installBin, "-NoVerify"
+            )
+        } finally {
+            if ($null -eq $previousFailAt) {
+                Remove-Item Env:RMUX_INSTALL_TEST_FAIL_AT -ErrorAction SilentlyContinue
+            } else {
+                $env:RMUX_INSTALL_TEST_FAIL_AT = $previousFailAt
+            }
+        }
+        $lateFailureOutput = $lateFailure.Output -join "`n"
+        if ($lateFailure.Status -eq 0 -or $lateFailureOutput -notmatch 'previous package restored') {
+            Fail "install.ps1 did not roll back a failure after package files were copied`n$lateFailureOutput"
+        }
+        if ((Sha256File $installedBinary) -ne $before.Rmux -or
+            (Sha256File $installedHelper) -ne $before.Helper -or
+            (Sha256File $installedDaemon) -ne $before.Daemon -or
+            (Sha256File $installedReadme) -ne $before.Readme) {
+            Fail "install.ps1 left a mixed package after a late copy failure"
+        }
+        Copy-Item -Force -LiteralPath $readmeBackup -Destination $packageReadme
+
+        $success = Invoke-NativeCapture $powerShell @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $InstallScript,
+            "-InstallDir", $installBin
+        )
+        if ($success.Status -ne 0) {
+            Fail "install.ps1 could not complete a valid upgrade after rollback`n$($success.Output)"
+        }
+        if ((Sha256File $installedHelper) -ne (Sha256File $packageHelper) -or
+            (Sha256File $installedBinary) -ne (Sha256File (Join-Path $PackageRoot "rmux.exe")) -or
+            (Sha256File $installedDaemon) -ne (Sha256File (Join-Path $PackageRoot "rmux-daemon.exe")) -or
+            (Sha256File $installedReadme) -ne (Sha256File $packageReadme)) {
+            Fail "install.ps1 did not commit the complete valid package"
+        }
+
+        # Hold the destination lock from this process, then prove that a real
+        # installer process reaches lock contention before mutating any package
+        # file and completes only after the lock is released.
+        $concurrentRoot = Join-Path $Root "concurrent-rmux"
+        $concurrentBin = Join-Path $concurrentRoot "bin"
+        $concurrentLockPath = Join-Path $concurrentRoot ".rmux-install.lock"
+        $concurrentWaitEventName = "Local\rmux-installer-test-$PID-$([guid]::NewGuid().ToString('N'))"
+        $concurrentWaitEvent = [System.Threading.EventWaitHandle]::new(
+            $false,
+            [System.Threading.EventResetMode]::ManualReset,
+            $concurrentWaitEventName
+        )
+        New-Item -ItemType Directory -Force -Path $concurrentRoot | Out-Null
+        $heldInstallLock = [System.IO.File]::Open(
+            $concurrentLockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $concurrentInstaller = $null
+        $concurrentFailure = $null
+        try {
+            $previousWaitEvent = $env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT
+            try {
+                $env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT = $concurrentWaitEventName
+                $concurrentInstaller = Start-Process `
+                    -FilePath $powerShell `
+                    -ArgumentList @(
+                        "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", "`"$InstallScript`"",
+                        "-InstallDir", "`"$concurrentBin`"",
+                        "-NoVerify"
+                    ) `
+                    -PassThru
+            } finally {
+                if ($null -eq $previousWaitEvent) {
+                    Remove-Item Env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT -ErrorAction SilentlyContinue
+                } else {
+                    $env:RMUX_INSTALL_TEST_LOCK_WAIT_EVENT = $previousWaitEvent
+                }
+            }
+
+            if (-not $concurrentWaitEvent.WaitOne(10000)) {
+                throw "contending installer did not report destination-lock contention"
+            }
+            if ($concurrentInstaller.HasExited) {
+                throw "contending installer exited before the held transaction lock was released"
+            }
+
+            foreach ($unexpected in @(
+                (Join-Path $concurrentBin "rmux.exe"),
+                (Join-Path $concurrentBin "rmux-daemon.exe"),
+                (Join-Path $concurrentRoot "libexec\rmux\rmux.exe"),
+                (Join-Path $concurrentRoot "README.md")
+            )) {
+                if (Test-Path -LiteralPath $unexpected) {
+                    throw "contending installer mutated the package before acquiring its transaction lock: $unexpected"
+                }
+            }
+        } catch {
+            $concurrentFailure = $_.Exception.Message
+        } finally {
+            $heldInstallLock.Dispose()
+            $concurrentWaitEvent.Dispose()
+        }
+
+        if ($null -ne $concurrentFailure) {
+            if ($null -ne $concurrentInstaller -and -not $concurrentInstaller.HasExited) {
+                $concurrentInstaller.Kill()
+                $concurrentInstaller.WaitForExit()
+            }
+            Fail $concurrentFailure
+        }
+        if (-not $concurrentInstaller.WaitForExit(15000)) {
+            $concurrentInstaller.Kill()
+            $concurrentInstaller.WaitForExit()
+            Fail "contending installer did not finish after the transaction lock was released"
+        }
+        $concurrentInstaller.WaitForExit()
+        $concurrentInstaller.Refresh()
+        if ($concurrentInstaller.ExitCode -ne 0) {
+            Fail "contending installer exited with $($concurrentInstaller.ExitCode) after the transaction lock was released"
+        }
+        $concurrentInstaller.Dispose()
+        if ((Sha256File (Join-Path $concurrentBin "rmux.exe")) -ne
+                (Sha256File (Join-Path $PackageRoot "rmux.exe")) -or
+            (Sha256File (Join-Path $concurrentBin "rmux-daemon.exe")) -ne
+                (Sha256File (Join-Path $PackageRoot "rmux-daemon.exe")) -or
+            (Sha256File (Join-Path $concurrentRoot "libexec\rmux\rmux.exe")) -ne
+                (Sha256File $packageHelper) -or
+            (Sha256File (Join-Path $concurrentRoot "README.md")) -ne
+                (Sha256File $packageReadme)) {
+            Fail "serialized installer did not commit the complete valid package"
+        }
+        if (Test-Path -LiteralPath $concurrentLockPath) {
+            Fail "serialized installer left its transaction lock marker behind"
+        }
+
+        $nonLeafRoot = Join-Path $Root "non-leaf-rmux"
+        $nonLeafBin = Join-Path $nonLeafRoot "bin"
+        $nonLeafHelper = Join-Path $nonLeafRoot "libexec\rmux\rmux.exe"
+        New-Item -ItemType Directory -Force -Path $nonLeafHelper | Out-Null
+        $nonLeaf = Invoke-NativeCapture $powerShell @(
+            "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $InstallScript,
+            "-InstallDir", $nonLeafBin, "-NoVerify"
+        )
+        if ($nonLeaf.Status -eq 0 -or ($nonLeaf.Output -join "`n") -notmatch 'exists but is not a file') {
+            Fail "install.ps1 did not reject a non-file binary destination"
+        }
+        if ((Test-Path -LiteralPath (Join-Path $nonLeafBin "rmux.exe")) -or
+            (Test-Path -LiteralPath (Join-Path $nonLeafBin "rmux-daemon.exe"))) {
+            Fail "install.ps1 mutated another slot before rejecting a non-file destination"
+        }
+    } finally {
+        if ($daemonStarted) {
+            & $helperBackup "-L" $label "kill-server" | Out-Null
+        }
+        Copy-Item -Force -LiteralPath $helperBackup -Destination $packageHelper
+        Copy-Item -Force -LiteralPath $readmeBackup -Destination $packageReadme
+        Remove-Item -Force -LiteralPath $helperBackup -ErrorAction SilentlyContinue
+        Remove-Item -Force -LiteralPath $readmeBackup -ErrorAction SilentlyContinue
+    }
 }
 
 function VerifyChecksumManifest([string]$Root, [string]$Manifest) {
@@ -413,6 +710,15 @@ try {
     if ($metadata.daemon_binary_sha256.ToLowerInvariant() -ne $packagedDaemonHash) {
         Fail "metadata daemon_binary_sha256 does not match packaged daemon binary"
     }
+    if ($RequireReleaseArtifact) {
+        & (Join-Path $PSScriptRoot "assert-windows-static-crt.ps1") `
+            -Binary $binary `
+            -HelperBinary $helperBinary `
+            -DaemonBinary $daemonBinary
+        if ($LASTEXITCODE -ne 0) {
+            Fail "packaged Windows static CRT verification failed"
+        }
+    }
 
     $portableAlias = $null
     if ($RunBinary -or $RunDaemonSmoke) {
@@ -424,6 +730,7 @@ try {
 
     if ($RunBinary) {
         AssertArchiveInstaller (Join-Path $packageRoot "install.ps1") $tmpRoot
+        AssertArchiveInstallerTransaction (Join-Path $packageRoot "install.ps1") $packageRoot $tmpRoot
         AssertSuccess $binary @("-V") | Out-Null
         AssertHelperFallback $binary
         AssertSuccess $helperBinary @("-V") | Out-Null

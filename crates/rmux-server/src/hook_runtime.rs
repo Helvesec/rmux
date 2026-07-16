@@ -1,7 +1,10 @@
 use std::cell::RefCell;
 use std::future::Future;
 
-use rmux_proto::{HookName, ScopeSelector, Target};
+use rmux_core::{PaneId, WindowId};
+use rmux_proto::{HookName, ScopeSelector, SessionId, Target};
+
+use crate::pane_terminals::WindowLinkOccurrenceId;
 
 tokio::task_local! {
     static HOOKS_DISABLED: bool;
@@ -26,7 +29,19 @@ pub(crate) struct PendingInlineHook {
     pub(crate) hook: HookName,
     pub(crate) scope: ScopeSelector,
     pub(crate) current_target: Option<Target>,
+    pub(crate) exact_pane_target: Option<ExactPaneHookTarget>,
+    pub(crate) exact_session_id: Option<SessionId>,
+    pub(crate) skip_dispatch: bool,
     pub(crate) format_mode: PendingInlineHookFormat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExactPaneHookTarget {
+    pub(crate) session_id: SessionId,
+    pub(crate) window_id: WindowId,
+    pub(crate) pane_id: PaneId,
+    pub(crate) preferred_window_index: u32,
+    pub(crate) window_occurrence_id: Option<WindowLinkOccurrenceId>,
 }
 
 pub(crate) fn hooks_disabled() -> bool {

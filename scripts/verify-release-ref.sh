@@ -33,8 +33,13 @@ ref_json=$(gh api \
 object_type=$(jq -er '.object.type' <<<"$ref_json")
 object_sha=$(jq -er '.object.sha | ascii_downcase' <<<"$ref_json")
 
-# Annotated tags point to tag objects. Peel every layer and reject cycles or
-# unexpected object types instead of trusting the mutable ref name.
+# Release provenance is a verified annotated tag, never a lightweight ref.
+# Peel every signed layer and reject cycles or unexpected object types instead
+# of trusting the mutable ref name.
+if [[ $object_type != tag ]]; then
+  echo "release ref $release_tag must be a verified signed annotated tag" >&2
+  exit 1
+fi
 visited=''
 for _ in $(seq 1 16); do
   if [[ $object_type == commit ]]; then
@@ -53,6 +58,11 @@ for _ in $(seq 1 16); do
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
     "repos/$repository/git/tags/$object_sha")
+  if ! jq -e '.verification.verified == true' <<<"$tag_json" >/dev/null; then
+    verification_reason=$(jq -r '.verification.reason // "missing"' <<<"$tag_json")
+    echo "release tag $release_tag has no verified signature (reason: $verification_reason)" >&2
+    exit 1
+  fi
   object_type=$(jq -er '.object.type' <<<"$tag_json")
   object_sha=$(jq -er '.object.sha | ascii_downcase' <<<"$tag_json")
 done

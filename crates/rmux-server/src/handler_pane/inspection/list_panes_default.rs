@@ -5,6 +5,7 @@ use rmux_core::formats::{
 use rmux_core::{Pane, Session};
 use rmux_proto::OptionName;
 
+use crate::pane_indices::visible_pane_index;
 use crate::pane_terminals::HandlerState;
 use crate::pane_visible_geometry::visible_pane_content_geometry;
 
@@ -50,21 +51,20 @@ pub(super) fn push_default_list_panes_line(
     };
 
     let geometry = list_panes_default_geometry(state, session, attached_count, window_index, pane);
+    let pane_index = visible_pane_index(session, &state.options, window_index, pane.index());
     let mut line = String::new();
     match format {
         DefaultListPanesFormat::Window => {
-            let _ = write!(&mut line, "{}: ", pane.index());
+            let _ = write!(&mut line, "{pane_index}: ");
         }
         DefaultListPanesFormat::Session => {
-            let _ = write!(&mut line, "{}.{}: ", window_index, pane.index());
+            let _ = write!(&mut line, "{window_index}.{pane_index}: ");
         }
         DefaultListPanesFormat::All => {
             let _ = write!(
                 &mut line,
-                "{}:{}.{}: ",
+                "{}:{window_index}.{pane_index}: ",
                 session.name(),
-                window_index,
-                pane.index()
             );
         }
     }

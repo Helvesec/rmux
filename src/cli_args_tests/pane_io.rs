@@ -104,10 +104,19 @@ fn last_pane_preserves_tmux_style_raw_targets() {
 }
 
 #[test]
-fn last_pane_rejects_conflicting_input_flags() {
-    let error = parse_args(&["last-pane", "-d", "-e"]).unwrap_err();
-
-    assert!(error.to_string().contains("cannot be used"));
+fn last_pane_accepts_combined_input_flags_like_tmux() {
+    for flags in [&["-de"][..], &["-d", "-e"][..], &["-e", "-d"][..]] {
+        let mut argv = vec!["last-pane"];
+        argv.extend_from_slice(flags);
+        let cli = parse_args(&argv).expect("tmux accepts both last-pane input flags");
+        match cli.command.expect("parsed command") {
+            super::super::Command::LastPane(args) => {
+                assert!(args.disable_input);
+                assert!(args.enable_input);
+            }
+            _ => panic!("expected LastPane command"),
+        }
+    }
 }
 
 #[test]

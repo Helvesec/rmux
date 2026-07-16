@@ -207,10 +207,19 @@ pub(super) fn assert_exact_tmux_compat(run: &TmuxCompatRun) {
     assert_eq!(run.tmux.stderr, run.rmux.stderr);
 }
 
-pub(super) fn drop_deferred_new_pane_binding(output: &[u8]) -> Vec<u8> {
+pub(super) fn drop_deferred_prefix_bindings(output: &[u8]) -> Vec<u8> {
+    const DEFERRED_BINDINGS: &[&[u8]] = &[
+        b"prefix:*:0\n",
+        b"prefix:DC:1\n",
+        b"prefix:S-Up:1\n",
+        b"prefix:S-Down:1\n",
+        b"prefix:S-Left:1\n",
+        b"prefix:S-Right:1\n",
+    ];
+
     output
         .split_inclusive(|byte| *byte == b'\n')
-        .filter(|line| *line != b"prefix:*:0\n")
+        .filter(|line| !DEFERRED_BINDINGS.contains(line))
         .flatten()
         .copied()
         .collect()

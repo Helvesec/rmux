@@ -5,7 +5,10 @@ use rmux_core::{
     command_parser::ParsedCommands,
     command_queue::{CommandGroup, CommandQueue},
 };
-use rmux_proto::{CommandOutput, ErrorResponse, Request, Response, RmuxError, Target};
+use rmux_proto::{
+    CommandOutput, ErrorResponse, PaneTarget, Request, Response, RmuxError, SessionName, Target,
+    WindowTarget,
+};
 
 use crate::mouse::AttachedMouseEvent;
 
@@ -16,6 +19,7 @@ use super::prompt_parse::{
     ParsedCommandPromptCommand, ParsedConfirmBeforeCommand, ParsedPromptHistoryCommand,
 };
 use super::queue_parse::{ParsedIfShellCommand, ParsedNewWindowCommand};
+use super::shell_parse::ParsedRunShellCommand;
 use super::source_files::ParsedSourceFileCommand;
 
 #[derive(Debug, Clone)]
@@ -25,6 +29,8 @@ pub(in crate::handler) struct QueueExecutionContext {
     pub(super) current_file: Option<String>,
     pub(super) current_target: Option<Target>,
     pub(super) current_target_allows_canfail_fallback: bool,
+    run_shell_canfail_fallback_target: bool,
+    pub(super) follows_attached_session: bool,
     pub(super) client_name: Option<String>,
     pub(super) mouse_target: Option<Target>,
     pub(super) mouse_event: Option<AttachedMouseEvent>,
@@ -38,6 +44,8 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            run_shell_canfail_fallback_target: false,
+            follows_attached_session: false,
             client_name: None,
             mouse_target: None,
             mouse_event: None,
@@ -51,6 +59,8 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            run_shell_canfail_fallback_target: false,
+            follows_attached_session: false,
             client_name: None,
             mouse_target: None,
             mouse_event: None,
@@ -68,6 +78,8 @@ impl QueueExecutionContext {
             current_file,
             current_target: self.current_target.clone(),
             current_target_allows_canfail_fallback: self.current_target_allows_canfail_fallback,
+            run_shell_canfail_fallback_target: self.run_shell_canfail_fallback_target,
+            follows_attached_session: self.follows_attached_session,
             client_name: self.client_name.clone(),
             mouse_target: self.mouse_target.clone(),
             mouse_event: self.mouse_event.clone(),
@@ -79,6 +91,7 @@ impl QueueExecutionContext {
         current_target: Option<Target>,
     ) -> Self {
         self.current_target_allows_canfail_fallback = current_target.is_some();
+        self.follows_attached_session = false;
         self.current_target = current_target;
         self
     }
@@ -90,6 +103,29 @@ impl QueueExecutionContext {
         self.current_target = current_target;
         self.current_target_allows_canfail_fallback = false;
         self
+    }
+
+    pub(in crate::handler) fn with_run_shell_canfail_fallback_target(mut self) -> Self {
+        self.run_shell_canfail_fallback_target = self.current_target.is_some();
+        self
+    }
+
+    pub(in crate::handler) fn following_attached_session(mut self) -> Self {
+        if !self.current_target_allows_canfail_fallback {
+            self.follows_attached_session = true;
+        }
+        self
+    }
+
+    pub(in crate::handler) fn follows_attached_session(&self) -> bool {
+        self.follows_attached_session
+    }
+
+    pub(in crate::handler) fn rebase_current_target_after_attached_switch(
+        &mut self,
+        current_target: Target,
+    ) {
+        self.current_target = Some(current_target);
     }
 
     pub(in crate::handler) fn uses_explicit_current_target(&self) -> bool {
@@ -123,6 +159,67 @@ impl QueueExecutionContext {
             .then_some(self.current_target.as_ref())
             .flatten()
     }
+
+    pub(in crate::handler) fn run_shell_canfail_fallback_target(&self) -> Option<&Target> {
+        self.run_shell_canfail_fallback_target
+            .then_some(self.current_target.as_ref())
+            .flatten()
+    }
+
+    pub(in crate::handler) fn rename_session_targets(
+        &mut self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+    ) {
+        if let Some(target) = self.current_target.as_mut() {
+            rename_target_session(target, old_name, new_name);
+        }
+        if let Some(target) = self.mouse_target.as_mut() {
+            rename_target_session(target, old_name, new_name);
+        }
+        if let Some(event) = self.mouse_event.as_mut() {
+            if let Some(target) = event.pane_target.as_mut() {
+                rename_pane_target_session(target, old_name, new_name);
+            }
+        }
+    }
+}
+
+pub(in crate::handler) fn rename_target_session(
+    target: &mut Target,
+    old_name: &SessionName,
+    new_name: &SessionName,
+) {
+    match target {
+        Target::Session(session_name) if session_name == old_name => {
+            *session_name = new_name.clone();
+        }
+        Target::Window(window) => rename_window_target_session(window, old_name, new_name),
+        Target::Pane(pane) => rename_pane_target_session(pane, old_name, new_name),
+        Target::Session(_) => {}
+    }
+}
+
+pub(in crate::handler) fn rename_window_target_session(
+    target: &mut WindowTarget,
+    old_name: &SessionName,
+    new_name: &SessionName,
+) {
+    if target.session_name() != old_name {
+        return;
+    }
+    *target = WindowTarget::with_window(new_name.clone(), target.window_index());
+}
+
+pub(in crate::handler) fn rename_pane_target_session(
+    target: &mut PaneTarget,
+    old_name: &SessionName,
+    new_name: &SessionName,
+) {
+    if target.session_name() != old_name {
+        return;
+    }
+    *target = PaneTarget::with_window(new_name.clone(), target.window_index(), target.pane_index());
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +279,7 @@ pub(super) enum QueueMode {
 #[derive(Debug, Clone)]
 pub(super) enum QueueInvocation {
     Request(Request),
+    RunShell(ParsedRunShellCommand),
     NoOp,
     StartServer,
     ListCommands(ParsedListCommandsCommand),
@@ -210,6 +308,20 @@ pub(super) fn remove_group_contexts(
         }
     }
     *contexts = retained;
+}
+
+pub(super) fn captures_attached_client_transition(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::AttachSession(_)
+            | Request::AttachSessionExt(_)
+            | Request::AttachSessionExt2(_)
+            | Request::AttachSessionExt3(_)
+            | Request::SwitchClient(_)
+            | Request::SwitchClientExt(_)
+            | Request::SwitchClientExt2(_)
+            | Request::SwitchClientExt3(_)
+    )
 }
 
 pub(super) fn queue_action_from_response(
@@ -255,5 +367,123 @@ pub(super) fn prompt_queue_action_from_result(
             source_file_error: None,
             exit_status: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_proto::request::{
+        AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
+        SwitchClientExt2Request, SwitchClientExt3Request, SwitchClientExtRequest,
+    };
+    use rmux_proto::{AttachSessionRequest, SessionName, SwitchClientRequest};
+
+    fn session_name(value: &str) -> SessionName {
+        SessionName::new(value).expect("valid test session")
+    }
+
+    #[test]
+    fn attached_transition_capture_recognizes_every_request_generation() {
+        let alpha = session_name("alpha");
+        assert!(captures_attached_client_transition(
+            &Request::AttachSession(AttachSessionRequest {
+                target: alpha.clone(),
+            })
+        ));
+        assert!(captures_attached_client_transition(
+            &Request::AttachSessionExt(AttachSessionExtRequest {
+                target: Some(alpha.clone()),
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only: false,
+                skip_environment_update: false,
+                flags: None,
+            })
+        ));
+        let attach_ext2 = AttachSessionExt2Request {
+            target: Some(alpha.clone()),
+            target_spec: None,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            read_only: false,
+            skip_environment_update: false,
+            flags: None,
+            working_directory: None,
+            client_terminal: Default::default(),
+            client_size: None,
+        };
+        assert!(captures_attached_client_transition(
+            &Request::AttachSessionExt2(Box::new(attach_ext2.clone()))
+        ));
+        assert!(captures_attached_client_transition(
+            &Request::AttachSessionExt3(Box::new(AttachSessionExt3Request::from_ext2(
+                attach_ext2,
+                Vec::new(),
+            )))
+        ));
+        assert!(captures_attached_client_transition(&Request::SwitchClient(
+            SwitchClientRequest {
+                target: alpha.clone(),
+            }
+        )));
+        assert!(captures_attached_client_transition(
+            &Request::SwitchClientExt(SwitchClientExtRequest {
+                target: None,
+                key_table: Some("root".to_owned()),
+            })
+        ));
+        assert!(captures_attached_client_transition(
+            &Request::SwitchClientExt2(Box::new(SwitchClientExt2Request {
+                target: None,
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: true,
+                toggle_read_only: true,
+                flags: None,
+                sort_order: None,
+                skip_environment_update: false,
+            }))
+        ));
+        assert!(captures_attached_client_transition(
+            &Request::SwitchClientExt3(Box::new(SwitchClientExt3Request {
+                target_client: Some("other".to_owned()),
+                target: Some(alpha.to_string()),
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: false,
+                toggle_read_only: false,
+                sort_order: None,
+                skip_environment_update: false,
+                zoom: false,
+            }))
+        ));
+        assert!(!captures_attached_client_transition(&Request::KillServer(
+            rmux_proto::KillServerRequest
+        )));
+    }
+
+    #[test]
+    fn attached_switch_rebases_every_queue_target() {
+        let alpha = Target::Session(session_name("alpha"));
+        let beta = Target::Session(session_name("beta"));
+        let mut implicit = QueueExecutionContext::without_caller_cwd()
+            .with_implicit_current_target(Some(alpha.clone()));
+        let mut explicit =
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(alpha));
+
+        implicit.rebase_current_target_after_attached_switch(beta.clone());
+        explicit.rebase_current_target_after_attached_switch(beta);
+
+        assert_eq!(
+            implicit.current_target(),
+            Some(&Target::Session(session_name("beta")))
+        );
+        assert_eq!(
+            explicit.current_target(),
+            Some(&Target::Session(session_name("beta")))
+        );
     }
 }

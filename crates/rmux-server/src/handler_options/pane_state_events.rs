@@ -77,6 +77,6 @@ fn pane_option_event_for_target(
         return None;
     }
     let pane_id = pane_id_for_resolved_target(state, target).ok()?;
-    let generation = state.pane_output_generation(target.session_name(), pane_id);
+    let generation = state.pane_output_generation_for_target(target, pane_id);
     Some((pane_id, generation, outcome.clone()))
 }

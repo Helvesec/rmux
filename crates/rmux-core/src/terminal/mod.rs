@@ -106,6 +106,10 @@ impl TerminalParser {
         &mut self.screen
     }
 
+    pub(crate) fn plain_output_forwarding_safe(&self) -> bool {
+        self.parser.plain_output_forwarding_safe() && self.screen.plain_output_forwarding_safe()
+    }
+
     /// Updates the tmux-style UTF-8 width and combining configuration on
     /// the underlying screen.
     pub(crate) fn set_utf8_config(&mut self, config: Utf8Config) {
@@ -198,7 +202,9 @@ impl TerminalParser {
 #[cfg(test)]
 mod tests {
     use super::{TerminalParser, TerminalParserState};
+    use crate::input::{mode, ScreenWriter};
     use crate::utf8::Utf8Config;
+    use crate::Screen;
     use rmux_proto::TerminalSize;
 
     fn size(cols: u16, rows: u16) -> TerminalSize {
@@ -452,5 +458,82 @@ mod tests {
         // After reset, normal ASCII must still print at the prior cursor.
         parser.feed(b"X");
         assert_eq!(parser.screen().cursor_position(), (1, 0));
+    }
+
+    #[test]
+    fn plain_output_forwarding_rejects_pending_wrap_and_non_default_modes() {
+        let mut pending_wrap = TerminalParser::new(size(8, 3), 4);
+        assert!(pending_wrap.plain_output_forwarding_safe());
+        pending_wrap.feed(b"ABCDEFGH");
+        assert!(!pending_wrap.plain_output_forwarding_safe());
+        pending_wrap.feed(b"\r");
+        assert!(pending_wrap.plain_output_forwarding_safe());
+
+        for (enable, disable, label) in [
+            (b"\x1b[4h".as_slice(), b"\x1b[4l".as_slice(), "IRM"),
+            (
+                b"\x1b[?2026h".as_slice(),
+                b"\x1b[?2026l".as_slice(),
+                "synchronized output",
+            ),
+        ] {
+            let mut parser = TerminalParser::new(size(8, 3), 4);
+            parser.feed(enable);
+            assert!(
+                !parser.plain_output_forwarding_safe(),
+                "{label} must disable raw output forwarding"
+            );
+            parser.feed(disable);
+            assert!(
+                parser.plain_output_forwarding_safe(),
+                "clearing {label} must restore the safe default state"
+            );
+        }
+
+        let mut linefeed_newline_mode = TerminalParser::new(size(8, 3), 4);
+        <Screen as ScreenWriter>::mode_set(linefeed_newline_mode.screen_mut(), mode::MODE_CRLF);
+        assert!(!linefeed_newline_mode.plain_output_forwarding_safe());
+        <Screen as ScreenWriter>::mode_clear(linefeed_newline_mode.screen_mut(), mode::MODE_CRLF);
+        assert!(linefeed_newline_mode.plain_output_forwarding_safe());
+
+        let mut input_only_modes = TerminalParser::new(size(8, 3), 4);
+        input_only_modes.feed(b"\x1b[?1000h\x1b[?2004h");
+        assert!(
+            input_only_modes.plain_output_forwarding_safe(),
+            "mouse tracking and bracketed paste do not change plain output semantics"
+        );
+    }
+
+    #[test]
+    fn plain_output_forwarding_rejects_style_hyperlink_and_parser_pending_state() {
+        let mut sgr = TerminalParser::new(size(8, 3), 4);
+        sgr.feed(b"\x1b[31m");
+        assert!(!sgr.plain_output_forwarding_safe());
+        sgr.feed(b"\x1b[0m");
+        assert!(sgr.plain_output_forwarding_safe());
+
+        let mut hyperlink = TerminalParser::new(size(8, 3), 4);
+        hyperlink.feed(b"\x1b]8;;https://example.test\x1b\\");
+        assert!(!hyperlink.plain_output_forwarding_safe());
+        hyperlink.feed(b"\x1b]8;;\x1b\\");
+        assert!(hyperlink.plain_output_forwarding_safe());
+
+        let mut pending_csi = TerminalParser::new(size(8, 3), 4);
+        pending_csi.feed(b"\x1b[1;");
+        assert!(!pending_csi.plain_output_forwarding_safe());
+        pending_csi.reset_to_ground();
+        assert!(pending_csi.plain_output_forwarding_safe());
+    }
+
+    #[test]
+    fn plain_output_forwarding_rejects_non_default_scroll_margins() {
+        let mut parser = TerminalParser::new(size(8, 4), 4);
+        parser.feed(b"\x1b[2;3r");
+        assert_eq!(parser.screen().scroll_region(), (1, 2));
+        assert!(!parser.plain_output_forwarding_safe());
+
+        parser.feed(b"\x1b[r");
+        assert_eq!(parser.screen().scroll_region(), (0, 3));
+        assert!(parser.plain_output_forwarding_safe());
     }
 }

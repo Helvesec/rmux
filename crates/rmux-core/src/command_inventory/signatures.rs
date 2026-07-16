@@ -53,7 +53,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ),
     (
         "display-message",
-        "(display) [-aCIlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]",
+        "(display) [-aCIlpv] [-c target-client] [-F format] [-t target-pane] [message]",
     ),
     (
         "display-popup",
@@ -139,7 +139,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("previous-window", "(prev) [-a] [-t target-session]"),
     (
         "refresh-client",
-        "(refresh) [-cDlLRSU] [-A pane:state] [-B name:what:format] [-C XxY] [-f flags] [-r pane:report] [-t target-client] [adjustment]",
+        "(refresh) [-lS] [-C XxY] [-f flags] [-F flags] [-t target-client]",
     ),
     ("rename-session", "(rename) [-t target-session] new-name"),
     ("rename-window", "(renamew) [-t target-window] new-name"),
@@ -176,7 +176,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
         "(send) [-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]",
     ),
     ("send-prefix", "[-2] [-t target-pane]"),
-    ("server-access", "[-adlrw] [-t target-pane] [user]"),
+    ("server-access", "[-adlrw] [user]"),
     (
         "set-buffer",
         "(setb) [-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]",
@@ -213,7 +213,7 @@ pub(super) const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("source-file", "(source) [-Fnqv] [-t target-pane] path ..."),
     (
         "split-window",
-        "(splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]",
+        "(splitw) [-bdefhIklPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-p percentage] [-t target-pane] [shell-command [argument ...]]",
     ),
     ("start-server", "(start) "),
     ("suspend-client", "(suspendc) [-t target-client]"),

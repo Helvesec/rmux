@@ -11,7 +11,13 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use super::{ControlClientFlags, ControlOutputQueue};
-use crate::handler::RequestHandler;
+use crate::handler::{ControlClientIdentity, RequestHandler};
+
+pub(super) enum PaneSubscriptionStart<'a> {
+    Oldest,
+    Now,
+    Sequences(&'a [(u32, u64)]),
+}
 
 #[derive(Debug)]
 pub(super) enum PaneEvent {
@@ -35,16 +41,18 @@ pub(super) struct PaneSubscription {
 
 pub(super) async fn refresh_subscriptions(
     handler: &RequestHandler,
+    control_identity: ControlClientIdentity,
     session_name: Option<&SessionName>,
     subscriptions: &mut HashMap<u32, PaneSubscription>,
     pane_event_tx: mpsc::Sender<PaneEvent>,
+    start: PaneSubscriptionStart<'_>,
 ) {
     let Some(session_name) = session_name else {
         subscriptions.clear();
         return;
     };
     let panes = handler
-        .control_session_panes(session_name)
+        .control_session_panes_for_identity(control_identity, session_name)
         .await
         .unwrap_or_default();
     let desired = panes
@@ -65,7 +73,16 @@ pub(super) async fn refresh_subscriptions(
         if subscriptions.contains_key(&pane_id) {
             continue;
         }
-        let mut receiver = sender.subscribe_from_oldest();
+        let mut receiver = match &start {
+            PaneSubscriptionStart::Oldest => sender.subscribe_from_oldest(),
+            PaneSubscriptionStart::Now => sender.subscribe(),
+            PaneSubscriptionStart::Sequences(sequences) => sequences
+                .iter()
+                .find_map(|(candidate, sequence)| {
+                    (*candidate == pane_id).then(|| sender.subscribe_from_sequence(*sequence))
+                })
+                .unwrap_or_else(|| sender.subscribe_from_oldest()),
+        };
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let pane_event_tx = pane_event_tx.clone();
         tokio::spawn(async move {

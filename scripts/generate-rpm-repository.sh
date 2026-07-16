@@ -17,6 +17,7 @@ Options:
   --repo-gpg-key-url <url>       Public repodata GPG key URL
   --repo-signing-key <key-id>    GPG key id/fingerprint for repodata/repomd.xml.asc
   --rpm-signing-key <key-id>     RPM signing key name/fingerprint for rpmsign --addsign
+  --rpm-signing-version <version> Only sign packages with this RPM metadata version
   -h, --help                     Show this help
 USAGE
 }
@@ -49,6 +50,7 @@ gpg_key_url=""
 repo_gpg_key_url=""
 repo_signing_key="${RMUX_RPM_REPO_GPG_KEY:-}"
 rpm_signing_key="${RMUX_RPM_GPG_KEY:-}"
+rpm_signing_version=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -97,6 +99,11 @@ while [ "$#" -gt 0 ]; do
       rpm_signing_key="$2"
       shift 2
       ;;
+    --rpm-signing-version)
+      [ "$#" -ge 2 ] || die "--rpm-signing-version requires a value"
+      rpm_signing_version="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -139,6 +146,13 @@ if [ -n "$rpm_signing_key" ] && [ -n "$repo_signing_key" ]; then
   [ "$rpm_fingerprint" != "$repo_fingerprint" ] || \
     die "RPM package and repository signing keys must be distinct"
 fi
+if [ -n "$rpm_signing_key" ]; then
+  [ -n "$rpm_signing_version" ] || \
+    die "--rpm-signing-version is required with --rpm-signing-key"
+  case "$rpm_signing_version" in
+    *[!0-9A-Za-z._+~-]*|"") die "invalid RPM signing version: $rpm_signing_version" ;;
+  esac
+fi
 
 repo_tool="$(createrepo_cmd)"
 input_dir="$(cd "$input_dir" && pwd)"
@@ -159,9 +173,22 @@ done
 
 if [ -n "$rpm_signing_key" ]; then
   need rpmsign
+  need rpm
+  signed_current=0
   for rpm in "$output_dir"/rmux-*.rpm; do
-    rpmsign --define "_gpg_name $rpm_signing_key" --addsign "$rpm"
+    rpm_identity="$(rpm -qp --queryformat '%{NAME}\t%{VERSION}' "$rpm")" || \
+      die "unable to read RPM identity: ${rpm##*/}"
+    IFS=$'\t' read -r rpm_name rpm_version rpm_extra <<< "$rpm_identity"
+    [ "$rpm_name" = rmux ] || die "unexpected RPM package name: $rpm_name"
+    [ -n "$rpm_version" ] && [ -z "${rpm_extra:-}" ] || \
+      die "malformed RPM package identity: ${rpm##*/}"
+    if [ "$rpm_version" = "$rpm_signing_version" ]; then
+      rpmsign --define "_gpg_name $rpm_signing_key" --addsign "$rpm"
+      signed_current=1
+    fi
   done
+  [ "$signed_current" -eq 1 ] || \
+    die "no RPM metadata matched current version $rpm_signing_version"
 fi
 
 "$repo_tool" "$output_dir"

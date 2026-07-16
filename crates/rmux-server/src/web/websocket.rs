@@ -16,7 +16,7 @@ pub(crate) enum WebSocketMessage {
     Text(String),
     Binary(Vec<u8>),
     Ping(Vec<u8>),
-    Pong,
+    Pong(Vec<u8>),
     Close,
 }
 
@@ -108,7 +108,7 @@ impl WebSocketReader {
             OPCODE_BINARY => Ok(WebSocketMessage::Binary(frame.payload)),
             OPCODE_CLOSE => Ok(WebSocketMessage::Close),
             OPCODE_PING => Ok(WebSocketMessage::Ping(frame.payload)),
-            OPCODE_PONG => Ok(WebSocketMessage::Pong),
+            OPCODE_PONG => Ok(WebSocketMessage::Pong(frame.payload)),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unsupported websocket frame opcode",
@@ -169,7 +169,14 @@ async fn read_frame_with_continuation_timeout(
     stream: &mut (impl AsyncRead + Unpin),
     continuation_timeout: Duration,
 ) -> io::Result<WebSocketFrame> {
-    match timeout(continuation_timeout, read_frame_without_timeout(stream)).await {
+    let mut first = [0u8; 1];
+    stream.read_exact(&mut first).await?;
+    match timeout(
+        continuation_timeout,
+        read_frame_after_first_byte(stream, first[0]),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -178,11 +185,12 @@ async fn read_frame_with_continuation_timeout(
     }
 }
 
-async fn read_frame_without_timeout(
+async fn read_frame_after_first_byte(
     stream: &mut (impl AsyncRead + Unpin),
+    first: u8,
 ) -> io::Result<WebSocketFrame> {
-    let mut head = [0u8; 2];
-    stream.read_exact(&mut head).await?;
+    let mut head = [first, 0];
+    stream.read_exact(&mut head[1..]).await?;
     let fin = head[0] & 0x80 != 0;
     if head[0] & 0x70 != 0 {
         return Err(io::Error::new(
@@ -447,13 +455,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_read_times_out_before_first_byte() {
-        let (_client, mut server) = tokio::io::duplex(8);
+    async fn idle_wait_does_not_consume_frame_continuation_budget() {
+        let (mut client, mut server) = tokio::io::duplex(32);
+        let read = read_frame_with_continuation_timeout(&mut server, Duration::from_millis(1));
+        tokio::pin!(read);
 
-        let error = read_frame_with_continuation_timeout(&mut server, Duration::from_millis(1))
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), read.as_mut())
+                .await
+                .is_err(),
+            "an authenticated idle connection must remain readable"
+        );
+
+        client
+            .write_all(&masked_frame(0x80 | OPCODE_TEXT, b"still-alive"))
             .await
-            .expect_err("idle client must time out before first frame byte");
-
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            .expect("write complete frame after idle");
+        let frame = tokio::time::timeout(Duration::from_millis(100), read)
+            .await
+            .expect("complete frame read after idle")
+            .expect("complete frame is valid");
+        assert_eq!(frame.opcode, OPCODE_TEXT);
+        assert_eq!(frame.payload, b"still-alive");
     }
 }

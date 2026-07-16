@@ -86,6 +86,22 @@ const FIXTURES: &[Fixture] = &[
         feeds: &[b"abcdef\x1b[2;1HXYZ"],
     },
     Fixture {
+        name: "ascii_reflow_cursor_history_anchor_product_divergence",
+        cols: 10,
+        rows: 4,
+        history: 10,
+        resize_after: Some((5, 4)),
+        feeds: &[b"abcdef\x1b[1;3H"],
+    },
+    Fixture {
+        name: "wide_reflow_cursor_gap",
+        cols: 10,
+        rows: 4,
+        history: 10,
+        resize_after: Some((4, 4)),
+        feeds: &["abc表d".as_bytes()],
+    },
+    Fixture {
         name: "sgr_basic_fg_bg_attrs",
         cols: 30,
         rows: 2,

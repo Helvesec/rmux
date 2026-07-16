@@ -256,11 +256,10 @@ fn parse_display_message_args(
                 target_client = Some(args.required("-c target-client")?);
             }
             "-d" => {
-                let _ = args.optional();
-                let _ = args.required("-d delay")?;
+                return Err(unsupported_flag("display-message", "-d"));
             }
             flag if flag.starts_with("-d") && flag.len() > 2 => {
-                let _ = args.optional();
+                return Err(unsupported_flag("display-message", "-d"));
             }
             flag if is_display_message_compact_cluster(flag) => {
                 let cluster = parse_compact_flag_cluster(flag, "aCIlNpv", "cdFt")
@@ -277,7 +276,9 @@ fn parse_display_message_args(
                         CompactFlag::Bare('C') => {}
                         CompactFlag::Bare('I') => stdin = true,
                         CompactFlag::Bare('l') => no_expand = true,
-                        CompactFlag::Bare('N') => {}
+                        CompactFlag::Bare('N') => {
+                            return Err(unsupported_flag("display-message", "-N"));
+                        }
                         CompactFlag::Bare('p') => print = true,
                         CompactFlag::Bare('v') => verbose = true,
                         CompactFlag::Bare(flag) => {
@@ -290,8 +291,8 @@ fn parse_display_message_args(
                             target_client =
                                 Some(compact_flag.value_or_next(&mut args, "-c target-client")?);
                         }
-                        compact_flag @ CompactFlag::Value { flag: 'd', .. } => {
-                            let _ = compact_flag.value_or_next(&mut args, "-d delay")?;
+                        CompactFlag::Value { flag: 'd', .. } => {
+                            return Err(unsupported_flag("display-message", "-d"));
                         }
                         compact_flag @ CompactFlag::Value { flag: 't', .. } => {
                             target = Some(compact_flag.value_or_next(&mut args, "-t target")?);
@@ -310,7 +311,7 @@ fn parse_display_message_args(
                 let _ = args.optional();
             }
             "-N" => {
-                let _ = args.optional();
+                return Err(unsupported_flag("display-message", "-N"));
             }
             "-v" => {
                 let _ = args.optional();

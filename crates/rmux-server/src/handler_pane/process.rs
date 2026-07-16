@@ -85,6 +85,15 @@ impl RequestHandler {
         let attached_count = self.attached_count(&session_name).await;
         let (response, respawned_pane_id) = {
             let mut state = self.state.lock().await;
+            let target_window = rmux_proto::WindowTarget::with_window(
+                request.target.session_name().clone(),
+                request.target.window_index(),
+            );
+            if let Err(error) =
+                super::super::require_expected_window_identity(&state, &target_window)
+            {
+                return Response::Error(ErrorResponse { error });
+            }
             request.start_directory = match render_start_directory_template(
                 &state,
                 &Target::Pane(target),

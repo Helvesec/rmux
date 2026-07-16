@@ -1,17 +1,32 @@
 use rmux_proto::{PaneTarget, RmuxError, Target};
 
+use super::super::attach_support::ActiveAttachIdentity;
 use super::super::RequestHandler;
 use super::support::{find_session_name_by_id, find_window_target_by_id};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 
 impl RequestHandler {
-    pub(in crate::handler) async fn attached_mouse_target(
+    pub(in crate::handler) async fn attached_mouse_target_for_session_identity(
         &self,
-        attach_pid: u32,
+        identity: ActiveAttachIdentity,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
         event: &AttachedMouseEvent,
     ) -> Result<Option<Target>, RmuxError> {
-        let session_name = self.attached_session_name(attach_pid).await?;
-        self.overlay_target_from_mouse(session_name, Some(event))
+        {
+            let active_attach = self.active_attach.lock().await;
+            let Some(_active) = active_attach
+                .by_pid
+                .get(&identity.attach_pid())
+                .filter(|active| {
+                    identity.matches_active_session(active, session_name, session_id)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            else {
+                return Ok(None);
+            };
+        }
+        self.overlay_target_from_mouse(session_name.clone(), Some(session_id), Some(event))
             .await
     }
 
@@ -48,7 +63,7 @@ impl RequestHandler {
                 .and_then(|active| active.mouse.current_event.clone())
         };
         if let Some(target) = self
-            .overlay_target_from_mouse(session_name.clone(), mouse_event.as_ref())
+            .overlay_target_from_mouse(session_name.clone(), None, mouse_event.as_ref())
             .await?
         {
             return Ok(target);
@@ -59,6 +74,7 @@ impl RequestHandler {
     async fn overlay_target_from_mouse(
         &self,
         attached_session: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
         event: Option<&AttachedMouseEvent>,
     ) -> Result<Option<Target>, RmuxError> {
         let Some(event) = event else {
@@ -68,6 +84,14 @@ impl RequestHandler {
             return Ok(Some(Target::Pane(target)));
         }
         let state = self.state.lock().await;
+        if expected_session_id.is_some_and(|expected| {
+            state
+                .sessions
+                .session(&attached_session)
+                .is_none_or(|session| session.id() != expected)
+        }) {
+            return Err(RmuxError::Server("attached session disappeared".to_owned()));
+        }
         match event.location {
             MouseLocation::StatusLeft => Ok(Some(Target::Session(attached_session))),
             MouseLocation::Status | MouseLocation::StatusDefault | MouseLocation::StatusRight => {

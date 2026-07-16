@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -7,9 +8,10 @@ use rmux_proto::{
     AttachedKeystroke, AttachedWindowsConsoleKey, TerminalSize,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::super::action::{run_attach_action, AttachActionExecutor};
+use super::super::terminal_cleanup::fallback_attach_stop_sequence;
 use super::*;
 use crate::attach_lock_state::AttachLockState;
 
@@ -79,6 +81,212 @@ async fn suspend_request_runs_action_and_sends_unlock() -> Result<(), Box<dyn st
     scenario.join().await?;
 
     assert_eq!(actions.calls(), vec!["suspend", "detach-kill"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lock_and_suspend_unlock_paths_rearm_attach_screen(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let screen_tracker = AttachScreenTracker::default();
+    let mut scenario = AttachScenario::with_screen_tracker(
+        RecordingActions::default(),
+        true,
+        screen_tracker.clone(),
+    );
+    let actions = scenario.actions.clone();
+    let mut server = scenario.take_server();
+    let requests = [
+        AttachMessage::Lock("legacy".to_owned()),
+        AttachMessage::LockShellCommand(AttachShellCommand::new(
+            "structured".to_owned(),
+            "pwsh.exe".to_owned(),
+            r"C:\work".to_owned(),
+        )),
+        AttachMessage::Suspend,
+    ];
+
+    for request in requests {
+        screen_tracker.mark_stopped();
+        write_server_message(&mut server, request).await?;
+        assert_eq!(
+            read_client_message(&mut server).await?,
+            AttachMessage::Unlock
+        );
+        assert!(
+            !screen_tracker.was_stopped(),
+            "successful resume must make a later EOF/reset abnormal again"
+        );
+    }
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+    assert_eq!(
+        actions.calls(),
+        vec!["lock:legacy", "lock:structured", "suspend", "detach-kill"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lock_completion_unlocks_while_preserving_a_concurrent_final_stop(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (input_tx, input_rx) = mpsc::channel(1);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let screen_tracker = AttachScreenTracker::default();
+    let client_tracker = screen_tracker.clone();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            SharedOutput::default(),
+            client_tracker,
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+        )
+        .await
+    });
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    write_server_message(&mut server, AttachMessage::Lock("block".to_owned())).await?;
+
+    let (action_rx, action) = receive_attach_action(action_rx).await?;
+    assert!(matches!(action, AttachAction::LegacyLock(command) if command == "block"));
+    let lock_prelude = wait_for_stop_generation(&screen_tracker, None).await?;
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    let final_stop = wait_for_stop_generation(&screen_tracker, Some(lock_prelude)).await?;
+
+    completion_tx.send(Ok(AttachActionOutcome::Unlock))?;
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Unlock,
+        "a completed lock must always be acknowledged"
+    );
+    assert_eq!(screen_tracker.current_stop_generation(), Some(final_stop));
+    input_tx
+        .send(super::super::input::AttachInput::bytes(
+            b"after-lock".to_vec(),
+        ))
+        .await?;
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"after-lock".to_vec())),
+        "a newer stop must not leave the attach input lock wedged"
+    );
+    assert!(
+        !client.is_finished(),
+        "a final stop may be followed by a detach action in a later frame"
+    );
+
+    let command = AttachShellCommand::new(
+        "echo bye".to_owned(),
+        "pwsh.exe".to_owned(),
+        r"C:\work".to_owned(),
+    );
+    write_server_message(
+        &mut server,
+        AttachMessage::DetachExecShellCommand(command.clone()),
+    )
+    .await?;
+    let (_action_rx, final_action) = receive_attach_action(action_rx).await?;
+    assert!(
+        matches!(final_action, AttachAction::DetachExec(received) if received.command() == command.command() && received.shell() == command.shell() && received.cwd() == command.cwd())
+    );
+    completion_tx.send(Ok(AttachActionOutcome::Exit))?;
+    timeout(client).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lock_completion_preserves_a_newer_resumable_stop() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(1);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let screen_tracker = AttachScreenTracker::default();
+    let client_tracker = screen_tracker.clone();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            SharedOutput::default(),
+            client_tracker,
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+        )
+        .await
+    });
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    write_server_message(&mut server, AttachMessage::Lock("block".to_owned())).await?;
+    let (action_rx, first_action) = receive_attach_action(action_rx).await?;
+    assert!(matches!(
+        first_action,
+        AttachAction::LegacyLock(command) if command == "block"
+    ));
+    let lock_stop = wait_for_stop_generation(&screen_tracker, None).await?;
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    write_server_message(&mut server, AttachMessage::Suspend).await?;
+    let (action_rx, second_action) = receive_attach_action(action_rx).await?;
+    assert!(matches!(second_action, AttachAction::Suspend));
+    let suspend_stop = wait_for_stop_generation(&screen_tracker, Some(lock_stop)).await?;
+
+    completion_tx.send(Ok(AttachActionOutcome::Unlock))?;
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Unlock
+    );
+    assert_eq!(
+        screen_tracker.current_stop_generation(),
+        Some(suspend_stop),
+        "the older completion must not consume the newer resumable stop"
+    );
+    assert!(
+        !client.is_finished(),
+        "the attach must await the newer action"
+    );
+
+    completion_tx.send(Ok(AttachActionOutcome::Unlock))?;
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Unlock
+    );
+    assert!(
+        !screen_tracker.was_stopped(),
+        "the matching completion must rearm the attach"
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    let (_action_rx, final_action) = receive_attach_action(action_rx).await?;
+    assert!(matches!(final_action, AttachAction::DetachKill));
+    completion_tx.send(Ok(AttachActionOutcome::Exit))?;
+    timeout(client).await???;
     Ok(())
 }
 
@@ -220,6 +428,147 @@ async fn windows_console_key_metadata_is_sent_with_single_chunk_input(
     assert_eq!(
         read_client_message(&mut server).await?,
         AttachMessage::Keystroke(AttachedKeystroke::new(vec![0x04]).with_windows_console_key(key))
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_windows_console_keys_are_sent_as_separate_structured_frames(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let mut server = scenario.take_server();
+    let input_tx = scenario.input_tx();
+    let repeated_key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 3);
+    let logical_key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 1);
+
+    input_tx
+        .send(super::super::input::AttachInput::with_windows_console_key(
+            b";".to_vec(),
+            repeated_key,
+        ))
+        .await
+        .expect("send repeated Ctrl+; input");
+
+    assert_eq!(
+        read_client_messages(&mut server, 3).await?,
+        vec![
+            AttachMessage::Keystroke(
+                AttachedKeystroke::new(b";".to_vec()).with_windows_console_key(logical_key)
+            );
+            3
+        ]
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+    Ok(())
+}
+
+#[test]
+fn repeated_input_counter_preserves_maximum_u16_without_expansion() {
+    let key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, u16::MAX);
+    let input = super::super::input::AttachInput::with_windows_console_key(b";".to_vec(), key);
+    let mut pending = PendingRepeatedAttachInput::new(input);
+
+    assert_eq!(pending.remaining, u16::MAX);
+    assert_eq!(pending.input.payload(), b";");
+    for _ in 1..u16::MAX {
+        assert!(!pending.consume_one());
+    }
+    assert!(pending.consume_one());
+}
+
+#[tokio::test]
+async fn maximum_console_key_repeat_does_not_starve_server_detach(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let actions = scenario.actions.clone();
+    let server = scenario.take_server();
+    let input_tx = scenario.input_tx();
+    let repeated_key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, u16::MAX);
+    let (mut server_reader, mut server_writer) = tokio::io::split(server);
+    let (first_repeat_tx, first_repeat_rx) = tokio::sync::oneshot::channel();
+
+    let drain = tokio::spawn(async move {
+        let mut decoder = AttachFrameDecoder::new();
+        let mut buffer = [0_u8; 4096];
+        let mut emitted_repeats = 0_u32;
+        let mut first_repeat_tx = Some(first_repeat_tx);
+
+        loop {
+            let bytes_read = server_reader
+                .read(&mut buffer)
+                .await
+                .expect("read repeated attach frames");
+            if bytes_read == 0 {
+                break;
+            }
+            decoder.push_bytes(&buffer[..bytes_read]);
+            while let Some(message) = decoder
+                .next_message()
+                .expect("decode repeated attach frame")
+            {
+                if matches!(message, AttachMessage::Keystroke(_)) {
+                    emitted_repeats += 1;
+                    if let Some(first_repeat_tx) = first_repeat_tx.take() {
+                        let _ = first_repeat_tx.send(());
+                    }
+                }
+            }
+        }
+
+        emitted_repeats
+    });
+
+    input_tx
+        .send(super::super::input::AttachInput::with_windows_console_key(
+            b";".to_vec(),
+            repeated_key,
+        ))
+        .await
+        .expect("send maximum repeated Ctrl+; input");
+    timeout(first_repeat_rx)
+        .await?
+        .map_err(|_| "attach stream ended before the first repeated key")?;
+
+    let detach = encode_attach_message(&AttachMessage::DetachKill)?;
+    timeout(server_writer.write_all(&detach)).await??;
+    actions
+        .wait_for_call("detach-kill", Duration::from_secs(1))
+        .await?;
+
+    scenario.join().await?;
+    let emitted_repeats = timeout(drain).await??;
+    assert!(emitted_repeats > 0, "repeat stream should have started");
+    assert!(
+        emitted_repeats < u32::from(u16::MAX),
+        "server detach must interrupt the repeat stream before all repeats are emitted"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_windows_console_keys_preserve_count_without_capability(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::with_windows_console_key(RecordingActions::default(), false);
+    let mut server = scenario.take_server();
+    let input_tx = scenario.input_tx();
+    let repeated_key = AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 3);
+
+    input_tx
+        .send(super::super::input::AttachInput::with_windows_console_key(
+            b";".to_vec(),
+            repeated_key,
+        ))
+        .await
+        .expect("send repeated Ctrl+; input");
+
+    assert_eq!(
+        read_client_messages(&mut server, 3).await?,
+        vec![AttachMessage::Keystroke(AttachedKeystroke::new(b";".to_vec())); 3]
     );
 
     write_server_message(&mut server, AttachMessage::DetachKill).await?;
@@ -900,6 +1249,311 @@ async fn output_writer_failure_wakes_attach_loop_while_server_is_idle(
 }
 
 #[tokio::test]
+async fn input_worker_error_wakes_idle_attach_and_runs_cleanup_once(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, _server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(8);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, _action_rx) = std::sync::mpsc::channel();
+    let (_action_completion_tx, action_completion_rx) = mpsc::unbounded_channel();
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let cleanup = fallback_attach_stop_sequence("xterm-256color");
+    let client_output = SharedOutput {
+        bytes: Arc::clone(&written),
+    };
+    let (input_completion_tx, input_completion_rx) = oneshot::channel();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            client_output,
+            AttachScreenTracker::default(),
+            AttachAsyncChannels::new(
+                input_rx,
+                resize_rx,
+                action_tx,
+                action_completion_rx,
+                locked,
+                true,
+            )
+            .with_input_completion(input_completion_rx)
+            .with_error_cleanup(Some(cleanup)),
+        )
+        .await
+    });
+
+    input_completion_tx
+        .send(Err(ClientError::Io(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "injected attach input failure",
+        ))))
+        .map_err(|_| "input completion receiver dropped before failure")?;
+    let error = timeout(client)
+        .await??
+        .expect_err("input failure must stop an otherwise idle attach");
+    assert!(
+        matches!(
+            error,
+            ClientError::Io(ref error)
+                if error.kind() == io::ErrorKind::BrokenPipe
+                    && error.to_string() == "injected attach input failure"
+        ),
+        "unexpected attach input error: {error}"
+    );
+    assert_eq!(
+        *written.lock().expect("output mutex poisoned"),
+        fallback_attach_stop_sequence("xterm-256color"),
+        "input failure must enqueue exactly one terminal cleanup sequence"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ready_input_error_preempts_already_queued_keystrokes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (input_tx, input_rx) = mpsc::channel(8);
+    input_tx
+        .send(super::super::input::AttachInput::bytes(
+            b"must-not-be-forwarded".to_vec(),
+        ))
+        .await?;
+    let (input_completion_tx, input_completion_rx) = oneshot::channel();
+    input_completion_tx
+        .send(Err(ClientError::Io(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "input failed after queuing bytes",
+        ))))
+        .map_err(|_| "input completion receiver dropped before attach start")?;
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, _action_rx) = std::sync::mpsc::channel();
+    let (_action_completion_tx, action_completion_rx) = mpsc::unbounded_channel();
+
+    let error = drive_async_attach(
+        reader,
+        writer,
+        Vec::new(),
+        SharedOutput::default(),
+        AttachScreenTracker::default(),
+        AttachAsyncChannels::new(
+            input_rx,
+            resize_rx,
+            action_tx,
+            action_completion_rx,
+            locked,
+            true,
+        )
+        .with_input_completion(input_completion_rx),
+    )
+    .await
+    .expect_err("a published input error must abort queued keystrokes");
+    assert!(
+        matches!(error, ClientError::Io(ref error) if error.kind() == io::ErrorKind::BrokenPipe),
+        "unexpected queued input error: {error}"
+    );
+
+    let mut forwarded = [0_u8; 64];
+    assert_eq!(
+        server.read(&mut forwarded).await?,
+        0,
+        "once the worker publishes an error, queued input must be abandoned rather than forwarded"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn input_worker_exit_without_result_fails_instead_of_becoming_read_only(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, _server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(8);
+    let (input_completion_tx, input_completion_rx) = oneshot::channel();
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, _action_rx) = std::sync::mpsc::channel();
+    let (_action_completion_tx, action_completion_rx) = mpsc::unbounded_channel();
+    drop(input_completion_tx);
+
+    let error = drive_async_attach(
+        reader,
+        writer,
+        Vec::new(),
+        SharedOutput::default(),
+        AttachScreenTracker::default(),
+        AttachAsyncChannels::new(
+            input_rx,
+            resize_rx,
+            action_tx,
+            action_completion_rx,
+            locked,
+            true,
+        )
+        .with_input_completion(input_completion_rx),
+    )
+    .await
+    .expect_err("a panicked input worker must stop attach");
+    assert!(
+        matches!(
+            error,
+            ClientError::Io(ref error)
+                if error.kind() == io::ErrorKind::Other
+                    && error.to_string()
+                        == "attach input worker stopped before reporting completion"
+        ),
+        "unexpected missing input completion error: {error}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn normal_input_completion_drains_final_bytes_and_keeps_output_open(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (input_tx, input_rx) = mpsc::channel(8);
+    input_tx
+        .send(super::super::input::AttachInput::bytes(
+            b"final-input".to_vec(),
+        ))
+        .await?;
+    drop(input_tx);
+    let (input_completion_tx, input_completion_rx) = oneshot::channel();
+    input_completion_tx
+        .send(Ok(()))
+        .map_err(|_| "input completion receiver dropped before attach start")?;
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, _action_rx) = std::sync::mpsc::channel();
+    let (_action_completion_tx, action_completion_rx) = mpsc::unbounded_channel();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            SharedOutput::default(),
+            AttachScreenTracker::default(),
+            AttachAsyncChannels::new(
+                input_rx,
+                resize_rx,
+                action_tx,
+                action_completion_rx,
+                locked,
+                true,
+            )
+            .with_input_completion(input_completion_rx),
+        )
+        .await
+    });
+
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"final-input".to_vec())),
+        "normal input completion must not discard bytes queued before EOF"
+    );
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        !client.is_finished(),
+        "normal stdin EOF must preserve the existing output-only attach behavior"
+    );
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    drop(server);
+    timeout(client).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn abrupt_eof_queues_cleanup_after_output_and_drops_the_only_writer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(8);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, _action_rx) = std::sync::mpsc::channel();
+    let (_completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let output = DropTrackingOutput {
+        dropped: Arc::clone(&dropped),
+        written: Arc::clone(&written),
+    };
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(b"render-before-eof".to_vec()),
+    )
+    .await?;
+    drop(server);
+    let error = drive_async_attach(
+        reader,
+        writer,
+        Vec::new(),
+        output,
+        AttachScreenTracker::default(),
+        AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true)
+            .with_error_cleanup(Some(fallback_attach_stop_sequence("xterm-256color"))),
+    )
+    .await
+    .expect_err("abrupt daemon EOF must fail an unstopped attach");
+
+    assert!(
+        matches!(
+            error,
+            ClientError::Io(ref error) if error.kind() == io::ErrorKind::UnexpectedEof
+        ),
+        "unexpected attach error: {error}"
+    );
+    assert!(dropped.load(Ordering::SeqCst), "output writer must stop");
+    let mut expected = b"render-before-eof".to_vec();
+    expected.extend_from_slice(&fallback_attach_stop_sequence("xterm-256color"));
+    assert_eq!(
+        *written.lock().expect("output mutex poisoned"),
+        expected,
+        "cleanup must be the final frame drained by the existing writer"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_detach_does_not_enqueue_error_cleanup() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut scenario = AttachScenario::with_error_cleanup(RecordingActions::default());
+    let mut server = scenario.take_server();
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+
+    assert!(scenario.join().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn observed_attach_stop_does_not_enqueue_error_cleanup(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::with_error_cleanup(RecordingActions::default());
+    let mut server = scenario.take_server();
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
+    drop(server);
+
+    assert_eq!(scenario.join().await?, ALT_SCREEN_EXIT_FALLBACK);
+    Ok(())
+}
+
+#[tokio::test]
 async fn mouse_sequences_toggle_windows_console_mouse_actions(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut scenario = AttachScenario::new(RecordingActions::default());
@@ -1058,6 +1712,36 @@ impl AttachScenario {
         actions: RecordingActions,
         windows_console_key_enabled: bool,
     ) -> Self {
+        Self::with_screen_tracker(
+            actions,
+            windows_console_key_enabled,
+            AttachScreenTracker::default(),
+        )
+    }
+
+    fn with_screen_tracker(
+        actions: RecordingActions,
+        windows_console_key_enabled: bool,
+        screen_tracker: AttachScreenTracker,
+    ) -> Self {
+        Self::with_options(actions, windows_console_key_enabled, screen_tracker, None)
+    }
+
+    fn with_error_cleanup(actions: RecordingActions) -> Self {
+        Self::with_options(
+            actions,
+            true,
+            AttachScreenTracker::default(),
+            Some(fallback_attach_stop_sequence("xterm-256color")),
+        )
+    }
+
+    fn with_options(
+        actions: RecordingActions,
+        windows_console_key_enabled: bool,
+        screen_tracker: AttachScreenTracker,
+        error_cleanup: Option<Vec<u8>>,
+    ) -> Self {
         let (client_stream, server) = tokio::io::duplex(4096);
         let (reader, writer) = tokio::io::split(client_stream);
         let (input_tx, input_rx) = mpsc::channel(8);
@@ -1086,7 +1770,7 @@ impl AttachScenario {
                 writer,
                 Vec::new(),
                 client_output,
-                AttachScreenTracker::default(),
+                screen_tracker,
                 AttachAsyncChannels::new(
                     input_rx,
                     resize_rx,
@@ -1094,7 +1778,8 @@ impl AttachScenario {
                     completion_rx,
                     locked,
                     windows_console_key_enabled,
-                ),
+                )
+                .with_error_cleanup(error_cleanup),
             )
             .await
         });
@@ -1225,6 +1910,32 @@ impl Write for FailingOutput {
     }
 }
 
+#[derive(Debug)]
+struct DropTrackingOutput {
+    dropped: Arc<AtomicBool>,
+    written: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Write for DropTrackingOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.written
+            .lock()
+            .map_err(|_| io::Error::other("output mutex poisoned"))?
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for DropTrackingOutput {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct RecordingActions {
     calls: Arc<Mutex<Vec<String>>>,
@@ -1323,6 +2034,35 @@ async fn write_server_message(
     Ok(())
 }
 
+async fn receive_attach_action(
+    receiver: std::sync::mpsc::Receiver<AttachAction>,
+) -> Result<(std::sync::mpsc::Receiver<AttachAction>, AttachAction), Box<dyn std::error::Error>> {
+    let (receiver, action) = tokio::task::spawn_blocking(move || {
+        let action = receiver.recv_timeout(Duration::from_secs(1));
+        (receiver, action)
+    })
+    .await?;
+    Ok((receiver, action?))
+}
+
+async fn wait_for_stop_generation(
+    tracker: &AttachScreenTracker,
+    previous: Option<AttachStopGeneration>,
+) -> Result<AttachStopGeneration, Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if let Some(generation) = tracker.current_stop_generation() {
+            if Some(generation) != previous {
+                return Ok(generation);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("timed out waiting for attach stop generation".into());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 async fn read_client_message(
     stream: &mut tokio::io::DuplexStream,
 ) -> Result<AttachMessage, Box<dyn std::error::Error>> {
@@ -1341,6 +2081,32 @@ async fn read_client_message(
             return Ok(message);
         }
     }
+}
+
+async fn read_client_messages(
+    stream: &mut tokio::io::DuplexStream,
+    expected_count: usize,
+) -> Result<Vec<AttachMessage>, Box<dyn std::error::Error>> {
+    let mut decoder = AttachFrameDecoder::new();
+    let mut messages = Vec::with_capacity(expected_count);
+    let mut buffer = [0_u8; 128];
+    while messages.len() < expected_count {
+        let bytes_read = timeout(stream.read(&mut buffer)).await??;
+        if bytes_read == 0 {
+            return Err(Box::new(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "client stream closed before all responses",
+            )));
+        }
+        decoder.push_bytes(&buffer[..bytes_read]);
+        while messages.len() < expected_count {
+            let Some(message) = decoder.next_message()? else {
+                break;
+            };
+            messages.push(message);
+        }
+    }
+    Ok(messages)
 }
 
 async fn wait_for_blocking_output_start(

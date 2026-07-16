@@ -169,6 +169,36 @@ fn new_session_attach_if_exists_does_not_silently_succeed_when_detached(
 }
 
 #[test]
+fn non_terminal_new_session_rejects_before_creating_session() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-notty-preflight")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    let attached = harness.run(&["new-session", "-s", "alpha"])?;
+
+    assert_eq!(attached.status.code(), Some(1));
+    assert!(stdout(&attached).is_empty());
+    assert_eq!(stderr(&attached), "open terminal failed: not a terminal\n");
+
+    let detached = harness.run(&["new-session", "-d", "-s", "alpha"])?;
+    assert_success(&detached);
+    Ok(())
+}
+
+#[test]
+fn non_terminal_new_session_preserves_duplicate_error_order() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-notty-duplicate")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let duplicate = harness.run(&["new-session", "-s", "alpha"])?;
+
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert!(stdout(&duplicate).is_empty());
+    assert_eq!(stderr(&duplicate), "duplicate session: alpha\n");
+    Ok(())
+}
+
+#[test]
 fn new_session_rejects_zero_dimensions_before_creating_session() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("new-session-zero-dimensions")?;
 

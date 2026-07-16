@@ -14,24 +14,42 @@ fn modoff_clears_extended_keys() {
 }
 
 #[test]
-fn kitty_keyboard_push_enables_csi_u_extended_keys() {
-    let (_p, w) = parse(b"\x1b[>1u");
-    assert!(w.has_call("mode_clear(0x248000)")); // EXTENDED_KEY_MODES
-    assert!(w.has_call("mode_set(0x240000)")); // MODE_KEYS_EXTENDED_2 | MODE_KEYS_KITTY
+fn kitty_keyboard_requests_are_consumed_without_negotiating_support() {
+    for request in [
+        b"\x1b[=8u".as_slice(),
+        b"\x1b[=0u".as_slice(),
+        b"\x1b[=1;3u".as_slice(),
+        b"\x1b[>1u".as_slice(),
+        b"\x1b[>0u".as_slice(),
+        b"\x1b[>1;3u".as_slice(),
+        b"\x1b[<u".as_slice(),
+        b"\x1b[<2u".as_slice(),
+        b"\x1b[?u".as_slice(),
+    ] {
+        let (parser, writer) = parse(request);
+
+        assert!(parser.reply_buf.is_empty(), "request {request:?}");
+        assert_eq!(writer.mode, MODE_CURSOR | MODE_WRAP, "request {request:?}");
+        assert!(!writer.has_call("mode_set("), "request {request:?}");
+        assert!(!writer.has_call("mode_clear("), "request {request:?}");
+    }
 }
 
 #[test]
-fn kitty_keyboard_set_and_pop_update_csi_u_extended_keys() {
-    let (_p, w) = parse(b"\x1b[=8u\x1b[<u");
-    assert!(w.has_call("mode_set(0x240000)")); // MODE_KEYS_EXTENDED_2 | MODE_KEYS_KITTY
-    assert!(w.has_call("mode_clear(0x240000)"));
-}
+fn kitty_keyboard_requests_preserve_xterm_extended_key_mode() {
+    let (_parser, writer) = parse(b"\x1b[>4;2m\x1b[=8u\x1b[>1u\x1b[<u\x1b[?u");
+    let mode_transitions = writer
+        .calls
+        .iter()
+        .filter(|call| call.starts_with("mode_set(") || call.starts_with("mode_clear("))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
 
-#[test]
-fn kitty_keyboard_query_reports_current_flag_state() {
-    let (p, _w) = parse(b"\x1b[>1u\x1b[?u");
-    let replies = String::from_utf8_lossy(&p.reply_buf);
-    assert_eq!(replies.as_ref(), "\x1b[?1u");
+    assert_eq!(writer.mode, MODE_CURSOR | MODE_WRAP | MODE_KEYS_EXTENDED_2);
+    assert_eq!(
+        mode_transitions,
+        ["mode_clear(0x248000)", "mode_set(0x40000)"]
+    );
 }
 
 // ─── Hardening: ground timer ───────────────────────────────────────

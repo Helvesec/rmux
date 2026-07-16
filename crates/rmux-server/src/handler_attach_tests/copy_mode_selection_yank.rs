@@ -232,14 +232,20 @@ async fn copy_mode_vi_escape_clears_active_selection_without_exiting_or_leaking(
     let forwarded_to_pane = handler
         .handle_attached_live_input_inner(requester_pid, &mut pending_input, b"\x1b")
         .await
-        .expect("Escape clears active vi selection");
+        .expect("Escape prefix waits for escape-time");
     assert!(
         !forwarded_to_pane,
         "Escape must be consumed by copy-mode instead of reaching pane IO"
     );
+    assert_eq!(pending_input, b"\x1b");
+    let forwarded_to_pane = handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("Escape timeout clears active vi selection");
+    assert!(!forwarded_to_pane);
     assert!(
         pending_input.is_empty(),
-        "Escape should fully decode and leave no pending input"
+        "Escape timeout should fully decode and leave no pending input"
     );
     assert_eq!(
         copy_selection_status(&handler, target.clone()).await,
@@ -335,10 +341,18 @@ async fn copy_mode_emacs_escape_exits_active_selection_without_leak() {
         "test setup must have an active emacs selection before Escape"
     );
 
+    let mut escape_input = Vec::new();
     handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b")
+        .handle_attached_live_input(requester_pid, &mut escape_input, b"\x1b")
         .await
-        .expect("Escape exits emacs copy-mode even with an active selection");
+        .expect("Escape prefix waits for escape-time");
+    assert_eq!(escape_input, b"\x1b");
+    let forwarded_to_pane = handler
+        .flush_attached_pending_escape_input(requester_pid, &mut escape_input)
+        .await
+        .expect("Escape timeout exits emacs copy-mode with an active selection");
+    assert!(!forwarded_to_pane);
+    assert!(escape_input.is_empty());
     assert_eq!(
         copy_selection_status(&handler, target.clone()).await,
         "0:,::::,:,\n",

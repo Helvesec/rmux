@@ -62,19 +62,17 @@ pub(super) struct ClaudeInvocation {
     args: Vec<OsString>,
 }
 
+impl ClaudeInvocation {
+    pub(super) fn new(args: Vec<OsString>) -> Self {
+        Self { args }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ClaudeRunnerInvocation {
     pid_file: PathBuf,
     main_socket: String,
     args: Vec<OsString>,
-}
-
-pub(super) fn parse_invocation(arguments: &[OsString]) -> Option<ClaudeInvocation> {
-    let command_index = split_top_level_prefix(arguments)?;
-    let command = arguments.get(command_index)?.to_str()?;
-    (command == "claude").then(|| ClaudeInvocation {
-        args: arguments[command_index + 1..].to_vec(),
-    })
 }
 
 pub(super) fn parse_internal_runner(arguments: &[OsString]) -> Option<ClaudeRunnerInvocation> {
@@ -100,6 +98,8 @@ pub(super) fn run(invocation: ClaudeInvocation) -> Result<i32, ExitFailure> {
     if should_launch_attached() {
         return run_attached(invocation);
     }
+    #[cfg(any(unix, windows))]
+    report_unrequested_direct_launch();
     run_direct(invocation)
 }
 
@@ -297,7 +297,99 @@ fn remove_temporary_shim_dir(dir: &Path) {
 
 #[cfg(any(unix, windows))]
 fn should_launch_attached() -> bool {
-    env::var_os(DIRECT_LAUNCH_ENV).is_none() && io::stdin().is_terminal()
+    #[cfg(windows)]
+    let stdin_is_msys_pty = stdin_is_msys_pty();
+    #[cfg(not(windows))]
+    let stdin_is_msys_pty = false;
+    launch_attached_decision(
+        env::var_os(DIRECT_LAUNCH_ENV).is_some(),
+        io::stdin().is_terminal(),
+        stdin_is_msys_pty,
+    )
+}
+
+#[cfg(any(unix, windows))]
+fn launch_attached_decision(
+    direct_launch_requested: bool,
+    stdin_is_terminal: bool,
+    stdin_is_msys_pty: bool,
+) -> bool {
+    !direct_launch_requested && stdin_is_terminal && !stdin_is_msys_pty
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectLaunchNotice {
+    NonTerminal,
+    MsysPty,
+}
+
+#[cfg(any(unix, windows))]
+fn direct_launch_notice(
+    direct_launch_requested: bool,
+    stderr_is_terminal: bool,
+    stdin_is_msys_pty: bool,
+    stderr_is_msys_pty: bool,
+) -> Option<DirectLaunchNotice> {
+    if direct_launch_requested || (!stderr_is_terminal && !stderr_is_msys_pty) {
+        return None;
+    }
+    Some(if stdin_is_msys_pty {
+        DirectLaunchNotice::MsysPty
+    } else {
+        DirectLaunchNotice::NonTerminal
+    })
+}
+
+/// Explains a fall-through to the direct launch path when the user did not
+/// ask for it. Claude's interactive UI needs a terminal; reaching this point
+/// means stdin was not recognized as one (issue #77: Git Bash/mintty ptys,
+/// VS Code tasks, plain pipes), and launching silently used to look like
+/// "rmux claude does nothing".
+#[cfg(any(unix, windows))]
+fn report_unrequested_direct_launch() {
+    #[cfg(windows)]
+    let stdin_is_msys_pty = stdin_is_msys_pty();
+    #[cfg(windows)]
+    let stderr_is_msys_pty = stderr_is_msys_pty();
+    #[cfg(not(windows))]
+    let stdin_is_msys_pty = false;
+    #[cfg(not(windows))]
+    let stderr_is_msys_pty = false;
+    let notice = direct_launch_notice(
+        env::var_os(DIRECT_LAUNCH_ENV).is_some(),
+        io::stderr().is_terminal(),
+        stdin_is_msys_pty,
+        stderr_is_msys_pty,
+    );
+    match notice {
+        Some(DirectLaunchNotice::MsysPty) => eprintln!(
+            "rmux claude: stdin is a Git Bash / MSYS pty, not a Windows console; \
+             the interactive claude UI cannot attach here. Run `rmux claude` from \
+             Windows Terminal, PowerShell, or cmd.exe (or prefix with `winpty`); \
+             set {DIRECT_LAUNCH_ENV}=1 to launch claude directly without a terminal."
+        ),
+        Some(DirectLaunchNotice::NonTerminal) => eprintln!(
+            "rmux claude: stdin is not a terminal, so the interactive UI is skipped \
+             and claude is launched directly; run from a terminal, or set \
+             {DIRECT_LAUNCH_ENV}=1 to make the direct launch explicit."
+        ),
+        None => {}
+    }
+}
+
+#[cfg(windows)]
+fn stdin_is_msys_pty() -> bool {
+    use std::os::windows::io::AsRawHandle;
+
+    crate::windows_terminal::handle_is_msys_pty(io::stdin().as_raw_handle())
+}
+
+#[cfg(windows)]
+fn stderr_is_msys_pty() -> bool {
+    use std::os::windows::io::AsRawHandle;
+
+    crate::windows_terminal::handle_is_msys_pty(io::stderr().as_raw_handle())
 }
 
 #[cfg(any(unix, windows))]
@@ -1467,45 +1559,6 @@ fn rmux_file_name() -> OsString {
     name
 }
 
-fn split_top_level_prefix(arguments: &[OsString]) -> Option<usize> {
-    let mut index = 0;
-
-    while let Some(argument) = arguments.get(index) {
-        let value = argument.to_str()?;
-        if value == "--" {
-            return Some(index + 1);
-        }
-        if !value.starts_with('-') || value == "-" {
-            return Some(index);
-        }
-
-        match value {
-            "-2" | "-D" | "-N" | "-l" | "-u" => {}
-            "-C" | "-v" => {}
-            "-c" | "-f" | "-L" | "-S" | "-T" => {
-                index += 1;
-            }
-            _ if value.starts_with("-L") && value.len() > 2 => {}
-            _ if value.starts_with("-S") && value.len() > 2 => {}
-            _ if value.starts_with("-f") && value.len() > 2 => {}
-            _ if value.starts_with("-T") && value.len() > 2 => {}
-            _ if is_short_flag_cluster(value, "2CDNluv") => {}
-            _ => return Some(index),
-        }
-
-        index += 1;
-    }
-
-    None
-}
-
-fn is_short_flag_cluster(value: &str, allowed: &str) -> bool {
-    value.len() > 2
-        && value.starts_with('-')
-        && !value.starts_with("--")
-        && value.chars().skip(1).all(|flag| allowed.contains(flag))
-}
-
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
@@ -1514,7 +1567,10 @@ mod tests {
         install_windows_tmux_shim_in_dir, resolve_windows_program,
         stale_windows_claude_temp_dir_pid, windows_full_helper_candidates,
     };
-    use super::{parse_invocation, path_with_shim_first_from};
+    use super::{
+        direct_launch_notice, launch_attached_decision, path_with_shim_first_from,
+        ClaudeInvocation, DirectLaunchNotice,
+    };
     use std::env;
     use std::ffi::OsString;
     #[cfg(any(unix, windows))]
@@ -1526,20 +1582,71 @@ mod tests {
     #[cfg(windows)]
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn unrequested_direct_launch_notice_distinguishes_human_stderr_from_redirects() {
+        assert_eq!(direct_launch_notice(false, false, false, false), None);
+        assert_eq!(
+            direct_launch_notice(false, false, true, true),
+            Some(DirectLaunchNotice::MsysPty)
+        );
+        assert_eq!(direct_launch_notice(false, false, true, false), None);
+        assert_eq!(
+            direct_launch_notice(false, false, false, true),
+            Some(DirectLaunchNotice::NonTerminal)
+        );
+        assert_eq!(
+            direct_launch_notice(false, true, true, false),
+            Some(DirectLaunchNotice::MsysPty)
+        );
+        assert_eq!(direct_launch_notice(true, true, true, true), None);
+    }
+
+    #[test]
+    fn attached_launch_rejects_direct_nonterminal_and_msys_inputs() {
+        assert!(launch_attached_decision(false, true, false));
+        assert!(!launch_attached_decision(true, true, false));
+        assert!(!launch_attached_decision(false, false, false));
+        assert!(!launch_attached_decision(false, true, true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn msys_pty_pipe_names_are_recognized() {
+        // Git Bash / mintty stdin (issue #77): MSYS and Cygwin pty pipes.
+        for name in [
+            r"\msys-dd50a72ab4668b33-pty0-from-master",
+            r"\msys-dd50a72ab4668b33-pty1-to-master",
+            r"\cygwin-e022582115c10879-pty4-from-master",
+        ] {
+            assert!(
+                crate::windows_terminal::is_msys_pty_pipe_name(&name.to_ascii_lowercase()),
+                "{name} must be detected as an MSYS pty"
+            );
+        }
+        for name in [
+            r"\pipe\rmux-daemon",
+            r"\msys-dd50a72ab4668b33-shared",
+            r"\some-pty-alike",
+            "",
+        ] {
+            assert!(
+                !crate::windows_terminal::is_msys_pty_pipe_name(&name.to_ascii_lowercase()),
+                "{name} must not be detected as an MSYS pty"
+            );
+        }
+    }
+
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
     }
 
     #[test]
-    fn parses_claude_after_top_level_socket_flags() {
-        let invocation = parse_invocation(&args(&[
-            "-Ldemo",
-            "claude",
+    fn invocation_preserves_claude_arguments() {
+        let invocation = ClaudeInvocation::new(args(&[
             "--dangerously-skip-permissions",
             "--teammate-mode",
             "in-process",
-        ]))
-        .expect("claude invocation");
+        ]));
 
         assert_eq!(
             invocation.args,
@@ -1549,11 +1656,6 @@ mod tests {
                 "in-process"
             ])
         );
-    }
-
-    #[test]
-    fn ignores_other_commands() {
-        assert!(parse_invocation(&args(&["list-sessions"])).is_none());
     }
 
     #[test]

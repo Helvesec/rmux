@@ -590,6 +590,8 @@ jobs:
 
       - name: cargo test workspace on Windows
         if: runner.os == 'Windows'
+        env:
+          RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: "1"
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
       - name: rmux binary smoke
@@ -652,6 +654,8 @@ jobs:
             cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Windows hidden daemon smoke
+        env:
+          RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: "1"
         run: cargo test --locked --test internal_daemon_windows -- --nocapture
 
       - name: Windows named-pipe IPC smoke

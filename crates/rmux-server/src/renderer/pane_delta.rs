@@ -2,11 +2,10 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use rmux_core::{input::mode, GridRenderOptions, OptionStore, Pane, Screen, Session};
-use rmux_proto::OptionName;
 
 use crate::pane_transcript::PaneTranscript;
 
-use super::pane_screen::pane_default_style;
+use super::pane_screen::{pane_default_style, pane_selection_overlay_style};
 use super::{
     cursor_position_bytes, replace_cursor_position_bytes, styled_pane_screen,
     truncate_rendered_pane_line, visible_pane_geometry, StatusGeometry,
@@ -364,6 +363,7 @@ impl PaneRenderSnapshot {
         Some(would_scroll)
     }
 
+    #[cfg(test)]
     pub(crate) fn positioned_plain_echo_frame(&self, bytes: &[u8]) -> Option<Vec<u8>> {
         if bytes.is_empty() || !bytes.iter().all(|byte| matches!(*byte, b' '..=b'~')) {
             return None;
@@ -762,7 +762,8 @@ fn capture_visible_pane_lines(
 ) -> Vec<Vec<u8>> {
     let render_options = pane_render_options();
     let default_style = pane_default_style(session, options, pane);
-    if screen.has_selected_cells() && pane_selection_style_is_set(session, options, pane) {
+    if screen.has_selected_cells() && pane_selection_overlay_style(session, options, pane).is_some()
+    {
         return styled_pane_screen(session, options, pane, screen)
             .capture_transcript_lines_independent(
                 rmux_core::ScreenCaptureRange::default(),
@@ -795,17 +796,6 @@ fn pane_render_options() -> GridRenderOptions {
         trim_spaces: false,
         ..GridRenderOptions::default()
     }
-}
-
-fn pane_selection_style_is_set(session: &Session, options: &OptionStore, pane: &Pane) -> bool {
-    options
-        .resolve_for_pane(
-            session.name(),
-            session.active_window_index(),
-            pane.index(),
-            OptionName::CopyModeSelectionStyle,
-        )
-        .is_some()
 }
 
 #[cfg(test)]
@@ -920,6 +910,32 @@ mod tests {
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
 
         assert_eq!(text, "d");
+    }
+
+    #[test]
+    fn pane_delta_keeps_styled_zwj_text_at_right_edge() {
+        let size = TerminalSize { cols: 5, rows: 3 };
+        let session = Session::new(session_name("alpha"), size);
+        let pane = session.window().active_pane().expect("active pane");
+        let options = OptionStore::new();
+        let before = Screen::new(size, 100);
+        let mut after = Screen::new(size, 100);
+        let mut parser = InputParser::new();
+        parser.parse("\x1b[31m👩\u{200d}💻ABC".as_bytes(), &mut after);
+        let before = PaneRenderSnapshot::capture(&session, &options, pane, &before)
+            .expect("before snapshot");
+        let after =
+            PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
+
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+            panic!("composed-cell repaint should stay incremental");
+        };
+        let frame = String::from_utf8(delta.frame().to_vec()).expect("delta frame is utf-8");
+
+        assert!(
+            frame.contains("\u{1b}[31m👩\u{200d}💻ABC"),
+            "delta repaint must preserve styled ZWJ cells and following text: {frame:?}"
+        );
     }
 
     #[test]

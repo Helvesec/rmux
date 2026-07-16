@@ -4,13 +4,13 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::process::Command as ProcessCommand;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::builder::RmuxBuilder;
 use super::owned_session::OwnedSessionBuilder;
 use crate::command::CommandRun;
 use crate::diagnostics::FEATURE_PROTOCOL_CAPABILITIES;
-use crate::transport::{DropGuard, TransportClient};
+use crate::transport::{DropGuard, OperationDeadline, TransportClient};
 use crate::{
     bootstrap::discovery, broadcast::BroadcastResult, ensure::EnsureSession, handles::Session,
     Input, Pane, PaneId, PaneRef, Result, RmuxEndpoint, RmuxError, SessionName, Window, WindowRef,
@@ -20,6 +20,8 @@ use rmux_proto::{
     CAPABILITY_HANDSHAKE, RMUX_WIRE_VERSION,
 };
 
+#[path = "rmux/command_process.rs"]
+mod command_process;
 #[path = "rmux/connect.rs"]
 mod connect;
 
@@ -91,12 +93,16 @@ impl Rmux {
         self.default_timeout
     }
 
-    /// Sets the default timeout used by waits created after this call.
+    /// Sets the default timeout used by SDK operations created after this call.
     ///
     /// Existing pane, session, or locator handles keep the timeout captured
     /// when those handles were built.
     pub fn set_default_timeout(&mut self, timeout: Duration) {
         self.default_timeout = Some(timeout);
+        let resolved_timeout = self.resolved_timeout(None);
+        if let Some(transport) = self.transport.as_mut() {
+            *transport = transport.with_default_timeout(resolved_timeout);
+        }
     }
 
     /// Resolves the endpoint that would be used by runtime SDK operations.
@@ -284,19 +290,23 @@ impl Rmux {
     /// represented by typed Rust methods. The SDK injects `-S <endpoint>` before
     /// caller arguments, so the spawned binary talks to the same daemon the
     /// facade would use for normal operations. The command is executed directly
-    /// without a shell. Non-zero exits are returned in [`CommandRun`] rather
-    /// than converted into [`RmuxError`].
+    /// without a shell. The facade's resolved operation timeout covers process
+    /// spawn, execution, and output collection; expiration terminates the
+    /// command's process tree. Non-zero exits are returned in [`CommandRun`]
+    /// rather than converted into [`RmuxError`].
     pub async fn cmd<I, S>(&self, args: I) -> Result<CommandRun>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         let endpoint = self.resolved_endpoint()?;
+        let timeout = self.resolved_timeout(None);
+        let started_at = Instant::now();
         let args = args
             .into_iter()
             .map(|arg| arg.as_ref().to_owned())
             .collect::<Vec<OsString>>();
-        tokio::task::spawn_blocking(move || run_binary_command(endpoint, args))
+        tokio::task::spawn_blocking(move || run_binary_command(endpoint, args, timeout, started_at))
             .await
             .map_err(|error| {
                 RmuxError::transport(
@@ -314,10 +324,9 @@ impl Rmux {
     /// remains cleanup-only and never waits for daemon shutdown.
     pub async fn shutdown(mut self) -> Result<()> {
         self.drop_guard.disarm();
-        let client = match self.transport.take() {
-            Some(client) => client,
-            None => self.connect_transport().await?,
-        };
+        let timeout = self.resolved_timeout(None);
+        let client = self.connect_transport_for_operation(timeout).await?;
+        self.transport.take();
 
         negotiate_shutdown_capability(&client).await?;
         let response = client
@@ -354,6 +363,8 @@ impl Rmux {
         default_timeout: Option<Duration>,
         transport: TransportClient,
     ) -> Self {
+        let transport =
+            transport.with_default_timeout(discovery::resolve_timeout(None, default_timeout));
         Self {
             endpoint,
             default_timeout,
@@ -362,11 +373,29 @@ impl Rmux {
         }
     }
 
+    pub(crate) async fn begin_operation_handle(&self) -> Result<Self> {
+        let timeout = self.resolved_timeout(None);
+        let transport = self.connect_transport_for_operation(timeout).await?;
+        Ok(Self {
+            endpoint: self.endpoint.clone(),
+            default_timeout: self.default_timeout,
+            transport: Some(transport),
+            drop_guard: DropGuard::noop(),
+        })
+    }
+
+    pub(crate) fn operation_deadline(&self) -> Option<OperationDeadline> {
+        self.transport
+            .as_ref()
+            .and_then(TransportClient::operation_deadline)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_transport_for_test(
         client: TransportClient,
         drop_request: Option<Request>,
     ) -> Self {
+        let client = client.into_fixture_transport();
         let drop_guard = drop_request
             .map(|request| DropGuard::best_effort(client.clone(), request))
             .unwrap_or_else(DropGuard::noop);
@@ -378,21 +407,27 @@ impl Rmux {
         }
     }
 
-    async fn connect_transport(&self) -> Result<TransportClient> {
-        let endpoint = self.resolved_endpoint()?;
-        connect_transport(&endpoint, self.resolved_timeout(None)).await
-    }
-
     pub(crate) async fn connect_transport_for_operation(
         &self,
         timeout: Option<Duration>,
     ) -> Result<TransportClient> {
-        if let Some(client) = self.transport.as_ref() {
+        if let Some(client) = self
+            .transport
+            .as_ref()
+            .filter(|client| client.operation_deadline().is_some())
+        {
             return Ok(client.clone());
         }
-
-        let endpoint = self.resolved_endpoint()?;
-        connect_transport(&endpoint, timeout).await
+        let deadline = OperationDeadline::from_timeout(timeout);
+        let client = if let Some(client) = self.transport.as_ref() {
+            client.clone()
+        } else {
+            let endpoint = self.resolved_endpoint()?;
+            connect_transport(&endpoint, deadline.remaining_timeout()).await?
+        };
+        Ok(client
+            .with_default_timeout(timeout)
+            .with_operation_deadline(deadline))
     }
 
     pub(crate) async fn connect_resolved_transport_for_operation(
@@ -400,11 +435,22 @@ impl Rmux {
         endpoint: &RmuxEndpoint,
         timeout: Option<Duration>,
     ) -> Result<TransportClient> {
-        if let Some(client) = self.transport.as_ref() {
+        if let Some(client) = self
+            .transport
+            .as_ref()
+            .filter(|client| client.operation_deadline().is_some())
+        {
             return Ok(client.clone());
         }
-
-        connect_transport(endpoint, timeout).await
+        let deadline = OperationDeadline::from_timeout(timeout);
+        let client = if let Some(client) = self.transport.as_ref() {
+            client.clone()
+        } else {
+            connect_transport(endpoint, deadline.remaining_timeout()).await?
+        };
+        Ok(client
+            .with_default_timeout(timeout)
+            .with_operation_deadline(deadline))
     }
 }
 
@@ -415,12 +461,16 @@ fn pane_not_found(session_name: &SessionName, pane_id: PaneId) -> RmuxError {
     ))
 }
 
-fn run_binary_command(endpoint: RmuxEndpoint, args: Vec<OsString>) -> Result<CommandRun> {
+fn run_binary_command(
+    endpoint: RmuxEndpoint,
+    args: Vec<OsString>,
+    timeout: Option<Duration>,
+    started_at: Instant,
+) -> Result<CommandRun> {
     let mut command = ProcessCommand::new(connect::daemon_binary());
     append_endpoint_args(&mut command, endpoint);
     command.args(args);
-    let output = command
-        .output()
+    let output = command_process::run_with_timeout(&mut command, timeout, started_at)
         .map_err(|error| RmuxError::transport("run rmux command", error))?;
 
     Ok(CommandRun {

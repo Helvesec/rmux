@@ -82,6 +82,7 @@ pub(super) struct SourcePathRead {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SourceSyntax {
     Rmux,
+    Canonical,
     TmuxCompat,
 }
 
@@ -125,7 +126,7 @@ impl From<SourceFileRequest> for ParsedSourceFileCommand {
 impl ParsedSourceFileCommand {
     pub(super) fn read_policy(&self) -> SourceReadPolicy {
         match self.syntax {
-            SourceSyntax::Rmux => SourceReadPolicy::Strict,
+            SourceSyntax::Rmux | SourceSyntax::Canonical => SourceReadPolicy::Strict,
             SourceSyntax::TmuxCompat => SourceReadPolicy::BestEffort,
         }
     }

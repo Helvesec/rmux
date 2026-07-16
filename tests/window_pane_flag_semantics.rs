@@ -198,6 +198,64 @@ fn source_file_split_window_stdin_flag_creates_empty_pane() -> Result<(), Box<dy
 }
 
 #[test]
+fn split_window_keep_flag_retains_exited_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("split-window-keep-flag")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "s"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-k", "-t", "s:0.0", "exit 7"])?);
+
+    let panes = wait_for_stdout_contains(
+        &harness,
+        &[
+            "list-panes",
+            "-t",
+            "s",
+            "-F",
+            "#{pane_index}:dead=#{pane_dead}:status=#{pane_dead_status}",
+        ],
+        "1:dead=1:status=7",
+    )?;
+    assert!(
+        panes.contains("1:dead=1:status=7"),
+        "split-window -k should retain the exited pane: {panes:?}"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn source_file_split_window_keep_flag_retains_exited_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-split-window-keep-flag")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "s"])?);
+    let source = harness.tmpdir().join("split-keep.conf");
+    fs::write(&source, "split-window -dk -t s:0.0 'exit 9'\n")?;
+    assert_success(&harness.run(&["source-file", source.to_str().expect("utf-8 path")])?);
+
+    let panes = wait_for_stdout_contains(
+        &harness,
+        &[
+            "list-panes",
+            "-t",
+            "s",
+            "-F",
+            "#{pane_index}:dead=#{pane_dead}:status=#{pane_dead_status}",
+        ],
+        "1:dead=1:status=9",
+    )?;
+    assert!(
+        panes.contains("1:dead=1:status=9"),
+        "source-file split-window -k should retain the exited pane: {panes:?}"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn initial_session_pane_preserves_non_utf8_client_environment() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("non-utf8-client-env")?;
     let mut daemon = harness.start_hidden_daemon()?;
@@ -478,6 +536,20 @@ fn last_pane_input_flags_apply_to_the_selected_last_pane() -> Result<(), Box<dyn
     );
     assert!(stderr(&enabled_capture).is_empty());
 
+    assert_success(&harness.run(&["select-pane", "-t", "s:0.1"])?);
+    assert_success(&harness.run(&["last-pane", "-de", "-t", "s:0"])?);
+    assert_success(&harness.run(&["send-keys", "-t", "s:0.0", "combined", "Enter"])?);
+    std::thread::sleep(SETTLE);
+
+    let combined_capture = harness.run(&["capture-pane", "-p", "-t", "s:0.0"])?;
+    assert_eq!(combined_capture.status.code(), Some(0));
+    assert!(
+        stdout(&combined_capture).contains("combined"),
+        "tmux gives last-pane -e precedence when -d is also present: {:?}",
+        stdout(&combined_capture)
+    );
+    assert!(stderr(&combined_capture).is_empty());
+
     terminate_child(daemon.child_mut())?;
     Ok(())
 }
@@ -694,6 +766,86 @@ fn pane_percentage_size_flags_match_tmux_compat() -> Result<(), Box<dyn Error>> 
     assert_eq!(moved_percent.status.code(), Some(0));
     assert_eq!(stdout(&moved_percent), "0:100x15\n1:100x8\n");
     assert!(stderr(&moved_percent).is_empty());
+
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-x",
+        "100",
+        "-y",
+        "24",
+        "-s",
+        "explicit-j",
+    ])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "explicit-j:0.0"])?);
+    let explicit_join_ids =
+        stdout(&harness.run(&["list-panes", "-t", "explicit-j", "-F", "#{pane_id}"])?)
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+    assert_eq!(explicit_join_ids.len(), 2);
+    let explicit_join_source = harness.tmpdir().join("join-explicit-percent.conf");
+    fs::write(
+        &explicit_join_source,
+        format!(
+            "join-pane -p35 -s {} -t {}\n",
+            explicit_join_ids[1], explicit_join_ids[0]
+        ),
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        explicit_join_source.to_str().expect("utf-8 path"),
+    ])?);
+    let explicit_joined = harness.run(&[
+        "list-panes",
+        "-t",
+        "explicit-j",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(explicit_joined.status.code(), Some(0));
+    assert_eq!(stdout(&explicit_joined), "0:100x15\n1:100x8\n");
+    assert!(stderr(&explicit_joined).is_empty());
+
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-x",
+        "100",
+        "-y",
+        "24",
+        "-s",
+        "explicit-m",
+    ])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "explicit-m:0.0"])?);
+    let explicit_move_ids =
+        stdout(&harness.run(&["list-panes", "-t", "explicit-m", "-F", "#{pane_id}"])?)
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+    assert_eq!(explicit_move_ids.len(), 2);
+    let explicit_move_source = harness.tmpdir().join("move-explicit-percent.conf");
+    fs::write(
+        &explicit_move_source,
+        format!(
+            "move-pane -p35 -s {} -t {}\n",
+            explicit_move_ids[1], explicit_move_ids[0]
+        ),
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        explicit_move_source.to_str().expect("utf-8 path"),
+    ])?);
+    let explicit_moved = harness.run(&[
+        "list-panes",
+        "-t",
+        "explicit-m",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(explicit_moved.status.code(), Some(0));
+    assert_eq!(stdout(&explicit_moved), "0:100x15\n1:100x8\n");
+    assert!(stderr(&explicit_moved).is_empty());
 
     assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "j"])?);
     assert_success(&harness.run(&["split-window", "-h", "-t", "j:0.0"])?);

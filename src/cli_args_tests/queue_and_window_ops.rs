@@ -33,6 +33,17 @@ fn standalone_argv_semicolon_builds_an_ordered_command_queue() {
 }
 
 #[test]
+fn argv_command_queue_rejects_refresh_client_pan_fields() {
+    for args in [
+        &["list-sessions", ";", "refresh-client", "-L", "10"][..],
+        &["list-sessions", ";", "refresh-client", "10"][..],
+    ] {
+        let error = parse_args(args).expect_err("refresh-client pan field must fail in argv queue");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+}
+
+#[test]
 fn target_client_and_hook_flags_survive_argv_queue_parsing() {
     let cli = parse_args(&[
         "load-buffer",
@@ -75,6 +86,242 @@ fn bare_semicolon_builds_a_noop_command_queue() {
 
     assert_eq!(commands.len(), 1);
     assert!(matches!(&commands[0], super::super::Command::Noop));
+}
+
+#[test]
+fn runtime_canonical_queue_keeps_every_group_on_the_typed_path() {
+    let cli = super::super::parse_with_runtime_command_groups(
+        [
+            "rmux",
+            "list-sessions",
+            ";",
+            "display-message",
+            "-p",
+            "unalias",
+            ";",
+            "ls",
+        ],
+        &[
+            super::super::RuntimeCommandGroup::Canonical("display-message -p canonical".to_owned()),
+            super::super::RuntimeCommandGroup::Canonical(
+                "display-message -p unalias ; display-message -p short".to_owned(),
+            ),
+        ],
+    )
+    .unwrap();
+    let commands = cli.into_command_queue();
+
+    assert!(matches!(
+        &commands[0],
+        super::super::Command::DisplayMessage(args)
+            if args.message == ["canonical".to_owned()]
+    ));
+    assert!(matches!(
+        &commands[1],
+        super::super::Command::DisplayMessage(_)
+    ));
+    assert!(matches!(
+        &commands[2],
+        super::super::Command::DisplayMessage(args)
+            if args.message == ["short".to_owned()]
+    ));
+}
+
+#[test]
+fn runtime_canonical_queue_preserves_reparse_escaped_literals() {
+    let literal = "space ; dollar $HOME slash\\ quote' double\"";
+    let rendered = rmux_core::command_parser::CommandArgument::String(literal.to_owned())
+        .to_tmux_reparse_string();
+    let cli = super::super::parse_with_runtime_command_groups(
+        ["rmux", "list-sessions", literal],
+        &[super::super::RuntimeCommandGroup::Canonical(format!(
+            "display-message -p -- {rendered}"
+        ))],
+    )
+    .unwrap();
+    let commands = cli.into_command_queue();
+
+    assert!(matches!(
+        &commands[0],
+        super::super::Command::DisplayMessage(args)
+            if args.message == [literal.to_owned()]
+    ));
+}
+
+#[test]
+fn runtime_canonical_queue_preserves_server_expanded_control_characters() {
+    let expected = "line1\nline2\rline3\t$slash\\quote\"`";
+    let rendered = rmux_core::command_parser::CommandArgument::String(expected.to_owned())
+        .to_tmux_reparse_string();
+    let cli = super::super::parse_with_runtime_command_groups(
+        ["rmux", "list-sessions"],
+        &[super::super::RuntimeCommandGroup::Canonical(format!(
+            "display-message -p {rendered}"
+        ))],
+    )
+    .unwrap();
+    let commands = cli.into_command_queue();
+
+    assert!(matches!(
+        &commands[0],
+        super::super::Command::DisplayMessage(args)
+            if args.message == [expected.to_owned()]
+    ));
+}
+
+#[test]
+fn runtime_canonical_extension_preserves_trailing_semicolon_literals() {
+    let cli = super::super::parse_with_runtime_command_groups(
+        [
+            "rmux",
+            "list-sessions",
+            ";",
+            "display-message",
+            "-p",
+            "semi\\;",
+        ],
+        &[
+            super::super::RuntimeCommandGroup::Canonical("display-message -p alias".to_owned()),
+            super::super::RuntimeCommandGroup::Canonical(
+                "find-sessions --name \"semi\\;\"".to_owned(),
+            ),
+        ],
+    )
+    .unwrap();
+    let commands = cli.into_command_queue();
+
+    assert!(matches!(
+        &commands[1],
+        super::super::Command::FindSessions(args)
+            if args.name.as_deref() == Some("semi;")
+    ));
+}
+
+#[test]
+fn runtime_alias_assignments_are_applied_before_the_validated_command() {
+    let cli = super::super::parse_with_runtime_command_groups(
+        ["rmux", "zz"],
+        &[super::super::RuntimeCommandGroup::Canonical(
+            "FOO=bar ; display-message -p bar".to_owned(),
+        )],
+    )
+    .expect("runtime alias assignment parses");
+    assert!(matches!(
+        cli.command,
+        Some(super::super::Command::DisplayMessage(_))
+    ));
+
+    let commands = cli.into_command_queue();
+    assert!(matches!(
+        &commands[0],
+        super::super::Command::ApplyParseTimeAssignments(assignments)
+            if assignments == "FOO=bar"
+    ));
+    assert!(matches!(
+        &commands[1],
+        super::super::Command::DisplayMessage(_)
+    ));
+}
+
+#[test]
+fn invalid_runtime_alias_tail_is_rejected_before_assignments_can_dispatch() {
+    let error = super::super::parse_with_runtime_command_groups(
+        ["rmux", "zz"],
+        &[super::super::RuntimeCommandGroup::Canonical(
+            "FOO=bar ; new-window -Q".to_owned(),
+        )],
+    )
+    .expect_err("invalid canonical tail must fail typed validation");
+
+    let message = error.to_string();
+    assert!(message.contains("new-window"), "{message}");
+    assert!(message.contains("-Q"), "{message}");
+}
+
+#[test]
+fn runtime_command_groups_use_the_preparsed_snapshot() {
+    let cli = super::super::parse_with_runtime_command_groups(
+        [
+            "rmux",
+            "set-option",
+            "-s",
+            "command-alias[0]",
+            "list-sessions=display-message -p new",
+            ";",
+            "list-sessions",
+        ],
+        &[super::super::RuntimeCommandGroup::Canonical(
+            "set-option -s command-alias[0] 'list-sessions=display-message -p new' ; display-message -p old"
+                .to_owned(),
+        )],
+    )
+    .unwrap();
+    let commands = cli.into_command_queue();
+
+    assert!(matches!(&commands[0], super::super::Command::SetOption(_)));
+    assert!(matches!(
+        &commands[1],
+        super::super::Command::DisplayMessage(args)
+            if args.message == ["old".to_owned()]
+    ));
+}
+
+#[test]
+fn runtime_canonical_reparse_does_not_apply_builtin_aliases_twice() {
+    let error = super::super::parse_with_runtime_command_groups(
+        ["rmux", "split-pane", "-d", "-t", "alpha:0.0"],
+        &[super::super::RuntimeCommandGroup::Canonical(
+            "split-pane -d -t alpha:0.0".to_owned(),
+        )],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("unknown command: split-pane"));
+
+    let cli = super::super::parse(["rmux", "split-pane", "-d", "-t", "alpha:0.0"])
+        .expect("an absent server keeps built-in defaults");
+    assert!(matches!(
+        cli.command,
+        Some(super::super::Command::SplitWindow(_))
+    ));
+}
+
+#[test]
+fn runtime_canonical_terminal_commands_stay_on_typed_dispatch_paths() {
+    let attach = super::super::parse_with_runtime_command_groups(
+        ["rmux", "list-sessions"],
+        &[super::super::RuntimeCommandGroup::Canonical(
+            "attach-session -t alpha".to_owned(),
+        )],
+    )
+    .unwrap();
+    assert!(matches!(
+        attach.command,
+        Some(super::super::Command::AttachSession(_))
+    ));
+
+    let kill = super::super::parse_with_runtime_command_groups(
+        ["rmux", "list-sessions"],
+        &[super::super::RuntimeCommandGroup::Canonical(
+            "kill-server".to_owned(),
+        )],
+    )
+    .unwrap();
+    assert!(matches!(
+        kill.command,
+        Some(super::super::Command::KillServer)
+    ));
+}
+
+#[test]
+fn runtime_canonical_reparse_rejects_an_unexpanded_alias_name() {
+    let error = super::super::parse_with_runtime_command_groups(
+        ["rmux", "foo"],
+        &[super::super::RuntimeCommandGroup::Canonical(
+            "bar".to_owned(),
+        )],
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("unknown command: bar"));
 }
 
 #[test]
@@ -251,6 +498,29 @@ fn swap_window_accepts_implicit_source() {
         super::super::Command::SwapWindow(args) => {
             assert!(args.source.is_none());
             assert_eq!(args.target.as_ref().expect("target").to_string(), "beta:1");
+        }
+        _ => panic!("expected SwapWindow command"),
+    }
+}
+
+#[test]
+fn swap_window_compact_flags_stop_at_the_first_value_flag_like_tmux() {
+    let detached = parse_args(&["swap-window", "-ds", "alpha:0", "-tbeta:1"]).unwrap();
+    match detached.command.expect("parsed command") {
+        super::super::Command::SwapWindow(args) => {
+            assert!(args.detached);
+            assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "beta:1");
+        }
+        _ => panic!("expected SwapWindow command"),
+    }
+
+    let source_suffix = parse_args(&["swap-window", "-sd", "-t", "alpha:1"]).unwrap();
+    match source_suffix.command.expect("parsed command") {
+        super::super::Command::SwapWindow(args) => {
+            assert!(!args.detached, "-sd is -s d, not -s plus -d");
+            assert_eq!(args.source.as_ref().expect("source").to_string(), "d");
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:1");
         }
         _ => panic!("expected SwapWindow command"),
     }

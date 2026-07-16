@@ -53,8 +53,8 @@ pub(crate) fn run_set_hook(args: SetHookArgs, socket_path: &Path) -> Result<i32,
 }
 
 pub(crate) fn run_show_hooks(args: ShowHooksArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
-    let scope = resolve_show_hooks_scope(args.global, args.window, args.pane, args.target)?;
     let hook = args.hook;
+    let scope = resolve_show_hooks_scope(args.global, args.window, args.pane, args.target, hook)?;
     let window = args.window;
     let pane = args.pane;
 
@@ -92,6 +92,14 @@ fn resolve_hook_scope(input: ResolveHookScopeInput<'_>) -> Result<HookScope, Exi
         run_immediately,
         allow_global_target,
     } = input;
+    if run_immediately {
+        return Ok(
+            target.map_or(HookScope::CurrentPane, |target| HookScope::Unresolved {
+                target,
+                kind: HookTargetKind::Pane,
+            }),
+        );
+    }
     if window && pane {
         return Err(ExitFailure::new(
             1,
@@ -103,7 +111,10 @@ fn resolve_hook_scope(input: ResolveHookScopeInput<'_>) -> Result<HookScope, Exi
         if !allow_global_target {
             reject_target(command, target.as_ref(), "-g")?;
         }
-        return Ok(HookScope::Resolved(ScopeSelector::Global));
+        return Ok(target.map_or(
+            HookScope::Resolved(ScopeSelector::Global),
+            HookScope::TargetCheckedGlobal,
+        ));
     }
 
     match (window, pane, target) {
@@ -121,8 +132,9 @@ fn resolve_hook_scope(input: ResolveHookScopeInput<'_>) -> Result<HookScope, Exi
             target,
             kind: HookTargetKind::Natural(hook),
         }),
-        (false, false, None) if run_immediately => Ok(HookScope::CurrentSession),
-        (false, false, None) => Ok(HookScope::CurrentSession),
+        (false, false, None) => {
+            Ok(hook.map_or(HookScope::CurrentSession, HookScope::CurrentNatural))
+        }
         (true, true, _) => unreachable!("validated conflicting hook scope flags"),
     }
 }
@@ -132,14 +144,11 @@ fn resolve_show_hooks_scope(
     window: bool,
     pane: bool,
     target: Option<TargetSpec>,
+    hook: Option<HookName>,
 ) -> Result<ShowHooksScope, ExitFailure> {
     if global {
         reject_target("show-hooks", target.as_ref(), "-g")?;
         return Ok(ShowHooksScope(HookScope::Resolved(ScopeSelector::Global)));
-    }
-
-    if !window && !pane && target.is_none() {
-        return Ok(ShowHooksScope(HookScope::CurrentSession));
     }
 
     resolve_hook_scope(ResolveHookScopeInput {
@@ -148,7 +157,7 @@ fn resolve_show_hooks_scope(
         window,
         pane,
         target,
-        hook: None,
+        hook,
         run_immediately: false,
         allow_global_target: false,
     })
@@ -161,7 +170,9 @@ struct ShowHooksScope(HookScope);
 #[derive(Debug, Clone)]
 enum HookScope {
     Resolved(ScopeSelector),
+    TargetCheckedGlobal(TargetSpec),
     CurrentSession,
+    CurrentNatural(HookName),
     CurrentWindow,
     CurrentPane,
     Unresolved {
@@ -195,8 +206,27 @@ impl HookScope {
     ) -> Result<ScopeSelector, ExitFailure> {
         match self {
             Self::Resolved(scope) => Ok(scope),
+            Self::TargetCheckedGlobal(target) => {
+                let _ = resolve_target_spec(
+                    connection,
+                    &target,
+                    ResolveTargetType::Pane,
+                    false,
+                    false,
+                )?;
+                Ok(ScopeSelector::Global)
+            }
             Self::CurrentSession => {
                 resolve_current_session_target(connection).map(ScopeSelector::Session)
+            }
+            Self::CurrentNatural(hook) => {
+                let session_name = resolve_current_session_target(connection)?;
+                resolve_natural_hook_scope_for_session_target(
+                    connection,
+                    command,
+                    hook,
+                    session_name,
+                )
             }
             Self::CurrentWindow => {
                 let pane = resolve_current_pane_target(connection, command)?;
@@ -221,12 +251,7 @@ fn resolve_unresolved_hook_scope(
     target: &TargetSpec,
     kind: HookTargetKind,
 ) -> Result<ScopeSelector, ExitFailure> {
-    let target_type = match kind {
-        HookTargetKind::Window => ResolveTargetType::Window,
-        HookTargetKind::Pane => ResolveTargetType::Pane,
-        HookTargetKind::Natural(_) => natural_target_type(target.raw()),
-    };
-    let target = resolve_target_spec(connection, target, target_type, false, false)?;
+    let target = resolve_target_spec(connection, target, ResolveTargetType::Pane, false, false)?;
     match (kind, target) {
         (HookTargetKind::Pane, Target::Pane(target)) => Ok(ScopeSelector::Pane(target)),
         (HookTargetKind::Pane, _) => Err(ExitFailure::new(
@@ -250,9 +275,11 @@ fn resolve_unresolved_hook_scope(
             Ok(ScopeSelector::Session(session_name))
         }
         (HookTargetKind::Natural(None), Target::Window(target)) => {
-            Ok(ScopeSelector::Window(target))
+            Ok(ScopeSelector::Session(target.session_name().clone()))
         }
-        (HookTargetKind::Natural(None), Target::Pane(target)) => Ok(ScopeSelector::Pane(target)),
+        (HookTargetKind::Natural(None), Target::Pane(target)) => {
+            Ok(ScopeSelector::Session(target.session_name().clone()))
+        }
     }
 }
 
@@ -341,20 +368,6 @@ fn resolve_active_pane_index(
 fn validate_hook_registration(hook: HookName, scope: &ScopeSelector) -> Result<(), ExitFailure> {
     rmux_core::validate_hook_registration(hook, scope)
         .map_err(|error| ExitFailure::new(1, error.to_string()))
-}
-
-fn natural_target_type(raw: &str) -> ResolveTargetType {
-    if raw.starts_with('%') || raw.rsplit_once('.').is_some() {
-        ResolveTargetType::Pane
-    } else if raw.starts_with('@')
-        || raw
-            .rsplit_once(':')
-            .is_some_and(|(_, rest)| !rest.is_empty())
-    {
-        ResolveTargetType::Window
-    } else {
-        ResolveTargetType::Session
-    }
 }
 
 fn reject_target(

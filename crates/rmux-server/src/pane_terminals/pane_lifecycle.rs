@@ -3,13 +3,12 @@ use std::path::Path;
 
 use rmux_core::{PaneId, Session};
 use rmux_proto::{
-    KillPaneResponse, PaneTarget, ProcessCommand, RespawnPaneRequest, RespawnPaneResponse,
-    RmuxError, SessionName,
+    KillPaneResponse, PaneTarget, RespawnPaneRequest, RespawnPaneResponse, RmuxError, SessionName,
 };
 use rmux_pty::PtyMaster;
 
 use crate::pane_io::{PaneAlertCallback, PaneExitCallback};
-use crate::pane_terminal_lookup::initial_pane;
+use crate::pane_terminal_lookup::{initial_pane, SessionPane};
 use crate::pane_terminal_process::{open_pane_terminal, PaneTerminal};
 use crate::terminal::{validate_process_command, SessionBaseEnvironment, TerminalProfile};
 
@@ -17,7 +16,7 @@ use super::lifecycle_state::terminal_size_from_geometry;
 use super::{
     pane_terminal_geometry_for_session, session_not_found, HandlerState, InitialPaneSpawnOptions,
     KilledPaneHookContext, KilledPaneResult, PaneLifecycleSpawn, PaneOutputSpawn,
-    WindowSpawnOptions,
+    SessionTransferSnapshot, WindowSpawnOptions,
 };
 
 #[path = "pane_lifecycle/preview.rs"]
@@ -28,8 +27,15 @@ mod split;
 
 #[path = "pane_lifecycle/linked_kill.rs"]
 mod linked_kill;
+pub(in crate::pane_terminals) use linked_kill::LinkedWindowTransferRemovalPlan;
 
 use preview::preview_kill_pane;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GroupedLastPaneAction {
+    KillSharedPane,
+    RemoveAddressedAlias,
+}
 
 pub(in crate::pane_terminals) struct PreparedWindowTerminal {
     terminal: PaneTerminal,
@@ -71,7 +77,7 @@ impl HandlerState {
             window_index,
             pane.geometry(),
         );
-        let profile = TerminalProfile::for_session_with_base_environment(
+        let mut profile = TerminalProfile::for_session_with_base_environment(
             &self.environment,
             &self.options,
             session.name(),
@@ -87,10 +93,14 @@ impl HandlerState {
                 .filter(|path| !path.as_os_str().is_empty())
                 .or(session.cwd()),
         )?;
+        if let Some(shell) = spawn.respawn_shell {
+            profile = profile.with_respawn_shell(shell.to_path_buf());
+        }
         let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
+        let respawn_shell = profile.shell().to_path_buf();
         let mut terminal =
             open_pane_terminal(pane_geometry, profile, runtime_window_name, spawn.command)?;
         let pid = terminal.pid();
@@ -116,9 +126,11 @@ impl HandlerState {
                 session_id: session.id(),
                 window_id: window.id(),
                 pane_id: pane.id(),
-                command: spawn.command.map(ProcessCommand::display_command),
+                process_command: spawn.command.cloned(),
                 working_directory: Some(lifecycle_cwd),
+                respawn_shell,
                 private_environment: spawn.environment_overrides.map(<[String]>::to_vec),
+                respawn_environment: spawn.respawn_environment.map(<[String]>::to_vec),
                 dimensions: terminal_size_from_geometry(pane_geometry),
                 pid: Some(pid),
             },
@@ -132,6 +144,7 @@ impl HandlerState {
         runtime_session_name: &SessionName,
         window_index: u32,
         prepared: PreparedWindowTerminal,
+        retained_output_sender: Option<crate::pane_io::PaneOutputSender>,
     ) -> Result<PaneId, RmuxError> {
         let PreparedWindowTerminal {
             terminal,
@@ -148,7 +161,12 @@ impl HandlerState {
             pane_index,
             terminal,
         )?;
-        if let Err(error) = self.reset_pane_output(runtime_session_name, pane_id, output) {
+        if let Err(error) = self.reset_pane_output_with_sender(
+            runtime_session_name,
+            pane_id,
+            output,
+            retained_output_sender,
+        ) {
             if let Some(terminal) = self.terminals.remove_pane(runtime_session_name, pane_id) {
                 terminal.terminate_in_background();
             }
@@ -208,6 +226,7 @@ impl HandlerState {
         let runtime_window_name = profile.runtime_window_name(spawn.command);
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
+        let respawn_shell = profile.shell().to_path_buf();
         let mut terminal = open_pane_terminal(
             pane_geometry,
             profile,
@@ -243,15 +262,67 @@ impl HandlerState {
             session_id,
             window_id,
             pane_id: pane.id,
-            command: spawn.command.map(ProcessCommand::display_command),
+            process_command: spawn.command.cloned(),
             working_directory: Some(lifecycle_cwd),
+            respawn_shell,
             private_environment: spawn.environment_overrides.map(<[String]>::to_vec),
+            respawn_environment: None,
             dimensions: terminal_size_from_geometry(pane.geometry),
             pid: Some(pid),
         });
         let output_sequence = self.pane_output_generation(&runtime_session_name, pane.id);
         self.update_pane_lifecycle_output_sequence(pane.id, output_sequence);
 
+        Ok(())
+    }
+
+    pub(crate) fn resize_window_terminal_runtime(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Result<(), RmuxError> {
+        #[cfg(test)]
+        {
+            self.window_runtime_resize_count = self.window_runtime_resize_count.saturating_add(1);
+        }
+        let (runtime_session_name, window_size, pane_geometries) = {
+            let session = self
+                .sessions
+                .session(session_name)
+                .ok_or_else(|| session_not_found(session_name))?;
+            let window = session.window_at(window_index).ok_or_else(|| {
+                RmuxError::invalid_target(
+                    format!("{session_name}:{window_index}"),
+                    "window index does not exist in session",
+                )
+            })?;
+            let runtime_session_name =
+                self.runtime_session_name_for_window(session_name, window_index);
+            let pane_geometries = window
+                .panes()
+                .iter()
+                .map(|pane| SessionPane {
+                    id: pane.id(),
+                    window_index,
+                    index: pane.index(),
+                    geometry: pane_terminal_geometry_for_session(
+                        session,
+                        &self.options,
+                        window_index,
+                        pane.geometry(),
+                    ),
+                })
+                .collect::<Vec<_>>();
+            (runtime_session_name, window.size(), pane_geometries)
+        };
+        let terminal_pixels = self.attached_terminal_pixels.get(session_name).copied();
+        self.terminals.resize_session(
+            &runtime_session_name,
+            &pane_geometries,
+            window_size,
+            terminal_pixels,
+        )?;
+        self.resize_transcripts(&runtime_session_name, &pane_geometries);
         Ok(())
     }
 
@@ -328,7 +399,7 @@ impl HandlerState {
         let captured_base_environment =
             self.session_base_environment_for_window(session_name, window_index);
         let base_environment = base_environment_override.or(captured_base_environment.as_ref());
-        let profile = TerminalProfile::for_session_with_base_environment(
+        let mut profile = TerminalProfile::for_session_with_base_environment(
             &self.environment,
             &self.options,
             session_name,
@@ -344,10 +415,14 @@ impl HandlerState {
                 .filter(|path| !path.as_os_str().is_empty())
                 .or(requested_cwd.as_deref()),
         )?;
+        if let Some(shell) = spawn.respawn_shell {
+            profile = profile.with_respawn_shell(shell.to_path_buf());
+        }
         let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
+        let respawn_shell = profile.shell().to_path_buf();
         let mut terminal = open_pane_terminal(
             pane_geometry,
             profile,
@@ -386,9 +461,11 @@ impl HandlerState {
             session_id,
             window_id,
             pane_id,
-            command: spawn.command.map(ProcessCommand::display_command),
+            process_command: spawn.command.cloned(),
             working_directory: Some(lifecycle_cwd),
+            respawn_shell,
             private_environment: spawn.environment_overrides.map(<[String]>::to_vec),
+            respawn_environment: spawn.respawn_environment.map(<[String]>::to_vec),
             dimensions: terminal_size_from_geometry(pane_geometry),
             pid: Some(pid),
         });
@@ -408,6 +485,31 @@ impl HandlerState {
         target: PaneTarget,
         kill_all_except: bool,
     ) -> Result<KilledPaneResult, RmuxError> {
+        self.kill_pane_with_grouped_last_pane_action(
+            target,
+            kill_all_except,
+            GroupedLastPaneAction::KillSharedPane,
+        )
+    }
+
+    pub(crate) fn remove_pane_alias_with_options(
+        &mut self,
+        target: PaneTarget,
+        kill_all_except: bool,
+    ) -> Result<KilledPaneResult, RmuxError> {
+        self.kill_pane_with_grouped_last_pane_action(
+            target,
+            kill_all_except,
+            GroupedLastPaneAction::RemoveAddressedAlias,
+        )
+    }
+
+    fn kill_pane_with_grouped_last_pane_action(
+        &mut self,
+        target: PaneTarget,
+        kill_all_except: bool,
+        grouped_last_pane_action: GroupedLastPaneAction,
+    ) -> Result<KilledPaneResult, RmuxError> {
         let session_name = target.session_name().clone();
         let previous_session = self
             .sessions
@@ -415,7 +517,7 @@ impl HandlerState {
             .cloned()
             .ok_or_else(|| session_not_found(&session_name))?;
         let before_pane_options = self.pane_option_slots_for_session(&session_name)?;
-        let (hook_context, pane_id, remove_session) = {
+        let (hook_context, pane_id, addressed_last_pane, remove_session) = {
             let window = previous_session
                 .window_at(target.window_index())
                 .ok_or_else(|| {
@@ -437,23 +539,31 @@ impl HandlerState {
                 window_id: window.id().as_u32(),
                 window_name: window.name().unwrap_or_default().to_owned(),
             };
+            let addressed_last_pane = !kill_all_except && window.pane_count() == 1;
             (
                 hook_context,
                 pane_id,
-                !kill_all_except
-                    && previous_session.windows().len() == 1
-                    && window.pane_count() == 1,
+                addressed_last_pane,
+                addressed_last_pane && previous_session.windows().len() == 1,
             )
         };
-        if !kill_all_except
-            && self.window_link_count(&session_name, target.window_index()) > 1
-            && previous_session
-                .window_at(target.window_index())
-                .is_some_and(|window| window.pane_count() == 1)
-        {
+        let linked_window_family = self.window_link_count(&session_name, target.window_index()) > 1;
+        let grouped_session_family =
+            self.window_linked_session_count(&session_name, target.window_index()) > 1;
+        let remove_complete_family = grouped_last_pane_action
+            == GroupedLastPaneAction::KillSharedPane
+            && (linked_window_family || grouped_session_family);
+        if addressed_last_pane && remove_complete_family {
             return self.kill_last_linked_pane(target, hook_context, pane_id);
         }
         if remove_session {
+            let mut affected_sessions =
+                self.window_linked_session_family_list(&session_name, target.window_index());
+            if affected_sessions.is_empty() {
+                affected_sessions.push(session_name.clone());
+            }
+            affected_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            affected_sessions.dedup();
             self.ensure_panes_exist(&session_name, &[pane_id])?;
             let current_runtime_owner = self.sessions.runtime_owner(&session_name);
             let next_runtime_owner = self.sessions.runtime_owner_transfer_target(&session_name);
@@ -476,9 +586,15 @@ impl HandlerState {
                 session_destroyed: true,
                 removed_session_id: Some(removed_session.id().as_u32()),
                 removed_pane_ids,
-                affected_sessions: vec![session_name.clone()],
+                affected_sessions,
                 destroyed_sessions: vec![(session_name, removed_session.id().as_u32())],
             });
+        }
+        if addressed_last_pane
+            && grouped_last_pane_action == GroupedLastPaneAction::RemoveAddressedAlias
+            && linked_window_family
+        {
+            return self.remove_last_pane_addressed_window_alias(target, hook_context);
         }
 
         let window_index = target.window_index();
@@ -506,6 +622,7 @@ impl HandlerState {
             window_index,
             preview_outcome.removed_pane_ids(),
         )?;
+        let transfer_snapshot = SessionTransferSnapshot::capture(self);
 
         let committed_outcome = {
             let session = self
@@ -520,6 +637,29 @@ impl HandlerState {
         };
         debug_assert_eq!(committed_outcome, preview_outcome);
         let removed_pane_ids = committed_outcome.removed_pane_ids().to_vec();
+        let mut affected_sessions = if committed_outcome.window_destroyed() {
+            vec![session_name.clone()]
+        } else {
+            let synchronize_result = (|| {
+                self.synchronize_linked_window_from_slot(&session_name, window_index)?;
+                let mut synchronized_sessions = HashSet::new();
+                for slot in &linked_slots {
+                    if synchronized_sessions.insert(slot.session_name.clone()) {
+                        self.synchronize_session_group_from(&slot.session_name)?;
+                    }
+                }
+                Ok::<_, RmuxError>(
+                    self.window_linked_session_family_list(&session_name, window_index),
+                )
+            })();
+            match synchronize_result {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    transfer_snapshot.restore(self);
+                    return Err(error);
+                }
+            }
+        };
 
         #[cfg(windows)]
         let terminal_pane_ids = committed_outcome
@@ -543,7 +683,7 @@ impl HandlerState {
             {
                 Ok(removed_terminals) => removed_terminals,
                 Err(error) => {
-                    self.replace_session(&session_name, previous_session)?;
+                    transfer_snapshot.restore(self);
                     return Err(error);
                 }
             }
@@ -552,14 +692,22 @@ impl HandlerState {
             self.remove_pane_outputs(&runtime_session_name, committed_outcome.removed_pane_ids());
 
         if let Err(error) = self.resize_terminals(&session_name) {
-            self.restore_session_and_panes_after_resize_error(
-                &session_name,
-                &runtime_session_name,
-                previous_session,
-                removed_terminals,
-                removed_outputs,
-                &error,
-            )?;
+            let terminal_rollback = self
+                .terminals
+                .insert_existing_panes(&runtime_session_name, removed_terminals);
+            self.insert_existing_pane_outputs(&runtime_session_name, removed_outputs);
+            transfer_snapshot.restore(self);
+            let resize_rollback = self.resize_terminals(&session_name);
+            terminal_rollback.map_err(|rollback_error| {
+                RmuxError::Server(format!(
+                    "failed to restore pane terminals for runtime session {runtime_session_name} after {error}: {rollback_error}"
+                ))
+            })?;
+            resize_rollback.map_err(|rollback_error| {
+                RmuxError::Server(format!(
+                    "failed to roll back session {session_name} after {error}: {rollback_error}"
+                ))
+            })?;
             return Err(error);
         }
         for pane_id in committed_outcome.removed_pane_ids() {
@@ -573,25 +721,20 @@ impl HandlerState {
         terminate_removed_terminals(&mut removed_terminals);
         self.remove_pane_lifecycles(committed_outcome.removed_pane_ids());
 
-        let affected_sessions = if committed_outcome.window_destroyed() {
-            self.synchronize_session_group_from(&session_name)?;
-            vec![session_name.clone()]
-        } else {
-            self.synchronize_linked_window_from_slot(&session_name, window_index)?;
-            let mut synchronized_sessions = HashSet::new();
-            for slot in linked_slots {
-                if synchronized_sessions.insert(slot.session_name.clone()) {
-                    self.synchronize_session_group_from(&slot.session_name)?;
+        if committed_outcome.window_destroyed() {
+            for synchronized_session in self.synchronize_session_group_from(&session_name)? {
+                if !affected_sessions.contains(&synchronized_session) {
+                    affected_sessions.push(synchronized_session);
                 }
             }
-            self.window_linked_session_family_list(&session_name, window_index)
-        };
+        }
         self.sync_pane_lifecycle_dimensions_for_session(&session_name);
         for (affected_session, before) in before_pane_options {
             self.rekey_pane_options_after_session_change(&before, &affected_session)?;
         }
 
         if committed_outcome.window_destroyed() {
+            let _ = self.detach_window_link_slot(&session_name, target.window_index());
             let _ = self
                 .options
                 .remove_window(&rmux_proto::WindowTarget::with_window(
@@ -615,6 +758,38 @@ impl HandlerState {
         })
     }
 
+    fn remove_last_pane_addressed_window_alias(
+        &mut self,
+        target: PaneTarget,
+        hook_context: KilledPaneHookContext,
+    ) -> Result<KilledPaneResult, RmuxError> {
+        let session_name = target.session_name().clone();
+        let mut affected_sessions =
+            self.window_linked_session_family_list(&session_name, target.window_index());
+        affected_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        affected_sessions.dedup();
+        let result = self.unlink_window(
+            rmux_proto::WindowTarget::with_window(session_name.clone(), target.window_index()),
+            false,
+        )?;
+        debug_assert!(
+            result.removed_pane_ids.is_empty(),
+            "removing one surviving window alias must preserve its shared pane runtime"
+        );
+        Ok(KilledPaneResult {
+            response: KillPaneResponse {
+                target,
+                window_destroyed: true,
+            },
+            hook_context,
+            session_destroyed: false,
+            removed_session_id: None,
+            removed_pane_ids: result.removed_pane_ids,
+            affected_sessions,
+            destroyed_sessions: Vec::new(),
+        })
+    }
+
     pub(crate) fn respawn_pane(
         &mut self,
         request: RespawnPaneRequest,
@@ -627,14 +802,14 @@ impl HandlerState {
         let RespawnPaneRequest {
             target,
             kill,
-            start_directory,
-            environment,
+            mut start_directory,
+            mut environment,
             command,
             process_command,
         } = request;
-        let process_command = process_command
+        let requested_process_command = process_command
             .or_else(|| crate::legacy_command::from_legacy_command(command.as_deref()));
-        validate_process_command(process_command.as_ref())?;
+        validate_process_command(requested_process_command.as_ref())?;
         let session_name = target.session_name().clone();
         let window_index = target.window_index();
         let pane_index = target.pane_index();
@@ -672,6 +847,26 @@ impl HandlerState {
             )
         };
 
+        let provenance = self.pane_respawn_provenance(pane_id);
+        let process_command = requested_process_command.or_else(|| {
+            provenance
+                .as_ref()
+                .and_then(|provenance| provenance.process_command.clone())
+        });
+        validate_process_command(process_command.as_ref())?;
+        if start_directory.is_none() {
+            start_directory = provenance
+                .as_ref()
+                .and_then(|provenance| provenance.working_directory.clone());
+        }
+        let respawn_environment = provenance
+            .as_ref()
+            .map(|provenance| provenance.private_environment.clone())
+            .unwrap_or_else(|| environment.clone().unwrap_or_default());
+        if environment.is_none() {
+            environment = Some(respawn_environment.clone());
+        }
+
         #[cfg(windows)]
         let pane_was_starting =
             self.pane_is_starting_in_window(&session_name, window_index, pane_index);
@@ -689,7 +884,7 @@ impl HandlerState {
             return Err(RmuxError::ProcessStillRunning);
         }
         let base_environment = self.session_base_environment_for_pane_target(&target);
-        let profile = TerminalProfile::for_session_with_base_environment(
+        let mut profile = TerminalProfile::for_session_with_base_environment(
             &self.environment,
             &self.options,
             &session_name,
@@ -702,10 +897,14 @@ impl HandlerState {
             Some(pane_id),
             start_directory.as_deref().or(requested_cwd.as_deref()),
         )?;
+        if let Some(provenance) = provenance.as_ref() {
+            profile = profile.with_respawn_shell(provenance.shell.clone());
+        }
         let automatic_window_name = profile.automatic_window_name(process_command.as_ref());
         let runtime_window_name = profile.runtime_window_name(process_command.as_ref());
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
+        let respawn_shell = profile.shell().to_path_buf();
         let mut terminal = open_pane_terminal(
             pane_geometry,
             profile,
@@ -778,11 +977,11 @@ impl HandlerState {
             session_id,
             window_id,
             pane_id,
-            command: process_command
-                .as_ref()
-                .map(ProcessCommand::display_command),
+            process_command,
             working_directory: Some(lifecycle_cwd),
+            respawn_shell,
             private_environment: environment,
+            respawn_environment: Some(respawn_environment),
             dimensions: terminal_size_from_geometry(pane_geometry),
             pid: Some(pid),
         });
@@ -822,7 +1021,7 @@ pub(in crate::pane_terminals) fn clone_terminal_for_exit_watcher(
     session_name: &SessionName,
     pane_id: PaneId,
 ) -> Result<rmux_pty::PtyChild, RmuxError> {
-    terminal.clone_child_for_wait().map_err(|error| {
+    terminal.clone_child_for_exit_teardown().map_err(|error| {
         RmuxError::Server(format!(
             "failed to clone pane exit watcher for pane id {} in session {}: {error}",
             pane_id.as_u32(),

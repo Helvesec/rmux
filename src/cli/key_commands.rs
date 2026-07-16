@@ -138,11 +138,11 @@ pub(super) fn run_list_keys(args: ListKeysArgs, socket_path: &Path) -> Result<i3
             write_command_output(output)?;
             Ok(0)
         }
-        ConnectResult::Absent => run_default_list_keys(request),
+        ConnectResult::Absent => run_default_list_keys(request, socket_path),
     }
 }
 
-fn run_default_list_keys(request: ListKeysRequest) -> Result<i32, ExitFailure> {
+fn run_default_list_keys(request: ListKeysRequest, socket_path: &Path) -> Result<i32, ExitFailure> {
     let sort_order = match request.sort_order.as_deref() {
         Some(value) => KeyBindingSortOrder::parse(value)
             .ok_or_else(|| ExitFailure::new(1, rmux_core::INVALID_SORT_ORDER))?,
@@ -181,8 +181,13 @@ fn run_default_list_keys(request: ListKeysRequest) -> Result<i32, ExitFailure> {
         bindings.truncate(1);
     }
 
-    let output =
-        render_default_list_keys_output(&bindings, &request, render_metrics, notes_key_width);
+    let output = render_default_list_keys_output(
+        &bindings,
+        &request,
+        socket_path,
+        render_metrics,
+        notes_key_width,
+    );
     write_command_output(&output)?;
     Ok(0)
 }
@@ -207,6 +212,7 @@ fn list_default_key_bindings(
 fn render_default_list_keys_output(
     bindings: &[KeyBindingDisplay],
     request: &ListKeysRequest,
+    socket_path: &Path,
     render_metrics: ListKeysRenderMetrics,
     notes_key_width: usize,
 ) -> CommandOutput {
@@ -241,6 +247,7 @@ fn render_default_list_keys_output(
                 render_metrics.has_repeat
             };
             let context = FormatContext::new()
+                .with_named_value("socket_path", socket_path.to_string_lossy().into_owned())
                 .with_named_value("key_repeat", bool_format(binding.binding().repeat()))
                 .with_named_value("key_note", binding.binding().note().unwrap_or_default())
                 .with_named_value(

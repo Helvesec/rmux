@@ -18,15 +18,21 @@ mod cli_args;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod cli_response;
 mod client_terminal;
+mod command_alias_snapshot;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod os_string;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod process_locale;
+mod runtime_command_expansion;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod server_runtime;
 #[cfg(all(feature = "tiny-cli", any(not(debug_assertions), test)))]
 mod tiny_main;
 mod tmux_error_surface;
+#[cfg(windows)]
+mod windows_shell;
+#[cfg(windows)]
+mod windows_terminal;
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use std::env;
@@ -56,7 +62,11 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             if !error.message().is_empty() {
-                let _ = write_exit_message(error.message(), error.use_stderr());
+                let _ = write_exit_message(
+                    error.message(),
+                    error.use_stderr(),
+                    error.message_termination(),
+                );
             }
             std::process::exit(error.exit_code());
         }
@@ -64,19 +74,34 @@ fn main() {
 }
 
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
-fn write_exit_message(message: &str, stderr: bool) -> io::Result<()> {
+fn write_exit_message(
+    message: &str,
+    stderr: bool,
+    termination: cli::ExitMessageTermination,
+) -> io::Result<()> {
     if stderr {
-        match writeln!(io::stderr().lock(), "{message}") {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
-            Err(error) => Err(error),
-        }
+        write_exit_message_to(&mut io::stderr().lock(), message, termination)
     } else {
-        match writeln!(io::stdout().lock(), "{message}") {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
-            Err(error) => Err(error),
-        }
+        write_exit_message_to(&mut io::stdout().lock(), message, termination)
+    }
+}
+
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
+fn write_exit_message_to(
+    output: &mut impl Write,
+    message: &str,
+    termination: cli::ExitMessageTermination,
+) -> io::Result<()> {
+    let result = match termination {
+        cli::ExitMessageTermination::Line => writeln!(output, "{message}"),
+        cli::ExitMessageTermination::Exact => output
+            .write_all(message.as_bytes())
+            .and_then(|()| output.flush()),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -339,13 +364,33 @@ fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
 
 #[cfg(all(test, any(not(feature = "tiny-cli"), debug_assertions)))]
 mod tests {
-    use super::{parse_internal_daemon_args, parse_internal_socket_path, try_main};
+    use super::{
+        parse_internal_daemon_args, parse_internal_socket_path, try_main, write_exit_message_to,
+    };
+    use crate::cli::ExitMessageTermination;
     use rmux_client::INTERNAL_DAEMON_FLAG;
     use rmux_server::ConfigFileSelection;
     use std::ffi::OsString;
     use std::path::PathBuf;
 
     const EXPECTED_BINARY_NAME: &str = "rmux";
+
+    #[test]
+    fn exit_message_writer_distinguishes_lines_from_exact_protocol_bytes() {
+        let mut line = Vec::new();
+        write_exit_message_to(&mut line, "diagnostic", ExitMessageTermination::Line)
+            .expect("line-terminated exit message");
+        assert_eq!(line, b"diagnostic\n");
+
+        let mut exact = Vec::new();
+        write_exit_message_to(
+            &mut exact,
+            "\u{1b}P1000pdiagnostic\n%exit\n\u{1b}\\",
+            ExitMessageTermination::Exact,
+        )
+        .expect("exact exit message");
+        assert_eq!(exact, b"\x1bP1000pdiagnostic\n%exit\n\x1b\\");
+    }
 
     #[test]
     fn compiled_binary_name_is_rmux() {

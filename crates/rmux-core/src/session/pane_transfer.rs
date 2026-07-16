@@ -268,6 +268,7 @@ impl Session {
                     self.name
                 )));
             }
+            self.winlink_alert_flags.remove(&source.window_index);
             if self.active_window == source.window_index {
                 self.active_window = self.next_active_window_after_removal(source.window_index);
             }

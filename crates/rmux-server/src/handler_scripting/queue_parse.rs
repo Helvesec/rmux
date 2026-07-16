@@ -18,7 +18,7 @@ use super::targets::{
     NewWindowTargetIndex,
 };
 use super::tokens::{parse_compact_flag_cluster, CompactFlag};
-use super::values::{missing_argument, unsupported_flag};
+use super::values::{missing_argument, reject_unknown_option_before_positional, unsupported_flag};
 use crate::pane_terminals::session_not_found;
 
 const DEFAULT_NEW_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
@@ -311,16 +311,35 @@ fn parse_queued_if_shell_attached_target(
     raw_target: String,
     sessions: &SessionStore,
     find_context: &TargetFindContext,
-) -> Result<Target, RmuxError> {
-    if matches!(raw_target.as_str(), "=" | "{mouse}") && find_context.mouse_target().is_none() {
-        return sessions.resolve_unresolved_target(
-            &UnresolvedTarget::none(),
-            TargetFindType::Pane,
-            TargetFindFlags::CANFAIL,
-            find_context,
-        );
+) -> Result<Option<Target>, RmuxError> {
+    if raw_target == "." && find_context.current().is_none() {
+        return Ok(None);
     }
-    parse_queued_if_shell_target(raw_target, sessions, find_context)
+    if matches!(raw_target.as_str(), "=" | "{mouse}") && find_context.mouse_target().is_none() {
+        return sessions
+            .resolve_unresolved_target(
+                &UnresolvedTarget::none(),
+                TargetFindType::Pane,
+                TargetFindFlags::CANFAIL,
+                find_context,
+            )
+            .map(Some);
+    }
+    match parse_queued_if_shell_target(raw_target, sessions, find_context) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) if if_shell_target_is_missing(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn if_shell_target_is_missing(error: &RmuxError) -> bool {
+    matches!(
+        error,
+        RmuxError::SessionNotFound(_) | RmuxError::PaneNotFound { .. }
+    ) || matches!(
+        error,
+        RmuxError::InvalidTarget { reason, .. } if reason.starts_with("can't find ")
+    )
 }
 
 pub(super) fn parse_queued_if_shell(
@@ -350,14 +369,15 @@ pub(super) fn parse_queued_if_shell(
             }
             "-t" => {
                 let _ = args.pop_front();
-                target = Some(parse_queued_if_shell_attached_target(
+                target = parse_queued_if_shell_attached_target(
                     pop_string_argument(&mut args, "-t target")?,
                     sessions,
                     find_context,
-                )?);
+                )?;
             }
             token => {
                 let Some(cluster) = parse_compact_flag_cluster(token, "bF", "t") else {
+                    reject_unknown_option_before_positional("if-shell", token)?;
                     break;
                 };
                 let _ = args.pop_front();
@@ -371,11 +391,11 @@ pub(super) fn parse_queued_if_shell(
                         CompactFlag::Value { flag: 't', value } => {
                             let value =
                                 compact_value_or_next_argument(&mut args, value, "-t target")?;
-                            target = Some(parse_queued_if_shell_attached_target(
+                            target = parse_queued_if_shell_attached_target(
                                 value,
                                 sessions,
                                 find_context,
-                            )?);
+                            )?;
                         }
                         CompactFlag::Value { flag, .. } => {
                             return Err(unsupported_flag("if-shell", &format!("-{flag}")));

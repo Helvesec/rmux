@@ -22,7 +22,7 @@ pub(super) async fn get_option(pane: &Pane, name: String) -> Result<Option<Strin
     let response = pane
         .transport()
         .request(Request::PaneOptionGet(PaneOptionGetRequest {
-            target: pane.proto_target_ref(),
+            target: pane.required_resolved_proto_target_ref().await?,
             name,
         }))
         .await?;
@@ -43,7 +43,7 @@ async fn mutate_option(
     let response = pane
         .transport()
         .request(Request::PaneOptionSet(PaneOptionSetRequest {
-            target: pane.proto_target_ref(),
+            target: pane.required_resolved_proto_target_ref().await?,
             name,
             value,
             mode: SetOptionMode::Replace,

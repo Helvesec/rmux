@@ -20,10 +20,10 @@ use super::json_output::{
 };
 use super::{
     cli_target_actions_enabled, expect_command_output, expect_command_success, list_session_names,
-    resolve_current_pane_target, resolve_pane_target_or_current, resolve_pane_target_spec,
-    resolve_session_listing_target, resolve_target_spec, resolve_window_target_or_current,
-    run_command_resolved, shell_command_text, target_action_needs_legacy_retry, write_lines_output,
-    ExitFailure,
+    listed_pane_index_matches_target, resolve_current_pane_target, resolve_pane_target_or_current,
+    resolve_pane_target_spec, resolve_session_listing_target, resolve_target_spec,
+    resolve_window_target_or_current, run_command_resolved, shell_command_text,
+    target_action_needs_legacy_retry, write_lines_output, ExitFailure,
 };
 use crate::cli_args::{
     LastPaneArgs, ListPanesArgs, PipePaneArgs, ResizePaneArgs, RespawnPaneArgs, SelectPaneArgs,
@@ -39,10 +39,10 @@ pub(super) fn run_last_pane(args: LastPaneArgs, socket_path: &Path) -> Result<i3
     run_command_resolved(socket_path, "last-pane", move |connection| {
         let target =
             resolve_window_target_or_current(connection, args.target.as_ref(), "last-pane")?;
-        let input_disabled = if args.disable_input {
-            Some(true)
-        } else if args.enable_input {
+        let input_disabled = if args.enable_input {
             Some(false)
+        } else if args.disable_input {
+            Some(true)
         } else {
             None
         };
@@ -453,24 +453,25 @@ fn resize_pane_window_size(
         .list_panes_in_window(
             target.session_name().clone(),
             Some(target.window_index()),
-            Some("#{pane_index}:#{window_width}:#{window_height}".to_owned()),
+            Some("#{pane_index}\t#{pane-base-index}\t#{window_width}\t#{window_height}".to_owned()),
         )
         .map_err(ExitFailure::from_client)?;
     let output = expect_command_output(&response, "list-panes")?;
     let stdout = String::from_utf8_lossy(output.stdout());
-    let pane_prefix = format!("{}:", target.pane_index());
-    let line = stdout
+    let (width, height) = stdout
         .lines()
-        .find_map(|line| line.strip_prefix(&pane_prefix))
+        .find_map(|line| {
+            let mut fields = line.split('\t');
+            listed_pane_index_matches_target(target, fields.next()?, fields.next()?)
+                .then(|| fields.next().zip(fields.next()))
+                .flatten()
+        })
         .ok_or_else(|| {
             ExitFailure::new(
                 1,
                 format!("resize-pane could not resolve dimensions for pane {target}"),
             )
         })?;
-    let (width, height) = line
-        .split_once(':')
-        .ok_or_else(|| ExitFailure::new(1, "resize-pane dimension output is malformed"))?;
     let width = width.parse::<u16>().map_err(|error| {
         ExitFailure::new(1, format!("invalid resize-pane window width: {error}"))
     })?;

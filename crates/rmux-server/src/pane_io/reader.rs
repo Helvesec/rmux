@@ -317,7 +317,14 @@ pub(crate) fn spawn_pane_exit_watcher(
         .name(thread_name.clone())
         .spawn(move || {
             let _ = child.wait();
-            child.close_pseudoconsole();
+            if let Err(error) = child.terminate_forcefully() {
+                warn!(
+                    session = %session_name,
+                    pane_id = pane_id.as_u32(),
+                    "failed to terminate pane descendants before closing ConPTY: {error}"
+                );
+                child.close_pseudoconsole();
+            }
             if eof_state.wait_until_published(WINDOWS_PANE_EOF_PUBLISHED_GRACE) {
                 return;
             }
@@ -538,15 +545,36 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
     if !pane_output.accepts_generation(generation) {
         return Vec::new();
     }
-    let Some((_sequence, (append_result, clipboard_set))) =
+    let Some((_sequence, append_result)) =
         pane_output.publish_for_generation(generation, bytes, |bytes| {
             let mut transcript = transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned");
+            let mouse_mode_before = transcript.mode() & rmux_core::input::mode::ALL_MOUSE_MODES;
             let mut append_result = transcript.append_bytes_with_effects(bytes);
+            let mouse_mode_changed =
+                transcript.mode() & rmux_core::input::mode::ALL_MOUSE_MODES != mouse_mode_before;
             let passthroughs = std::mem::take(&mut append_result.passthroughs);
             let clipboard_set = passthroughs.iter().any(passthrough_is_clipboard_set);
-            ((append_result, clipboard_set), passthroughs)
+            let clipboard_writes = passthroughs
+                .iter()
+                .filter_map(osc52_clipboard_write_payload)
+                .collect::<Vec<_>>();
+            if let Some(callback) = pane_alert_callback {
+                callback(PaneAlertEvent {
+                    session_name: session_name.clone(),
+                    pane_id,
+                    bell_count: append_result.bell_count,
+                    title_changed: append_result.title_changed,
+                    title_change: append_result.title_change.clone(),
+                    clipboard_set,
+                    clipboard_writes,
+                    mouse_mode_changed,
+                    queue_activity_alert: emit_no_bell_alert || append_result.bell_count > 0,
+                    generation,
+                });
+            }
+            (append_result, passthroughs)
         })
     else {
         return Vec::new();
@@ -563,18 +591,6 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
             dropped = dropped_passthrough_count,
             "dropped terminal passthrough events due to parser safety limits"
         );
-    }
-    if let Some(callback) = pane_alert_callback {
-        callback(PaneAlertEvent {
-            session_name: session_name.clone(),
-            pane_id,
-            bell_count: append_result.bell_count,
-            title_changed: append_result.title_changed,
-            title_change: append_result.title_change.clone(),
-            clipboard_set,
-            queue_activity_alert: emit_no_bell_alert || append_result.bell_count > 0,
-            generation,
-        });
     }
     replies
 }
@@ -598,30 +614,94 @@ fn osc52_payload_is_clipboard_set(sequence: &[u8]) -> bool {
         return false;
     };
     let payload = &body[separator + 1..];
-    payload != b"?" && base64_payload_syntax_is_valid(payload)
-}
-
-fn base64_payload_syntax_is_valid(payload: &[u8]) -> bool {
-    if payload.len() % 4 == 1 {
+    if payload.is_empty() || payload == b"?" {
         return false;
     }
+    // Use the same strict decoder as `osc52_clipboard_write_payload` so the
+    // clipboard_set flag (which drives the PaneSetClipboard hook emission)
+    // stays in sync with buffer storage. Base64 payloads that decode to zero
+    // bytes (e.g. a lone `==` sequence) match the syntax-only classifier but
+    // are dropped by paste_add on the frozen tmux 3.7b oracle — mirror that
+    // so the hook does not fire without a stored buffer.
+    osc52_payload_decodes(payload)
+}
 
-    let mut padding = 0usize;
-    let mut seen_padding = false;
-    for &byte in payload {
+/// Decodes an inbound OSC 52 clipboard-write passthrough to its raw bytes, or
+/// returns None for a query (`?`), an empty/malformed payload, or a
+/// non-clipboard passthrough. Matches the frozen tmux 3.7b oracle: empty and
+/// invalid-base64 writes create no paste buffer (input_osc_52 returns early
+/// without paste_add).
+fn osc52_clipboard_write_payload(passthrough: &TerminalPassthrough) -> Option<Vec<u8>> {
+    if passthrough.kind() != TerminalPassthroughKind::Clipboard {
+        return None;
+    }
+    let body = passthrough.payload().strip_prefix(b"\x1b]52;")?;
+    let body = body
+        .strip_suffix(b"\x07")
+        .or_else(|| body.strip_suffix(b"\x1b\\"))?;
+    let separator = body.iter().position(|byte| *byte == b';')?;
+    let payload = &body[separator + 1..];
+    if payload.is_empty() || payload == b"?" {
+        return None;
+    }
+    let decoded = decode_base64_standard(payload)?;
+    // A decoded length of 0 is possible when the base64 symbols round to zero
+    // output bytes (e.g. a lone `=` sequence). tmux drops these too.
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(decoded)
+}
+
+/// Same validation as `osc52_clipboard_write_payload` reduced to a boolean,
+/// exposed to the outer-forward gate in `passthrough.rs`. Kept in this module
+/// so both paths share the exact same decoder.
+pub(super) fn osc52_payload_decodes(payload: &[u8]) -> bool {
+    decode_base64_standard(payload)
+        .map(|decoded| !decoded.is_empty())
+        .unwrap_or(false)
+}
+
+/// Standard-alphabet base64 decode, tolerating the missing padding some OSC 52
+/// producers emit. Returns None on any invalid symbol so a malformed write is
+/// dropped rather than turned into a garbage buffer.
+fn decode_base64_standard(input: &[u8]) -> Option<Vec<u8>> {
+    fn symbol_value(byte: u8) -> Option<u32> {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !seen_padding => {}
-            b'=' => {
-                seen_padding = true;
-                padding += 1;
-                if padding > 2 {
-                    return false;
-                }
-            }
-            _ => return false,
+            b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+            b'a'..=b'z' => Some(u32::from(byte - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(byte - b'0') + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
         }
     }
-    true
+
+    let mut end = input.len();
+    let mut padding = 0;
+    while end > 0 && input[end - 1] == b'=' {
+        end -= 1;
+        padding += 1;
+    }
+    if padding > 2 {
+        return None;
+    }
+    let symbols = &input[..end];
+    if symbols.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(symbols.len() / 4 * 3 + 2);
+    let mut accumulator = 0u32;
+    let mut bits = 0u32;
+    for &byte in symbols {
+        accumulator = (accumulator << 6) | symbol_value(byte)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((accumulator >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
 }
 
 struct PaneGroundTimerJob {
@@ -851,7 +931,18 @@ fn spawn_blocking_pane_output_reader_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::osc52_payload_is_clipboard_set;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use super::{
+        decode_base64_standard, osc52_clipboard_write_payload, osc52_payload_is_clipboard_set,
+        publish_pane_bytes, PanePublishContext,
+    };
+    use rmux_core::{PaneId, TerminalPassthrough};
+    use rmux_proto::{SessionName, TerminalSize};
+
+    use crate::pane_io::{pane_output_channel, PaneAlertCallback};
+    use crate::pane_transcript::PaneTranscript;
 
     #[test]
     fn osc52_clipboard_set_requires_write_payload() {
@@ -860,6 +951,169 @@ mod tests {
         assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;?\x07"));
         assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;%%\x07"));
         assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;abcde\x07"));
+        // The classifier must reject the same payloads the write decoder
+        // rejects, otherwise the PaneSetClipboard hook fires without a stored
+        // buffer (diverges from the frozen tmux 3.7b oracle: paste_add and
+        // notify_pane must fire together or not at all).
+        assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;\x07"));
+        assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;==\x07"));
+        assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;!!!\x07"));
+    }
+
+    #[test]
+    fn decode_base64_standard_handles_padding_and_missing_padding() {
+        assert_eq!(
+            decode_base64_standard(b"aGVsbG8=").as_deref(),
+            Some(&b"hello"[..])
+        );
+        // OSC 52 producers sometimes omit the trailing padding.
+        assert_eq!(
+            decode_base64_standard(b"aGVsbG8").as_deref(),
+            Some(&b"hello"[..])
+        );
+        assert_eq!(decode_base64_standard(b"aGk=").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(decode_base64_standard(b"").as_deref(), Some(&b""[..]));
+        // Invalid symbols / lengths are rejected rather than decoded to garbage.
+        assert_eq!(decode_base64_standard(b"%%"), None);
+        assert_eq!(decode_base64_standard(b"abcde"), None);
+    }
+
+    #[test]
+    fn osc52_clipboard_write_payload_decodes_writes_and_skips_queries() {
+        assert_eq!(
+            osc52_clipboard_write_payload(&TerminalPassthrough::clipboard(
+                b"\x1b]52;c;aGVsbG8=\x07".to_vec()
+            ))
+            .as_deref(),
+            Some(&b"hello"[..])
+        );
+        // The ST terminator form decodes identically.
+        assert_eq!(
+            osc52_clipboard_write_payload(&TerminalPassthrough::clipboard(
+                b"\x1b]52;c;aGk\x1b\\".to_vec()
+            ))
+            .as_deref(),
+            Some(&b"hi"[..])
+        );
+        // A query carries no write payload.
+        assert!(
+            osc52_clipboard_write_payload(&TerminalPassthrough::clipboard(
+                b"\x1b]52;c;?\x07".to_vec()
+            ))
+            .is_none()
+        );
+        // A non-clipboard passthrough is ignored.
+        assert!(osc52_clipboard_write_payload(&TerminalPassthrough::raw(
+            0,
+            0,
+            b"\x1b]52;c;aGk=\x07".to_vec()
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn osc52_empty_payload_is_dropped_matching_oracle() {
+        // tmux 3.7b's input_osc_52 returns early on an empty payload — no
+        // paste_add, no outer forward. rmux must not create an empty buffer.
+        assert!(
+            osc52_clipboard_write_payload(&TerminalPassthrough::clipboard(
+                b"\x1b]52;c;\x07".to_vec()
+            ))
+            .is_none()
+        );
+        // Neither should a base64 payload that decodes to zero bytes (a lone
+        // padding sequence).
+        assert!(
+            osc52_clipboard_write_payload(&TerminalPassthrough::clipboard(
+                b"\x1b]52;c;==\x07".to_vec()
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn osc52_invalid_base64_payload_is_dropped_matching_oracle() {
+        assert!(
+            osc52_clipboard_write_payload(&TerminalPassthrough::clipboard(
+                b"\x1b]52;c;!!!\x07".to_vec()
+            ))
+            .is_none()
+        );
+        assert!(
+            osc52_clipboard_write_payload(&TerminalPassthrough::clipboard(
+                b"\x1b]52;c;@@@@\x07".to_vec()
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn title_alert_callback_runs_inside_the_transcript_publication_boundary() {
+        let transcript = PaneTranscript::shared(2_000, TerminalSize { cols: 80, rows: 24 });
+        let callback_transcript = Arc::clone(&transcript);
+        let callback_observed = Arc::new(AtomicBool::new(false));
+        let callback_observed_clone = Arc::clone(&callback_observed);
+        let callback: PaneAlertCallback = Arc::new(move |event| {
+            assert!(event.title_change.is_some(), "OSC 2 must change the title");
+            assert!(
+                callback_transcript.try_lock().is_err(),
+                "the title callback must run before the transcript publication lock is released"
+            );
+            callback_observed_clone.store(true, Ordering::Release);
+        });
+        let output = pane_output_channel();
+        let session_name = SessionName::new("title-linearization").expect("valid session name");
+
+        let _ = publish_pane_bytes(
+            PanePublishContext {
+                session_name: &session_name,
+                pane_id: PaneId::new(1),
+                transcript: &transcript,
+                pane_output: &output,
+                generation: None,
+                pane_alert_callback: Some(&callback),
+                emit_no_bell_alert: false,
+            },
+            b"\x1b]2;linearized-title\x07".to_vec(),
+        );
+
+        assert!(callback_observed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn mouse_mode_alert_is_stamped_by_production_pane_publication() {
+        let transcript = PaneTranscript::shared(2_000, TerminalSize { cols: 80, rows: 24 });
+        let callback_transcript = Arc::clone(&transcript);
+        let callback_observed = Arc::new(AtomicBool::new(false));
+        let callback_observed_clone = Arc::clone(&callback_observed);
+        let callback: PaneAlertCallback = Arc::new(move |event| {
+            assert!(
+                event.mouse_mode_changed,
+                "the reader publication path must stamp a real mouse-mode transition"
+            );
+            assert!(
+                callback_transcript.try_lock().is_err(),
+                "mouse-mode comparison and callback must share the transcript boundary"
+            );
+            callback_observed_clone.store(true, Ordering::Release);
+        });
+        let output = pane_output_channel();
+        let session_name = SessionName::new("mouse-mode-stamping").expect("valid session name");
+
+        let _ = publish_pane_bytes(
+            PanePublishContext {
+                session_name: &session_name,
+                pane_id: PaneId::new(1),
+                transcript: &transcript,
+                pane_output: &output,
+                generation: None,
+                pane_alert_callback: Some(&callback),
+                emit_no_bell_alert: false,
+            },
+            b"\x1b[?1003h".to_vec(),
+        );
+
+        assert!(callback_observed.load(Ordering::Acquire));
     }
 }
 
@@ -1000,7 +1254,7 @@ finally:
     #[tokio::test]
     async fn async_output_reader_uses_server_runtime_when_spawned_from_temporary_runtime(
     ) -> Result<(), Box<dyn Error>> {
-        let mut spawned = ChildCommand::new("sh")
+        let spawned = ChildCommand::new("sh")
             .size(PtyTerminalSize::new(80, 24))
             .spawn()?;
         let output_reader = spawned.master().try_clone()?;
@@ -1043,8 +1297,25 @@ finally:
         .await;
 
         spawned.child().terminate_forcefully()?;
-        let _ = spawned.child_mut().wait();
         output_reader_task.abort();
+        drop(writer);
+        let (master, mut child) = spawned.into_parts();
+        drop(master);
+
+        let reap_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if Instant::now() >= reap_deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "temporary-runtime PTY child did not exit after forceful termination",
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         assert!(
             captured.contains("RMUX_SERVER_RUNTIME_OK"),

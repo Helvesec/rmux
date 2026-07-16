@@ -5,10 +5,16 @@ use super::RequestHandler;
 
 #[path = "handler_mode_tree/actions.rs"]
 mod mode_tree_actions;
+#[path = "handler_mode_tree/buffer_actions.rs"]
+mod mode_tree_buffer_actions;
 #[path = "handler_mode_tree/build.rs"]
 mod mode_tree_build;
+#[path = "handler_mode_tree/client_actions.rs"]
+mod mode_tree_client_actions;
 #[path = "handler_mode_tree/customize_build.rs"]
 mod mode_tree_customize_build;
+#[path = "handler_mode_tree/dismissal.rs"]
+mod mode_tree_dismissal;
 #[path = "handler_mode_tree/filter.rs"]
 mod mode_tree_filter;
 #[path = "handler_mode_tree/input.rs"]
@@ -33,7 +39,10 @@ mod mode_tree_selection;
 mod mode_tree_sort;
 #[path = "handler_mode_tree/tree_build.rs"]
 mod mode_tree_tree_build;
+#[path = "handler_mode_tree/tree_kill.rs"]
+mod mode_tree_tree_kill;
 
+pub(in crate::handler) use self::mode_tree_model::ModeTreeActionIdentity;
 use self::mode_tree_model::ModeTreeKind;
 pub(super) use self::mode_tree_model::{ModeTreeClientState, ParsedModeTreeCommand};
 use self::mode_tree_preview::{mode_tree_preview_lines, preview_lines_for_target};

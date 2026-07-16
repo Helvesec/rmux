@@ -1,6 +1,9 @@
-use crate::utf8::{text_width, truncate_right_to_width, truncate_to_width, Utf8Config};
+use crate::utf8::Utf8Config;
 
 use super::regex_cache::cached_regex;
+use super::styled_text::{
+    styled_text_width, truncate_styled_text_right_to_width, truncate_styled_text_to_width,
+};
 use super::FormatModifier;
 
 /// Shell quoting: backslash-escapes tmux shell special characters.
@@ -211,18 +214,18 @@ fn push_tmux_byte(byte: u8, output: &mut String) {
 
 pub(super) fn truncate_left(s: &str, max: usize) -> String {
     let config = Utf8Config::default();
-    if text_width(s, &config) <= max {
+    if styled_text_width(s, &config) <= max {
         s.to_owned()
     } else {
-        truncate_to_width(s, max, &config)
+        truncate_styled_text_to_width(s, max, &config)
     }
 }
 
 pub(super) fn truncate_right(s: &str, max: usize) -> String {
     let config = Utf8Config::default();
-    if text_width(s, &config) <= max {
+    if styled_text_width(s, &config) <= max {
         return s.to_owned();
     }
 
-    truncate_right_to_width(s, max, &config)
+    truncate_styled_text_right_to_width(s, max, &config)
 }

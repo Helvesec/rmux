@@ -2,24 +2,31 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::control_support::{with_control_queue_identity, ControlClientIdentity};
 use super::RequestHandler;
+use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::handler::scripting_support::QueueExecutionContext;
 use crate::hook_runtime::with_hook_execution;
+use crate::outer_terminal::OuterTerminalContext;
 use rmux_core::command_parser::CommandParser;
 use rmux_core::TargetFindContext;
 use rmux_proto::{
-    BreakPaneRequest, DisplayMessageRequest, HookName, IfShellRequest, KillWindowRequest,
-    LastWindowRequest, LinkWindowRequest, NewSessionExtRequest, NewSessionRequest,
-    NewWindowRequest, NextWindowRequest, OptionName, OptionScopeSelector, PaneTarget,
-    PreviousWindowRequest, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
-    RotateWindowDirection, RotateWindowRequest, RunShellDelaySeconds, RunShellRequest,
-    RunShellResponse, ScopeSelector, SelectPaneRequest, SessionName, SetEnvironmentRequest,
-    SetOptionMode, SetOptionRequest, ShowBufferRequest, ShowOptionsRequest, SourceFileRequest,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapPaneDirection, SwapPaneRequest,
-    Target, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse, WindowTarget,
+    encode_internal_runtime_command_arguments, BreakPaneRequest, DisplayMessageRequest, HookName,
+    IfShellRequest, KillSessionRequest, KillWindowRequest, LastWindowRequest, LinkWindowRequest,
+    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName,
+    OptionScopeSelector, PaneTarget, PreviousWindowRequest, Request, RespawnPaneRequest,
+    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest,
+    RunShellDelaySeconds, RunShellRequest, RunShellResponse, ScopeSelector, SelectPaneRequest,
+    SessionName, SetEnvironmentRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
+    ShowEnvironmentRequest, ShowOptionsRequest, SourceFileRequest, SplitDirection,
+    SplitWindowRequest, SplitWindowTarget, SwapPaneDirection, SwapPaneRequest, Target,
+    TerminalSize, WaitForMode, WaitForRequest, WaitForResponse, WindowTarget,
+    INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH, INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
+    INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -58,6 +65,26 @@ fn source_file_request(paths: Vec<String>, cwd: Option<PathBuf>) -> Request {
         caller_cwd: cwd,
         stdin: None,
     }))
+}
+
+fn source_file_stdout_failure(response: Response) -> String {
+    let Response::SourceFile(response) = response else {
+        panic!("expected source-file failure response, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert!(
+        response.stderr().is_empty(),
+        "source-file parse diagnostics must stay on stdout: {:?}",
+        response.stderr()
+    );
+    String::from_utf8(
+        response
+            .command_output()
+            .expect("source-file failure should include stdout diagnostics")
+            .stdout()
+            .to_vec(),
+    )
+    .expect("source-file stdout diagnostic is UTF-8")
 }
 
 fn temp_root(label: &str) -> PathBuf {
@@ -170,8 +197,123 @@ fn background_shell_test_timeout() -> std::time::Duration {
     }
     #[cfg(not(windows))]
     {
-        std::time::Duration::from_secs(2)
+        // Background shell startup competes with thousands of async tests in
+        // the full server suite. Keep this as a bounded liveness budget, not a
+        // scheduler-latency assertion.
+        std::time::Duration::from_secs(8)
     }
+}
+
+async fn register_control_for_session(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session_name: SessionName,
+) -> (u64, tokio::sync::mpsc::Receiver<ControlServerEvent>) {
+    let (event_tx, event_rx) =
+        tokio::sync::mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: rmux_proto::ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(requester_pid, Some(session_name))
+        .await
+        .expect("control session binds");
+    (control_id, event_rx)
+}
+
+async fn create_background_identity_session(handler: &RequestHandler, session_name: SessionName) {
+    let response = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+}
+
+async fn replace_background_identity_session(handler: &RequestHandler, session_name: SessionName) {
+    let response = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: session_name.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    create_background_identity_session(handler, session_name).await;
+}
+
+async fn wait_for_active_window_name(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+    expected: &str,
+) {
+    tokio::time::timeout(background_shell_test_timeout(), async {
+        loop {
+            let matches = {
+                let state = handler.state.lock().await;
+                state
+                    .sessions
+                    .session(session_name)
+                    .and_then(|session| session.window_at(session.active_window_index()))
+                    .and_then(rmux_core::Window::name)
+                    == Some(expected)
+            };
+            if matches {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background command follows the active attached session");
+}
+
+async fn wait_for_background_waiter(handler: &RequestHandler, channel: &str) {
+    tokio::time::timeout(background_shell_test_timeout(), async {
+        loop {
+            if handler.wait_for_counts(channel).0 == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background command reaches its wait-for seam");
+}
+
+async fn release_background_waiter(handler: &RequestHandler, channel: &str) {
+    let response = handler.handle(wait_for(channel, WaitForMode::Signal)).await;
+    assert_eq!(response, Response::WaitFor(WaitForResponse));
+}
+
+async fn assert_sessions_survive_background_control_reuse(
+    handler: &RequestHandler,
+    original: &SessionName,
+    replacement: &SessionName,
+) {
+    wait_for_detached_request_count(handler, 0).await;
+    let state = handler.state.lock().await;
+    assert!(
+        state.sessions.contains_session(original),
+        "the stale background command must not mutate the original session"
+    );
+    assert!(
+        state.sessions.contains_session(replacement),
+        "the stale background command must not jump to the replacement registration"
+    );
 }
 
 #[cfg(unix)]
@@ -248,6 +390,9 @@ mod if_shell;
 #[path = "handler_scripting_tests/parsed_queue_core.rs"]
 mod parsed_queue_core;
 
+#[path = "handler_scripting_tests/parsed_queue_cwd.rs"]
+mod parsed_queue_cwd;
+
 #[path = "handler_scripting_tests/queued_inventory.rs"]
 mod queued_inventory;
 
@@ -256,6 +401,9 @@ mod parsed_queue_split;
 
 #[path = "handler_scripting_tests/parsed_queue_targets.rs"]
 mod parsed_queue_targets;
+
+#[path = "handler_scripting_tests/parsed_queue_swap_window.rs"]
+mod parsed_queue_swap_window;
 
 #[path = "handler_scripting_tests/parsed_queue_windows_mouse.rs"]
 mod parsed_queue_windows_mouse;

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 #[cfg(not(windows))]
-const CLIENT_SPAWN_ENVIRONMENT_NAMES: &[&str] = &["PATH", "SHELL"];
+// SHELL is part of the session's initial environment. A later client may
+// refresh PATH for command lookup, but must not change that session identity.
+const CLIENT_SPAWN_ENVIRONMENT_NAMES: &[&str] = &["PATH"];
 #[cfg(windows)]
 const CLIENT_SPAWN_ENVIRONMENT_NAMES: &[&str] = &["PATH", "PATHEXT"];
 
@@ -75,7 +77,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn client_spawn_environment_keeps_shell_for_default_shell_resolution() {
+    fn client_spawn_environment_does_not_replace_the_session_shell() {
         let client_environment = HashMap::from([
             ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
             ("SHELL".to_owned(), "/usr/bin/fish".to_owned()),
@@ -84,10 +86,7 @@ mod tests {
         let spawn_environment =
             client_spawn_environment(Some(&client_environment)).expect("spawn env is retained");
 
-        assert_eq!(
-            spawn_environment.get("SHELL").map(String::as_str),
-            Some("/usr/bin/fish")
-        );
+        assert!(!spawn_environment.contains_key("SHELL"));
     }
 
     #[test]
@@ -105,6 +104,7 @@ mod tests {
     fn initial_session_spawn_environment_keeps_full_invoking_client_environment() {
         let client_environment = HashMap::from([
             ("PATH".to_owned(), "/tmp/client-bin:/usr/bin".to_owned()),
+            ("SHELL".to_owned(), "/usr/bin/fish".to_owned()),
             (
                 "RMUX_CLIENT_ENV_SENTINEL".to_owned(),
                 "from-client".to_owned(),

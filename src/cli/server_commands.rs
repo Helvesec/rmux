@@ -18,7 +18,10 @@ use super::{expect_command_success, write_command_output};
 use crate::cli_args::{ClientTargetArgs, ServerAccessArgs, SessionTargetArgs};
 
 #[cfg(unix)]
-const KILL_SERVER_SOCKET_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+// The daemon may spend up to five seconds draining accepted lifecycle hooks
+// before it releases the endpoint. Keep enough margin for connection cleanup
+// and scheduler contention so a successful kill-server is a restart barrier.
+const KILL_SERVER_SOCKET_CLEANUP_TIMEOUT: Duration = Duration::from_secs(7);
 #[cfg(unix)]
 const KILL_SERVER_SOCKET_CLEANUP_MIN_POLL: Duration = Duration::from_millis(1);
 #[cfg(unix)]
@@ -153,7 +156,7 @@ pub(super) fn run_server_access(
             list: args.list,
             read_only: args.read_only,
             write: args.write,
-            target: args.target,
+            target: None,
             user: args.user,
         })
     })

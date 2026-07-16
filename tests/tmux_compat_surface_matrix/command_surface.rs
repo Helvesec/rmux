@@ -181,9 +181,9 @@ fn tmux_compat_key_tables_and_list_keys_exact_surface_when_frozen_tmux_is_availa
     assert_eq!(list_keys.tmux.timed_out, list_keys.rmux.timed_out);
     assert_eq!(list_keys.tmux.stderr, list_keys.rmux.stderr);
     assert_eq!(
-        drop_deferred_new_pane_binding(&list_keys.tmux.stdout),
+        drop_deferred_prefix_bindings(&list_keys.tmux.stdout),
         list_keys.rmux.stdout,
-        "RMUX must not advertise the deferred C-D32 new-pane binding before it is implemented"
+        "RMUX must not advertise deferred bindings whose commands are not implemented"
     );
     assert_run_metadata(
         &list_keys,

@@ -1,6 +1,6 @@
 use rmux_core::{
     key_code_is_mouse_move, key_code_lookup_bits, key_string_lookup_string, KeyBinding, KeyCode,
-    KEYC_ANY, KEYC_MASK_KEY, KEYC_MASK_MODIFIERS,
+    Session, KEYC_ANY, KEYC_MASK_KEY, KEYC_MASK_MODIFIERS,
 };
 use rmux_proto::{OptionName, PaneTarget};
 
@@ -68,6 +68,25 @@ pub(crate) fn default_key_table_name(state: &HandlerState, target: &PaneTarget) 
         .filter(|value| !value.is_empty())
         .unwrap_or(ROOT_TABLE)
         .to_owned()
+}
+
+pub(crate) fn effective_client_key_table_name(
+    state: &HandlerState,
+    session: &Session,
+    transient_table: Option<&str>,
+) -> String {
+    if let Some(table_name) = transient_table {
+        return table_name.to_owned();
+    }
+
+    default_key_table_name(
+        state,
+        &PaneTarget::with_window(
+            session.name().clone(),
+            session.active_window_index(),
+            session.active_pane_index(),
+        ),
+    )
 }
 
 pub(crate) fn session_option_key(
@@ -344,8 +363,10 @@ fn control_alpha_key(byte: u8) -> Option<KeyCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_attached_key, AttachedKeyDecode};
-    use rmux_core::{key_code_lookup_bits, key_string_lookup_string};
+    use super::{decode_attached_key, effective_client_key_table_name, AttachedKeyDecode};
+    use crate::pane_terminals::HandlerState;
+    use rmux_core::{key_code_lookup_bits, key_string_lookup_string, Session};
+    use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize};
 
     fn assert_attached_key(sequence: &[u8], expected_name: &str) {
         let AttachedKeyDecode::Matched { size, key } = decode_attached_key(sequence, None) else {
@@ -356,6 +377,31 @@ mod tests {
             key_code_lookup_bits(key),
             key_code_lookup_bits(key_string_lookup_string(expected_name).expect("key parses")),
             "{expected_name} key bits"
+        );
+    }
+
+    #[test]
+    fn effective_client_table_uses_session_default_beneath_transient_table() {
+        let session_name = SessionName::new("alpha").expect("valid session name");
+        let session = Session::new(session_name.clone(), TerminalSize { cols: 80, rows: 24 });
+        let mut state = HandlerState::default();
+        state
+            .options
+            .set(
+                ScopeSelector::Session(session_name),
+                OptionName::KeyTable,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session key-table option should be accepted");
+
+        assert_eq!(
+            effective_client_key_table_name(&state, &session, None),
+            "off"
+        );
+        assert_eq!(
+            effective_client_key_table_name(&state, &session, Some("prefix")),
+            "prefix"
         );
     }
 

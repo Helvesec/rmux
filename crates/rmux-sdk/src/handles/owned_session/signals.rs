@@ -2,8 +2,8 @@
 
 #[cfg(windows)]
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 #[cfg(unix)]
 use std::thread;
 
@@ -11,86 +11,209 @@ use std::thread;
 use tokio::task::JoinHandle;
 
 use crate::transport::TransportClient;
-#[cfg(unix)]
-use crate::RmuxError;
-use crate::{Result, SessionName};
-use rmux_proto::{KillSessionRequest, Request};
+use crate::{Result, RmuxError};
+use rmux_proto::Request;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum SignalHandlerPhase {
+    #[default]
+    Idle,
+    Armed,
+    Firing,
+    Finished,
+    Disarmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalHandlerDropAction {
+    CancelListener,
+    KeepCleanup,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct SignalHandlerState {
+    phase: Mutex<SignalHandlerPhase>,
+}
+
+impl SignalHandlerState {
+    fn reserve_install(&self) -> Result<()> {
+        let mut phase = self.lock_phase();
+        if *phase != SignalHandlerPhase::Idle {
+            return Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                "owned session signal handlers are already installed".to_owned(),
+            )));
+        }
+        *phase = SignalHandlerPhase::Armed;
+        Ok(())
+    }
+
+    pub(super) fn disarm_for_ownership_release(&self) -> Result<()> {
+        let mut phase = self.lock_phase();
+        match *phase {
+            SignalHandlerPhase::Idle | SignalHandlerPhase::Disarmed => Ok(()),
+            SignalHandlerPhase::Armed => {
+                *phase = SignalHandlerPhase::Disarmed;
+                Ok(())
+            }
+            SignalHandlerPhase::Firing => Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                "owned-session signal cleanup is already in progress".to_owned(),
+            ))),
+            SignalHandlerPhase::Finished => {
+                Err(RmuxError::protocol(rmux_proto::RmuxError::Server(
+                    "owned-session signal cleanup has already finished".to_owned(),
+                )))
+            }
+        }
+    }
+
+    pub(super) fn try_begin_cleanup(&self) -> bool {
+        let mut phase = self.lock_phase();
+        if *phase != SignalHandlerPhase::Armed {
+            return false;
+        }
+        *phase = SignalHandlerPhase::Firing;
+        true
+    }
+
+    fn finish_cleanup(&self) {
+        let mut phase = self.lock_phase();
+        if *phase == SignalHandlerPhase::Firing {
+            *phase = SignalHandlerPhase::Finished;
+        }
+    }
+
+    fn rollback_install(&self) {
+        let mut phase = self.lock_phase();
+        if *phase == SignalHandlerPhase::Armed {
+            *phase = SignalHandlerPhase::Idle;
+        }
+    }
+
+    fn release_guard(&self) -> SignalHandlerDropAction {
+        let mut phase = self.lock_phase();
+        match *phase {
+            SignalHandlerPhase::Idle => SignalHandlerDropAction::CancelListener,
+            SignalHandlerPhase::Armed | SignalHandlerPhase::Disarmed => {
+                *phase = SignalHandlerPhase::Idle;
+                SignalHandlerDropAction::CancelListener
+            }
+            SignalHandlerPhase::Firing | SignalHandlerPhase::Finished => {
+                SignalHandlerDropAction::KeepCleanup
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_installed(&self) -> bool {
+        *self.lock_phase() != SignalHandlerPhase::Idle
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_disarmed(&self) -> bool {
+        *self.lock_phase() == SignalHandlerPhase::Disarmed
+    }
+
+    fn lock_phase(&self) -> std::sync::MutexGuard<'_, SignalHandlerPhase> {
+        self.phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 pub(super) fn install_default_signal_handlers(
     transport: TransportClient,
-    target: SessionName,
-    installed: Arc<AtomicBool>,
+    cleanup_request: Request,
+    state: Arc<SignalHandlerState>,
 ) -> Result<OwnedSessionSignalHandlers> {
+    let reservation = SignalHandlerInstallReservation::acquire(state)?;
     #[cfg(unix)]
-    {
-        install_unix_signal_handlers(transport, target, installed)
-    }
+    let handlers =
+        install_unix_signal_handlers(transport, cleanup_request, Arc::clone(&reservation.state))?;
     #[cfg(windows)]
-    {
-        Ok(install_tokio_signal_handlers(transport, target, installed))
-    }
+    let handlers =
+        install_tokio_signal_handlers(transport, cleanup_request, Arc::clone(&reservation.state))?;
     #[cfg(all(not(unix), not(windows)))]
-    {
-        let _ = (transport, target);
-        Ok(OwnedSessionSignalHandlers { installed })
+    let handlers = {
+        let _ = (transport, cleanup_request);
+        OwnedSessionSignalHandlers {
+            state: Arc::clone(&reservation.state),
+        }
+    };
+    reservation.commit();
+    Ok(handlers)
+}
+
+struct SignalHandlerInstallReservation {
+    state: Arc<SignalHandlerState>,
+    committed: bool,
+}
+
+impl SignalHandlerInstallReservation {
+    fn acquire(state: Arc<SignalHandlerState>) -> Result<Self> {
+        state.reserve_install()?;
+        Ok(Self {
+            state,
+            committed: false,
+        })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SignalHandlerInstallReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.state.rollback_install();
+        }
     }
 }
 
 #[cfg(windows)]
 fn install_tokio_signal_handlers(
     transport: TransportClient,
-    target: SessionName,
-    installed: Arc<AtomicBool>,
-) -> OwnedSessionSignalHandlers {
-    let task = tokio::spawn(async move {
+    cleanup_request: Request,
+    state: Arc<SignalHandlerState>,
+) -> Result<OwnedSessionSignalHandlers> {
+    let runtime = current_runtime()?;
+    let cleanup_state = Arc::clone(&state);
+    let task = runtime.spawn(async move {
         wait_for_default_shutdown_signal().await;
-        let _ = transport
-            .request(Request::KillSession(KillSessionRequest {
-                target,
-                kill_all_except_target: false,
-                clear_alerts: false,
-                kill_group: false,
-            }))
-            .await;
+        if cleanup_state.try_begin_cleanup() {
+            run_signal_cleanup(transport, cleanup_request, cleanup_state).await;
+        }
     });
 
-    OwnedSessionSignalHandlers { task, installed }
+    Ok(OwnedSessionSignalHandlers { task, state })
 }
 
 #[cfg(unix)]
 fn install_unix_signal_handlers(
     transport: TransportClient,
-    target: SessionName,
-    installed: Arc<AtomicBool>,
+    cleanup_request: Request,
+    state: Arc<SignalHandlerState>,
 ) -> Result<OwnedSessionSignalHandlers> {
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
 
-    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
-        RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
-            "owned session signal handlers require a Tokio runtime: {error}"
-        )))
-    })?;
+    let runtime = current_runtime()?;
     let mut signals =
         Signals::new([SIGINT, SIGTERM, SIGHUP]).map_err(|source| RmuxError::Transport {
             operation: "install owned-session signal handlers".to_owned(),
             source,
         })?;
     let handle = signals.handle();
+    let cleanup_state = Arc::clone(&state);
     let thread = thread::Builder::new()
         .name("rmux-sdk-owned-signals".to_owned())
         .spawn(move || {
-            if signals.forever().next().is_some() {
-                runtime.spawn(async move {
-                    let _ = transport
-                        .request(Request::KillSession(KillSessionRequest {
-                            target,
-                            kill_all_except_target: false,
-                            clear_alerts: false,
-                            kill_group: false,
-                        }))
-                        .await;
-                });
+            if signals.forever().next().is_some() && cleanup_state.try_begin_cleanup() {
+                runtime.spawn(run_signal_cleanup(
+                    transport,
+                    cleanup_request,
+                    cleanup_state,
+                ));
             }
         })
         .map_err(|source| RmuxError::Transport {
@@ -101,7 +224,26 @@ fn install_unix_signal_handlers(
     Ok(OwnedSessionSignalHandlers {
         signal_handle: handle,
         thread: Some(thread),
-        installed,
+        state,
+    })
+}
+
+#[cfg(any(unix, windows))]
+async fn run_signal_cleanup(
+    transport: TransportClient,
+    cleanup_request: Request,
+    state: Arc<SignalHandlerState>,
+) {
+    let _ = transport.request(cleanup_request).await;
+    state.finish_cleanup();
+}
+
+#[cfg(any(unix, windows))]
+fn current_runtime() -> Result<tokio::runtime::Handle> {
+    tokio::runtime::Handle::try_current().map_err(|error| {
+        RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+            "owned session signal handlers require a Tokio runtime: {error}"
+        )))
     })
 }
 
@@ -115,16 +257,18 @@ pub struct OwnedSessionSignalHandlers {
     thread: Option<thread::JoinHandle<()>>,
     #[cfg(windows)]
     task: JoinHandle<()>,
-    installed: Arc<AtomicBool>,
+    state: Arc<SignalHandlerState>,
 }
 
 impl OwnedSessionSignalHandlers {
-    /// Stops listening for process signals without killing the session.
+    /// Stops listening for process signals without starting cleanup.
+    /// Cleanup that already started is allowed to finish.
     pub fn abort(self) {}
 }
 
 impl Drop for OwnedSessionSignalHandlers {
     fn drop(&mut self) {
+        let drop_action = self.state.release_guard();
         #[cfg(unix)]
         {
             self.signal_handle.close();
@@ -133,8 +277,11 @@ impl Drop for OwnedSessionSignalHandlers {
             }
         }
         #[cfg(windows)]
-        self.task.abort();
-        self.installed.store(false, Ordering::Release);
+        if drop_action == SignalHandlerDropAction::CancelListener {
+            self.task.abort();
+        }
+        #[cfg(not(windows))]
+        let _ = drop_action;
     }
 }
 
@@ -231,5 +378,106 @@ impl ShutdownSignalWaiters {
         for task in self.tasks {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    #[cfg(any(unix, windows))]
+    use std::sync::Arc;
+
+    #[cfg(any(unix, windows))]
+    use super::run_signal_cleanup;
+    use super::{SignalHandlerDropAction, SignalHandlerState};
+    #[cfg(any(unix, windows))]
+    use crate::transport::TransportClient;
+
+    #[test]
+    fn armed_signal_guard_releases_the_installation_reservation_on_drop() {
+        let state = SignalHandlerState::default();
+        state
+            .reserve_install()
+            .expect("first install reserves state");
+
+        assert_eq!(
+            state.release_guard(),
+            SignalHandlerDropAction::CancelListener
+        );
+
+        state
+            .reserve_install()
+            .expect("dropping an armed guard must permit a later installation");
+    }
+
+    #[test]
+    fn in_flight_cleanup_survives_guard_drop_and_stays_fail_closed() {
+        let state = SignalHandlerState::default();
+        state
+            .reserve_install()
+            .expect("first install reserves state");
+        assert!(state.try_begin_cleanup(), "signal begins cleanup once");
+
+        assert_eq!(state.release_guard(), SignalHandlerDropAction::KeepCleanup);
+        assert!(
+            state.reserve_install().is_err(),
+            "guard drop must not make an in-flight cleanup installable again"
+        );
+        let error = state
+            .disarm_for_ownership_release()
+            .expect_err("canceled or in-flight cleanup must block ownership release");
+        assert!(
+            error.to_string().contains("already in progress"),
+            "unexpected ownership-release error: {error}"
+        );
+    }
+
+    #[test]
+    fn finished_cleanup_remains_terminal_after_guard_drop() {
+        let state = SignalHandlerState::default();
+        state
+            .reserve_install()
+            .expect("first install reserves state");
+        assert!(state.try_begin_cleanup(), "signal begins cleanup once");
+        state.finish_cleanup();
+
+        assert_eq!(state.release_guard(), SignalHandlerDropAction::KeepCleanup);
+        assert!(
+            state.reserve_install().is_err(),
+            "completed signal cleanup must not allow another installation"
+        );
+        let error = state
+            .disarm_for_ownership_release()
+            .expect_err("completed signal cleanup must block ownership release");
+        assert!(
+            error.to_string().contains("already finished"),
+            "unexpected ownership-release error: {error}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn completed_cleanup_request_marks_the_state_terminal() {
+        let (client_stream, server_stream) = tokio::io::duplex(1024);
+        drop(server_stream);
+        let state = Arc::new(SignalHandlerState::default());
+        state
+            .reserve_install()
+            .expect("first install reserves state");
+        assert!(state.try_begin_cleanup(), "signal begins cleanup once");
+
+        run_signal_cleanup(
+            TransportClient::spawn(client_stream),
+            super::super::session_identity_kill_request(crate::SessionId::new(42)),
+            Arc::clone(&state),
+        )
+        .await;
+
+        let error = state
+            .disarm_for_ownership_release()
+            .expect_err("a completed cleanup request must block ownership release");
+        assert!(
+            error.to_string().contains("already finished"),
+            "unexpected ownership-release error: {error}"
+        );
     }
 }

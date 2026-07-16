@@ -11,7 +11,7 @@ use rmux_proto::{
 use super::tokens::{
     parse_compact_flag_cluster, rebuild_shell_command, CommandTokens, CompactFlag,
 };
-use super::values::{parse_percentage, unsupported_flag};
+use super::values::{parse_percentage, reject_unknown_option_before_positional, unsupported_flag};
 use super::{
     implicit_pane_target, implicit_split_target, marked_pane_target_or_current, parse_pane_target,
     parse_split_window_target, parse_window_target,
@@ -110,8 +110,8 @@ pub(super) fn parse_select_pane(
     let mut input_disabled = None;
     let mut preserve_zoom = false;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -171,7 +171,42 @@ pub(super) fn parse_select_pane(
                 let _ = args.optional();
                 direction = Some(SelectPaneDirection::Right);
             }
-            _ => break,
+            _ => {
+                // tmux 3.7b accepts the hidden value-taking -P option even though
+                // its list-commands signature omits it, so parse compact forms
+                // here without changing the public inventory.
+                let Some(cluster) = parse_compact_flag_cluster(&token, "DdeLlMmRUZ", "PTt") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('m') => mark = true,
+                        CompactFlag::Bare('M') => clear_marked = true,
+                        CompactFlag::Bare('l') => last = true,
+                        CompactFlag::Bare('Z') => preserve_zoom = true,
+                        CompactFlag::Bare('d') => input_disabled = Some(true),
+                        CompactFlag::Bare('e') => input_disabled = Some(false),
+                        CompactFlag::Bare('U') => direction = Some(SelectPaneDirection::Up),
+                        CompactFlag::Bare('D') => direction = Some(SelectPaneDirection::Down),
+                        CompactFlag::Bare('L') => direction = Some(SelectPaneDirection::Left),
+                        CompactFlag::Bare('R') => direction = Some(SelectPaneDirection::Right),
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_pane_target(
+                                "select-pane",
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'T', .. } => {
+                            title = Some(compact_flag.value_or_next(&mut args, "-T title")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'P', .. } => {
+                            style = Some(compact_flag.value_or_next(&mut args, "-P style")?);
+                        }
+                        _ => unreachable!("compact select-pane flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
     args.no_extra("select-pane")?;
@@ -267,6 +302,7 @@ fn parse_split_window_command(
     let mut print_target = false;
     let mut format = None;
     let mut stdin = false;
+    let mut keep_alive_on_exit = false;
 
     while let Some(token) = args.peek() {
         match token {
@@ -342,6 +378,10 @@ fn parse_split_window_command(
                 let _ = args.optional();
                 stdin = true;
             }
+            "-k" => {
+                let _ = args.optional();
+                keep_alive_on_exit = true;
+            }
             "-F" | "-P" => {
                 return Err(unsupported_flag("split-window", token));
             }
@@ -360,7 +400,9 @@ fn parse_split_window_command(
                 environment.push(args.required("-e name=value")?);
             }
             token => {
-                let Some(cluster) = parse_compact_flag_cluster(token, "bdfhIPvZP", "ceFltp") else {
+                let Some(cluster) = parse_compact_flag_cluster(token, "bdfhIkpvZP", "ceFltp")
+                else {
+                    reject_unknown_option_before_positional("split-window", token)?;
                     break;
                 };
                 let _ = args.optional();
@@ -379,6 +421,7 @@ fn parse_split_window_command(
                             direction_set = true;
                         }
                         CompactFlag::Bare('I') => stdin = true,
+                        CompactFlag::Bare('k') => keep_alive_on_exit = true,
                         CompactFlag::Bare('P') if allow_print_flags => print_target = true,
                         CompactFlag::Bare('P') => {
                             return Err(unsupported_flag("split-window", "-P"));
@@ -454,6 +497,7 @@ fn parse_split_window_command(
         || size.is_some()
         || full_size
         || preserve_zoom
+        || keep_alive_on_exit
         || stdin_to_empty_pane
     {
         Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
@@ -464,7 +508,7 @@ fn parse_split_window_command(
             command,
             process_command: stdin_to_empty_pane.then(|| ProcessCommand::Shell(String::new())),
             start_directory,
-            keep_alive_on_exit: stdin_to_empty_pane.then_some(true),
+            keep_alive_on_exit: (keep_alive_on_exit || stdin_to_empty_pane).then_some(true),
             detached,
             size,
             preserve_zoom,
@@ -782,7 +826,10 @@ pub(super) fn parse_pipe_pane(
                 let _ = args.optional();
                 target = Some(parse_pane_target("pipe-pane", args.required("-t target")?)?);
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("pipe-pane", token)?;
+                break;
+            }
         }
     }
 
@@ -835,7 +882,10 @@ pub(super) fn parse_respawn_pane(
                     args.required("-t target")?,
                 )?);
             }
-            _ => break,
+            token => {
+                reject_unknown_option_before_positional("respawn-pane", token)?;
+                break;
+            }
         }
     }
 

@@ -121,6 +121,17 @@ pub struct SplitWindowTargetActionRequest {
     pub stdin_payload: Option<Vec<u8>>,
 }
 
+/// SDK split request that returns the new pane's visible slot and stable id
+/// atomically with the mutation.
+///
+/// This is a capability-gated append-only wire extension. The existing
+/// [`SplitWindowTargetActionRequest`] remains unchanged for CLI callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitWindowIdentityRequest {
+    /// Complete split action resolved server-side before the mutation.
+    pub action: SplitWindowTargetActionRequest,
+}
+
 impl<'de> Deserialize<'de> for SplitWindowExtRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

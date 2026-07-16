@@ -53,6 +53,50 @@ impl Harness {
         })
     }
 
+    pub async fn start_via_cmd(label: &str, session_name: &SessionName) -> TestResult<Self> {
+        let pipe_name = unique_pipe_name(label)?;
+        let daemon_binary = rmux_binary()?.to_path_buf();
+        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let rmux = builder(&pipe_name).build();
+        let run = rmux
+            .cmd(["new-session", "-d", "-s", session_name.as_str()])
+            .await?;
+        if run.exit != Some(0) {
+            return Err(format!(
+                "cold-start command exited {:?}: {}",
+                run.exit,
+                String::from_utf8_lossy(&run.stderr)
+            )
+            .into());
+        }
+        Ok(Self {
+            pipe_name,
+            rmux: Some(rmux),
+            armed: true,
+        })
+    }
+
+    pub async fn start_with_default_config_environment(
+        label: &str,
+        appdata: &Path,
+        caller_cwd: &Path,
+    ) -> TestResult<Self> {
+        let pipe_name = unique_pipe_name(label)?;
+        let daemon_binary = rmux_binary()?.to_path_buf();
+        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let _appdata_env = EnvGuard::set("APPDATA", appdata.as_os_str());
+        let _xdg_env = EnvGuard::remove("XDG_CONFIG_HOME");
+        let _userprofile_env = EnvGuard::remove("USERPROFILE");
+        let _explicit_config_env = EnvGuard::remove("RMUX_CONFIG_FILE");
+        let _cwd = CurrentDirGuard::set(caller_cwd)?;
+        let rmux = builder(&pipe_name).connect_or_start().await?;
+        Ok(Self {
+            pipe_name,
+            rmux: Some(rmux),
+            armed: true,
+        })
+    }
+
     pub fn rmux(&self) -> &Rmux {
         self.rmux.as_ref().expect("harness rmux is available")
     }
@@ -384,6 +428,12 @@ impl EnvGuard {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -392,5 +442,23 @@ impl Drop for EnvGuard {
             Some(value) => std::env::set_var(self.key, value),
             None => std::env::remove_var(self.key),
         }
+    }
+}
+
+struct CurrentDirGuard {
+    previous: PathBuf,
+}
+
+impl CurrentDirGuard {
+    fn set(path: &Path) -> std::io::Result<Self> {
+        let previous = std::env::current_dir()?;
+        std::env::set_current_dir(path)?;
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.previous);
     }
 }

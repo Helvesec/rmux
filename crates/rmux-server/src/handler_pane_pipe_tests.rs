@@ -7,6 +7,8 @@ use rmux_proto::{
     DisplayMessageRequest, NewSessionRequest, PaneTarget, PipePaneRequest, Request, Response,
     SendKeysRequest, SessionName, Target, TerminalSize,
 };
+#[cfg(unix)]
+use rustix::process::{kill_process, test_kill_process, Pid, Signal};
 use tokio::time::sleep;
 
 const PANE_PIPE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -163,6 +165,97 @@ async fn wait_for_pipe_child_count_to_return_to(baseline: usize) {
     }
 }
 
+#[cfg(unix)]
+async fn wait_for_pipe_descendant_pid(path: &Path) -> Pid {
+    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
+    loop {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Ok(raw_pid) = contents.trim().parse::<i32>() {
+                if let Some(pid) = Pid::from_raw(raw_pid) {
+                    return pid;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for pipe-pane descendant pid"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_windows_pipe_descendant_pid(path: &Path) -> u32 {
+    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
+    loop {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Ok(pid) = contents.trim().parse::<u32>() {
+                return pid;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for Windows pipe-pane descendant pid"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_process_to_exit(pid: Pid) {
+    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
+    loop {
+        match test_kill_process(pid) {
+            Err(error) if error == rustix::io::Errno::SRCH => return,
+            Err(error) => panic!("failed to query pipe-pane descendant {pid:?}: {error}"),
+            Ok(()) => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pipe-pane descendant {pid:?} survived pipe shutdown"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_windows_process_to_exit(pid: u32) {
+    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
+    while rmux_os::process::is_live(pid) && tokio::time::Instant::now() < deadline {
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !rmux_os::process::is_live(pid),
+        "Windows pipe-pane descendant {pid} survived pipe shutdown"
+    );
+}
+
+#[cfg(unix)]
+struct PipeDescendantCleanup(Option<Pid>);
+
+#[cfg(unix)]
+impl Drop for PipeDescendantCleanup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = kill_process(pid, Signal::KILL);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsPipeDescendantCleanup(Option<u32>);
+
+#[cfg(windows)]
+impl Drop for WindowsPipeDescendantCleanup {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            let _ = std::process::Command::new("taskkill.exe")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
+        }
+    }
+}
+
 #[tokio::test]
 async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
     let handler = RequestHandler::new();
@@ -213,6 +306,114 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
 
     let _ = fs::remove_file(first_output);
     let _ = fs::remove_file(second_output);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stopping_pipe_pane_terminates_descendants_after_the_shell_exits() {
+    let handler = RequestHandler::new();
+    let target = PaneTarget::with_window(session_name("pipe-process-group"), 0, 0);
+    let pid_file = unique_temp_path("descendant-pid");
+    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
+    create_session(&handler, "pipe-process-group").await;
+    let command = format!(
+        "sleep 60 & child=$!; printf '%s\\n' \"$child\" > {}",
+        crate::test_shell::sh_quote_path(&pid_file)
+    );
+
+    let response = handler
+        .handle(Request::PipePane(PipePaneRequest {
+            target: target.clone(),
+            stdin: true,
+            stdout: false,
+            once: false,
+            command: Some(command),
+        }))
+        .await;
+    assert!(matches!(response, Response::PipePane(_)));
+    let descendant = wait_for_pipe_descendant_pid(&pid_file).await;
+    let mut cleanup = PipeDescendantCleanup(Some(descendant));
+    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
+
+    pipe_pane(&handler, target, false, None).await;
+    wait_for_process_to_exit(descendant).await;
+    cleanup.0 = None;
+    let _ = fs::remove_file(pid_file);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn stopping_pipe_pane_terminates_fast_descendants_after_the_shell_exits() {
+    let handler = RequestHandler::new();
+    let target = PaneTarget::with_window(session_name("pipe-windows-job"), 0, 0);
+    let pid_file = unique_temp_path("windows-descendant-pid");
+    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
+    create_session(&handler, "pipe-windows-job").await;
+    let command = crate::test_shell::powershell_encoded_command(&format!(
+        "$child=Start-Process -FilePath ($PSHOME + '\\powershell.exe') -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru; [System.IO.File]::WriteAllText({}, [string]$child.Id)",
+        crate::test_shell::powershell_quote_path(&pid_file)
+    ));
+
+    let response = handler
+        .handle(Request::PipePane(PipePaneRequest {
+            target: target.clone(),
+            stdin: true,
+            stdout: false,
+            once: false,
+            command: Some(command),
+        }))
+        .await;
+    assert!(matches!(response, Response::PipePane(_)));
+    let descendant = wait_for_windows_pipe_descendant_pid(&pid_file).await;
+    let mut cleanup = WindowsPipeDescendantCleanup(Some(descendant));
+    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
+
+    pipe_pane(&handler, target, false, None).await;
+    wait_for_windows_process_to_exit(descendant).await;
+    cleanup.0 = None;
+    let _ = fs::remove_file(pid_file);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn late_pipe_stop_does_not_reuse_a_disarmed_process_group_id() {
+    let handler = RequestHandler::new();
+    let target = PaneTarget::with_window(session_name("pipe-late-stop"), 0, 0);
+    create_session(&handler, "pipe-late-stop").await;
+
+    let response = handler
+        .handle(Request::PipePane(PipePaneRequest {
+            target: target.clone(),
+            stdin: true,
+            stdout: false,
+            once: false,
+            command: Some("printf done".to_owned()),
+        }))
+        .await;
+    assert!(matches!(response, Response::PipePane(_)));
+    let probe = handler
+        .state
+        .lock()
+        .await
+        .pane_pipe_process_group_probe_for_test(&target)
+        .expect("active pipe process group probe");
+
+    let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
+    while probe.is_armed() || probe.termination_count() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "completed pipe process group stayed armed"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(probe.termination_count(), 1);
+
+    pipe_pane(&handler, target, false, None).await;
+    assert_eq!(
+        probe.termination_count(),
+        1,
+        "a late stop must not signal a recycled numeric process group"
+    );
 }
 
 #[tokio::test]

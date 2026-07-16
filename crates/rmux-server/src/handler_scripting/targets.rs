@@ -10,6 +10,7 @@ use rmux_proto::{
 };
 
 use super::super::{switch_client_target_find_type, target_support::pane_id_target};
+use super::tokens::{short_option_prefix_len, short_option_takes_next_value};
 use super::values::{missing_argument, parse_u32};
 
 pub(super) fn resolve_queue_target_arguments(
@@ -24,7 +25,9 @@ pub(super) fn resolve_queue_target_arguments(
 
     let mut resolved = Vec::with_capacity(arguments.len());
     let all_arguments = arguments.clone();
-    let mut arguments = VecDeque::from(arguments);
+    let option_prefix_len = short_option_prefix_len(command_name, &arguments);
+    let positional_arguments = arguments[option_prefix_len..].to_vec();
+    let mut arguments = VecDeque::from(arguments[..option_prefix_len].to_vec());
     while let Some(argument) = arguments.pop_front() {
         if argument == "--" {
             resolved.push(argument);
@@ -117,9 +120,16 @@ pub(super) fn resolve_queue_target_arguments(
                 find_context,
             )?);
         } else {
+            let takes_next_value = short_option_takes_next_value(command_name, &argument);
             resolved.push(argument);
+            if takes_next_value {
+                if let Some(value) = arguments.pop_front() {
+                    resolved.push(value);
+                }
+            }
         }
     }
+    resolved.extend(positional_arguments);
 
     Ok(resolved)
 }
@@ -259,6 +269,45 @@ pub(super) fn resolve_queue_target_argument(
     resolve_target_argument_with_spec(value, spec, sessions, find_context)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum QueueTargetArgumentResolution {
+    Resolved(String),
+    CanFail,
+}
+
+pub(super) fn resolve_queue_target_argument_typed(
+    command_name: &str,
+    flag: char,
+    value: String,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<QueueTargetArgumentResolution, RmuxError> {
+    let Some(spec) = target_spec_for_flag(command_name, flag) else {
+        return Ok(QueueTargetArgumentResolution::Resolved(value));
+    };
+    resolve_target_argument_with_spec_typed(value, spec, sessions, find_context)
+}
+
+fn resolve_target_argument_with_spec_typed(
+    value: String,
+    spec: CommandTargetSpec,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<QueueTargetArgumentResolution, RmuxError> {
+    match sessions.resolve_unresolved_target(
+        &UnresolvedTarget::new(value),
+        spec.find_type,
+        spec.flags,
+        find_context,
+    ) {
+        Ok(target) => Ok(QueueTargetArgumentResolution::Resolved(target.to_string())),
+        Err(_) if spec.flags.contains(TargetFindFlags::CANFAIL) => {
+            Ok(QueueTargetArgumentResolution::CanFail)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn resolve_target_argument_with_spec(
     value: String,
     spec: CommandTargetSpec,
@@ -316,8 +365,6 @@ fn queue_target_spec_for_flag(
         spec.find_type = switch_client_target_find_type(value);
     } else if command_name == "set-option" && flag == 't' {
         spec.find_type = set_option_target_find_type(arguments);
-    } else if matches!(command_name, "set-hook" | "show-hooks") && flag == 't' {
-        spec.find_type = hook_target_find_type(value, arguments);
     }
     Some(spec)
 }
@@ -373,24 +420,6 @@ fn signed_window_index_target(value: &str) -> bool {
         return false;
     };
     rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn hook_target_find_type(value: &str, arguments: &[String]) -> TargetFindType {
-    if arguments.iter().any(|arg| arg == "-p") {
-        TargetFindType::Pane
-    } else if arguments.iter().any(|arg| arg == "-w") || value == "." {
-        TargetFindType::Window
-    } else if value.starts_with('%') || value.rsplit_once('.').is_some() {
-        TargetFindType::Pane
-    } else if value.starts_with('@')
-        || value
-            .rsplit_once(':')
-            .is_some_and(|(_, rest)| !rest.is_empty())
-    {
-        TargetFindType::Window
-    } else {
-        TargetFindType::Session
-    }
 }
 
 pub(super) fn new_window_target_is_session(value: &str) -> bool {
@@ -461,67 +490,20 @@ fn queue_compact_bare_flags(command_name: &str) -> Option<&'static str> {
         "copy-mode" => Some("deHMSqu"),
         "join-pane" | "move-pane" => Some("bdfhv"),
         "send-keys" | "send" => Some("FHlKMRX"),
-        "split-window" => Some("bdfhIPvZP"),
+        "set-hook" => Some("agpRuw"),
+        "show-hooks" => Some("gpw"),
+        "split-window" => Some("bdfhIkpvZP"),
         "swap-pane" => Some("dDUZ"),
+        "swap-window" => Some("d"),
         _ => None,
     }
 }
 
 fn queue_target_resolution_enabled(command_name: &str) -> bool {
-    matches!(
-        command_name,
-        "attach-session"
-            | "break-pane"
-            | "capture-pane"
-            | "copy-mode"
-            | "display-message"
-            | "display-menu"
-            | "display-popup"
-            | "has-session"
-            | "if-shell"
-            | "join-pane"
-            | "kill-pane"
-            | "kill-session"
-            | "kill-window"
-            | "last-pane"
-            | "last-window"
-            | "link-window"
-            | "list-panes"
-            | "list-windows"
-            | "move-pane"
-            | "move-window"
-            | "new-window"
-            | "next-layout"
-            | "next-window"
-            | "paste-buffer"
-            | "pipe-pane"
-            | "previous-layout"
-            | "previous-window"
-            | "rename-session"
-            | "rename-window"
-            | "resize-pane"
-            | "resize-window"
-            | "respawn-pane"
-            | "respawn-window"
-            | "rotate-window"
-            | "select-layout"
-            | "select-pane"
-            | "send-prefix"
-            | "select-window"
-            | "send-keys"
-            | "set-environment"
-            | "set-hook"
-            | "set-option"
-            | "set-window-option"
-            | "show-environment"
-            | "show-hooks"
-            | "show-options"
-            | "show-window-options"
-            | "split-window"
-            | "swap-pane"
-            | "swap-window"
-            | "switch-client"
-    )
+    // run-shell and source-file preserve CMD_FIND_CANFAIL through command-specific
+    // parsers; display-panes -t names a client rather than a command target.
+    command_target_metadata(command_name).is_some()
+        && !matches!(command_name, "display-panes" | "run-shell" | "source-file")
 }
 
 pub(super) struct QueueTargetFindContextInput<'a> {
@@ -969,6 +951,122 @@ mod tests {
     }
 
     #[test]
+    fn queue_stops_target_resolution_at_the_first_positional() {
+        let sessions = session_store_with_alpha_beta();
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        let resolved = resolve_queue_target_arguments(
+            "set-option",
+            ["-g", "@compact", "-tfoo"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            &sessions,
+            &context,
+        )
+        .expect("option-like value after the option name stays positional");
+        assert_eq!(resolved, ["-g", "@compact", "-tfoo"]);
+
+        let resolved = resolve_queue_target_arguments(
+            "list-windows",
+            ["-F", "-tfoo", "-t", "beta"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            &sessions,
+            &context,
+        )
+        .expect("option values are consumed before finding the positional boundary");
+        assert_eq!(resolved, ["-F", "-tfoo", "-t", "beta"]);
+    }
+
+    #[test]
+    fn queue_resolves_set_window_option_targets_like_set_option_window_scope() {
+        let mut sessions = session_store_with_alpha_beta();
+        let (window_index, _) = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created");
+        sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .rename_window(window_index, "named".to_owned())
+            .expect("second alpha window can be named");
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        for (command_name, arguments, expected) in [
+            (
+                "set-window-option",
+                vec!["-t", "+", "automatic-rename", "off"],
+                vec!["-t", "alpha:1", "automatic-rename", "off"],
+            ),
+            (
+                "set-window-option",
+                vec!["-t", "named", "synchronize-panes", "on"],
+                vec!["-t", "alpha:1", "synchronize-panes", "on"],
+            ),
+            (
+                "set-option",
+                vec!["-w", "-t", "+", "automatic-rename", "off"],
+                vec!["-w", "-t", "alpha:1", "automatic-rename", "off"],
+            ),
+        ] {
+            let resolved = resolve_queue_target_arguments(
+                command_name,
+                arguments.into_iter().map(str::to_owned).collect(),
+                &sessions,
+                &context,
+            )
+            .expect("set-window-option queue target resolves");
+
+            assert_eq!(resolved, expected);
+        }
+    }
+
+    #[test]
+    fn queue_rejects_missing_set_window_option_target_like_set_option_window_scope() {
+        let sessions = session_store_with_alpha_beta();
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        let alias = resolve_queue_target_arguments(
+            "set-window-option",
+            ["-t", "nosuch", "automatic-rename", "off"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            &sessions,
+            &context,
+        )
+        .expect_err("missing alias window target should fail");
+        let canonical = resolve_queue_target_arguments(
+            "set-option",
+            ["-w", "-t", "nosuch", "automatic-rename", "off"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            &sessions,
+            &context,
+        )
+        .expect_err("missing canonical window target should fail");
+
+        assert_eq!(alias.to_string(), canonical.to_string());
+        assert!(alias.to_string().contains("nosuch"));
+    }
+
+    #[test]
     fn queue_resolves_default_mouse_binding_compact_copy_mode_target() {
         let sessions = session_store_with_alpha_beta();
         let mouse_target = Target::Pane(PaneTarget::with_window(session_name("alpha"), 0, 0));
@@ -1000,6 +1098,93 @@ mod tests {
         .expect("send-keys mouse target resolves");
 
         assert_eq!(resolved, ["-X", "-t", "alpha:0.0", "select-word"]);
+    }
+
+    #[test]
+    fn typed_queue_target_resolution_canonicalizes_run_shell_pane_id() {
+        let sessions = session_store_with_alpha_beta();
+        let pane_id = sessions
+            .session(&session_name("alpha"))
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id().to_string())
+            .expect("alpha pane id exists");
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("beta"),
+            0,
+            0,
+        ))));
+
+        let resolved =
+            resolve_queue_target_argument_typed("run-shell", 't', pane_id, &sessions, &context)
+                .expect("run-shell pane id resolves");
+
+        assert_eq!(
+            resolved,
+            QueueTargetArgumentResolution::Resolved("alpha:0.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn typed_queue_target_resolution_reports_run_shell_canfail_target() {
+        let sessions = session_store_with_alpha_beta();
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        let resolved = resolve_queue_target_argument_typed(
+            "run-shell",
+            't',
+            "%9999".to_owned(),
+            &sessions,
+            &context,
+        )
+        .expect("run-shell missing pane id is CANFAIL");
+
+        assert_eq!(resolved, QueueTargetArgumentResolution::CanFail);
+    }
+
+    #[test]
+    fn queue_resolves_compact_swap_window_source_and_target_values() {
+        let mut sessions = session_store_with_alpha_beta();
+        let (window_index, _) = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created");
+        sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .rename_window(window_index, "one".to_owned())
+            .expect("second alpha window can be named");
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("alpha"),
+            0,
+            0,
+        ))));
+
+        for (arguments, expected) in [
+            (
+                vec!["-ds", "one", "-t", "alpha:0"],
+                vec!["-d", "-s", "alpha:1", "-t", "alpha:0"],
+            ),
+            (
+                vec!["-dt", "+1", "-s", "alpha:0"],
+                vec!["-d", "-t", "alpha:1", "-s", "alpha:0"],
+            ),
+        ] {
+            let resolved = resolve_queue_target_arguments(
+                "swap-window",
+                arguments.into_iter().map(str::to_owned).collect(),
+                &sessions,
+                &context,
+            )
+            .expect("compact swap-window targets resolve");
+
+            assert_eq!(resolved, expected);
+        }
     }
 
     #[test]

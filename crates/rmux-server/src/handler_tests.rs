@@ -10,12 +10,13 @@ use rmux_core::{
 use rmux_ipc::PeerIdentity;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
-    ControlMode, DisplayMessageRequest, ErrorResponse, HasSessionRequest, HookName,
+    ControlMode, DisplayMessageRequest, ErrorResponse, HasSessionRequest, HookLifecycle, HookName,
     KillPaneRequest, KillSessionRequest, LayoutName, ListPanesRequest, ListSessionsRequest,
     NewSessionExtRequest, NewSessionRequest, OptionName, PaneTarget, RenameSessionRequest, Request,
     ResizePaneAdjustment, ResizePaneTargetActionRequest, Response, RmuxError, ScopeSelector,
-    SelectPaneRequest, SessionName, SetOptionMode, SetOptionRequest, SplitWindowRequest,
-    SplitWindowTarget, SplitWindowTargetActionRequest, Target, TerminalSize,
+    SelectPaneRequest, SessionName, SetHookRequest, SetOptionMode, SetOptionRequest,
+    SplitWindowIdentityRequest, SplitWindowRequest, SplitWindowTarget,
+    SplitWindowTargetActionRequest, Target, TerminalSize,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -46,6 +47,9 @@ mod split_before;
 
 #[path = "handler_tests/rename_session.rs"]
 mod rename_session;
+
+#[path = "handler_tests/rename_session_retained_output.rs"]
+mod rename_session_retained_output;
 
 #[path = "handler_tests/lists_and_hooks.rs"]
 mod lists_and_hooks;

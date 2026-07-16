@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use rmux_core::LifecycleEvent;
 use rmux_proto::{
     ControlMode, DeleteBufferRequest, DetachClientRequest, DisplayMessageRequest, HookLifecycle,
     HookName, KillSessionRequest, KillWindowRequest, NewSessionRequest, NewWindowRequest,
@@ -92,7 +93,11 @@ fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> V
     loop {
         match rx.try_recv() {
             Ok(ControlServerEvent::Notification(line)) => lines.push(line),
-            Ok(ControlServerEvent::SessionChanged(_) | ControlServerEvent::Refresh) => {}
+            Ok(
+                ControlServerEvent::SessionChanged(_)
+                | ControlServerEvent::SessionChangedAt { .. }
+                | ControlServerEvent::Refresh,
+            ) => {}
             Ok(ControlServerEvent::Exit(reason)) => {
                 panic!("unexpected control exit: {reason:?}");
             }
@@ -191,6 +196,29 @@ async fn dispatch_as(handler: &RequestHandler, requester_pid: u32, request: Requ
     }
 
     outcome.response
+}
+
+async fn prepared_client_session_changed(
+    handler: &RequestHandler,
+    session_name: SessionName,
+    session_id: rmux_proto::SessionId,
+    client_name: &str,
+) -> super::QueuedLifecycleEvent {
+    let mut events = handler.subscribe_lifecycle_events();
+    handler
+        .emit_for_session_identity(
+            LifecycleEvent::ClientSessionChanged {
+                session_name: session_name.clone(),
+                client_name: Some(client_name.to_owned()),
+            },
+            &session_name,
+            session_id,
+        )
+        .await;
+    events
+        .recv()
+        .await
+        .expect("exact client-session-changed event queued")
 }
 
 #[tokio::test]
@@ -703,4 +731,203 @@ async fn hook_commands_do_not_emit_nested_control_notifications() {
         has_beta,
         Response::HasSession(rmux_proto::HasSessionResponse { exists: true })
     );
+}
+
+#[tokio::test]
+async fn exact_client_attached_event_follows_rename_and_name_reuse_by_session_id() {
+    let handler = RequestHandler::new();
+    let original = session_name("client-attached-original");
+    let renamed = session_name("client-attached-renamed");
+    new_session(&handler, &original).await;
+    let original_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&original)
+            .expect("original session exists")
+            .id()
+    };
+
+    let response = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: original.clone(),
+            new_name: renamed.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RenameSession(_)),
+        "{response:?}"
+    );
+    new_session(&handler, &original).await;
+
+    let mut events = handler.subscribe_lifecycle_events();
+    handler
+        .emit_client_attached_identity(9_901, original, original_id)
+        .await;
+    let queued = events
+        .recv()
+        .await
+        .expect("exact client-attached event queued");
+    assert_eq!(queued.control_session_identity, Some(original_id));
+    assert!(matches!(
+        queued.event,
+        LifecycleEvent::ClientAttached { session_name, .. } if session_name == renamed
+    ));
+}
+
+#[tokio::test]
+async fn client_session_changed_notification_follows_rename_not_reused_name() {
+    let handler = RequestHandler::new();
+    let original = session_name("notify-session-original");
+    let renamed = session_name("notify-session-renamed");
+    let observer = session_name("notify-session-observer");
+    new_session(&handler, &original).await;
+    new_session(&handler, &observer).await;
+    let original_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&original)
+            .expect("session exists")
+            .id()
+    };
+    let queued =
+        prepared_client_session_changed(&handler, original.clone(), original_id, "9902").await;
+    let mut observer_rx = register_control_client(&handler, 9_903, Some(observer)).await;
+    let _ = drain_control_notifications(&mut observer_rx);
+
+    let response = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: original.clone(),
+            new_name: renamed.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RenameSession(_)),
+        "{response:?}"
+    );
+    new_session(&handler, &original).await;
+    let _ = drain_control_notifications(&mut observer_rx);
+
+    handler.dispatch_lifecycle_hook(queued).await;
+    assert_eq!(
+        drain_control_notifications(&mut observer_rx),
+        vec![format!(
+            "%client-session-changed 9902 ${} {renamed}",
+            original_id.as_u32()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn hooks_disabled_client_session_changed_skips_deleted_reused_session() {
+    let handler = RequestHandler::new();
+    let replaced = session_name("notify-session-replaced");
+    let observer = session_name("notify-session-disabled-observer");
+    new_session(&handler, &replaced).await;
+    new_session(&handler, &observer).await;
+    let replaced_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&replaced)
+            .expect("session exists")
+            .id()
+    };
+    let queued =
+        prepared_client_session_changed(&handler, replaced.clone(), replaced_id, "9904").await;
+    let mut observer_rx = register_control_client(&handler, 9_905, Some(observer)).await;
+    let _ = drain_control_notifications(&mut observer_rx);
+
+    let response = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: replaced.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    new_session(&handler, &replaced).await;
+    let _ = drain_control_notifications(&mut observer_rx);
+
+    crate::hook_runtime::with_hook_execution(Vec::new(), async {
+        handler.emit_prepared(queued).await;
+    })
+    .await;
+    assert!(drain_control_notifications(&mut observer_rx).is_empty());
+}
+
+#[tokio::test]
+async fn control_notification_delivery_cannot_jump_to_reused_pid_registration() {
+    let handler = RequestHandler::new();
+    let requester_pid = 9_906;
+    let (old_tx, mut old_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let old_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+            },
+            old_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    let queued = {
+        let mut state = handler.state.lock().await;
+        super::prepare_lifecycle_event(
+            &mut state,
+            &LifecycleEvent::PasteBufferChanged {
+                buffer_name: "recipient-aba".to_owned(),
+            },
+        )
+    };
+    let pause = handler.install_control_notification_delivery_pause();
+    let dispatch_handler = handler.clone();
+    let dispatch = tokio::spawn(async move {
+        dispatch_handler
+            .dispatch_control_notifications(&queued)
+            .await;
+    });
+    pause.reached.notified().await;
+
+    let replacement_handler = handler.clone();
+    let replacement = tokio::spawn(async move {
+        let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+        let control_id = replacement_handler
+            .register_control_with_closing(
+                requester_pid,
+                ControlModeUpgrade {
+                    initial_command_count: 0,
+                    mode: ControlMode::Plain,
+                    terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+                },
+                event_tx,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        (control_id, event_rx)
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !replacement.is_finished(),
+        "replacement registration waits for the identity-locked delivery"
+    );
+
+    pause.release.notify_one();
+    dispatch.await.expect("notification dispatch completes");
+    let (replacement_id, mut replacement_rx) = replacement
+        .await
+        .expect("replacement registration completes");
+    assert_ne!(replacement_id, old_id);
+    assert!(collect_control_events(&mut old_rx).iter().any(|event| {
+        matches!(
+            event,
+            ControlServerEvent::Notification(line)
+                if line == "%paste-buffer-changed recipient-aba"
+        )
+    }));
+    assert!(drain_control_notifications(&mut replacement_rx).is_empty());
 }

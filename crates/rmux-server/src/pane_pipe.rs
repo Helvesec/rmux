@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::process::Child;
 use std::process::Stdio;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 #[cfg(windows)]
 use std::sync::Mutex as StdMutex;
 use std::sync::{
@@ -11,40 +8,35 @@ use std::sync::{
     Arc,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
+use rmux_os::process_tree::{ConsoleWindowBehavior, ProcessTreeChild};
 use rmux_proto::{RmuxError, SessionName};
 use rmux_pty::PtyMaster;
 use tokio::sync::{mpsc, watch};
 
-const PIPE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[path = "pane_pipe/process_group.rs"]
+mod process_group;
 #[cfg(test)]
-static ACTIVE_PIPE_CHILDREN: AtomicUsize = AtomicUsize::new(0);
+pub(crate) use process_group::active_pipe_child_count_for_test;
+use process_group::{mark_pipe_child_started_for_test, wait_for_pipe_child, PipeChildProcessGroup};
 
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
 use crate::terminal::TerminalProfile;
 
 #[cfg(test)]
-pub(crate) fn active_pipe_child_count_for_test() -> usize {
-    ACTIVE_PIPE_CHILDREN.load(Ordering::SeqCst)
-}
+#[derive(Clone)]
+pub(crate) struct PipeProcessGroupProbe(Arc<PipeChildProcessGroup>);
 
 #[cfg(test)]
-fn mark_pipe_child_started_for_test() {
-    ACTIVE_PIPE_CHILDREN.fetch_add(1, Ordering::SeqCst);
-}
+impl PipeProcessGroupProbe {
+    pub(crate) fn is_armed(&self) -> bool {
+        self.0.is_armed_for_test()
+    }
 
-#[cfg(not(test))]
-fn mark_pipe_child_started_for_test() {}
-
-struct ActivePipeChildGuard;
-
-impl Drop for ActivePipeChildGuard {
-    fn drop(&mut self) {
-        #[cfg(test)]
-        ACTIVE_PIPE_CHILDREN.fetch_sub(1, Ordering::SeqCst);
+    pub(crate) fn termination_count(&self) -> usize {
+        self.0.termination_count_for_test()
     }
 }
 
@@ -66,6 +58,18 @@ impl PanePipeStore {
         self.sessions
             .get(session_name)
             .is_some_and(|panes| panes.contains_key(&pane_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_group_probe(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<PipeProcessGroupProbe> {
+        self.sessions
+            .get(session_name)?
+            .get(&pane_id)
+            .map(ActivePanePipe::process_group_probe)
     }
 
     pub(crate) fn insert(
@@ -240,6 +244,7 @@ impl PanePipeStore {
 pub(crate) struct ActivePanePipe {
     stop_tx: watch::Sender<bool>,
     stop_flag: Arc<AtomicBool>,
+    process_group: Arc<PipeChildProcessGroup>,
     #[cfg(windows)]
     output_abort: Arc<StdMutex<Option<tokio::task::AbortHandle>>>,
 }
@@ -280,14 +285,19 @@ impl ActivePanePipe {
         for (name, value) in profile.environment() {
             child.env(name, value);
         }
-
-        let mut child = child.spawn().map_err(|error| {
+        let mut child = ProcessTreeChild::spawn_with_console_window(
+            &mut child,
+            ConsoleWindowBehavior::Suppress,
+        )
+        .map_err(|error| {
             RmuxError::Server(format!("failed to spawn pipe-pane command: {error}"))
         })?;
+        let process_group = Arc::new(PipeChildProcessGroup::from_controller(child.controller()));
+        let pipe_process_group = Arc::clone(&process_group);
         mark_pipe_child_started_for_test();
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdin = child.child_mut().stdin.take();
+        let stdout = child.child_mut().stdout.take();
+        let stderr = child.child_mut().stderr.take();
         let (stop_tx, stop_rx) = watch::channel(false);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let pipe_stop_flag = stop_flag.clone();
@@ -339,27 +349,39 @@ impl ActivePanePipe {
             }
 
             let child_stop = stop_flag.clone();
-            let mut child_wait =
-                tokio::task::spawn_blocking(move || wait_for_pipe_child(child, child_stop));
+            let child_process_group = Arc::clone(&process_group);
+            let mut child_wait = tokio::task::spawn_blocking(move || {
+                wait_for_pipe_child(child, child_stop, child_process_group)
+            });
             let mut stop_wait = stop_rx.clone();
-            tokio::select! {
+            let completed_child = tokio::select! {
                 _ = wait_for_pipe_stop(&mut stop_wait) => {
                     stop_flag.store(true, Ordering::SeqCst);
-                    let _ = child_wait.await;
+                    process_group.terminate();
+                    child_wait.await.ok()
                 }
-                _ = &mut child_wait => {
+                result = &mut child_wait => {
                     // The child exited normally. Keep output forwarders alive
                     // until stdout/stderr reach EOF so short pipe-pane
                     // commands cannot lose their last bytes under load.
+                    result.ok()
                 }
-            }
+            };
             for task in async_tasks {
                 task.abort();
                 let _ = task.await;
             }
+            let cleanup_process_group = Arc::clone(&process_group);
             let _ = tokio::task::spawn_blocking(move || {
                 for task in blocking_tasks {
                     let _ = task.join();
+                }
+                // Keep an exited Unix leader waitable until every forwarder
+                // has released the tree. Its PGID cannot be recycled before
+                // this final one-shot termination and reap.
+                cleanup_process_group.terminate();
+                if let Some(mut child) = completed_child {
+                    let _ = child.wait();
                 }
             })
             .await;
@@ -368,6 +390,7 @@ impl ActivePanePipe {
         Ok(Self {
             stop_tx,
             stop_flag: pipe_stop_flag,
+            process_group: pipe_process_group,
             #[cfg(windows)]
             output_abort,
         })
@@ -375,6 +398,9 @@ impl ActivePanePipe {
 
     pub(crate) fn stop(self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        // This is independent of the child waiter so a descendant that keeps
+        // stdout/stderr open after the shell exits cannot strand a forwarder.
+        self.process_group.terminate();
         #[cfg(windows)]
         if let Ok(mut output_abort) = self.output_abort.lock() {
             if let Some(output_abort) = output_abort.take() {
@@ -382,6 +408,11 @@ impl ActivePanePipe {
             }
         }
         let _ = self.stop_tx.send(true);
+    }
+
+    #[cfg(test)]
+    fn process_group_probe(&self) -> PipeProcessGroupProbe {
+        PipeProcessGroupProbe(Arc::clone(&self.process_group))
     }
 }
 
@@ -459,21 +490,6 @@ where
                     break;
                 }
             }
-        }
-    }
-}
-
-fn wait_for_pipe_child(mut child: Child, stop_flag: Arc<AtomicBool>) {
-    let _active_child = ActivePipeChildGuard;
-    loop {
-        if stop_flag.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return;
-        }
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) => thread::sleep(PIPE_CHILD_POLL_INTERVAL),
         }
     }
 }

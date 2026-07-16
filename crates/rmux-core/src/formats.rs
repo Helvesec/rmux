@@ -11,7 +11,7 @@
 //! are handled in this core expansion layer.
 
 use crate::style::parse_colour;
-use crate::utf8::{text_width, Utf8Config};
+use crate::utf8::Utf8Config;
 #[path = "formats/colour.rs"]
 mod colour;
 #[path = "formats/condition.rs"]
@@ -30,6 +30,8 @@ mod modifiers;
 mod regex_cache;
 #[path = "formats/scan.rs"]
 mod scan;
+#[path = "formats/styled_text.rs"]
+mod styled_text;
 #[path = "formats/time.rs"]
 mod time;
 #[path = "formats/transforms.rs"]
@@ -49,6 +51,7 @@ use glob::format_fnmatch;
 use modifiers::{parse_modifiers, FormatModifier};
 use scan::format_skip;
 pub use scan::format_skip_delimiter;
+pub use styled_text::{styled_text_width, truncate_styled_text_to_width};
 pub use time::expand_time_tokens;
 use time::format_time_string;
 use transforms::{
@@ -414,14 +417,14 @@ where
     // Padding.
     if width > 0 {
         if let Some(w) = bounded_format_padding_width(width) {
-            let current_width = text_width(&result, &Utf8Config::default());
+            let current_width = styled_text_width(&result, &Utf8Config::default());
             if current_width < w {
                 result.push_str(&" ".repeat(w - current_width));
             }
         }
     } else if width < 0 {
         if let Some(w) = bounded_format_padding_width(width) {
-            let current_width = text_width(&result, &Utf8Config::default());
+            let current_width = styled_text_width(&result, &Utf8Config::default());
             if current_width < w {
                 result = format!("{}{result}", " ".repeat(w - current_width));
             }
@@ -553,7 +556,7 @@ fn format_display_width<V>(
 where
     V: FormatVariables + ?Sized,
 {
-    text_width(result, &Utf8Config::default()).to_string()
+    styled_text_width(result, &Utf8Config::default()).to_string()
 }
 
 fn format_dirname(value: &str) -> String {

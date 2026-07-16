@@ -1,8 +1,10 @@
-#[cfg(windows)]
-use rmux_core::key_string_lookup_string;
 use std::io;
 
-use rmux_core::{key_code_lookup_bits, key_string_lookup_key};
+use rmux_core::{
+    key_code_lookup_bits, key_code_to_bytes, key_string_lookup_key, key_string_lookup_string,
+};
+#[cfg(windows)]
+use rmux_proto::ProcessCommand;
 use rmux_proto::{
     ErrorResponse, OptionName, PaneTarget, Response, RmuxError, SendKeysResponse, SessionName,
 };
@@ -10,7 +12,7 @@ use rmux_pty::PtyMaster;
 #[cfg(windows)]
 use rmux_pty::{ProcessId, WindowsConsoleKeyEvent};
 
-use crate::input_keys::{encode_key, encode_mouse_event, ExtendedKeyFormat};
+use crate::input_keys::{encode_key_with_backspace, encode_mouse_event, ExtendedKeyFormat};
 use crate::keys::parse_key_code;
 #[cfg(windows)]
 use crate::pane_terminals::DeferredInitialPaneConsoleInputAction;
@@ -71,7 +73,6 @@ pub(super) enum WindowsConsoleInputAction {
     Key(WindowsConsoleKeyEvent),
     KeyThenInterrupt(WindowsConsoleKeyEvent),
     Interrupt,
-    Noop,
 }
 
 #[cfg(windows)]
@@ -83,7 +84,6 @@ impl WindowsConsoleInputAction {
                 DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(key)
             }
             Self::Interrupt => DeferredInitialPaneConsoleInputAction::Interrupt,
-            Self::Noop => DeferredInitialPaneConsoleInputAction::Noop,
         }
     }
 }
@@ -195,15 +195,6 @@ pub(super) fn prepare_pane_console_input_write(
             sink: PaneConsoleInputSink::Disabled,
         });
     }
-    if matches!(action, WindowsConsoleInputAction::Noop) {
-        let _ = bytes;
-        return Ok(PaneConsoleInputWrite {
-            session_name,
-            window_index,
-            pane_index,
-            sink: PaneConsoleInputSink::Disabled,
-        });
-    }
     #[cfg(test)]
     if state.append_pane_input_capture_for_test(target, bytes) {
         return Ok(PaneConsoleInputWrite {
@@ -244,13 +235,13 @@ pub(super) fn windows_console_input_for_attached_key(
     decoded_key: rmux_core::KeyCode,
     console_key: WindowsConsoleKeyEvent,
 ) -> WindowsConsoleInputAction {
-    if key_matches_name(decoded_key, "C-d")
-        && !target_routes_windows_ctrl_d_as_posix_eot(state, target)
+    let console_key = if key_matches_name(decoded_key, "C-d")
         && !target_uses_windows_cmd_console_ctrl_d(state, target)
     {
-        return WindowsConsoleInputAction::Noop;
-    }
-
+        windows_ctrl_d_console_key(false).with_repeat_count(console_key.repeat_count())
+    } else {
+        console_key
+    };
     windows_console_input_for_attached_key_event(console_key)
 }
 
@@ -284,19 +275,22 @@ pub(super) fn windows_console_input_for_target_tokens(
     tokens: &[String],
     repeat_count: usize,
 ) -> Option<(WindowsConsoleInputAction, Vec<u8>)> {
-    if tokens_are_windows_ctrl_d(tokens)
-        && !target_routes_windows_ctrl_d_as_posix_eot(state, target)
-        && !target_uses_windows_cmd_console_ctrl_d(state, target)
-    {
-        return Some((WindowsConsoleInputAction::Noop, Vec::new()));
-    }
+    let target_uses_cmd =
+        tokens_are_windows_ctrl_d(tokens) && target_uses_windows_cmd_console_ctrl_d(state, target);
+    let ctrl_d = windows_ctrl_d_console_key(target_uses_cmd);
+    windows_console_input_for_tokens_with_ctrl_d(tokens, repeat_count, ctrl_d)
+}
 
-    let ctrl_d = if target_uses_windows_cmd_console_ctrl_d(state, target) {
+#[cfg(windows)]
+/// `cmd.exe` needs the physical key record to interrupt commands such as
+/// `timeout.exe`. Every other target receives a typed, scan-code-free EOT: the
+/// writer suppresses it in processed mode but preserves it for raw/TUI input.
+const fn windows_ctrl_d_console_key(target_uses_cmd: bool) -> WindowsConsoleKeyEvent {
+    if target_uses_cmd {
         WindowsConsoleKeyEvent::ctrl_d()
     } else {
         WindowsConsoleKeyEvent::ctrl_d_eot()
-    };
-    windows_console_input_for_tokens_with_ctrl_d(tokens, repeat_count, ctrl_d)
+    }
 }
 
 #[cfg(windows)]
@@ -456,12 +450,12 @@ fn target_uses_windows_cmd_shell(state: &HandlerState, target: &PaneTarget) -> b
 
 #[cfg(windows)]
 fn target_uses_windows_cmd_console_ctrl_d(state: &HandlerState, target: &PaneTarget) -> bool {
-    if let Some(start_command_is_cmd) = pane_id_for_input_target(state, target)
+    if let Some(uses_cmd) = pane_id_for_input_target(state, target)
         .ok()
-        .and_then(|pane_id| state.pane_start_command_for_id(pane_id))
-        .and_then(command_prefers_windows_cmd_console_ctrl_d)
+        .and_then(|pane_id| state.pane_start_process_command_for_id(pane_id))
+        .and_then(process_command_windows_cmd_hint)
     {
-        return start_command_is_cmd;
+        return uses_cmd;
     }
 
     if let Some(profile_shell_is_cmd) = state
@@ -495,22 +489,67 @@ fn target_uses_windows_cmd_console_ctrl_d(state: &HandlerState, target: &PaneTar
 }
 
 #[cfg(windows)]
-fn command_prefers_windows_cmd_console_ctrl_d(command: &[String]) -> Option<bool> {
-    let head = command
-        .iter()
-        .find_map(|part| part.split_whitespace().next())?;
-    let trimmed = head.trim_matches(['"', '\'']);
-    let name = std::path::Path::new(trimmed)
+fn process_command_windows_cmd_hint(command: &ProcessCommand) -> Option<bool> {
+    match command {
+        // Shell text is normally executed by the configured shell, but an
+        // explicit nested shell overrides that profile for Ctrl-D semantics.
+        ProcessCommand::Shell(command) => shell_text_windows_cmd_hint(command),
+        ProcessCommand::Argv(argv) => Some(argv_invokes_windows_cmd(argv)),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn shell_text_windows_cmd_hint(command: &str) -> Option<bool> {
+    let head = windows_shell_command_head(command)?;
+    let name = windows_command_name(head);
+    if is_windows_cmd_name(name) {
+        Some(true)
+    } else if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe" | "wsl" | "wsl.exe"
+    ) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn windows_shell_command_head(command: &str) -> Option<&str> {
+    let command = command.trim_start();
+    let quote = command.as_bytes().first().copied()?;
+    if matches!(quote, b'"' | b'\'') {
+        let quoted = &command[1..];
+        let end = quoted.as_bytes().iter().position(|byte| *byte == quote)?;
+        return Some(&quoted[..end]);
+    }
+    let end = command.find(char::is_whitespace).unwrap_or(command.len());
+    Some(&command[..end])
+}
+
+#[cfg(windows)]
+fn argv_invokes_windows_cmd(argv: &[String]) -> bool {
+    let Some(head) = argv.first() else {
+        return false;
+    };
+    let name = windows_command_name(head);
+    is_windows_cmd_name(name)
+        || std::path::Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
+            })
+}
+
+#[cfg(windows)]
+fn windows_command_name(command: &str) -> &str {
+    let trimmed = command.trim_matches(['"', '\'']);
+    std::path::Path::new(trimmed)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(trimmed);
-    if is_windows_cmd_name(name) {
-        return Some(true);
-    }
-    if is_windows_powershell_name(name) {
-        return Some(false);
-    }
-    None
+        .unwrap_or(trimmed)
 }
 
 #[cfg(windows)]
@@ -624,14 +663,6 @@ fn is_wsl_host_name(name: &str) -> bool {
 #[cfg(windows)]
 fn is_windows_cmd_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
-}
-
-#[cfg(windows)]
-fn is_windows_powershell_name(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe"
-    )
 }
 
 #[cfg(windows)]
@@ -848,7 +879,6 @@ pub(super) async fn write_windows_console_input_action_to_target_io(
                         rmux_pty::send_windows_console_interrupt(pid)
                     })
                 }
-                WindowsConsoleInputAction::Noop => Ok(()),
             })
             .await
             .map_err(|error| RmuxError::Server(format!("pane console input task failed: {error}")))?
@@ -985,6 +1015,20 @@ pub(super) fn encode_key_for_target(
         return windows_cmd_select_all_sequence(state, target);
     }
 
+    let pane_mode = pane_input_mode(state, target)?;
+    let format =
+        ExtendedKeyFormat::parse(state.options.resolve(None, OptionName::ExtendedKeysFormat));
+    let backspace = state
+        .options
+        .resolve(None, OptionName::Backspace)
+        .and_then(key_string_lookup_string)
+        .and_then(key_code_to_bytes)
+        .and_then(|bytes| (bytes.len() == 1).then_some(bytes[0]))
+        .unwrap_or(0x7f);
+    Ok(encode_key_with_backspace(pane_mode, format, key, backspace))
+}
+
+pub(super) fn pane_input_mode(state: &HandlerState, target: &PaneTarget) -> Result<u32, RmuxError> {
     let pane_id = state
         .sessions
         .session(target.session_name())
@@ -998,9 +1042,7 @@ pub(super) fn encode_key_for_target(
         .pane_screen_state(target.session_name(), pane_id)
         .map(|screen_state| screen_state.mode)
         .unwrap_or_default();
-    let format =
-        ExtendedKeyFormat::parse(state.options.resolve(None, OptionName::ExtendedKeysFormat));
-    Ok(encode_key(pane_mode, format, key))
+    Ok(pane_mode)
 }
 
 pub(super) fn encode_mouse_for_target(
@@ -1069,6 +1111,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use crate::pane_terminals::DeferredInitialPaneConsoleInputAction;
+    use rmux_proto::ProcessCommand;
     use rmux_pty::WindowsConsoleKeyEvent;
 
     #[test]
@@ -1140,33 +1183,81 @@ mod windows_tests {
             super::WindowsConsoleInputAction::Interrupt.deferred(),
             DeferredInitialPaneConsoleInputAction::Interrupt
         );
+    }
+
+    #[test]
+    fn windows_ctrl_d_uses_a_physical_key_only_for_cmd() {
         assert_eq!(
-            super::WindowsConsoleInputAction::Noop.deferred(),
-            DeferredInitialPaneConsoleInputAction::Noop
+            super::windows_ctrl_d_console_key(false),
+            WindowsConsoleKeyEvent::ctrl_d_eot()
+        );
+        assert_eq!(
+            super::windows_ctrl_d_console_key(true),
+            WindowsConsoleKeyEvent::ctrl_d()
         );
     }
 
     #[test]
-    fn windows_ctrl_d_shell_detection_prefers_explicit_start_command() {
+    fn windows_ctrl_d_launch_plan_detection_preserves_shell_wrapper() {
         assert_eq!(
-            super::command_prefers_windows_cmd_console_ctrl_d(&["cmd.exe /D /Q /K".to_owned()]),
+            super::process_command_windows_cmd_hint(&ProcessCommand::Shell(
+                "timeout.exe /T 10000".to_owned()
+            )),
+            None,
+            "shell text must defer to the configured shell profile"
+        );
+        assert_eq!(
+            super::process_command_windows_cmd_hint(&ProcessCommand::Shell(
+                "pwsh.exe -NoLogo -NoProfile".to_owned()
+            )),
+            Some(false),
+            "an explicit PowerShell command must override a cmd profile"
+        );
+        assert_eq!(
+            super::process_command_windows_cmd_hint(&ProcessCommand::Shell(
+                r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile"#.to_owned()
+            )),
+            Some(false),
+            "a quoted PowerShell path must remain one command token"
+        );
+        assert_eq!(
+            super::process_command_windows_cmd_hint(&ProcessCommand::Shell(
+                "cmd.exe /D /Q /K".to_owned()
+            )),
             Some(true)
         );
         assert_eq!(
-            super::command_prefers_windows_cmd_console_ctrl_d(&[
-                "pwsh.exe -NoLogo -NoProfile".to_owned()
-            ]),
+            super::process_command_windows_cmd_hint(&ProcessCommand::Shell(
+                r#""C:\Windows\System32\cmd.exe" /D /Q /K"#.to_owned()
+            )),
+            Some(true),
+            "a quoted cmd path must retain physical Ctrl-D semantics"
+        );
+        assert_eq!(
+            super::process_command_windows_cmd_hint(&ProcessCommand::Argv(vec![
+                "cmd.exe".to_owned(),
+                "/K".to_owned(),
+            ])),
+            Some(true)
+        );
+        assert_eq!(
+            super::process_command_windows_cmd_hint(&ProcessCommand::Argv(vec![
+                r"C:\tools\build.cmd".to_owned(),
+            ])),
+            Some(true)
+        );
+        assert_eq!(
+            super::process_command_windows_cmd_hint(&ProcessCommand::Argv(vec![
+                "pwsh.exe".to_owned(),
+                "-NoProfile".to_owned(),
+            ])),
             Some(false)
         );
         assert_eq!(
-            super::command_prefers_windows_cmd_console_ctrl_d(&[
-                "powershell.exe -NoLogo -NoProfile".to_owned()
-            ]),
+            super::process_command_windows_cmd_hint(&ProcessCommand::Argv(vec![
+                "python.exe".to_owned(),
+            ])),
             Some(false)
-        );
-        assert_eq!(
-            super::command_prefers_windows_cmd_console_ctrl_d(&["python.exe".to_owned()]),
-            None
         );
     }
 }

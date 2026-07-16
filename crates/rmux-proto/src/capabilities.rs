@@ -40,8 +40,16 @@ pub const CAPABILITY_SDK_PANE_OPTIONS: &str = "sdk.pane.options";
 pub const CAPABILITY_SDK_PANE_STATE_EVENTS: &str = "sdk.pane.state_events";
 /// Stable feature id for SDK best-effort pane foreground process state.
 pub const CAPABILITY_SDK_PANE_FOREGROUND: &str = "sdk.pane.foreground";
+/// Stable feature id for atomic SDK split visible/stable identity responses.
+pub const CAPABILITY_SDK_PANE_SPLIT_IDENTITY: &str = "sdk.pane.split_identity";
 /// Stable feature id for daemon-side app-owned session leases.
 pub const CAPABILITY_SDK_SESSION_LEASE: &str = "sdk.session.lease";
+/// Stable feature id for app-owned session lease requests addressed by session id.
+pub const CAPABILITY_SDK_SESSION_LEASE_BY_ID: &str = "sdk.session.lease.by_id";
+/// Stable feature id for connection-negotiated app-owned lease requests addressed by session id.
+pub const CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2: &str = "sdk.session.lease.by_id.v2";
+/// Stable feature id for owned-session creation that returns a stable session identity.
+pub const CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY: &str = "sdk.owned_session.stable_identity";
 /// Stable feature id for explicit SDK process launch modes.
 pub const CAPABILITY_SDK_PROCESS_COMMAND: &str = "sdk.process.command";
 /// Stable feature id for target-client aware command request variants.
@@ -50,6 +58,8 @@ pub const CAPABILITY_TARGET_CLIENT_COMMANDS: &str = "commands.target_client";
 pub const CAPABILITY_CLI_TARGET_ACTIONS: &str = "commands.cli_target_actions";
 /// Stable feature id for `capture-pane` with daemon-side target resolution.
 pub const CAPABILITY_CLI_CAPTURE_TARGET_ACTION: &str = "commands.cli_capture_target_action";
+/// Stable feature id for non-executing server-side CLI alias canonicalization.
+pub const CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION: &str = "commands.cli_runtime_command_expansion";
 /// Stable feature id for browser-visible pane sharing.
 ///
 /// This optional capability is advertised by daemons compiled with their web
@@ -77,11 +87,30 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_SDK_PANE_STATE_EVENTS,
     CAPABILITY_SDK_PANE_FOREGROUND,
     CAPABILITY_SDK_SESSION_LEASE,
+    CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
+    CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
     CAPABILITY_SDK_PROCESS_COMMAND,
     CAPABILITY_TARGET_CLIENT_COMMANDS,
     CAPABILITY_CLI_TARGET_ACTIONS,
     CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
+    CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION,
+    CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
 ];
+
+/// Builds the capability inventory for a binary with the supplied optional
+/// features enabled.
+///
+/// The protocol baseline stays feature-independent, while binaries compiled
+/// with browser sharing must advertise that optional capability consistently
+/// from both their local inventory and daemon handshake.
+#[must_use]
+pub fn capabilities_for_features(web_share: bool) -> Vec<&'static str> {
+    let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
+    if web_share {
+        capabilities.push(CAPABILITY_WEB_SHARE);
+    }
+    capabilities
+}
 
 /// Client-to-server version and capability negotiation request.
 ///
@@ -182,9 +211,12 @@ impl HandshakeResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
+        capabilities_for_features, HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
         CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
-        CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_HANDSHAKE, CAPABILITY_SDK_WAITS_ARMED,
+        CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_HANDSHAKE,
+        CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY, CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
+        CAPABILITY_SDK_SESSION_LEASE_BY_ID, CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
+        CAPABILITY_SDK_WAITS_ARMED, CAPABILITY_WEB_SHARE,
     };
     use crate::{RmuxError, RMUX_WIRE_VERSION};
 
@@ -219,6 +251,46 @@ mod tests {
                 "missing capability {expected}"
             );
         }
+    }
+
+    #[test]
+    fn current_handshake_versions_session_lease_identity_addressing() {
+        let response = HandshakeResponse::current();
+
+        assert!(!response
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID));
+        assert!(response
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2));
+    }
+
+    #[test]
+    fn current_handshake_advertises_owned_session_stable_identity() {
+        let response = HandshakeResponse::current();
+
+        assert!(response
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY));
+    }
+
+    #[test]
+    fn current_handshake_advertises_atomic_sdk_split_identity() {
+        let response = HandshakeResponse::current();
+
+        assert!(response
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_SDK_PANE_SPLIT_IDENTITY));
+    }
+
+    #[test]
+    fn optional_web_capability_follows_the_compiled_feature() {
+        assert!(!capabilities_for_features(false).contains(&CAPABILITY_WEB_SHARE));
+        assert!(capabilities_for_features(true).contains(&CAPABILITY_WEB_SHARE));
     }
 
     #[test]

@@ -483,6 +483,20 @@ fn split_window_parses_stdin_flag_without_treating_it_as_command() {
 }
 
 #[test]
+fn split_window_parses_compact_keep_alive_flag() {
+    let cli = parse_args(&["split-window", "-dk", "-t", "alpha:0.0", "exit 7"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert!(args.detached);
+            assert!(args.keep_alive_on_exit);
+            assert_eq!(args.command, ["exit 7".to_owned()]);
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
 fn swap_pane_accepts_relative_direction_without_a_source() {
     let cli = parse_args(&["swap-pane", "-D", "-t", "alpha:2.3"]).unwrap();
 

@@ -31,14 +31,17 @@ mod screen;
 mod terminal;
 #[path = "attach/terminal_cleanup.rs"]
 mod terminal_cleanup;
+#[path = "attach/termination.rs"]
+mod termination;
 
 use render_drain::{drain_available_attach_stream, flush_pending_render};
 #[cfg(test)]
 use resize::terminal_size_from_fd;
 use resize::{terminal_geometry_from_fd, ResizeWatcher, SignalMaskGuard};
-use screen::{AttachScreenTracker, AttachStopDetector};
+use screen::{AttachScreenTracker, AttachStopDetector, AttachStopGeneration};
 use terminal::current_process_pid;
 pub use terminal::{AttachError, RawTerminal, Result};
+use termination::AttachTerminationGuard;
 
 #[cfg(test)]
 use terminal_cleanup::fallback_attach_stop_sequence;
@@ -50,6 +53,8 @@ const POLL_TIMEOUT: Timespec = Timespec {
     tv_nsec: 100_000_000,
 };
 const RENDER_MAX_PENDING: Duration = Duration::from_millis(8);
+const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TERMINATION_OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Runs the attach loop using the process stdin/stdout streams.
 pub fn attach_terminal(stream: UnixStream) -> std::result::Result<(), ClientError> {
@@ -131,6 +136,7 @@ where
     Input: Read + AsFd + Send + 'static,
     Output: Write + Send + 'static,
 {
+    let termination_guard = AttachTerminationGuard::install().map_err(ClientError::Io)?;
     let raw_terminal = RawTerminal::from_fd(terminal).map_err(ClientError::from)?;
     let _ = raw_terminal.flush_pending_input();
     let screen_tracker = AttachScreenTracker::default();
@@ -141,13 +147,19 @@ where
         raw_terminal: &raw_terminal,
         screen_tracker: &screen_tracker,
         resize_geometry_enabled,
+        termination_signals_enabled: true,
     };
     let result = drive_attach_with_terminal_state(attach_state, input, output);
-    if result.is_err() && !screen_tracker.was_stopped() {
-        let _ = raw_terminal.restore_attach_terminal_state();
+    if result.is_err() {
+        if termination::was_requested() {
+            let _ = raw_terminal.restore_after_termination();
+        } else if !screen_tracker.was_stopped() {
+            let _ = raw_terminal.restore_attach_terminal_state();
+        }
     }
     let _ = raw_terminal.flush_pending_input();
     drop(raw_terminal);
+    termination_guard.finish().map_err(ClientError::Io)?;
     result
 }
 
@@ -158,6 +170,7 @@ struct AttachTerminalState<'a, Terminal> {
     raw_terminal: &'a RawTerminal,
     screen_tracker: &'a AttachScreenTracker,
     resize_geometry_enabled: bool,
+    termination_signals_enabled: bool,
 }
 
 struct AttachStreamState<'a> {
@@ -167,6 +180,7 @@ struct AttachStreamState<'a> {
     screen_tracker: AttachScreenTracker,
     resize_events: mpsc::Receiver<TerminalGeometry>,
     resize_geometry_enabled: bool,
+    termination_signals_enabled: bool,
 }
 
 struct AttachInputReadLease<'a> {
@@ -222,6 +236,7 @@ where
         screen_tracker: state.screen_tracker.clone(),
         resize_events: resize_rx,
         resize_geometry_enabled: state.resize_geometry_enabled,
+        termination_signals_enabled: state.termination_signals_enabled,
     };
     let attach_result = drive_attach_stream_inner(stream_state, input, output);
     drop(resize_watcher);
@@ -247,6 +262,7 @@ where
         screen_tracker: AttachScreenTracker::default(),
         resize_events,
         resize_geometry_enabled: false,
+        termination_signals_enabled: false,
     };
     drive_attach_stream_inner(stream_state, input, output)
 }
@@ -284,8 +300,9 @@ where
         )
     });
     let output_screen_tracker = state.screen_tracker.clone();
+    let action_screen_tracker = state.screen_tracker.clone();
     let output_thread = thread::spawn(move || {
-        let result = output_loop(
+        let result = output_loop_with_termination(
             state.stream,
             state.initial_bytes,
             output,
@@ -293,6 +310,7 @@ where
             output_locked,
             output_screen_tracker,
             event_tx.clone(),
+            state.termination_signals_enabled,
         );
         let _ = event_tx.send(ClientAttachEvent::OutputDone);
         result
@@ -303,7 +321,9 @@ where
         state.raw_terminal,
         &mut lock_stream,
         &locked,
+        &action_screen_tracker,
         event_rx,
+        state.termination_signals_enabled,
     );
     locked.close();
     closed.store(true, Ordering::SeqCst);
@@ -410,10 +430,11 @@ where
     }
 }
 
+#[cfg(test)]
 fn output_loop<Output>(
-    mut stream: UnixStream,
+    stream: UnixStream,
     initial_bytes: Vec<u8>,
-    mut output: Output,
+    output: Output,
     closed: Arc<AtomicBool>,
     locked: Arc<AttachLockState>,
     screen_tracker: AttachScreenTracker,
@@ -422,6 +443,33 @@ fn output_loop<Output>(
 where
     Output: Write,
 {
+    output_loop_with_termination(
+        stream,
+        initial_bytes,
+        output,
+        closed,
+        locked,
+        screen_tracker,
+        event_tx,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn output_loop_with_termination<Output>(
+    mut stream: UnixStream,
+    initial_bytes: Vec<u8>,
+    output: Output,
+    closed: Arc<AtomicBool>,
+    locked: Arc<AttachLockState>,
+    screen_tracker: AttachScreenTracker,
+    event_tx: mpsc::Sender<ClientAttachEvent>,
+    termination_signals_enabled: bool,
+) -> std::result::Result<(), ClientError>
+where
+    Output: Write,
+{
+    let mut output = termination::TerminationAwareWriter::new(output, termination_signals_enabled);
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&initial_bytes);
     let mut read_buffer = [0_u8; READ_BUFFER_SIZE];
@@ -433,6 +481,7 @@ where
     let mut data_scratch = [0_u8; READ_BUFFER_SIZE];
 
     loop {
+        fail_if_attach_termination_requested(termination_signals_enabled)?;
         loop {
             while let Some(bytes) = decoder
                 .next_data_payload_into(&mut data_scratch)
@@ -496,7 +545,13 @@ where
                         &mut pending_render_started_at,
                     )?;
                     locked.lock();
-                    send_attach_action(&event_tx, ClientAttachAction::Lock(command))?;
+                    send_attach_action(
+                        &event_tx,
+                        ClientAttachAction::Lock {
+                            command,
+                            stop_generation: screen_tracker.current_stop_generation(),
+                        },
+                    )?;
                 }
                 AttachMessage::LockShellCommand(command) => {
                     flush_pending_render_state(
@@ -505,7 +560,13 @@ where
                         &mut pending_render_started_at,
                     )?;
                     locked.lock();
-                    send_attach_action(&event_tx, ClientAttachAction::LockShell(command))?;
+                    send_attach_action(
+                        &event_tx,
+                        ClientAttachAction::LockShell {
+                            command,
+                            stop_generation: screen_tracker.current_stop_generation(),
+                        },
+                    )?;
                 }
                 AttachMessage::Suspend => {
                     flush_pending_render_state(
@@ -514,7 +575,12 @@ where
                         &mut pending_render_started_at,
                     )?;
                     locked.lock();
-                    send_attach_action(&event_tx, ClientAttachAction::Suspend)?;
+                    send_attach_action(
+                        &event_tx,
+                        ClientAttachAction::Suspend {
+                            stop_generation: screen_tracker.current_stop_generation(),
+                        },
+                    )?;
                 }
                 AttachMessage::DetachKill => {
                     flush_pending_render_state(
@@ -595,7 +661,9 @@ where
             painted_render_frame = true;
         }
 
-        let bytes_read = match stream.read(&mut read_buffer) {
+        let read_result =
+            read_attach_stream(&mut stream, &mut read_buffer, termination_signals_enabled);
+        let bytes_read = match read_result {
             Ok(0) => {
                 closed.store(true, Ordering::SeqCst);
                 if screen_tracker.was_stopped() {
@@ -641,6 +709,48 @@ where
             decoder.push_bytes(&read_buffer[consumed..bytes_read]);
         }
     }
+}
+
+fn read_attach_stream(
+    stream: &mut UnixStream,
+    read_buffer: &mut [u8],
+    termination_signals_enabled: bool,
+) -> io::Result<usize> {
+    if !termination_signals_enabled {
+        return stream.read(read_buffer);
+    }
+
+    loop {
+        if termination::was_requested() {
+            return Err(termination::interruption_error());
+        }
+        let mut fds = [PollFd::new(
+            &*stream,
+            PollFlags::IN | PollFlags::ERR | PollFlags::HUP,
+        )];
+        match poll(&mut fds, Some(&POLL_TIMEOUT)) {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(error) => return Err(error.into()),
+        }
+        if termination::was_requested() {
+            return Err(termination::interruption_error());
+        }
+        if fds[0].revents().is_empty() {
+            continue;
+        }
+        return stream.read(read_buffer);
+    }
+}
+
+fn fail_if_attach_termination_requested(
+    termination_signals_enabled: bool,
+) -> std::result::Result<(), ClientError> {
+    if termination_signals_enabled && termination::was_requested() {
+        return Err(ClientError::Io(termination::interruption_error()));
+    }
+    Ok(())
 }
 
 fn handle_attach_data_payload<Output>(
@@ -696,22 +806,70 @@ fn wait_for_output_thread(
     raw_terminal: Option<&RawTerminal>,
     lock_stream: &mut UnixStream,
     locked: &Arc<AttachLockState>,
+    screen_tracker: &AttachScreenTracker,
     event_rx: mpsc::Receiver<ClientAttachEvent>,
+    termination_signals_enabled: bool,
 ) -> std::result::Result<std::result::Result<(), ClientError>, ClientError> {
-    while let Ok(ClientAttachEvent::Action(action)) = event_rx.recv() {
-        handle_attach_action(raw_terminal, lock_stream, locked, action)?;
+    if termination_signals_enabled {
+        loop {
+            if termination::was_requested() {
+                wait_for_backpressured_output_shutdown(&output_thread, raw_terminal, &event_rx);
+                return Err(ClientError::Io(termination::interruption_error()));
+            }
+            match event_rx.recv_timeout(TERMINATION_POLL_INTERVAL) {
+                Ok(ClientAttachEvent::Action(action)) => {
+                    handle_attach_action(
+                        raw_terminal,
+                        lock_stream,
+                        locked,
+                        screen_tracker,
+                        action,
+                    )?;
+                }
+                Ok(ClientAttachEvent::OutputDone) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    } else {
+        while let Ok(ClientAttachEvent::Action(action)) = event_rx.recv() {
+            handle_attach_action(raw_terminal, lock_stream, locked, screen_tracker, action)?;
+        }
     }
 
     while let Ok(event) = event_rx.try_recv() {
         match event {
             ClientAttachEvent::Action(action) => {
-                handle_attach_action(raw_terminal, lock_stream, locked, action)?;
+                handle_attach_action(raw_terminal, lock_stream, locked, screen_tracker, action)?;
             }
             ClientAttachEvent::OutputDone => {}
         }
     }
 
     join_attach_thread(output_thread)
+}
+
+fn wait_for_backpressured_output_shutdown(
+    output_thread: &thread::JoinHandle<std::result::Result<(), ClientError>>,
+    raw_terminal: Option<&RawTerminal>,
+    event_rx: &mpsc::Receiver<ClientAttachEvent>,
+) {
+    termination::interrupt_thread(output_thread);
+    let _nonblocking_output =
+        raw_terminal.and_then(|raw_terminal| raw_terminal.interrupt_output_writer().ok());
+    let deadline = Instant::now() + TERMINATION_OUTPUT_SHUTDOWN_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match event_rx.recv_timeout(remaining) {
+            Ok(ClientAttachEvent::OutputDone) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(ClientAttachEvent::Action(_)) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+        }
+    }
 }
 
 fn send_attach_action(
@@ -727,10 +885,14 @@ fn handle_attach_action(
     raw_terminal: Option<&RawTerminal>,
     lock_stream: &mut UnixStream,
     locked: &Arc<AttachLockState>,
+    screen_tracker: &AttachScreenTracker,
     action: ClientAttachAction,
 ) -> std::result::Result<(), ClientError> {
     match action {
-        ClientAttachAction::Lock(command) => {
+        ClientAttachAction::Lock {
+            command,
+            stop_generation,
+        } => {
             locked.wait_until_input_idle();
             let Some(raw_terminal) = raw_terminal else {
                 locked.unlock();
@@ -741,11 +903,14 @@ fn handle_attach_action(
             let result = raw_terminal
                 .run_lock_command(&command)
                 .map_err(ClientError::from)
-                .and_then(|()| write_attach_message(lock_stream, AttachMessage::Unlock));
+                .and_then(|()| write_attach_unlock(lock_stream, screen_tracker, stop_generation));
             locked.unlock();
             result
         }
-        ClientAttachAction::LockShell(command) => {
+        ClientAttachAction::LockShell {
+            command,
+            stop_generation,
+        } => {
             locked.wait_until_input_idle();
             let Some(raw_terminal) = raw_terminal else {
                 locked.unlock();
@@ -756,11 +921,11 @@ fn handle_attach_action(
             let result = raw_terminal
                 .run_lock_shell_command(&command)
                 .map_err(ClientError::from)
-                .and_then(|()| write_attach_message(lock_stream, AttachMessage::Unlock));
+                .and_then(|()| write_attach_unlock(lock_stream, screen_tracker, stop_generation));
             locked.unlock();
             result
         }
-        ClientAttachAction::Suspend => {
+        ClientAttachAction::Suspend { stop_generation } => {
             locked.wait_until_input_idle();
             let Some(raw_terminal) = raw_terminal else {
                 locked.unlock();
@@ -771,7 +936,7 @@ fn handle_attach_action(
             let result = raw_terminal
                 .suspend_self()
                 .map_err(ClientError::from)
-                .and_then(|()| write_attach_message(lock_stream, AttachMessage::Unlock));
+                .and_then(|()| write_attach_unlock(lock_stream, screen_tracker, stop_generation));
             locked.unlock();
             result
         }
@@ -831,6 +996,34 @@ fn write_attach_message(
     stream.write_all(&frame).map_err(ClientError::Io)
 }
 
+fn write_attach_unlock(
+    stream: &mut UnixStream,
+    screen_tracker: &AttachScreenTracker,
+    stop_generation: Option<AttachStopGeneration>,
+) -> std::result::Result<(), ClientError> {
+    // Rearm only the stop published by this lock/suspend prelude. A newer
+    // generation belongs to a concurrent detach or session exit and must stay
+    // authoritative even when the local action completes later.
+    let rearmed =
+        stop_generation.is_some_and(|generation| screen_tracker.rearm_if_current(generation));
+    if !rearmed && screen_tracker.was_stopped() {
+        return Ok(());
+    }
+
+    match write_attach_message(stream, AttachMessage::Unlock) {
+        Err(ClientError::Io(error))
+            if screen_tracker.was_stopped()
+                && matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 fn write_attach_data(
     stream: &mut UnixStream,
     bytes: &[u8],
@@ -863,9 +1056,17 @@ fn shutdown_attach_writes(stream: &UnixStream) -> std::result::Result<(), Client
 
 #[derive(Debug)]
 enum ClientAttachAction {
-    Lock(String),
-    LockShell(AttachShellCommand),
-    Suspend,
+    Lock {
+        command: String,
+        stop_generation: Option<AttachStopGeneration>,
+    },
+    LockShell {
+        command: AttachShellCommand,
+        stop_generation: Option<AttachStopGeneration>,
+    },
+    Suspend {
+        stop_generation: Option<AttachStopGeneration>,
+    },
     DetachKill,
     DetachExec(String),
     DetachExecShell(AttachShellCommand),

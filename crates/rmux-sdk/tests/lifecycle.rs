@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use rmux_proto::{encode_frame, FrameDecoder, HasSessionRequest, Request, Response};
+use rmux_proto::{
+    encode_frame, FrameDecoder, HasSessionRequest, OptionName, RenameSessionRequest, Request,
+    Response, ScopeSelector, SetOptionMode, SetOptionRequest, WindowTarget,
+};
 use rmux_sdk::{
     CleanupPolicy, EnsureSession, LeaseState, PaneCloseOutcome, PaneInfo, PaneProcessState,
     PaneRespawnOptions, ProcessSpec, RmuxBuilder, RmuxError, SessionName, SplitDirection,
@@ -235,6 +238,107 @@ async fn split_with_spawn_keep_alive_keeps_dead_child_pane() -> TestResult {
 }
 
 #[tokio::test]
+async fn split_targets_and_returns_the_right_pane_with_nonzero_pane_base_index() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("pane-split-base").await?;
+    let rmux = harness.rmux();
+
+    for (label, stable_source, builder) in [
+        ("slot-simple", false, false),
+        ("slot-builder", false, true),
+        ("stable-simple", true, false),
+        ("stable-builder", true, true),
+    ] {
+        let name = session_name(&format!("sdksplit{label}"));
+        let session = EnsureSession::named(name.clone())
+            .create_only()
+            .ensure(&rmux)
+            .await?;
+        let root = session.pane(0, 0);
+        let root_id = root.id().await?.expect("root pane has a stable id");
+        let sibling = root.split(SplitDirection::Down).await?;
+        let sibling_id = sibling.id().await?.expect("sibling pane has a stable id");
+        root.set_title(format!("root-{label}")).await?;
+        sibling.set_title(format!("sibling-{label}")).await?;
+
+        let response = framed_request(
+            &harness.socket_path,
+            Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(name.clone(), 0)),
+                option: OptionName::PaneBaseIndex,
+                value: "1".to_owned(),
+                mode: SetOptionMode::Replace,
+            }),
+        )
+        .await?;
+        assert!(
+            matches!(response, Response::SetOption(_)),
+            "pane-base-index setup failed for {label}: {response:?}"
+        );
+
+        let source = if stable_source {
+            session.pane_by_id(root_id).await?
+        } else {
+            session.pane(0, 1)
+        };
+        let child_title = format!("child-{label}");
+        let child = if builder {
+            source
+                .split_with(SplitDirection::Right)
+                .title(child_title.clone())
+                .await?
+        } else {
+            let child = source.split(SplitDirection::Right).await?;
+            child.set_title(child_title.clone()).await?;
+            child
+        };
+
+        let child_id = child.id().await?.expect("split child has a stable id");
+        assert_ne!(child_id, root_id, "split returned the root for {label}");
+        assert_ne!(
+            child_id, sibling_id,
+            "split returned the pre-existing sibling for {label}"
+        );
+
+        let stable_root = session.pane_by_id(root_id).await?;
+        let stable_sibling = session.pane_by_id(sibling_id).await?;
+        assert_eq!(
+            stable_root.title().await?.as_deref(),
+            Some(format!("root-{label}").as_str()),
+            "split title mutated the root for {label}"
+        );
+        assert_eq!(
+            stable_sibling.title().await?.as_deref(),
+            Some(format!("sibling-{label}").as_str()),
+            "split title mutated the sibling for {label}"
+        );
+        assert_eq!(
+            child.title().await?.as_deref(),
+            Some(child_title.as_str()),
+            "split child title was not applied to the child for {label}"
+        );
+        let child_info = only_pane_info(&child.info().await?);
+        assert_eq!(
+            child.target().pane_index,
+            child_info.index,
+            "returned target must use the child's visible pane index for {label}"
+        );
+
+        let root_info = only_pane_info(&stable_root.info().await?);
+        let sibling_info = only_pane_info(&stable_sibling.info().await?);
+        assert!(
+            root_info.size.cols < sibling_info.size.cols,
+            "split anchored to the sibling instead of the root for {label}: \
+             root={:?}, sibling={:?}",
+            root_info.size,
+            sibling_info.size
+        );
+    }
+
+    harness.finish().await
+}
+
+#[tokio::test]
 async fn owned_session_cleanup_kills_session_explicitly() -> TestResult {
     let _lock = LIVE_DAEMON_LOCK.lock().await;
     let harness = Harness::start("owned-cleanup").await?;
@@ -422,6 +526,129 @@ async fn owned_session_signal_handlers_are_opt_in_and_unique() -> TestResult {
     harness.finish().await
 }
 
+#[tokio::test]
+async fn owned_session_cleanup_follows_rename_and_preserves_old_name_homonym() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("owned-cleanup-rename").await?;
+    let rmux = harness.rmux();
+    let old_name = session_name("sdkowncleanbefore");
+    let new_name = session_name("sdkowncleanafter");
+    let _keeper = EnsureSession::named(session_name("sdkowncleankeeper"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let mut owned = rmux.owned_session(old_name.clone()).await?;
+    rename_session(&harness.socket_path, old_name.clone(), new_name.clone()).await?;
+    let homonym = EnsureSession::named(old_name.clone())
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+
+    assert!(owned.cleanup().await?);
+    wait_for_session_absent(&rmux, new_name).await?;
+    assert!(
+        homonym.exists().await?,
+        "cleanup must preserve the old-name homonym"
+    );
+    homonym.kill().await?;
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn owned_session_drop_follows_rename_and_preserves_old_name_homonym() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("owned-drop-rename").await?;
+    let rmux = harness.rmux();
+    let old_name = session_name("sdkowndropbefore");
+    let new_name = session_name("sdkowndropafter");
+    let _keeper = EnsureSession::named(session_name("sdkowndropkeeper"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let owned = rmux.owned_session(old_name.clone()).await?;
+    rename_session(&harness.socket_path, old_name.clone(), new_name.clone()).await?;
+    let homonym = EnsureSession::named(old_name)
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+
+    drop(owned);
+    wait_for_session_absent(&rmux, new_name).await?;
+    assert!(
+        homonym.exists().await?,
+        "Drop must preserve the old-name homonym"
+    );
+    homonym.kill().await?;
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn owned_session_lease_renews_and_releases_by_identity_after_rename() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("owned-lease-rename").await?;
+    let rmux = harness.rmux();
+    let old_name = session_name("sdkownleasebefore");
+    let new_name = session_name("sdkownleaseafter");
+    let _keeper = EnsureSession::named(session_name("sdkownleasekeeper"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let owned = rmux
+        .owned_session(old_name.clone())
+        .cleanup_policy(CleanupPolicy::KillOnOwnerExit)
+        .lease_ttl(Duration::from_millis(600))
+        .await?;
+    rename_session(&harness.socket_path, old_name, new_name.clone()).await?;
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(
+        rmux.has_session(new_name.clone()).await?,
+        "stable-id heartbeat must keep a renamed session alive across multiple TTLs"
+    );
+    let preserved = owned.preserve().await?;
+    drop(preserved);
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        rmux.has_session(new_name.clone()).await?,
+        "preserve must release the renamed session ownership token"
+    );
+    rmux.session(new_name).await?.kill().await?;
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn owned_session_signal_kill_follows_rename_and_preserves_homonym() -> TestResult {
+    use signal_hook::consts::signal::SIGINT;
+
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("owned-signal-rename").await?;
+    let rmux = harness.rmux();
+    let old_name = session_name("sdkownsignalbefore");
+    let new_name = session_name("sdkownsignalafter");
+    let _keeper = EnsureSession::named(session_name("sdkownsignalkeeper"))
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let owned = rmux.owned_session(old_name.clone()).await?;
+    let signal_guard = owned.install_default_signal_handlers()?;
+    rename_session(&harness.socket_path, old_name.clone(), new_name.clone()).await?;
+    let homonym = EnsureSession::named(old_name)
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+
+    signal_hook::low_level::raise(SIGINT)?;
+    wait_for_session_absent(&rmux, new_name).await?;
+    assert!(
+        homonym.exists().await?,
+        "signal cleanup must preserve the old-name homonym"
+    );
+    drop(signal_guard);
+    drop(owned);
+    homonym.kill().await?;
+    harness.finish().await
+}
+
 fn running_pid(info: &PaneInfo) -> TestResult<u32> {
     match info.process {
         PaneProcessState::Running { pid: Some(pid) } => Ok(pid),
@@ -564,6 +791,25 @@ async fn framed_request(socket_path: &Path, request: Request) -> TestResult<Resp
     let frame = encode_frame(&request)?;
     stream.write_all(&frame).await?;
     read_response(&mut stream).await
+}
+
+async fn rename_session(
+    socket_path: &Path,
+    target: SessionName,
+    new_name: SessionName,
+) -> TestResult {
+    let response = framed_request(
+        socket_path,
+        Request::RenameSession(RenameSessionRequest {
+            target,
+            new_name: new_name.clone(),
+        }),
+    )
+    .await?;
+    match response {
+        Response::RenameSession(response) if response.session_name == new_name => Ok(()),
+        response => Err(format!("unexpected rename-session response: {response:?}").into()),
+    }
 }
 
 async fn read_response(stream: &mut UnixStream) -> TestResult<Response> {

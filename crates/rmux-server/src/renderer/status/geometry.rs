@@ -4,7 +4,7 @@ use rmux_proto::{OptionName, TerminalSize};
 use crate::status_lines::status_line_count;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::renderer) struct StatusGeometry {
+pub(crate) struct StatusGeometry {
     pub(in crate::renderer) terminal_size: TerminalSize,
     pub(in crate::renderer) content_rows: u16,
     pub(in crate::renderer) content_y_offset: u16,
@@ -13,7 +13,7 @@ pub(in crate::renderer) struct StatusGeometry {
 }
 
 impl StatusGeometry {
-    pub(in crate::renderer) fn for_session(session: &Session, options: &OptionStore) -> Self {
+    pub(crate) fn for_session(session: &Session, options: &OptionStore) -> Self {
         let size = session.window().size();
         let status = options.resolve(Some(session.name()), OptionName::Status);
         if size.cols == 0 || size.rows == 0 || matches!(status, Some("off")) {
@@ -54,6 +54,14 @@ impl StatusGeometry {
             cols: self.terminal_size.cols,
             rows: self.content_rows,
         }
+    }
+
+    pub(crate) const fn content_y_offset(self) -> u16 {
+        self.content_y_offset
+    }
+
+    pub(crate) const fn content_rows(self) -> u16 {
+        self.content_rows
     }
 
     pub(in crate::renderer) const fn status_line_y(self, line: u16) -> Option<u16> {

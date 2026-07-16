@@ -312,7 +312,6 @@ fn capture_pane_matches_frozen_tmux_for_respawned_output_when_available(
         config.clone(),
     )?;
     assert_exact_tmux_compat(&remain_on_exit);
-
     let respawn = harness.run_pair_with(
         &tmux_binary,
         &[
@@ -371,6 +370,18 @@ fn capture_pane_matches_frozen_tmux_after_respawned_pane_exits_when_available(
         config.clone(),
     )?;
     assert_exact_tmux_compat(&remain_on_exit);
+    let remain_on_exit_format = harness.run_pair_with(
+        &tmux_binary,
+        &[
+            "set-window-option",
+            "-t",
+            "alpha:0",
+            "remain-on-exit-format",
+            "Pane is dead (status #{pane_dead_status})",
+        ],
+        config.clone(),
+    )?;
+    assert_exact_tmux_compat(&remain_on_exit_format);
 
     let respawn = harness.run_pair_with(
         &tmux_binary,

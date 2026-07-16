@@ -103,6 +103,19 @@ fn default_store_keeps_prefix_meta_layout_bindings() {
 }
 
 #[test]
+fn default_store_does_not_bind_unimplemented_refresh_client_panning() {
+    let store = KeyBindingStore::default();
+    for key in ["DC", "S-Up", "S-Down", "S-Left", "S-Right"] {
+        assert!(
+            store
+                .get_binding("prefix", key_string_lookup_string(key).expect("key parses"))
+                .is_none(),
+            "default prefix table advertised unsupported refresh-client panning on {key}"
+        );
+    }
+}
+
+#[test]
 fn default_store_matches_tmux37_lot6_root_and_copy_bindings() {
     let store = KeyBindingStore::default();
     for (table, key, expected) in [

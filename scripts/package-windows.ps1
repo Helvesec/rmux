@@ -224,26 +224,42 @@ $binary = Join-Path $targetDir (Join-Path $Target (Join-Path $profileDir "rmux.e
 $helperBinary = Join-Path $targetDir (Join-Path $Target (Join-Path $profileDir "rmux-full.exe"))
 $daemonBinary = Join-Path $targetDir (Join-Path $Target (Join-Path $profileDir "rmux-daemon.exe"))
 
-if (-not $SkipBuild -and -not $ReuseReleaseBinaries) {
-    & cargo @cargoArgs --bin rmux
-    if ($LASTEXITCODE -ne 0) {
-        Fail "cargo build full rmux helper failed"
-    }
-    Copy-Item -LiteralPath $binary -Destination $helperBinary -Force
+$buildsReleaseMsvc = $Configuration -eq "release" -and
+    $Target -match '-pc-windows-msvc$' -and
+    -not $SkipBuild -and
+    -not $ReuseReleaseBinaries
+$originalRustFlags = $env:RUSTFLAGS
+if ($buildsReleaseMsvc -and $originalRustFlags -notlike "*+crt-static*") {
+    $env:RUSTFLAGS = "$originalRustFlags -C target-feature=+crt-static".Trim()
+}
+try {
+    if (-not $SkipBuild -and -not $ReuseReleaseBinaries) {
+        & cargo @cargoArgs --bin rmux
+        if ($LASTEXITCODE -ne 0) {
+            Fail "cargo build full rmux helper failed"
+        }
+        Copy-Item -LiteralPath $binary -Destination $helperBinary -Force
 
-    $tinyCargoArgs = @($cargoArgs)
-    $tinyCargoArgs += @("--features", "tiny-cli")
-    & cargo @tinyCargoArgs --bin rmux
-    if ($LASTEXITCODE -ne 0) {
-        Fail "cargo build tiny rmux failed"
+        $tinyCargoArgs = @($cargoArgs)
+        $tinyCargoArgs += @("--features", "tiny-cli")
+        & cargo @tinyCargoArgs --bin rmux
+        if ($LASTEXITCODE -ne 0) {
+            Fail "cargo build tiny rmux failed"
+        }
+        # Keep the packaged hidden daemon web-capable. The public binary can still
+        # use the tiny CLI fast path, but sessions it starts must remain shareable
+        # later from a fresh `rmux web-share` invocation.
+        $daemonCargoArgs = @($cargoArgs)
+        & cargo @daemonCargoArgs --bin rmux-daemon
+        if ($LASTEXITCODE -ne 0) {
+            Fail "cargo build rmux-daemon failed"
+        }
     }
-    # Keep the packaged hidden daemon web-capable. The public binary can still
-    # use the tiny CLI fast path, but sessions it starts must remain shareable
-    # later from a fresh `rmux web-share` invocation.
-    $daemonCargoArgs = @($cargoArgs)
-    & cargo @daemonCargoArgs --bin rmux-daemon
-    if ($LASTEXITCODE -ne 0) {
-        Fail "cargo build rmux-daemon failed"
+} finally {
+    if ($null -eq $originalRustFlags) {
+        Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue
+    } else {
+        $env:RUSTFLAGS = $originalRustFlags
     }
 }
 
@@ -275,6 +291,15 @@ if ($ReuseReleaseBinaries) {
         $binary `
         $helperBinary `
         $daemonBinary
+}
+if ($Configuration -eq "release" -and $Target -match '-pc-windows-msvc$') {
+    & (Join-Path $PSScriptRoot "assert-windows-static-crt.ps1") `
+        -Binary $binary `
+        -HelperBinary $helperBinary `
+        -DaemonBinary $daemonBinary
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Windows static CRT verification failed"
+    }
 }
 
 $distDir = [System.IO.Path]::GetFullPath($OutputDir)
@@ -363,13 +388,13 @@ $generatedAtUtc = GitOutput @("show", "-s", "--format=%cI", "HEAD")
 $metadata = [ordered]@{
     schema = 1
     artifact_kind = "windows-package-binary"
-    binary_path = $binaryAbs
+    binary_path = "rmux.exe"
     binary_sha256 = $binarySha256
     binary_bytes = $binaryBytes
-    helper_binary_path = $helperBinaryAbs
+    helper_binary_path = "libexec/rmux/rmux.exe"
     helper_binary_sha256 = $helperBinarySha256
     helper_binary_bytes = $helperBinaryBytes
-    daemon_binary_path = $daemonBinaryAbs
+    daemon_binary_path = "rmux-daemon.exe"
     daemon_binary_sha256 = $daemonBinarySha256
     daemon_binary_bytes = $daemonBinaryBytes
     rmux_version = $version

@@ -13,12 +13,16 @@ mod pane_by_id;
 mod pane_deferred_wait;
 #[path = "handler_pane/display_panes.rs"]
 mod pane_display_panes;
+#[path = "handler_pane/exit_probe.rs"]
+mod pane_exit_probe;
 #[path = "handler_pane/inspection.rs"]
 mod pane_inspection;
 #[path = "handler_pane/io_encoding.rs"]
 mod pane_io_encoding;
 #[path = "handler_pane/key_bindings.rs"]
 mod pane_key_bindings;
+#[path = "handler_pane/kill_effects.rs"]
+mod pane_kill_effects;
 #[path = "handler_pane/layout.rs"]
 mod pane_layout;
 #[path = "handler_pane/lifecycle.rs"]
@@ -37,11 +41,18 @@ mod pane_send_keys;
 mod pane_snapshot;
 #[path = "handler_pane/split_effects.rs"]
 mod pane_split_effects;
+#[path = "handler_pane/timer_mutations.rs"]
+mod pane_timer_mutations;
+#[path = "handler_pane/transfer.rs"]
+mod pane_transfer;
 #[cfg(windows)]
 #[path = "handler_pane/windows_console_sequence.rs"]
 mod pane_windows_console_sequence;
 
-pub(super) use pane_attached_input::retain_partial_attached_control_input;
+pub(in crate::handler) use pane_attached_input::bracketed_paste::{
+    strip_bracketed_paste_markers, strip_bracketed_paste_markers_after_append,
+};
+pub(super) use pane_attached_input::retain_partial_attached_escape_input;
 pub(super) use pane_by_id::resolve_pane_target_ref;
 #[cfg(windows)]
 pub(in crate::handler) use pane_deferred_wait::format_references_pane_pid;
@@ -56,7 +67,7 @@ use pane_io_encoding::{
 pub(super) use pane_io_encoding::{
     prepare_pane_input_write, write_bytes_to_target_io, PaneInputLiveness,
 };
-pub(in crate::handler) use pane_management::SplitWindowParts;
+pub(in crate::handler) use pane_management::{SplitWindowParts, SplitWindowResponseMode};
 pub(super) use pane_prompt_input::decode_prompt_input_event;
 pub(in crate::handler) use pane_snapshot::PaneSnapshotRevisionRegistry;
 
@@ -68,6 +79,8 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 
 struct AttachedKeyDispatch {
     attach_pid: u32,
+    live_identity: Option<super::attach_support::ActiveAttachIdentity>,
+    live_session_id: Option<rmux_proto::SessionId>,
     requester_pid: u32,
     current_target: Option<Target>,
     mouse_target: Option<Target>,

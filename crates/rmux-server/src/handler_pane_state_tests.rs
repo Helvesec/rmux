@@ -4,6 +4,7 @@ use std::{
 };
 
 use super::RequestHandler;
+use crate::pane_io::PaneExitEvent;
 use crate::pane_state_journal::{
     PaneStateChange, PANE_STATE_JOURNAL_BYTE_CAPACITY, PANE_STATE_JOURNAL_CAPACITY,
 };
@@ -473,6 +474,83 @@ async fn respawn_pane_reopens_pane_state_before_future_close() {
                 }] if *event_pane_id == pane_id
             ));
         }
+        response => panic!("pane-state cursor failed: {response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn subscription_after_kept_exit_and_respawn_receives_new_generation_events() {
+    let handler = RequestHandler::new();
+    let (session, target, pane_id) =
+        create_session_with_pane(&handler, "pane-state-respawn-generation").await;
+    handler.wait_for_initial_panes_for_test().await;
+
+    let remain_on_exit = handler
+        .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+            target: PaneTargetRef::slot(target.clone()),
+            name: "remain-on-exit".to_owned(),
+            value: Some("on".to_owned()),
+            mode: SetOptionMode::Replace,
+            unset: false,
+        }))
+        .await;
+    assert!(
+        matches!(remain_on_exit, Response::PaneOptionSet(_)),
+        "{remain_on_exit:?}"
+    );
+
+    let generation = {
+        let mut state = handler.state.lock().await;
+        let generation = state.pane_output_generation_for_target(&target, pane_id);
+        state
+            .mark_pane_dead_without_exit_details(&target)
+            .expect("mark pane dead");
+        generation
+    };
+    handler
+        .handle_pane_exit_event(PaneExitEvent::eof_published(
+            session,
+            pane_id,
+            Some(generation),
+        ))
+        .await;
+
+    let response = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
+
+    let subscription_id = subscribe(&handler, 107, target.clone(), false, true).await;
+    let after_subscription = handler
+        .pane_state_journal
+        .lock()
+        .expect("pane-state journal lock should not be poisoned")
+        .current_revision();
+    let changed = handler
+        .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+            target: PaneTargetRef::slot(target),
+            name: "@post-respawn".to_owned(),
+            value: Some("visible".to_owned()),
+            mode: SetOptionMode::Replace,
+            unset: false,
+        }))
+        .await;
+    assert!(matches!(changed, Response::PaneOptionSet(_)), "{changed:?}");
+
+    match read_cursor(&handler, 107, subscription_id, after_subscription).await {
+        Response::PaneStateCursor(response) => assert!(matches!(
+            response.events.as_slice(),
+            [PaneStateEventDto::OptionSet {
+                name, new_value, ..
+            }] if name == "@post-respawn" && new_value == "visible"
+        )),
         response => panic!("pane-state cursor failed: {response:?}"),
     }
 }

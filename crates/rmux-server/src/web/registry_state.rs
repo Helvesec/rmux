@@ -137,7 +137,10 @@ impl WebShareState {
                 matches!(
                     &record.target,
                     WebShareTarget::Pane(target)
-                        if target.pane_id().is_some_and(|pane_id| pane_ids.contains(&pane_id))
+                        if target
+                            .target()
+                            .pane_id()
+                            .is_some_and(|pane_id| pane_ids.contains(&pane_id))
                 )
             })
             .map(|(share_id, _)| share_id.clone())
@@ -250,9 +253,13 @@ fn target_matches_removed_session(
     sessions: &[(SessionName, SessionId)],
 ) -> bool {
     match target {
+        // WebPaneTarget carries the stable session identity captured when the
+        // share was created. Revoke every pane share owned by a removed
+        // session (including slot refs), without touching a same-name share
+        // created later for a replacement SessionId.
         WebShareTarget::Pane(target) => sessions
             .iter()
-            .any(|(session_name, _)| target.session_name() == session_name),
+            .any(|(_, session_id)| target.session_id() == *session_id),
         WebShareTarget::Session(target) => sessions
             .iter()
             .any(|(_, session_id)| target.id() == *session_id),

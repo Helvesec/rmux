@@ -216,14 +216,8 @@ fn resolve_set_environment_mode(
 ) -> Result<Option<SetEnvironmentMode>, ExitFailure> {
     let mode = match (args.clear, args.unset) {
         (true, false) => Some(SetEnvironmentMode::Clear),
-        (false, true) => Some(SetEnvironmentMode::Unset),
+        (false, true) | (true, true) => Some(SetEnvironmentMode::Unset),
         (false, false) => Some(SetEnvironmentMode::Set),
-        (true, true) => {
-            return Err(ExitFailure::new(
-                1,
-                "set-environment accepts at most one of -r or -u",
-            ))
-        }
     };
 
     if matches!(
@@ -254,7 +248,9 @@ mod tests {
         parse_target_spec, SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind,
         ShowOptionsArgs, ShowOptionsCommandKind, TargetSpec,
     };
-    use rmux_proto::{OptionScopeSelector, PaneTarget, SessionName, WindowTarget};
+    use rmux_proto::{
+        OptionScopeSelector, PaneTarget, SessionName, SetEnvironmentMode, WindowTarget,
+    };
     use std::path::Path;
 
     fn target_spec(value: &str) -> TargetSpec {
@@ -325,6 +321,23 @@ mod tests {
 
         assert_eq!(error.exit_code(), 1);
         assert_eq!(error.message(), "no value specified");
+    }
+
+    #[test]
+    fn set_environment_unset_takes_precedence_over_clear() {
+        let mode = super::resolve_set_environment_mode(&SetEnvironmentArgs {
+            global: true,
+            target: None,
+            format: false,
+            hidden: false,
+            clear: true,
+            unset: true,
+            name: "AUDIT_VAR".to_owned(),
+            value: None,
+        })
+        .expect("tmux accepts -r and -u together");
+
+        assert_eq!(mode, Some(SetEnvironmentMode::Unset));
     }
 
     #[test]

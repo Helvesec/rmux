@@ -5,6 +5,8 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 use std::path::Path;
 use std::process::Command as ProcessCommand;
 #[cfg(windows)]
@@ -142,7 +144,8 @@ fn configure_shell_command(command: &mut ProcessCommand, argv0: &OsString, shell
 
 #[cfg(windows)]
 fn configure_shell_command(command: &mut ProcessCommand, _argv0: &OsString, shell_command: &str) {
-    command.arg("/C").arg(shell_command);
+    command.arg("/C");
+    command.raw_arg(rmux_os::command::cmd_c_verbatim_tail(shell_command));
 }
 
 fn shell_argv0(shell: &Path, login_shell: bool) -> OsString {

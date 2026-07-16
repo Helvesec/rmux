@@ -28,11 +28,11 @@ async fn parsed_queue_accepts_display_message_format_flag() {
 }
 
 #[tokio::test]
-async fn parsed_queue_display_message_consumes_neutral_compat_flags_before_message() {
+async fn parsed_queue_display_message_consumes_implemented_compat_flags_before_message() {
     let handler = RequestHandler::new();
 
     let parsed = CommandParser::new()
-        .parse("display-message -p -d 10 -I -l -N -v hello")
+        .parse("display-message -p -I -l -v hello")
         .expect("display-message compat flags parse");
     let output = handler
         .execute_parsed_commands_for_test(std::process::id(), parsed)
@@ -65,18 +65,25 @@ async fn parsed_queue_display_message_rejects_multiple_message_arguments() {
 }
 
 #[tokio::test]
-async fn parsed_queue_display_message_consumes_compact_delay_before_message() {
+async fn parsed_queue_display_message_rejects_inert_delay_and_no_format_flags() {
     let handler = RequestHandler::new();
 
-    let parsed = CommandParser::new()
-        .parse("display-message -d0 -p hello")
-        .expect("display-message compact delay flag parses");
-    let output = handler
-        .execute_parsed_commands_for_test(std::process::id(), parsed)
-        .await
-        .expect("display-message compact delay flag executes");
-
-    assert_eq!(output.stdout(), b"hello\n");
+    for (command, flag) in [
+        ("display-message -d0 -p hello", "-d"),
+        ("display-message -pN hello", "-N"),
+    ] {
+        let parsed = CommandParser::new()
+            .parse(command)
+            .expect("generic command parser preserves display-message flags");
+        let error = handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+            .expect_err("unimplemented display-message flag must be rejected");
+        assert_eq!(
+            error,
+            rmux_proto::RmuxError::Server(format!("command display-message: unknown flag {flag}"))
+        );
+    }
 }
 
 #[tokio::test]
@@ -289,6 +296,23 @@ async fn hook_string_mode_newlines_share_one_abort_group() {
             .await,
         Response::Error(_)
     ));
+}
+
+#[tokio::test]
+async fn compact_short_options_execute_through_builtin_alias_in_hook() {
+    let handler = RequestHandler::new();
+
+    let result = with_hook_execution(Vec::new(), async {
+        handler
+            .execute_hook_command(std::process::id(), "server-info")
+            .await
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "builtin compact alias should execute: {result:?}"
+    );
 }
 
 #[tokio::test]

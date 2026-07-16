@@ -73,6 +73,18 @@ impl HookBindings {
         dispatches
     }
 
+    pub(super) fn one_shot_indices(&self, hook: HookName) -> Vec<u32> {
+        self.hooks.get(&hook).map_or_else(Vec::new, |array| {
+            array
+                .entries
+                .iter()
+                .filter_map(|(index, registered)| {
+                    (registered.lifecycle == HookLifecycle::OneShot).then_some(*index)
+                })
+                .collect()
+        })
+    }
+
     pub(super) fn views(&self, filter: Option<HookName>) -> Vec<HookBindingView> {
         hook_inventory()
             .into_iter()

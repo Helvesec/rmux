@@ -150,7 +150,24 @@ async fn attached_prefix_meta_digits_select_tmux_layout_presets() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let control_backlog = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached client exists")
+            .control_backlog
+            .clone()
+    };
+    let control_drain = tokio::spawn(async move {
+        while let Some(control) = control_rx.recv().await {
+            crate::pane_io::release_attach_control_backlog(
+                &control_backlog,
+                control.received_backlog_units(),
+            );
+        }
+    });
     for _ in 0..2 {
         assert!(matches!(
             handler
@@ -204,6 +221,7 @@ async fn attached_prefix_meta_digits_select_tmux_layout_presets() {
             "prefix meta digit input {bytes:?} should select {expected_layout:?}"
         );
     }
+    control_drain.abort();
 }
 
 #[tokio::test]

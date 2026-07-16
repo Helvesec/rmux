@@ -14,6 +14,14 @@ pub(crate) async fn require(client: &TransportClient, capabilities: &[&str]) -> 
     require_with_handshake(client, &[], capabilities).await
 }
 
+/// Non-erroring probe: whether the daemon advertises every listed capability.
+pub(crate) async fn supports(client: &TransportClient, capabilities: &[&str]) -> Result<bool> {
+    let supported = negotiated_capabilities_requiring(client, &[]).await?;
+    Ok(capabilities
+        .iter()
+        .all(|capability| supported.iter().any(|entry| entry == capability)))
+}
+
 pub(crate) async fn require_with_handshake(
     client: &TransportClient,
     required_capabilities: &[&str],

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use rmux_core::{PaneId, SessionStore};
+use rmux_core::{PaneId, SessionStore, WindowId};
 use rmux_proto::{KillPaneResponse, PaneTarget, RmuxError, SessionName, WindowTarget};
 
 use super::super::{
@@ -12,7 +12,19 @@ use super::super::{
 struct LinkedWindowRemoval {
     session_name: SessionName,
     window_index: u32,
-    destroy_session: bool,
+    window_id: WindowId,
+}
+
+pub(in crate::pane_terminals) struct LinkedWindowTransferRemovalPlan {
+    direct_slots: Vec<WindowLinkSlot>,
+    removals: Vec<LinkedWindowRemoval>,
+}
+
+pub(in crate::pane_terminals) struct DestroyedLinkedSessionRuntime {
+    session_name: SessionName,
+    session_id: u32,
+    current_runtime_owner: Option<SessionName>,
+    next_runtime_owner: Option<SessionName>,
 }
 
 struct LinkedKillSnapshot {
@@ -23,7 +35,9 @@ struct LinkedKillSnapshot {
     auto_named_windows: HashSet<(SessionName, u32)>,
     window_link_groups: HashMap<u64, WindowLinkGroup>,
     window_link_slots: HashMap<WindowLinkSlot, u64>,
+    window_link_occurrences: HashMap<WindowLinkSlot, super::super::WindowLinkOccurrenceId>,
     next_window_link_group_id: u64,
+    next_window_link_occurrence_id: u64,
 }
 
 impl LinkedKillSnapshot {
@@ -36,7 +50,9 @@ impl LinkedKillSnapshot {
             auto_named_windows: state.auto_named_windows.clone(),
             window_link_groups: state.window_link_groups.clone(),
             window_link_slots: state.window_link_slots.clone(),
+            window_link_occurrences: state.window_link_occurrences.clone(),
             next_window_link_group_id: state.next_window_link_group_id,
+            next_window_link_occurrence_id: state.next_window_link_occurrence_id,
         }
     }
 
@@ -48,7 +64,9 @@ impl LinkedKillSnapshot {
         state.auto_named_windows = self.auto_named_windows;
         state.window_link_groups = self.window_link_groups;
         state.window_link_slots = self.window_link_slots;
+        state.window_link_occurrences = self.window_link_occurrences;
         state.next_window_link_group_id = self.next_window_link_group_id;
+        state.next_window_link_occurrence_id = self.next_window_link_occurrence_id;
     }
 }
 
@@ -85,8 +103,8 @@ impl HandlerState {
         };
         let mut removed_outputs = self.remove_pane_outputs(&runtime_session_name, &[pane_id]);
 
-        let commit = self.commit_linked_window_removals(&direct_slots, &removals);
-        let destroyed_sessions = match commit {
+        let commit = self.commit_linked_window_removals(&direct_slots, &removals, false, true);
+        let destroyed_runtime_plans = match commit {
             Ok(destroyed_sessions) => destroyed_sessions,
             Err(error) => {
                 snapshot.restore(self);
@@ -110,14 +128,20 @@ impl HandlerState {
         removed_outputs.abort_output_readers();
         terminate_removed_terminals(&mut removed_terminals);
         self.remove_pane_lifecycle(pane_id);
-        for (destroyed_session, _) in &destroyed_sessions {
-            self.remove_destroyed_linked_session_runtime(destroyed_session);
+        for destroyed in &destroyed_runtime_plans {
+            self.remove_destroyed_linked_session_runtime(&destroyed.session_name);
         }
+        let destroyed_sessions = destroyed_runtime_plans
+            .into_iter()
+            .map(|destroyed| (destroyed.session_name, destroyed.session_id))
+            .collect::<Vec<_>>();
 
-        let affected_sessions = removals
+        let mut affected_sessions = removals
             .iter()
             .map(|removal| removal.session_name.clone())
             .collect::<Vec<_>>();
+        affected_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        affected_sessions.dedup();
         let removed_session_id =
             destroyed_sessions
                 .iter()
@@ -145,41 +169,158 @@ impl HandlerState {
         &mut self,
         direct_slots: &[WindowLinkSlot],
         removals: &[LinkedWindowRemoval],
-    ) -> Result<Vec<(SessionName, u32)>, RmuxError> {
+        allow_already_removed_windows: bool,
+        synchronize_survivors: bool,
+    ) -> Result<Vec<DestroyedLinkedSessionRuntime>, RmuxError> {
         for slot in direct_slots {
             let _ = self.detach_window_link_slot(&slot.session_name, slot.window_index);
         }
 
         let mut destroyed_sessions = Vec::new();
         let mut surviving_sessions = Vec::new();
-        for removal in removals {
-            let window_target =
-                WindowTarget::with_window(removal.session_name.clone(), removal.window_index);
-            self.clear_auto_named_window(&removal.session_name, removal.window_index);
-            if removal.destroy_session {
-                let removed = self.sessions.remove_session(&removal.session_name)?;
-                let _ = self.options.remove_session(&removal.session_name);
-                let _ = self.environment.remove_session(&removal.session_name);
-                let _ = self.hooks.remove_session(&removal.session_name);
-                destroyed_sessions.push((removal.session_name.clone(), removed.id().as_u32()));
+        let mut removal_start = 0;
+        while removal_start < removals.len() {
+            let session_name = removals[removal_start].session_name.clone();
+            let removal_end = removals[removal_start..]
+                .iter()
+                .position(|removal| removal.session_name != session_name)
+                .map_or(removals.len(), |offset| removal_start + offset);
+            let session_removals = &removals[removal_start..removal_end];
+            let destroy_session = {
+                let session = self
+                    .sessions
+                    .session(&session_name)
+                    .ok_or_else(|| session_not_found(&session_name))?;
+                session.windows().iter().all(|(window_index, window)| {
+                    session_removals.iter().any(|removal| {
+                        removal.window_index == *window_index && removal.window_id == window.id()
+                    })
+                })
+            };
+
+            if destroy_session {
+                for removal in session_removals {
+                    self.clear_auto_named_window(&session_name, removal.window_index);
+                }
+                let current_runtime_owner = self.sessions.runtime_owner(&session_name);
+                let next_runtime_owner = self.sessions.runtime_owner_transfer_target(&session_name);
+                let removed = self.sessions.remove_session(&session_name)?;
+                let _ = self.options.remove_session(&session_name);
+                let _ = self.environment.remove_session(&session_name);
+                let _ = self.hooks.remove_session(&session_name);
+                destroyed_sessions.push(DestroyedLinkedSessionRuntime {
+                    session_name,
+                    session_id: removed.id().as_u32(),
+                    current_runtime_owner,
+                    next_runtime_owner,
+                });
             } else {
-                self.sessions
-                    .session_mut(&removal.session_name)
-                    .ok_or_else(|| session_not_found(&removal.session_name))?
-                    .remove_window(removal.window_index)?;
-                let _ = self.options.remove_window(&window_target);
-                let _ = self.hooks.remove_window(&window_target);
-                surviving_sessions.push(removal.session_name.clone());
+                for removal in session_removals {
+                    let window_target =
+                        WindowTarget::with_window(session_name.clone(), removal.window_index);
+                    let current_window_id = self
+                        .sessions
+                        .session(&session_name)
+                        .and_then(|session| session.window_at(removal.window_index))
+                        .map(rmux_core::Window::id);
+                    match current_window_id {
+                        Some(window_id) if window_id == removal.window_id => {
+                            self.clear_auto_named_window(&session_name, removal.window_index);
+                            let session = self
+                                .sessions
+                                .session_mut(&session_name)
+                                .ok_or_else(|| session_not_found(&session_name))?;
+                            session.remove_window(removal.window_index)?;
+                            let _ = self.options.remove_window(&window_target);
+                            let _ = self.hooks.remove_window(&window_target);
+                            surviving_sessions.push(session_name.clone());
+                        }
+                        Some(_) if allow_already_removed_windows => {}
+                        None if allow_already_removed_windows => {
+                            self.clear_auto_named_window(&session_name, removal.window_index);
+                            let _ = self.options.remove_window(&window_target);
+                            let _ = self.hooks.remove_window(&window_target);
+                        }
+                        Some(_) => {
+                            return Err(RmuxError::Server(format!(
+                                "linked window {window_target} changed identity before removal"
+                            )));
+                        }
+                        None => {
+                            return Err(RmuxError::invalid_target(
+                                window_target.to_string(),
+                                "window index does not exist in linked session",
+                            ));
+                        }
+                    }
+                }
             }
+            removal_start = removal_end;
         }
 
-        surviving_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        surviving_sessions.dedup();
-        for surviving_session in surviving_sessions {
-            self.synchronize_session_group_from(&surviving_session)?;
-            self.sync_pane_lifecycle_dimensions_for_session(&surviving_session);
+        if synchronize_survivors {
+            surviving_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            surviving_sessions.dedup();
+            for surviving_session in surviving_sessions {
+                self.synchronize_session_group_from(&surviving_session)?;
+                self.sync_pane_lifecycle_dimensions_for_session(&surviving_session);
+            }
         }
         Ok(destroyed_sessions)
+    }
+
+    pub(in crate::pane_terminals) fn linked_last_pane_transfer_removal_plan(
+        &self,
+        target: &PaneTarget,
+        pane_id: PaneId,
+    ) -> Result<Option<LinkedWindowTransferRemovalPlan>, RmuxError> {
+        let session = self
+            .sessions
+            .session(target.session_name())
+            .ok_or_else(|| session_not_found(target.session_name()))?;
+        let window = session.window_at(target.window_index()).ok_or_else(|| {
+            RmuxError::invalid_target(
+                format!("{}:{}", target.session_name(), target.window_index()),
+                "window index does not exist in linked session",
+            )
+        })?;
+        if window.pane_count() != 1 || window.panes().first().map(|pane| pane.id()) != Some(pane_id)
+        {
+            return Ok(None);
+        }
+        if self.window_link_count(target.session_name(), target.window_index()) <= 1
+            && self.window_linked_session_count(target.session_name(), target.window_index()) <= 1
+        {
+            return Ok(None);
+        }
+
+        let direct_slots = self.window_link_slots_for(target.session_name(), target.window_index());
+        let removals = linked_window_removals(self, &direct_slots, pane_id)?;
+        Ok(Some(LinkedWindowTransferRemovalPlan {
+            direct_slots,
+            removals,
+        }))
+    }
+
+    pub(in crate::pane_terminals) fn commit_linked_last_pane_transfer_removal(
+        &mut self,
+        plan: LinkedWindowTransferRemovalPlan,
+    ) -> Result<Vec<DestroyedLinkedSessionRuntime>, RmuxError> {
+        self.commit_linked_window_removals(&plan.direct_slots, &plan.removals, true, false)
+    }
+
+    pub(in crate::pane_terminals) fn finish_destroyed_linked_session_transfers(
+        &mut self,
+        destroyed_sessions: Vec<DestroyedLinkedSessionRuntime>,
+    ) -> Result<(), RmuxError> {
+        for destroyed in destroyed_sessions {
+            self.remove_session_terminals(
+                &destroyed.session_name,
+                destroyed.current_runtime_owner.as_ref(),
+                destroyed.next_runtime_owner.as_ref(),
+            )?;
+        }
+        Ok(())
     }
 
     fn remove_destroyed_linked_session_runtime(&mut self, session_name: &SessionName) {
@@ -259,7 +400,7 @@ fn linked_window_removals(
         removals.push(LinkedWindowRemoval {
             session_name: slot.session_name,
             window_index: slot.window_index,
-            destroy_session: session.windows().len() == 1,
+            window_id: window.id(),
         });
     }
 

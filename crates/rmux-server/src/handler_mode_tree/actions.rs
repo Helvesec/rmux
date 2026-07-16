@@ -1,23 +1,23 @@
-use rmux_core::{command_parser::CommandParser, LifecycleEvent};
+use rmux_core::command_parser::CommandParser;
 use rmux_proto::{
-    DeleteBufferRequest, KillPaneRequest, KillSessionRequest, KillWindowRequest, PaneTarget,
-    PasteBufferRequest, Response, RmuxError, SessionName, SetOptionByNameRequest, SetOptionMode,
+    PaneTarget, Response, RmuxError, SetOptionByNameRequest, SetOptionMode, TerminalGeometry,
     UnbindKeyRequest, WindowTarget,
 };
 
-use super::super::attach_support::attach_target_for_session;
+use super::super::attach_support::AttachedSwitchCommitRequest;
+use super::super::client_support::SwitchTargetSelection;
 use super::super::control_support::ManagedClient;
 use super::super::prompt_support::substitute_prompt_template;
 use super::super::scripting_support::QueueExecutionContext;
 use super::super::RequestHandler;
 use super::mode_tree_model::{
-    ModeTreeAction, ModeTreeBuild, ModeTreeClientState, ModeTreeKind, ModeTreePromptCallback,
+    ChooseTreeTarget, ModeTreeAction, ModeTreeActionIdentity, ModeTreeBuild, ModeTreeClientState,
+    ModeTreeKind, ModeTreePromptCallback,
 };
-use super::mode_tree_selection::{current_selected_item, selected_items, tree_kill_sort_key};
+use super::mode_tree_selection::selected_items;
 use super::{
     CHOOSE_BUFFER_DEFAULT_TEMPLATE, CHOOSE_CLIENT_DEFAULT_TEMPLATE, CHOOSE_TREE_DEFAULT_TEMPLATE,
 };
-use crate::pane_io::AttachControl;
 use crate::pane_terminals::session_not_found;
 
 impl RequestHandler {
@@ -25,18 +25,35 @@ impl RequestHandler {
         &self,
         attach_pid: u32,
     ) -> Result<(), RmuxError> {
-        let mut mode = {
+        let (mut mode, action_identity) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            active
-                .mode_tree
-                .clone()
-                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
+            (
+                active
+                    .mode_tree
+                    .clone()
+                    .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?,
+                ModeTreeActionIdentity::new(attach_pid, active.id, active.mode_tree_state_id),
+            )
         };
+        let had_tagged_items_before_rebuild = !mode.tagged.is_empty();
+        let selected_id_before_rebuild = mode.selected_id.clone();
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
+        if had_tagged_items_before_rebuild && mode.tagged.is_empty() {
+            return self.refresh_mode_tree_overlay_if_active(attach_pid).await;
+        }
+        if mode.tagged.is_empty() {
+            match selected_id_before_rebuild {
+                Some(selected_id) if build.items.contains_key(&selected_id) => {
+                    mode.selected_id = Some(selected_id);
+                }
+                Some(_) => return Ok(()),
+                None => {}
+            }
+        }
         let targets = selected_items(&mode, &build);
         let Some(first) = targets.first() else {
             return Ok(());
@@ -45,22 +62,32 @@ impl RequestHandler {
         match &first.action {
             ModeTreeAction::TreeTarget {
                 session_name,
+                session_id,
                 window_index,
+                window_id,
+                window_occurrence_id,
                 pane_index,
-                ..
+                pane_id,
             } if mode.template.as_deref() == Some(CHOOSE_TREE_DEFAULT_TEMPLATE) => {
                 self.apply_choose_tree_default_target(
-                    attach_pid,
-                    session_name.clone(),
-                    *window_index,
-                    *pane_index,
+                    action_identity,
+                    ChooseTreeTarget {
+                        session_name: session_name.clone(),
+                        session_id: *session_id,
+                        window_index: *window_index,
+                        window_id: *window_id,
+                        window_occurrence_id: *window_occurrence_id,
+                        pane_index: *pane_index,
+                        pane_id: *pane_id,
+                    },
                 )
                 .await?;
             }
             ModeTreeAction::Buffer { .. }
                 if mode.template.as_deref() == Some(CHOOSE_BUFFER_DEFAULT_TEMPLATE) =>
             {
-                self.perform_buffer_paste(attach_pid, false).await?;
+                self.perform_buffer_paste_for_identity(action_identity, false)
+                    .await?;
             }
             ModeTreeAction::Client { .. }
                 if mode.template.as_deref() == Some(CHOOSE_CLIENT_DEFAULT_TEMPLATE) =>
@@ -83,66 +110,171 @@ impl RequestHandler {
         Ok(())
     }
 
-    async fn apply_choose_tree_default_target(
+    pub(super) async fn apply_choose_tree_default_target(
         &self,
-        attach_pid: u32,
-        session_name: SessionName,
-        window_index: Option<u32>,
-        pane_index: Option<u32>,
+        action_identity: ModeTreeActionIdentity,
+        target: ChooseTreeTarget,
     ) -> Result<(), RmuxError> {
-        {
-            let mut state = self.state.lock().await;
-            let session = state
-                .sessions
-                .session_mut(&session_name)
-                .ok_or_else(|| session_not_found(&session_name))?;
-            if let Some(window_index) = window_index {
-                session.select_window(window_index)?;
-                if let Some(pane_index) = pane_index {
-                    session.select_pane_in_window(window_index, pane_index)?;
+        let attach_pid = action_identity.attach_pid();
+        let expected_attach_id = action_identity.attach_id();
+        let ChooseTreeTarget {
+            session_name,
+            session_id,
+            window_index,
+            window_id,
+            window_occurrence_id,
+            pane_index,
+            pane_id,
+        } = target;
+        let target_selection = {
+            let state = self.state.lock().await;
+            let active_attach = self.active_attach.lock().await;
+            if active_attach.by_pid.get(&attach_pid).is_none_or(|active| {
+                active.id != expected_attach_id
+                    || active.mode_tree_state_id != action_identity.state_id()
+                    || active.mode_tree.is_none()
+                    || active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            }) {
+                return Err(crate::handler_support::attached_client_required(
+                    "switch-client",
+                ));
+            }
+            if let (Some(window_index), Some(window_occurrence_id)) =
+                (window_index, window_occurrence_id)
+            {
+                if state.window_link_occurrence_id(&session_name, window_index)
+                    != Some(window_occurrence_id)
+                {
+                    return Err(RmuxError::invalid_target(
+                        window_index.to_string(),
+                        "window occurrence changed before mode-tree selection",
+                    ));
                 }
             }
-        }
-
-        let current_session = self.attached_session_name(attach_pid).await?;
-        let refresh_sessions = self.dismiss_mode_tree(attach_pid).await?;
-        if current_session == session_name {
-            for session_name in refresh_sessions {
-                self.refresh_attached_session(&session_name).await;
+            let session = state
+                .sessions
+                .session(&session_name)
+                .ok_or_else(|| session_not_found(&session_name))?;
+            if session.id() != session_id {
+                return Err(RmuxError::SessionNotFound(session_name.to_string()));
             }
-            return Ok(());
-        }
+            match (
+                window_index,
+                window_id,
+                window_occurrence_id,
+                pane_index,
+                pane_id,
+            ) {
+                (None, None, None, None, None) => None,
+                (Some(window_index), Some(window_id), Some(_), None, None) => {
+                    let window = session.window_at(window_index).ok_or_else(|| {
+                        RmuxError::invalid_target(
+                            window_index.to_string(),
+                            "window identity changed before mode-tree selection",
+                        )
+                    })?;
+                    if window.id() != window_id {
+                        return Err(RmuxError::invalid_target(
+                            window_index.to_string(),
+                            "window identity changed before mode-tree selection",
+                        ));
+                    }
+                    Some(SwitchTargetSelection::Window {
+                        target: WindowTarget::with_window(session_name.clone(), window_index),
+                        window_id,
+                    })
+                }
+                (Some(window_index), Some(window_id), Some(_), Some(_), Some(pane_id)) => {
+                    let window = session.window_at(window_index).ok_or_else(|| {
+                        RmuxError::invalid_target(
+                            window_index.to_string(),
+                            "window identity changed before mode-tree selection",
+                        )
+                    })?;
+                    if window.id() != window_id {
+                        return Err(RmuxError::invalid_target(
+                            window_index.to_string(),
+                            "window identity changed before mode-tree selection",
+                        ));
+                    }
+                    let pane_index = window
+                        .panes()
+                        .iter()
+                        .find(|pane| pane.id() == pane_id)
+                        .map(rmux_core::Pane::index)
+                        .ok_or_else(|| {
+                            RmuxError::invalid_target(
+                                pane_id.to_string(),
+                                "pane identity changed before mode-tree selection",
+                            )
+                        })?;
+                    Some(SwitchTargetSelection::Pane {
+                        target: PaneTarget::with_window(
+                            session_name.clone(),
+                            window_index,
+                            pane_index,
+                        ),
+                        window_id,
+                        pane_id,
+                        zoom: true,
+                    })
+                }
+                _ => {
+                    return Err(RmuxError::Server(
+                        "mode-tree target lost its stable identity".to_owned(),
+                    ));
+                }
+            }
+        };
+        let refresh_sessions = self
+            .dismiss_mode_tree_for_action_identity(action_identity)
+            .await?;
 
         let attached_count = self
-            .attached_count_after_switch(&session_name, ManagedClient::Attach(attach_pid))
-            .await;
-        let Some(terminal_context) = self.terminal_context_for_attached_client(attach_pid).await
-        else {
-            return Err(RmuxError::Server("attached client disappeared".to_owned()));
-        };
-        let target = {
-            let state = self.state.lock().await;
-            attach_target_for_session(
-                &state,
+            .attached_count_after_switch(
                 &session_name,
-                attached_count,
-                &terminal_context,
-                &self.socket_path(),
-            )?
-        };
-        let _ = self
-            .send_attach_control(
-                attach_pid,
-                AttachControl::switch(target),
-                "switch-client",
-                Some(session_name.clone()),
+                ManagedClient::Attach {
+                    pid: attach_pid,
+                    attach_id: expected_attach_id,
+                },
             )
-            .await?;
-        self.emit(LifecycleEvent::ClientSessionChanged {
-            session_name: session_name.clone(),
-            client_name: Some(attach_pid.to_string()),
-        })
-        .await;
+            .await;
+        let Some((terminal_context, client_size, client_pixels, render_stream, client_flags)) =
+            self.terminal_context_and_size_for_attached_client_identity(
+                attach_pid,
+                expected_attach_id,
+            )
+            .await
+        else {
+            return Err(crate::handler_support::attached_client_required(
+                "switch-client",
+            ));
+        };
+        // The default choose-tree action is `switch-client -Zt`. Commit it
+        // through the same atomic path so target selection, client-size
+        // reconciliation, PTY rollback, and attach identity move together.
+        self.commit_attached_session_switch(
+            attach_pid,
+            expected_attach_id,
+            AttachedSwitchCommitRequest {
+                expected_current_session_id: None,
+                session_name: session_name.clone(),
+                session_id,
+                target_selection,
+                terminal_context,
+                client_geometry: TerminalGeometry {
+                    size: client_size,
+                    pixels: client_pixels,
+                },
+                client_flags,
+                render_stream,
+                attached_count,
+                client_environment: None,
+            },
+        )
+        .await?;
+        self.emit_client_session_changed(attach_pid, session_name.clone(), session_id)
+            .await;
         for refresh in refresh_sessions {
             self.refresh_attached_session(&refresh).await;
         }
@@ -188,239 +320,6 @@ impl RequestHandler {
             self.refresh_attached_session(&session_name).await;
         }
         Ok(())
-    }
-
-    pub(super) async fn perform_buffer_paste(
-        &self,
-        attach_pid: u32,
-        delete_after: bool,
-    ) -> Result<(), RmuxError> {
-        let mut mode = {
-            let active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get(&attach_pid)
-                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            active
-                .mode_tree
-                .clone()
-                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
-        };
-        let build = self.build_mode_tree(&mut mode, attach_pid).await?;
-        let target = self.mode_tree_active_pane(&mode.session_name).await?;
-        for item in selected_items(&mode, &build) {
-            let ModeTreeAction::Buffer { name } = &item.action else {
-                continue;
-            };
-            let response = self
-                .handle_paste_buffer(PasteBufferRequest {
-                    name: Some(name.clone()),
-                    target: target.clone(),
-                    delete_after,
-                    separator: None,
-                    linefeed: false,
-                    raw: false,
-                    bracketed: false,
-                })
-                .await;
-            if let Response::Error(error) = response {
-                return Err(error.error);
-            }
-        }
-        self.dismiss_mode_tree_with_refresh(attach_pid).await
-    }
-
-    pub(super) async fn perform_tree_kill_current(&self, attach_pid: u32) -> Result<(), RmuxError> {
-        let mut mode = {
-            let active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get(&attach_pid)
-                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            active
-                .mode_tree
-                .clone()
-                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
-        };
-        let build = self.build_mode_tree(&mut mode, attach_pid).await?;
-        let Some(item) = current_selected_item(&mode, &build) else {
-            return Ok(());
-        };
-        self.perform_tree_kill_actions(attach_pid, vec![item.action.clone()])
-            .await
-    }
-
-    pub(super) async fn perform_tree_kill_tagged(&self, attach_pid: u32) -> Result<(), RmuxError> {
-        let mut mode = {
-            let active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get(&attach_pid)
-                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            active
-                .mode_tree
-                .clone()
-                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
-        };
-        let build = self.build_mode_tree(&mut mode, attach_pid).await?;
-        let actions = build
-            .items
-            .values()
-            .filter(|item| mode.tagged.contains(&item.id))
-            .map(|item| item.action.clone())
-            .collect::<Vec<_>>();
-        self.perform_tree_kill_actions(attach_pid, actions).await
-    }
-
-    async fn perform_tree_kill_actions(
-        &self,
-        attach_pid: u32,
-        mut actions: Vec<ModeTreeAction>,
-    ) -> Result<(), RmuxError> {
-        actions.sort_by_key(tree_kill_sort_key);
-        for action in actions {
-            let response = match action {
-                ModeTreeAction::TreeTarget {
-                    session_name,
-                    window_index: None,
-                    ..
-                } => {
-                    self.handle_kill_session(KillSessionRequest {
-                        target: session_name,
-                        kill_all_except_target: false,
-                        clear_alerts: false,
-                        kill_group: false,
-                    })
-                    .await
-                }
-                ModeTreeAction::TreeTarget {
-                    session_name,
-                    window_index: Some(window_index),
-                    pane_index: None,
-                    ..
-                } => {
-                    self.handle_kill_window(KillWindowRequest {
-                        target: WindowTarget::with_window(session_name, window_index),
-                        kill_all_others: false,
-                    })
-                    .await
-                }
-                ModeTreeAction::TreeTarget {
-                    session_name,
-                    window_index: Some(window_index),
-                    pane_index: Some(pane_index),
-                    ..
-                } => {
-                    self.handle_kill_pane(KillPaneRequest {
-                        target: PaneTarget::with_window(session_name, window_index, pane_index),
-                        kill_all_except: false,
-                    })
-                    .await
-                }
-                ModeTreeAction::None
-                | ModeTreeAction::Buffer { .. }
-                | ModeTreeAction::Client { .. }
-                | ModeTreeAction::CustomizeOption { .. }
-                | ModeTreeAction::CustomizeKey { .. } => continue,
-            };
-            if let Response::Error(error) = response {
-                return Err(error.error);
-            }
-        }
-        if self.mode_tree_active(attach_pid).await {
-            self.refresh_mode_tree_overlay_if_active(attach_pid).await?;
-        }
-        Ok(())
-    }
-
-    pub(super) async fn perform_buffer_delete(&self, attach_pid: u32) -> Result<(), RmuxError> {
-        let mut mode = {
-            let active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get(&attach_pid)
-                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            active
-                .mode_tree
-                .clone()
-                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
-        };
-        let build = self.build_mode_tree(&mut mode, attach_pid).await?;
-        for item in selected_items(&mode, &build) {
-            let ModeTreeAction::Buffer { name } = &item.action else {
-                continue;
-            };
-            let response = self
-                .handle_delete_buffer(DeleteBufferRequest {
-                    name: Some(name.clone()),
-                })
-                .await;
-            if let Response::Error(error) = response {
-                return Err(error.error);
-            }
-        }
-        self.refresh_mode_tree_overlay_if_active(attach_pid).await
-    }
-
-    pub(super) async fn perform_client_detach(&self, attach_pid: u32) -> Result<(), RmuxError> {
-        let mut mode = {
-            let active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get(&attach_pid)
-                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            active
-                .mode_tree
-                .clone()
-                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
-        };
-        let build = self.build_mode_tree(&mut mode, attach_pid).await?;
-        let items = selected_items(&mode, &build);
-
-        // Detach self last so other detaches complete while we still have state.
-        let mut self_detach = false;
-        for item in &items {
-            let ModeTreeAction::Client { pid, control } = item.action else {
-                continue;
-            };
-            if pid == attach_pid && !control {
-                self_detach = true;
-                continue;
-            }
-            if control {
-                let session = self.exit_control_client(pid, None).await?;
-                if let Some(session_name) = session {
-                    self.emit(LifecycleEvent::ClientDetached {
-                        session_name,
-                        client_name: Some(pid.to_string()),
-                    })
-                    .await;
-                }
-            } else if let Ok(session_name) = self
-                .send_attach_control(pid, AttachControl::Detach, "detach-client", None)
-                .await
-            {
-                self.emit(LifecycleEvent::ClientDetached {
-                    session_name,
-                    client_name: Some(pid.to_string()),
-                })
-                .await;
-            }
-        }
-        if self_detach {
-            if let Ok(session_name) = self
-                .send_attach_control(attach_pid, AttachControl::Detach, "detach-client", None)
-                .await
-            {
-                self.emit(LifecycleEvent::ClientDetached {
-                    session_name,
-                    client_name: Some(attach_pid.to_string()),
-                })
-                .await;
-            }
-            return Ok(());
-        }
-        self.refresh_mode_tree_overlay_if_active(attach_pid).await
     }
 
     pub(super) async fn start_customize_set_prompt(

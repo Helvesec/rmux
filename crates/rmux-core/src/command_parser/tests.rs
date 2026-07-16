@@ -160,6 +160,116 @@ fn preserves_standard_escaped_backslashes_in_windows_drive_paths() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn preserves_literal_and_escaped_windows_unc_paths() {
+    for input in [
+        r#"set-environment -g AUDIT_PATH "\\server\share""#,
+        r#"set-environment -g AUDIT_PATH "\\\\server\\share""#,
+    ] {
+        let commands = CommandParser::new().parse(input).unwrap();
+        assert_eq!(
+            commands.commands()[0].arguments()[2].as_string(),
+            Some(r"\\server\share"),
+            "input: {input}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_literal_and_escaped_windows_device_paths() {
+    for input in [
+        r#"set-environment -g AUDIT_PATH "\\?\C:\Users\RMUXUser""#,
+        r#"set-environment -g AUDIT_PATH "\\\\?\\C:\\Users\\RMUXUser""#,
+    ] {
+        let commands = CommandParser::new().parse(input).unwrap();
+        assert_eq!(
+            commands.commands()[0].arguments()[2].as_string(),
+            Some(r"\\?\C:\Users\RMUXUser"),
+            "input: {input}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_non_path_leading_escaped_text_semantics() {
+    let commands = CommandParser::new()
+        .parse(r#"display-message "\\n""#)
+        .unwrap();
+
+    assert_eq!(
+        commands.commands()[0].arguments()[0].as_string(),
+        Some(r"\n")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_relative_and_embedded_windows_paths() {
+    for (input, expected) in [
+        (
+            r#"display-message ".\scripts\tool.ps1""#,
+            r".\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "..\scripts\tool.ps1""#,
+            r"..\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=.\scripts\tool.ps1""#,
+            r"--script=.\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=C:\scripts\tool.ps1""#,
+            r"--script=C:\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=C:\folder=one\tool.ps1""#,
+            r"--script=C:\folder=one\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=\\server\share\tool.ps1""#,
+            r"--script=\\server\share\tool.ps1",
+        ),
+    ] {
+        let commands = CommandParser::new().parse(input).unwrap();
+        assert_eq!(
+            commands.commands()[0].arguments()[0].as_string(),
+            Some(expected),
+            "input: {input}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_escape_semantics_when_a_later_separator_exists() {
+    let commands = CommandParser::new()
+        .parse(
+            r#"display-message "\n/later" "\t/later" "\u263A/later" "\101/later" "\a\b\e\f\s\v\r\n\t\101\u263A/later""#,
+        )
+        .unwrap();
+    let args = commands.commands()[0].arguments();
+
+    assert_eq!(args[0].as_string(), Some("\n/later"));
+    assert_eq!(args[1].as_string(), Some("\t/later"));
+    assert_eq!(args[2].as_string(), Some("☺/later"));
+    assert_eq!(args[3].as_string(), Some("A/later"));
+    assert_eq!(
+        args[4].as_string(),
+        Some("\x07\x08\x1b\x0c \x0b\r\n\tA☺/later")
+    );
+
+    for input in [
+        r#"display-message "\400/later""#,
+        r#"display-message "\u12xz/later""#,
+    ] {
+        assert!(CommandParser::new().parse(input).is_err(), "input: {input}");
+    }
+}
+
 #[test]
 fn expands_variables_and_tilde_at_tokenization_boundary() {
     let commands = CommandParser::new()
@@ -175,6 +285,34 @@ fn expands_variables_and_tilde_at_tokenization_boundary() {
         .collect::<Vec<_>>();
 
     assert_eq!(args, ["alpha", "", "/tmp/home/x", "/home/bob/y"]);
+}
+
+#[test]
+fn current_user_tilde_prefers_home_and_uses_an_explicit_fallback() {
+    let primary = CommandParser::new()
+        .with_environment_value("HOME", "/primary/home")
+        .with_home_dir("/fallback/home")
+        .parse("display-message ~/config")
+        .expect("HOME-backed tilde parses");
+    assert_eq!(
+        primary.commands()[0].arguments()[0].as_string(),
+        Some("/primary/home/config")
+    );
+
+    let empty_home = CommandParser::new()
+        .with_environment_value("HOME", "")
+        .with_home_dir("/fallback/home")
+        .parse("display-message ~/config")
+        .expect("empty HOME uses the explicit fallback");
+    assert_eq!(
+        empty_home.commands()[0].arguments()[0].as_string(),
+        Some("/fallback/home/config")
+    );
+
+    let missing_home = CommandParser::new()
+        .parse("display-message ~/config")
+        .expect_err("tilde without HOME or a fallback must remain an error");
+    assert_eq!(missing_home.to_string(), "unknown user: ~");
 }
 
 #[test]
@@ -499,6 +637,48 @@ fn classifies_assignments_and_hidden_assignments() {
 }
 
 #[test]
+fn hoists_nested_parse_time_assignments_in_lexical_order_and_reparses_losslessly() {
+    let commands = CommandParser::new()
+        .parse(
+            "OUTER=first ; if-shell -F 0 { FALSE_ONLY=no ; %hidden SECRET='two words' } { TRUE_ONLY=yes } ; set-hook -g after-new-window { HOOK=hooked ; if-shell -F 1 { DEEP=deep } } ; OUTER=last",
+        )
+        .expect("nested assignments parse");
+
+    assert_eq!(
+        commands
+            .assignments()
+            .iter()
+            .map(|assignment| (assignment.name(), assignment.value(), assignment.hidden()))
+            .collect::<Vec<_>>(),
+        [
+            ("OUTER", "first", false),
+            ("FALSE_ONLY", "no", false),
+            ("SECRET", "two words", true),
+            ("TRUE_ONLY", "yes", false),
+            ("HOOK", "hooked", false),
+            ("DEEP", "deep", false),
+            ("OUTER", "last", false),
+        ]
+    );
+    for command in commands.commands() {
+        for argument in command.arguments() {
+            if let CommandArgument::Commands(nested) = argument {
+                assert!(
+                    nested.assignments().is_empty(),
+                    "nested assignments must be owned by the parse root"
+                );
+            }
+        }
+    }
+
+    let rendered = commands.to_tmux_reparse_string();
+    let reparsed = CommandParser::new()
+        .parse(&rendered)
+        .expect("rendered assignments reparse");
+    assert_eq!(reparsed, commands, "lossless reparse string: {rendered}");
+}
+
+#[test]
 fn rejects_hidden_before_non_assignment() {
     assert_eq!(
         CommandParser::new()
@@ -680,6 +860,23 @@ fn resolved_command_alias_option_entries_replace_default_aliases() {
 }
 
 #[test]
+fn duplicate_command_alias_names_use_the_first_array_entry() {
+    let commands = CommandParser::new()
+        .with_command_aliases([
+            "say=display-message -p first",
+            "say=display-message -p second",
+        ])
+        .parse_arguments(["say"])
+        .expect("duplicate runtime alias should parse");
+
+    assert_eq!(commands.commands()[0].name(), "display-message");
+    assert_eq!(
+        commands.commands()[0].arguments()[1].as_string(),
+        Some("first")
+    );
+}
+
+#[test]
 fn command_alias_reparse_sees_parse_time_assignments() {
     let commands = CommandParser::new()
         .with_command_alias("say=display-message \"$FOO\"")
@@ -691,6 +888,51 @@ fn command_alias_reparse_sees_parse_time_assignments() {
     assert_eq!(
         commands.commands()[0].arguments()[0].as_string(),
         Some("bar")
+    );
+}
+
+#[test]
+fn runtime_argv_assignment_feeds_alias_without_changing_direct_argv_parsing() {
+    let parser = CommandParser::new()
+        .with_command_alias("say=display-message \"$FOO\"")
+        .unwrap();
+
+    assert!(parser.parse_arguments(["FOO=bar", "say"]).is_err());
+
+    let commands = parser
+        .parse_arguments_with_assignments(["FOO=bar", "say"])
+        .expect("runtime argv assignment should feed alias expansion");
+    assert_eq!(commands.assignments()[0].name(), "FOO");
+    assert_eq!(commands.assignments()[0].value(), "bar");
+    assert_eq!(commands.commands()[0].name(), "display-message");
+    assert_eq!(
+        commands.commands()[0].arguments()[0].as_string(),
+        Some("bar")
+    );
+
+    let terminated_assignment = parser
+        .parse_arguments_with_assignments(["FOO=group;", "say"])
+        .expect("assignment-only group should feed the following alias");
+    assert_eq!(
+        terminated_assignment.commands()[0].arguments()[0].as_string(),
+        Some("group")
+    );
+
+    let literal_semicolon = parser
+        .parse_arguments_with_assignments(["FOO=value\\;", "say"])
+        .expect("escaped semicolon should remain in the assignment value");
+    assert_eq!(literal_semicolon.assignments()[0].value(), "value;");
+    assert_eq!(
+        literal_semicolon.commands()[0].arguments()[0].as_string(),
+        Some("value;")
+    );
+
+    assert_eq!(
+        parser
+            .parse_arguments_with_assignments(["1FOO=bar", "say"])
+            .unwrap_err()
+            .to_string(),
+        "unknown command: 1FOO=bar"
     );
 }
 

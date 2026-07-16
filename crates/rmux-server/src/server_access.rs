@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 
 use rmux_os::identity::{IdentityResolver, UserIdentity};
 use rmux_proto::request::{AttachSessionExt2Request, AttachSessionExt3Request};
+#[cfg(test)]
+use rmux_proto::INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH;
 use rmux_proto::{
     AttachSessionExtRequest, CommandOutput, Request, RmuxError, ServerAccessRequest, SessionName,
-    Target,
+    SourceFileRequest, Target, INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +296,7 @@ fn read_only_request_allowed(request: &Request) -> bool {
         }
         Request::DisplayMessage(request) => display_message_request_is_read_only(request.print),
         Request::DisplayMessageExt(request) => display_message_request_is_read_only(request.print),
+        Request::SourceFile(request) => internal_runtime_command_expansion_is_read_only(request),
         _ => matches!(
             request,
             Request::HasSession(_)
@@ -335,6 +338,16 @@ fn read_only_request_allowed(request: &Request) -> bool {
     }
 }
 
+fn internal_runtime_command_expansion_is_read_only(request: &SourceFileRequest) -> bool {
+    request.paths.as_slice() == [INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH]
+        && !request.quiet
+        && request.parse_only
+        && request.verbose
+        && !request.expand_paths
+        && request.target.is_none()
+        && request.stdin.is_some()
+}
+
 fn capture_pane_request_is_read_only(print: bool, buffer_name: Option<&str>) -> bool {
     print && buffer_name.is_none()
 }
@@ -346,8 +359,23 @@ fn display_message_request_is_read_only(print: bool) -> bool {
 pub(crate) fn validate_server_access_request(
     request: &ServerAccessRequest,
 ) -> Result<(), RmuxError> {
+    if request.target.is_some() {
+        return Err(RmuxError::Server(
+            "command server-access: unknown flag -t".to_owned(),
+        ));
+    }
     if request.list {
         return Ok(());
+    }
+    if request.add && request.deny {
+        return Err(RmuxError::Server(
+            "-a and -d cannot be used together".to_owned(),
+        ));
+    }
+    if request.read_only && request.write {
+        return Err(RmuxError::Server(
+            "-r and -w cannot be used together".to_owned(),
+        ));
     }
     #[cfg(windows)]
     {
@@ -461,6 +489,60 @@ mod tests {
                 .expect("SDK wait cancel is read-only cleanup"),
             cancel
         );
+    }
+
+    #[test]
+    fn read_only_access_allows_only_the_non_mutating_internal_source_shape() {
+        let expansion = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH.to_owned()],
+            quiet: false,
+            parse_only: true,
+            verbose: true,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("[\"list-sessions\"]".to_owned()),
+        }));
+        assert_eq!(
+            apply_access_policy(expansion.clone(), false).expect("runtime expansion is read-only"),
+            expansion
+        );
+
+        let assignments = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![rmux_proto::INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("FOO=bar".to_owned()),
+        }));
+        assert!(apply_access_policy(assignments, false).is_err());
+
+        let canonical_execution = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("list-sessions".to_owned()),
+        }));
+        assert!(apply_access_policy(canonical_execution, false).is_err());
+
+        let public_source = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec!["-".to_owned()],
+            quiet: false,
+            parse_only: true,
+            verbose: true,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("list-sessions".to_owned()),
+        }));
+        assert!(apply_access_policy(public_source, false).is_err());
     }
 
     #[test]

@@ -67,7 +67,7 @@ pub(super) fn sort_clients(
         let ordering = match sort_order.unwrap_or(SortOrder::Name) {
             SortOrder::Name => left.label.cmp(&right.label),
             SortOrder::Size => (left.width, left.height).cmp(&(right.width, right.height)),
-            SortOrder::Creation | SortOrder::Index => left.order.cmp(&right.order),
+            SortOrder::Creation | SortOrder::Index => left.attach_id.cmp(&right.attach_id),
             SortOrder::Activity => right.activity.cmp(&left.activity),
         };
         stable_order(ordering, reversed, &left.label, &right.label)

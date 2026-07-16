@@ -19,16 +19,10 @@ async fn source_file_lookup_parse_errors_skip_bad_file_and_continue_other_paths(
         ))
         .await;
 
-    let Response::Error(error) = response else {
-        panic!("source-file should fail on parse errors, got {response:?}");
-    };
-    assert!(
-        matches!(
-            error.error,
-            rmux_proto::RmuxError::Server(ref message)
-                if message == &format!("{}:2: unknown command: not-a-command", bad.display())
-        ),
-        "unexpected source-file parse error: {error:?}"
+    assert_eq!(
+        source_file_stdout_failure(response),
+        format!("{}:2: unknown command: not-a-command\n", bad.display()),
+        "unexpected source-file parse diagnostic"
     );
     for name in ["before-error", "after-error"] {
         assert!(
@@ -133,16 +127,10 @@ async fn nested_source_file_lookup_parse_error_skips_child_but_outer_continues()
         ))
         .await;
 
-    let Response::Error(error) = response else {
-        panic!("nested source-file should fail on parse errors, got {response:?}");
-    };
+    let diagnostic = source_file_stdout_failure(response);
     assert!(
-        matches!(
-            error.error,
-            rmux_proto::RmuxError::Server(ref message)
-                if message.contains("inner.conf:1: unknown command: bogus-command")
-        ),
-        "unexpected nested source-file parse error: {error:?}"
+        diagnostic.contains("inner.conf:1: unknown command: bogus-command"),
+        "unexpected nested source-file parse diagnostic: {diagnostic:?}"
     );
     assert!(
         matches!(
@@ -188,18 +176,12 @@ async fn nested_source_file_skips_child_after_command_syntax_error() {
         ))
         .await;
 
-    let Response::Error(error) = response else {
-        panic!("nested source-file should fail on command syntax errors, got {response:?}");
-    };
+    let diagnostic = source_file_stdout_failure(response);
     assert!(
-        matches!(
-            error.error,
-            rmux_proto::RmuxError::Server(ref message)
-                if message.contains("inner.conf:2:")
-                    && message.contains("new-window")
-                    && message.contains("unknown flag -Q")
-        ),
-        "unexpected nested source-file syntax error: {error:?}"
+        diagnostic.contains("inner.conf:2:")
+            && diagnostic.contains("new-window")
+            && diagnostic.contains("unknown flag -Q"),
+        "unexpected nested source-file syntax diagnostic: {diagnostic:?}"
     );
     for name in ["child-before", "child-after"] {
         assert!(matches!(
@@ -693,6 +675,34 @@ show-options -gqv extended-keys\n"
             .unwrap_or_else(|| panic!("queued show-options output, got {response:?}"))
             .stdout(),
         b"on\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_preserves_option_like_set_option_values_after_the_option_name() {
+    let handler = RequestHandler::new();
+    let root = temp_root("set-option-option-like-value");
+    fs::create_dir_all(&root).expect("create temp root");
+
+    let response = handler
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec!["-".to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: Some(root),
+            stdin: Some("set-option -g @compact -tfoo\nshow-options -gqv @compact\n".to_owned()),
+        })))
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .unwrap_or_else(|| panic!("queued show-options output, got {response:?}"))
+            .stdout(),
+        b"-tfoo\n"
     );
 }
 

@@ -1,5 +1,5 @@
 use super::{LexToken, Lexer};
-use crate::command_parser::CommandParseError;
+use crate::command_parser::{is_parse_time_assignment, CommandParseError};
 
 impl<'a> Lexer<'a> {
     pub(super) fn read_token(&mut self, ch: char) -> Result<String, CommandParseError> {
@@ -45,6 +45,14 @@ impl<'a> Lexer<'a> {
             }
 
             if ch == '\\' && state != QuoteState::SingleQuotes {
+                #[cfg(windows)]
+                if can_start_windows_path_prefix(&buffer)
+                    && self.read_windows_path_prefix(&mut buffer)
+                {
+                    last = state;
+                    current = self.get_char();
+                    continue;
+                }
                 self.read_escape(&mut buffer)?;
                 last = state;
                 current = self.get_char();
@@ -110,6 +118,72 @@ impl<'a> Lexer<'a> {
             self.unget_char(ch);
         }
         Ok(buffer)
+    }
+
+    #[cfg(windows)]
+    fn read_windows_path_prefix(&mut self, buffer: &mut String) -> bool {
+        let Some(second) = self.get_char() else {
+            return false;
+        };
+        let mut consumed = vec![second];
+        if second != '\\' {
+            self.restore_consumed_chars(&consumed);
+            return false;
+        }
+
+        let Some(third) = self.get_char() else {
+            self.restore_consumed_chars(&consumed);
+            return false;
+        };
+        consumed.push(third);
+
+        // Accept the standard escaped spelling (`\\\\server\\share`) by
+        // consuming the four leading source backslashes as one UNC prefix.
+        if third == '\\' {
+            let Some(fourth) = self.get_char() else {
+                self.restore_consumed_chars(&consumed);
+                return false;
+            };
+            consumed.push(fourth);
+            if fourth == '\\' {
+                buffer.push_str(r"\\");
+                return true;
+            }
+            self.restore_consumed_chars(&consumed);
+            return false;
+        }
+
+        // Native Windows configs commonly use the literal spelling
+        // (`\\server\share` or `\\?\C:\...`). Only classify it as a path
+        // when another separator exists before the token boundary, preserving
+        // ordinary leading escaped text such as `\\n`.
+        let mut found_separator = false;
+        while let Some(next) = self.get_char() {
+            consumed.push(next);
+            if matches!(next, '\\' | '/') {
+                found_separator = true;
+                break;
+            }
+            if matches!(next, '"' | '\'' | ' ' | '\t' | '\r' | '\n' | ';' | '}') {
+                break;
+            }
+        }
+
+        if found_separator {
+            self.restore_consumed_chars(&consumed[1..]);
+            buffer.push_str(r"\\");
+            true
+        } else {
+            self.restore_consumed_chars(&consumed);
+            false
+        }
+    }
+
+    #[cfg(windows)]
+    fn restore_consumed_chars(&mut self, consumed: &[char]) {
+        for ch in consumed.iter().rev() {
+            self.unget_char(*ch);
+        }
     }
 
     fn get_char_after_quoted_newline(&mut self) -> Option<char> {
@@ -326,16 +400,8 @@ enum QuoteState {
 }
 
 pub(super) fn classify_word(word: String) -> LexToken {
-    if word.contains('=') && word.chars().next().is_some_and(|ch| is_var_char(ch, true)) {
-        let mut chars = word.chars().skip(1);
-        for ch in &mut chars {
-            if ch == '=' {
-                return LexToken::Equals(word);
-            }
-            if !is_var_char(ch, false) {
-                break;
-            }
-        }
+    if is_parse_time_assignment(&word) {
+        return LexToken::Equals(word);
     }
 
     LexToken::Token(word)
@@ -353,11 +419,21 @@ fn is_var_char(ch: char, first: bool) -> bool {
 
 #[cfg(windows)]
 fn is_windows_path_escape_context(buffer: &str) -> bool {
-    if has_windows_drive_prefix(buffer) {
+    let value = windows_path_value(buffer);
+
+    if value.starts_with(r"\\") {
         return true;
     }
 
-    if buffer
+    if has_windows_drive_prefix(value) {
+        return true;
+    }
+
+    if matches!(value, "." | "..") || value.starts_with(".\\") || value.starts_with("..\\") {
+        return true;
+    }
+
+    if value
         .chars()
         .last()
         .is_some_and(|ch| matches!(ch, '\\' | '/'))
@@ -365,11 +441,23 @@ fn is_windows_path_escape_context(buffer: &str) -> bool {
         return true;
     }
 
-    let mut chars = buffer.chars().rev();
+    let mut chars = value.chars().rev();
     matches!(
         (chars.next(), chars.next(), chars.next()),
         (Some(':'), Some(drive), None) if drive.is_ascii_alphabetic()
     )
+}
+
+#[cfg(windows)]
+fn can_start_windows_path_prefix(buffer: &str) -> bool {
+    windows_path_value(buffer).is_empty()
+}
+
+#[cfg(windows)]
+fn windows_path_value(buffer: &str) -> &str {
+    // Keep the path prefix independent from a single-token option name such as
+    // `--script=.\scripts\tool.ps1`.
+    buffer.split_once('=').map_or(buffer, |(_, value)| value)
 }
 
 #[cfg(windows)]

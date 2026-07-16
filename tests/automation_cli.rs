@@ -86,6 +86,109 @@ fn wait_snapshot_and_locator_commands_work_end_to_end() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn nonzero_pane_base_index_preserves_targeted_automation_and_percent_resize(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-pane-base-index")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-x", "80", "-y", "24"])?);
+    assert_success(&harness.run(&[
+        "set-window-option",
+        "-t",
+        "alpha:0",
+        "pane-base-index",
+        "1",
+    ])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "alpha:0.1"])?);
+
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.1",
+        "printf PANE_ONE_MARKER",
+        "Enter",
+    ])?);
+    assert_success(&harness.run(&[
+        "wait-pane",
+        "-t",
+        "alpha:0.1",
+        "--text",
+        "PANE_ONE_MARKER",
+        "--timeout",
+        "5s",
+    ])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.2",
+        "--wait-next-text",
+        "PANE_TWO_MARKER",
+        "--timeout",
+        "5s",
+        "--",
+        "printf PANE_TWO_MARKER",
+        "Enter",
+    ])?);
+
+    let pane_one = run_json(&harness, &["pane-snapshot", "-t", "alpha:0.1", "--json"])?;
+    let pane_two = run_json(&harness, &["pane-snapshot", "-t", "alpha:0.2", "--json"])?;
+    let pane_one_text = pane_one["text"].as_str().expect("pane one snapshot text");
+    let pane_two_text = pane_two["text"].as_str().expect("pane two snapshot text");
+    assert!(pane_one_text.contains("PANE_ONE_MARKER"), "{pane_one}");
+    assert!(!pane_one_text.contains("PANE_TWO_MARKER"), "{pane_one}");
+    assert!(pane_two_text.contains("PANE_TWO_MARKER"), "{pane_two}");
+    assert!(!pane_two_text.contains("PANE_ONE_MARKER"), "{pane_two}");
+
+    assert_success(&harness.run(&["resize-pane", "-t", "alpha:0.1", "-x", "60%"])?);
+    let panes = harness.run(&[
+        "list-panes",
+        "-t",
+        "alpha:0",
+        "-F",
+        "#{pane_index}:#{pane_width}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    assert!(stderr(&panes).is_empty());
+    let panes = stdout(&panes);
+    let pane_one_width = pane_width(&panes, 1)?;
+    let pane_two_width = pane_width(&panes, 2)?;
+    assert_eq!(pane_one_width, 48, "unexpected pane widths: {panes:?}");
+    assert_ne!(pane_two_width, 48, "resize targeted wrong pane: {panes:?}");
+
+    Ok(())
+}
+
+#[test]
+fn automation_slot_lookup_preserves_list_panes_hook_family() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-slot-lookup-hook")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "slot-lookup-hook", "seed"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-list-panes",
+        "set-buffer -b slot-lookup-hook list-panes",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-display-message",
+        "set-buffer -b slot-lookup-hook display-message",
+    ])?);
+
+    let snapshot = run_json(&harness, &["pane-snapshot", "-t", "alpha:0.0", "--json"])?;
+    assert_eq!(snapshot["ok"], true);
+    let hook_family = harness.run(&["show-buffer", "-b", "slot-lookup-hook"])?;
+    assert_eq!(hook_family.status.code(), Some(0));
+    assert_eq!(stdout(&hook_family), "list-panes");
+    assert!(stderr(&hook_family).is_empty());
+
+    Ok(())
+}
+
+#[test]
 fn wait_next_text_times_out_without_history_match() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("automation-next-text-timeout")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -418,6 +521,360 @@ fn send_keys_wait_rejects_unobservable_target_client() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn send_keys_text_wait_follows_session_identity_across_rename() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-wait-text-rename")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut command = harness.base_command();
+    let mut wait_child = command
+        .args([
+            "send-keys",
+            "-t",
+            "alpha:0.0",
+            "--wait-text",
+            "WAIT_TEXT_FINISHED",
+            "--timeout",
+            "5s",
+            "--",
+            "printf WAIT_TEXT_%s STARTED; sleep 1; printf WAIT_TEXT_%s FINISHED",
+            "Enter",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    assert_success(&harness.run(&[
+        "wait-pane",
+        "-t",
+        "alpha:0.0",
+        "--text",
+        "WAIT_TEXT_STARTED",
+        "--timeout",
+        "3s",
+    ])?);
+    assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_child.try_wait()?.is_none(),
+        "text wait must remain armed after the target session is renamed"
+    );
+
+    let output = wait_child_with_timeout(wait_child, Duration::from_secs(4))?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "text wait failed after rename\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn send_keys_quiet_wait_follows_session_identity_across_rename() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-wait-quiet-rename")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut command = harness.base_command();
+    let mut wait_child = command
+        .args([
+            "send-keys",
+            "-t",
+            "alpha:0.0",
+            "--wait",
+            "quiet",
+            "--stable-for",
+            "2s",
+            "--timeout",
+            "5s",
+            "--",
+            "printf WAIT_QUIET_%s STARTED; sleep 1; printf WAIT_QUIET_%s FINISHED",
+            "Enter",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    assert_success(&harness.run(&[
+        "wait-pane",
+        "-t",
+        "alpha:0.0",
+        "--text",
+        "WAIT_QUIET_STARTED",
+        "--timeout",
+        "3s",
+    ])?);
+    assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_child.try_wait()?.is_none(),
+        "quiet wait must not report false success when the target session is renamed"
+    );
+
+    let output = wait_child_with_timeout(wait_child, Duration::from_secs(4))?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "quiet wait failed after rename\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_success(&harness.run(&[
+        "wait-pane",
+        "-t",
+        "beta:0.0",
+        "--text",
+        "WAIT_QUIET_FINISHED",
+        "--timeout",
+        "1s",
+    ])?);
+    Ok(())
+}
+
+#[test]
+fn send_keys_waits_fail_closed_when_observed_session_is_killed() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-wait-killed-session")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "keeper", "sleep", "30"])?);
+
+    for (session, wait_args, started) in [
+        (
+            "quiet-target",
+            vec!["--wait", "quiet", "--stable-for", "2s"],
+            "KILL_QUIET_STARTED",
+        ),
+        (
+            "visible-target",
+            vec!["--wait-visible-text", "KILL_VISIBLE_EXPECTED"],
+            "KILL_VISIBLE_STARTED",
+        ),
+    ] {
+        assert_success(&harness.run(&["new-session", "-d", "-s", session])?);
+        let target = format!("{session}:0.0");
+        let mut arguments = vec!["send-keys", "-t", &target];
+        arguments.extend(wait_args);
+        arguments.extend([
+            "--timeout",
+            "5s",
+            "--",
+            "printf KILL_QUIET_%s STARTED; printf KILL_VISIBLE_%s STARTED; sleep 5",
+            "Enter",
+        ]);
+        let mut command = harness.base_command();
+        let wait_child = command
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        assert_success(&harness.run(&[
+            "wait-pane",
+            "-t",
+            &target,
+            "--text",
+            started,
+            "--timeout",
+            "3s",
+        ])?);
+        assert_success(&harness.run(&["kill-session", "-t", session])?);
+
+        let output = wait_child_with_timeout(wait_child, Duration::from_secs(2))?;
+        assert_ne!(
+            output.status.code(),
+            Some(0),
+            "wait must not claim success after its stable session identity is destroyed\nstdout:\n{}\nstderr:\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn send_keys_visible_wait_rejects_old_session_name_aba_after_rename() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("automation-wait-rename-aba")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut command = harness.base_command();
+    let mut wait_child = command
+        .args([
+            "send-keys",
+            "-t",
+            "alpha:0.0",
+            "--wait-visible-text",
+            "ABA_TARGET_DONE",
+            "--timeout",
+            "5s",
+            "--",
+            "printf ABA_%s STARTED; read marker; printf ABA_%s TARGET_DONE",
+            "Enter",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    assert_success(&harness.run(&[
+        "wait-pane",
+        "-t",
+        "alpha:0.0",
+        "--text",
+        "ABA_STARTED",
+        "--timeout",
+        "3s",
+    ])?);
+    assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "printf ABA_%s TARGET_DONE",
+        "Enter",
+    ])?);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_child.try_wait()?.is_none(),
+        "wait followed a replacement session that reused the original name"
+    );
+
+    assert_success(&harness.run(&["send-keys", "-t", "beta:0.0", "release", "Enter"])?);
+    let output = wait_child_with_timeout(wait_child, Duration::from_secs(3))?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "wait did not follow the original session identity through rename and name reuse\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn send_keys_quiet_wait_rejects_old_session_name_aba_after_rename() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("automation-quiet-wait-rename-aba")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut command = harness.base_command();
+    let mut wait_child = command
+        .args([
+            "send-keys",
+            "-t",
+            "alpha:0.0",
+            "--wait",
+            "quiet",
+            "--stable-for",
+            "5s",
+            "--timeout",
+            "8s",
+            "--",
+            "printf ABA_QUIET_%s STARTED; read marker; printf ABA_QUIET_%s DONE",
+            "Enter",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    assert_success(&harness.run(&[
+        "wait-pane",
+        "-t",
+        "alpha:0.0",
+        "--text",
+        "ABA_QUIET_STARTED",
+        "--timeout",
+        "3s",
+    ])?);
+    assert_success(&harness.run(&[
+        "rename-session",
+        "-t",
+        "alpha",
+        "beta",
+        ";",
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+    ])?);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_child.try_wait()?.is_none(),
+        "quiet wait mistook a replacement session without the stable pane id for pane exit"
+    );
+
+    assert_success(&harness.run(&["send-keys", "-t", "beta:0.0", "release", "Enter"])?);
+    let output = wait_child_with_timeout(wait_child, Duration::from_secs(6))?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "quiet wait did not remain bound to the original pane identity\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn wait_pane_visible_text_follows_session_identity_across_rename() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("wait-pane-visible-rename")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut command = harness.base_command();
+    let mut wait_child = command
+        .args([
+            "wait-pane",
+            "-t",
+            "alpha:0.0",
+            "--visible-text",
+            "DIRECT_WAIT_DONE",
+            "--timeout",
+            "5s",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_child.try_wait()?.is_none(),
+        "wait-pane must be armed before the rename"
+    );
+
+    assert_success(&harness.run(&["rename-session", "-t", "alpha", "beta"])?);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        wait_child.try_wait()?.is_none(),
+        "wait-pane must remain armed after the target session is renamed"
+    );
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "beta:0.0",
+        "printf DIRECT_WAIT_%s DONE",
+        "Enter",
+    ])?);
+
+    let output = wait_child_with_timeout(wait_child, Duration::from_secs(3))?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "wait-pane failed to follow the stable session identity\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    Ok(())
+}
+
+#[test]
 fn collect_pane_output_drains_until_pane_exit_eof() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("automation-collect-output")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -596,6 +1053,15 @@ fn with_session_kill_on_owner_exit_releases_name_immediately() -> Result<(), Box
     ])?);
     assert_success(&harness.run(&["new-session", "-d", "-s", "owned", "sleep", "60"])?);
     Ok(())
+}
+
+fn pane_width(output: &str, pane_index: u32) -> Result<u16, Box<dyn Error>> {
+    let prefix = format!("{pane_index}:");
+    let width = output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .ok_or_else(|| format!("pane {pane_index} missing from {output:?}"))?;
+    Ok(width.parse()?)
 }
 
 fn run_json(harness: &CliHarness, args: &[&str]) -> Result<Value, Box<dyn Error>> {

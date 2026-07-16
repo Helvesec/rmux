@@ -162,7 +162,7 @@ impl Drop for AttachedSession {
     }
 }
 
-fn prepare_canonical_termios<Fd>(fd: &Fd) -> Result<Termios, Box<dyn Error>>
+pub(crate) fn prepare_canonical_termios<Fd>(fd: &Fd) -> Result<Termios, Box<dyn Error>>
 where
     Fd: std::os::fd::AsFd,
 {
@@ -317,7 +317,7 @@ pub(crate) fn read_until_contains_all(
     .into())
 }
 
-fn assert_termios_eq(expected: &Termios, actual: &Termios) {
+pub(crate) fn assert_termios_eq(expected: &Termios, actual: &Termios) {
     assert_eq!(actual.input_modes, expected.input_modes);
     assert_eq!(actual.output_modes, expected.output_modes);
     assert_eq!(actual.control_modes, expected.control_modes);

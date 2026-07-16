@@ -20,12 +20,9 @@ pub(super) fn render_mode_tree_overlay(
         return Vec::new();
     };
     let size = session.window().size();
-    let status_on = state
-        .options
-        .resolve(Some(session.name()), OptionName::Status)
-        .map(|value| value != "off")
-        .unwrap_or(true);
-    let usable_rows = size.rows.saturating_sub(u16::from(status_on));
+    let geometry = crate::renderer::StatusGeometry::for_session(session, &state.options);
+    let usable_rows = geometry.content_rows();
+    let content_y_offset = geometry.content_y_offset();
     if usable_rows == 0 || size.cols == 0 {
         return Vec::new();
     }
@@ -72,7 +69,7 @@ pub(super) fn render_mode_tree_overlay(
             .is_some_and(|id| mode.selected_id.as_ref() == Some(id));
         render_overlay_line(
             &mut frame,
-            row,
+            content_y_offset.saturating_add(row),
             size.cols,
             &text,
             if selected {
@@ -86,7 +83,14 @@ pub(super) fn render_mode_tree_overlay(
     }
 
     while row < list_rows {
-        render_overlay_line(&mut frame, row, size.cols, "", &default_style, &utf8);
+        render_overlay_line(
+            &mut frame,
+            content_y_offset.saturating_add(row),
+            size.cols,
+            "",
+            &default_style,
+            &utf8,
+        );
         row = row.saturating_add(1);
     }
 
@@ -95,7 +99,7 @@ pub(super) fn render_mode_tree_overlay(
         let title = mode_tree_preview_title(mode, build);
         render_mode_tree_box(
             &mut frame,
-            list_rows,
+            content_y_offset.saturating_add(list_rows),
             preview_height,
             size.cols,
             &title,
@@ -125,7 +129,8 @@ pub(super) fn render_mode_tree_overlay(
             render_overlay_formatted_line(
                 &mut frame,
                 2,
-                list_rows
+                content_y_offset
+                    .saturating_add(list_rows)
                     .saturating_add(1)
                     .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
                 size.cols.saturating_sub(4),
@@ -136,7 +141,14 @@ pub(super) fn render_mode_tree_overlay(
         }
     } else {
         while row < usable_rows {
-            render_overlay_line(&mut frame, row, size.cols, "", &default_style, &utf8);
+            render_overlay_line(
+                &mut frame,
+                content_y_offset.saturating_add(row),
+                size.cols,
+                "",
+                &default_style,
+                &utf8,
+            );
             row = row.saturating_add(1);
         }
     }

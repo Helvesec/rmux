@@ -93,24 +93,27 @@ impl<'a> PaneSplitBuilder<'a> {
                 message: rmux_proto::PROCESS_COMMAND_EMPTY_MESSAGE.to_owned(),
             });
         }
-        let target = self.pane.current_target().await?;
-        let target = split_pane_with_process(
-            self.pane.transport(),
-            &target,
+        let operation_pane = self.pane.begin_operation_handle();
+        let outcome = split_pane_with_process(
+            operation_pane.transport(),
+            operation_pane.split_target_text(),
             self.direction,
             self.process,
             self.cwd,
             self.keep_alive_on_exit,
         )
         .await?;
-        let pane = Pane::new(
-            target,
-            self.pane.endpoint().clone(),
-            self.pane.configured_default_timeout(),
-            self.pane.transport().clone(),
+        let pane = Pane::new_by_id(
+            outcome.target,
+            outcome.pane_id,
+            operation_pane.endpoint().clone(),
+            operation_pane.configured_default_timeout(),
+            operation_pane.transport().clone(),
         );
         if let Some(title) = self.title {
-            pane.set_title(title).await?;
+            let mut scoped_pane = pane.clone();
+            scoped_pane.transport = operation_pane.transport().clone();
+            scoped_pane.set_title(title).await?;
         }
         Ok(pane)
     }

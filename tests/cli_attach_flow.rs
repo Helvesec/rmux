@@ -14,6 +14,7 @@ use rmux_proto::TerminalSize as ScreenTerminalSize;
 use rmux_pty::TerminalSize;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const ATTACH_OUTPUT_QUIET_PERIOD: Duration = Duration::from_millis(100);
 
 type PaneWidthRow = (usize, usize, bool);
 type TestResult<T> = Result<T, Box<dyn Error>>;
@@ -435,6 +436,38 @@ fn apply_quiescent_attach_output(
     capture_attach_transcript(screen, parser, &bytes)
 }
 
+fn observe_attach_output_until_quiet(
+    attach: &mut AttachedSession,
+    screen: &mut Screen,
+    parser: &mut InputParser,
+    minimum_observation: Duration,
+    timeout: Duration,
+) -> Result<String, Box<dyn Error>> {
+    let started_at = std::time::Instant::now();
+    let deadline = started_at + timeout;
+    let mut quiet_since = started_at;
+
+    loop {
+        let bytes = drain_attach_output_bytes(attach.master_mut())?;
+        if bytes.is_empty() {
+            let now = std::time::Instant::now();
+            if now.duration_since(started_at) >= minimum_observation
+                && now.duration_since(quiet_since) >= ATTACH_OUTPUT_QUIET_PERIOD
+            {
+                return capture_attach_transcript(screen, parser, &[]);
+            }
+            if now >= deadline {
+                return Err("attach output did not become quiet".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        capture_attach_transcript(screen, parser, &bytes)?;
+        quiet_since = std::time::Instant::now();
+    }
+}
+
 fn wait_for_attach_transcript_matching<F>(
     attach: &mut AttachedSession,
     screen: &mut Screen,
@@ -558,13 +591,12 @@ fn wait_for_layout(
 
 fn drain_attach_output_until_quiet(attach: &mut AttachedSession) -> Result<(), Box<dyn Error>> {
     let deadline = std::time::Instant::now() + IO_TIMEOUT;
-    let quiet_period = Duration::from_millis(100);
     let mut quiet_since = std::time::Instant::now();
 
     loop {
         let bytes = drain_attach_output_bytes(attach.master_mut())?;
         if bytes.is_empty() {
-            if std::time::Instant::now().duration_since(quiet_since) >= quiet_period {
+            if std::time::Instant::now().duration_since(quiet_since) >= ATTACH_OUTPUT_QUIET_PERIOD {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -1947,11 +1979,12 @@ fn choose_tree_q_restores_the_four_pane_layout_on_the_real_attached_client(
         "choose-tree q should restore pane content instead of mode-tree content\n--- restored ---\n{restored_panes}"
     );
 
-    let settled = apply_quiescent_attach_output(
+    let settled = observe_attach_output_until_quiet(
         &mut attach,
         &mut screen,
         &mut parser,
         Duration::from_millis(1200),
+        IO_TIMEOUT,
     )?;
     let settled_panes = transcript_without_status_line(&settled);
     let settled_geometry = list_pane_geometry(&harness, "alpha")?;

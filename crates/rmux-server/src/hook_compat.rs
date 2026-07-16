@@ -45,12 +45,13 @@ pub(crate) fn normalize_set_hook_mutation_request(
 
 pub(crate) fn canonicalize_set_hook_mutation_command(
     mut request: SetHookMutationRequest,
+    parser: &CommandParser,
 ) -> Result<SetHookMutationRequest, RmuxError> {
     let Some(command) = request.command.as_deref() else {
         return Ok(request);
     };
 
-    match CommandParser::new().parse(command) {
+    match parser.parse(command) {
         Ok(parsed) => {
             validate_parsed_hook_commands(&parsed)?;
             request.command = Some(parsed.to_tmux_binding_string());
@@ -334,11 +335,39 @@ mod tests {
             index: None,
         };
 
-        let canonical = super::canonicalize_set_hook_mutation_command(request)
-            .expect("known commands should canonicalize");
+        let canonical = super::canonicalize_set_hook_mutation_command(
+            request,
+            &rmux_core::command_parser::CommandParser::new(),
+        )
+        .expect("known commands should canonicalize");
         assert_eq!(
             canonical.command.as_deref(),
             Some("display-message hi \\; select-window -t :0")
+        );
+    }
+
+    #[test]
+    fn canonicalizes_user_command_aliases_before_hook_storage() {
+        let request = SetHookMutationRequest {
+            scope: ScopeSelector::Global,
+            hook: HookName::AfterSetBuffer,
+            command: Some("sbuf from-hook".to_owned()),
+            lifecycle: HookLifecycle::Persistent,
+            append: false,
+            unset: false,
+            run_immediately: false,
+            index: None,
+        };
+        let parser = rmux_core::command_parser::CommandParser::new()
+            .with_command_alias("sbuf=set-buffer -b aliased")
+            .expect("valid command alias");
+
+        let canonical = super::canonicalize_set_hook_mutation_command(request, &parser)
+            .expect("user aliases should canonicalize");
+
+        assert_eq!(
+            canonical.command.as_deref(),
+            Some("set-buffer -b aliased from-hook")
         );
     }
 
@@ -355,8 +384,11 @@ mod tests {
             index: None,
         };
 
-        let error = super::canonicalize_set_hook_mutation_command(request)
-            .expect_err("known commands with invalid arity must be rejected");
+        let error = super::canonicalize_set_hook_mutation_command(
+            request,
+            &rmux_core::command_parser::CommandParser::new(),
+        )
+        .expect_err("known commands with invalid arity must be rejected");
         assert!(
             error.to_string().contains("too many arguments"),
             "unexpected error: {error}"
@@ -376,8 +408,11 @@ mod tests {
             index: None,
         };
 
-        let error = super::canonicalize_set_hook_mutation_command(request)
-            .expect_err("unknown hook commands must be rejected");
+        let error = super::canonicalize_set_hook_mutation_command(
+            request,
+            &rmux_core::command_parser::CommandParser::new(),
+        )
+        .expect_err("unknown hook commands must be rejected");
         assert!(
             error.to_string().contains("unknown command: printf"),
             "unexpected error: {error}"

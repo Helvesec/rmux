@@ -8,6 +8,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
 mod http;
+mod keepalive;
 mod pre_auth;
 mod rate_limit;
 mod streams;
@@ -21,7 +22,7 @@ use super::websocket::{valid_client_key, WebSocket};
 use super::{crypto, crypto::EncryptedWebSocketReader};
 use crate::handler::{RequestHandler, WebShareStream};
 use http::{read_http_request, write_response, HttpRequest};
-use pre_auth::{PreAuthGuard, PreAuthQueue};
+use pre_auth::{PreAuthAdmission, PreAuthGuard, PreAuthQueue};
 use streams::{serve_pane_loop, serve_session_loop};
 
 const PRE_AUTH_SLOTS: usize = 64;
@@ -45,6 +46,7 @@ struct PreReadyWebShare {
     auth_pin: Option<String>,
     supports_session_pane_frame: bool,
     opener: crypto::FrameOpener,
+    pre_auth_guard: PreAuthGuard,
     sealer: crypto::FrameSealer,
 }
 
@@ -116,7 +118,7 @@ async fn serve(
         if let Err(error) = stream.set_nodelay(true) {
             warn!(%peer_addr, ?error, "failed to enable TCP_NODELAY for web-share client");
         }
-        let Some(pre_auth_guard) = pre_auth.try_register_peer(peer_addr.ip()) else {
+        let Some(pre_auth_admission) = pre_auth.admit_peer(peer_addr.ip()).await else {
             debug!(
                 %peer_addr,
                 "web-share pre-auth capacity reached; closing pending connection"
@@ -125,10 +127,29 @@ async fn serve(
         };
         let handler = Arc::clone(&handler);
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(stream, handler, pre_auth_guard).await {
+            if let Err(error) = serve_admitted_connection(stream, handler, pre_auth_admission).await
+            {
                 debug!("web-share connection ended: {error}");
             }
         });
+    }
+}
+
+async fn serve_admitted_connection(
+    stream: TcpStream,
+    handler: Arc<RequestHandler>,
+    admission: PreAuthAdmission,
+) -> io::Result<()> {
+    let (guard, cancellation) = admission.into_parts();
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            // Load shedding must not create a faster observable path than the
+            // uniform pre-ready rejection delay.
+            sleep(UNIFORM_AUTH_DELAY).await;
+            Ok(())
+        },
+        result = serve_connection(stream, handler, guard) => result,
     }
 }
 
@@ -255,6 +276,7 @@ async fn establish_web_share(
     handler: Arc<RequestHandler>,
     pre_auth_guard: PreAuthGuard,
 ) -> io::Result<Option<EstablishedWebShare>> {
+    let peer_ip = stream.peer_addr().ok().map(|address| address.ip());
     let pre_ready = match timeout(
         PRE_READY_TIMEOUT,
         complete_pre_ready_handshake(stream, request, key, Arc::clone(&handler), pre_auth_guard),
@@ -276,14 +298,30 @@ async fn establish_web_share(
         auth_pin,
         supports_session_pane_frame,
         opener,
+        pre_auth_guard,
         sealer,
     } = pre_ready;
 
     // Authenticate against the registry outside PRE_READY_TIMEOUT. The registry
     // backoff may intentionally sleep longer than the pre-ready budget, and its
     // cancellation-safe guard owns in-flight accounting for that phase.
+    // Transfer this socket atomically from the pre-auth queue to the bounded
+    // post-handshake queue. If the latter is full, retain the pre-auth guard
+    // through the uniform rejection delay so overflow tasks remain bounded too.
+    let auth_wait = match handler.reserve_web_share_authentication(&token_id, peer_ip) {
+        Ok(auth_wait) => {
+            drop(pre_auth_guard);
+            auth_wait
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let close = close_for_auth_error(&message);
+            reject_handshake_with_close(&mut socket, close.reason, close.wire_close).await?;
+            return Ok(None);
+        }
+    };
     let share = match handler
-        .open_web_share_token_id(&token_id, auth_pin.as_deref())
+        .open_web_share_token_id_with_wait(&token_id, auth_pin.as_deref(), &auth_wait)
         .await
     {
         Ok(pane) => pane,
@@ -357,6 +395,12 @@ async fn complete_pre_ready_handshake(
         reject_handshake(&mut socket, "unknown_token").await?;
         return Ok(None);
     };
+    // A registry hit proves knowledge of a non-enumerable token id. From this
+    // point onward the connection is protected from pre-auth load shedding;
+    // unknown-token and incomplete peers remain replaceable.
+    if !pre_auth_guard.protect() {
+        return Ok(None);
+    }
     if !origin_allowed {
         reject_handshake(&mut socket, "origin_not_allowed").await?;
         return Ok(None);
@@ -412,7 +456,6 @@ async fn complete_pre_ready_handshake(
             return Ok(None);
         }
     };
-    drop(pre_auth_guard);
     Ok(Some(PreReadyWebShare {
         socket,
         origin,
@@ -420,6 +463,7 @@ async fn complete_pre_ready_handshake(
         auth_pin: auth.pin,
         supports_session_pane_frame: auth.supports_session_pane_frame,
         opener,
+        pre_auth_guard,
         sealer,
     }))
 }

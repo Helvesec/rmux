@@ -1,6 +1,6 @@
 use super::http::{path_from_target, HttpRequest};
 use super::pre_auth::PreAuthQueue;
-use super::{is_fd_exhaustion, serve_connection, should_continue_accept_loop};
+use super::{is_fd_exhaustion, serve_admitted_connection, should_continue_accept_loop};
 use crate::handler::RequestHandler;
 use crate::web::protocol::{AUTH_FRAME_TIMEOUT, WEB_SHARE_PROTOCOL_VERSION};
 use crate::web::SecretHashForCrypto;
@@ -18,7 +18,7 @@ use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{timeout, Duration};
+use tokio::time::{advance, pause, timeout, Duration};
 
 #[cfg(windows)]
 const WEBSOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,46 +86,93 @@ async fn non_get_head_methods_return_405() {
 }
 
 #[tokio::test]
-async fn pre_auth_queue_rejects_new_entries_when_full() {
-    let queue = PreAuthQueue::new(1);
-    let first = queue.try_register().expect("first pre-auth slot");
-
-    assert!(
-        queue.try_register().is_none(),
-        "full pre-auth queue rejects a new slot"
-    );
-    assert_eq!(queue.pending_count(), 1);
-    tokio::time::sleep(Duration::from_millis(25)).await;
-    assert_eq!(queue.pending_count(), 1);
-    drop(first);
-    assert_eq!(queue.pending_count(), 0);
-}
-
-#[tokio::test]
-async fn pre_auth_full_queue_keeps_the_oldest_idle_connection() {
+async fn pre_auth_full_queue_replaces_the_oldest_idle_connection() {
     let handler = Arc::new(RequestHandler::new());
     let queue = PreAuthQueue::new(1);
     let (mut first_client, first_task) = raw_connection(Arc::clone(&handler), queue.clone()).await;
     wait_for_pending_pre_auth(&queue, 1).await;
 
-    let mut second_client = rejected_raw_connection(handler, queue).await;
-    let mut byte = [0u8; 1];
-    let read = timeout(Duration::from_secs(1), second_client.read(&mut byte))
+    let (mut second_client, second_task) = raw_peer_connection(handler, queue.clone())
         .await
-        .expect("newest connection should be closed")
-        .expect("read newest connection");
+        .expect("a new request replaces the oldest unproved connection");
+    let mut byte = [0u8; 1];
+    let read = timeout(Duration::from_secs(1), first_client.read(&mut byte))
+        .await
+        .expect("oldest connection should be cancelled")
+        .expect("read oldest connection");
     assert_eq!(read, 0);
+    first_task
+        .await
+        .expect("oldest connection task joins")
+        .expect("load-shed connection exits cleanly");
+    assert_eq!(queue.pending_count(), 1);
 
-    first_client
+    second_client
         .write_all(b"GET / HTTP/1.1\r\nHost: local\r\n\r\n")
         .await
         .expect("write request");
-    let response = read_http_response(&mut first_client).await;
+    let response = read_http_response(&mut second_client).await;
     assert!(response.starts_with("HTTP/1.1 404 Not Found"));
 
     drop(first_client);
     drop(second_client);
-    let _ = first_task.await.expect("first connection task joins");
+    second_task
+        .await
+        .expect("replacement connection task joins")
+        .expect("replacement request succeeds");
+    assert_eq!(queue.pending_count(), 0);
+}
+
+#[tokio::test]
+async fn incomplete_loopback_tunnel_peers_do_not_starve_complete_requests() {
+    let handler = Arc::new(RequestHandler::new());
+    let queue = PreAuthQueue::with_per_ip_capacity(8, 4);
+    let mut idle_clients = Vec::new();
+    let mut idle_tasks = Vec::new();
+    for _ in 0..8 {
+        let (client, task) = raw_peer_connection(Arc::clone(&handler), queue.clone())
+            .await
+            .expect("loopback abuse connection fits within the global queue");
+        idle_clients.push(client);
+        idle_tasks.push(task);
+    }
+    wait_for_pending_pre_auth(&queue, 8).await;
+
+    let (mut viewer, viewer_task) = raw_peer_connection(Arc::clone(&handler), queue.clone())
+        .await
+        .expect("a complete tunnel viewer replaces the oldest idle peer");
+    let mut oldest = idle_clients.remove(0);
+    let mut byte = [0u8; 1];
+    let read = timeout(Duration::from_secs(1), oldest.read(&mut byte))
+        .await
+        .expect("oldest loopback peer should be cancelled")
+        .expect("read oldest loopback peer");
+    assert_eq!(read, 0);
+    idle_tasks
+        .remove(0)
+        .await
+        .expect("oldest loopback task joins")
+        .expect("oldest loopback task exits cleanly");
+
+    viewer
+        .write_all(b"GET / HTTP/1.1\r\nHost: local\r\n\r\n")
+        .await
+        .expect("write complete viewer request");
+    let response = read_http_response(&mut viewer).await;
+    assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+    drop(viewer);
+    viewer_task
+        .await
+        .expect("complete viewer task joins")
+        .expect("complete viewer request succeeds");
+    assert_eq!(queue.pending_count(), 7);
+
+    drop(oldest);
+    drop(idle_clients);
+    for task in idle_tasks {
+        let _ = task.await.expect("idle connection task joins");
+    }
+    assert_eq!(queue.pending_count(), 0);
 }
 
 #[tokio::test]
@@ -147,6 +194,13 @@ async fn auth_frame_timeout_releases_pre_auth_slot() {
     let challenge = read_server_frame(&mut stream).await;
     assert_eq!(challenge.opcode, OPCODE_TEXT);
     assert_eq!(queue.pending_count(), 1);
+    assert!(
+        queue
+            .admit_peer("127.0.0.1".parse().expect("loopback address"))
+            .await
+            .is_none(),
+        "a connection that proved a non-enumerable token is not evicted"
+    );
 
     timeout(AUTH_FRAME_TIMEOUT + Duration::from_secs(2), task)
         .await
@@ -255,6 +309,134 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
     assert_eq!(revoked["reason"], "stopped_by_owner");
 
     client.close().await;
+}
+
+#[tokio::test]
+async fn authenticated_idle_pane_and_session_shares_survive_with_matching_pongs() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_session(&handler, "websocket-idle-keepalive").await;
+    let pane_share = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(
+            PaneTarget::new(session_name.clone(), 0).into(),
+        )),
+    )
+    .await;
+    let session_share = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name)),
+    )
+    .await;
+    let mut pane = TestWebSocket::connect(
+        Arc::clone(&handler),
+        &token_from_url(
+            pane_share
+                .spectator_url
+                .as_deref()
+                .expect("pane spectator URL"),
+        ),
+    )
+    .await;
+    let mut session = TestWebSocket::connect(
+        handler,
+        &token_from_url(
+            session_share
+                .spectator_url
+                .as_deref()
+                .expect("session spectator URL"),
+        ),
+    )
+    .await;
+    assert_eq!(pane.read_json().await["scope"], "pane");
+    pane.read_binary_with_prefix(0x10, "pane snapshot").await;
+    assert_eq!(session.read_json().await["scope"], "session");
+    session
+        .read_binary_with_prefix(0x10, "session snapshot")
+        .await;
+
+    for _ in 0..4 {
+        for client in [&mut pane, &mut session] {
+            acknowledge_next_keepalive(&mut client.stream).await;
+        }
+    }
+
+    assert!(
+        !pane.task.is_finished() && !session.task.is_finished(),
+        "matching WebSocket pongs must keep idle shares alive"
+    );
+    pane.close().await;
+    session.close().await;
+}
+
+#[tokio::test]
+async fn authenticated_idle_pane_and_session_shares_close_without_pongs() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_session(&handler, "websocket-idle-pong-timeout").await;
+    let pane_share = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(
+            PaneTarget::new(session_name.clone(), 0).into(),
+        )),
+    )
+    .await;
+    let session_share = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name)),
+    )
+    .await;
+    let mut pane = TestWebSocket::connect(
+        Arc::clone(&handler),
+        &token_from_url(
+            pane_share
+                .spectator_url
+                .as_deref()
+                .expect("pane spectator URL"),
+        ),
+    )
+    .await;
+    let mut session = TestWebSocket::connect(
+        handler,
+        &token_from_url(
+            session_share
+                .spectator_url
+                .as_deref()
+                .expect("session spectator URL"),
+        ),
+    )
+    .await;
+    assert_eq!(pane.read_json().await["scope"], "pane");
+    pane.read_binary_with_prefix(0x10, "pane snapshot").await;
+    assert_eq!(session.read_json().await["scope"], "session");
+    session
+        .read_binary_with_prefix(0x10, "session snapshot")
+        .await;
+
+    pause();
+    for _ in 0..3 {
+        advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        for client in [&mut pane, &mut session] {
+            let mut saw_ping = false;
+            for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
+                let frame = read_server_frame_inner(&mut client.stream)
+                    .await
+                    .expect("read keepalive frame");
+                assert_ne!(frame.opcode, OPCODE_CLOSE, "share closed before timeout");
+                if frame.opcode == OPCODE_PING {
+                    assert_eq!(frame.payload, b"rmux");
+                    saw_ping = true;
+                    break;
+                }
+            }
+            assert!(saw_ping, "idle share did not emit its keepalive ping");
+        }
+    }
+
+    advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    pane.read_close(4009, "pong_timeout").await;
+    session.read_close(4009, "pong_timeout").await;
+    assert!(pane.task.is_finished() && session.task.is_finished());
 }
 
 #[tokio::test]
@@ -889,6 +1071,103 @@ async fn handshake_rejects_wrong_pin_with_same_collapsed_close() {
 }
 
 #[tokio::test]
+async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
+    let handler = Arc::new(RequestHandler::new_with_web_authentication_limits(
+        1, 8, 8, 4,
+    ));
+    let protected_session = create_session(&handler, "websocket-protected-wait").await;
+    let protected = create_share(
+        &handler,
+        CreateWebShareRequest {
+            require_pin: true,
+            ..share_request(WebShareScope::Pane(
+                PaneTarget::new(protected_session, 0).into(),
+            ))
+        },
+    )
+    .await;
+    let unrelated_session = create_session(&handler, "websocket-unrelated-wait").await;
+    let unrelated = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(
+            PaneTarget::new(unrelated_session, 0).into(),
+        )),
+    )
+    .await;
+    let protected_token =
+        token_from_url(protected.spectator_url.as_deref().expect("protected URL"));
+    let protected_pin = protected
+        .spectator_pairing_code
+        .as_deref()
+        .expect("protected share has a PIN");
+    let wrong_pin = if protected_pin == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    let protected_token_id = SecretHashForCrypto::from_secret(&protected_token).token_id();
+    let unrelated_token =
+        token_from_url(unrelated.spectator_url.as_deref().expect("unrelated URL"));
+
+    // Four settled failures make the next attempt wait 800 ms, leaving enough
+    // time to complete a real encrypted handshake for the unrelated share.
+    for _ in 0..4 {
+        let HandshakeSession {
+            mut stream, task, ..
+        } = drive_handshake_through_auth(
+            Arc::clone(&handler),
+            &protected_token,
+            &protected_token_id,
+            &auth_text_with_pin(wrong_pin),
+        )
+        .await;
+        assert_close(&mut stream, 4000, "handshake_rejected").await;
+        drop(stream);
+        let _ = task.await.expect("failed PIN task joins");
+    }
+
+    let mut waiters = Vec::with_capacity(4);
+    for _ in 0..4 {
+        waiters.push(
+            drive_handshake_through_auth(
+                Arc::clone(&handler),
+                &protected_token,
+                &protected_token_id,
+                &auth_text_with_pin(protected_pin),
+            )
+            .await,
+        );
+    }
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while handler.web_authentication_wait_count() != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("four loopback connections enter authentication backoff");
+
+    let mut unrelated = TestWebSocket::connect(Arc::clone(&handler), &unrelated_token).await;
+    let ready = tokio::time::timeout(Duration::from_millis(600), unrelated.read_json())
+        .await
+        .expect("unrelated share reaches ready while protected share waits");
+    assert_eq!(ready["type"], "ready");
+
+    for waiter in waiters {
+        let HandshakeSession { stream, task, .. } = waiter;
+        drop(stream);
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("backoff task was cancelled")
+                .is_cancelled(),
+            "cancelling a backoff task must stop it"
+        );
+    }
+    unrelated.close().await;
+    assert_eq!(handler.web_authentication_wait_count(), 0);
+}
+
+#[tokio::test]
 async fn handshake_rejects_capacity_reached_with_collapsed_close() {
     // The share caps spectators at 1. Once that slot is held by a live viewer,
     // a second spectator hits the capacity-reached path after token auth. Keep
@@ -1229,11 +1508,11 @@ async fn response_for(request: impl AsRef<[u8]>) -> String {
     let mut client = client.expect("client connects");
     let (server, _) = server.expect("server accepts");
     let pre_auth = PreAuthQueue::new(16);
-    let pre_auth_guard = pre_auth.try_register().expect("pre-auth slot");
-    let task = tokio::spawn(serve_connection(
+    let pre_auth_admission = pre_auth.try_register().expect("pre-auth slot");
+    let task = tokio::spawn(serve_admitted_connection(
         server,
         Arc::new(RequestHandler::new()),
-        pre_auth_guard,
+        pre_auth_admission,
     ));
 
     client
@@ -1570,15 +1849,19 @@ async fn raw_connection(
     let (client, server) = tokio::join!(client, server);
     let client = client.expect("client connects");
     let (server, _) = server.expect("server accepts");
-    let pre_auth_guard = pre_auth.try_register().expect("pre-auth slot");
-    let task = tokio::spawn(serve_connection(server, handler, pre_auth_guard));
+    let pre_auth_admission = pre_auth.try_register().expect("pre-auth slot");
+    let task = tokio::spawn(serve_admitted_connection(
+        server,
+        handler,
+        pre_auth_admission,
+    ));
     (client, task)
 }
 
-async fn rejected_raw_connection(
+async fn raw_peer_connection(
     handler: Arc<RequestHandler>,
     pre_auth: PreAuthQueue,
-) -> TcpStream {
+) -> Option<(TcpStream, tokio::task::JoinHandle<io::Result<()>>)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
@@ -1587,14 +1870,14 @@ async fn rejected_raw_connection(
     let server = listener.accept();
     let (client, server) = tokio::join!(client, server);
     let client = client.expect("client connects");
-    let (server, _) = server.expect("server accepts");
-    assert!(
-        pre_auth.try_register().is_none(),
-        "full pre-auth queue rejects connection"
-    );
-    drop(handler);
-    drop(server);
-    client
+    let (server, peer_addr) = server.expect("server accepts");
+    let pre_auth_admission = pre_auth.admit_peer(peer_addr.ip()).await?;
+    let task = tokio::spawn(serve_admitted_connection(
+        server,
+        handler,
+        pre_auth_admission,
+    ));
+    Some((client, task))
 }
 
 async fn wait_for_pending_pre_auth(queue: &PreAuthQueue, expected: usize) {
@@ -1762,6 +2045,44 @@ async fn read_server_frame(stream: &mut TcpStream) -> ServerFrame {
         .expect("read websocket frame")
 }
 
+async fn acknowledge_next_keepalive(stream: &mut TcpStream) {
+    for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
+        let frame = timeout(
+            WEBSOCKET_FRAME_TIMEOUT + Duration::from_secs(1),
+            read_server_frame_inner(stream),
+        )
+        .await
+        .expect("keepalive frame timeout")
+        .expect("read keepalive frame");
+        assert_ne!(frame.opcode, OPCODE_CLOSE, "share closed while idle");
+        if frame.opcode != OPCODE_PING {
+            continue;
+        }
+
+        assert_eq!(frame.payload, b"rmux");
+        write_client_frame(stream, OPCODE_PONG, &frame.payload).await;
+
+        const BARRIER_PAYLOAD: &[u8] = b"rmux-keepalive-ack";
+        write_client_frame(stream, OPCODE_PING, BARRIER_PAYLOAD).await;
+        for _ in 0..MAX_INTERLEAVED_WEBSOCKET_FRAMES {
+            let response = timeout(WEBSOCKET_FRAME_TIMEOUT, read_server_frame_inner(stream))
+                .await
+                .expect("keepalive acknowledgement timeout")
+                .expect("read keepalive acknowledgement");
+            assert_ne!(response.opcode, OPCODE_CLOSE, "share closed after pong");
+            match response.opcode {
+                OPCODE_PONG if response.payload == BARRIER_PAYLOAD => return,
+                OPCODE_PING => {
+                    write_client_frame(stream, OPCODE_PONG, &response.payload).await;
+                }
+                _ => {}
+            }
+        }
+        panic!("server did not acknowledge the keepalive barrier");
+    }
+    panic!("idle share did not emit its keepalive ping");
+}
+
 async fn read_server_frame_inner(stream: &mut TcpStream) -> io::Result<ServerFrame> {
     let mut head = [0u8; 2];
     stream.read_exact(&mut head).await?;
@@ -1802,5 +2123,7 @@ fn token_from_url(url: &str) -> String {
 const OPCODE_TEXT: u8 = 0x1;
 const OPCODE_BINARY: u8 = 0x2;
 const OPCODE_CLOSE: u8 = 0x8;
+const OPCODE_PING: u8 = 0x9;
+const OPCODE_PONG: u8 = 0xa;
 const TEST_CLIENT_NONCE: &str = "AQIDBAUGBwgJCgsMDQ4PEA";
 const MAX_INTERLEAVED_WEBSOCKET_FRAMES: usize = 32;

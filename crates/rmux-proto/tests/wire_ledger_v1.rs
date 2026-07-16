@@ -39,12 +39,13 @@ use rmux_proto::{
     ResolveTargetType, Response, RmuxError, ScopeSelector, SdkWaitForOutputRefRequest,
     SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId,
     SendKeysExt2Request, SendKeysRequest, SendKeysResponse, SessionName, SetHookRequest,
-    SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowTargetActionRequest,
-    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
-    SubscribePaneStateRequest, SubscribePaneStateResponse, TerminalSize,
-    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse, UnsubscribePaneStateRequest,
-    UnsubscribePaneStateResponse, WebShareConfigRequest, WebShareListener, WebShareRequest,
-    WebShareResponse, WindowTarget, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
+    SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowIdentityRequest,
+    SplitWindowIdentityResponse, SplitWindowTargetActionRequest, SubscribePaneOutputRefRequest,
+    SubscribePaneOutputRequest, SubscribePaneOutputResponse, SubscribePaneStateRequest,
+    SubscribePaneStateResponse, TerminalSize, UnsubscribePaneOutputRequest,
+    UnsubscribePaneOutputResponse, UnsubscribePaneStateRequest, UnsubscribePaneStateResponse,
+    WebShareConfigRequest, WebShareListener, WebShareRequest, WebShareResponse, WindowTarget,
+    RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
 
 fn fixture_root() -> PathBuf {
@@ -139,6 +140,23 @@ fn fixtures() -> Vec<FullFrameFixture> {
             full_size: false,
             stdin_payload: None,
         }));
+    let split_identity = Request::SplitWindowIdentity(Box::new(SplitWindowIdentityRequest {
+        action: SplitWindowTargetActionRequest {
+            target: Some("alpha:0.3".to_owned()),
+            direction: SplitDirection::Vertical,
+            before: true,
+            environment: Some(vec!["RMUX_ROLE=agent".to_owned()]),
+            command: None,
+            process_command: None,
+            start_directory: None,
+            keep_alive_on_exit: Some(true),
+            detached: false,
+            size: Some("40%".to_owned()),
+            preserve_zoom: true,
+            full_size: false,
+            stdin_payload: None,
+        },
+    }));
     let resize_target_action = Request::ResizePaneTargetAction(ResizePaneTargetActionRequest {
         target: Some("alpha:0.0".to_owned()),
         adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 100 },
@@ -278,6 +296,10 @@ fn fixtures() -> Vec<FullFrameFixture> {
             revision: 11,
             state: Some(foreground),
         }));
+    let split_identity_response = Response::SplitWindowIdentity(SplitWindowIdentityResponse {
+        pane: PaneTarget::with_window(alpha(), 2, 7),
+        pane_id: PaneId::new(42),
+    });
 
     vec![
         FullFrameFixture {
@@ -321,6 +343,13 @@ fn fixtures() -> Vec<FullFrameFixture> {
             direction: FrameDirection::ClientToServer,
             feature: FrameFeature::Panes,
             encode: Frame::Request(split_target_action),
+        },
+        FullFrameFixture {
+            name: "split_window_identity_request",
+            kind: frame_kind_for_request(&split_identity),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(split_identity),
         },
         FullFrameFixture {
             name: "resize_pane_target_action_request",
@@ -441,6 +470,13 @@ fn fixtures() -> Vec<FullFrameFixture> {
             feature: FrameFeature::Panes,
             encode: Frame::Response(pane_foreground_state_response),
         },
+        FullFrameFixture {
+            name: "split_window_identity_response",
+            kind: frame_kind_for_response(&split_identity_response),
+            direction: FrameDirection::ServerToClient,
+            feature: FrameFeature::Panes,
+            encode: Frame::Response(split_identity_response),
+        },
     ]
 }
 
@@ -455,7 +491,7 @@ fn encode_fixture(fixture: &FullFrameFixture) -> Vec<u8> {
 fn fixture_count_matches_manifest() {
     assert_eq!(
         fixtures().len(),
-        23,
+        25,
         "ledger fixture manifest must stay explicit"
     );
 }
@@ -874,6 +910,23 @@ fn cross_section_requests() -> Vec<Request> {
             },
             vec![rmux_proto::CAPABILITY_ATTACH_RENDER.to_owned()],
         ))),
+        Request::SplitWindowIdentity(Box::new(SplitWindowIdentityRequest {
+            action: SplitWindowTargetActionRequest {
+                target: Some("alpha:0.2".to_owned()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+                command: None,
+                process_command: None,
+                start_directory: None,
+                keep_alive_on_exit: None,
+                detached: false,
+                size: None,
+                preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
+            },
+        })),
     ]
 }
 
@@ -956,6 +1009,10 @@ fn cross_section_responses() -> Vec<Response> {
                 ),
             },
         ))),
+        Response::SplitWindowIdentity(SplitWindowIdentityResponse {
+            pane: PaneTarget::with_window(alpha, 2, 7),
+            pane_id: PaneId::new(42),
+        }),
     ]
 }
 
@@ -1077,8 +1134,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 127 Request variants + 101 Response variants.
-    assert_eq!(active_count, 127 + 101, "active ledger size mismatch");
+    // Active entries = 128 Request variants + 102 Response variants.
+    assert_eq!(active_count, 128 + 102, "active ledger size mismatch");
 }
 
 #[test]
@@ -1283,6 +1340,9 @@ fn assert_request_semantic_equal(actual: &Request, expected: &Request, label: &s
         (Request::PaneForegroundState(actual), Request::PaneForegroundState(expected)) => {
             assert_eq!(actual, expected, "{label}");
         }
+        (Request::SplitWindowIdentity(actual), Request::SplitWindowIdentity(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
         (Request::NewSession(actual), Request::NewSession(expected)) => {
             assert_eq!(
                 actual.session_name.as_str(),
@@ -1338,6 +1398,9 @@ fn assert_response_semantic_equal(actual: &Response, expected: &Response, label:
             assert_eq!(actual, expected, "{label}");
         }
         (Response::PaneForegroundState(actual), Response::PaneForegroundState(expected)) => {
+            assert_eq!(actual, expected, "{label}");
+        }
+        (Response::SplitWindowIdentity(actual), Response::SplitWindowIdentity(expected)) => {
             assert_eq!(actual, expected, "{label}");
         }
         (actual, expected) => {
@@ -1703,6 +1766,7 @@ fn fixture_set_kinds_match_manifest_table() {
         ("pane_state_cursor_request", 0x007C),
         ("unsubscribe_pane_state_request", 0x007D),
         ("pane_foreground_state_request", 0x007E),
+        ("split_window_identity_request", 0x007F),
         ("new_session_response", 0x8000),
         ("error_response", 0x801F),
         ("pane_option_set_response", 0x805E),
@@ -1712,6 +1776,7 @@ fn fixture_set_kinds_match_manifest_table() {
         ("pane_state_lag_response", 0x8062),
         ("unsubscribe_pane_state_response", 0x8063),
         ("pane_foreground_state_response", 0x8064),
+        ("split_window_identity_response", 0x8065),
     ];
     let mut by_name: std::collections::HashMap<&str, u16> = std::collections::HashMap::new();
     for entry in V1_FRAME_LEDGER {

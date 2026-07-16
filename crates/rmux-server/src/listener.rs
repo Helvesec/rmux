@@ -6,7 +6,7 @@ use std::time::Duration;
 use rmux_ipc::{wait_for_peer_close, LocalListener, LocalStream, PeerIdentity};
 use rmux_proto::{
     encode_frame, ErrorResponse, FrameDecoder, Request, Response, WaitForMode,
-    CAPABILITY_SDK_WAITS_ARMED,
+    CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2, CAPABILITY_SDK_WAITS_ARMED,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
@@ -16,8 +16,9 @@ use tracing::{debug, warn};
 use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
-    attach_support::AttachRegistration, ControlRegistration, DetachedRequestGuard, PreparedSdkWait,
-    RequestHandler,
+    attach_support::AttachRegistration, with_session_lease_create_addressing,
+    ControlClientIdentity, ControlRegistration, DetachedRequestGuard, PreparedSdkWait,
+    RequestHandler, SessionLeaseCreateAddressing,
 };
 use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
@@ -27,7 +28,15 @@ use crate::pane_io;
 use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
 
+mod legacy_shutdown;
+
+use legacy_shutdown::{
+    encode_legacy_kill_server_response, inspect_legacy_kill_server_frame, LegacyKillServerFrame,
+    PublishedLegacyWireVersion,
+};
+
 const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+const LIFECYCLE_HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const DETACHED_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Accept loop: spawns a per-connection task for each incoming client.
@@ -65,6 +74,9 @@ pub(crate) async fn serve(
     ));
     handler.install_shutdown_handle(shutdown_handle.clone());
     handler.set_socket_path(&socket_path);
+    let lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .ok_or_else(|| io::Error::other("lifecycle dispatch receiver already active"))?;
     #[cfg(all(any(unix, windows), feature = "web"))]
     if web_required {
         handler
@@ -72,22 +84,21 @@ pub(crate) async fn serve(
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::AddrNotAvailable, error.to_string()))?;
     }
+    let (connection_shutdown, connection_shutdown_rx) = watch::channel(());
+    let (hook_shutdown, hook_shutdown_rx) = oneshot::channel();
+    let mut connection_tasks = JoinSet::new();
+    let hook_handler = Arc::clone(&handler);
+    let mut hook_task = tokio::spawn(async move {
+        hook_handler
+            .consume_lifecycle_hooks(lifecycle_events, hook_shutdown_rx)
+            .await;
+    });
     let startup_guard = handler.start_config_loading();
     let startup_handler = Arc::clone(&handler);
     let startup_config = options.config_load;
     let startup_task = tokio::spawn(async move {
         startup_handler
             .load_startup_config_with_guard(startup_config, startup_guard)
-            .await;
-    });
-    let (connection_shutdown, connection_shutdown_rx) = watch::channel(());
-    let mut connection_tasks = JoinSet::new();
-    let hook_handler = Arc::clone(&handler);
-    let hook_events = handler.subscribe_lifecycle_events();
-    let hook_shutdown = connection_shutdown_rx.clone();
-    let hook_task = tokio::spawn(async move {
-        hook_handler
-            .consume_lifecycle_hooks(hook_events, hook_shutdown)
             .await;
     });
 
@@ -123,7 +134,6 @@ pub(crate) async fn serve(
             }
             _ = &mut shutdown => {
                 debug!("shutdown requested");
-                cleanup_on_drop.cleanup_now();
                 break;
             }
             result = wait_server_signal(&server_signals), if server_signals.is_some() => {
@@ -153,9 +163,31 @@ pub(crate) async fn serve(
     }
 
     drain_connection_tasks_for_shutdown(&mut connection_tasks).await;
-    if let Err(error) = hook_task.await {
-        warn!("lifecycle hook task failed: {error}");
+    handler.shutdown_wait_for();
+    let _ = hook_shutdown.send(());
+    // Keep shell registration open while already accepted lifecycle hooks drain. The
+    // shared deadline also bounds older background jobs before the final tree cleanup.
+    let hook_result = tokio::time::timeout(LIFECYCLE_HOOK_SHUTDOWN_GRACE, &mut hook_task).await;
+    handler.shutdown_shell_processes();
+    match hook_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("lifecycle hook task failed: {error}"),
+        Err(_) => {
+            warn!("aborting lifecycle hooks that did not drain during daemon shutdown");
+            hook_task.abort();
+            match hook_task.await {
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => warn!("lifecycle hook task failed after abort: {error}"),
+                Ok(()) => {}
+            }
+        }
     }
+
+    // Keep the old endpoint reserved until every accepted lifecycle hook has either
+    // completed or been cancelled. Releasing it earlier lets an old hook reconnect
+    // to a new daemon generation through its inherited RMUX/TMUX environment.
+    drop(listener);
+    cleanup_on_drop.cleanup_now();
 
     Ok(())
 }
@@ -180,13 +212,16 @@ async fn serve_connection(
     let mut conn = Connection::new(stream);
     let detached_connection_guard = handler.begin_detached_connection(connection_id);
     let mut sdk_wait_armed_ack_enabled = false;
+    let mut session_lease_by_id_enabled = false;
 
     loop {
         tokio::select! {
             request = conn.read_request() => {
-                let Some(request) = request? else {
+                let Some(incoming_request) = request? else {
                     return Ok(());
                 };
+                let legacy_kill_server_wire = incoming_request.legacy_kill_server_wire;
+                let request = incoming_request.request;
                 let Some(access_mode) = handler.access_mode_for_peer(&requester) else {
                     conn.write_response(&Response::Error(ErrorResponse {
                         error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),
@@ -210,9 +245,18 @@ async fn serve_connection(
                 if request_enables_sdk_wait_armed_ack(&request) {
                     sdk_wait_armed_ack_enabled = true;
                 }
+                let enables_session_lease_by_id =
+                    request_enables_session_lease_by_id(&request);
+                let session_lease_create_addressing = if session_lease_by_id_enabled {
+                    SessionLeaseCreateAddressing::StableId
+                } else {
+                    SessionLeaseCreateAddressing::Nominal
+                };
                 let cancel_on_peer_disconnect = request_cancels_on_peer_disconnect(&request);
                 debug!("dispatching {}", request.command_name());
-                let outcome = match request {
+                #[cfg(feature = "web")]
+                let mut undelivered_web_share;
+                let mut outcome = match request {
                     Request::SdkWaitForOutput(request) => {
                         let prepared = handler
                             .prepare_sdk_wait_for_output(connection_id, request)
@@ -252,8 +296,31 @@ async fn serve_connection(
                         continue;
                     }
                     request => {
+                        #[cfg(feature = "web")]
+                        let dispatch = handler.dispatch_for_connection_with_web_share_guard(
+                            requester.pid,
+                            connection_id,
+                            request,
+                        );
+                        #[cfg(not(feature = "web"))]
+                        let dispatch = handler.dispatch_for_connection(
+                            requester.pid,
+                            connection_id,
+                            request,
+                        );
                         tokio::select! {
-                            outcome = handler.dispatch_for_connection(requester.pid, connection_id, request) => outcome,
+                            outcome = with_session_lease_create_addressing(
+                                session_lease_create_addressing,
+                                dispatch,
+                            ) => {
+                                #[cfg(feature = "web")]
+                                {
+                                    undelivered_web_share = outcome.1;
+                                    outcome.0
+                                }
+                                #[cfg(not(feature = "web"))]
+                                outcome
+                            },
                             result = shutdown.changed() => {
                                 if result.is_ok() {
                                     debug!("closing client connection during shutdown");
@@ -268,7 +335,80 @@ async fn serve_connection(
                         }
                     }
                 };
-                if let Err(error) = conn.write_response(&outcome.response).await {
+                if enables_session_lease_by_id
+                    && matches!(&outcome.response, Response::Handshake(_))
+                {
+                    session_lease_by_id_enabled = true;
+                }
+                // An attach registration is removed as soon as its last
+                // session closes, but its forwarder still has to deliver the
+                // terminal exit frame. Bridge that transition before any
+                // further await can let exit-empty shut the daemon down.
+                let attach_forwarder_guard = outcome
+                    .attach
+                    .is_some()
+                    .then(|| handler.begin_attach_forwarder());
+                let pending_control = if let Some(control_upgrade) = outcome.control.take() {
+                    let initial_command_count = control_upgrade.initial_command_count as usize;
+                    if let Err(error) =
+                        control::validate_initial_control_command_count(initial_command_count)
+                    {
+                        conn.write_response(&Response::Error(ErrorResponse { error }))
+                            .await?;
+                        drop(detached_request_guard.take());
+                        continue;
+                    }
+                    let control_mode = control_upgrade.mode;
+                    let (server_event_tx, server_event_rx) =
+                        tokio::sync::mpsc::channel::<ControlServerEvent>(
+                            control::CONTROL_SERVER_EVENT_CAPACITY,
+                        );
+                    let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let control_id = match handler
+                        .register_control_with_access(
+                            requester.pid,
+                            control_upgrade,
+                            ControlRegistration {
+                                event_tx: server_event_tx,
+                                closing: closing.clone(),
+                                uid: requester.uid,
+                                user: requester.user.clone(),
+                                can_write,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(control_id) => control_id,
+                        Err(error) => {
+                            conn.write_response(&Response::Error(ErrorResponse {
+                                error: error.into_rmux_error(),
+                            }))
+                            .await?;
+                            drop(detached_request_guard.take());
+                            continue;
+                        }
+                    };
+                    Some((
+                        initial_command_count,
+                        control_mode,
+                        server_event_rx,
+                        closing,
+                        control_id,
+                    ))
+                } else {
+                    None
+                };
+
+                let response_result = match (legacy_kill_server_wire, &outcome.response) {
+                    (Some(wire_version), Response::KillServer(_)) => {
+                        conn.write_legacy_kill_server_response(wire_version).await
+                    }
+                    _ => conn.write_response(&outcome.response).await,
+                };
+                if let Err(error) = response_result {
+                    if let Some((_, _, _, _, control_id)) = pending_control.as_ref() {
+                        handler.finish_control(requester.pid, *control_id).await;
+                    }
                     drop(detached_request_guard.take());
                     #[cfg(windows)]
                     let _ = handler
@@ -276,7 +416,14 @@ async fn serve_connection(
                     return Err(error);
                 }
 
+                #[cfg(feature = "web")]
+                if let Some(guard) = undelivered_web_share.as_mut() {
+                    guard.disarm();
+                }
+
                 if let Some(attach) = outcome.attach {
+                    let attach_forwarder_guard = attach_forwarder_guard
+                        .expect("attach outcome must hold an attach forwarder guard");
                     let Response::AttachSession(response) = &outcome.response else {
                         return Err(io::Error::other(
                             "attach upgrade requires an attach-session response",
@@ -284,10 +431,11 @@ async fn serve_connection(
                     };
                     let session_name = response.session_name.clone();
                     let terminal_context = attach.target.outer_terminal.context().clone();
-                    let attach_id = handler
-                        .register_attach_with_access(
+                    let attach_identity = handler
+                        .register_attach_identity_with_access(
                             requester.pid,
                             session_name.clone(),
+                            Some(attach.session_id),
                             AttachRegistration {
                                 control_tx: attach.control_tx,
                                 control_backlog: attach.control_backlog.clone(),
@@ -302,10 +450,19 @@ async fn serve_connection(
                                 client_size: attach.client_size,
                             },
                         )
-                        .await;
+                        .await
+                        .ok_or_else(|| {
+                            io::Error::other("attach session changed before registration")
+                        })?;
                     drop(detached_connection_guard);
                     drop(detached_request_guard.take());
-                    handler.emit_client_attached(requester.pid, session_name).await;
+                    handler
+                        .emit_client_attached_identity(
+                            requester.pid,
+                            session_name,
+                            attach.session_id,
+                        )
+                        .await;
                     let (stream, buffered_bytes) = conn.into_raw_parts();
                     if !buffered_bytes.is_empty() {
                         warn!(
@@ -322,44 +479,40 @@ async fn serve_connection(
                         attach.control_backlog,
                         attach.closing,
                         attach.persistent_overlay_epoch,
-                        pane_io::LiveAttachInputContext {
-                            handler: Arc::clone(&handler),
-                            attach_pid: requester.pid,
-                        },
+                        pane_io::LiveAttachInputContext::new(
+                            Arc::clone(&handler),
+                            attach_identity,
+                        ),
                         attach.render_stream,
                     )
                     .await;
-                    handler.finish_attach(requester.pid, attach_id).await;
+                    handler
+                        .finish_attach(requester.pid, attach_identity.attach_id())
+                        .await;
+                    drop(attach_forwarder_guard);
+                    let _ = handler.request_shutdown_if_pending();
                     return result;
                 }
-                if let Some(control_upgrade) = outcome.control {
-                    let initial_command_count = control_upgrade.initial_command_count as usize;
-                    let (server_event_tx, server_event_rx) =
-                        tokio::sync::mpsc::channel::<ControlServerEvent>(
-                            control::CONTROL_SERVER_EVENT_CAPACITY,
-                        );
-                    let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    let control_id = handler
-                        .register_control_with_access(
-                            requester.pid,
-                            control_upgrade,
-                            ControlRegistration {
-                                event_tx: server_event_tx,
-                                closing: closing.clone(),
-                                uid: requester.uid,
-                                user: requester.user.clone(),
-                                can_write,
-                            },
-                        )
-                        .await;
+                if let Some((
+                    initial_command_count,
+                    control_mode,
+                    server_event_rx,
+                    closing,
+                    control_id,
+                )) = pending_control
+                {
                     drop(detached_connection_guard);
                     drop(detached_request_guard.take());
                     let (stream, buffered_bytes) = conn.into_raw_parts();
                     let result = control::forward_control(
                         stream,
                         Arc::clone(&handler),
-                        requester.pid,
-                        ControlUpgradeInput::new(buffered_bytes, initial_command_count),
+                        ControlClientIdentity::new(requester.pid, control_id),
+                        ControlUpgradeInput::with_mode(
+                            buffered_bytes,
+                            initial_command_count,
+                            control_mode,
+                        ),
                         shutdown,
                         server_event_rx,
                         ControlLifecycle {
@@ -501,6 +654,17 @@ fn request_enables_sdk_wait_armed_ack(request: &Request) -> bool {
     )
 }
 
+fn request_enables_session_lease_by_id(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Handshake(handshake)
+            if handshake
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2)
+    )
+}
+
 fn request_cancels_on_peer_disconnect(request: &Request) -> bool {
     matches!(
         request,
@@ -511,6 +675,10 @@ fn request_cancels_on_peer_disconnect(request: &Request) -> bool {
         Request::SdkWaitForOutput(_)
             | Request::SdkWaitForOutputRef(_)
             | Request::PaneStateCursor(rmux_proto::PaneStateCursorRequest { wait: true, .. })
+    ) || matches!(
+        request,
+        Request::WebShare(web_share)
+            if matches!(web_share.as_ref(), rmux_proto::WebShareRequest::Create(_))
     )
 }
 
@@ -567,6 +735,27 @@ struct Connection {
     read_buffer: [u8; 8192],
 }
 
+struct IncomingRequest {
+    request: Request,
+    legacy_kill_server_wire: Option<PublishedLegacyWireVersion>,
+}
+
+impl IncomingRequest {
+    fn current(request: Request) -> Self {
+        Self {
+            request,
+            legacy_kill_server_wire: None,
+        }
+    }
+
+    fn legacy_kill_server(wire_version: PublishedLegacyWireVersion) -> Self {
+        Self {
+            request: Request::KillServer(rmux_proto::KillServerRequest),
+            legacy_kill_server_wire: Some(wire_version),
+        }
+    }
+}
+
 impl Connection {
     fn new(stream: LocalStream) -> Self {
         Self {
@@ -576,15 +765,24 @@ impl Connection {
         }
     }
 
-    async fn read_request(&mut self) -> io::Result<Option<Request>> {
+    async fn read_request(&mut self) -> io::Result<Option<IncomingRequest>> {
         loop {
-            match self.decoder.next_frame::<Request>() {
-                Ok(Some(request)) => return Ok(Some(request)),
-                Ok(None) => {}
-                Err(error) => {
-                    let response = Response::Error(ErrorResponse { error });
-                    self.write_response(&response).await?;
-                    return Ok(None);
+            match inspect_legacy_kill_server_frame(self.decoder.remaining_bytes()) {
+                LegacyKillServerFrame::Complete(wire_version) => {
+                    self.decoder = FrameDecoder::new();
+                    return Ok(Some(IncomingRequest::legacy_kill_server(wire_version)));
+                }
+                LegacyKillServerFrame::Incomplete => {}
+                LegacyKillServerFrame::NotLegacyKillServer => {
+                    match self.decoder.next_frame::<Request>() {
+                        Ok(Some(request)) => return Ok(Some(IncomingRequest::current(request))),
+                        Ok(None) => {}
+                        Err(error) => {
+                            let response = Response::Error(ErrorResponse { error });
+                            self.write_response(&response).await?;
+                            return Ok(None);
+                        }
+                    }
                 }
             }
 
@@ -599,9 +797,21 @@ impl Connection {
 
     async fn write_response(&mut self, response: &Response) -> io::Result<()> {
         let frame = encode_response_frame(response).map_err(io::Error::other)?;
+        self.write_frame(&frame).await
+    }
+
+    async fn write_legacy_kill_server_response(
+        &mut self,
+        wire_version: PublishedLegacyWireVersion,
+    ) -> io::Result<()> {
+        let frame = encode_legacy_kill_server_response(wire_version);
+        self.write_frame(&frame).await
+    }
+
+    async fn write_frame(&mut self, frame: &[u8]) -> io::Result<()> {
         tokio::time::timeout(
             DETACHED_RESPONSE_WRITE_TIMEOUT,
-            self.stream.write_all(&frame),
+            self.stream.write_all(frame),
         )
         .await
         .map_err(|_| {
@@ -636,8 +846,9 @@ mod tests {
     use super::*;
     use crate::server_access::AccessMode;
     use rmux_proto::{
-        decode_frame, AttachSessionRequest, CancelSdkWaitResponse, DaemonStatusRequest,
-        ErrorResponse, HandshakeRequest, ListSessionsRequest, NewSessionRequest,
+        decode_frame, AttachSessionRequest, CancelSdkWaitResponse, ClientTerminalContext,
+        ControlMode, ControlModeRequest, CreateSessionLeaseRequest, DaemonStatusRequest,
+        ErrorResponse, HandshakeRequest, HasSessionRequest, ListSessionsRequest, NewSessionRequest,
         PaneOutputSubscriptionStart, PaneTarget, RenameSessionRequest, RmuxError,
         SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome,
         SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest, ShutdownIfIdleResponse, TerminalSize,
@@ -680,6 +891,38 @@ mod tests {
         drain_connection_tasks_for_shutdown(&mut tasks).await;
         assert!(tasks.is_empty());
         drop(client);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn excessive_initial_control_commands_are_rejected_before_upgrade_ack() -> io::Result<()>
+    {
+        let handler = Arc::new(RequestHandler::new());
+        let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+
+        write_test_request(
+            &mut client,
+            Request::ControlMode(ControlModeRequest {
+                mode: ControlMode::Plain,
+                client_terminal: ClientTerminalContext::default(),
+                initial_command_count: (rmux_proto::MAX_INITIAL_CONTROL_COMMANDS + 1) as u32,
+            }),
+        )
+        .await?;
+
+        let response = read_test_response(&mut client).await?;
+        assert!(
+            matches!(
+                &response,
+                Response::Error(ErrorResponse {
+                    error: RmuxError::Server(message),
+                }) if message.contains("too many initial control-mode commands")
+            ),
+            "the detached response must reject the command count before upgrading: {response:?}"
+        );
+
+        drop(client);
+        connection_task.await.expect("connection task")?;
         Ok(())
     }
 
@@ -930,6 +1173,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiated_session_lease_by_id_survives_name_reuse_before_creation() -> io::Result<()>
+    {
+        let handler = Arc::new(RequestHandler::new());
+        let original_name = SessionName::new("lease-negotiated-owner").expect("valid session");
+        let renamed = SessionName::new("lease-negotiated-renamed").expect("valid session");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: original_name.clone(),
+                    detached: true,
+                    size: None,
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::RenameSession(RenameSessionRequest {
+                    target: original_name.clone(),
+                    new_name: renamed.clone(),
+                }))
+                .await,
+            Response::RenameSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: original_name.clone(),
+                    detached: true,
+                    size: None,
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+
+        let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+        write_test_request(
+            &mut client,
+            Request::Handshake(HandshakeRequest::requiring([
+                CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
+            ])),
+        )
+        .await?;
+        assert!(matches!(
+            read_test_response(&mut client).await?,
+            Response::Handshake(_)
+        ));
+
+        write_test_request(
+            &mut client,
+            Request::CreateSessionLease(CreateSessionLeaseRequest {
+                session_name: SessionName::new("$0").expect("stable session target"),
+                ttl_millis: 600,
+            }),
+        )
+        .await?;
+        assert!(matches!(
+            read_test_response(&mut client).await?,
+            Response::CreateSessionLease(_)
+        ));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let renamed_exists = handler
+                .handle(Request::HasSession(HasSessionRequest {
+                    target: renamed.clone(),
+                }))
+                .await;
+            if matches!(
+                renamed_exists,
+                Response::HasSession(rmux_proto::HasSessionResponse { exists: false })
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "stable-id lease did not reap the originally created session"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            handler
+                .handle(Request::HasSession(HasSessionRequest {
+                    target: original_name,
+                }))
+                .await,
+            Response::HasSession(rmux_proto::HasSessionResponse { exists: true }),
+            "the session that reused the nominal name must survive"
+        );
+
+        drop(client);
+        connection_task.await.expect("connection task")?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn legacy_sdk_wait_connection_does_not_receive_armed_ack() -> io::Result<()> {
         let handler = Arc::new(RequestHandler::new());
         let session = SessionName::new("sdklegacy").expect("valid session");
@@ -979,6 +1320,86 @@ mod tests {
         );
         drop(client);
         connection_task.await.expect("connection task")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn published_legacy_kill_server_frames_dispatch_and_ack_shutdown() -> io::Result<()> {
+        for wire_version in 1..=3 {
+            let handler = Arc::new(RequestHandler::new());
+            let (server, mut client) = LocalStream::pair()?;
+            let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(());
+            let (shutdown_handle, shutdown_request_rx) = ShutdownHandle::new();
+            handler.install_shutdown_handle(shutdown_handle.clone());
+            let requester = PeerIdentity {
+                pid: std::process::id(),
+                uid: rmux_os::identity::real_user_id(),
+                user: rmux_os::identity::UserIdentity::Uid(rmux_os::identity::real_user_id()),
+            };
+            let connection_id = handler.allocate_connection_id();
+            let connection_handler = Arc::clone(&handler);
+            let connection_task = tokio::spawn(async move {
+                run_connection_with_cleanup(
+                    server,
+                    requester,
+                    connection_handler,
+                    connection_id,
+                    connection_shutdown_rx,
+                    shutdown_handle,
+                )
+                .await
+            });
+
+            let frame = raw_legacy_kill_server_frame(wire_version);
+            for byte in frame {
+                client.write_all(&[byte]).await?;
+                tokio::task::yield_now().await;
+            }
+
+            let mut response = [0_u8; 10];
+            client.read_exact(&mut response).await?;
+            assert_eq!(response[0], rmux_proto::RMUX_FRAME_MAGIC);
+            assert_eq!(response[1], wire_version);
+            assert_eq!(&response[2..6], &4_u32.to_le_bytes());
+            assert_eq!(&response[6..], &63_u32.to_le_bytes());
+
+            tokio::time::timeout(Duration::from_secs(2), shutdown_request_rx)
+                .await
+                .expect("legacy kill-server should request daemon shutdown")
+                .expect("shutdown receiver should complete cleanly");
+            drop(client);
+            let _ = connection_shutdown_tx.send(());
+            connection_task.await.expect("connection task")?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_envelope_exception_rejects_non_kill_and_unpublished_frames() -> io::Result<()> {
+        let mut other_request = raw_legacy_kill_server_frame(3);
+        other_request[6..10].copy_from_slice(&71_u32.to_le_bytes());
+
+        let mut trailing_payload = raw_legacy_kill_server_frame(3);
+        trailing_payload[2..6].copy_from_slice(&5_u32.to_le_bytes());
+        trailing_payload.push(0);
+
+        let unpublished_wire = raw_legacy_kill_server_frame(4);
+
+        for frame in [other_request, trailing_payload, unpublished_wire] {
+            let (server, mut client) = LocalStream::pair()?;
+            let mut connection = Connection::new(server);
+            let read_task = tokio::spawn(async move { connection.read_request().await });
+            client.write_all(&frame).await?;
+
+            let response = read_test_response(&mut client).await?;
+            assert!(matches!(
+                response,
+                Response::Error(ErrorResponse {
+                    error: RmuxError::UnsupportedWireVersion { .. },
+                })
+            ));
+            assert!(read_task.await.expect("read task")?.is_none());
+        }
         Ok(())
     }
 
@@ -1048,7 +1469,13 @@ mod tests {
         let request = tokio::time::timeout(Duration::from_secs(5), connection.read_request())
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read_request timed out"))??;
-        assert!(matches!(request, Some(Request::AttachSession(_))));
+        assert!(matches!(
+            request,
+            Some(IncomingRequest {
+                request: Request::AttachSession(_),
+                legacy_kill_server_wire: None,
+            })
+        ));
         let (mut stream, buffered_bytes) = connection.into_raw_parts();
         let mut stream_remainder = Vec::new();
         stream.read_to_end(&mut stream_remainder).await?;
@@ -1185,6 +1612,13 @@ mod tests {
         })
     }
 
+    fn raw_legacy_kill_server_frame(wire_version: u8) -> Vec<u8> {
+        let mut frame = vec![rmux_proto::RMUX_FRAME_MAGIC, wire_version];
+        frame.extend_from_slice(&4_u32.to_le_bytes());
+        frame.extend_from_slice(&72_u32.to_le_bytes());
+        frame
+    }
+
     async fn write_test_request(stream: &mut LocalStream, request: Request) -> io::Result<()> {
         let frame = encode_frame(&request).map_err(io::Error::other)?;
         stream.write_all(&frame).await
@@ -1225,6 +1659,10 @@ mod tests {
         assert_eq!(handler.wait_for_counts(channel), expected);
     }
 }
+
+#[cfg(all(test, unix, feature = "web"))]
+#[path = "listener_web_share_tests.rs"]
+mod web_share_tests;
 
 #[cfg(all(test, windows))]
 mod windows_tests {

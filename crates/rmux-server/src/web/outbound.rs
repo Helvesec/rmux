@@ -73,6 +73,64 @@ enum ControlCmd {
 struct KeyframeCmd {
     frames: Vec<Vec<u8>>,
     epoch: u64,
+    backlog: AccountedBacklog,
+}
+
+#[derive(Debug)]
+struct AccountedBacklog {
+    backlog_bytes: Arc<AtomicUsize>,
+    len: usize,
+}
+
+impl AccountedBacklog {
+    fn replace(
+        backlog_bytes: Arc<AtomicUsize>,
+        replaced_len: usize,
+        len: usize,
+    ) -> Result<Self, OutboundQueueResult> {
+        backlog_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_sub(replaced_len)?
+                    .checked_add(len)
+                    .filter(|next| *next <= BACKLOG_BYTES_MAX)
+            })
+            .map_err(|_| OutboundQueueResult::Backpressure)?;
+        Ok(Self { backlog_bytes, len })
+    }
+
+    fn disarm(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl Drop for AccountedBacklog {
+    fn drop(&mut self) {
+        subtract_backlog(self.backlog_bytes.as_ref(), self.len);
+    }
+}
+
+struct AccountedDataPermit<'a> {
+    permit: Option<mpsc::Permit<'a, DataCmd>>,
+    backlog_bytes: &'a AtomicUsize,
+    len: usize,
+}
+
+impl AccountedDataPermit<'_> {
+    fn send(mut self, command: DataCmd) {
+        self.permit
+            .take()
+            .expect("accounted data permit must remain available")
+            .send(command);
+    }
+}
+
+impl Drop for AccountedDataPermit<'_> {
+    fn drop(&mut self) {
+        if self.permit.is_some() {
+            subtract_backlog(self.backlog_bytes, self.len);
+        }
+    }
 }
 
 impl WebSocketOutbound {
@@ -106,46 +164,30 @@ impl WebSocketOutbound {
 
     pub(crate) fn queue_frame(&self, bytes: Vec<u8>) -> OutboundQueueResult {
         let len = bytes.len();
-        if self.backlog_exceeds(len) {
-            let result = OutboundQueueResult::Backpressure;
-            trace_outbound_queue("frame", len, result, false);
-            return result;
-        }
-        let epoch = self.latest_epoch.load(Ordering::Acquire);
-        let result = match self.tx.try_send(DataCmd::Frame { bytes, epoch }) {
-            Ok(()) => {
-                self.backlog_bytes.fetch_add(len, Ordering::Relaxed);
-                OutboundQueueResult::Queued
+        let permit = match self.reserve_data_slot(len) {
+            Ok(permit) => permit,
+            Err(result) => {
+                trace_outbound_queue("frame", len, result, false);
+                return result;
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => OutboundQueueResult::Closed,
-            Err(mpsc::error::TrySendError::Full(_)) => OutboundQueueResult::Full,
         };
+        let epoch = self.latest_epoch.load(Ordering::Acquire);
+        permit.send(DataCmd::Frame { bytes, epoch });
+        let result = OutboundQueueResult::Queued;
         trace_outbound_queue("frame", len, result, false);
         result
     }
 
     pub(crate) fn queue_snapshot(&self, bytes: Vec<u8>) -> OutboundQueueResult {
         let len = bytes.len();
-        if self.backlog_exceeds(len) {
-            let result = OutboundQueueResult::Backpressure;
-            trace_outbound_queue("snapshot", len, result, false);
-            return result;
-        }
-        let permit = match self.tx.try_reserve() {
+        let permit = match self.reserve_data_slot(len) {
             Ok(permit) => permit,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                let result = OutboundQueueResult::Closed;
-                trace_outbound_queue("snapshot", len, result, false);
-                return result;
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                let result = OutboundQueueResult::Full;
+            Err(result) => {
                 trace_outbound_queue("snapshot", len, result, false);
                 return result;
             }
         };
         let epoch = self.latest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        self.backlog_bytes.fetch_add(len, Ordering::Relaxed);
         permit.send(DataCmd::Snapshot { bytes, epoch });
         let result = OutboundQueueResult::Queued;
         trace_outbound_queue("snapshot", len, result, false);
@@ -154,22 +196,33 @@ impl WebSocketOutbound {
 
     pub(crate) fn queue_keyframe(&self, frames: Vec<Vec<u8>>) -> OutboundQueueResult {
         let len = keyframe_len(&frames);
-        if self.backlog_exceeds(len) {
-            let result = OutboundQueueResult::Backpressure;
-            trace_outbound_queue("keyframe", len, result, false);
-            return result;
-        }
-        let epoch = self.latest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        match self.latest_keyframe.lock() {
-            Ok(mut latest) => {
-                *latest = Some(KeyframeCmd { frames, epoch });
-            }
+        let mut latest = match self.latest_keyframe.lock() {
+            Ok(latest) => latest,
             Err(_) => {
                 let result = OutboundQueueResult::Closed;
                 trace_outbound_queue("keyframe", len, result, false);
                 return result;
             }
+        };
+        let replaced_len = latest.as_ref().map_or(0, |keyframe| keyframe.backlog.len);
+        let backlog = match AccountedBacklog::replace(self.backlog_bytes.clone(), replaced_len, len)
+        {
+            Ok(backlog) => backlog,
+            Err(result) => {
+                trace_outbound_queue("keyframe", len, result, false);
+                return result;
+            }
+        };
+        if let Some(replaced) = latest.as_mut() {
+            replaced.backlog.disarm();
         }
+        let epoch = self.latest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        *latest = Some(KeyframeCmd {
+            frames,
+            epoch,
+            backlog,
+        });
+        drop(latest);
         if self.keyframe_wakeup_pending.swap(true, Ordering::AcqRel) {
             let result = OutboundQueueResult::Queued;
             trace_outbound_queue("keyframe", len, result, true);
@@ -228,11 +281,30 @@ impl WebSocketOutbound {
         .await
     }
 
-    fn backlog_exceeds(&self, next_len: usize) -> bool {
-        self.backlog_bytes
-            .load(Ordering::Relaxed)
-            .saturating_add(next_len)
-            > BACKLOG_BYTES_MAX
+    fn reserve_data_slot(
+        &self,
+        len: usize,
+    ) -> Result<AccountedDataPermit<'_>, OutboundQueueResult> {
+        let permit = self.tx.try_reserve().map_err(|error| match error {
+            mpsc::error::TrySendError::Closed(_) => OutboundQueueResult::Closed,
+            mpsc::error::TrySendError::Full(_) => OutboundQueueResult::Full,
+        })?;
+        if self
+            .backlog_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(len)
+                    .filter(|next| *next <= BACKLOG_BYTES_MAX)
+            })
+            .is_err()
+        {
+            return Err(OutboundQueueResult::Backpressure);
+        }
+        Ok(AccountedDataPermit {
+            permit: Some(permit),
+            backlog_bytes: self.backlog_bytes.as_ref(),
+            len,
+        })
     }
 
     async fn enqueue_control(
@@ -391,32 +463,32 @@ async fn handle_control_cmd(
                 Ok(mut latest) => latest.take(),
                 Err(_) => None,
             };
-            let Some(KeyframeCmd { frames, epoch }) = keyframe else {
+            let Some(keyframe) = keyframe else {
                 return true;
             };
-            if epoch < latest_epoch.load(Ordering::Acquire) {
+            if keyframe.epoch < latest_epoch.load(Ordering::Acquire) {
                 return true;
             }
-            for (index, frame) in frames.iter().enumerate() {
+            for (index, frame) in keyframe.frames.iter().enumerate() {
                 let _span = crate::perf_instrument::span("web_writer")
                     .with_str("frame", "keyframe")
                     .with_usize("bytes", frame.len())
                     .with_usize("frame_index", index)
-                    .with_usize("frame_count", frames.len())
-                    .with_u64("epoch", epoch);
+                    .with_usize("frame_count", keyframe.frames.len())
+                    .with_u64("epoch", keyframe.epoch);
                 if let Err(error) = write_with_timeout(writer.write_binary(frame)).await {
                     warn!(
                         frame = "keyframe",
-                        epoch,
+                        epoch = keyframe.epoch,
                         frame_index = index,
-                        frame_count = frames.len(),
+                        frame_count = keyframe.frames.len(),
                         error = %error,
                         "web-share writer task stopped"
                     );
                     return false;
                 }
             }
-            latest_epoch.fetch_max(epoch, Ordering::Release);
+            latest_epoch.fetch_max(keyframe.epoch, Ordering::Release);
         }
         ControlCmd::Text { text, done } => {
             let _span = crate::perf_instrument::span("web_writer")
@@ -521,8 +593,49 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::{
-        ControlCmd, OutboundQueueResult, WebSocketOutbound, BACKLOG_BYTES_MAX, VIEWER_CHANNEL_CAP,
+        subtract_backlog, ControlCmd, DataCmd, OutboundQueueResult, WebSocketOutbound,
+        BACKLOG_BYTES_MAX, VIEWER_CHANNEL_CAP,
     };
+
+    #[tokio::test]
+    async fn data_slot_accounts_backlog_before_publication() {
+        let (outbound, mut data_rx, _control_rx) = WebSocketOutbound::test_channels();
+
+        let permit = outbound
+            .reserve_data_slot(4)
+            .expect("reserve accounted data slot");
+
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 4);
+        assert!(data_rx.try_recv().is_err());
+
+        permit.send(DataCmd::Frame {
+            bytes: vec![b'r', b'm', b'u', b'x'],
+            epoch: 0,
+        });
+        let command = data_rx.recv().await.expect("published data command");
+        let DataCmd::Frame { bytes, epoch } = command else {
+            panic!("expected frame command");
+        };
+        assert_eq!(bytes, b"rmux");
+        assert_eq!(epoch, 0);
+        subtract_backlog(outbound.backlog_bytes.as_ref(), bytes.len());
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_unsent_data_slot_rolls_back_accounting() {
+        let (outbound, mut data_rx, _control_rx) = WebSocketOutbound::test_channels();
+
+        let permit = outbound
+            .reserve_data_slot(4)
+            .expect("reserve accounted data slot");
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 4);
+
+        drop(permit);
+
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 0);
+        assert!(data_rx.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn keyframe_replaces_latest_even_when_data_queue_is_full() {
@@ -551,6 +664,92 @@ mod tests {
         let latest = latest.as_ref().expect("latest keyframe retained");
         assert_eq!(latest.frames, vec![vec![b'n', b'e', b'w']]);
         assert_eq!(latest.epoch, outbound.latest_epoch.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn keyframe_then_data_respects_shared_backlog_limit() {
+        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
+
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![0; BACKLOG_BYTES_MAX]]),
+            OutboundQueueResult::Queued
+        );
+        assert_eq!(
+            outbound.backlog_bytes.load(Ordering::Acquire),
+            BACKLOG_BYTES_MAX
+        );
+        assert_eq!(
+            outbound.queue_frame(vec![0]),
+            OutboundQueueResult::Backpressure
+        );
+        assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
+    }
+
+    #[tokio::test]
+    async fn replacing_latest_keyframe_transfers_its_backlog_reservation() {
+        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
+
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![b'o'; BACKLOG_BYTES_MAX]]),
+            OutboundQueueResult::Queued
+        );
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![b'n'; BACKLOG_BYTES_MAX]]),
+            OutboundQueueResult::Queued
+        );
+
+        assert_eq!(
+            outbound.backlog_bytes.load(Ordering::Acquire),
+            BACKLOG_BYTES_MAX
+        );
+        assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
+        assert!(control_rx.try_recv().is_err());
+        let latest = outbound.latest_keyframe.lock().expect("keyframe lock");
+        assert_eq!(latest.as_ref().expect("latest keyframe").frames[0][0], b'n');
+    }
+
+    #[tokio::test]
+    async fn in_flight_keyframe_remains_in_the_shared_backlog_budget() {
+        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
+
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![0; BACKLOG_BYTES_MAX - 1]]),
+            OutboundQueueResult::Queued
+        );
+        assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
+        outbound
+            .keyframe_wakeup_pending
+            .store(false, Ordering::Release);
+        let in_flight = outbound
+            .latest_keyframe
+            .lock()
+            .expect("keyframe lock")
+            .take()
+            .expect("in-flight keyframe");
+
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![0; 2]]),
+            OutboundQueueResult::Backpressure
+        );
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![0]]),
+            OutboundQueueResult::Queued
+        );
+        assert_eq!(
+            outbound.backlog_bytes.load(Ordering::Acquire),
+            BACKLOG_BYTES_MAX
+        );
+
+        drop(in_flight);
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 1);
+        drop(
+            outbound
+                .latest_keyframe
+                .lock()
+                .expect("keyframe lock")
+                .take(),
+        );
+        assert_eq!(outbound.backlog_bytes.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

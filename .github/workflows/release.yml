@@ -19,6 +19,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: rmux-release
+  cancel-in-progress: false
+
 env:
   CARGO_HTTP_MULTIPLEXING: "false"
   CARGO_TERM_COLOR: always
@@ -27,6 +31,7 @@ jobs:
   source-gates:
     name: Release source gates
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     outputs:
       package_version: ${{ steps.release_identity.outputs.package_version }}
       release_version: ${{ steps.release_identity.outputs.release_version }}
@@ -139,6 +144,7 @@ jobs:
     needs:
       - source-gates
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -176,6 +182,7 @@ jobs:
       BINARY: ${{ matrix.binary }}
       BUILD_PROFILE: release
       PROFILE_DIR: release
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
     steps:
       - name: Validate release ref
         shell: bash
@@ -291,7 +298,7 @@ jobs:
           $env:CARGO_PROFILE_DEV_DEBUG = "0"
           $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG = "0"
           $env:CARGO_PROFILE_TEST_DEBUG = "0"
-          $env:RUSTFLAGS = "-Clink-arg=/DEBUG:NONE"
+          $env:RUSTFLAGS = "-C target-feature=+crt-static -Clink-arg=/DEBUG:NONE"
           # GitHub Actions pwsh only checks the LAST native exit code, so a
           # failing intermediate assert or cargo test would be masked by any
           # later success; fail closed after every native command instead,
@@ -334,6 +341,11 @@ jobs:
           } finally {
             $env:RUSTFLAGS = $testRustFlags
           }
+          Run "./scripts/assert-windows-static-crt.ps1" @(
+            "-Binary", $releaseBin,
+            "-HelperBinary", $packageHelper,
+            "-DaemonBinary", $releaseDaemon
+          )
           $actualGitSha = (& git rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or $actualGitSha -ne $env:RMUX_EXPECTED_GIT_SHA) {
             throw "release binary manifest Git SHA does not match the checked-out release"
@@ -458,6 +470,63 @@ jobs:
             dist/*.rpm
           if-no-files-found: error
 
+  platform-gates:
+    name: Native release gate on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    needs:
+      - source-gates
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15-intel
+          - macos-15
+          - windows-latest
+    env:
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.SOURCE_GIT_SHA }}
+          persist-credentials: false
+
+      - name: Verify immutable source checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_GIT_SHA"
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.96.1"
+          components: rustfmt
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Windows native release review gate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: "1"
+        run: ./scripts/release-review-gate-windows.ps1 -SkipPackage -SkipClippy
+
+      - name: macOS native runtime smoke
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rmux-macos-smoke-target
+          RMUX_SMOKE_DIR: ${{ runner.temp }}/rmux-macos-smoke-reports
+        run: scripts/smoke-macos.sh
+
+      - name: Upload macOS native smoke report
+        if: runner.os == 'macOS' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-${{ env.RELEASE_REF }}-${{ matrix.os }}-macos-smoke
+          path: ${{ runner.temp }}/rmux-macos-smoke-reports
+          if-no-files-found: error
+
   snap:
     name: Build Snap ${{ matrix.snap-arch }}
     runs-on: ${{ matrix.os }}
@@ -516,9 +585,43 @@ jobs:
           path: ${{ steps.snapcraft.outputs.snap }}
           if-no-files-found: error
 
-  publish:
-    name: Publish GitHub release assets
+  validate-external-configuration:
+    name: Validate external rollout configuration
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: release
+    needs:
+      - source-gates
+    env:
+      IS_PRERELEASE: ${{ needs.source-gates.outputs.is_prerelease }}
+    steps:
+      - name: Require configured external publishers
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
+        shell: bash
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+          RMUX_PACKAGE_REPO_TOKEN: ${{ secrets.RMUX_PACKAGE_REPO_TOKEN }}
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          missing=0
+          if [ -z "${SNAPCRAFT_STORE_CREDENTIALS:-}" ]; then
+            echo "Missing required secret: SNAPCRAFT_STORE_CREDENTIALS" >&2
+            missing=1
+          fi
+          if [ "$IS_PRERELEASE" != "true" ]; then
+            for name in RMUX_PACKAGE_REPO_TOKEN CHOCOLATEY_API_KEY; do
+              if [ -z "${!name:-}" ]; then
+                echo "Missing required secret: $name" >&2
+                missing=1
+              fi
+            done
+          fi
+          [ "$missing" -eq 0 ]
+
+  prepare-release:
+    name: Prepare signed release draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     environment: release
     permissions:
       contents: write
@@ -527,6 +630,7 @@ jobs:
     needs:
       - source-gates
       - build
+      - platform-gates
       - snap
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
@@ -534,6 +638,8 @@ jobs:
       RELEASE_VERSION: ${{ needs.source-gates.outputs.release_version }}
       IS_PRERELEASE: ${{ needs.source-gates.outputs.is_prerelease }}
       SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
+      RMUX_PACKAGE_REPO: Helvesec/rmux-packages
+      RMUX_PACKAGE_REPO_BRANCH: main
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -711,6 +817,53 @@ jobs:
           path: target/package-managers
           if-no-files-found: error
 
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-validation-assets-${{ env.RELEASE_REF }}
+          path: release-assets/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Authenticate retained Linux package history
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+        shell: bash
+        env:
+          RMUX_APT_GPG_KEY: ${{ secrets.RMUX_APT_GPG_KEY }}
+          RMUX_RPM_GPG_KEY: ${{ secrets.RMUX_RPM_GPG_KEY }}
+        run: |
+          : "${RMUX_APT_GPG_KEY:?missing RMUX_APT_GPG_KEY}"
+          : "${RMUX_RPM_GPG_KEY:?missing RMUX_RPM_GPG_KEY}"
+          : "${RMUX_PACKAGE_REPO:?missing RMUX_PACKAGE_REPO}"
+          : "${RMUX_PACKAGE_REPO_BRANCH:?missing RMUX_PACKAGE_REPO_BRANCH}"
+          (
+            cd release-assets
+            sha256sum --check --strict SHA256SUMS
+          )
+          rm -rf target/package-repository-inputs
+          mkdir -p target/package-repository-inputs
+          shopt -s nullglob
+          current_packages=(release-assets/*.deb release-assets/*.rpm)
+          if (( ${#current_packages[@]} == 0 )); then
+            echo "No current Linux packages found in release assets" >&2
+            exit 1
+          fi
+          cp -- "${current_packages[@]}" target/package-repository-inputs/
+          rm -rf target/package-repository-history
+          git clone --depth 1 --branch "$RMUX_PACKAGE_REPO_BRANCH" \
+            "https://github.com/${RMUX_PACKAGE_REPO}.git" \
+            target/package-repository-history
+          git -C target/package-repository-history rev-parse --verify 'HEAD^{commit}' \
+            > target/PACKAGE_REPOSITORY_BASE
+          scripts/retain-linux-package-history.py \
+            --repository-dir target/package-repository-history \
+            --staging-dir target/package-repository-inputs \
+            --apt-signing-key "$RMUX_APT_GPG_KEY" \
+            --rpm-signing-key "$RMUX_RPM_GPG_KEY" \
+            --current-version "$PACKAGE_VERSION" \
+            --apt-architecture amd64 \
+            --apt-architecture arm64 \
+            --rpm-architecture x86_64 \
+            --rpm-architecture aarch64
+
       - name: Generate Linux package repositories
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
         shell: bash
@@ -724,7 +877,7 @@ jobs:
           : "${RMUX_RPM_REPO_GPG_KEY:?missing RMUX_RPM_REPO_GPG_KEY}"
           mkdir -p target/package-repositories
           scripts/generate-apt-repository.sh \
-            --input-dir release-assets \
+            --input-dir target/package-repository-inputs \
             --output-dir target/package-repositories/debian \
             --suite stable \
             --component main \
@@ -732,12 +885,13 @@ jobs:
             --architecture arm64 \
             --signing-key "$RMUX_APT_GPG_KEY"
           scripts/generate-rpm-repository.sh \
-            --input-dir release-assets \
+            --input-dir target/package-repository-inputs \
             --output-dir target/package-repositories/rpm \
             --baseurl https://packages.rmux.io/rpm \
             --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
             --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \
             --rpm-signing-key "$RMUX_RPM_GPG_KEY" \
+            --rpm-signing-version "$PACKAGE_VERSION" \
             --repo-signing-key "$RMUX_RPM_REPO_GPG_KEY"
           gpg --armor --export "$RMUX_APT_GPG_KEY" > target/package-repositories/debian/rmux.asc
           gpg --armor --export "$RMUX_RPM_GPG_KEY" > target/package-repositories/rpm/RPM-GPG-KEY-rmux
@@ -755,6 +909,13 @@ jobs:
           test -f target/package-repositories/rpm/rmux.repo
           grep -qx 'gpgcheck=1' target/package-repositories/rpm/rmux.repo
           grep -qx 'repo_gpgcheck=1' target/package-repositories/rpm/rmux.repo
+          cp target/PACKAGE_REPOSITORY_BASE target/package-repositories/PACKAGE_REPOSITORY_BASE
+          (
+            cd target/package-repositories
+            find debian rpm PACKAGE_REPOSITORY_BASE -type f -print0 | LC_ALL=C sort -z | \
+              xargs -0 sha256sum > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
@@ -770,7 +931,17 @@ jobs:
           tag="$RELEASE_REF"
           scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
           scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$tag" "$SOURCE_GIT_SHA"
-          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if release_is_draft="$(
+            gh release view "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft 2>/dev/null
+          )"; then
+            if [ "$release_is_draft" != "true" ]; then
+              echo "Refusing to replace assets on published release $tag" >&2
+              exit 1
+            fi
+          else
             release_args=(
               "$tag"
               --repo "$GITHUB_REPOSITORY"
@@ -801,108 +972,24 @@ jobs:
           fi
           scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
           scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$tag" "$SOURCE_GIT_SHA"
+          test "$(
+            gh release view "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft
+          )" = "true" || {
+            echo "Refusing to replace assets on published release $tag" >&2
+            exit 1
+          }
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "${assets[@]}" --clobber
           scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
           scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$tag" "$SOURCE_GIT_SHA"
-
-      - name: Deploy Linux package repositories
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
-        shell: bash
-        env:
-          RMUX_PACKAGE_REPO_TOKEN: ${{ secrets.RMUX_PACKAGE_REPO_TOKEN }}
-          RMUX_PACKAGE_REPO: Helvesec/rmux-packages
-          RMUX_PACKAGE_REPO_BRANCH: main
-        run: |
-          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
-          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$RELEASE_REF" "$SOURCE_GIT_SHA"
-          : "${RMUX_PACKAGE_REPO_TOKEN:?missing RMUX_PACKAGE_REPO_TOKEN}"
-          : "${RMUX_PACKAGE_REPO:?missing RMUX_PACKAGE_REPO}"
-          : "${RMUX_PACKAGE_REPO_BRANCH:?missing RMUX_PACKAGE_REPO_BRANCH}"
-
-          test -d target/package-repositories/debian
-          test -d target/package-repositories/rpm
-
-          work="$(mktemp -d)"
-          trap 'rm -rf "$work"' EXIT
-          package_repo_url="https://x-access-token:${RMUX_PACKAGE_REPO_TOKEN}@github.com/${RMUX_PACKAGE_REPO}.git"
-          git clone --depth 1 --branch "$RMUX_PACKAGE_REPO_BRANCH" "$package_repo_url" "$work"
-
-          rm -rf "$work/debian" "$work/rpm"
-          cp -a target/package-repositories/debian "$work/debian"
-          cp -a target/package-repositories/rpm "$work/rpm"
-
-          cat > "$work/index.html" <<'EOF'
-          <!doctype html>
-          <html lang="en">
-            <head>
-              <meta charset="utf-8">
-              <meta name="viewport" content="width=device-width, initial-scale=1">
-              <title>RMUX Packages</title>
-            </head>
-            <body>
-              <h1>RMUX Packages</h1>
-              <ul>
-                <li><a href="/debian/dists/stable/InRelease">APT repository</a></li>
-                <li><a href="/rpm/rmux.repo">RPM repository</a></li>
-              </ul>
-            </body>
-          </html>
-          EOF
-
-          cat > "$work/_headers" <<'EOF'
-          /debian/dists/*
-            Cache-Control: public, max-age=300
-
-          /debian/rmux.asc
-            Cache-Control: public, max-age=3600
-
-          /debian/pool/*
-            Cache-Control: public, max-age=31536000, immutable
-
-          /rpm/repodata/*
-            Cache-Control: public, max-age=300
-
-          /rpm/RPM-GPG-KEY-rmux
-            Cache-Control: public, max-age=3600
-
-          /rpm/rmux.repo
-            Cache-Control: public, max-age=300
-
-          /rpm/*.rpm
-            Cache-Control: public, max-age=31536000, immutable
-          EOF
-
-          cd "$work"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          if [ -z "$(git status --porcelain)" ]; then
-            echo "Linux package repository already points to $RELEASE_REF."
-            exit 0
-          fi
-
-          git add _headers index.html debian rpm
-          git commit -m "packages: publish rmux $RELEASE_REF"
-          git push "$package_repo_url" "HEAD:$RMUX_PACKAGE_REPO_BRANCH"
-
-      - name: Publish GitHub release
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
-        shell: bash
-        run: |
-          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
-          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$RELEASE_REF" "$SOURCE_GIT_SHA"
-          gh release edit "$RELEASE_REF" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --target "$SOURCE_GIT_SHA" \
-            --draft=false
-          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
-          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$RELEASE_REF" "$SOURCE_GIT_SHA"
 
   publish-snap:
     name: Publish Snap ${{ matrix.snap-arch }} candidate
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     needs:
       - publish
       - snap
@@ -964,8 +1051,9 @@ jobs:
   validate-winget:
     name: Validate WinGet manifest
     runs-on: windows-latest
+    timeout-minutes: 60
     needs:
-      - publish
+      - prepare-release
       - source-gates
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
@@ -998,18 +1086,10 @@ jobs:
           name: package-manager-metadata-${{ env.RELEASE_REF }}
           path: package-manager-metadata
 
-      - name: Download release checksums
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          gh release download $env:RELEASE_REF `
-            --repo $env:GITHUB_REPOSITORY `
-            --pattern SHA256SUMS `
-            --dir release-assets `
-            --clobber
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-validation-assets-${{ env.RELEASE_REF }}
+          path: release-assets
 
       - name: Validate generated WinGet manifest
         shell: pwsh
@@ -1034,19 +1114,17 @@ jobs:
           winget --version
           winget validate --manifest $manifest --disable-interactivity
 
-  publish-chocolatey:
-    name: Publish Chocolatey package
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+  validate-chocolatey:
+    name: Validate Chocolatey package
     runs-on: windows-latest
+    timeout-minutes: 60
     needs:
-      - publish
+      - prepare-release
       - source-gates
-    environment: release
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
       PACKAGE_VERSION: ${{ needs.source-gates.outputs.package_version }}
       SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
-      CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
     steps:
       - name: Validate release ref
         shell: pwsh
@@ -1077,12 +1155,10 @@ jobs:
       - name: Validate Chocolatey prerequisites
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
-            throw "Missing required GitHub Actions secret: CHOCOLATEY_API_KEY"
-          }
           choco --version
 
-      - name: Pack and smoke-test Chocolatey package
+      - name: Pack Chocolatey package
+        id: chocolatey
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1117,6 +1193,238 @@ jobs:
           if (-not (Test-Path $package)) {
             throw "Chocolatey package was not generated: $package"
           }
+          "package=$package" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: chocolatey-package-${{ env.RELEASE_REF }}
+          path: ${{ steps.chocolatey.outputs.package }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish canonical GitHub release
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+    needs:
+      - source-gates
+      - prepare-release
+      - validate-external-configuration
+      - validate-winget
+      - validate-chocolatey
+    env:
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.SOURCE_GIT_SHA }}
+          persist-credentials: false
+
+      - name: Verify immutable source checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_GIT_SHA"
+
+      - name: Publish GitHub release
+        shell: bash
+        run: |
+          # GitHub is the canonical public recovery point. APT/RPM, Snap, and
+          # Chocolatey start only after this succeeds; those independent
+          # stores cannot be made transactionally atomic with one another.
+          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
+          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$RELEASE_REF" "$SOURCE_GIT_SHA"
+          release_is_draft="$(
+            gh release view "$RELEASE_REF" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft
+          )"
+          case "$release_is_draft" in
+            true)
+              gh release edit "$RELEASE_REF" \
+                --repo "$GITHUB_REPOSITORY" \
+                --verify-tag \
+                --target "$SOURCE_GIT_SHA" \
+                --draft=false
+              ;;
+            false)
+              # A failed post-publication verification may be retried without
+              # republishing or blocking the downstream store jobs.
+              echo "Canonical GitHub release $RELEASE_REF is already public."
+              ;;
+            *)
+              echo "Unable to resolve draft state for $RELEASE_REF" >&2
+              exit 1
+              ;;
+          esac
+          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
+          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$RELEASE_REF" "$SOURCE_GIT_SHA"
+
+  publish-linux-repositories:
+    name: Publish APT and RPM repositories
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    needs:
+      - publish
+      - prepare-release
+      - source-gates
+    env:
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
+      GH_TOKEN: ${{ github.token }}
+      RMUX_PACKAGE_REPO: Helvesec/rmux-packages
+      RMUX_PACKAGE_REPO_BRANCH: main
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.SOURCE_GIT_SHA }}
+          persist-credentials: false
+
+      - name: Verify immutable source checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_GIT_SHA"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-package-repositories-${{ env.RELEASE_REF }}
+          path: package-repositories
+
+      - name: Deploy Linux package repositories
+        shell: bash
+        env:
+          RMUX_PACKAGE_REPO_TOKEN: ${{ secrets.RMUX_PACKAGE_REPO_TOKEN }}
+        run: |
+          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
+          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$RELEASE_REF" "$SOURCE_GIT_SHA"
+          : "${RMUX_PACKAGE_REPO_TOKEN:?missing RMUX_PACKAGE_REPO_TOKEN}"
+          : "${RMUX_PACKAGE_REPO:?missing RMUX_PACKAGE_REPO}"
+          : "${RMUX_PACKAGE_REPO_BRANCH:?missing RMUX_PACKAGE_REPO_BRANCH}"
+
+          test -d package-repositories/debian
+          test -d package-repositories/rpm
+          test -s package-repositories/PACKAGE_REPOSITORY_BASE
+          test -s package-repositories/SHA256SUMS
+          (
+            cd package-repositories
+            sha256sum --check --strict SHA256SUMS
+          )
+
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          package_repo_url="https://x-access-token:${RMUX_PACKAGE_REPO_TOKEN}@github.com/${RMUX_PACKAGE_REPO}.git"
+          git clone --depth 1 --branch "$RMUX_PACKAGE_REPO_BRANCH" "$package_repo_url" "$work"
+          expected_base="$(tr -d '\r\n' < package-repositories/PACKAGE_REPOSITORY_BASE)"
+          scripts/verify-package-repository-base.sh "$work" "$expected_base"
+
+          rm -rf "$work/debian" "$work/rpm"
+          cp -a package-repositories/debian "$work/debian"
+          cp -a package-repositories/rpm "$work/rpm"
+
+          cat > "$work/index.html" <<'EOF'
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>RMUX Packages</title>
+            </head>
+            <body>
+              <h1>RMUX Packages</h1>
+              <ul>
+                <li><a href="/debian/dists/stable/InRelease">APT repository</a></li>
+                <li><a href="/rpm/rmux.repo">RPM repository</a></li>
+              </ul>
+            </body>
+          </html>
+          EOF
+
+          cat > "$work/_headers" <<'EOF'
+          /debian/dists/*
+            Cache-Control: public, max-age=300
+
+          /debian/rmux.asc
+            Cache-Control: public, max-age=3600
+
+          /debian/pool/*
+            Cache-Control: public, max-age=31536000, immutable
+
+          /rpm/repodata/*
+            Cache-Control: public, max-age=300
+
+          /rpm/RPM-GPG-KEY-rmux
+            Cache-Control: public, max-age=3600
+
+          /rpm/rmux.repo
+            Cache-Control: public, max-age=300
+
+          /rpm/*.rpm
+            Cache-Control: public, max-age=31536000, immutable
+          EOF
+
+          cd "$work"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Linux package repository already points to $RELEASE_REF."
+            exit 0
+          fi
+
+          git add _headers index.html debian rpm
+          git commit -m "packages: publish rmux $RELEASE_REF"
+          git push "$package_repo_url" "HEAD:$RMUX_PACKAGE_REPO_BRANCH"
+
+  publish-chocolatey:
+    name: Publish Chocolatey package
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs:
+      - publish
+      - source-gates
+      - validate-chocolatey
+    environment: release
+    env:
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      PACKAGE_VERSION: ${{ needs.source-gates.outputs.package_version }}
+      SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.SOURCE_GIT_SHA }}
+          persist-credentials: false
+
+      - name: Verify immutable source checkout
+        shell: pwsh
+        run: |
+          $actual = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:SOURCE_GIT_SHA) {
+            throw "checked-out source does not match SOURCE_GIT_SHA"
+          }
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: chocolatey-package-${{ env.RELEASE_REF }}
+          path: chocolatey-package
+
+      - name: Smoke-test Chocolatey package against public assets
+        shell: pwsh
+        run: |
+          # The generated install script intentionally downloads the canonical
+          # GitHub URL, so this rollout smoke cannot run against a private draft.
+          $ErrorActionPreference = "Stop"
+          $version = $env:PACKAGE_VERSION
+          $package = "chocolatey-package\rmux.$version.nupkg"
+          if (-not (Test-Path $package)) {
+            throw "Chocolatey package not found: $package"
+          }
+          $packageRoot = (Resolve-Path "chocolatey-package").Path
 
           choco install rmux `
             --source $packageRoot `
@@ -1131,19 +1439,20 @@ jobs:
           }
 
           .\scripts\smoke-installed-rmux.ps1 -Rmux rmux -RequireDaemonCommand
-
           choco uninstall rmux --yes --no-progress
           "CHOCOLATEY_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Push Chocolatey package
         shell: pwsh
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
           $ErrorActionPreference = "Stop"
-          if (-not (Test-Path $env:CHOCOLATEY_PACKAGE)) {
-            throw "Chocolatey package not found: $env:CHOCOLATEY_PACKAGE"
+          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
+            throw "Missing required GitHub Actions secret: CHOCOLATEY_API_KEY"
           }
 
-          $version = $env:VERSION
+          $version = $env:PACKAGE_VERSION
           $query = "https://community.chocolatey.org/api/v2/FindPackagesById()?id='rmux'"
           $response = Invoke-WebRequest -Uri $query -Method Get
           [xml]$feed = $response.Content

@@ -5,6 +5,8 @@ use std::ffi::{CStr, CString};
 use std::io;
 
 #[cfg(windows)]
+use std::mem::{size_of, MaybeUninit};
+#[cfg(windows)]
 use std::ptr::null_mut;
 #[cfg(windows)]
 use std::sync::OnceLock;
@@ -25,6 +27,62 @@ pub enum UserIdentity {
     Uid(u32),
     /// Windows security identifier string.
     Sid(Box<str>),
+}
+
+/// Storage aligned for a variable-length Windows token-information record.
+///
+/// Windows writes a fixed `Header` followed by variable-length data into the
+/// same allocation. Keeping the allocation typed as `MaybeUninit<Header>`
+/// preserves the header's alignment without claiming that Windows has
+/// initialized it before a successful API call.
+#[cfg(windows)]
+pub struct TokenInformationBuffer<Header> {
+    storage: Vec<MaybeUninit<Header>>,
+    byte_len: u32,
+}
+
+#[cfg(windows)]
+impl<Header> TokenInformationBuffer<Header> {
+    /// Allocates enough header-aligned storage for `byte_len` bytes.
+    pub fn new(byte_len: u32) -> io::Result<Self> {
+        let byte_len_usize = usize::try_from(byte_len).map_err(|_| io::ErrorKind::InvalidData)?;
+        let header_size = size_of::<Header>();
+        if header_size == 0 || byte_len_usize < header_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows token information is smaller than its header",
+            ));
+        }
+        let units = byte_len_usize.div_ceil(header_size);
+        let storage = std::iter::repeat_with(MaybeUninit::uninit)
+            .take(units)
+            .collect();
+        Ok(Self { storage, byte_len })
+    }
+
+    /// Returns the writable storage pointer passed to `GetTokenInformation`.
+    pub fn as_mut_ptr(&mut self) -> *mut core::ffi::c_void {
+        self.storage.as_mut_ptr().cast()
+    }
+
+    /// Returns the exact byte length requested from Windows.
+    #[must_use]
+    pub const fn byte_len(&self) -> u32 {
+        self.byte_len
+    }
+
+    /// Returns the initialized fixed header after a successful Windows query.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that Windows successfully initialized a valid
+    /// `Header` at the start of this buffer and that any pointers read through
+    /// the header are used only while this buffer remains alive.
+    pub unsafe fn assume_init_header(&self) -> &Header {
+        // SAFETY: The caller establishes initialization and validity; the
+        // allocation itself is aligned for Header by construction.
+        unsafe { self.storage[0].assume_init_ref() }
+    }
 }
 
 /// Unix user details resolved from the platform account database.
@@ -286,14 +344,15 @@ fn token_user_sid_string(token: HANDLE) -> io::Result<String> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut buffer = vec![0_u8; usize::try_from(needed).map_err(|_| io::ErrorKind::InvalidData)?];
+    let mut buffer = TokenInformationBuffer::<TOKEN_USER>::new(needed)?;
+    let buffer_len = buffer.byte_len();
     let ok = unsafe {
-        // SAFETY: `buffer` is writable for `needed` bytes reported above.
+        // SAFETY: `buffer` is writable for the aligned byte count allocated above.
         GetTokenInformation(
             token,
             TokenUser,
-            buffer.as_mut_ptr().cast(),
-            needed,
+            buffer.as_mut_ptr(),
+            buffer_len,
             &mut needed,
         )
     };
@@ -302,9 +361,9 @@ fn token_user_sid_string(token: HANDLE) -> io::Result<String> {
     }
 
     let token_user = unsafe {
-        // SAFETY: A successful TokenUser query initializes a TOKEN_USER header
-        // at the beginning of the provided buffer.
-        &*(buffer.as_ptr().cast::<TOKEN_USER>())
+        // SAFETY: A successful TokenUser query initializes a valid TOKEN_USER
+        // header and its SID remains backed by `buffer` for this call.
+        buffer.assume_init_header()
     };
     sid_to_string(token_user.User.Sid)
 }
@@ -356,6 +415,9 @@ fn wide_ptr_to_string(ptr: *const u16) -> io::Result<String> {
 mod tests {
     use super::{IdentityResolver, UserIdentity};
 
+    #[cfg(windows)]
+    use super::TokenInformationBuffer;
+
     #[test]
     fn current_identity_is_available() {
         let identity = IdentityResolver::current().expect("current user identity");
@@ -371,6 +433,35 @@ mod tests {
         let second = IdentityResolver::current().expect("second current user identity");
 
         assert_eq!(first, second);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn token_information_buffer_aligns_and_covers_variable_data() {
+        #[repr(C, align(32))]
+        struct AlignedHeader([u8; 32]);
+
+        let requested = std::mem::size_of::<AlignedHeader>() + 1;
+        let mut buffer = TokenInformationBuffer::<AlignedHeader>::new(
+            u32::try_from(requested).expect("test size fits u32"),
+        )
+        .expect("aligned token buffer");
+
+        assert_eq!(
+            buffer.as_mut_ptr() as usize % std::mem::align_of::<AlignedHeader>(),
+            0
+        );
+        assert!(buffer.storage.len() * std::mem::size_of::<AlignedHeader>() >= requested);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn token_information_buffer_rejects_an_incomplete_header() {
+        let error = TokenInformationBuffer::<u64>::new(1)
+            .err()
+            .expect("undersized token buffer must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[cfg(unix)]

@@ -195,6 +195,24 @@ fn search_again_advances_to_next_match() {
 }
 
 #[test]
+fn case_insensitive_plain_search_maps_unicode_expansion_to_original_cell() {
+    let screen = build_screen(10, 1, "İx");
+    let mut state = CopyModeState::for_test(screen);
+    let context = test_context();
+
+    state
+        .execute_command("search-forward-text", &["x".to_owned()], &context)
+        .unwrap();
+
+    assert_eq!(state.search_results.len(), 1);
+    assert_eq!(state.search_results[0].text, "x");
+    assert_eq!(
+        state.cursor.x, 1,
+        "the match must stay on the original x cell"
+    );
+}
+
+#[test]
 fn oversized_regex_search_marks_partial_without_matches() {
     let screen = build_screen(80, 3, &"a".repeat(1000));
     let mut state = CopyModeState::for_test(screen);

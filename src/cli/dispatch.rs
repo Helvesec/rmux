@@ -3,7 +3,8 @@ use std::path::Path;
 
 use rmux_client::connect;
 use rmux_proto::{
-    ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response, Target,
+    ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response,
+    INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
 };
 
 use super::attach_transport::{
@@ -109,7 +110,11 @@ fn dispatch_commands(
     client_terminal: ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
     let mut exit_code = 0;
-    let queued_commands = commands.len() > 1;
+    let queued_commands = commands
+        .iter()
+        .filter(|command| !matches!(command, Command::ApplyParseTimeAssignments(_)))
+        .count()
+        > 1;
     let mut queued_attach_session = None::<QueuedAttachSession>;
     for (index, command) in commands.iter().cloned().enumerate() {
         let command_is_detach_client = matches!(&command, Command::DetachClient(_));
@@ -178,6 +183,7 @@ fn command_allows_detached_connection_reuse(candidate: &Command) -> bool {
     match candidate {
         Command::SendKeys(args) if args.has_wait() => false,
         Command::Noop => true,
+        Command::ApplyParseTimeAssignments(_) => false,
         Command::NewSession(_)
         | Command::StartServer(_)
         | Command::KillServer
@@ -291,13 +297,21 @@ fn dispatch(
     queue_attach_detach: bool,
     queued_attach_session: &mut Option<QueuedAttachSession>,
 ) -> Result<i32, ExitFailure> {
+    let start_server_args = match &command {
+        Command::StartServer(args) => Some(args),
+        _ => None,
+    };
     let command_startup = startup.for_command(
         command_has_start_server_flag(&command),
         command_requires_web_daemon(&command),
+        start_server_args,
     );
 
     match command {
         Command::Noop => run_noop(socket_path),
+        Command::ApplyParseTimeAssignments(assignments) => {
+            run_apply_parse_time_assignments(socket_path, assignments)
+        }
         Command::NewSession(args) => {
             run_new_session(args, socket_path, command_startup, client_terminal)
         }
@@ -512,7 +526,7 @@ fn dispatch(
         Command::SendKeys(args) => run_send_keys(args, socket_path),
         Command::BindKey(args) => run_bind_key(args, socket_path),
         Command::UnbindKey(args) => run_unbind_key(args, socket_path),
-        Command::ListCommands(args) => run_list_commands(args),
+        Command::ListCommands(args) => run_list_commands(args, socket_path),
         Command::ListKeys(args) => run_list_keys(args, socket_path),
         Command::SendPrefix(args) => run_send_prefix(args, socket_path),
         Command::Prompt(args) => {
@@ -657,8 +671,7 @@ fn dispatch(
             let (command, arguments) =
                 run_shell_command_and_arguments(args.command, args.as_commands)?;
             run_command_resolved(socket_path, "run-shell", move |connection| {
-                let target =
-                    resolve_run_shell_target(connection, socket_path, args.target.as_ref())?;
+                let target = resolve_run_shell_target(connection, args.target.as_ref())?;
                 connection
                     .run_shell(
                         command,
@@ -675,16 +688,9 @@ fn dispatch(
         }
         Command::RunShell(args) => run_shell_foreground(socket_path, args),
         Command::SourceFile(args) => run_source_file(args, socket_path, command_startup),
-        Command::IfShell(args) => run_command(socket_path, "if-shell", move |connection| {
-            connection.if_shell(
-                args.condition,
-                args.format_mode,
-                args.then_command,
-                args.else_command,
-                args.target,
-                args.background,
-            )
-        }),
+        Command::IfShell(args) => {
+            run_queued_server_command(socket_path, "if-shell", args.queue_command)
+        }
         Command::WaitFor(args) => {
             let mode = args.mode();
             run_command(socket_path, "wait-for", move |connection| {
@@ -719,12 +725,10 @@ fn run_shell_foreground(
     socket_path: &Path,
     args: crate::cli_args::RunShellArgs,
 ) -> Result<i32, ExitFailure> {
-    let explicit_target = args.target.is_some();
     let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands)?;
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let target = resolve_run_shell_target(&mut connection, socket_path, args.target.as_ref())?;
-    let output_target = explicit_target.then(|| target.clone()).flatten();
+    let target = resolve_run_shell_target(&mut connection, args.target.as_ref())?;
     let response = connection
         .run_shell(
             command,
@@ -740,59 +744,12 @@ fn run_shell_foreground(
 
     match response {
         Response::RunShell(response) => {
-            if let Some(target) = output_target {
-                if let Some(output) = response.command_output() {
-                    if matches!(
-                        deliver_targeted_run_shell_output(
-                            &mut connection,
-                            target,
-                            output.stdout(),
-                        )?,
-                        TargetedRunShellDelivery::Caller
-                    ) {
-                        write_command_output(output)?;
-                    }
-                }
-            } else {
-                if let Some(output) = response.command_output() {
-                    write_command_output(output)?;
-                }
+            if let Some(output) = response.command_output() {
+                write_command_output(output)?;
             }
             Ok(response.exit_status().unwrap_or(0))
         }
         other => finish_command_success(other, "run-shell"),
-    }
-}
-
-enum TargetedRunShellDelivery {
-    Delivered,
-    Caller,
-}
-
-fn deliver_targeted_run_shell_output(
-    connection: &mut rmux_client::Connection,
-    target: rmux_proto::PaneTarget,
-    output: &[u8],
-) -> Result<TargetedRunShellDelivery, ExitFailure> {
-    let message = String::from_utf8_lossy(output)
-        .trim_end_matches(['\r', '\n'])
-        .replace('#', "##");
-    if message.is_empty() {
-        return Ok(TargetedRunShellDelivery::Delivered);
-    }
-    let response = connection
-        .display_message(Some(Target::Pane(target)), false, Some(message))
-        .map_err(ExitFailure::from_client)?;
-    match response {
-        Response::DisplayMessage(_) => Ok(TargetedRunShellDelivery::Delivered),
-        Response::Error(ErrorResponse {
-            error:
-                rmux_proto::RmuxError::InvalidTarget { .. }
-                | rmux_proto::RmuxError::SessionNotFound(_)
-                | rmux_proto::RmuxError::PaneNotFound { .. },
-        }) => Ok(TargetedRunShellDelivery::Caller),
-        response => finish_command_success(response, "display-message")
-            .map(|_| TargetedRunShellDelivery::Delivered),
     }
 }
 
@@ -812,7 +769,6 @@ fn run_shell_command_and_arguments(
 
 fn resolve_run_shell_target(
     connection: &mut rmux_client::Connection,
-    socket_path: &Path,
     target: Option<&crate::cli_args::TargetSpec>,
 ) -> Result<Option<rmux_proto::PaneTarget>, ExitFailure> {
     match target {
@@ -820,7 +776,7 @@ fn resolve_run_shell_target(
             Ok(target) => Ok(Some(target)),
             Err(_) => Ok(None),
         },
-        None => inherited_pane_target(connection, socket_path),
+        None => Ok(None),
     }
 }
 
@@ -847,6 +803,26 @@ fn run_noop(socket_path: &Path) -> Result<i32, ExitFailure> {
     Ok(0)
 }
 
+fn run_apply_parse_time_assignments(
+    socket_path: &Path,
+    assignments: String,
+) -> Result<i32, ExitFailure> {
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let response = connection
+        .source_file(
+            vec![INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
+            false,
+            false,
+            false,
+            false,
+            None,
+            Some(assignments),
+        )
+        .map_err(ExitFailure::from_client)?;
+    finish_command_success(response, "source-file")
+}
+
 fn looks_like_custom_layout(layout: &str) -> bool {
     layout.contains(',')
 }
@@ -857,7 +833,7 @@ fn invalid_layout_failure(layout: &str) -> ExitFailure {
 
 pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
     match command {
-        Command::Noop => false,
+        Command::Noop | Command::ApplyParseTimeAssignments(_) => false,
         Command::NewSession(_) | Command::StartServer(_) | Command::AttachSession(_) => true,
         Command::WebShare(args) => web_share_creates_share(args),
         _ => false,

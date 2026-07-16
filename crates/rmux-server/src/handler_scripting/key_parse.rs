@@ -2,7 +2,9 @@ use rmux_proto::{Request, RmuxError, SendKeysRequest};
 
 use super::parse_pane_target;
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::{missing_argument, parse_usize, unsupported_flag};
+use super::values::{
+    missing_argument, parse_usize, reject_unknown_option_before_positional, unsupported_flag,
+};
 
 pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut target = None;
@@ -17,7 +19,7 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
     let mut repeat_count = None;
 
     while let Some(token) = args.peek().map(str::to_owned) {
-        if let Some(cluster) = parse_compact_flag_cluster(&token, "FHlKMRX", "ct") {
+        if let Some(cluster) = parse_compact_flag_cluster(&token, "FHlKMRX", "cNt") {
             let _ = args.optional();
             for flag in cluster {
                 match flag {
@@ -34,6 +36,11 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
                     compact_flag @ CompactFlag::Value { flag: 'c', .. } => {
                         target_client =
                             Some(compact_flag.value_or_next(&mut args, "-c target-client")?);
+                    }
+                    compact_flag @ CompactFlag::Value { flag: 'N', .. } => {
+                        repeat_count = Some(parse_send_keys_repeat_count(
+                            &compact_flag.value_or_next(&mut args, "-N count")?,
+                        )?);
                     }
                     compact_flag @ CompactFlag::Value { flag: 't', .. } => {
                         target = Some(parse_pane_target(
@@ -166,8 +173,8 @@ pub(super) fn parse_bind_key(mut args: CommandTokens) -> Result<Request, RmuxErr
     let mut note = None;
     let mut repeat = false;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -188,7 +195,27 @@ pub(super) fn parse_bind_key(mut args: CommandTokens) -> Result<Request, RmuxErr
                 let _ = args.optional();
                 table_name = Some(args.required("-T key-table")?);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "nr", "NT") else {
+                    reject_unknown_option_before_positional("bind-key", &token)?;
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('n') => table_name = Some("root".to_owned()),
+                        CompactFlag::Bare('r') => repeat = true,
+                        compact_flag @ CompactFlag::Value { flag: 'N', .. } => {
+                            note = Some(compact_flag.value_or_next(&mut args, "-N note")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'T', .. } => {
+                            table_name =
+                                Some(compact_flag.value_or_next(&mut args, "-T key-table")?);
+                        }
+                        _ => unreachable!("compact bind-key flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 
@@ -207,8 +234,8 @@ pub(super) fn parse_unbind_key(mut args: CommandTokens) -> Result<Request, RmuxE
     let mut all = false;
     let mut quiet = false;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -229,7 +256,24 @@ pub(super) fn parse_unbind_key(mut args: CommandTokens) -> Result<Request, RmuxE
                 let _ = args.optional();
                 table_name = Some(args.required("-T key-table")?);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "anq", "T") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('a') => all = true,
+                        CompactFlag::Bare('n') => table_name = Some("root".to_owned()),
+                        CompactFlag::Bare('q') => quiet = true,
+                        compact_flag @ CompactFlag::Value { flag: 'T', .. } => {
+                            table_name =
+                                Some(compact_flag.value_or_next(&mut args, "-T key-table")?);
+                        }
+                        _ => unreachable!("compact unbind-key flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 
@@ -253,8 +297,8 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
     let mut sort_order = None;
     let mut prefix = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -279,17 +323,9 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 format = Some(args.required("-F format")?);
             }
-            flag if flag.starts_with("-F") => {
-                let flag = args.optional().expect("peeked list-keys -F flag exists");
-                format = Some(flag[2..].to_owned());
-            }
             "-O" => {
                 let _ = args.optional();
                 sort_order = Some(args.required("-O order")?);
-            }
-            flag if flag.starts_with("-O") => {
-                let flag = args.optional().expect("peeked list-keys -O flag exists");
-                sort_order = Some(flag[2..].to_owned());
             }
             "-P" => {
                 let _ = args.optional();
@@ -299,7 +335,34 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 table_name = Some(args.required("-T key-table")?);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "1aNr", "FOPT") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('1') => first_only = true,
+                        CompactFlag::Bare('a') => include_unnoted = true,
+                        CompactFlag::Bare('N') => notes = true,
+                        CompactFlag::Bare('r') => reversed = true,
+                        compact_flag @ CompactFlag::Value { flag: 'F', .. } => {
+                            format = Some(compact_flag.value_or_next(&mut args, "-F format")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'O', .. } => {
+                            sort_order = Some(compact_flag.value_or_next(&mut args, "-O order")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'P', .. } => {
+                            prefix = Some(compact_flag.value_or_next(&mut args, "-P prefix")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'T', .. } => {
+                            table_name =
+                                Some(compact_flag.value_or_next(&mut args, "-T key-table")?);
+                        }
+                        _ => unreachable!("compact list-keys flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 
@@ -322,8 +385,8 @@ pub(super) fn parse_send_prefix(mut args: CommandTokens) -> Result<Request, Rmux
     let mut secondary = false;
     let mut target = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -339,7 +402,24 @@ pub(super) fn parse_send_prefix(mut args: CommandTokens) -> Result<Request, Rmux
                     args.required("-t target")?,
                 )?);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "2", "t") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('2') => secondary = true,
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_pane_target(
+                                "send-prefix",
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        _ => unreachable!("compact send-prefix flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
     args.no_extra("send-prefix")?;
@@ -391,6 +471,106 @@ mod tests {
             Some(parse_pane_target("send-keys", "=".to_owned()).unwrap())
         );
         assert_eq!(request.keys, vec!["select-word"]);
+    }
+
+    #[test]
+    fn parse_send_keys_accepts_mixed_bare_and_value_flag_clusters() {
+        let request = parse_send_keys(CommandTokens::new(vec![token("-lN2"), token("literal")]))
+            .expect("mixed send-keys cluster parses");
+
+        let Request::SendKeysExt(request) = request else {
+            panic!("mixed cluster must use extended send-keys request");
+        };
+        assert!(request.literal);
+        assert_eq!(request.repeat_count, Some(2));
+        assert_eq!(request.keys, vec!["literal"]);
+    }
+
+    #[test]
+    fn parse_bind_key_accepts_clusters_attached_values_and_separator() {
+        let request = parse_bind_key(CommandTokens::new(vec![
+            token("-nrTroot"),
+            token("-N"),
+            token("cluster note"),
+            token("C-a"),
+            token("display-message"),
+            token("ok"),
+        ]))
+        .expect("clustered bind-key flags parse");
+
+        let Request::BindKey(request) = request else {
+            panic!("expected bind-key request");
+        };
+        assert_eq!(request.table_name, "root");
+        assert!(request.repeat);
+        assert_eq!(request.note.as_deref(), Some("cluster note"));
+        assert_eq!(request.key, "C-a");
+
+        let separated = parse_bind_key(CommandTokens::new(vec![
+            token("--"),
+            token("-nr"),
+            token("display-message"),
+            token("literal-key"),
+        ]))
+        .expect("bind-key separator preserves a flag-looking key");
+        let Request::BindKey(separated) = separated else {
+            panic!("expected separated bind-key request");
+        };
+        assert_eq!(separated.table_name, "prefix");
+        assert!(!separated.repeat);
+        assert_eq!(separated.key, "-nr");
+    }
+
+    #[test]
+    fn parse_unbind_key_accepts_bare_clusters_and_attached_table() {
+        let request = parse_unbind_key(CommandTokens::new(vec![token("-aqTroot")]))
+            .expect("clustered unbind-key flags parse");
+
+        let Request::UnbindKey(request) = request else {
+            panic!("expected unbind-key request");
+        };
+        assert!(request.all);
+        assert!(request.quiet);
+        assert_eq!(request.table_name, "root");
+        assert!(request.key.is_none());
+    }
+
+    #[test]
+    fn parse_list_keys_accepts_bare_cluster_before_attached_value_flags() {
+        let request = parse_list_keys(CommandTokens::new(vec![
+            token("-1aNrF#{key}"),
+            token("-Okey"),
+            token("-Pprefix"),
+            token("-Troot"),
+        ]))
+        .expect("clustered list-keys flags parse");
+
+        let Request::ListKeys(request) = request else {
+            panic!("expected list-keys request");
+        };
+        assert!(request.first_only);
+        assert!(request.include_unnoted);
+        assert!(request.notes);
+        assert!(request.reversed);
+        assert_eq!(request.format.as_deref(), Some("#{key}"));
+        assert_eq!(request.sort_order.as_deref(), Some("key"));
+        assert_eq!(request.prefix.as_deref(), Some("prefix"));
+        assert_eq!(request.table_name.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn parse_send_prefix_accepts_bare_and_attached_target_cluster() {
+        let request = parse_send_prefix(CommandTokens::new(vec![token("-2talpha:0.0")]))
+            .expect("clustered send-prefix flags parse");
+
+        let Request::SendPrefix(request) = request else {
+            panic!("expected send-prefix request");
+        };
+        assert!(request.secondary);
+        assert_eq!(
+            request.target,
+            Some(parse_pane_target("send-prefix", "alpha:0.0".to_owned()).unwrap())
+        );
     }
 
     #[test]

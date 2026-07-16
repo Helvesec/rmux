@@ -6,6 +6,8 @@ use rmux_pty::ChildCommand;
 
 #[cfg(windows)]
 use super::executable_name;
+#[cfg(windows)]
+use rmux_os::command::cmd_c_verbatim_tail;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct ShellSpec {
@@ -55,7 +57,7 @@ impl ShellSpec {
                 .arg("/D")
                 .arg("/S")
                 .arg("/C")
-                .arg(command),
+                .windows_verbatim_args(cmd_c_verbatim_tail(command)),
             #[cfg(windows)]
             ShellKind::Posix => ShellCommandPlan::new(&self.program).arg("-lc").arg(command),
             #[cfg(windows)]
@@ -337,9 +339,14 @@ mod tests {
     #[test]
     fn cmd_command_preserves_command_text_without_wrapping_cwd() {
         let spec = ShellSpec::new(Path::new("cmd.exe"));
-        let plan = spec.command_plan(Path::new(r"C:\tmp"), "echo RMUX_OK");
+        let command = r#"echo "RMUX OK" & echo left^&right"#;
+        let plan = spec.command_plan(Path::new(r"C:\tmp"), command);
 
-        assert_eq!(plan.args, os_args(["/D", "/S", "/C", "echo RMUX_OK"]));
+        assert_eq!(plan.args, os_args(["/D", "/S", "/C"]));
+        assert_eq!(
+            plan.windows_verbatim_args.as_deref(),
+            Some(cmd_c_verbatim_tail(command).as_os_str())
+        );
     }
 
     #[cfg(windows)]

@@ -10,7 +10,7 @@ use rmux_pty::{write_windows_console_mouse_drag, ChildCommand, SpawnedPty, Termi
 #[path = "support/windows_cli_serial.rs"]
 mod windows_cli_serial;
 
-const ATTACH_READY_DELAY: Duration = Duration::from_millis(700);
+const ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const MOUSE_SETTLE_DELAY: Duration = Duration::from_millis(900);
 const MOUSE_GEOMETRY_CHANGE_TIMEOUT: Duration = Duration::from_secs(6);
 const ATTACH_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -559,7 +559,7 @@ impl AttachGuard {
             .args(args)
             .size(TerminalSize::new(80, 24))
             .spawn()?;
-        wait_for_attach_client(label, session, ATTACH_READY_DELAY)?;
+        wait_for_attach_client(label, session, ATTACH_READY_TIMEOUT)?;
         Ok(Self {
             label: label.to_owned(),
             child,

@@ -75,6 +75,8 @@ impl<'a> Lexer<'a> {
     /// rest of the lexer only ever sees LF. Without this, a trailing `\r` from a
     /// CRLF-saved config is swallowed into the preceding word by `read_word`, and
     /// backslash line-continuation (which only checks for `\n`) fails on `\r\n`.
+    /// This deliberately applies inside quoted text too: it is an RMUX
+    /// portability behavior, not byte-identical tmux 3.7b parsing.
     fn normalize_newlines(input: &str) -> Vec<char> {
         let mut chars = Vec::with_capacity(input.len());
         let mut iter = input.chars().peekable();

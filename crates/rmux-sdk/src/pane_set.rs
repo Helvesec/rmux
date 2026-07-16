@@ -15,6 +15,10 @@ use crate::{
     RmuxError,
 };
 
+mod runtime;
+
+use runtime::{join_failure, run_all, wait_visible_text_for_pane};
+
 /// Owned group of pane handles.
 #[derive(Debug, Clone, Default)]
 #[must_use = "pane sets do nothing unless one of their async methods is awaited"]
@@ -68,10 +72,15 @@ impl PaneSet {
     /// Call [`PaneSetBatch::is_success`] when the caller requires every pane
     /// to succeed.
     pub async fn snapshot_all(&self) -> PaneSetBatch<PaneSnapshot> {
-        run_all(
-            self.panes.clone(),
-            |pane| async move { pane.snapshot().await },
-        )
+        run_all(operation_panes(&self.panes, None), |pane| async move {
+            let target = pane.target().clone();
+            let (pane, pane_id) = match pane.pin_to_current_identity().await {
+                Ok(identity) => identity,
+                Err(error) => return (target, None, Err(error)),
+            };
+            let result = pane.snapshot().await;
+            (target, pane_id, result)
+        })
         .await
     }
 
@@ -80,7 +89,7 @@ impl PaneSet {
     /// Stale panes use the ordinary [`Pane::close`] idempotent semantics and
     /// return [`PaneCloseOutcome::AlreadyClosed`] as a success.
     pub async fn close_all(self) -> PaneSetBatch<PaneCloseOutcome> {
-        run_all(self.panes, |pane| async move { pane.close().await }).await
+        close_all_in_order(operation_panes(&self.panes, None)).await
     }
 
     /// Starts an all-panes visible-text expectation builder.
@@ -112,6 +121,34 @@ impl PaneSet {
     pub fn wait_any(&self) -> PaneSetExpectation<'_> {
         self.expect_any()
     }
+}
+
+async fn close_all_in_order(panes: Vec<Pane>) -> PaneSetBatch<PaneCloseOutcome> {
+    let mut prepared = Vec::with_capacity(panes.len());
+    for pane in panes {
+        let target = pane.target().clone();
+        match pane.pin_to_current_identity().await {
+            Ok((pane, pane_id)) => prepared.push(Ok((target, pane, pane_id))),
+            Err(error) => prepared.push(Err(PaneSetFailure::new(target, None, error))),
+        }
+    }
+
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    for outcome in prepared {
+        let (target, pane, pane_id) = match outcome {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                failures.push(failure);
+                continue;
+            }
+        };
+        match pane.close().await {
+            Ok(value) => successes.push(PaneSetSuccess::new(target, pane_id, value)),
+            Err(error) => failures.push(PaneSetFailure::new(target, pane_id, error)),
+        }
+    }
+    PaneSetBatch::new(successes, failures)
 }
 
 impl From<Vec<Pane>> for PaneSet {
@@ -386,35 +423,36 @@ impl<'a> PaneSetVisibleTextWait<'a> {
     }
 
     async fn run(self) -> PaneSetVisibleTextOutcome {
+        let panes = operation_panes(self.panes, self.timeout);
         match self.mode {
             ExpectMode::All => {
                 let matcher = self.matcher;
                 let timeout = self.timeout;
                 let poll_interval = self.poll_interval;
                 PaneSetVisibleTextOutcome::All(
-                    run_all(self.panes.to_vec(), move |pane| {
+                    run_all(panes, move |pane| {
                         let matcher = matcher.clone();
-                        async move { wait_visible_text(pane, matcher, timeout, poll_interval).await }
+                        wait_visible_text_for_pane(pane, matcher, timeout, poll_interval)
                     })
                     .await,
                 )
             }
-            ExpectMode::Any => PaneSetVisibleTextOutcome::Any(self.run_any().await),
+            ExpectMode::Any => PaneSetVisibleTextOutcome::Any(self.run_any(panes).await),
         }
     }
 
-    async fn run_any(self) -> PaneSetAny<PaneSnapshot> {
+    async fn run_any(self, panes: Vec<Pane>) -> PaneSetAny<PaneSnapshot> {
         let mut tasks = JoinSet::new();
-        for pane in self.panes.iter().cloned() {
+        for pane in panes {
             let matcher = self.matcher.clone();
             let timeout = self.timeout;
             let poll_interval = self.poll_interval;
-            tasks.spawn(async move {
-                let target = pane.target().clone();
-                let pane_id = pane.id().await.ok().flatten();
-                let result = wait_visible_text(pane, matcher, timeout, poll_interval).await;
-                (target, pane_id, result)
-            });
+            tasks.spawn(wait_visible_text_for_pane(
+                pane,
+                matcher,
+                timeout,
+                poll_interval,
+            ));
         }
 
         let mut failures = Vec::new();
@@ -440,6 +478,17 @@ impl<'a> PaneSetVisibleTextWait<'a> {
         PaneSetAny::failure(failures)
     }
 }
+
+fn operation_panes(panes: &[Pane], timeout: Option<Duration>) -> Vec<Pane> {
+    panes
+        .iter()
+        .map(|pane| pane.begin_operation_handle_with_timeout(timeout))
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "pane_set_tests.rs"]
+mod tests;
 
 impl<'a> IntoFuture for PaneSetVisibleTextWait<'a> {
     type Output = PaneSetVisibleTextOutcome;
@@ -493,106 +542,4 @@ enum VisibleSetMatcher {
     Contains(String),
     Any(Vec<String>),
     All(Vec<String>),
-}
-
-async fn wait_visible_text(
-    pane: Pane,
-    matcher: VisibleSetMatcher,
-    timeout: Option<Duration>,
-    poll_interval: Option<Duration>,
-) -> Result<PaneSnapshot> {
-    match matcher {
-        VisibleSetMatcher::Contains(pattern) => {
-            let wait = pane.expect_visible_text().to_contain(pattern);
-            apply_visible_options(wait, timeout, poll_interval).await
-        }
-        VisibleSetMatcher::Any(patterns) => {
-            let wait = pane.expect_visible_text().to_match_any(patterns);
-            apply_visible_options(wait, timeout, poll_interval).await
-        }
-        VisibleSetMatcher::All(patterns) => {
-            let wait = pane.expect_visible_text().to_match_all(patterns);
-            apply_visible_options(wait, timeout, poll_interval).await
-        }
-    }
-}
-
-async fn apply_visible_options(
-    mut wait: crate::VisibleTextWait<'_>,
-    timeout: Option<Duration>,
-    poll_interval: Option<Duration>,
-) -> Result<PaneSnapshot> {
-    if let Some(timeout) = timeout {
-        wait = wait.timeout(timeout);
-    }
-    if let Some(poll_interval) = poll_interval {
-        wait = wait.poll_interval(poll_interval);
-    }
-    wait.await
-}
-
-async fn run_all<T, Fut>(
-    panes: Vec<Pane>,
-    operation: impl Fn(Pane) -> Fut + Clone + Send + Sync + 'static,
-) -> PaneSetBatch<T>
-where
-    T: Send + 'static,
-    Fut: Future<Output = Result<T>> + Send + 'static,
-{
-    let mut tasks = JoinSet::new();
-    for (index, pane) in panes.into_iter().enumerate() {
-        let operation = operation.clone();
-        tasks.spawn(async move {
-            let target = pane.target().clone();
-            let pane_id = pane.id().await.ok().flatten();
-            let result = operation(pane).await;
-            (index, target, pane_id, result)
-        });
-    }
-
-    let mut outcomes = Vec::new();
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok(outcome) => outcomes.push(outcome),
-            Err(error) => outcomes.push((
-                usize::MAX,
-                PaneRef::new(
-                    crate::SessionName::new("unknown").expect("static session name"),
-                    0,
-                    0,
-                ),
-                None,
-                Err(RmuxError::transport(
-                    "join pane-set worker task",
-                    std::io::Error::other(error.to_string()),
-                )),
-            )),
-        }
-    }
-    outcomes.sort_by_key(|(index, _, _, _)| *index);
-
-    let mut successes = Vec::new();
-    let mut failures = Vec::new();
-    for (_, target, pane_id, result) in outcomes {
-        match result {
-            Ok(value) => successes.push(PaneSetSuccess::new(target, pane_id, value)),
-            Err(error) => failures.push(PaneSetFailure::new(target, pane_id, error)),
-        }
-    }
-    PaneSetBatch::new(successes, failures)
-}
-
-fn join_failure(error: tokio::task::JoinError) -> PaneSetFailure {
-    PaneSetFailure::new(
-        PaneRef::new(
-            crate::SessionName::new("unknown").expect("static session name"),
-            0,
-            0,
-        ),
-        None,
-        RmuxError::transport(
-            "join pane-set worker task",
-            std::io::Error::other(error.to_string()),
-        ),
-    )
 }

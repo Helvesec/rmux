@@ -9,10 +9,10 @@ use rmux_proto::{
     BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
     MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneKillRequest,
     PaneRespawnRequest, PaneSnapshotRequest, PaneTarget, PaneTargetRef, PipePaneRequest,
-    ProcessCommand, RenameWindowRequest, Request, RespawnPaneRequest, Response, ScopeSelector,
-    SelectPaneRequest, SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest,
-    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, TerminalSize,
-    WindowTarget,
+    ProcessCommand, RenameWindowRequest, Request, ResizePaneAdjustment, ResizePaneRequest,
+    RespawnPaneRequest, Response, ScopeSelector, SelectPaneRequest, SessionName,
+    SetHookMutationRequest, SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowExtRequest,
+    SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
 };
 use rmux_proto::{HookLifecycle, HookName};
 use tokio::sync::mpsc;
@@ -93,6 +93,78 @@ fn expected_spawn_cwd(path: &Path) -> String {
 #[cfg(unix)]
 fn expected_spawn_cwd(path: &Path) -> String {
     path.display().to_string()
+}
+
+#[cfg(unix)]
+fn respawn_replay_script(output: &Path, tag: &str) -> String {
+    format!(
+        "printf '%s:%s:{tag}\\n' \"$(pwd)\" \"$RMUX_RESPAWN\" >> {}; sleep 60",
+        shell_quote(output)
+    )
+}
+
+#[cfg(windows)]
+fn respawn_replay_script(output: &Path, tag: &str) -> String {
+    format!(
+        "[System.IO.File]::AppendAllText({}, ((Get-Location).Path + ':' + $env:RMUX_RESPAWN + ':{}' + [char]10)); Start-Sleep -Seconds 60",
+        crate::test_shell::powershell_quote_path(output),
+        tag
+    )
+}
+
+#[cfg(unix)]
+fn respawn_argv_probe_command(output: &Path, tag: &str) -> Vec<String> {
+    vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        respawn_replay_script(output, tag),
+    ]
+}
+
+#[cfg(windows)]
+fn respawn_argv_probe_command(output: &Path, tag: &str) -> Vec<String> {
+    vec![
+        "powershell.exe".to_owned(),
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-Command".to_owned(),
+        respawn_replay_script(output, tag),
+    ]
+}
+
+#[cfg(unix)]
+fn respawn_shell_probe_command(output: &Path, tag: &str) -> String {
+    respawn_replay_script(output, tag)
+}
+
+#[cfg(unix)]
+fn respawn_shell_identity_command(output: &Path, tag: &str) -> String {
+    format!(
+        "printf '%s:%s:{tag}\\n' \"${{0##*/}}\" \"$SHELL\" >> {}; sleep 60",
+        shell_quote(output)
+    )
+}
+
+#[cfg(unix)]
+async fn set_global_default_shell(handler: &RequestHandler, shell: &str) {
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::DefaultShell,
+            value: shell.to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+}
+
+#[cfg(windows)]
+fn respawn_shell_probe_command(output: &Path, tag: &str) -> String {
+    crate::test_shell::powershell_encoded_command(&respawn_replay_script(output, tag))
+}
+
+fn respawn_probe_line(cwd: &str, environment: &str, tag: &str) -> String {
+    format!("{cwd}:{environment}:{tag}\n")
 }
 
 async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
@@ -310,6 +382,74 @@ async fn list_panes_activity_sort_follows_selection_counter_like_tmux() {
     select(0).await;
     assert_eq!(list(false).await, "2\n1\n0\n");
     assert_eq!(list(true).await, "0\n1\n2\n");
+}
+
+#[tokio::test]
+async fn list_panes_size_sort_uses_area_in_both_directions() {
+    let handler = RequestHandler::new();
+    let session = session_name("list-panes-area-sort");
+    create_session(&handler, &session).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::ResizePane(ResizePaneRequest {
+                target: PaneTarget::with_window(session.clone(), 0, 0),
+                adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 59 },
+            }))
+            .await,
+        Response::ResizePane(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::ResizePane(ResizePaneRequest {
+                target: PaneTarget::with_window(session.clone(), 0, 0),
+                adjustment: ResizePaneAdjustment::AbsoluteHeight { rows: 5 },
+            }))
+            .await,
+        Response::ResizePane(_)
+    ));
+
+    let list = |reversed| {
+        Request::ListPanes(Box::new(ListPanesRequest {
+            target: session.clone(),
+            target_window_index: Some(0),
+            format: Some("#{pane_index}:#{pane_width}x#{pane_height}".to_owned()),
+            filter: None,
+            sort_order: Some("size".to_owned()),
+            reversed,
+        }))
+    };
+
+    assert_eq!(
+        list_stdout(handler.handle(list(false)).await),
+        "0:59x5\n2:20x24\n1:59x18\n"
+    );
+    assert_eq!(
+        list_stdout(handler.handle(list(true)).await),
+        "1:59x18\n2:20x24\n0:59x5\n"
+    );
 }
 
 async fn wait_for_dead_pane(
@@ -1001,6 +1141,8 @@ async fn move_pane_routes_through_join_semantics() {
                     socket_path: Path::new("/tmp/rmux-test.sock"),
                     spawn_environment: None,
                     environment_overrides: None,
+                    respawn_shell: None,
+                    respawn_environment: None,
                     pane_alert_callback: None,
                     pane_exit_callback: None,
                 },
@@ -1137,6 +1279,64 @@ async fn break_pane_print_target_uses_custom_format() {
 }
 
 #[tokio::test]
+async fn break_pane_implicit_destination_starts_at_base_index() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("break-base-index");
+
+    let set_base_index = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::BaseIndex,
+            value: "1".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set_base_index, Response::SetOption(_)));
+    create_session(&handler, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let response = handler
+        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
+            source: PaneTarget::with_window(alpha.clone(), 1, 1),
+            target: None,
+            name: None,
+            detached: true,
+            after: false,
+            before: false,
+            print_target: true,
+            format: Some("#{window_index}.#{pane_index}".to_owned()),
+        })))
+        .await;
+
+    let Response::BreakPane(success) = response else {
+        panic!("expected break-pane response, got {response:?}");
+    };
+    assert_eq!(
+        success
+            .command_output()
+            .expect("break-pane -P output")
+            .stdout(),
+        b"2.0\n"
+    );
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session survives");
+    assert_eq!(
+        session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[tokio::test]
 async fn break_pane_print_target_refreshes_automatic_window_name() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-break-name");
@@ -1228,6 +1428,68 @@ async fn attached_input_to_dead_kept_pane_does_not_fail_liveness_probe() {
     assert!(
         !matches!(&result, Err(error) if error.to_string().contains("target pane has exited")),
         "attached input must not use child-process liveness as a pane liveness gate: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn respawn_pane_without_command_restarts_dead_remain_on_exit_workload() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-dead-provenance");
+    create_session(&handler, &alpha).await;
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Pane(target.clone()),
+                option: OptionName::RemainOnExit,
+                value: "on".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    let explicit = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: Some(ProcessCommand::Shell("exit 7".to_owned())),
+        })))
+        .await;
+    assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
+    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.pane_id_in_window(0, 0))
+            .expect("dead pane exists")
+    };
+    let (first_generation, _) = wait_for_lifecycle_exit(&handler, pane_id, 7).await;
+
+    let inherited = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target,
+            kill: false,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited, Response::RespawnPane(_)),
+        "{inherited:?}"
+    );
+    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    let (second_generation, _) = wait_for_lifecycle_exit(&handler, pane_id, 7).await;
+    assert!(
+        second_generation > first_generation,
+        "command-less respawn must run and exit the original workload again"
     );
 }
 
@@ -1333,6 +1595,201 @@ async fn respawn_pane_with_kill_flag_applies_directory_environment_and_command()
 }
 
 #[tokio::test]
+async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-pane-provenance");
+    let initial_cwd = unique_temp_path("respawn-pane-provenance-initial");
+    let override_cwd = unique_temp_path("respawn-pane-provenance-override");
+    let output = unique_temp_path("respawn-pane-provenance-output");
+    fs::create_dir_all(&initial_cwd).expect("initial respawn cwd");
+    fs::create_dir_all(&override_cwd).expect("override respawn cwd");
+    let initial_argv = respawn_argv_probe_command(&output, "argv");
+    let initial_process_command = ProcessCommand::Argv(initial_argv.clone());
+    let initial_environment = "RMUX_RESPAWN=initial".to_owned();
+
+    let created = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(alpha.clone()),
+            working_directory: Some(initial_cwd.to_string_lossy().into_owned()),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: Some(vec![initial_environment.clone()]),
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: Some(initial_process_command.clone()),
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let initial_cwd_text = expected_spawn_cwd(&initial_cwd);
+    let initial_line = respawn_probe_line(&initial_cwd_text, "initial", "argv");
+    wait_for_file_contents(&output, &initial_line).await;
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let pane_id = {
+        let state = handler.state.lock().await;
+        let pane_id = state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.pane_id_in_window(0, 0))
+            .expect("initial pane exists");
+        let lifecycle = state.pane_lifecycle(pane_id).expect("initial lifecycle");
+        assert_eq!(lifecycle.process_command(), Some(&initial_process_command));
+        assert_eq!(
+            lifecycle.respawn_environment(),
+            std::slice::from_ref(&initial_environment)
+        );
+        pane_id
+    };
+
+    let inherited = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited, Response::RespawnPane(_)),
+        "{inherited:?}"
+    );
+    wait_for_file_contents(&output, &format!("{initial_line}{initial_line}")).await;
+
+    let override_environment = "RMUX_RESPAWN=override".to_owned();
+    let explicit_shell = respawn_shell_probe_command(&output, "shell");
+    let explicit_process_command = ProcessCommand::Shell(explicit_shell);
+    let explicit = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: Some(override_cwd.clone()),
+            environment: Some(vec![override_environment.clone()]),
+            command: None,
+            process_command: Some(explicit_process_command.clone()),
+        })))
+        .await;
+    assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
+    let override_cwd_text = expected_spawn_cwd(&override_cwd);
+    let override_line = respawn_probe_line(&override_cwd_text, "override", "shell");
+    wait_for_file_contents(
+        &output,
+        &format!("{initial_line}{initial_line}{override_line}"),
+    )
+    .await;
+    {
+        let state = handler.state.lock().await;
+        let lifecycle = state.pane_lifecycle(pane_id).expect("override lifecycle");
+        assert_eq!(lifecycle.process_command(), Some(&explicit_process_command));
+        assert_eq!(
+            lifecycle.private_environment(),
+            std::slice::from_ref(&override_environment)
+        );
+        assert_eq!(
+            lifecycle.respawn_environment(),
+            std::slice::from_ref(&initial_environment)
+        );
+    }
+
+    let inherited_after_override = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target,
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited_after_override, Response::RespawnPane(_)),
+        "{inherited_after_override:?}"
+    );
+    let inherited_override_line = respawn_probe_line(&override_cwd_text, "initial", "shell");
+    wait_for_file_contents(
+        &output,
+        &format!("{initial_line}{initial_line}{override_line}{inherited_override_line}"),
+    )
+    .await;
+
+    drop(handler);
+    let _ = fs::remove_file(output);
+    let _ = fs::remove_dir_all(initial_cwd);
+    let _ = fs::remove_dir_all(override_cwd);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn respawn_pane_keeps_the_original_resolved_shell_after_option_changes() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-pane-shell-provenance");
+    let output = unique_temp_path("respawn-pane-shell-provenance-output");
+    set_global_default_shell(&handler, "/bin/sh").await;
+    create_session(&handler, &alpha).await;
+    handler.wait_for_initial_panes_for_test().await;
+    set_global_default_shell(&handler, "/bin/bash").await;
+
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let shell_command = respawn_shell_identity_command(&output, "shell");
+    let explicit = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: Some(ProcessCommand::Shell(shell_command)),
+        })))
+        .await;
+    assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
+    let expected_line = "sh:/bin/sh:shell\n";
+    wait_for_file_contents(&output, expected_line).await;
+
+    let inherited = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target,
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited, Response::RespawnPane(_)),
+        "{inherited:?}"
+    );
+    wait_for_file_contents(&output, &format!("{expected_line}{expected_line}")).await;
+
+    let state = handler.state.lock().await;
+    let pane_id = state
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.pane_id_in_window(0, 0))
+        .expect("respawned pane exists");
+    assert_eq!(
+        state
+            .pane_lifecycle(pane_id)
+            .expect("respawned pane lifecycle")
+            .respawn_shell(),
+        Path::new("/bin/sh")
+    );
+    drop(state);
+    drop(handler);
+    let _ = fs::remove_file(output);
+}
+
+#[tokio::test]
 async fn respawn_pane_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("respawn-exit");
@@ -1365,11 +1822,7 @@ async fn respawn_pane_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
         .await;
     assert!(matches!(response, rmux_proto::Response::RespawnPane(_)));
 
-    let maybe_event = timeout(Duration::from_millis(150), lifecycle_events.recv()).await;
-    assert!(
-        maybe_event.is_err(),
-        "forced respawn must not synthesize pane-exited like tmux 3.4/3.6: {maybe_event:?}"
-    );
+    assert_no_pane_exited_event(&mut lifecycle_events, "forced respawn").await;
 
     let state = handler.state.lock().await;
     let pane = state

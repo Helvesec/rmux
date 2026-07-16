@@ -1,7 +1,6 @@
 use std::sync::atomic::Ordering;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
-#[cfg(test)]
 use std::sync::Arc;
 
 use rmux_core::LifecycleEvent;
@@ -14,11 +13,11 @@ use crate::handler::RequestHandler;
 use crate::mouse::ClientMouseState;
 #[cfg(test)]
 use crate::outer_terminal::OuterTerminalContext;
-use crate::pane_io::AttachControl;
+use crate::pane_io::{AttachControl, AttachControlSender};
 #[cfg(test)]
 use crate::server_access::current_owner_uid;
 
-use super::state::{ActiveAttach, AttachRegistration};
+use super::state::{ActiveAttach, ActiveAttachIdentity, AttachRegistration};
 
 impl RequestHandler {
     #[cfg(test)]
@@ -69,6 +68,7 @@ impl RequestHandler {
         self.register_attach_with_access(
             requester_pid,
             session_name,
+            None,
             AttachRegistration {
                 control_tx,
                 control_backlog: Arc::new(AtomicUsize::new(0)),
@@ -84,47 +84,73 @@ impl RequestHandler {
             },
         )
         .await
+        .expect("test attach registration session must remain current")
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_attach_with_access(
         &self,
         requester_pid: u32,
         session_name: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
-    ) -> u64 {
+    ) -> Option<u64> {
+        self.register_attach_identity_with_access(
+            requester_pid,
+            session_name,
+            expected_session_id,
+            registration,
+        )
+        .await
+        .map(ActiveAttachIdentity::attach_id)
+    }
+
+    pub(crate) async fn register_attach_identity_with_access(
+        &self,
+        requester_pid: u32,
+        session_name: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
+        registration: AttachRegistration,
+    ) -> Option<ActiveAttachIdentity> {
         #[cfg(windows)]
         self.wait_for_windows_deferred_session_panes_ready(&session_name)
             .await;
         let mut replaced_key_table = None;
+        let mut replaced_overlay = None;
         let attached_session_name = session_name.clone();
-        let (client_size, active_window_index) = {
-            let state = self.state.lock().await;
-            let session = state.sessions.session(&attached_session_name);
-            let active_window_index = session.map(rmux_core::Session::active_window_index);
-            let client_size = registration.client_size.unwrap_or_else(|| {
-                session
-                    .map(|session| session.window().size())
-                    .unwrap_or(super::super::DEFAULT_SESSION_SIZE)
-            });
-            (client_size, active_window_index)
-        };
+        let state = self.state.lock().await;
+        let session = state.sessions.session(&attached_session_name)?;
+        let session_id = session.id();
+        if expected_session_id.is_some_and(|expected| expected != session_id) {
+            return None;
+        }
+        let active_window_index = Some(session.active_window_index());
+        let client_size = registration
+            .client_size
+            .unwrap_or_else(|| session.window().size());
         let mut active_attach = self.active_attach.lock().await;
         let attach_id = active_attach.next_id;
         active_attach.next_id += 1;
         let size_sequence = active_attach.next_size_sequence;
         active_attach.next_size_sequence = active_attach.next_size_sequence.saturating_add(1);
+        let control_backlog = registration.control_backlog;
+        let control_tx = AttachControlSender::new(
+            registration.control_tx,
+            Arc::clone(&control_backlog),
+            super::ATTACH_CONTROL_BACKLOG_LIMIT,
+            Arc::clone(&registration.closing),
+        );
         if let Some(mut previous) = active_attach.by_pid.insert(
             requester_pid,
             ActiveAttach {
                 id: attach_id,
                 session_name,
+                session_id,
                 last_session: None,
+                last_session_id: None,
                 flags: registration.flags,
-                pan_window: None,
-                pan_ox: 0,
-                pan_oy: 0,
-                control_tx: registration.control_tx,
-                control_backlog: registration.control_backlog,
+                control_tx,
+                control_backlog,
                 render_stream: registration.render_stream,
                 render_refresh_pending: false,
                 uid: registration.uid,
@@ -132,6 +158,7 @@ impl RequestHandler {
                 can_write: registration.can_write,
                 suspended: false,
                 closing: registration.closing,
+                emit_detached_on_finish: false,
                 terminal_context: registration.terminal_context,
                 client_size,
                 client_pixels: None,
@@ -160,7 +187,7 @@ impl RequestHandler {
         ) {
             active_attach.forget_attached_client_windows(requester_pid);
             replaced_key_table = previous.key_table_name.clone();
-            super::terminate_overlay_job(previous.overlay.take());
+            replaced_overlay = previous.overlay.take();
             let _ = previous.control_tx.send(AttachControl::Detach);
             previous.closing.store(true, Ordering::SeqCst);
         }
@@ -172,7 +199,9 @@ impl RequestHandler {
             );
         }
         drop(active_attach);
+        drop(state);
         self.bump_active_attach_epoch();
+        super::terminate_overlay_job(replaced_overlay);
 
         if let Some(table_name) = replaced_key_table {
             let mut state = self.state.lock().await;
@@ -186,7 +215,11 @@ impl RequestHandler {
         drop(state);
         self.refresh_clock_overlays_for_session(&attached_session_name)
             .await;
-        attach_id
+        Some(ActiveAttachIdentity::new(
+            requester_pid,
+            attach_id,
+            session_id,
+        ))
     }
 
     pub(crate) async fn finish_attach(&self, requester_pid: u32, attach_id: u64) {
@@ -200,9 +233,10 @@ impl RequestHandler {
                 active_attach
                     .remove_attached_client(requester_pid)
                     .map(|active| {
-                        let emit_detached = !active.closing.load(Ordering::SeqCst);
+                        let emit_detached = active.emit_detached_on_finish
+                            || !active.closing.load(Ordering::SeqCst);
                         (
-                            Some(active.session_name),
+                            Some((active.session_name, active.session_id)),
                             active.key_table_name,
                             active.overlay,
                             emit_detached,
@@ -221,7 +255,7 @@ impl RequestHandler {
             let mut state = self.state.lock().await;
             state.key_bindings.unref_table(&table_name);
         }
-        if let Some(session_name) = removed_session {
+        if let Some((session_name, session_id)) = removed_session {
             if emit_detached {
                 self.emit(LifecycleEvent::ClientDetached {
                     session_name: session_name.clone(),
@@ -232,7 +266,40 @@ impl RequestHandler {
             if let Ok(Some(target)) = self.reconcile_attached_session_size(&session_name).await {
                 self.emit(LifecycleEvent::WindowResized { target }).await;
             }
-            self.destroy_unattached_sessions(vec![session_name]).await;
+            self.destroy_unattached_sessions(vec![(session_name, session_id)])
+                .await;
         }
+    }
+
+    pub(crate) async fn current_live_attach_input(&self, identity: ActiveAttachIdentity) -> bool {
+        let active_attach = self.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&identity.attach_pid())
+            .is_some_and(|active| {
+                identity.matches_active(active) && !active.closing.load(Ordering::SeqCst)
+            })
+    }
+
+    pub(crate) async fn active_attach_identity(
+        &self,
+        attach_pid: u32,
+    ) -> Option<ActiveAttachIdentity> {
+        self.active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .map(|active| active.identity(attach_pid))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn active_attach_identity_for_test(
+        &self,
+        attach_pid: u32,
+    ) -> ActiveAttachIdentity {
+        self.active_attach_identity(attach_pid)
+            .await
+            .expect("test attach must be registered")
     }
 }

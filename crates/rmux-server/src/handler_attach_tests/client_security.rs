@@ -493,7 +493,7 @@ async fn refresh_client_flags_merge_incrementally() {
 }
 
 #[tokio::test]
-async fn refresh_client_unimplemented_control_mode_flags_are_rejected() {
+async fn refresh_client_reserved_wire_fields_from_old_clients_are_rejected() {
     use rmux_proto::request::RefreshClientRequest;
 
     let handler = RequestHandler::new();
@@ -514,37 +514,67 @@ async fn refresh_client_unimplemented_control_mode_flags_are_rejected() {
         .register_attach(std::process::id(), alpha, control_tx)
         .await;
 
-    let response = handler
-        .dispatch(
-            std::process::id(),
-            Request::RefreshClient(Box::new(RefreshClientRequest {
-                target_client: None,
-                adjustment: None,
-                clear_pan: false,
-                pan_left: false,
-                pan_right: false,
-                pan_up: false,
-                pan_down: false,
-                status_only: false,
-                clipboard_query: false,
-                flags: None,
-                flags_alias: None,
-                subscriptions: vec!["%0:on".to_owned()],
-                subscriptions_format: vec!["name:%0:#{pane_id}".to_owned()],
-                control_size: Some("80x24".to_owned()),
-                colour_report: Some("%0".to_owned()),
-            })),
-        )
-        .await
-        .response;
+    let base_request = || RefreshClientRequest {
+        target_client: None,
+        adjustment: None,
+        clear_pan: false,
+        pan_left: false,
+        pan_right: false,
+        pan_up: false,
+        pan_down: false,
+        status_only: false,
+        clipboard_query: false,
+        flags: None,
+        flags_alias: None,
+        subscriptions: Vec::new(),
+        subscriptions_format: Vec::new(),
+        control_size: Some("80x24".to_owned()),
+        colour_report: None,
+    };
 
-    assert!(
-        matches!(
+    let mut clear_pan = base_request();
+    clear_pan.clear_pan = true;
+    let mut pan_down = base_request();
+    pan_down.pan_down = true;
+    let mut pan_left = base_request();
+    pan_left.pan_left = true;
+    let mut pan_right = base_request();
+    pan_right.pan_right = true;
+    let mut pan_up = base_request();
+    pan_up.pan_up = true;
+    let mut adjustment = base_request();
+    adjustment.adjustment = Some(10);
+    let mut subscriptions = base_request();
+    subscriptions.subscriptions = vec!["%0:on".to_owned()];
+    let mut subscriptions_format = base_request();
+    subscriptions_format.subscriptions_format = vec!["name:%0:#{pane_id}".to_owned()];
+    let mut colour_report = base_request();
+    colour_report.colour_report = Some("%0".to_owned());
+
+    for (request, expected) in [
+        (clear_pan, "refresh-client -c is not supported"),
+        (pan_down, "refresh-client -D is not supported"),
+        (pan_left, "refresh-client -L is not supported"),
+        (pan_right, "refresh-client -R is not supported"),
+        (pan_up, "refresh-client -U is not supported"),
+        (adjustment, "refresh-client adjustment is not supported"),
+        (subscriptions, "refresh-client -A is not supported"),
+        (subscriptions_format, "refresh-client -B is not supported"),
+        (colour_report, "refresh-client -r is not supported"),
+    ] {
+        let response = handler
+            .dispatch(
+                std::process::id(),
+                Request::RefreshClient(Box::new(request)),
+            )
+            .await
+            .response;
+
+        assert_eq!(
             response,
             Response::Error(rmux_proto::ErrorResponse {
-                error: RmuxError::Server(ref message)
-            }) if message.contains("-A/-B/-r")
-        ),
-        "unimplemented control-mode refresh-client flags should fail explicitly, got {response:?}"
-    );
+                error: RmuxError::Server(expected.to_owned()),
+            })
+        );
+    }
 }

@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::transport::TransportClient;
+use crate::transport::{OperationDeadline, TransportClient};
 use crate::{PaneId, PaneRef, Result, RmuxEndpoint, RmuxError, SessionName, WindowRef};
 use rmux_proto::{HasSessionRequest, KillSessionRequest, ListSessionsRequest, Request, Response};
 
@@ -32,6 +32,9 @@ impl Session {
         created: bool,
         creation_tags: Option<Vec<String>>,
     ) -> Self {
+        let transport = transport.with_default_timeout(
+            crate::bootstrap::discovery::resolve_timeout(None, default_timeout),
+        );
         Self {
             name,
             endpoint,
@@ -64,6 +67,29 @@ impl Session {
         &self.transport
     }
 
+    pub(crate) fn begin_operation_handle(&self) -> Self {
+        let mut session = Self {
+            name: self.name.clone(),
+            endpoint: self.endpoint.clone(),
+            default_timeout: self.default_timeout,
+            transport: self.transport.clone(),
+            created: self.created,
+            creation_tags: self.creation_tags.clone(),
+        };
+        session.transport = session.transport.begin_operation();
+        session
+    }
+
+    pub(crate) fn with_operation_deadline(&self, deadline: OperationDeadline) -> Self {
+        let mut session = self.begin_operation_handle();
+        session.transport = session.transport.with_operation_deadline(deadline);
+        session
+    }
+
+    pub(crate) const fn operation_deadline(&self) -> Option<OperationDeadline> {
+        self.transport.operation_deadline()
+    }
+
     /// Returns whether the ensure operation created the session.
     ///
     /// `false` means the handle was bound to a session that already existed
@@ -82,13 +108,13 @@ impl Session {
 
     /// Checks the live daemon for this session.
     pub async fn exists(&self) -> Result<bool> {
-        has_session(&self.transport, self.name.clone()).await
+        has_session(&self.transport.begin_operation(), self.name.clone()).await
     }
 
     /// Checks whether this session appears in the daemon's `list-sessions`
     /// projection.
     pub async fn is_listed(&self) -> Result<bool> {
-        Ok(list_session_names(&self.transport)
+        Ok(list_session_names(&self.transport.begin_operation())
             .await?
             .iter()
             .any(|candidate| candidate == &self.name))
@@ -96,7 +122,7 @@ impl Session {
 
     /// Lists exact session names currently reported by the daemon.
     pub async fn list_session_names(&self) -> Result<Vec<SessionName>> {
-        list_session_names(&self.transport).await
+        list_session_names(&self.transport.begin_operation()).await
     }
 
     /// Returns a handle for a window slot in this session.
@@ -140,7 +166,8 @@ impl Session {
     /// one daemon lifetime; callers that persist ids across reconnects must
     /// re-validate them.
     pub async fn pane_by_id(&self, pane_id: PaneId) -> Result<Pane> {
-        let target = super::pane::resolve_pane_ref_for_id(&self.transport, &self.name, pane_id)
+        let transport = self.transport.begin_operation();
+        let target = super::pane::resolve_pane_ref_for_id(&transport, &self.name, pane_id)
             .await?
             .ok_or_else(|| pane_not_found(&self.name, pane_id))?;
         Ok(Pane::new_by_id(
@@ -148,7 +175,7 @@ impl Session {
             pane_id,
             self.endpoint.clone(),
             self.default_timeout,
-            self.transport.clone(),
+            transport,
         ))
     }
 
@@ -188,7 +215,7 @@ impl Session {
     /// The returned boolean mirrors the daemon response: `true` means a
     /// session existed and was removed.
     pub async fn kill(&self) -> Result<bool> {
-        kill_session(&self.transport, self.name.clone()).await
+        kill_session(&self.transport.begin_operation(), self.name.clone()).await
     }
 }
 

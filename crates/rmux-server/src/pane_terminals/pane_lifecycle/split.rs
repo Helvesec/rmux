@@ -145,6 +145,7 @@ impl HandlerState {
         let runtime_window_name = profile.runtime_window_name(command);
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
+        let respawn_shell = profile.shell().to_path_buf();
         let mut terminal = match open_pane_terminal(
             new_pane_geometry,
             profile,
@@ -230,22 +231,26 @@ impl HandlerState {
             return Err(error);
         }
 
-        let sessions_to_synchronize = self
-            .window_link_slots_for(&session_name, window_index)
-            .into_iter()
-            .map(|slot| slot.session_name)
-            .collect::<Vec<_>>();
-        self.synchronize_linked_window_from_slot(&session_name, window_index)?;
-        for synchronized_session in sessions_to_synchronize {
-            self.synchronize_session_group_from(&synchronized_session)?;
+        let synchronized_sessions =
+            self.synchronize_window_alias_family_from_slot(&session_name, window_index)?;
+        let synchronized_source = self
+            .sessions
+            .session(&session_name)
+            .cloned()
+            .ok_or_else(|| session_not_found(&session_name))?;
+        self.synchronize_pane_alias_options_from_session(&synchronized_source)?;
+        for synchronized_session in synchronized_sessions {
+            self.sync_pane_lifecycle_dimensions_for_session(&synchronized_session);
         }
         self.record_pane_lifecycle_spawn(PaneLifecycleSpawn {
             session_id,
             window_id,
             pane_id: new_pane_id,
-            command: command.map(ProcessCommand::display_command),
+            process_command: command.cloned(),
             working_directory: Some(lifecycle_cwd),
+            respawn_shell,
             private_environment: environment_overrides.map(<[String]>::to_vec),
+            respawn_environment: None,
             dimensions: terminal_size_from_geometry(new_pane_geometry),
             pid: Some(pid),
         });

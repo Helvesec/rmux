@@ -1,5 +1,6 @@
 use std::io;
 
+use rmux_core::KeyCode;
 use rmux_proto::RmuxError;
 
 use super::super::prompt_support::PromptInputEvent;
@@ -8,11 +9,11 @@ use super::super::RequestHandler;
 use super::layout::{menu_option_styles, menu_width, target_window_index};
 use super::menu::{
     menu_handle_event, menu_handle_mouse, popup_menu_items, MenuOutcome, MenuOverlayState,
-    OverlayMenuAction, PopupMenuAction,
+    OverlayMenuAction,
 };
 use super::mouse::{popup_handle_mouse, PopupMouseOutcome};
 use super::state::ClientOverlayState;
-use super::support::decode_prompt_key_guess;
+use crate::handler::attach_support::ActiveAttachIdentity;
 use crate::handler_support::attached_client_required;
 use crate::input_keys::{encode_mouse_event, MouseForwardEvent};
 use crate::renderer::OverlayRect;
@@ -23,11 +24,31 @@ impl RequestHandler {
         attach_pid: u32,
         event: PromptInputEvent,
     ) -> Result<bool, RmuxError> {
+        self.handle_menu_input_event_with_identity(attach_pid, None, event)
+            .await
+    }
+
+    pub(super) async fn handle_menu_input_event_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        event: PromptInputEvent,
+    ) -> Result<bool, RmuxError> {
+        self.handle_menu_input_event_with_identity(identity.attach_pid(), Some(identity), event)
+            .await
+    }
+
+    async fn handle_menu_input_event_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+        event: PromptInputEvent,
+    ) -> Result<bool, RmuxError> {
         let outcome = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             match active.overlay.as_mut() {
                 Some(ClientOverlayState::Menu(menu)) => menu_handle_event(menu, event),
@@ -41,7 +62,8 @@ impl RequestHandler {
             }
         };
 
-        self.apply_menu_outcome(attach_pid, outcome).await?;
+        self.apply_menu_outcome(attach_pid, identity, outcome)
+            .await?;
         Ok(true)
     }
 
@@ -50,11 +72,31 @@ impl RequestHandler {
         attach_pid: u32,
         raw: MouseForwardEvent,
     ) -> Result<(), RmuxError> {
+        self.handle_menu_mouse_event_with_identity(attach_pid, None, raw)
+            .await
+    }
+
+    pub(super) async fn handle_menu_mouse_event_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        raw: MouseForwardEvent,
+    ) -> Result<(), RmuxError> {
+        self.handle_menu_mouse_event_with_identity(identity.attach_pid(), Some(identity), raw)
+            .await
+    }
+
+    async fn handle_menu_mouse_event_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+        raw: MouseForwardEvent,
+    ) -> Result<(), RmuxError> {
         let outcome = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
             match active.overlay.as_mut() {
                 Some(ClientOverlayState::Menu(menu)) => menu_handle_mouse(menu, raw),
@@ -68,27 +110,34 @@ impl RequestHandler {
             }
         };
 
-        self.apply_menu_outcome(attach_pid, outcome).await
+        self.apply_menu_outcome(attach_pid, identity, outcome).await
     }
 
     async fn apply_menu_outcome(
         &self,
         attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
         outcome: MenuOutcome,
     ) -> Result<(), RmuxError> {
         match outcome {
             MenuOutcome::Stay => {}
             MenuOutcome::Redraw => {
-                self.refresh_interactive_overlay_if_active(attach_pid)
+                self.refresh_interactive_overlay_for_optional_identity(attach_pid, identity)
                     .await?;
             }
             MenuOutcome::Close => {
                 let mut clear_root = false;
                 {
                     let mut active_attach = self.active_attach.lock().await;
-                    let active = active_attach.by_pid.get_mut(&attach_pid).ok_or_else(|| {
-                        RmuxError::Server("attached client disappeared".to_owned())
-                    })?;
+                    let active = active_attach
+                        .by_pid
+                        .get_mut(&attach_pid)
+                        .filter(|active| {
+                            identity.is_none_or(|identity| identity.matches_active(active))
+                        })
+                        .ok_or_else(|| {
+                            RmuxError::Server("attached client disappeared".to_owned())
+                        })?;
                     match active.overlay.as_mut() {
                         Some(ClientOverlayState::Menu(_)) => clear_root = true,
                         Some(ClientOverlayState::Popup(popup)) => popup.nested_menu = None,
@@ -96,18 +145,27 @@ impl RequestHandler {
                     }
                 }
                 if clear_root {
-                    self.clear_interactive_overlay(attach_pid, true).await?;
+                    self.clear_interactive_overlay_for_optional_identity(
+                        attach_pid, identity, true,
+                    )
+                    .await?;
                 } else {
-                    self.refresh_interactive_overlay_if_active(attach_pid)
+                    self.refresh_interactive_overlay_for_optional_identity(attach_pid, identity)
                         .await?;
                 }
             }
             MenuOutcome::Execute(action) => {
                 let (requester_pid, target) = {
                     let mut active_attach = self.active_attach.lock().await;
-                    let active = active_attach.by_pid.get_mut(&attach_pid).ok_or_else(|| {
-                        RmuxError::Server("attached client disappeared".to_owned())
-                    })?;
+                    let active = active_attach
+                        .by_pid
+                        .get_mut(&attach_pid)
+                        .filter(|active| {
+                            identity.is_none_or(|identity| identity.matches_active(active))
+                        })
+                        .ok_or_else(|| {
+                            RmuxError::Server("attached client disappeared".to_owned())
+                        })?;
                     match active.overlay.as_mut() {
                         Some(ClientOverlayState::Menu(menu)) => {
                             let target = menu.current_target.clone();
@@ -126,9 +184,11 @@ impl RequestHandler {
                 };
                 match action {
                     OverlayMenuAction::Command(command) => {
-                        self.refresh_interactive_overlay_if_active(attach_pid)
-                            .await
-                            .ok();
+                        self.refresh_interactive_overlay_for_optional_identity(
+                            attach_pid, identity,
+                        )
+                        .await
+                        .ok();
                         let parsed = self.parse_command_string_one_group(&command).await?;
                         let _ = self
                             .execute_parsed_commands(
@@ -140,7 +200,8 @@ impl RequestHandler {
                             .await?;
                     }
                     OverlayMenuAction::Popup(action) => {
-                        self.apply_popup_menu_action(attach_pid, action).await?;
+                        self.apply_popup_menu_action(attach_pid, identity, action)
+                            .await?;
                     }
                 }
             }
@@ -148,100 +209,31 @@ impl RequestHandler {
         Ok(())
     }
 
-    async fn apply_popup_menu_action(
+    pub(super) async fn handle_popup_key_input(
         &self,
         attach_pid: u32,
-        action: PopupMenuAction,
-    ) -> Result<(), RmuxError> {
-        match action {
-            PopupMenuAction::Close => {
-                self.clear_interactive_overlay(attach_pid, true).await?;
-            }
-            PopupMenuAction::Paste => {
-                let bytes = {
-                    let state = self.state.lock().await;
-                    state
-                        .buffers
-                        .stack_head()
-                        .and_then(|name| state.buffers.get(name))
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_default()
-                };
-                let mut refreshed = false;
-                {
-                    let mut active_attach = self.active_attach.lock().await;
-                    let active = active_attach.by_pid.get_mut(&attach_pid).ok_or_else(|| {
-                        RmuxError::Server("attached client disappeared".to_owned())
-                    })?;
-                    if let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() {
-                        popup.nested_menu = None;
-                        if let Some(job) = &popup.job {
-                            let _ = job.write(&bytes);
-                        }
-                        refreshed = true;
-                    }
-                }
-                if refreshed {
-                    self.refresh_interactive_overlay_if_active(attach_pid)
-                        .await?;
-                }
-            }
-            PopupMenuAction::FillSpace | PopupMenuAction::Centre => {
-                let mut refreshed = false;
-                {
-                    let mut active_attach = self.active_attach.lock().await;
-                    let active = active_attach.by_pid.get_mut(&attach_pid).ok_or_else(|| {
-                        RmuxError::Server("attached client disappeared".to_owned())
-                    })?;
-                    let client_size = active.client_size;
-                    if let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() {
-                        popup.nested_menu = None;
-                        match action {
-                            PopupMenuAction::FillSpace => {
-                                popup.rect = OverlayRect {
-                                    x: 0,
-                                    y: 0,
-                                    width: client_size.cols.max(1),
-                                    height: client_size.rows.max(1),
-                                };
-                                popup.preferred_width = popup.rect.width;
-                                popup.preferred_height = popup.rect.height;
-                            }
-                            PopupMenuAction::Centre => {
-                                popup.rect.x =
-                                    client_size.cols.saturating_sub(popup.rect.width) / 2;
-                                popup.rect.y =
-                                    client_size.rows.saturating_sub(popup.rect.height) / 2;
-                            }
-                            _ => {}
-                        }
-                        let content_size = popup.content_size();
-                        popup
-                            .surface
-                            .lock()
-                            .expect("popup surface")
-                            .resize(content_size);
-                        if let Some(job) = &popup.job {
-                            let _ = job.resize(content_size);
-                        }
-                        refreshed = true;
-                    }
-                }
-                if refreshed {
-                    self.refresh_interactive_overlay_if_active(attach_pid)
-                        .await?;
-                }
-            }
-            PopupMenuAction::HorizontalPane | PopupMenuAction::VerticalPane => {
-                self.clear_interactive_overlay(attach_pid, true).await?;
-            }
-        }
-        Ok(())
+        key: KeyCode,
+        bytes: &[u8],
+    ) -> io::Result<bool> {
+        self.handle_popup_key_input_with_identity(attach_pid, None, key, bytes)
+            .await
     }
 
-    pub(super) async fn handle_popup_raw_input(
+    pub(super) async fn handle_popup_key_input_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        key: KeyCode,
+        bytes: &[u8],
+    ) -> io::Result<bool> {
+        self.handle_popup_key_input_with_identity(identity.attach_pid(), Some(identity), key, bytes)
+            .await
+    }
+
+    async fn handle_popup_key_input_with_identity(
         &self,
         attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+        key: KeyCode,
         bytes: &[u8],
     ) -> io::Result<bool> {
         let popup = {
@@ -249,6 +241,7 @@ impl RequestHandler {
             active_attach
                 .by_pid
                 .get(&attach_pid)
+                .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .and_then(|active| match active.overlay.as_ref() {
                     Some(ClientOverlayState::Popup(popup)) => Some(popup.clone()),
                     _ => None,
@@ -262,30 +255,74 @@ impl RequestHandler {
             return Ok(false);
         }
 
+        // A no-job popup consumes bytes as keys (Escape closes, close_any_key
+        // closes on any input). A bracketed-paste envelope arriving here would
+        // otherwise let the leading ESC close the popup and leak the body to
+        // the underlying pane — so scrub markers when we're in the key-decoding
+        // mode. A job-backed popup forwards bytes verbatim to the child
+        // process (which handles its own ?2004h), so keep those raw.
+        let scrubbed = if popup.no_job || popup.job.is_none() {
+            Some(crate::handler::pane_support::strip_bracketed_paste_markers(
+                bytes,
+            ))
+        } else {
+            None
+        };
+        let bytes: &[u8] = scrubbed.as_deref().unwrap_or(bytes);
+
         if bytes.is_empty() {
             return Ok(true);
         }
-        if (bytes == b"\x1b"
-            || bytes == b"\x03"
-            || matches!(
-                decode_prompt_key_guess(bytes),
-                Some(PromptInputEvent::Escape | PromptInputEvent::Ctrl('c'))
-            ))
+        if popup.scrollable_text.is_some() {
+            return self
+                .handle_scrollable_popup_key_input(attach_pid, identity, popup.id, key)
+                .await;
+        }
+        if (bytes == b"\x1b" || bytes == b"\x03")
             && ((!popup.close_on_exit && !popup.close_on_zero_exit) || popup.no_job)
         {
-            self.clear_interactive_overlay(attach_pid, true)
+            self.clear_interactive_overlay_for_optional_identity(attach_pid, identity, true)
                 .await
                 .map_err(io::Error::other)?;
             return Ok(true);
         }
         if popup.no_job && popup.close_any_key {
-            self.clear_interactive_overlay(attach_pid, true)
+            self.clear_interactive_overlay_for_optional_identity(attach_pid, identity, true)
                 .await
                 .map_err(io::Error::other)?;
             return Ok(true);
         }
-        if let Some(job) = &popup.job {
-            job.write(bytes)?;
+        if popup.job.is_some() {
+            let receipt = {
+                let active_attach = self.active_attach.lock().await;
+                active_attach
+                    .by_pid
+                    .get(&attach_pid)
+                    .filter(|active| {
+                        identity.is_none_or(|identity| identity.matches_active(active))
+                    })
+                    .and_then(|active| match active.overlay.as_ref() {
+                        Some(ClientOverlayState::Popup(current)) if current.id == popup.id => {
+                            current.job.as_ref()
+                        }
+                        _ => None,
+                    })
+                    .map(|job| job.enqueue_write(bytes))
+                    .transpose()?
+            };
+            if let Some(receipt) = receipt {
+                if receipt.wait().await.is_err() {
+                    // A synchronous ConPTY write can remain blocked when the
+                    // popup child stops reading. Retire only the popup whose
+                    // write failed so a concurrently installed replacement is
+                    // never cleared, and keep the attached client alive.
+                    self.clear_interactive_overlay_for_optional_identity_and_id(
+                        attach_pid, identity, popup.id, true,
+                    )
+                    .await
+                    .map_err(io::Error::other)?;
+                }
+            }
         }
         Ok(true)
     }
@@ -295,20 +332,45 @@ impl RequestHandler {
         attach_pid: u32,
         raw: MouseForwardEvent,
     ) -> io::Result<()> {
+        self.handle_popup_mouse_event_with_identity(attach_pid, None, raw)
+            .await
+    }
+
+    pub(super) async fn handle_popup_mouse_event_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        raw: MouseForwardEvent,
+    ) -> io::Result<()> {
+        self.handle_popup_mouse_event_with_identity(identity.attach_pid(), Some(identity), raw)
+            .await
+    }
+
+    async fn handle_popup_mouse_event_with_identity(
+        &self,
+        attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
+        raw: MouseForwardEvent,
+    ) -> io::Result<()> {
         let nested_menu_active = {
             let active_attach = self.active_attach.lock().await;
             active_attach
                 .by_pid
                 .get(&attach_pid)
+                .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .and_then(|active| active.overlay.as_ref())
                 .is_some_and(|overlay| {
                     matches!(overlay, ClientOverlayState::Popup(popup) if popup.nested_menu.is_some())
                 })
         };
         if nested_menu_active {
-            self.handle_menu_mouse_event(attach_pid, raw)
-                .await
-                .map_err(io::Error::other)?;
+            match identity {
+                Some(identity) => {
+                    self.handle_menu_mouse_event_for_identity(identity, raw)
+                        .await
+                }
+                None => self.handle_menu_mouse_event(attach_pid, raw).await,
+            }
+            .map_err(io::Error::other)?;
             return Ok(());
         }
         let outcome = {
@@ -316,6 +378,7 @@ impl RequestHandler {
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .ok_or_else(|| io::Error::other("attached client disappeared"))?;
             let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() else {
                 return Ok(());
@@ -325,31 +388,41 @@ impl RequestHandler {
 
         match outcome {
             PopupMouseOutcome::Ignore => {}
-            PopupMouseOutcome::Redraw => {
-                self.refresh_interactive_overlay_if_active(attach_pid)
+            PopupMouseOutcome::Redraw { resize } => {
+                if let Some(receipt) = resize {
+                    let _ = receipt.wait().await;
+                }
+                self.refresh_interactive_overlay_for_optional_identity(attach_pid, identity)
                     .await
                     .map_err(io::Error::other)?;
             }
             PopupMouseOutcome::Forward { mode, event, x, y } => {
-                let popup = {
+                let encoded = encode_mouse_event(mode, &event, x, y);
+                let popup_write = {
                     let active_attach = self.active_attach.lock().await;
-                    active_attach.by_pid.get(&attach_pid).and_then(|active| {
-                        match active.overlay.as_ref() {
-                            Some(ClientOverlayState::Popup(popup)) => Some(popup.clone()),
-                            _ => None,
-                        }
-                    })
+                    active_attach
+                        .by_pid
+                        .get(&attach_pid)
+                        .filter(|active| {
+                            identity.is_none_or(|identity| identity.matches_active(active))
+                        })
+                        .and_then(|active| active.overlay.as_ref())
+                        .and_then(|overlay| match overlay {
+                            ClientOverlayState::Popup(popup) => popup.job.as_ref(),
+                            ClientOverlayState::Menu(_) => None,
+                        })
+                        .and_then(|job| {
+                            encoded
+                                .as_deref()
+                                .and_then(|bytes| job.enqueue_write(bytes).ok())
+                        })
                 };
-                if let Some(popup) = popup {
-                    if let Some(job) = &popup.job {
-                        if let Some(bytes) = encode_mouse_event(mode, &event, x, y) {
-                            let _ = job.write(&bytes);
-                        }
-                    }
+                if let Some(receipt) = popup_write {
+                    let _ = receipt.wait().await;
                 }
             }
             PopupMouseOutcome::OpenMenu { x, y } => {
-                self.open_popup_internal_menu(attach_pid, x, y)
+                self.open_popup_internal_menu(attach_pid, identity, x, y)
                     .await
                     .map_err(io::Error::other)?;
             }
@@ -360,6 +433,7 @@ impl RequestHandler {
     async fn open_popup_internal_menu(
         &self,
         attach_pid: u32,
+        identity: Option<ActiveAttachIdentity>,
         x: u16,
         y: u16,
     ) -> Result<(), RmuxError> {
@@ -368,6 +442,7 @@ impl RequestHandler {
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
+                .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .ok_or_else(|| attached_client_required("display-menu"))?;
             let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_ref() else {
                 return Ok(());
@@ -408,6 +483,7 @@ impl RequestHandler {
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .ok_or_else(|| attached_client_required("display-menu"))?;
             if let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() {
                 popup.nested_menu = Some(MenuOverlayState {
@@ -426,7 +502,7 @@ impl RequestHandler {
                 });
             }
         }
-        self.refresh_interactive_overlay_if_active(attach_pid)
+        self.refresh_interactive_overlay_for_optional_identity(attach_pid, identity)
             .await?;
         Ok(())
     }

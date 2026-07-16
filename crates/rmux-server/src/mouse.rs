@@ -6,7 +6,7 @@ use rmux_core::{
     key_string_lookup_string, KeyCode, PaneGeometry, KEYC_CTRL, KEYC_DRAGGING, KEYC_META,
     KEYC_SHIFT,
 };
-use rmux_proto::{OptionName, PaneTarget, SessionName};
+use rmux_proto::{OptionName, PaneTarget, SessionId, SessionName};
 
 use crate::copy_mode::CopyModeMouseContext;
 use crate::input_keys::MouseForwardEvent;
@@ -49,6 +49,35 @@ const MOUSE_BUTTON_10: u16 = 130;
 const MOUSE_BUTTON_11: u16 = 131;
 
 impl ClientMouseState {
+    pub(crate) fn rename_session_targets(
+        &mut self,
+        old_name: &SessionName,
+        session_id: SessionId,
+        new_name: &SessionName,
+    ) {
+        for event in [
+            self.click_event.as_mut(),
+            self.current_event.as_mut(),
+            self.drag_start_event.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if event.session_id == session_id.as_u32() {
+                if let Some(target) = event.pane_target.as_mut() {
+                    rename_mouse_pane_target(target, old_name, new_name);
+                }
+            }
+        }
+        if let Some(handler) = self.drag_handler.as_mut() {
+            let target = match handler {
+                types::MouseDragHandler::CopyModeSelection { target }
+                | types::MouseDragHandler::CopyModeScrollbar { target } => target,
+            };
+            rename_mouse_pane_target(target, old_name, new_name);
+        }
+    }
+
     pub(crate) fn click_deadline(&self) -> Option<Instant> {
         self.click_deadline
     }
@@ -83,6 +112,17 @@ impl ClientMouseState {
         self.click_event = None;
         double_click.flatten()
     }
+}
+
+fn rename_mouse_pane_target(
+    target: &mut PaneTarget,
+    old_name: &SessionName,
+    new_name: &SessionName,
+) {
+    if target.session_name() != old_name {
+        return;
+    }
+    *target = PaneTarget::with_window(new_name.clone(), target.window_index(), target.pane_index());
 }
 
 pub(crate) fn layout_for_session(
@@ -222,6 +262,19 @@ pub(crate) fn classify_mouse_events(
     let expired = state.expire_click_timer(now, layout);
     let current = classify_current_mouse_event(state, layout, raw, now);
     expired.into_iter().chain(current).collect()
+}
+
+/// Maps a raw outer-terminal report to the pane under the cursor without
+/// synthesizing tmux click/drag bindings. This is the application passthrough
+/// path used when the pane requested mouse tracking but the RMUX `mouse`
+/// option is off.
+pub(crate) fn mouse_event_for_pane_passthrough(
+    layout: &MouseLayout,
+    raw: MouseForwardEvent,
+) -> Option<AttachedMouseEvent> {
+    let hit = resolve_mouse_hit(layout, raw.x, raw.y, false, None);
+    let event = hit_to_attached_event(layout, raw, hit, false)?;
+    (event.location == MouseLocation::Pane).then_some(event)
 }
 
 fn classify_current_mouse_event(

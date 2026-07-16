@@ -76,6 +76,7 @@ fn run_attached_probe(
         .env("TMUX", r"\\.\pipe\outer-tmux,123,0")
         .env("RMUX_PANE", "%outer")
         .env("TMUX_PANE", "%outer")
+        .allow_explicit_job_breakaway()
         .size(TerminalSize::new(100, 30));
     if mode == FakeClaudeMode::CreateMateThroughTmuxInheritance {
         command = command.env("RMUX_CLAUDE_TEST_CREATE_SWARM_FALLBACK", "1");

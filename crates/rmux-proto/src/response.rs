@@ -45,8 +45,9 @@ pub use pane::{
     PaneSnapshotCursor, PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorResponse,
     PaneStateEventDto, PaneStateLagResponse, PaneStateSnapshot, PipePaneResponse,
     ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse, SendKeysResponse,
-    SplitWindowResponse, SubscribePaneOutputResponse, SubscribePaneStateResponse, SwapPaneResponse,
-    UnsubscribePaneOutputResponse, UnsubscribePaneStateResponse,
+    SplitWindowIdentityResponse, SplitWindowResponse, SubscribePaneOutputResponse,
+    SubscribePaneStateResponse, SwapPaneResponse, UnsubscribePaneOutputResponse,
+    UnsubscribePaneStateResponse,
 };
 
 #[path = "response/client.rs"]
@@ -283,6 +284,8 @@ pub enum Response {
     UnsubscribePaneState(UnsubscribePaneStateResponse),
     /// Success payload for SDK pane foreground-state lookup.
     PaneForegroundState(Box<PaneForegroundStateResponse>),
+    /// Atomic visible and stable identity returned by an SDK split.
+    SplitWindowIdentity(SplitWindowIdentityResponse),
 }
 
 impl Response {
@@ -307,7 +310,7 @@ impl Response {
             Self::MoveWindow(_) => "move-window",
             Self::SwapWindow(_) => "swap-window",
             Self::RotateWindow(_) => "rotate-window",
-            Self::SplitWindow(_) => "split-window",
+            Self::SplitWindow(_) | Self::SplitWindowIdentity(_) => "split-window",
             Self::SwapPane(_) => "swap-pane",
             Self::LastPane(_) => "last-pane",
             Self::JoinPane(_) => "join-pane",
@@ -445,6 +448,7 @@ impl Response {
             | Self::PaneStateLag(_)
             | Self::UnsubscribePaneState(_)
             | Self::PaneForegroundState(_)
+            | Self::SplitWindowIdentity(_)
             | Self::CreateSessionLease(_)
             | Self::RenewSessionLease(_)
             | Self::ReleaseSessionLease(_)
@@ -786,14 +790,8 @@ where
     match seq.next_element::<T>() {
         Ok(Some(value)) => Ok(value),
         Ok(None) => Ok(T::default()),
-        Err(error) if is_truncated_compat_sequence(&error) => Ok(T::default()),
         Err(error) => Err(error),
     }
-}
-
-fn is_truncated_compat_sequence(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("UnexpectedEof") || message.contains("unexpected end of file")
 }
 
 /// Response payload for `if-shell`.
@@ -960,6 +958,7 @@ impl<'de> Visitor<'de> for SourceFileResponseVisitor {
 pub struct WaitForResponse;
 
 /// Terminal state for a daemon-backed SDK byte wait.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SdkWaitOutcome {
     /// The requested byte sequence was observed.
@@ -990,10 +989,9 @@ pub struct CancelSdkWaitResponse {
 impl CancelSdkWaitResponse {
     /// Returns the compatibility-preserving ACK used by armed SDK waits.
     ///
-    /// `SdkWaitOutcome` is a published exhaustive enum whose terminal outcomes
-    /// must stay source-compatible across patch releases. The daemon therefore
-    /// acknowledges an armed wait with this existing response shape instead of
-    /// adding a third `SdkWaitOutcome` variant.
+    /// Armed acknowledgement is deliberately kept outside the terminal
+    /// `SdkWaitOutcome` enum. This preserves the current release wire while the
+    /// non-exhaustive outcome type remains forward-compatible for SDK callers.
     #[must_use]
     pub const fn armed_ack(wait_id: SdkWaitId) -> Self {
         Self {
@@ -1035,34 +1033,24 @@ mod tests {
     }
 
     #[test]
-    fn run_shell_response_deserializes_old_payloads_with_no_exit_status() {
+    fn run_shell_response_rejects_old_unversioned_payload() {
         let bytes = bincode::serialize(&OldRunShellResponse { output: None })
             .expect("old run-shell response serializes");
 
-        let decoded: RunShellResponse =
-            bincode::deserialize(&bytes).expect("new run-shell response decodes old payload");
-
-        assert_eq!(decoded.command_output(), None);
-        assert_eq!(decoded.exit_status(), None);
+        bincode::deserialize::<RunShellResponse>(&bytes)
+            .expect_err("current response rejects old payload without a matching wire version");
     }
 
     #[test]
-    fn source_file_response_deserializes_old_payloads_with_empty_stderr() {
+    fn source_file_response_rejects_old_unversioned_payload() {
         let bytes = bincode::serialize(&OldSourceFileResponse {
             output: Some(CommandOutput::from_stdout(b"parsed\n".to_vec())),
             exit_status: Some(1),
         })
         .expect("old source-file response serializes");
 
-        let decoded: SourceFileResponse =
-            bincode::deserialize(&bytes).expect("new source-file response decodes old payload");
-
-        assert_eq!(
-            decoded.command_output(),
-            Some(&CommandOutput::from_stdout(b"parsed\n".to_vec()))
-        );
-        assert_eq!(decoded.exit_status(), Some(1));
-        assert!(decoded.stderr().is_empty());
+        bincode::deserialize::<SourceFileResponse>(&bytes)
+            .expect_err("current response rejects old payload without a matching wire version");
     }
 
     #[test]
@@ -1118,11 +1106,10 @@ mod tests {
     }
 
     #[test]
-    fn sdk_wait_outcome_patch_surface_stays_terminal_only() {
+    fn known_sdk_wait_outcomes_are_terminal() {
+        #[allow(unreachable_patterns)]
         fn is_terminal(outcome: SdkWaitOutcome) -> bool {
-            match outcome {
-                SdkWaitOutcome::Matched | SdkWaitOutcome::Cancelled => true,
-            }
+            matches!(outcome, SdkWaitOutcome::Matched | SdkWaitOutcome::Cancelled)
         }
 
         assert!(is_terminal(SdkWaitOutcome::Matched));

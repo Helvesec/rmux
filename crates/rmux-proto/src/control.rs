@@ -61,6 +61,10 @@ pub struct ClientTerminalContext {
     pub utf8: bool,
 }
 
+/// Maximum number of command-line commands accepted across a control-mode
+/// upgrade boundary.
+pub const MAX_INITIAL_CONTROL_COMMANDS: usize = 1024;
+
 /// Detached upgrade request that switches a connection into tmux-compatible
 /// control mode while leaving the underlying RPC framing unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

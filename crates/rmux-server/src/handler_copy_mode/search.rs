@@ -4,6 +4,7 @@ use tokio::sync::oneshot;
 
 use rmux_proto::{PaneTarget, RmuxError};
 
+use super::super::attach_support::ActiveAttachIdentity;
 use super::super::prompt_support::{
     CommandPromptPlan, PromptField, PromptQueueResult, PromptStartOutcome, PromptType,
 };
@@ -50,6 +51,32 @@ impl RequestHandler {
         target: PaneTarget,
         direction: AttachedCopyModeSearchDirection,
     ) -> Result<(), RmuxError> {
+        self.start_copy_mode_search_prompt_with_identity(None, attach_pid, target, direction)
+            .await
+    }
+
+    pub(super) async fn start_copy_mode_search_prompt_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        target: PaneTarget,
+        direction: AttachedCopyModeSearchDirection,
+    ) -> Result<(), RmuxError> {
+        self.start_copy_mode_search_prompt_with_identity(
+            Some(identity),
+            identity.attach_pid(),
+            target,
+            direction,
+        )
+        .await
+    }
+
+    async fn start_copy_mode_search_prompt_with_identity(
+        &self,
+        identity: Option<ActiveAttachIdentity>,
+        attach_pid: u32,
+        target: PaneTarget,
+        direction: AttachedCopyModeSearchDirection,
+    ) -> Result<(), RmuxError> {
         let plan = CommandPromptPlan {
             requester_pid: attach_pid,
             target_client: None,
@@ -68,11 +95,18 @@ impl RequestHandler {
             format_values: Vec::new(),
         };
 
-        if let PromptStartOutcome::Waiting(rx) = self.start_command_prompt(plan).await? {
+        let outcome = match identity {
+            Some(identity) => {
+                self.start_command_prompt_for_identity(identity, plan)
+                    .await?
+            }
+            None => self.start_command_prompt(plan).await?,
+        };
+        if let PromptStartOutcome::Waiting(rx) = outcome {
             let handler = self.clone();
             tokio::spawn(async move {
                 handler
-                    .await_copy_mode_search_prompt(attach_pid, target, direction, rx)
+                    .await_copy_mode_search_prompt(identity, attach_pid, target, direction, rx)
                     .await;
             });
         }
@@ -81,6 +115,7 @@ impl RequestHandler {
 
     async fn await_copy_mode_search_prompt(
         &self,
+        identity: Option<ActiveAttachIdentity>,
         attach_pid: u32,
         target: PaneTarget,
         direction: AttachedCopyModeSearchDirection,
@@ -100,9 +135,16 @@ impl RequestHandler {
             AttachedCopyModeSearchDirection::Backward => "search-backward",
         };
         let args = vec!["--".to_owned(), query.clone()];
-        let _ = self
-            .execute_copy_mode_command(attach_pid, target, command, &args, 1)
-            .await;
+        let _ = match identity {
+            Some(identity) => {
+                self.execute_copy_mode_command_for_identity(identity, target, command, &args, 1)
+                    .await
+            }
+            None => {
+                self.execute_copy_mode_command(attach_pid, target, command, &args, 1)
+                    .await
+            }
+        };
     }
 
     pub(super) async fn execute_copy_mode_search_command(

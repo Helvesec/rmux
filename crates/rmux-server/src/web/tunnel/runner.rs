@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
-use std::io::{self, BufRead, Read};
+use std::io;
 use std::net::SocketAddr;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
+use rmux_os::process_tree::{ProcessTreeChild, ProcessTreeController};
 use rmux_proto::RmuxError;
 use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::{mpsc, oneshot};
@@ -17,12 +18,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info};
 
+use super::output;
 use super::preset::{ProcessOutput, TunnelPreset};
 use crate::web::origin::validate_public_base_url;
 use crate::web::settings::WebShareSettings;
 use crate::web::tunnel::TunnelInfo;
 
-const LINE_CHANNEL_CAPACITY: usize = 64;
 const ERROR_LINE_LIMIT: usize = 8;
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const TUNNEL_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -82,19 +83,18 @@ pub(super) async fn start(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
+    let mut child = ProcessTreeChild::spawn(&mut command)
         .map_err(|error| spawn_error(&preset, &program, error))?;
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    let (line_tx, line_rx) = mpsc::channel(LINE_CHANNEL_CAPACITY);
-    spawn_line_reader(
+    let stdout = child.child_mut().stdout.take().expect("stdout is piped");
+    let stderr = child.child_mut().stderr.take().expect("stderr is piped");
+    let (line_tx, line_rx) = output::channel();
+    output::spawn_reader(
         "rmux-tunnel-stdout",
         stdout,
         line_tx.clone(),
         ProcessOutput::Stdout,
     );
-    spawn_line_reader("rmux-tunnel-stderr", stderr, line_tx, ProcessOutput::Stderr);
+    output::spawn_reader("rmux-tunnel-stderr", stderr, line_tx, ProcessOutput::Stderr);
 
     let (stop_tx, stop_rx) = oneshot::channel();
     let (exit_tx, exit_rx) = oneshot::channel();
@@ -260,23 +260,23 @@ fn default_port(scheme: &str) -> io::Result<u16> {
 }
 
 fn wait_for_tunnel_child(
-    mut child: Child,
+    mut child: ProcessTreeChild,
     stop_flag: Arc<AtomicBool>,
-) -> io::Result<std::process::ExitStatus> {
+) -> io::Result<ExitStatus> {
+    let controller = child.controller();
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
+        if child.has_exited()? {
+            return terminate_descendants_and_wait(&mut child, &controller);
         }
         if stop_flag.load(Ordering::SeqCst) {
-            terminate_child(&mut child);
+            terminate_child_gracefully(&mut child);
             let deadline = Instant::now() + STOP_GRACE_PERIOD;
             loop {
-                if let Some(status) = child.try_wait()? {
-                    return Ok(status);
+                if child.has_exited()? {
+                    return terminate_descendants_and_wait(&mut child, &controller);
                 }
                 if Instant::now() >= deadline {
-                    child.kill()?;
-                    return child.wait();
+                    return terminate_descendants_and_wait(&mut child, &controller);
                 }
                 thread::sleep(TUNNEL_CHILD_POLL_INTERVAL);
             }
@@ -286,20 +286,23 @@ fn wait_for_tunnel_child(
 }
 
 #[cfg(unix)]
-fn terminate_child(child: &mut Child) {
-    let Some(pid) = child
-        .id()
-        .try_into()
-        .ok()
-        .and_then(rustix::process::Pid::from_raw)
-    else {
-        return;
-    };
-    let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+fn terminate_child_gracefully(child: &mut ProcessTreeChild) {
+    let _ = child.forward_signal(rustix::process::Signal::TERM.as_raw());
 }
 
 #[cfg(not(unix))]
-fn terminate_child(_child: &mut Child) {}
+fn terminate_child_gracefully(child: &mut ProcessTreeChild) {
+    let _ = child.terminate();
+}
+
+fn terminate_descendants_and_wait(
+    child: &mut ProcessTreeChild,
+    controller: &ProcessTreeController,
+) -> io::Result<ExitStatus> {
+    let terminate_result = controller.terminate();
+    let wait_result = child.wait();
+    terminate_result.and(wait_result)
+}
 
 async fn wait_for_url(
     preset: &TunnelPreset,
@@ -350,19 +353,6 @@ async fn wait_for_url(
         .map_err(|_| tunnel_error(preset, "timed out waiting for a public URL", &last_lines))?
 }
 
-fn spawn_line_reader<R>(
-    name: &'static str,
-    reader: R,
-    tx: mpsc::Sender<(ProcessOutput, String)>,
-    source: ProcessOutput,
-) where
-    R: Read + Send + 'static,
-{
-    let _ = thread::Builder::new().name(name.to_owned()).spawn(move || {
-        read_lines(source, reader, tx);
-    });
-}
-
 fn spawn_output_drain(
     provider: String,
     mut lines: mpsc::Receiver<(ProcessOutput, String)>,
@@ -377,25 +367,6 @@ fn spawn_output_drain(
             );
         }
     })
-}
-
-fn read_lines<R>(source: ProcessOutput, reader: R, tx: mpsc::Sender<(ProcessOutput, String)>)
-where
-    R: Read,
-{
-    for line in io::BufReader::new(reader).lines() {
-        match line {
-            Ok(line) => {
-                if tx.blocking_send((source, line)).is_err() {
-                    return;
-                }
-            }
-            Err(error) => {
-                debug!("web-share tunnel output read failed: {error}");
-                return;
-            }
-        }
-    }
 }
 
 fn remember_line(lines: &mut VecDeque<String>, line: &str) {
@@ -451,6 +422,8 @@ fn expand(value: &str, settings: &WebShareSettings) -> Result<String, RmuxError>
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    #[cfg(unix)]
+    use std::path::Path;
 
     #[test]
     fn endpoint_probe_prefers_ipv4_before_ipv6() {
@@ -494,5 +467,91 @@ mod tests {
             .expect("tunnel starts");
         assert_eq!(info.public_url, url);
         drop(info);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_tunnel_stops_wrapper_descendants() {
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        use super::start;
+        use crate::web::settings::WebShareSettings;
+        use crate::web::tunnel::preset::{TunnelPreset, UrlSource};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind readiness probe listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let _listener_task =
+            tokio::spawn(
+                async move { while let Ok((_stream, _addr)) = listener.accept().await {} },
+            );
+        let root = std::env::temp_dir().join(format!(
+            "rmux-tunnel-tree-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create tunnel test root");
+        let pid_path = root.join("descendant.pid");
+        let url = format!("http://127.0.0.1:{port}");
+        let script = format!(
+            "sleep 30 & child=$!; printf '%s' \"$child\" > '{}'; printf '%s\\n' '{}'; wait",
+            pid_path.display(),
+            url
+        );
+        let preset = TunnelPreset {
+            name: "wrapper-tree-test".to_owned(),
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), script],
+            url_pattern: regex::escape(&url),
+            ready_pattern: None,
+            url_source: UrlSource::Stdout,
+            ready_timeout_secs: 5,
+            install_hint: None,
+        };
+        let info = start(preset, &WebShareSettings::default())
+            .await
+            .expect("tunnel starts");
+        let descendant_pid = wait_for_descendant_pid(&pid_path).await;
+        assert!(process_exists(descendant_pid), "descendant must start");
+
+        drop(info);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while process_exists(descendant_pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !process_exists(descendant_pid),
+            "dropping a tunnel must terminate its provider descendants"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_descendant_pid(path: &Path) -> i32 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                if let Ok(pid) = raw.parse::<i32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tunnel descendant pid was not published"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        rustix::process::Pid::from_raw(pid)
+            .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
     }
 }

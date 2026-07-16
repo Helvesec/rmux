@@ -47,7 +47,7 @@ impl<'a> ConfigLoadRequest<'a> {
                 ConfigLoadMode::Execute
             },
             read_policy: match command.syntax {
-                SourceSyntax::Rmux => ConfigReadPolicy::Strict,
+                SourceSyntax::Rmux | SourceSyntax::Canonical => ConfigReadPolicy::Strict,
                 SourceSyntax::TmuxCompat => ConfigReadPolicy::ImportCompat,
             },
             quiet: command.quiet,

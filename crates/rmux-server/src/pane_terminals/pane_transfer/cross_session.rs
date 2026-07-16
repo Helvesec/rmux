@@ -1,11 +1,21 @@
-use rmux_core::{BreakPaneOptions, PaneJoinOptions, PaneSwapOptions, Session, SessionPaneTarget};
+use rmux_core::{BreakPaneOptions, PaneJoinOptions, PaneSwapOptions, SessionPaneTarget};
 use rmux_proto::{
     BreakPaneRequest, BreakPaneResponse, JoinPaneRequest, JoinPaneResponse, PaneTarget, RmuxError,
     SessionName, SwapPaneResponse, WindowTarget,
 };
 
 use super::super::{session_not_found, HandlerState};
+use super::window_metadata::PaneTransferWindowMetadata;
 use super::{join_pane_internal_direction, pane_id_for_target, pane_index_for_id};
+
+#[path = "cross_session/transaction.rs"]
+pub(super) mod transaction;
+use transaction::{
+    cross_session_rollback_error, inserted_window_index_map, pane_option_snapshots_for_transfer,
+    resize_two_sessions, restore_pane_options_after_transfer, rollback_cross_session_move,
+    rollback_cross_session_swap, sync_pane_lifecycle_for_sessions,
+    synchronize_cross_session_transfer_families, window_ids_by_index, CrossSessionTransferSnapshot,
+};
 
 impl HandlerState {
     pub(super) fn swap_pane_across_sessions(
@@ -17,22 +27,38 @@ impl HandlerState {
     ) -> Result<SwapPaneResponse, RmuxError> {
         let source_session_name = source.session_name().clone();
         let target_session_name = target.session_name().clone();
-        let mut source_before_options = self.pane_option_slots_for_session(&source_session_name)?;
-        let mut target_before_options = self.pane_option_slots_for_session(&target_session_name)?;
-        let previous_source_session = self
+        let source_before_session = self
             .sessions
             .session(&source_session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&source_session_name))?;
-        let previous_target_session = self
+        let target_before_session = self
             .sessions
             .session(&target_session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&target_session_name))?;
-        let source_pane_id = pane_id_for_target(&previous_source_session, &source)?;
-        let target_pane_id = pane_id_for_target(&previous_target_session, &target)?;
-        self.ensure_panes_exist(&source_session_name, &[source_pane_id])?;
-        self.ensure_panes_exist(&target_session_name, &[target_pane_id])?;
+        let source_pane_id = pane_id_for_target(&source_before_session, &source)?;
+        let target_pane_id = pane_id_for_target(&target_before_session, &target)?;
+        let slots = [
+            (source_session_name.clone(), source.window_index()),
+            (target_session_name.clone(), target.window_index()),
+        ];
+        let pane_option_snapshots = pane_option_snapshots_for_transfer(self, &slots)?;
+        let source_runtime =
+            self.runtime_session_name_for_window(&source_session_name, source.window_index());
+        let target_runtime =
+            self.runtime_session_name_for_window(&target_session_name, target.window_index());
+        self.ensure_window_panes_exist(
+            &source_session_name,
+            source.window_index(),
+            &[source_pane_id],
+        )?;
+        self.ensure_window_panes_exist(
+            &target_session_name,
+            target.window_index(),
+            &[target_pane_id],
+        )?;
+        let transfer_snapshot = CrossSessionTransferSnapshot::capture(self);
 
         let mutation_result = self.sessions.with_extracted_session_pair(
             &source_session_name,
@@ -47,103 +73,66 @@ impl HandlerState {
             },
         )?;
         if let Err(error) = mutation_result {
-            self.restore_cross_session_snapshots(
-                &source_session_name,
-                previous_source_session,
-                &target_session_name,
-                previous_target_session,
-            )?;
+            transfer_snapshot.restore(self);
+            return Err(error);
+        }
+
+        let lifecycle_sessions = match synchronize_cross_session_transfer_families(self, &slots) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                transfer_snapshot.restore(self);
+                return Err(error);
+            }
+        };
+        if let Err(error) = restore_pane_options_after_transfer(self, &pane_option_snapshots) {
+            transfer_snapshot.restore(self);
             return Err(error);
         }
 
         if let Err(error) = self.terminals.swap_panes_between_sessions(
-            &source_session_name,
+            &source_runtime,
             &[source_pane_id],
-            &target_session_name,
+            &target_runtime,
             &[target_pane_id],
         ) {
-            self.restore_cross_session_snapshots(
-                &source_session_name,
-                previous_source_session,
-                &target_session_name,
-                previous_target_session,
-            )?;
+            transfer_snapshot.restore(self);
             return Err(error);
         }
         if let Err(error) = self.swap_pane_outputs_between_sessions(
-            &source_session_name,
+            &source_runtime,
             &[source_pane_id],
-            &target_session_name,
+            &target_runtime,
             &[target_pane_id],
         ) {
-            self.terminals.swap_panes_between_sessions(
-                &source_session_name,
+            let runtime_rollback = self.terminals.swap_panes_between_sessions(
+                &source_runtime,
                 &[target_pane_id],
-                &target_session_name,
+                &target_runtime,
                 &[source_pane_id],
-            )?;
-            self.restore_cross_session_snapshots(
-                &source_session_name,
-                previous_source_session,
-                &target_session_name,
-                previous_target_session,
-            )?;
+            );
+            transfer_snapshot.restore(self);
+            runtime_rollback.map_err(|rollback_error| {
+                cross_session_rollback_error(&error, &[rollback_error])
+            })?;
             return Err(error);
         }
 
         if let Err(error) = resize_two_sessions(self, &source_session_name, &target_session_name) {
-            self.terminals.swap_panes_between_sessions(
-                &source_session_name,
-                &[target_pane_id],
-                &target_session_name,
-                &[source_pane_id],
-            )?;
-            self.swap_pane_outputs_between_sessions(
-                &source_session_name,
-                &[target_pane_id],
-                &target_session_name,
-                &[source_pane_id],
-            )?;
-            restore_two_sessions_after_resize_error(
+            rollback_cross_session_swap(
                 self,
+                transfer_snapshot,
                 &source_session_name,
-                previous_source_session,
                 &target_session_name,
-                previous_target_session,
+                &source_runtime,
+                source_pane_id,
+                &target_runtime,
+                target_pane_id,
                 &error,
             )?;
             return Err(error);
         }
 
-        self.synchronize_session_group_from(&source_session_name)?;
-        if source_session_name != target_session_name {
-            self.synchronize_session_group_from(&target_session_name)?;
-        }
-        self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
-        if source_session_name != target_session_name {
-            self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
-        }
-
-        source_before_options.remove(&source_pane_id);
-        target_before_options.remove(&target_pane_id);
-        self.rekey_pane_options_after_session_change(&source_before_options, &source_session_name)?;
-        self.rekey_pane_options_after_session_change(&target_before_options, &target_session_name)?;
-        let source_final_target = pane_target_for_id(
-            self,
-            &target_session_name,
-            target.window_index(),
-            source_pane_id,
-        )?;
-        let target_final_target = pane_target_for_id(
-            self,
-            &source_session_name,
-            source.window_index(),
-            target_pane_id,
-        )?;
-        self.options.rekey_pane_overrides(&[
-            (source.clone(), Some(source_final_target)),
-            (target.clone(), Some(target_final_target)),
-        ])?;
+        sync_pane_lifecycle_for_sessions(self, &lifecycle_sessions);
 
         Ok(SwapPaneResponse { source, target })
     }
@@ -154,25 +143,45 @@ impl HandlerState {
     ) -> Result<JoinPaneResponse, RmuxError> {
         let source_session_name = request.source.session_name().clone();
         let target_session_name = request.target.session_name().clone();
-        let mut source_before_options = self.pane_option_slots_for_session(&source_session_name)?;
-        let target_before_options = self.pane_option_slots_for_session(&target_session_name)?;
         let previous_source_session = self
             .sessions
             .session(&source_session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&source_session_name))?;
-        let previous_target_session = self
-            .sessions
-            .session(&target_session_name)
-            .cloned()
-            .ok_or_else(|| session_not_found(&target_session_name))?;
+        if self.sessions.session(&target_session_name).is_none() {
+            return Err(session_not_found(&target_session_name));
+        }
         let current_runtime_owner = self.sessions.runtime_owner(&source_session_name);
         let next_runtime_owner = self
             .sessions
             .runtime_owner_transfer_target(&source_session_name);
         let source_group_members_before = self.sessions.session_group_members(&source_session_name);
         let source_pane_id = pane_id_for_target(&previous_source_session, &request.source)?;
-        self.ensure_panes_exist(&source_session_name, &[source_pane_id])?;
+        if let Some(removal_plan) =
+            self.linked_last_pane_transfer_removal_plan(&request.source, source_pane_id)?
+        {
+            return self.join_last_linked_pane_across_sessions(
+                request,
+                source_pane_id,
+                removal_plan,
+            );
+        }
+        let source_window_metadata = PaneTransferWindowMetadata::capture(self, &request.source)?;
+        let slots = [
+            (source_session_name.clone(), request.source.window_index()),
+            (target_session_name.clone(), request.target.window_index()),
+        ];
+        let pane_option_snapshots = pane_option_snapshots_for_transfer(self, &slots)?;
+        let source_runtime = self
+            .runtime_session_name_for_window(&source_session_name, request.source.window_index());
+        let target_runtime = self
+            .runtime_session_name_for_window(&target_session_name, request.target.window_index());
+        self.ensure_window_panes_exist(
+            &source_session_name,
+            request.source.window_index(),
+            &[source_pane_id],
+        )?;
+        let transfer_snapshot = CrossSessionTransferSnapshot::capture(self);
 
         let direction = join_pane_internal_direction(request.direction);
         let mutation_result = self.sessions.with_extracted_session_pair(
@@ -199,44 +208,73 @@ impl HandlerState {
                 .session(&source_session_name)
                 .is_some_and(|session| session.windows().is_empty());
         if let Err(error) = mutation_result {
-            self.restore_cross_session_snapshots(
-                &source_session_name,
-                previous_source_session,
-                &target_session_name,
-                previous_target_session,
-            )?;
+            transfer_snapshot.restore(self);
             return Err(error);
         }
 
+        let mut synchronized_slots =
+            vec![(target_session_name.clone(), request.target.window_index())];
+        if !source_session_will_be_removed {
+            synchronized_slots.push((source_session_name.clone(), request.source.window_index()));
+        }
+        let lifecycle_sessions =
+            match synchronize_cross_session_transfer_families(self, &synchronized_slots) {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    transfer_snapshot.restore(self);
+                    return Err(error);
+                }
+            };
+        let moved_target_result = (|| {
+            let moved_index = self
+                .sessions
+                .session(&target_session_name)
+                .and_then(|session| {
+                    pane_index_for_id(session, request.target.window_index(), source_pane_id)
+                })
+                .ok_or_else(|| {
+                    RmuxError::Server(
+                        "moved pane disappeared after cross-session join-pane".to_owned(),
+                    )
+                })?;
+            let moved_target = PaneTarget::with_window(
+                target_session_name.clone(),
+                request.target.window_index(),
+                moved_index,
+            );
+            restore_pane_options_after_transfer(self, &pane_option_snapshots)?;
+            Ok::<_, RmuxError>(moved_target)
+        })();
+        let moved_target = match moved_target_result {
+            Ok(target) => target,
+            Err(error) => {
+                transfer_snapshot.restore(self);
+                return Err(error);
+            }
+        };
+
         if let Err(error) = self.terminals.move_panes_between_sessions(
-            &source_session_name,
-            &target_session_name,
+            &source_runtime,
+            &target_runtime,
             &[source_pane_id],
         ) {
-            self.restore_cross_session_snapshots(
-                &source_session_name,
-                previous_source_session,
-                &target_session_name,
-                previous_target_session,
-            )?;
+            transfer_snapshot.restore(self);
             return Err(error);
         }
         if let Err(error) = self.move_pane_outputs_between_sessions(
-            &source_session_name,
-            &target_session_name,
+            &source_runtime,
+            &target_runtime,
             &[source_pane_id],
         ) {
-            self.terminals.move_panes_between_sessions(
-                &target_session_name,
-                &source_session_name,
+            let runtime_rollback = self.terminals.move_panes_between_sessions(
+                &target_runtime,
+                &source_runtime,
                 &[source_pane_id],
-            )?;
-            self.restore_cross_session_snapshots(
-                &source_session_name,
-                previous_source_session,
-                &target_session_name,
-                previous_target_session,
-            )?;
+            );
+            transfer_snapshot.restore(self);
+            runtime_rollback.map_err(|rollback_error| {
+                cross_session_rollback_error(&error, &[rollback_error])
+            })?;
             return Err(error);
         }
 
@@ -246,58 +284,18 @@ impl HandlerState {
             resize_two_sessions(self, &source_session_name, &target_session_name)
         };
         if let Err(error) = resize_result {
-            self.terminals.move_panes_between_sessions(
-                &target_session_name,
+            rollback_cross_session_move(
+                self,
+                transfer_snapshot,
                 &source_session_name,
-                &[source_pane_id],
-            )?;
-            self.move_pane_outputs_between_sessions(
                 &target_session_name,
-                &source_session_name,
-                &[source_pane_id],
+                &source_runtime,
+                &target_runtime,
+                source_pane_id,
+                &error,
             )?;
-            if source_session_will_be_removed {
-                self.replace_session(&source_session_name, previous_source_session)?;
-                self.replace_session(&target_session_name, previous_target_session)?;
-                resize_two_sessions(self, &source_session_name, &target_session_name).map_err(
-                    |rollback_error| {
-                        RmuxError::Server(format!(
-                            "failed to roll back sessions {source_session_name} and {target_session_name} after {error}: {rollback_error}"
-                        ))
-                    },
-                )?;
-            } else {
-                restore_two_sessions_after_resize_error(
-                    self,
-                    &source_session_name,
-                    previous_source_session,
-                    &target_session_name,
-                    previous_target_session,
-                    &error,
-                )?;
-            }
             return Err(error);
         }
-
-        let moved_index = self
-            .sessions
-            .session(&target_session_name)
-            .and_then(|session| {
-                pane_index_for_id(session, request.target.window_index(), source_pane_id)
-            })
-            .ok_or_else(|| {
-                RmuxError::Server("moved pane disappeared after cross-session join-pane".to_owned())
-            })?;
-        let moved_target = PaneTarget::with_window(
-            target_session_name.clone(),
-            request.target.window_index(),
-            moved_index,
-        );
-        source_before_options.remove(&source_pane_id);
-        self.rekey_pane_options_after_session_change(&source_before_options, &source_session_name)?;
-        self.rekey_pane_options_after_session_change(&target_before_options, &target_session_name)?;
-        self.options
-            .transfer_pane_overrides(&request.source, &moved_target);
 
         if source_session_will_be_removed {
             if source_group_members_before.len() > 1 {
@@ -313,24 +311,13 @@ impl HandlerState {
                     next_runtime_owner.as_ref(),
                 )?;
             }
-        } else {
-            self.synchronize_session_group_from(&source_session_name)?;
-            self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
-        }
-        if source_session_name != target_session_name {
-            self.synchronize_session_group_from(&target_session_name)?;
-        }
-        if source_session_name != target_session_name {
-            self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
         }
 
+        source_window_metadata.prune_removed_aliases(self);
+        sync_pane_lifecycle_for_sessions(self, &lifecycle_sessions);
         self.clear_marked_pane_if_id(source_pane_id);
         Ok(JoinPaneResponse {
-            target: PaneTarget::with_window(
-                target_session_name,
-                request.target.window_index(),
-                moved_index,
-            ),
+            target: moved_target,
         })
     }
 
@@ -340,26 +327,52 @@ impl HandlerState {
         destination_session_name: SessionName,
     ) -> Result<BreakPaneResponse, RmuxError> {
         let source_session_name = request.source.session_name().clone();
-        let mut source_before_options = self.pane_option_slots_for_session(&source_session_name)?;
-        let destination_before_options =
-            self.pane_option_slots_for_session(&destination_session_name)?;
         let previous_source_session = self
             .sessions
             .session(&source_session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&source_session_name))?;
-        let previous_destination_session = self
+        if self.sessions.session(&destination_session_name).is_none() {
+            return Err(session_not_found(&destination_session_name));
+        }
+        let source_pane_id = pane_id_for_target(&previous_source_session, &request.source)?;
+        if self
+            .linked_last_pane_transfer_removal_plan(&request.source, source_pane_id)?
+            .is_some()
+        {
+            return self.break_last_linked_pane_across_sessions(
+                request,
+                destination_session_name,
+                source_pane_id,
+            );
+        }
+        let source_window_metadata = PaneTransferWindowMetadata::capture(self, &request.source)?;
+        let destination_slot_before = request
+            .target
+            .as_ref()
+            .map_or(0, WindowTarget::window_index);
+        let slots_before = [
+            (source_session_name.clone(), request.source.window_index()),
+            (destination_session_name.clone(), destination_slot_before),
+        ];
+        let pane_option_snapshots = pane_option_snapshots_for_transfer(self, &slots_before)?;
+        let destination_window_ids_before = window_ids_by_index(self, &destination_session_name)?;
+        let destination_group_members = self
             .sessions
-            .session(&destination_session_name)
-            .cloned()
-            .ok_or_else(|| session_not_found(&destination_session_name))?;
+            .session_group_members(&destination_session_name);
         let current_runtime_owner = self.sessions.runtime_owner(&source_session_name);
         let next_runtime_owner = self
             .sessions
             .runtime_owner_transfer_target(&source_session_name);
         let source_group_members_before = self.sessions.session_group_members(&source_session_name);
-        let source_pane_id = pane_id_for_target(&previous_source_session, &request.source)?;
-        self.ensure_panes_exist(&source_session_name, &[source_pane_id])?;
+        let source_runtime = self
+            .runtime_session_name_for_window(&source_session_name, request.source.window_index());
+        self.ensure_window_panes_exist(
+            &source_session_name,
+            request.source.window_index(),
+            &[source_pane_id],
+        )?;
+        let transfer_snapshot = CrossSessionTransferSnapshot::capture(self);
 
         let destination_index = self.sessions.with_extracted_session_pair(
             &source_session_name,
@@ -386,45 +399,89 @@ impl HandlerState {
         let destination_index = match destination_index {
             Ok(destination_index) => destination_index,
             Err(error) => {
-                self.restore_cross_session_snapshots(
-                    &source_session_name,
-                    previous_source_session,
-                    &destination_session_name,
-                    previous_destination_session,
-                )?;
+                transfer_snapshot.restore(self);
                 return Err(error);
             }
         };
+        let destination_index_map = match inserted_window_index_map(
+            self,
+            &destination_session_name,
+            &destination_window_ids_before,
+            destination_index,
+        ) {
+            Ok(index_map) => index_map,
+            Err(error) => {
+                transfer_snapshot.restore(self);
+                return Err(error);
+            }
+        };
+        for group_member in &destination_group_members {
+            if let Err(error) =
+                self.remap_reindexed_window_metadata(group_member, &destination_index_map)
+            {
+                transfer_snapshot.restore(self);
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.synchronize_session_group_models_from_with_window_selection_map(
+            &destination_session_name,
+            &destination_index_map,
+        ) {
+            transfer_snapshot.restore(self);
+            return Err(error);
+        }
+        let destination_window =
+            WindowTarget::with_window(destination_session_name.clone(), destination_index);
+        if let Err(error) =
+            source_window_metadata.move_to_surviving_window(self, &destination_window)
+        {
+            transfer_snapshot.restore(self);
+            return Err(error);
+        }
+        let destination_runtime =
+            self.runtime_session_name_for_window(&destination_session_name, destination_index);
+
+        let mut synchronized_slots = vec![(destination_session_name.clone(), destination_index)];
+        if !source_session_will_be_removed {
+            synchronized_slots.push((source_session_name.clone(), request.source.window_index()));
+        }
+        let lifecycle_sessions =
+            match synchronize_cross_session_transfer_families(self, &synchronized_slots) {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    transfer_snapshot.restore(self);
+                    return Err(error);
+                }
+            };
+        let moved_target =
+            PaneTarget::with_window(destination_session_name.clone(), destination_index, 0);
+        if let Err(error) = restore_pane_options_after_transfer(self, &pane_option_snapshots) {
+            transfer_snapshot.restore(self);
+            return Err(error);
+        }
 
         if let Err(error) = self.terminals.move_panes_between_sessions(
-            &source_session_name,
-            &destination_session_name,
+            &source_runtime,
+            &destination_runtime,
             &[source_pane_id],
         ) {
-            self.restore_cross_session_snapshots(
-                &source_session_name,
-                previous_source_session,
-                &destination_session_name,
-                previous_destination_session,
-            )?;
+            transfer_snapshot.restore(self);
             return Err(error);
         }
         if let Err(error) = self.move_pane_outputs_between_sessions(
-            &source_session_name,
-            &destination_session_name,
+            &source_runtime,
+            &destination_runtime,
             &[source_pane_id],
         ) {
-            self.terminals.move_panes_between_sessions(
-                &destination_session_name,
-                &source_session_name,
+            let runtime_rollback = self.terminals.move_panes_between_sessions(
+                &destination_runtime,
+                &source_runtime,
                 &[source_pane_id],
-            )?;
-            self.restore_cross_session_snapshots(
-                &source_session_name,
-                previous_source_session,
-                &destination_session_name,
-                previous_destination_session,
-            )?;
+            );
+            transfer_snapshot.restore(self);
+            runtime_rollback.map_err(|rollback_error| {
+                cross_session_rollback_error(&error, &[rollback_error])
+            })?;
             return Err(error);
         }
 
@@ -434,48 +491,18 @@ impl HandlerState {
             resize_two_sessions(self, &source_session_name, &destination_session_name)
         };
         if let Err(error) = resize_result {
-            self.terminals.move_panes_between_sessions(
-                &destination_session_name,
+            rollback_cross_session_move(
+                self,
+                transfer_snapshot,
                 &source_session_name,
-                &[source_pane_id],
-            )?;
-            self.move_pane_outputs_between_sessions(
                 &destination_session_name,
-                &source_session_name,
-                &[source_pane_id],
+                &source_runtime,
+                &destination_runtime,
+                source_pane_id,
+                &error,
             )?;
-            if source_session_will_be_removed {
-                self.replace_session(&source_session_name, previous_source_session)?;
-                self.replace_session(&destination_session_name, previous_destination_session)?;
-                resize_two_sessions(self, &source_session_name, &destination_session_name)
-                    .map_err(|rollback_error| {
-                        RmuxError::Server(format!(
-                            "failed to roll back sessions {source_session_name} and {destination_session_name} after {error}: {rollback_error}"
-                        ))
-                    })?;
-            } else {
-                restore_two_sessions_after_resize_error(
-                    self,
-                    &source_session_name,
-                    previous_source_session,
-                    &destination_session_name,
-                    previous_destination_session,
-                    &error,
-                )?;
-            }
             return Err(error);
         }
-
-        let moved_target =
-            PaneTarget::with_window(destination_session_name.clone(), destination_index, 0);
-        source_before_options.remove(&source_pane_id);
-        self.rekey_pane_options_after_session_change(&source_before_options, &source_session_name)?;
-        self.rekey_pane_options_after_session_change(
-            &destination_before_options,
-            &destination_session_name,
-        )?;
-        self.options
-            .transfer_pane_overrides(&request.source, &moved_target);
 
         if source_session_will_be_removed {
             if source_group_members_before.len() > 1 {
@@ -491,95 +518,14 @@ impl HandlerState {
                     next_runtime_owner.as_ref(),
                 )?;
             }
-        } else {
-            self.synchronize_session_group_from(&source_session_name)?;
-            self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
-        }
-        if source_session_name != destination_session_name {
-            self.synchronize_session_group_from(&destination_session_name)?;
-        }
-        if source_session_name != destination_session_name {
-            self.sync_pane_lifecycle_dimensions_for_session(&destination_session_name);
         }
 
+        source_window_metadata.prune_removed_aliases(self);
+        sync_pane_lifecycle_for_sessions(self, &lifecycle_sessions);
         self.clear_marked_pane_if_id(source_pane_id);
         Ok(BreakPaneResponse {
-            target: PaneTarget::with_window(destination_session_name, destination_index, 0),
+            target: moved_target,
             output: None,
         })
     }
-
-    fn restore_cross_session_snapshots(
-        &mut self,
-        source_session_name: &SessionName,
-        previous_source_session: Session,
-        target_session_name: &SessionName,
-        previous_target_session: Session,
-    ) -> Result<(), RmuxError> {
-        self.restore_cross_session_snapshot(source_session_name, previous_source_session)?;
-        self.restore_cross_session_snapshot(target_session_name, previous_target_session)
-    }
-
-    fn restore_cross_session_snapshot(
-        &mut self,
-        session_name: &SessionName,
-        previous_session: Session,
-    ) -> Result<(), RmuxError> {
-        if self.sessions.contains_session(session_name) {
-            self.replace_session(session_name, previous_session)
-        } else {
-            self.sessions.insert_existing_session(previous_session)
-        }
-    }
-}
-
-fn pane_target_for_id(
-    state: &HandlerState,
-    session_name: &SessionName,
-    window_index: u32,
-    pane_id: rmux_core::PaneId,
-) -> Result<PaneTarget, RmuxError> {
-    let session = state
-        .sessions
-        .session(session_name)
-        .ok_or_else(|| session_not_found(session_name))?;
-    let pane_index = pane_index_for_id(session, window_index, pane_id).ok_or_else(|| {
-        RmuxError::Server(format!(
-            "pane {} disappeared from {session_name}:{window_index} after cross-session move",
-            pane_id.as_u32()
-        ))
-    })?;
-    Ok(PaneTarget::with_window(
-        session_name.clone(),
-        window_index,
-        pane_index,
-    ))
-}
-
-fn resize_two_sessions(
-    state: &mut HandlerState,
-    source_session_name: &SessionName,
-    target_session_name: &SessionName,
-) -> Result<(), RmuxError> {
-    state.resize_terminals(source_session_name)?;
-    state.resize_terminals(target_session_name)
-}
-
-fn restore_two_sessions_after_resize_error(
-    state: &mut HandlerState,
-    source_session_name: &SessionName,
-    previous_source_session: Session,
-    target_session_name: &SessionName,
-    previous_target_session: Session,
-    source_error: &RmuxError,
-) -> Result<(), RmuxError> {
-    state.replace_session(source_session_name, previous_source_session)?;
-    state.replace_session(target_session_name, previous_target_session)?;
-    resize_two_sessions(state, source_session_name, target_session_name).map_err(
-        |rollback_error| {
-            RmuxError::Server(format!(
-                "failed to roll back sessions {source_session_name} and {target_session_name} after {source_error}: {rollback_error}"
-            ))
-        },
-    )
 }

@@ -1,6 +1,4 @@
-use rmux_proto::{
-    HookName, PaneTarget, RmuxError, ScopeSelector, SessionName, Target, WindowTarget,
-};
+use rmux_proto::{HookName, RmuxError, ScopeSelector, SessionName, Target, WindowTarget};
 
 use super::types::{HookClass, HookGlobalRoot};
 
@@ -24,10 +22,27 @@ pub fn validate_hook_registration(hook: HookName, scope: &ScopeSelector) -> Resu
     validate_hook_scope(hook, scope)
 }
 
-/// Resolves tmux's natural `-t` hook scope without enforcing storage
-/// compatibility. Explicit `-w`/`-p` still chooses those scopes directly.
+/// Resolves the measured natural hook storage scope after target-pane lookup.
 #[must_use]
 pub fn hook_natural_scope_for_target(hook: HookName, target: Target) -> ScopeSelector {
+    match target {
+        Target::Session(session_name) => ScopeSelector::Session(session_name),
+        Target::Window(target) => match hook_class(hook) {
+            HookClass::Session => ScopeSelector::Session(target.session_name().clone()),
+            HookClass::Window | HookClass::Pane => ScopeSelector::Window(target),
+        },
+        Target::Pane(target) => match hook_class(hook) {
+            HookClass::Session => ScopeSelector::Session(target.session_name().clone()),
+            HookClass::Window | HookClass::Pane => ScopeSelector::Window(
+                WindowTarget::with_window(target.session_name().clone(), target.window_index()),
+            ),
+        },
+    }
+}
+
+/// Normalizes a scope selected explicitly with `-w` or `-p` for the hook.
+#[must_use]
+pub fn hook_explicit_scope_for_target(hook: HookName, target: Target) -> ScopeSelector {
     match target {
         Target::Session(session_name) => ScopeSelector::Session(session_name),
         Target::Window(target) => match hook_class(hook) {
@@ -52,18 +67,13 @@ pub fn hook_natural_scope_for_session_target(
     hook: HookName,
     session_name: SessionName,
     window_index: u32,
-    pane_index: u32,
+    _pane_index: u32,
 ) -> ScopeSelector {
     match hook_class(hook) {
         HookClass::Session => ScopeSelector::Session(session_name),
-        HookClass::Window => {
+        HookClass::Window | HookClass::Pane => {
             ScopeSelector::Window(WindowTarget::with_window(session_name, window_index))
         }
-        HookClass::Pane => ScopeSelector::Pane(PaneTarget::with_window(
-            session_name,
-            window_index,
-            pane_index,
-        )),
     }
 }
 

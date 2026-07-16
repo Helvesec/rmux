@@ -114,13 +114,23 @@ pub(crate) struct ServerAccessArgs {
     pub(crate) read_only: bool,
     #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) write: bool,
-    #[arg(short = 't', allow_hyphen_values = true)]
-    pub(crate) target: Option<String>,
     pub(crate) user: Option<String>,
 }
 
 impl ServerAccessArgs {
     pub(super) fn validate(self) -> Result<Self, clap::Error> {
+        if !self.list && self.add && self.deny {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "-a and -d cannot be used together",
+            ));
+        }
+        if !self.list && self.read_only && self.write {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "-r and -w cannot be used together",
+            ));
+        }
         Ok(self)
     }
 }

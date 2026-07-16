@@ -21,9 +21,45 @@ pub(super) enum AttachOutputBatch {
     Events {
         bytes: Vec<u8>,
         passthroughs: Vec<TerminalPassthrough>,
+        passthrough_sequences: Vec<u64>,
         close_after_render: bool,
+        close_sequence: Option<u64>,
         sustained: bool,
     },
+}
+
+#[cfg(any(unix, windows))]
+impl AttachOutputBatch {
+    /// A same-source render refresh partitions output at its receiver start:
+    /// the snapshot covers older bytes, while its new receiver owns bytes at
+    /// and after the boundary. Only older passthrough side effects are absent
+    /// from the snapshot and still need forwarding from an already dequeued
+    /// batch.
+    pub(super) fn covered_by_render_snapshot(self, before_sequence: u64) -> Self {
+        let Self::Events {
+            passthroughs,
+            passthrough_sequences,
+            close_sequence,
+            ..
+        } = self
+        else {
+            return self;
+        };
+        debug_assert_eq!(passthroughs.len(), passthrough_sequences.len());
+        let (passthroughs, passthrough_sequences): (Vec<_>, Vec<_>) = passthroughs
+            .into_iter()
+            .zip(passthrough_sequences)
+            .filter(|(_, sequence)| *sequence < before_sequence)
+            .unzip();
+        Self::Events {
+            bytes: Vec::new(),
+            passthroughs,
+            passthrough_sequences,
+            close_after_render: close_sequence.is_some_and(|sequence| sequence < before_sequence),
+            close_sequence,
+            sustained: false,
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -81,6 +117,8 @@ struct AttachOutputBatchBuilder {
     sustained: bool,
     bytes: Vec<u8>,
     passthroughs: Vec<TerminalPassthrough>,
+    passthrough_sequences: Vec<u64>,
+    close_sequence: Option<u64>,
 }
 
 #[cfg(any(unix, windows))]
@@ -103,6 +141,7 @@ impl AttachOutputBatchBuilder {
     fn push(&mut self, item: OutputCursorItem, gap_log: GapLog) -> Option<AttachOutputBatch> {
         match item {
             OutputCursorItem::Event(event) => {
+                let sequence = event.sequence();
                 let byte_len = event.byte_len();
                 let has_bytes = !event.is_empty();
                 let has_passthroughs = !event.passthroughs().is_empty();
@@ -114,6 +153,8 @@ impl AttachOutputBatchBuilder {
                     }
                     ByteCollection::Skip => event.into_passthroughs(),
                 };
+                self.passthrough_sequences
+                    .extend(std::iter::repeat_n(sequence, passthroughs.len()));
                 self.passthroughs.extend(passthroughs);
                 if has_bytes {
                     self.saw_output_bytes = true;
@@ -128,6 +169,7 @@ impl AttachOutputBatchBuilder {
                 }
                 if self.saw_output_bytes || has_passthroughs {
                     self.close_after_render = true;
+                    self.close_sequence = Some(sequence);
                     return None;
                 }
                 Some(AttachOutputBatch::Closed)
@@ -146,7 +188,9 @@ impl AttachOutputBatchBuilder {
             AttachOutputBatch::Events {
                 bytes: self.bytes,
                 passthroughs: self.passthroughs,
+                passthrough_sequences: self.passthrough_sequences,
                 close_after_render: self.close_after_render,
+                close_sequence: self.close_sequence,
                 sustained: self.sustained,
             }
         } else {
@@ -210,6 +254,7 @@ mod tests {
             passthroughs,
             close_after_render,
             sustained,
+            ..
         } = batch
         else {
             panic!("expected coalesced output batch");
@@ -218,6 +263,49 @@ mod tests {
         assert_eq!(passthroughs.len(), 2);
         assert!(!close_after_render);
         assert!(!sustained);
+    }
+
+    #[test]
+    fn render_snapshot_keeps_only_pre_boundary_passthroughs_from_dequeued_batch() {
+        let sender = pane_output_channel_with_limits(8, 1024);
+        let mut receiver = sender.subscribe();
+        sender.send_for_generation_with_passthroughs(
+            None,
+            b"covered".to_vec(),
+            vec![TerminalPassthrough::kitty_graphics(
+                0,
+                0,
+                b"Gf=100;covered".to_vec(),
+            )],
+        );
+        sender.send_for_generation_with_passthroughs(
+            None,
+            b"after".to_vec(),
+            vec![TerminalPassthrough::sixel(1, 1, b"q#0!10~".to_vec())],
+        );
+        sender.send(Vec::new());
+
+        let first = receiver.try_recv().expect("first output event");
+        let batch =
+            collect_attach_output_batch(first, Some(&mut receiver)).covered_by_render_snapshot(1);
+
+        let AttachOutputBatch::Events {
+            bytes,
+            passthroughs,
+            passthrough_sequences,
+            close_after_render,
+            ..
+        } = batch
+        else {
+            panic!("snapshot-covered output remains a passthrough batch");
+        };
+        assert!(bytes.is_empty(), "snapshot-covered bytes must not replay");
+        assert_eq!(passthroughs.len(), 1);
+        assert_eq!(passthrough_sequences, vec![0]);
+        assert!(
+            !close_after_render,
+            "the replacement receiver still owns the close at the boundary"
+        );
     }
 
     #[test]
@@ -243,6 +331,7 @@ mod tests {
             passthroughs,
             close_after_render,
             sustained,
+            ..
         } = batch
         else {
             panic!("expected coalesced output batch");
@@ -271,7 +360,9 @@ mod tests {
             AttachOutputBatch::Events {
                 bytes: b"final".to_vec(),
                 passthroughs: Vec::new(),
+                passthrough_sequences: Vec::new(),
                 close_after_render: true,
+                close_sequence: Some(1),
                 sustained: false,
             }
         );

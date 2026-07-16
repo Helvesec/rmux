@@ -1,6 +1,6 @@
 //! Screen state and `ScreenWriter` implementation backed by [`Grid`].
 
-use crate::grid::{Grid, GridCell, GridCellFlags, GridLine};
+use crate::grid::{Grid, GridCell, GridCellFlags, GridLine, GridPhysicalCursor};
 use crate::hyperlinks::Hyperlinks;
 use crate::input::{mode, CellState, SavedState, ScreenWriter, COLOUR_DEFAULT};
 use crate::terminal_passthrough::{TerminalPassthrough, MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES};
@@ -123,6 +123,15 @@ impl Screen {
     #[must_use]
     pub const fn scroll_region(&self) -> (u32, u32) {
         (self.rupper, self.rlower)
+    }
+
+    pub(crate) const fn plain_output_forwarding_safe(&self) -> bool {
+        let unsafe_modes = mode::MODE_INSERT | mode::MODE_CRLF | mode::MODE_SYNC;
+        !self.pending_wrap
+            && self.mode & mode::MODE_WRAP != 0
+            && self.mode & unsafe_modes == 0
+            && self.rupper == 0
+            && self.rlower == self.grid.sy().saturating_sub(1)
     }
 
     /// Returns the screen size.
@@ -347,7 +356,22 @@ impl Screen {
         let cols = u32::from(size.cols.max(1));
         let rows = u32::from(size.rows.max(1));
         if cols != self.grid.sx() {
-            self.grid.resize_width(cols, COLOUR_DEFAULT);
+            let remapped = if self.is_alternate() {
+                self.grid.resize_visible_width_preserving_cursor(
+                    cols,
+                    COLOUR_DEFAULT,
+                    self.cursor_y,
+                    self.cursor_x,
+                    self.pending_wrap,
+                )
+            } else {
+                let cursor =
+                    self.grid
+                        .logical_cursor(self.cursor_y, self.cursor_x, self.pending_wrap);
+                self.grid
+                    .resize_width_remapping_cursor(cols, COLOUR_DEFAULT, cursor)
+            };
+            self.apply_grid_cursor(remapped);
             self.reset_tabs();
         }
         if rows != self.grid.sy() {
@@ -357,7 +381,9 @@ impl Screen {
         self.rupper = 0;
         self.rlower = rows.saturating_sub(1);
         self.cursor_x = self.cursor_x.min(self.max_cursor_x());
-        self.pending_wrap &= self.cursor_x == self.max_cursor_x();
+        self.pending_wrap = self.pending_wrap
+            && (self.mode & mode::MODE_WRAP) != 0
+            && self.cursor_x == self.max_cursor_x();
     }
 
     /// Clears history and optionally resets stored hyperlinks.
@@ -384,6 +410,20 @@ impl Screen {
         self.cursor_x.min(self.max_cursor_x())
     }
 
+    fn logical_insert_column(&self) -> u32 {
+        let x = self.cursor_column();
+        let Some(line) = self.grid.visible_line(self.cursor_y) else {
+            return x;
+        };
+        let Some(owner_x) = line.owning_cell_x(x).filter(|owner_x| *owner_x != x) else {
+            return x;
+        };
+        let width = line
+            .cell(owner_x)
+            .map_or(1, |cell| u32::from(cell.width()).max(1));
+        owner_x.saturating_add(width)
+    }
+
     fn current_line_mut(&mut self) -> Option<&mut GridLine> {
         self.grid.visible_line_mut(self.cursor_y)
     }
@@ -396,6 +436,18 @@ impl Screen {
         self.cursor_x = x.min(self.max_cursor_x());
         self.cursor_y = y.min(self.grid.sy().saturating_sub(1));
         self.pending_wrap = pending_wrap
+            && (self.mode & mode::MODE_WRAP) != 0
+            && self.cursor_x == self.max_cursor_x();
+    }
+
+    fn apply_grid_cursor(&mut self, cursor: GridPhysicalCursor) {
+        let history_size = self.grid.hsize();
+        self.cursor_x = cursor.x.min(self.max_cursor_x());
+        self.cursor_y = cursor
+            .absolute_y
+            .saturating_sub(history_size)
+            .min(self.grid.sy().saturating_sub(1) as usize) as u32;
+        self.pending_wrap = cursor.pending_wrap
             && (self.mode & mode::MODE_WRAP) != 0
             && self.cursor_x == self.max_cursor_x();
     }
@@ -544,29 +596,57 @@ impl Screen {
         self.clear_selected_cells();
 
         let ch = if acs { acs::translate_acs(ch) } else { ch };
-        let width = u32::from(self.utf8_config.width(ch));
+        let requested_width = u32::from(self.utf8_config.width(ch));
         if self.combine_char(ch) {
             return;
         }
+        // A cell wider than the entire viewport cannot be represented with
+        // its normal padding. Preserve the glyph as a one-column cell rather
+        // than creating an out-of-bounds wide owner.
+        let width = requested_width.clamp(1, self.grid.sx());
 
-        let automatic_wrap_continuation = self.pending_wrap && (self.mode & mode::MODE_WRAP) != 0;
+        let wrap_enabled = (self.mode & mode::MODE_WRAP) != 0;
+        let mut automatic_wrap_continuation = self.pending_wrap && wrap_enabled;
         self.apply_pending_wrap();
 
-        if (self.mode & mode::MODE_WRAP) != 0
-            && self.cursor_x > self.grid.sx().saturating_sub(width)
-        {
+        if (self.mode & mode::MODE_INSERT) != 0 {
+            let insert_x = self.logical_insert_column();
+            if insert_x >= self.grid.sx() {
+                if !wrap_enabled {
+                    return;
+                }
+                if let Some(line) = self.current_line_mut() {
+                    line.set_wrapped(true);
+                }
+                self.linefeed(false, COLOUR_DEFAULT);
+                self.cursor_x = 0;
+                automatic_wrap_continuation = true;
+            } else {
+                self.cursor_x = insert_x;
+            }
+        }
+
+        let write_would_cross_right_edge =
+            width > self.grid.sx() || self.cursor_x > self.grid.sx().saturating_sub(width);
+        if !wrap_enabled && width > 1 && write_would_cross_right_edge {
+            return;
+        }
+
+        // tmux shifts the current row before an auto-wrapped wide glyph moves
+        // to the next row; the no-wrap rejection above must leave it untouched.
+        if (self.mode & mode::MODE_INSERT) != 0 {
+            <Self as ScreenWriter>::insert_character(self, width, cell.bg());
+        }
+
+        if wrap_enabled && write_would_cross_right_edge {
+            let gap_start = self.cursor_column();
             if let Some(line) = self.current_line_mut() {
+                line.mark_unused_suffix_as_reflow_gap(gap_start);
                 line.set_wrapped(true);
             }
             self.linefeed(false, COLOUR_DEFAULT);
             self.cursor_x = 0;
-        }
-
-        if (self.mode & mode::MODE_WRAP) == 0
-            && width > 1
-            && (width > self.grid.sx() || self.cursor_x > self.grid.sx().saturating_sub(width))
-        {
-            return;
+            automatic_wrap_continuation = true;
         }
 
         if self.cursor_y >= self.grid.sy()
@@ -597,7 +677,7 @@ impl Screen {
             line.touch();
         }
 
-        if (self.mode & mode::MODE_WRAP) != 0 && x + width >= self.grid.sx() {
+        if wrap_enabled && x + width >= self.grid.sx() {
             self.cursor_x = self.max_cursor_x();
             self.pending_wrap = true;
         } else {
@@ -611,6 +691,7 @@ impl Screen {
             return true;
         }
         if acs
+            || (self.mode & mode::MODE_INSERT) != 0
             || cell.attr() != 0
             || cell.fg() != COLOUR_DEFAULT
             || cell.bg() != COLOUR_DEFAULT
@@ -628,7 +709,8 @@ impl Screen {
                 self.pending_wrap && (self.mode & mode::MODE_WRAP) != 0;
             self.apply_pending_wrap();
             if self.cursor_y >= self.grid.sy() {
-                return false;
+                self.write_ascii_run_slow(bytes, cell, acs);
+                return true;
             }
 
             let sx = self.grid.sx();
@@ -640,21 +722,27 @@ impl Screen {
             if (self.mode & mode::MODE_WRAP) == 0 {
                 let available = sx.saturating_sub(x) as usize;
                 if bytes.len() > available {
-                    return false;
+                    self.write_ascii_run_slow(bytes, cell, acs);
+                    return true;
                 }
             }
 
             let writable = sx.saturating_sub(x) as usize;
             if writable == 0 {
-                return false;
+                self.write_ascii_run_slow(bytes, cell, acs);
+                return true;
             }
             let chunk_len = bytes.len().min(writable);
             let (chunk, rest) = bytes.split_at(chunk_len);
-            let Some(line) = self.current_line_mut() else {
-                return false;
-            };
-            if !line.write_plain_ascii_run(x, chunk) {
-                return false;
+            let wrote_chunk = self
+                .current_line_mut()
+                .is_some_and(|line| line.write_plain_ascii_run(x, chunk));
+            if !wrote_chunk {
+                // Earlier chunks in this run may already have changed prior
+                // rows. Consume only the untouched suffix through the general
+                // writer so the caller never replays bytes already written.
+                self.write_ascii_run_slow(bytes, cell, acs);
+                return true;
             }
 
             if (self.mode & mode::MODE_WRAP) != 0 && x + chunk_len as u32 >= sx {
@@ -667,6 +755,12 @@ impl Screen {
             bytes = rest;
         }
         true
+    }
+
+    fn write_ascii_run_slow(&mut self, bytes: &[u8], cell: &CellState, acs: bool) {
+        for &byte in bytes {
+            self.write_char(char::from(byte), cell, acs);
+        }
     }
 
     fn break_previous_wrapped_line(&mut self) {
@@ -691,16 +785,18 @@ impl Screen {
             x -= 1;
         }
 
-        let Some(line) = self.grid.visible_line_mut(self.cursor_y) else {
+        let Some((target_x, previous)) = self.grid.visible_line(self.cursor_y).map(|line| {
+            let target_x = line.owning_cell_x(x).unwrap_or(x);
+            let previous = line
+                .cell(target_x)
+                .map(|cell| (cell.text().to_owned(), cell.width()));
+            (target_x, previous)
+        }) else {
             return matches!(
                 utf8_combine_char(None, ch, &self.utf8_config),
                 CombineResult::Discard
             );
         };
-        let target_x = line.owning_cell_x(x).unwrap_or(x);
-        let previous = line
-            .cell(target_x)
-            .map(|cell| (cell.text().to_owned(), cell.width()));
         let result = utf8_combine_char(
             previous
                 .as_ref()
@@ -714,6 +810,17 @@ impl Screen {
             CombineResult::Discard => true,
             CombineResult::Combined { text, width } => {
                 let previous_width = previous.as_ref().map_or(0, |(_, width)| *width);
+                let available_width = self.grid.sx().saturating_sub(target_x).max(1);
+                let width = width.min(u8::try_from(available_width).unwrap_or(u8::MAX));
+                if width != previous_width {
+                    // Width promotion may replace the owner of an adjacent
+                    // wide cell. Clear that owner's displaced padding before
+                    // installing the new owner/padding pair.
+                    self.overwrite_for_write(target_x, u32::from(width));
+                }
+                let Some(line) = self.grid.visible_line_mut(self.cursor_y) else {
+                    return true;
+                };
                 if let Some(cell) = line.cell_mut(target_x) {
                     cell.set_text(text);
                     cell.set_width(width);

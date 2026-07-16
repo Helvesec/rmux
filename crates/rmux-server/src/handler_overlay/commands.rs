@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use rmux_proto::{CommandOutput, OptionName, RmuxError, Target};
+use rmux_proto::{OptionName, RmuxError, Target};
 
 use super::super::scripting_support::{
     format_context_for_target, QueueCommandAction, QueueExecutionContext,
@@ -14,9 +14,7 @@ use super::layout::{
 use super::menu::{
     MenuOverlayItem, MenuOverlayState, OverlayMenuAction, MENU_NOMOUSE, MENU_STAYOPEN,
 };
-use super::parse::{
-    parse_menu_shortcut, ParsedDisplayMenuCommand, ParsedDisplayPopupCommand, PopupSizeSpec,
-};
+use super::parse::{parse_menu_shortcut, ParsedDisplayMenuCommand, ParsedDisplayPopupCommand};
 use super::popup_job::{spawn_popup_job, PopupDragMode, PopupSurface};
 use super::state::{ClientOverlayState, PopupOverlayState};
 use super::support::popup_shell_command;
@@ -171,14 +169,17 @@ impl RequestHandler {
             )
             .await?;
 
-        let existing_popup = {
+        let existing_overlay_is_menu = {
             let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .get(&attach_pid)
-                .and_then(|active| active.overlay.clone())
+            matches!(
+                active_attach
+                    .by_pid
+                    .get(&attach_pid)
+                    .and_then(|active| active.overlay.as_ref()),
+                Some(ClientOverlayState::Menu(_))
+            )
         };
-        if matches!(existing_popup, Some(ClientOverlayState::Menu(_))) {
+        if existing_overlay_is_menu {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
@@ -191,7 +192,7 @@ impl RequestHandler {
             .build_display_popup_state(attach_pid, requester_pid, command, target)
             .await?;
 
-        {
+        let (popup_identity, replaced_popup_job) = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -199,14 +200,31 @@ impl RequestHandler {
                 .ok_or_else(|| attached_client_required("display-popup"))?;
             active.overlay_state_id = active.overlay_state_id.saturating_add(1);
             popup.id = active.overlay_state_id;
-            active.overlay = Some(ClientOverlayState::Popup(Box::new(popup.clone())));
+            let replaced_popup_job = match active
+                .overlay
+                .replace(ClientOverlayState::Popup(Box::new(popup.clone())))
+            {
+                Some(ClientOverlayState::Popup(replaced)) => replaced.job,
+                Some(ClientOverlayState::Menu(_)) | None => None,
+            };
+            (active.identity(attach_pid), replaced_popup_job)
+        };
+
+        // Termination may touch a PTY or schedule ConPTY teardown, so keep it
+        // outside the attach-state mutex. The old popup id can no longer match
+        // the replacement, which makes its waiter and reader callbacks stale.
+        if let Some(job) = replaced_popup_job {
+            job.terminate();
         }
 
         if let Some(job) = popup.job.clone() {
-            self.spawn_popup_waiter(attach_pid, popup.id, job.clone());
-            if let Err(error) =
-                self.spawn_popup_reader(attach_pid, popup.id, popup.surface.clone(), job.clone())
-            {
+            self.spawn_popup_waiter(popup_identity, popup.id, job.clone());
+            if let Err(error) = self.spawn_popup_reader(
+                popup_identity,
+                popup.id,
+                popup.surface.clone(),
+                job.clone(),
+            ) {
                 job.terminate();
                 return Err(error);
             }
@@ -220,75 +238,6 @@ impl RequestHandler {
             source_file_error: None,
             exit_status: None,
         })
-    }
-
-    pub(in crate::handler) async fn show_attached_command_output_popup(
-        &self,
-        attach_pid: u32,
-        requester_pid: u32,
-        target: Target,
-        title: &str,
-        output: &CommandOutput,
-    ) -> Result<bool, RmuxError> {
-        if output.stdout().is_empty() || self.mode_tree_active(attach_pid).await {
-            return Ok(false);
-        }
-        let overlay_available = {
-            let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .get(&attach_pid)
-                .ok_or_else(|| attached_client_required("attached command output"))?
-                .overlay
-                .is_none()
-        };
-        if !overlay_available {
-            return Ok(false);
-        }
-
-        let command = ParsedDisplayPopupCommand {
-            target_client: None,
-            target_pane: None,
-            title: title.to_owned(),
-            x: Some("C".to_owned()),
-            y: Some("C".to_owned()),
-            width: Some(PopupSizeSpec::Percent(90)),
-            height: Some(PopupSizeSpec::Percent(80)),
-            style: None,
-            border_style: None,
-            border_lines: None,
-            close_existing: false,
-            close_on_exit: false,
-            close_on_zero_exit: false,
-            close_any_key: true,
-            no_job: true,
-            start_directory: None,
-            environment: Vec::new(),
-            command: None,
-        };
-        let mut popup = self
-            .build_display_popup_state(attach_pid, requester_pid, command, target)
-            .await?;
-        popup
-            .surface
-            .lock()
-            .expect("popup surface")
-            .append(&popup_output_bytes(output));
-
-        {
-            let mut active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get_mut(&attach_pid)
-                .ok_or_else(|| attached_client_required("attached command output"))?;
-            active.overlay_state_id = active.overlay_state_id.saturating_add(1);
-            popup.id = active.overlay_state_id;
-            active.overlay = Some(ClientOverlayState::Popup(Box::new(popup)));
-        }
-
-        self.refresh_interactive_overlay_if_active(attach_pid)
-            .await?;
-        Ok(true)
     }
 
     async fn build_display_menu_state(
@@ -388,7 +337,7 @@ impl RequestHandler {
         })
     }
 
-    async fn build_display_popup_state(
+    pub(super) async fn build_display_popup_state(
         &self,
         attach_pid: u32,
         requester_pid: u32,
@@ -461,6 +410,7 @@ impl RequestHandler {
             close_any_key: command.close_any_key,
             no_job: command.no_job,
             surface,
+            scrollable_text: None,
             job: None,
             nested_menu: None,
             dragging: PopupDragMode::Off,
@@ -499,20 +449,6 @@ impl RequestHandler {
 
         Ok(popup)
     }
-}
-
-fn popup_output_bytes(output: &CommandOutput) -> Vec<u8> {
-    let stdout = output.stdout();
-    let mut normalized = Vec::with_capacity(stdout.len());
-    let mut previous_was_cr = false;
-    for byte in stdout {
-        if *byte == b'\n' && !previous_was_cr {
-            normalized.push(b'\r');
-        }
-        normalized.push(*byte);
-        previous_was_cr = *byte == b'\r';
-    }
-    normalized
 }
 
 fn runtime_with_mouse_values<'a>(

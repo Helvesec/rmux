@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::io::{self, ErrorKind, Write};
 
 use rmux_core::formats::TMUX_FORMAT_TABLE_NAMES;
-use rmux_proto::{RMUX_WIRE_VERSION, SUPPORTED_CAPABILITIES};
+use rmux_proto::{capabilities_for_features, RMUX_WIRE_VERSION};
 use serde_json::json;
 
 use super::scripting_contract::{BINARY_CONTRACT_VERSION, CONTROL_NOTIFICATIONS, JSON_COMMANDS};
@@ -147,9 +147,8 @@ fn render_human() -> String {
 }
 
 fn write_json() -> Result<i32, ExitFailure> {
-    let capabilities = SUPPORTED_CAPABILITIES
-        .iter()
-        .copied()
+    let capabilities = compiled_protocol_capabilities()
+        .into_iter()
         .chain(["scripting.binary_contract.v1", "scripting.json.v1"])
         .collect::<Vec<_>>();
     let report = json!({
@@ -165,6 +164,10 @@ fn write_json() -> Result<i32, ExitFailure> {
     });
 
     write_json_value(&report)
+}
+
+fn compiled_protocol_capabilities() -> Vec<&'static str> {
+    capabilities_for_features(cfg!(all(any(unix, windows), feature = "web")))
 }
 
 fn control_mode_contract() -> serde_json::Value {
@@ -229,7 +232,8 @@ fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_invocation, CapabilitiesFormat};
+    use super::{compiled_protocol_capabilities, parse_invocation, CapabilitiesFormat};
+    use rmux_proto::CAPABILITY_WEB_SHARE;
     use std::ffi::OsString;
 
     fn args(values: &[&str]) -> Vec<OsString> {
@@ -250,5 +254,13 @@ mod tests {
         assert!(parse_invocation(&args(&["list-sessions"]))
             .expect("parse succeeds")
             .is_none());
+    }
+
+    #[test]
+    fn local_inventory_reports_compiled_web_capability() {
+        assert_eq!(
+            compiled_protocol_capabilities().contains(&CAPABILITY_WEB_SHARE),
+            cfg!(all(any(unix, windows), feature = "web"))
+        );
     }
 }

@@ -110,6 +110,72 @@ fn rendered_pane_line_truncates_to_pane_width_without_counting_sgr() {
 }
 
 #[test]
+fn rendered_pane_line_closes_hyperlink_when_visible_text_is_clipped() {
+    let utf8 = Utf8Config::default();
+    let close = "\u{1b}]8;;\u{1b}\\";
+
+    for (line, expected) in [
+        (
+            "\u{1b}]8;id=ascii;https://example.test\u{1b}\\AB\u{1b}]8;;\u{1b}\\",
+            format!("\u{1b}]8;id=ascii;https://example.test\u{1b}\\A{close}"),
+        ),
+        (
+            "\u{1b}]8;;https://example.test\u{7}表B\u{1b}]8;;\u{7}",
+            format!("\u{1b}]8;;https://example.test\u{7}表{close}"),
+        ),
+    ] {
+        let clipped = String::from_utf8(super::truncate_rendered_pane_line(
+            line.as_bytes(),
+            if line.contains('表') { 2 } else { 1 },
+            &utf8,
+        ))
+        .expect("rendered pane line is utf-8");
+        assert_eq!(clipped, expected);
+    }
+}
+
+#[test]
+fn rendered_pane_line_keeps_composed_cells_at_pane_width() {
+    let utf8 = Utf8Config::default();
+
+    for (line, expected) in [
+        ("👋🏽ABC", "👋🏽ABC"),
+        ("👩\u{200d}💻ABC", "👩\u{200d}💻ABC"),
+        ("\u{1b}[31m👋🏽\u{1b}[32mABC", "\u{1b}[31m👋🏽\u{1b}[32mABC"),
+    ] {
+        let clipped = String::from_utf8(super::truncate_rendered_pane_line(
+            line.as_bytes(),
+            5,
+            &utf8,
+        ))
+        .expect("rendered pane line is utf-8");
+
+        assert_eq!(clipped, expected, "line {line:?}");
+    }
+}
+
+#[test]
+fn pane_render_keeps_modified_emoji_text_at_right_edge() {
+    let size = TerminalSize { cols: 5, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with("👋🏽ABC".as_bytes(), size);
+
+    let frame = String::from_utf8(super::render_pane_screen(
+        &session,
+        &OptionStore::new(),
+        pane,
+        &screen,
+    ))
+    .expect("pane frame is utf-8");
+
+    assert!(
+        frame.contains("👋🏽ABC"),
+        "full repaint must preserve the complete composed cell and following text: {frame:?}"
+    );
+}
+
+#[test]
 fn copy_mode_position_truncation_does_not_style_separator_before_bracket() {
     let session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 4 });
     let pane = session.window().pane(0).expect("pane 0 exists");
@@ -354,6 +420,66 @@ fn pane_render_uses_line_clear_for_unstyled_full_width_panes() {
 }
 
 #[test]
+fn pane_selection_overlay_style_expands_defaults_and_overrides() {
+    let size = TerminalSize { cols: 6, rows: 2 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+
+    // Default: copy-mode-selection-style is "#{E:mode-style}", which must
+    // expand through the format engine to the mode-style default instead of
+    // reaching the cell style parser as a raw template (issue #90).
+    let options = OptionStore::new();
+    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
+        .expect("default selection style expands");
+    assert!(
+        style.contains("fg=black") && style.contains("bg=yellow"),
+        "default selection style must expand mode-style, got {style:?}"
+    );
+
+    // The default follows a changed mode-style.
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::ModeStyle,
+            "bg=blue,fg=white".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("set mode-style");
+    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
+        .expect("inherited selection style expands");
+    assert!(
+        style.contains("bg=blue"),
+        "selection style must follow mode-style, got {style:?}"
+    );
+
+    // An explicit copy-mode-selection-style wins over mode-style.
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::ModeStyle,
+            "bg=blue,fg=white".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("set mode-style");
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModeSelectionStyle,
+            "bg=red".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("set copy-mode-selection-style");
+    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
+        .expect("explicit selection style expands");
+    assert!(
+        style.contains("bg=red") && !style.contains("bg=blue"),
+        "explicit selection style must win, got {style:?}"
+    );
+}
+
+#[test]
 fn styled_pane_screen_borrows_when_no_overlay_is_needed() {
     let size = TerminalSize { cols: 6, rows: 2 };
     let session = Session::new(session_name("alpha"), size);
@@ -365,6 +491,52 @@ fn styled_pane_screen_borrows_when_no_overlay_is_needed() {
         super::styled_pane_screen(&session, &options, pane, &screen),
         std::borrow::Cow::Borrowed(_)
     ));
+}
+
+fn selected_cell_colours(
+    options: &OptionStore,
+) -> (rmux_core::input::Colour, rmux_core::input::Colour) {
+    let size = TerminalSize { cols: 6, rows: 2 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let mut screen = screen_with(b"D", size);
+    screen.mark_selected_row_range(0, 0, 0);
+
+    let styled = super::styled_pane_screen(&session, options, pane, &screen);
+    let mut colours = None;
+    assert!(styled.visit_visible_line_cells(0, 1, |cell| {
+        colours = Some((cell.fg(), cell.bg()));
+    }));
+    colours.expect("selected cell exists")
+}
+
+#[test]
+fn copy_mode_selection_style_default_expands_mode_style() {
+    assert_eq!(selected_cell_colours(&OptionStore::new()), (0, 3));
+}
+
+#[test]
+fn copy_mode_selection_style_tracks_mode_style_until_explicitly_overridden() {
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::ModeStyle,
+            "bg=magenta,fg=white".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("mode-style override succeeds");
+    assert_eq!(selected_cell_colours(&options), (7, 5));
+
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModeSelectionStyle,
+            "bg=cyan,fg=red".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("copy-mode-selection-style override succeeds");
+    assert_eq!(selected_cell_colours(&options), (1, 6));
 }
 
 #[test]
@@ -934,6 +1106,125 @@ fn status_format_expands_shell_job_introduced_by_status_left() {
 
     let frame = render_until_contains(&session, &options, &marker);
     assert!(frame.contains(&format!("X{marker}Y")), "{frame}");
+}
+
+#[test]
+fn status_right_inline_styles_do_not_consume_length_budget() {
+    let size = TerminalSize { cols: 20, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    for (option, value) in [
+        (OptionName::StatusLeft, ""),
+        (
+            OptionName::StatusRight,
+            "#[fg=#{?session_attached,green,red},bold]CLOCK-DATE-HOST",
+        ),
+        (OptionName::StatusRightLength, "10"),
+        (OptionName::WindowStatusFormat, ""),
+        (OptionName::WindowStatusCurrentFormat, ""),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let screen = screen_with(&render(&session, &options), size);
+    let status = visible_line_text(&screen, 2, usize::from(size.cols));
+
+    assert_eq!(status, "          CLOCK-DATE", "{status:?}");
+}
+
+#[test]
+fn explicit_status_format_width_modifier_ignores_inline_styles() {
+    let size = TerminalSize { cols: 20, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    for (option, value) in [
+        (
+            OptionName::StatusFormat,
+            "#[align=right]#{T;=/10:status-right}",
+        ),
+        (OptionName::StatusRight, "#[fg=green]CLOCK-DATE-HOST"),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let screen = screen_with(&render(&session, &options), size);
+    let status = visible_line_text(&screen, 2, usize::from(size.cols));
+
+    assert_eq!(status, "          CLOCK-DATE", "{status:?}");
+}
+
+#[test]
+fn status_left_inline_styles_preserve_unicode_cell_truncation() {
+    let size = TerminalSize { cols: 12, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    for (option, value) in [
+        (OptionName::StatusLeft, "#[fg=red]表A#[bold]👋🏽B"),
+        (OptionName::StatusLeftLength, "5"),
+        (OptionName::StatusRight, ""),
+        (OptionName::WindowStatusFormat, ""),
+        (OptionName::WindowStatusCurrentFormat, ""),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let screen = screen_with(&render(&session, &options), size);
+    let status = visible_line_text(&screen, 2, usize::from(size.cols));
+
+    // Screen visitors expose each wide glyph's continuation cell as a space.
+    assert_eq!(status, "表 A👋🏽        ", "{status:?}");
+}
+
+#[test]
+fn status_component_limit_keeps_a_zwj_grapheme_whole_product_divergence() {
+    let size = TerminalSize { cols: 8, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    for (option, value) in [
+        (OptionName::StatusLeft, "#[fg=red]👩\u{200d}💻A"),
+        (OptionName::StatusLeftLength, "2"),
+        (OptionName::StatusRight, ""),
+        (OptionName::WindowStatusFormat, ""),
+        (OptionName::WindowStatusCurrentFormat, ""),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let frame = render(&session, &options);
+    let frame = String::from_utf8(frame).expect("status frame is utf-8");
+    assert!(
+        frame.contains("👩\u{200d}💻"),
+        "the ZWJ grapheme must survive the formatted frame"
+    );
+    assert!(!frame.contains("👩\u{200d}💻A"), "{frame:?}");
 }
 
 #[test]

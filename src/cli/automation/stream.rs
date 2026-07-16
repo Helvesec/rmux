@@ -187,7 +187,7 @@ pub(crate) fn run_collect_pane_output(
                 "stored_bytes": output.len(),
                 "truncated": truncated,
                 "missed_events": missed_events,
-                "pane_exit": pane_exit,
+                "pane_exit": pane_exit.json_value(),
             }))
             .map(|_| 1);
         }
@@ -206,7 +206,7 @@ pub(crate) fn run_collect_pane_output(
             "stored_bytes": output.len(),
             "truncated": truncated,
             "output_utf8_lossy": String::from_utf8_lossy(&output),
-            "pane_exit": pane_exit,
+            "pane_exit": pane_exit.json_value(),
         }));
     }
     write_stdout_bytes(&output)

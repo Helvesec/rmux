@@ -127,15 +127,3 @@ fn contains_runtime_target_id(value: &str) -> bool {
         .split([':', '.'])
         .any(|part| part.starts_with(['$', '@']))
 }
-
-pub(super) fn parse_target(value: &str) -> Result<Target, String> {
-    let value = exact_match_target(value);
-
-    if let Some(session_name) = value.strip_suffix(':') {
-        if !session_name.is_empty() {
-            return parse_session_name(session_name).map(Target::Session);
-        }
-    }
-
-    Target::parse(value).map_err(|error| error.to_string())
-}

@@ -47,8 +47,9 @@ pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
 
     #[cfg(not(unix))]
     {
-        if helper_output_should_be_piped() {
-            return run_full_helper_with_piped_output(command);
+        let output_pipes = helper_output_pipes();
+        if output_pipes.any() {
+            return run_full_helper_with_piped_output(command, output_pipes);
         }
         let status = command.status().map_err(|error| {
             format!(
@@ -61,13 +62,61 @@ pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
 }
 
 #[cfg(not(unix))]
-fn helper_output_should_be_piped() -> bool {
-    !io::stdout().is_terminal() || !io::stderr().is_terminal()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HelperOutputPipes {
+    stdout: bool,
+    stderr: bool,
 }
 
 #[cfg(not(unix))]
-fn run_full_helper_with_piped_output(mut command: Command) -> Result<i32, String> {
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+impl HelperOutputPipes {
+    fn any(self) -> bool {
+        self.stdout || self.stderr
+    }
+}
+
+#[cfg(windows)]
+fn helper_output_pipes() -> HelperOutputPipes {
+    use std::os::windows::io::AsRawHandle;
+
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    HelperOutputPipes {
+        stdout: helper_stream_should_be_piped(
+            stdout.is_terminal(),
+            crate::windows_terminal::handle_is_msys_pty(stdout.as_raw_handle()),
+        ),
+        stderr: helper_stream_should_be_piped(
+            stderr.is_terminal(),
+            crate::windows_terminal::handle_is_msys_pty(stderr.as_raw_handle()),
+        ),
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn helper_output_pipes() -> HelperOutputPipes {
+    HelperOutputPipes {
+        stdout: !io::stdout().is_terminal(),
+        stderr: !io::stderr().is_terminal(),
+    }
+}
+
+#[cfg(not(unix))]
+fn helper_stream_should_be_piped(is_terminal: bool, is_msys_pty: bool) -> bool {
+    !is_terminal && !is_msys_pty
+}
+
+#[cfg(not(unix))]
+fn run_full_helper_with_piped_output(
+    mut command: Command,
+    output_pipes: HelperOutputPipes,
+) -> Result<i32, String> {
+    if output_pipes.stdout {
+        command.stdout(Stdio::piped());
+    }
+    if output_pipes.stderr {
+        command.stderr(Stdio::piped());
+    }
     let mut child = command.spawn().map_err(|error| {
         format!(
             "failed to run private rmux helper '{}': {error}",
@@ -235,7 +284,9 @@ mod tests {
     use super::{daemon_file_name, daemon_from_executable_path};
     use super::{helper_file_name, helper_from_executable_paths};
     #[cfg(windows)]
-    use super::{set_windows_client_shell_handoff, INTERNAL_CLIENT_SHELL_ENV};
+    use super::{
+        helper_stream_should_be_piped, set_windows_client_shell_handoff, INTERNAL_CLIENT_SHELL_ENV,
+    };
 
     fn temp_root(name: &str) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -326,6 +377,14 @@ mod tests {
             .find(|(name, _)| name.eq_ignore_ascii_case(INTERNAL_CLIENT_SHELL_ENV))
             .expect("client shell handoff env override");
         assert!(handoff.1.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_full_helper_preserves_msys_terminal_handles() {
+        assert!(!helper_stream_should_be_piped(false, true));
+        assert!(!helper_stream_should_be_piped(true, false));
+        assert!(helper_stream_should_be_piped(false, false));
     }
 
     #[cfg(not(windows))]

@@ -1,6 +1,92 @@
 use super::*;
 
 #[tokio::test]
+async fn attached_copy_mode_renders_mark_regular_and_current_match_styles() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+    replace_transcript_contents(
+        &handler,
+        &target,
+        TerminalSize { cols: 40, rows: 6 },
+        b"needle-one\r\nplain\r\nneedle-two\r\n",
+    )
+    .await;
+    for (option, value) in [
+        (OptionName::CopyModeMarkStyle, "bg=colour17,fg=colour231"),
+        (OptionName::CopyModeMatchStyle, "bg=colour18,fg=colour231"),
+        (
+            OptionName::CopyModeCurrentMatchStyle,
+            "bg=colour19,fg=colour231",
+        ),
+    ] {
+        assert!(matches!(
+            handler
+                .handle(Request::SetOption(SetOptionRequest {
+                    scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                    option,
+                    value: value.to_owned(),
+                    mode: SetOptionMode::Replace,
+                }))
+                .await,
+            Response::SetOption(_)
+        ));
+    }
+    drain_attach_controls(&mut control_rx);
+
+    assert!(matches!(
+        handler
+            .handle(Request::CopyMode(CopyModeRequest {
+                target: Some(target.clone()),
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: false,
+                mouse_drag_start: false,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }))
+            .await,
+        Response::CopyMode(_)
+    ));
+    let _ = recv_render_frame(&mut control_rx, "copy-mode initial refresh").await;
+    drain_attach_controls(&mut control_rx);
+
+    assert!(matches!(
+        super::copy_mode_keys::send_attached_copy_mode_command(&handler, &target, &["set-mark"])
+            .await,
+        Response::SendKeys(_)
+    ));
+    let mark_frame = recv_render_frame(&mut control_rx, "copy-mode mark refresh").await;
+    assert!(
+        mark_frame.contains("\u{1b}[48;5;17m"),
+        "mark style must reach the attached render frame: {mark_frame:?}"
+    );
+
+    assert!(matches!(
+        super::copy_mode_keys::send_attached_copy_mode_command(
+            &handler,
+            &target,
+            &["search-forward-text", "needle"],
+        )
+        .await,
+        Response::SendKeys(_)
+    ));
+    let search_frame = recv_render_frame(&mut control_rx, "copy-mode search refresh").await;
+    assert!(
+        search_frame.contains("\u{1b}[48;5;18m"),
+        "a non-current search result must use copy-mode-match-style: {search_frame:?}"
+    );
+    assert!(
+        search_frame.contains("\u{1b}[48;5;19m"),
+        "the current search result must use copy-mode-current-match-style: {search_frame:?}"
+    );
+}
+
+#[tokio::test]
 async fn attached_copy_mode_u_attach_render_matches_mode_capture_source() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
@@ -146,7 +232,7 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
     let mode_capture = {
         let response = handler
             .handle(Request::CapturePane(Box::new(CapturePaneRequest {
-                target,
+                target: target.clone(),
                 start: None,
                 end: None,
                 print: true,
@@ -188,9 +274,26 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
         rendered_screen.contains("tester@RMUXHOST:~$"),
         "attached copy-mode mouse refresh should keep the prompt visible after replay, frame={frame:?} replay={rendered_screen:?}"
     );
+    // A drag start has no selected cells yet, so this frame may only carry
+    // the position indicator's mode-style. Extend the selection and require
+    // a second mode-style span: the indicator alone must not satisfy the
+    // selection-paint assertion (the previous form of this test passed even
+    // when selections were never painted, issue #90).
     assert!(
         frame.contains("\u{1b}[0;30;43m"),
-        "attached copy-mode mouse refresh should paint the selection with tmux mode-style, frame={frame:?}"
+        "attached copy-mode mouse refresh should style the position indicator, frame={frame:?}"
+    );
+    assert!(matches!(
+        super::copy_mode_keys::send_attached_copy_mode_command(&handler, &target, &["select-line"])
+            .await,
+        Response::SendKeys(_)
+    ));
+    let frame = recv_render_frame(&mut control_rx, "copy-mode selection refresh").await;
+    assert!(
+        frame.contains("\u{1b}[30m\u{1b}[43m"),
+        "extending the selection must paint selected cells with tmux mode-style; \
+         the position indicator's combined ESC[0;30;43m form alone must not \
+         satisfy this, frame={frame:?}"
     );
 }
 

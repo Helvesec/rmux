@@ -14,7 +14,11 @@ use rmux_proto::{
     LinkWindowRequest, ListPanesRequest, NewWindowRequest, PaneTarget, Request,
     ResizeWindowRequest, Response, SendKeysRequest, WindowTarget,
 };
-use rmux_sdk::{EnsureSession, PaneProcessState, PaneRef, PaneSnapshot, RmuxBuilder, SessionName};
+use rmux_sdk::{
+    EnsureSession, PaneCloseOutcome, PaneProcessState, PaneRef, PaneRespawnOptions, PaneSnapshot,
+    PaneStateEvent, PaneStateEventsOptions, ProcessSpec, RmuxBuilder, RmuxError, SessionName,
+    TerminalSizeSpec,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::Instant;
@@ -77,6 +81,24 @@ async fn pane_id_info_and_snapshot_resolve_through_daemon_for_live_and_stale_slo
     let stale_snapshot = stale.snapshot().await?;
     assert_eq!(stale_snapshot, PaneSnapshot::default());
     assert_eq!(stale_snapshot.revision, 0);
+    assert!(
+        stale.foreground_state_with_revision().await?.is_none(),
+        "a stale slot must not fall back to a raw protocol slot for foreground state"
+    );
+    let stale_events_error = match stale.state_events(PaneStateEventsOptions::default()).await {
+        Ok(_) => return Err("a stale slot unexpectedly opened a pane-state stream".into()),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &stale_events_error,
+            RmuxError::Protocol {
+                source: rmux_proto::RmuxError::InvalidTarget { .. },
+                ..
+            }
+        ),
+        "a stale slot must fail closed before subscribing: {stale_events_error}"
+    );
 
     let stale_pane_in_window = session.pane(0, 99);
     assert_eq!(stale_pane_in_window.id().await?, None);
@@ -252,6 +274,23 @@ async fn pane_id_resolves_to_same_identity_through_linked_window_views() -> Test
     assert_ne!(
         owner_info.panes[0].session_id, viewer_info.panes[0].session_id,
         "the two views are owned by distinct sessions"
+    );
+
+    let owner_by_id = owner_session.pane_by_id(owner_id).await?;
+    let viewer_by_id = rmux.pane_by_id(viewer.clone(), owner_id).await?;
+    assert_eq!(
+        owner_by_id.target().session_name,
+        owner,
+        "the original linked-window view must win by-id resolution"
+    );
+    assert_eq!(
+        viewer_by_id.target().session_name,
+        viewer,
+        "an explicitly preferred alias must win before deterministic fallback sessions"
+    );
+    assert_eq!(
+        owner_by_id.snapshot().await?,
+        viewer_by_id.snapshot().await?
     );
 
     harness.finish().await
@@ -761,4 +800,308 @@ fn compact_label(label: &str) -> String {
     } else {
         compact
     }
+}
+
+#[tokio::test]
+async fn issue_94_reporter_flow_slot_snapshot_sees_live_content() -> TestResult {
+    // Exact reporter flow from issue #94: CreateOrReuse detached session with
+    // an explicit size, working directory, and a shell that produces output;
+    // then a fresh session handle and an index-based pane handle. The slot
+    // snapshot must expose the live pane like by-id resolution does, not the
+    // stale-slot default.
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("issue94-reporter-flow").await?;
+    let rmux = harness.rmux();
+    let name = session_name("sdkissue94");
+    EnsureSession::named(name.clone())
+        .policy(rmux_sdk::EnsureSessionPolicy::CreateOrReuse)
+        .detached(true)
+        .size(rmux_sdk::TerminalSizeSpec::new(500, 50))
+        .working_directory("/tmp")
+        .shell("printf 'ISSUE94_CONTENT\\n'; exec sh")
+        .ensure(&rmux)
+        .await?;
+
+    let session = rmux.session(name.clone()).await?;
+    let by_id = rmux.find_panes().session(name.clone()).one().await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = by_id.snapshot().await?;
+        if snap.visible_text().contains("ISSUE94_CONTENT") {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("pane never showed ISSUE94_CONTENT via by-id".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let slot_pane = session.pane(0, 0);
+    assert!(
+        slot_pane.exists().await?,
+        "slot handle (0, 0) must resolve the live pane"
+    );
+    let snap = slot_pane.snapshot().await?;
+    assert!(
+        snap.revision >= 1,
+        "slot snapshot must be live, got revision {}",
+        snap.revision
+    );
+    assert!(
+        snap.visible_text().contains("ISSUE94_CONTENT"),
+        "slot snapshot must expose the live content"
+    );
+
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn issue_94_slot_handles_resolve_visible_indexes_under_base_index_one() -> TestResult {
+    // Recon companion for issue #94: with base-index 1 and pane-base-index 1,
+    // the user-facing slot coordinates are the visible ones — session.pane(1, 1)
+    // must resolve the live pane and session.pane(0, 0) must not exist.
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("issue94-base-index-one").await?;
+    let rmux = harness.rmux();
+    for (name, value, scope) in [
+        (
+            "base-index",
+            "1",
+            rmux_proto::OptionScopeSelector::SessionGlobal,
+        ),
+        (
+            "pane-base-index",
+            "1",
+            rmux_proto::OptionScopeSelector::WindowGlobal,
+        ),
+    ] {
+        match framed_request(
+            harness.socket_path(),
+            Request::SetOptionByName(Box::new(rmux_proto::SetOptionByNameRequest {
+                scope,
+                name: (*name).to_owned(),
+                value: Some((*value).to_owned()),
+                mode: rmux_proto::SetOptionMode::Replace,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                format: false,
+                format_target: None,
+            })),
+        )
+        .await?
+        {
+            Response::SetOptionByName(_) => {}
+            response => return Err(format!("set {name} failed: {response:?}").into()),
+        }
+    }
+
+    let name = session_name("sdkissue94base");
+    EnsureSession::named(name.clone())
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let session = rmux.session(name.clone()).await?;
+
+    let visible = session.pane(1, 1);
+    assert!(
+        visible.exists().await?,
+        "visible slot (1, 1) must resolve under base-index 1"
+    );
+    let mutation = visible.set_option("remain-on-exit", "on").await?;
+    assert_eq!(mutation.pane_id, visible.id().await?.expect("pane id"));
+    assert_eq!(
+        visible.option("remain-on-exit").await?.as_deref(),
+        Some("on")
+    );
+    visible.unset_option("remain-on-exit").await?;
+
+    let snap = visible.snapshot().await?;
+    assert!(
+        snap.revision >= 1,
+        "visible slot snapshot must be live, got revision {}",
+        snap.revision
+    );
+    let info = visible.info().await?;
+    assert_eq!(
+        info.panes.len(),
+        1,
+        "visible slot info must retain pane details"
+    );
+    assert_eq!(
+        info.panes[0].index, 1,
+        "pane info exposes the visible index"
+    );
+
+    visible.set_title("sdk-visible-slot").await?;
+    assert_eq!(visible.title().await?.as_deref(), Some("sdk-visible-slot"));
+    visible
+        .resize(TerminalSizeSpec::new(snap.cols, snap.rows))
+        .await?;
+
+    let capture = visible.capture_pane().await?;
+    assert!(
+        capture.buffer_name.is_none(),
+        "printing capture must not allocate a buffer"
+    );
+    let output = visible.output_stream().await?;
+    drop(output);
+
+    let marker = "SDK_VISIBLE_SLOT_WAIT";
+    let armed = visible.wait_for_next(marker.as_bytes()).await?;
+    visible.send_text(format!("printf '{marker}\\n'\n")).await?;
+    armed.await?;
+
+    let respawned = visible
+        .respawn(PaneRespawnOptions {
+            kill: true,
+            start_directory: None,
+            process: ProcessSpec {
+                command: Some(vec!["cat >/dev/null".to_owned()]),
+                process_command: None,
+                environment: None,
+            },
+            keep_alive_on_exit: Some(true),
+        })
+        .await?;
+    assert_eq!(
+        respawned,
+        visible.target().clone(),
+        "respawn must return public visible coordinates"
+    );
+    let foreground = visible.foreground_state_with_revision().await?;
+    assert!(
+        foreground.is_some(),
+        "visible slot foreground query must resolve through its stable pane id"
+    );
+    let mut events = visible
+        .state_events(PaneStateEventsOptions::default())
+        .await?;
+    let initial = tokio::time::timeout(Duration::from_secs(5), events.next()).await??;
+    assert!(
+        matches!(initial, Some(PaneStateEvent::Snapshot { .. })),
+        "visible slot state-events stream must open with a snapshot: {initial:?}"
+    );
+
+    let raw = session.pane(0, 0);
+    assert!(
+        !raw.exists().await?,
+        "raw slot (0, 0) must not exist under base-index 1"
+    );
+    assert!(
+        raw.foreground_state_with_revision().await?.is_none(),
+        "an invisible raw slot must not address the live base-index-adjusted pane"
+    );
+    let raw_events_error =
+        match raw.state_events(PaneStateEventsOptions::default()).await {
+            Ok(_) => return Err(
+                "an invisible raw slot unexpectedly opened a pane-state stream under base-index 1"
+                    .into(),
+            ),
+            Err(error) => error,
+        };
+    assert!(
+        matches!(
+            &raw_events_error,
+            RmuxError::Protocol {
+                source: rmux_proto::RmuxError::InvalidTarget { .. },
+                ..
+            }
+        ),
+        "an invisible raw slot must fail closed before subscribing: {raw_events_error}"
+    );
+
+    raw_new_window(harness.socket_path(), name, 2).await?;
+    let close_target = visible.target().clone();
+    assert_eq!(
+        visible.close().await?,
+        PaneCloseOutcome::Closed {
+            target: close_target,
+            window_destroyed: true,
+        },
+        "close must resolve the visible slot identity without killing another pane"
+    );
+
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn issue_85_foreground_change_reaches_the_event_stream_end_to_end() -> TestResult {
+    // Issue #85: a foreground process launched inside the pane's shell must
+    // surface as a ForegroundChanged event on the state_events stream and
+    // agree with the revision-carrying snapshot query, end to end across the
+    // daemon transport. (Unix-only flow: the probe reads the pty foreground
+    // process group; the Windows twin in pane_foreground_events_windows.rs
+    // pins that platform's root-process contract.)
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("pane-fg-events").await?;
+    let rmux = harness.rmux();
+    let alpha = session_name("sdkfgevents");
+    let session = EnsureSession::named(alpha.clone())
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let pane = session.pane(0, 0);
+
+    let mut stream = pane
+        .state_events(PaneStateEventsOptions {
+            include_foreground: true,
+            ..PaneStateEventsOptions::default()
+        })
+        .await?;
+    let first = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await
+        .map_err(|_| "timed out waiting for the initial pane-state snapshot")??;
+    assert!(
+        matches!(first, Some(PaneStateEvent::Snapshot { .. })),
+        "stream must open with a snapshot: {first:?}"
+    );
+
+    pane.send_text("sleep 120\n").await?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let observed_revision = loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("timed out waiting for a sleep ForegroundChanged event")?;
+        let event = tokio::time::timeout(remaining, stream.next())
+            .await
+            .map_err(|_| "timed out waiting for a sleep ForegroundChanged event")??
+            .ok_or("pane state stream ended before the foreground changed")?;
+        if let PaneStateEvent::ForegroundChanged {
+            revision,
+            new_state,
+            ..
+        } = event
+        {
+            if new_state
+                .command
+                .clone()
+                .unwrap_or_default()
+                .contains("sleep")
+            {
+                break revision;
+            }
+        }
+    };
+    assert!(
+        observed_revision > 0,
+        "foreground revision must be positive"
+    );
+
+    let (pane_id, query_revision, state) = pane
+        .foreground_state_with_revision()
+        .await?
+        .ok_or("live pane must report a foreground snapshot")?;
+    assert_eq!(Some(pane_id), pane.id().await?, "stable pane id matches");
+    assert!(
+        query_revision >= observed_revision,
+        "query revision {query_revision} must not precede the event revision {observed_revision}"
+    );
+    assert!(
+        state.command.clone().unwrap_or_default().contains("sleep"),
+        "queried foreground should still be sleep: {state:?}"
+    );
+
+    harness.finish().await
 }
