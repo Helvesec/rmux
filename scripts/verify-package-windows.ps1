@@ -710,6 +710,15 @@ try {
     if ($metadata.daemon_binary_sha256.ToLowerInvariant() -ne $packagedDaemonHash) {
         Fail "metadata daemon_binary_sha256 does not match packaged daemon binary"
     }
+    if ($RequireReleaseArtifact) {
+        & (Join-Path $PSScriptRoot "assert-windows-static-crt.ps1") `
+            -Binary $binary `
+            -HelperBinary $helperBinary `
+            -DaemonBinary $daemonBinary
+        if ($LASTEXITCODE -ne 0) {
+            Fail "packaged Windows static CRT verification failed"
+        }
+    }
 
     $portableAlias = $null
     if ($RunBinary -or $RunDaemonSmoke) {

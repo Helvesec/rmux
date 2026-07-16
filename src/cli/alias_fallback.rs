@@ -4,7 +4,7 @@ use std::path::Path;
 use rmux_client::{connect, resolve_socket_path, resolve_tmux_compatible_socket_path, Connection};
 use rmux_core::{
     command_inventory::{has_tmux_command_candidate, RMUX_EXTENSION_COMMANDS},
-    command_parser::{is_parse_time_assignment, CommandParser},
+    command_parser::{is_parse_time_assignment, lookup_command, CommandParser},
 };
 use rmux_proto::OptionScopeSelector;
 
@@ -101,6 +101,9 @@ pub(super) fn runtime_command_resolution_for_invocation(
     let Some((scan, invocation)) = prepare_runtime_command_invocation(args) else {
         return Ok(None);
     };
+    if invocation_is_intrinsically_local(&invocation) {
+        return Ok(None);
+    }
     let socket_path = if invoked_as_tmux {
         resolve_tmux_compatible_socket_path(
             scan.socket_name.as_deref(),
@@ -191,6 +194,19 @@ fn prepare_runtime_command_invocation(
             control_mode,
         },
     ))
+}
+
+fn invocation_is_intrinsically_local(invocation: &RuntimeCommandInvocation) -> bool {
+    if invocation.control_mode != 0 || invocation.groups.len() != 1 {
+        return false;
+    }
+    let Some(command_name) = invocation.groups[0]
+        .iter()
+        .find(|argument| !is_parse_time_assignment(argument))
+    else {
+        return false;
+    };
+    lookup_command(command_name).is_ok_and(|entry| entry.name == "list-commands")
 }
 
 fn resolve_runtime_command_with_connection(
@@ -448,6 +464,51 @@ mod tests {
                 vec!["list-sessions".to_owned()],
             ])
         );
+    }
+
+    #[test]
+    fn only_single_non_control_list_commands_invocations_are_intrinsically_local() {
+        let local = RuntimeCommandInvocation {
+            arguments: vec!["list-commands".to_owned()],
+            groups: vec![vec!["FOO=bar".to_owned(), "list-commands".to_owned()]],
+            control_mode: 0,
+        };
+        assert!(invocation_is_intrinsically_local(&local));
+
+        let alias = RuntimeCommandInvocation {
+            arguments: vec!["lscm".to_owned()],
+            groups: vec![vec!["lscm".to_owned()]],
+            control_mode: 0,
+        };
+        assert!(invocation_is_intrinsically_local(&alias));
+
+        let unique_prefix = RuntimeCommandInvocation {
+            arguments: vec!["list-com".to_owned()],
+            groups: vec![vec!["list-com".to_owned()]],
+            control_mode: 0,
+        };
+        assert!(invocation_is_intrinsically_local(&unique_prefix));
+
+        let control = RuntimeCommandInvocation {
+            arguments: vec!["list-commands".to_owned()],
+            groups: vec![vec!["list-commands".to_owned()]],
+            control_mode: 1,
+        };
+        assert!(!invocation_is_intrinsically_local(&control));
+
+        let queue = RuntimeCommandInvocation {
+            arguments: vec![
+                "list-commands".to_owned(),
+                ";".to_owned(),
+                "list-sessions".to_owned(),
+            ],
+            groups: vec![
+                vec!["list-commands".to_owned()],
+                vec!["list-sessions".to_owned()],
+            ],
+            control_mode: 0,
+        };
+        assert!(!invocation_is_intrinsically_local(&queue));
     }
 
     #[test]

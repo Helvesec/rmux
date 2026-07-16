@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use rmux_os::process_tree::ProcessTreeChild;
+use rmux_os::process_tree::{ConsoleWindowBehavior, ProcessTreeChild};
 use rmux_proto::{RmuxError, DEFAULT_MAX_FRAME_LENGTH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{ChildStderr, ChildStdout};
@@ -190,8 +190,11 @@ async fn run_shell_foreground_async(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = ProcessTreeChild::spawn(&mut command_builder)
-        .map_err(|error| RmuxError::Server(format!("failed to run shell command: {error}")))?;
+    let mut child = ProcessTreeChild::spawn_with_console_window(
+        &mut command_builder,
+        ConsoleWindowBehavior::Suppress,
+    )
+    .map_err(|error| RmuxError::Server(format!("failed to run shell command: {error}")))?;
     let registration_guard = register_shell_process(&mut child, shell_processes.as_ref())?;
     let stdout_task = child
         .child_mut()
@@ -249,8 +252,11 @@ async fn shell_condition_is_true_async(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = ProcessTreeChild::spawn(&mut command_builder)
-        .map_err(|error| RmuxError::Server(format!("failed to run if-shell condition: {error}")))?;
+    let mut child = ProcessTreeChild::spawn_with_console_window(
+        &mut command_builder,
+        ConsoleWindowBehavior::Suppress,
+    )
+    .map_err(|error| RmuxError::Server(format!("failed to run if-shell condition: {error}")))?;
     let registration_guard = register_shell_process(&mut child, shell_processes.as_ref())?;
     let status = wait_child_with_timeout(
         &mut child,

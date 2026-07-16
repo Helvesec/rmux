@@ -317,7 +317,14 @@ pub(crate) fn spawn_pane_exit_watcher(
         .name(thread_name.clone())
         .spawn(move || {
             let _ = child.wait();
-            child.close_pseudoconsole();
+            if let Err(error) = child.terminate_forcefully() {
+                warn!(
+                    session = %session_name,
+                    pane_id = pane_id.as_u32(),
+                    "failed to terminate pane descendants before closing ConPTY: {error}"
+                );
+                child.close_pseudoconsole();
+            }
             if eof_state.wait_until_published(WINDOWS_PANE_EOF_PUBLISHED_GRACE) {
                 return;
             }

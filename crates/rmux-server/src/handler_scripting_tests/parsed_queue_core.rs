@@ -934,6 +934,62 @@ async fn parsed_queue_accepts_compact_new_window_flags() {
 }
 
 #[tokio::test]
+async fn parsed_queue_new_window_k_validates_environment_before_replacing_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("new-window-k-env-validation");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let setup = CommandParser::new()
+        .parse("new-window -d -t new-window-k-env-validation:1 -n protected")
+        .expect("window setup parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), setup)
+        .await
+        .expect("window setup succeeds");
+    let protected_window_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.window_at(1))
+        .expect("protected window exists")
+        .id();
+
+    let invalid = CommandParser::new()
+        .parse("new-window -d -k -t new-window-k-env-validation:1 -e NOT_AN_ASSIGNMENT")
+        .expect("invalid environment reaches runtime validation");
+    let error = handler
+        .execute_parsed_commands_for_test(std::process::id(), invalid)
+        .await
+        .expect_err("invalid environment is rejected");
+
+    assert!(
+        error
+            .to_string()
+            .contains("environment assignment must be NAME=VALUE"),
+        "{error}"
+    );
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session survives");
+    assert_eq!(session.windows().len(), 2);
+    let protected = session
+        .window_at(1)
+        .expect("invalid replacement must preserve the target window");
+    assert_eq!(protected.id(), protected_window_id);
+    assert_eq!(protected.name(), Some("protected"));
+}
+
+#[tokio::test]
 async fn parsed_queue_new_window_before_beats_after_like_tmux() {
     for flags in ["-b -a", "-ba"] {
         let handler = RequestHandler::new();

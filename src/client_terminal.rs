@@ -1,6 +1,22 @@
 //! Client-side terminal capability detection shared by the full and tiny CLIs.
 
+use std::io::IsTerminal;
+
 use rmux_proto::ClientTerminalContext;
+
+pub(crate) const ATTACH_TERMINAL_REQUIRED_MESSAGE: &str = "open terminal failed: not a terminal";
+
+pub(crate) fn require_attach_terminal() -> Result<(), &'static str> {
+    require_attach_terminal_from(std::io::stdin().is_terminal())
+}
+
+fn require_attach_terminal_from(stdin_is_terminal: bool) -> Result<(), &'static str> {
+    if stdin_is_terminal {
+        Ok(())
+    } else {
+        Err(ATTACH_TERMINAL_REQUIRED_MESSAGE)
+    }
+}
 
 pub(crate) fn client_terminal_context_from_parts(
     terminal_features: Vec<String>,
@@ -60,7 +76,19 @@ fn push_unique_terminal_feature(features: &mut Vec<String>, feature: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::client_terminal_context_from_parts;
+    use super::{
+        client_terminal_context_from_parts, require_attach_terminal_from,
+        ATTACH_TERMINAL_REQUIRED_MESSAGE,
+    };
+
+    #[test]
+    fn attach_terminal_preflight_rejects_redirected_stdin() {
+        assert_eq!(
+            require_attach_terminal_from(false),
+            Err(ATTACH_TERMINAL_REQUIRED_MESSAGE)
+        );
+        assert_eq!(require_attach_terminal_from(true), Ok(()));
+    }
 
     #[test]
     fn detected_client_terminal_context_preserves_explicit_features() {

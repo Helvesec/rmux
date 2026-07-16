@@ -82,6 +82,9 @@ impl RequestHandler {
             }
         }
 
+        if let Some(environment) = environment.as_deref() {
+            crate::terminal::parse_environment_assignments(environment)?;
+        }
         let (target_window_index, replace_after_create) = self
             .prepare_queued_new_window_kill_existing(
                 &target,

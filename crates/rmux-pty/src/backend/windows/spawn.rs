@@ -299,10 +299,23 @@ pub(crate) fn try_wait_child(child: &mut WindowsChild) -> Result<Option<ExitStat
 }
 
 pub(crate) fn try_clone_child_for_wait(child: &WindowsChild) -> Result<WindowsChild> {
+    clone_child_with_job(child, None)
+}
+
+pub(crate) fn try_clone_child_for_exit_teardown(child: &WindowsChild) -> Result<WindowsChild> {
+    let job = child
+        .job
+        .as_ref()
+        .map(JobObjectGuard::try_clone)
+        .transpose()?;
+    clone_child_with_job(child, job)
+}
+
+fn clone_child_with_job(child: &WindowsChild, job: Option<JobObjectGuard>) -> Result<WindowsChild> {
     Ok(WindowsChild {
         process: duplicate_handle(&child.process)?,
         thread: duplicate_handle(&child.thread)?,
-        job: None,
+        job,
         pty: Arc::clone(&child.pty),
         pid: child.pid,
     })
@@ -321,18 +334,17 @@ pub(crate) fn kill_child(child: &WindowsChild, signal: Signal) -> Result<()> {
         Signal::INT => interrupt_child(child),
         Signal::CONT => Ok(()),
         Signal::TERM | Signal::KILL | Signal::HUP => {
-            child.pty.close_pseudoconsole();
-            if let Some(job) = &child.job {
-                job.terminate(1)?;
-                if process_is_still_running(&child.process)? {
-                    let _ = terminate_process(&child.process, 1);
-                }
-            } else {
+            let Some(job) = &child.job else {
                 return Err(io::Error::other(
                     "Windows child has no Job Object cleanup guard; refusing unsafe fallback kill",
                 )
                 .into());
+            };
+            job.terminate(1)?;
+            if process_is_still_running(&child.process)? {
+                let _ = terminate_process(&child.process, 1);
             }
+            child.pty.close_pseudoconsole();
             Ok(())
         }
     }
@@ -456,6 +468,12 @@ impl JobObjectGuard {
             return Err(last_os_error());
         }
         Ok(())
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            handle: duplicate_handle(&self.handle)?,
+        })
     }
 
     fn terminate(&self, exit_code: u32) -> io::Result<()> {

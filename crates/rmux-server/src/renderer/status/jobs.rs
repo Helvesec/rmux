@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_os::process_tree::{ProcessTreeChild, ProcessTreeController};
+use rmux_os::process_tree::{ConsoleWindowBehavior, ProcessTreeChild, ProcessTreeController};
 #[cfg(unix)]
 use rustix::process::Signal;
 
@@ -260,7 +260,9 @@ fn run_status_job(command: &str, profile: Option<&TerminalProfile>) -> String {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let Ok(mut child) = ProcessTreeChild::spawn(&mut process) else {
+    let Ok(mut child) =
+        ProcessTreeChild::spawn_with_console_window(&mut process, ConsoleWindowBehavior::Suppress)
+    else {
         return String::new();
     };
     let process_group = child.controller();

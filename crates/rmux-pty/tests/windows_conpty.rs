@@ -2,6 +2,7 @@
 
 use std::env;
 use std::fs;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -13,11 +14,11 @@ use rmux_pty::{
 };
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, SetConsoleCtrlHandler, SetConsoleMode, CTRL_C_EVENT,
-    ENABLE_PROCESSED_INPUT, STD_INPUT_HANDLE,
+    GetConsoleMode, GetStdHandle, SetConsoleCtrlHandler, SetConsoleMode, CTRL_CLOSE_EVENT,
+    CTRL_C_EVENT, ENABLE_PROCESSED_INPUT, STD_INPUT_HANDLE,
 };
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetExitCodeProcess, OpenProcess, Sleep, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_TERMINATE,
 };
 
@@ -26,12 +27,23 @@ mod job;
 
 const CONPTY_CHILD_OUTPUT_TIMEOUT: Duration = Duration::from_secs(15);
 const CTRL_C_COUNT_PATH_ENV: &str = "RMUX_TEST_CTRL_C_COUNT_PATH";
+const EXIT_WATCHER_HOLDER_PID_PATH_ENV: &str = "RMUX_TEST_EXIT_WATCHER_HOLDER_PID_PATH";
 
 static CTRL_C_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "system" fn count_ctrl_c(kind: u32) -> i32 {
     if kind == CTRL_C_EVENT {
         CTRL_C_CALLBACK_COUNT.fetch_add(1, Ordering::SeqCst);
+        return 1;
+    }
+    0
+}
+
+unsafe extern "system" fn delay_console_close(kind: u32) -> i32 {
+    if kind == CTRL_CLOSE_EVENT {
+        // SAFETY: Sleeping the dedicated Win32 console-control thread is the
+        // fixture behavior used to expose ClosePseudoConsole ordering.
+        unsafe { Sleep(30_000) };
         return 1;
     }
     0
@@ -371,6 +383,98 @@ fn conpty_force_kill_reaps_grandchild_process_tree() -> Result<(), Box<dyn std::
         let _ = terminate_process_id(grandchild_pid);
         return Err(format!("grandchild process {grandchild_pid} survived Job Object kill").into());
     }
+    Ok(())
+}
+
+#[test]
+fn conpty_exit_watcher_descendant_helper() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(pid_path) = env::var_os(EXIT_WATCHER_HOLDER_PID_PATH_ENV) else {
+        return Ok(());
+    };
+    let installed = unsafe {
+        // SAFETY: delay_console_close has the process-static callback signature
+        // Win32 requires and remains valid for this helper's lifetime.
+        SetConsoleCtrlHandler(Some(delay_console_close), 1)
+    };
+    if installed == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    fs::write(pid_path, std::process::id().to_string())?;
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn conpty_exit_watcher_leader_helper() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(pid_path) = env::var_os(EXIT_WATCHER_HOLDER_PID_PATH_ENV) else {
+        return Ok(());
+    };
+    Command::new(env::current_exe()?)
+        .args([
+            "--exact",
+            "conpty_exit_watcher_descendant_helper",
+            "--nocapture",
+        ])
+        .env(EXIT_WATCHER_HOLDER_PID_PATH_ENV, pid_path)
+        .spawn()?;
+    Ok(())
+}
+
+#[test]
+fn conpty_exit_watcher_terminates_descendants_before_close(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let suffix = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let pid_path = env::temp_dir().join(format!(
+        "rmux-exit-watcher-holder-{}-{suffix}.txt",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&pid_path);
+    let spawned = ChildCommand::new(env::current_exe()?)
+        .args([
+            "--exact",
+            "conpty_exit_watcher_leader_helper",
+            "--nocapture",
+        ])
+        .env(EXIT_WATCHER_HOLDER_PID_PATH_ENV, pid_path.as_os_str())
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let mut exit_watcher = spawned.child().try_clone_for_exit_teardown()?;
+    assert!(exit_watcher.wait()?.success());
+
+    let ready_deadline = Instant::now() + Duration::from_secs(3);
+    while !pid_path.is_file() && Instant::now() < ready_deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    let descendant_pid = fs::read_to_string(&pid_path)?.trim().parse::<u32>()?;
+    assert!(
+        process_is_running(descendant_pid),
+        "same-console descendant must be alive before exit teardown"
+    );
+
+    let teardown_started = Instant::now();
+    exit_watcher.terminate_forcefully()?;
+    assert!(
+        teardown_started.elapsed() < Duration::from_secs(2),
+        "Job termination must precede ClosePseudoConsole"
+    );
+    exit_watcher.terminate_forcefully()?;
+    exit_watcher.close_pseudoconsole();
+    exit_watcher.close_pseudoconsole();
+    spawned.child().terminate_forcefully()?;
+
+    let exit_deadline = Instant::now() + Duration::from_secs(2);
+    while process_is_running(descendant_pid) && Instant::now() < exit_deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    if process_is_running(descendant_pid) {
+        let _ = terminate_process_id(descendant_pid);
+        return Err(format!(
+            "same-console descendant {descendant_pid} survived exit watcher teardown"
+        )
+        .into());
+    }
+    let _ = fs::remove_file(pid_path);
     Ok(())
 }
 

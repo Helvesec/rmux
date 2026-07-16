@@ -41,6 +41,13 @@ impl TerminalScreen {
         self.parser.screen_mut()
     }
 
+    /// Returns whether plain printable output can bypass structured rendering
+    /// without losing parser or screen semantics.
+    #[must_use]
+    pub fn plain_output_forwarding_safe(&self) -> bool {
+        self.parser.plain_output_forwarding_safe()
+    }
+
     /// Updates the tmux-style UTF-8 width and combining configuration.
     pub fn set_utf8_config(&mut self, config: Utf8Config) {
         self.parser.set_utf8_config(config);

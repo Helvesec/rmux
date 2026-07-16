@@ -728,6 +728,7 @@ impl RequestHandler {
                             }
                             Err(error) => {
                                 let _removed = state.sessions.remove_session(&session_name);
+                                let _ = state.environment.remove_session(&session_name);
                                 return Response::Error(ErrorResponse { error });
                             }
                         }
@@ -737,6 +738,7 @@ impl RequestHandler {
                         Ok(()) => {}
                         Err(error) => {
                             let _removed = state.sessions.remove_session(&session_name);
+                            let _ = state.environment.remove_session(&session_name);
                             return Response::Error(ErrorResponse { error });
                         }
                     }

@@ -732,6 +732,13 @@ impl GridLine {
         }
     }
 
+    /// Marks only the unused physical suffix skipped before a wide pre-wrap.
+    pub(crate) fn mark_unused_suffix_as_reflow_gap(&mut self, start: u32) {
+        if self.used_end() <= start as usize {
+            self.mark_reflow_gap(start);
+        }
+    }
+
     fn restore_trailing_reflow_gaps(&mut self, count: usize) {
         self.materialize_reflow_gaps();
         for cell in self.cells.iter_mut().rev().take(count) {

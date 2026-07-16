@@ -42,6 +42,7 @@ mod output;
 mod parse;
 mod trace;
 
+use crate::client_terminal::require_attach_terminal;
 use crate::command_alias_snapshot::{decode_command_alias_definitions, definition_matches_name};
 use crate::runtime_command_expansion::expand_runtime_command_segment;
 use crate::tmux_error_surface::{source_file_error_uses_stdout, tmux_cli_error_message};
@@ -61,7 +62,10 @@ use parse::{
 use trace::{trace_direct, trace_fallback};
 
 #[cfg(unix)]
-const KILL_SERVER_SOCKET_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+// The daemon may spend up to five seconds draining accepted lifecycle hooks
+// before it releases the endpoint. Keep enough margin for connection cleanup
+// and scheduler contention so a successful kill-server is a restart barrier.
+const KILL_SERVER_SOCKET_CLEANUP_TIMEOUT: Duration = Duration::from_secs(7);
 #[cfg(unix)]
 const KILL_SERVER_SOCKET_CLEANUP_MIN_POLL: Duration = Duration::from_millis(1);
 #[cfg(unix)]
@@ -1400,7 +1404,7 @@ fn run_new_session(
 fn run_attach_session(
     original_args: &[OsString],
     socket_path: &Path,
-    request: AttachSessionExt2Request,
+    mut request: AttachSessionExt2Request,
 ) -> Result<i32, String> {
     let connection_outcome = match connect_with_validated_startup_outcome(socket_path) {
         Ok(outcome) => outcome,
@@ -1416,6 +1420,18 @@ fn run_attach_session(
         }
         return Err("no sessions".to_owned());
     }
+    if let Some(target_spec) = request.target_spec.as_ref() {
+        let response = connection
+            .resolve_target(
+                Some(target_spec.clone()),
+                ResolveTargetType::Session,
+                false,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+        request.target = Some(attach_resolved_session(response)?);
+    }
+    require_attach_terminal().map_err(str::to_owned)?;
 
     let attach_resize_geometry = connection
         .supports_capability(CAPABILITY_ATTACH_RESIZE_GEOMETRY)
@@ -1482,6 +1498,22 @@ fn run_attach_session(
         AttachTransition::Rejected(response) => {
             write_response_output_or_error(response, "attach-session")
         }
+    }
+}
+
+fn attach_resolved_session(response: Response) -> Result<rmux_proto::SessionName, String> {
+    match response {
+        Response::ResolveTarget(response) => match response.target {
+            Target::Session(target) => Ok(target),
+            _ => Err(
+                "protocol error: resolve-target returned a non-session target for attach-session"
+                    .to_owned(),
+            ),
+        },
+        Response::Error(error) => Err(tmux_cli_error_message("attach-session", &error.error)),
+        _ => Err(
+            "protocol error: unexpected response while resolving attach-session target".to_owned(),
+        ),
     }
 }
 

@@ -256,6 +256,25 @@ EOF
   "$RMUX" -L "$sock" new-session -d -s prefixdemo sleep 60 >/dev/null
   "$RMUX" -L "$sock" new-session -d -s killtarget sleep 60 >/dev/null
 
+  run_capture attach_missing_non_tty -L "$sock" attach-session -t missing
+  [ "$(cat "$SMOKE_ROOT/attach_missing_non_tty.rc")" != "0" ] ||
+    die "tiny non-terminal attach accepted a missing target"
+  assert_trace attach_missing_non_tty "rmux tiny: direct: attach-session"
+  assert_stderr_contains attach_missing_non_tty "can't find session: missing"
+
+  set +e
+  RMUX_TINY_TRACE=1 perl -e 'alarm 5; exec @ARGV' \
+    "$RMUX" -L "$sock" attach-session -t alpha </dev/null \
+    >"$SMOKE_ROOT/attach_non_tty.out" 2>"$SMOKE_ROOT/attach_non_tty.err"
+  local attach_non_tty_status=$?
+  set -e
+  [ "$attach_non_tty_status" -eq 1 ] ||
+    die "tiny non-terminal attach exited $attach_non_tty_status instead of failing immediately"
+  grep -Fq "rmux tiny: direct: attach-session" "$SMOKE_ROOT/attach_non_tty.err" ||
+    die "non-terminal attach did not stay on the tiny direct path"
+  grep -Fq "open terminal failed: not a terminal" "$SMOKE_ROOT/attach_non_tty.err" ||
+    die "tiny non-terminal attach did not report the terminal preflight error"
+
   "$RMUX" -L "$sock" set-environment -gu TINY_ALIAS_PERSISTED >/dev/null 2>&1 || true
   "$RMUX" -L "$sock" set-option -s 'command-alias[20]' \
     'list-sessions=TINY_ALIAS_PERSISTED=from-tiny display-message -p tiny-alias' >/dev/null

@@ -126,6 +126,10 @@ created_dirs=()
 transaction_root=""
 transaction_active=0
 transaction_committed=0
+install_lock_path=""
+install_lock_nonce=""
+install_lock_held=0
+prefix_created=0
 
 ensure_directory() {
   local directory
@@ -151,6 +155,142 @@ ensure_directory_tree() {
     mkdir "${missing[$index]}"
     created_dirs+=("${missing[$index]}")
   done
+}
+
+ensure_install_prefix() {
+  if [ -e "$prefix" ] || [ -L "$prefix" ]; then
+    [ -d "$prefix" ] || die "prefix exists but is not a directory: $prefix"
+    return
+  fi
+  mkdir -p "$prefix"
+  if [ "$prefix_created" -eq 0 ]; then
+    created_dirs+=("$prefix")
+    prefix_created=1
+  fi
+}
+
+read_install_lock_owner() {
+  local owner_file extra
+  owner_file="$1/owner"
+  lock_owner_pid=""
+  lock_owner_nonce=""
+
+  [ -f "$owner_file" ] && [ ! -L "$owner_file" ] || return 1
+  {
+    IFS= read -r lock_owner_pid &&
+      IFS= read -r lock_owner_nonce &&
+      ! IFS= read -r extra
+  } <"$owner_file" || return 1
+  case "$lock_owner_pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  case "$lock_owner_nonce" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+}
+
+reclaim_stale_install_lock() {
+  local expected_pid expected_nonce reclaim_path quarantine suffix
+  expected_pid="$1"
+  expected_nonce="$2"
+  reclaim_path="$install_lock_path/.reclaim"
+
+  (umask 077 && mkdir "$reclaim_path") 2>/dev/null || return 1
+
+  # A waiter may only move the exact stale lock that it inspected before
+  # winning the reclaim marker. A live owner always keeps its lock.
+  if ! read_install_lock_owner "$install_lock_path" ||
+    [ "$lock_owner_pid" != "$expected_pid" ] ||
+    [ "$lock_owner_nonce" != "$expected_nonce" ] ||
+    kill -0 "$lock_owner_pid" 2>/dev/null; then
+    rmdir "$reclaim_path" 2>/dev/null || :
+    return 1
+  fi
+
+  quarantine="${install_lock_path}.quarantine.$$.$RANDOM.$RANDOM"
+  suffix=0
+  while [ -e "$quarantine" ] || [ -L "$quarantine" ]; do
+    suffix=$((suffix + 1))
+    quarantine="${install_lock_path}.quarantine.$$.$RANDOM.$suffix"
+  done
+  if ! mv "$install_lock_path" "$quarantine"; then
+    rmdir "$reclaim_path" 2>/dev/null || :
+    return 1
+  fi
+  rm -rf "$quarantine" ||
+    die "failed to clean stale installer lock quarantine at $quarantine"
+}
+
+write_install_lock_owner() {
+  local owner_file owner_tmp
+  owner_file="$install_lock_path/owner"
+  owner_tmp="$install_lock_path/.owner.$$"
+  install_lock_nonce="$$.$SECONDS.$RANDOM.$RANDOM"
+  if ! (umask 077 && printf '%s\n%s\n' "$$" "$install_lock_nonce" >"$owner_tmp") ||
+    ! mv "$owner_tmp" "$owner_file"; then
+    rm -f "$owner_tmp" 2>/dev/null || :
+    rm -f "$owner_file" 2>/dev/null || :
+    rmdir "$install_lock_path" 2>/dev/null || :
+    return 1
+  fi
+}
+
+acquire_install_lock() {
+  local deadline reported_wait stale_pid stale_nonce
+  install_lock_path="$prefix/.rmux-install.lock"
+  deadline=$((SECONDS + 30))
+  reported_wait=0
+
+  while ! (umask 077 && mkdir "$install_lock_path") 2>/dev/null; do
+    if [ -L "$install_lock_path" ] ||
+      { [ -e "$install_lock_path" ] && [ ! -d "$install_lock_path" ]; }; then
+      die "installer lock path exists but is not a directory: $install_lock_path"
+    fi
+    if [ ! -d "$prefix" ]; then
+      ensure_install_prefix
+    fi
+    if read_install_lock_owner "$install_lock_path"; then
+      stale_pid="$lock_owner_pid"
+      stale_nonce="$lock_owner_nonce"
+      if ! kill -0 "$stale_pid" 2>/dev/null; then
+        if reclaim_stale_install_lock "$stale_pid" "$stale_nonce"; then
+          continue
+        fi
+      fi
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      die "timed out waiting for another rmux installation to finish"
+    fi
+    if [ "$reported_wait" -eq 0 ]; then
+      if [ -n "${RMUX_INSTALL_TEST_LOCK_WAIT_FILE:-}" ]; then
+        : >"$RMUX_INSTALL_TEST_LOCK_WAIT_FILE" 2>/dev/null || :
+      fi
+      printf 'Another rmux installation is updating this destination; waiting up to 30 seconds.\n' >&2
+      reported_wait=1
+    fi
+    sleep 0.05
+  done
+  write_install_lock_owner || die "could not record installer lock ownership"
+  install_lock_held=1
+
+  if [ -n "${RMUX_INSTALL_TEST_LOCK_ACQUIRED_FILE:-}" ]; then
+    : >"$RMUX_INSTALL_TEST_LOCK_ACQUIRED_FILE"
+  fi
+  if [ -n "${RMUX_INSTALL_TEST_LOCK_RESUME_FILE:-}" ]; then
+    while [ ! -e "$RMUX_INSTALL_TEST_LOCK_RESUME_FILE" ]; do
+      sleep 0.01
+    done
+  fi
+}
+
+release_install_lock() {
+  [ "$install_lock_held" -eq 1 ] || return 0
+  read_install_lock_owner "$install_lock_path" || return 1
+  [ "$lock_owner_pid" = "$$" ] || return 1
+  [ "$lock_owner_nonce" = "$install_lock_nonce" ] || return 1
+  rm "$install_lock_path/owner" || return 1
+  rmdir "$install_lock_path" || return 1
+  install_lock_held=0
 }
 
 restore_target() {
@@ -254,8 +394,18 @@ cleanup_transaction() {
 
   if [ "$transaction_committed" -eq 0 ]; then
     for ((index = ${#created_dirs[@]} - 1; index >= 0; index--)); do
-      rmdir "${created_dirs[$index]}" 2>/dev/null || :
+      if [ "${created_dirs[$index]}" != "$prefix" ]; then
+        rmdir "${created_dirs[$index]}" 2>/dev/null || :
+      fi
     done
+  fi
+
+  if ! release_install_lock; then
+    printf 'error: failed to release installer lock at %s\n' "$install_lock_path" >&2
+    rollback_failed=1
+  fi
+  if [ "$transaction_committed" -eq 0 ] && [ "$prefix_created" -eq 1 ]; then
+    rmdir "$prefix" 2>/dev/null || :
   fi
 
   if [ "$rollback_failed" -ne 0 ]; then
@@ -272,6 +422,12 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Serialize the complete preflight, backup, publish, verification, rollback,
+# and cleanup interval. Without this lock, an older failing transaction can
+# restore its snapshot over a newer package that already reported success.
+ensure_install_prefix
+acquire_install_lock
+
 # Reject every unusable destination before creating staging files or replacing
 # any executable. Symlinks are allowed because a successful upgrade replaces
 # them just as the previous installer did; backups preserve them on rollback.
@@ -283,12 +439,6 @@ for target in "${targets[@]}"; do
 done
 checkpoint after-preflight
 
-if [ -e "$prefix" ] || [ -L "$prefix" ]; then
-  [ -d "$prefix" ] || die "prefix exists but is not a directory: $prefix"
-else
-  mkdir -p "$prefix"
-  created_dirs+=("$prefix")
-fi
 ensure_directory "$prefix/bin"
 ensure_directory "$prefix/libexec"
 ensure_directory "$prefix/libexec/rmux"

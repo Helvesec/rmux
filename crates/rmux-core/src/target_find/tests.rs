@@ -642,4 +642,26 @@ fn command_metadata_captures_find_type_and_flags() {
     assert!(set_window_option_target
         .flags
         .contains(TargetFindFlags::CANFAIL));
+
+    for command in ["resize-window", "unlink-window"] {
+        let target = command_target_metadata(command)
+            .unwrap_or_else(|| panic!("{command} metadata exists"))
+            .target
+            .expect("target spec");
+        assert_eq!(target.find_type, TargetFindType::Window);
+        assert_eq!(target.flags, TargetFindFlags::NONE);
+    }
+
+    let show_window_options =
+        command_target_metadata("show-window-options").expect("metadata exists");
+    let show_window_options_target = show_window_options.target.expect("target spec");
+    assert_eq!(show_window_options_target.find_type, TargetFindType::Window);
+    assert!(show_window_options_target
+        .flags
+        .contains(TargetFindFlags::CANFAIL));
+
+    let send_prefix = command_target_metadata("send-prefix").expect("metadata exists");
+    let send_prefix_target = send_prefix.target.expect("target spec");
+    assert_eq!(send_prefix_target.find_type, TargetFindType::Pane);
+    assert_eq!(send_prefix_target.flags, TargetFindFlags::NONE);
 }

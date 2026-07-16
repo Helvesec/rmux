@@ -125,6 +125,15 @@ impl Screen {
         (self.rupper, self.rlower)
     }
 
+    pub(crate) const fn plain_output_forwarding_safe(&self) -> bool {
+        let unsafe_modes = mode::MODE_INSERT | mode::MODE_CRLF | mode::MODE_SYNC;
+        !self.pending_wrap
+            && self.mode & mode::MODE_WRAP != 0
+            && self.mode & unsafe_modes == 0
+            && self.rupper == 0
+            && self.rlower == self.grid.sy().saturating_sub(1)
+    }
+
     /// Returns the screen size.
     #[must_use]
     pub fn size(&self) -> TerminalSize {
@@ -597,10 +606,9 @@ impl Screen {
         let width = requested_width.clamp(1, self.grid.sx());
 
         let wrap_enabled = (self.mode & mode::MODE_WRAP) != 0;
-        let automatic_wrap_continuation = self.pending_wrap && wrap_enabled;
+        let mut automatic_wrap_continuation = self.pending_wrap && wrap_enabled;
         self.apply_pending_wrap();
 
-        let mut insert_padding_wrap = false;
         if (self.mode & mode::MODE_INSERT) != 0 {
             let insert_x = self.logical_insert_column();
             if insert_x >= self.grid.sx() {
@@ -612,7 +620,7 @@ impl Screen {
                 }
                 self.linefeed(false, COLOUR_DEFAULT);
                 self.cursor_x = 0;
-                insert_padding_wrap = true;
+                automatic_wrap_continuation = true;
             } else {
                 self.cursor_x = insert_x;
             }
@@ -631,11 +639,14 @@ impl Screen {
         }
 
         if wrap_enabled && write_would_cross_right_edge {
+            let gap_start = self.cursor_column();
             if let Some(line) = self.current_line_mut() {
+                line.mark_unused_suffix_as_reflow_gap(gap_start);
                 line.set_wrapped(true);
             }
             self.linefeed(false, COLOUR_DEFAULT);
             self.cursor_x = 0;
+            automatic_wrap_continuation = true;
         }
 
         if self.cursor_y >= self.grid.sy()
@@ -645,7 +656,7 @@ impl Screen {
         }
 
         let x = self.cursor_column();
-        if x == 0 && !automatic_wrap_continuation && !insert_padding_wrap {
+        if x == 0 && !automatic_wrap_continuation {
             self.break_previous_wrapped_line();
         }
         self.overwrite_for_write(x, width);

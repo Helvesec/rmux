@@ -57,9 +57,9 @@ pub(crate) use overlay::{
 };
 pub(crate) use pane_delta::{PaneRenderDelta, PaneRenderDeltaFrame, PaneRenderSnapshot};
 pub(crate) use pane_screen::{
-    render_copy_mode_pane_screen, render_copy_mode_pane_screen_preserving_prompt_cursor,
-    render_pane_screen, render_pane_screen_preserving_prompt_cursor, styled_pane_screen,
-    truncate_rendered_pane_line,
+    pane_default_style, render_copy_mode_pane_screen,
+    render_copy_mode_pane_screen_preserving_prompt_cursor, render_pane_screen,
+    render_pane_screen_preserving_prompt_cursor, styled_pane_screen, truncate_rendered_pane_line,
 };
 #[cfg(test)]
 use status::status_bar_runs;

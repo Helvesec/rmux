@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{atomic::Ordering, Arc};
 
-use rmux_core::{input::mode, key_code_lookup_bits, LifecycleEvent};
+use rmux_core::{input::mode, key_code_lookup_bits, KeyCode, LifecycleEvent, KEYC_ANY};
 #[cfg(windows)]
 use rmux_core::{key_string_lookup_string, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_META, KEYC_SHIFT};
 use rmux_proto::{AttachedKeystroke, PaneTarget, Response, WindowTarget};
@@ -42,8 +42,8 @@ use crate::handler::overlay_support::AttachedOverlayInput;
 use crate::handler::{attach_support::ActiveAttachIdentity, prepare_lifecycle_event};
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{
-    decode_attached_key, lookup_attached_key_table_binding, matches_prefix_key, session_option_key,
-    AttachedKeyDecode, PREFIX_TABLE,
+    decode_attached_key, default_key_table_name, lookup_attached_key_table_binding,
+    matches_prefix_key, session_option_key, AttachedKeyDecode, PREFIX_TABLE,
 };
 
 pub(crate) type ActiveClientEmitCache = Option<(u64, WindowTarget)>;
@@ -68,6 +68,48 @@ struct AttachedLiveInputWork {
     start: usize,
     end: usize,
     windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
+}
+
+struct PlainKeyDispatchSnapshot {
+    prefix: Option<KeyCode>,
+    prefix2: Option<KeyCode>,
+    bindings: Vec<KeyCode>,
+}
+
+impl PlainKeyDispatchSnapshot {
+    fn new(state: &crate::pane_terminals::HandlerState, target: &PaneTarget) -> Self {
+        let table_name = default_key_table_name(state, target);
+        let bindings = state
+            .key_bindings
+            .table(&table_name)
+            .into_iter()
+            .flat_map(|table| table.active().keys())
+            .map(|key| key_code_lookup_bits(*key))
+            .filter(|key| *key == KEYC_ANY || *key <= u64::from(char::MAX as u32))
+            .collect();
+        Self {
+            prefix: session_option_key(
+                state,
+                target.session_name(),
+                rmux_proto::OptionName::Prefix,
+            ),
+            prefix2: session_option_key(
+                state,
+                target.session_name(),
+                rmux_proto::OptionName::Prefix2,
+            ),
+            bindings,
+        }
+    }
+
+    fn requires_dispatch(&self, key: KeyCode) -> bool {
+        let key = key_code_lookup_bits(key);
+        matches_prefix_key(key, self.prefix, self.prefix2)
+            || self
+                .bindings
+                .iter()
+                .any(|binding| *binding == KEYC_ANY || *binding == key)
+    }
 }
 
 impl AttachedLiveInputWork {
@@ -639,7 +681,7 @@ impl RequestHandler {
         pending_input.extend_from_slice(bytes);
         let mut raw_start = 0;
         let mut offset = 0;
-        let mut prefix_keys = None;
+        let mut plain_key_dispatch = None;
 
         while offset < pending_input.len() {
             let slice = &pending_input[offset..];
@@ -1002,36 +1044,10 @@ impl RequestHandler {
             if !key_table_active && !target_in_copy_mode {
                 let first = slice[0];
                 if !first.is_ascii_control() {
-                    let (prefix, prefix2) = match prefix_keys {
-                        Some(keys) => keys,
-                        None => {
-                            let state = self.state.lock().await;
-                            let keys = (
-                                session_option_key(
-                                    &state,
-                                    target.session_name(),
-                                    rmux_proto::OptionName::Prefix,
-                                ),
-                                session_option_key(
-                                    &state,
-                                    target.session_name(),
-                                    rmux_proto::OptionName::Prefix2,
-                                ),
-                            );
-                            prefix_keys = Some(keys);
-                            keys
-                        }
-                    };
-                    if first.is_ascii() {
-                        if !first_input_key_matches_prefix(slice, prefix, prefix2) {
-                            offset += 1;
-                            continue;
-                        }
+                    let (key, size) = if first.is_ascii() {
+                        (KeyCode::from(first), 1)
                     } else if let Some((character, size)) = decode_utf8_char(slice) {
-                        if !matches_prefix_key(character as rmux_core::KeyCode, prefix, prefix2) {
-                            offset += size;
-                            continue;
-                        }
+                        (KeyCode::from(character), size)
                     } else {
                         if is_utf8_lead_byte(first) && slice.len() < utf8_expected_len(first) {
                             if raw_start < offset {
@@ -1047,6 +1063,18 @@ impl RequestHandler {
                             return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                         }
                         offset += 1;
+                        continue;
+                    };
+                    if plain_key_dispatch.is_none() {
+                        let state = self.state.lock().await;
+                        plain_key_dispatch = Some(PlainKeyDispatchSnapshot::new(&state, &target));
+                    }
+                    if !plain_key_dispatch
+                        .as_ref()
+                        .expect("plain key dispatch snapshot must be initialized")
+                        .requires_dispatch(key)
+                    {
+                        offset += size;
                         continue;
                     }
                 }
@@ -1320,7 +1348,7 @@ impl RequestHandler {
                         return Ok(None);
                     }
                 }
-                if input_contains_prefix(bytes, &target, state) {
+                if plain_input_requires_key_dispatch(bytes, &target, state) {
                     return Ok(None);
                 }
                 if let Some(submitted) = submitted_text_before_enter(bytes) {
@@ -1714,17 +1742,6 @@ fn is_plain_attached_fast_path_input(bytes: &[u8]) -> bool {
             .all(|byte| matches!(*byte, b'\r' | b'\n' | b' '..=b'~'))
 }
 
-fn first_input_key_matches_prefix(
-    bytes: &[u8],
-    prefix: Option<rmux_core::KeyCode>,
-    prefix2: Option<rmux_core::KeyCode>,
-) -> bool {
-    let AttachedKeyDecode::Matched { key, .. } = decode_live_attached_key(bytes, None) else {
-        return false;
-    };
-    matches_prefix_key(key, prefix, prefix2)
-}
-
 fn decode_live_attached_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
     match decode_attached_key(input, backspace) {
         AttachedKeyDecode::Invalid => {
@@ -1765,7 +1782,7 @@ fn decode_live_attached_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyD
     }
 }
 
-fn input_contains_prefix(
+fn plain_input_requires_key_dispatch(
     bytes: &[u8],
     target: &PaneTarget,
     state: &crate::pane_terminals::HandlerState,
@@ -1776,12 +1793,24 @@ fn input_contains_prefix(
         target.session_name(),
         rmux_proto::OptionName::Prefix2,
     );
-    bytes.iter().enumerate().any(|(offset, _)| {
-        matches!(
-            decode_live_attached_key(&bytes[offset..], None),
-            AttachedKeyDecode::Matched { key, .. }
-                if matches_prefix_key(key, prefix, prefix2)
-        )
+    let table_name = default_key_table_name(state, target);
+    let mut checked_bytes = [false; 256];
+
+    bytes.iter().copied().any(|byte| {
+        let byte_index = usize::from(byte);
+        if checked_bytes[byte_index] {
+            return false;
+        }
+        checked_bytes[byte_index] = true;
+
+        let encoded = [byte];
+        let AttachedKeyDecode::Matched { key, .. } = decode_live_attached_key(&encoded, None)
+        else {
+            return true;
+        };
+        matches_prefix_key(key, prefix, prefix2)
+            || lookup_attached_key_table_binding(state, &table_name, key_code_lookup_bits(key))
+                .is_some()
     })
 }
 

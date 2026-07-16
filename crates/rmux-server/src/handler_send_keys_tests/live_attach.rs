@@ -1743,6 +1743,155 @@ async fn live_attach_control_bytes_dispatch_tmux_distinct_bindings() {
 }
 
 #[tokio::test]
+async fn live_attach_plain_fast_path_dispatches_root_binding() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("plain-fast-root-binding");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let rebound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "root".to_owned(),
+            key: "x".to_owned(),
+            note: Some("plain fast path root binding".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "send-keys".to_owned(),
+                "-l".to_owned(),
+                "R".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "plain-fast-root-binding", 1).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"x")
+        .await
+        .expect("plain root binding input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"R").await;
+}
+
+#[tokio::test]
+async fn live_attach_plain_fast_path_dispatches_custom_default_table_binding() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("plain-fast-custom-binding");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let configured = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::KeyTable,
+            value: "custom-fast".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(
+        matches!(configured, Response::SetOption(_)),
+        "{configured:?}"
+    );
+    let rebound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "custom-fast".to_owned(),
+            key: "x".to_owned(),
+            note: Some("plain fast path custom binding".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "send-keys".to_owned(),
+                "-l".to_owned(),
+                "C".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "plain-fast-custom-binding", 1).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"x")
+        .await
+        .expect("plain custom-table binding input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"C").await;
+}
+
+#[tokio::test]
+async fn live_attach_plain_fast_path_forwards_unbound_input_unchanged() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("plain-fast-unbound");
+    let requester_pid = std::process::id();
+    let input = b"plain text\r";
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "plain-fast-unbound", input.len()).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, input)
+        .await
+        .expect("unbound plain input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, input).await;
+}
+
+#[tokio::test]
+async fn live_attach_utf8_dispatches_bound_key_and_forwards_unbound_tail() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("utf8-root-binding");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let rebound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "root".to_owned(),
+            key: "é".to_owned(),
+            note: Some("utf8 root binding".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "send-keys".to_owned(),
+                "-l".to_owned(),
+                "R".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let expected = "Rλ".as_bytes();
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "utf8-root-binding", expected.len()).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, "éλ".as_bytes())
+        .await
+        .expect("utf8 bound and unbound input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
 async fn live_attach_named_key_table_dispatches_before_rerouted_plain_tail() {
     let handler = RequestHandler::new();
     let alpha = session_name("named-table-live-input");

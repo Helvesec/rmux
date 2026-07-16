@@ -413,6 +413,105 @@ mod tests {
         request
     }
 
+    fn parse_targeted_queue_request(
+        command: &str,
+        sessions: &SessionStore,
+        current_target: Target,
+    ) -> Request {
+        let parsed = CommandParser::new()
+            .parse(command)
+            .unwrap_or_else(|error| panic!("{command} should parse: {error}"));
+        assert_eq!(parsed.commands().len(), 1);
+        let invocation = parse_queue_invocation(
+            parsed.commands()[0].clone(),
+            None,
+            sessions,
+            &OptionStore::default(),
+            &TargetFindContext::from_target(current_target),
+            None,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{command} queue target should resolve: {error}"));
+        let QueueInvocation::Request(request) = invocation else {
+            panic!("{command} should produce a request, got {invocation:?}");
+        };
+        request
+    }
+
+    #[test]
+    fn queued_target_metadata_resolves_window_relative_pane_id_and_session_targets() {
+        let alpha = SessionName::new("alpha").expect("valid session name");
+        let mut sessions = SessionStore::new();
+        sessions
+            .create_session(alpha.clone(), TerminalSize { cols: 80, rows: 24 })
+            .expect("session creation succeeds");
+        let (logs_index, _) = sessions
+            .session_mut(&alpha)
+            .expect("alpha exists")
+            .create_window(TerminalSize { cols: 80, rows: 24 })
+            .expect("logs window creation succeeds");
+        assert_eq!(logs_index, 1);
+        let active_pane_index = {
+            let session = sessions.session_mut(&alpha).expect("alpha exists");
+            session
+                .rename_window(logs_index, "logs".to_owned())
+                .expect("logs window rename succeeds");
+            session
+                .split_active_pane()
+                .expect("active pane split succeeds")
+        };
+        let active_pane = PaneTarget::with_window(alpha.clone(), 0, active_pane_index);
+        let logs_pane_id = sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(logs_index))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id().to_string())
+            .expect("logs pane id exists");
+        let current = Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0));
+
+        let Request::ResizeWindow(resize) =
+            parse_targeted_queue_request("resize-window -t logs -x 91", &sessions, current.clone())
+        else {
+            panic!("resize-window should produce a resize request");
+        };
+        assert_eq!(
+            resize.target,
+            WindowTarget::with_window(alpha.clone(), logs_index)
+        );
+
+        let Request::ShowOptions(show) = parse_targeted_queue_request(
+            &format!("show-window-options -v -t {logs_pane_id} automatic-rename"),
+            &sessions,
+            current.clone(),
+        ) else {
+            panic!("show-window-options should produce a show-options request");
+        };
+        assert_eq!(
+            show.scope,
+            rmux_proto::OptionScopeSelector::Window(WindowTarget::with_window(
+                alpha.clone(),
+                logs_index,
+            ))
+        );
+
+        let Request::UnlinkWindow(unlink) =
+            parse_targeted_queue_request("unlink-window -t :+", &sessions, current.clone())
+        else {
+            panic!("unlink-window should produce an unlink request");
+        };
+        assert_eq!(
+            unlink.target,
+            WindowTarget::with_window(alpha.clone(), logs_index)
+        );
+
+        let Request::SendPrefix(send_prefix) =
+            parse_targeted_queue_request("send-prefix -talpha", &sessions, current)
+        else {
+            panic!("send-prefix should produce a send-prefix request");
+        };
+        assert_eq!(send_prefix.target, Some(active_pane));
+    }
+
     #[test]
     fn queued_select_layout_navigation_uses_existing_layout_cycle_requests() {
         let (sessions, session_name) = select_layout_sessions();

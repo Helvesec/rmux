@@ -1456,6 +1456,88 @@ fn joined_capture_merges_wrapped_rows() {
 }
 
 #[test]
+fn wide_character_prewrap_preserves_joined_capture() {
+    let mut screen = new_screen(10, 3, 10);
+    parse(&mut screen, "123456789界Z".as_bytes());
+
+    // tmux 3.7b emits the glyph on the next physical row but keeps both rows
+    // in one soft-wrapped logical line.
+    assert_eq!(
+        &screen.capture_grid(false).lines[..2],
+        &["123456789", "界Z"]
+    );
+    assert!(screen
+        .grid()
+        .visible_line(0)
+        .expect("pre-wrapped row")
+        .flags()
+        .contains(crate::grid::GridLineFlags::WRAPPED));
+    assert_eq!(screen.capture_grid(true).lines[0], "123456789界Z");
+    let joined = String::from_utf8(screen.capture_transcript(
+        full_range(),
+        GridRenderOptions {
+            join_wrapped: true,
+            ..GridRenderOptions::default()
+        },
+    ))
+    .expect("joined capture must be UTF-8");
+    assert!(joined.starts_with("123456789界Z\n"), "{joined:?}");
+}
+
+#[test]
+fn wide_character_prewrap_reflows_as_one_logical_line() {
+    let mut screen = new_screen(10, 4, 20);
+    parse(&mut screen, "123456789界Z".as_bytes());
+
+    for cols in [12, 6, 10] {
+        screen.resize(TerminalSize { cols, rows: 4 });
+        assert_no_wide_cell_fragments(&screen);
+        assert_eq!(
+            screen.capture_grid(true).lines[0],
+            "123456789界Z",
+            "pre-wrapped wide text must survive reflow at width {cols}"
+        );
+    }
+}
+
+#[test]
+fn wide_character_prewrap_respects_insert_and_no_wrap_edges() {
+    for (input, expected) in [
+        ("12345678界Z", "12345678界Z"),
+        ("123456789\x1b[4h界\x1b[4lZ", "123456789界Z"),
+    ] {
+        let mut screen = new_screen(10, 3, 10);
+        parse(&mut screen, input.as_bytes());
+
+        assert!(screen
+            .grid()
+            .visible_line(0)
+            .expect("wrapped row")
+            .flags()
+            .contains(crate::grid::GridLineFlags::WRAPPED));
+        assert_eq!(screen.capture_grid(true).lines[0], expected);
+        assert_no_wide_cell_fragments(&screen);
+    }
+
+    let mut occupied_edge = new_screen(10, 3, 10);
+    parse(&mut occupied_edge, "abcdefghij\x1b[10G界Z".as_bytes());
+    occupied_edge.resize(TerminalSize { cols: 12, rows: 3 });
+    assert_eq!(occupied_edge.capture_grid(true).lines[0], "abcdefghij界Z");
+    assert_no_wide_cell_fragments(&occupied_edge);
+
+    let mut no_wrap = new_screen(10, 2, 10);
+    parse(&mut no_wrap, "\x1b[?7l123456789界Z".as_bytes());
+    assert_eq!(no_wrap.capture_grid(false).lines[0], "123456789Z");
+    assert!(!no_wrap
+        .grid()
+        .visible_line(0)
+        .expect("unwrapped row")
+        .flags()
+        .contains(crate::grid::GridLineFlags::WRAPPED));
+    assert_no_wide_cell_fragments(&no_wrap);
+}
+
+#[test]
 fn alternate_screen_restore_preserves_wrapped_rows() {
     let mut screen = new_screen(3, 2, 10);
     parse(&mut screen, b"abcdef");

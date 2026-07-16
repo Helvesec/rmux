@@ -159,8 +159,17 @@ fn windows_attach_exit_emits_exited_banner() -> Result<(), Box<dyn Error>> {
 fn windows_full_helper_client_shell_handoff_starts_power_shell_pane_when_available(
 ) -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
-    if !pwsh_available() {
-        eprintln!("skipping full-helper shell handoff probe because pwsh.exe is unavailable");
+    let Some(system_root) = std::env::var_os("SystemRoot") else {
+        eprintln!("skipping full-helper shell handoff probe because SystemRoot is unavailable");
+        return Ok(());
+    };
+    let powershell = PathBuf::from(system_root)
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+    if !powershell.is_file() {
+        eprintln!("skipping full-helper shell handoff probe because PowerShell is unavailable");
         return Ok(());
     }
 
@@ -173,7 +182,7 @@ fn windows_full_helper_client_shell_handoff_starts_power_shell_pane_when_availab
         .arg(&label)
         .args(["new-session", "-d", "-s", "handoff"])
         .env("RMUX_INTERNAL_PUBLIC_BINARY_PATH", &binary)
-        .env("RMUX_INTERNAL_CLIENT_SHELL", "pwsh.exe")
+        .env("RMUX_INTERNAL_CLIENT_SHELL", &powershell)
         .output()?;
     assert!(
         output.status.success(),
@@ -197,7 +206,8 @@ fn windows_full_helper_client_shell_handoff_starts_power_shell_pane_when_availab
     let command_name = String::from_utf8_lossy(&current.stdout);
     let command_name = command_name.trim();
     assert!(
-        command_name.eq_ignore_ascii_case("pwsh.exe") || command_name.eq_ignore_ascii_case("pwsh"),
+        command_name.eq_ignore_ascii_case("powershell.exe")
+            || command_name.eq_ignore_ascii_case("powershell"),
         "helper shell handoff should start a PowerShell pane, got {command_name:?}"
     );
 

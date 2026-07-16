@@ -8,6 +8,8 @@
 
 mod endpoint;
 mod listener;
+#[cfg(unix)]
+mod managed_socket_unix;
 mod stream;
 #[cfg(windows)]
 mod windows_mutex;

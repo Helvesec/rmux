@@ -164,7 +164,12 @@ fn kill_server_bounds_slow_session_closed_hook_tree() -> Result<(), Box<dyn Erro
         &format!("run-shell {}", shell_quote_str(&probe.command())),
     ])?);
 
+    let shutdown_started = Instant::now();
     assert_success(&harness.run(&["kill-server"])?);
+    assert!(
+        shutdown_started.elapsed() >= Duration::from_secs(4),
+        "kill-server returned before the bounded lifecycle hook was cancelled"
+    );
     probe.wait_until_started()?;
     wait_for_daemon_exit_with_timeout(&mut daemon, SLOW_HOOK_SHUTDOWN_TIMEOUT)?;
 

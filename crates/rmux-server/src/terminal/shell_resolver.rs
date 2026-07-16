@@ -8,6 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rmux_core::OptionStore;
+#[cfg(windows)]
+use rmux_os::shell::is_usable_shell_candidate;
 use rmux_proto::{OptionName, SessionName};
 #[cfg(unix)]
 use rustix::fs::{access, Access};
@@ -149,7 +151,12 @@ fn inherited_client_shell(environment: &HashMap<String, String>) -> Option<PathB
     if shell.is_empty() {
         return None;
     }
-    Some(resolve_program_path(Path::new(shell), environment))
+    let requested = Path::new(shell);
+    let resolved = resolve_program_path(requested, environment);
+    if requested.components().count() == 1 && resolved == requested {
+        return None;
+    }
+    (resolved.is_file() && is_usable_shell_candidate(&resolved)).then_some(resolved)
 }
 
 #[cfg(windows)]
@@ -197,26 +204,6 @@ fn search_path_in_from(
         }
     }
     None
-}
-
-#[cfg(windows)]
-fn is_usable_shell_candidate(path: &Path) -> bool {
-    // `%LOCALAPPDATA%\Microsoft\WindowsApps` entries are app-execution aliases;
-    // launching them as ConPTY shells is unreliable. Packaged applications may
-    // also live under `C:\Program Files\WindowsApps\...`; those are real package
-    // executables and should remain eligible.
-    !is_windowsapps_alias_candidate(path)
-}
-
-#[cfg(windows)]
-fn is_windowsapps_alias_candidate(path: &Path) -> bool {
-    let components = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>();
-    components.windows(2).any(|window| {
-        window[0].eq_ignore_ascii_case("Microsoft") && window[1].eq_ignore_ascii_case("WindowsApps")
-    })
 }
 
 #[cfg(windows)]
@@ -506,6 +493,28 @@ mod tests {
             .to_ascii_lowercase();
 
         assert_eq!(leaf, "cmd.exe");
+    }
+
+    #[test]
+    fn alias_only_client_shell_hint_falls_back_instead_of_retaining_bare_name() {
+        let root = unique_test_dir("client-shell-alias");
+        let windows_apps = root.join("Microsoft").join("WindowsApps");
+        let cmd = root.join("cmd.exe");
+        fs::create_dir_all(&windows_apps).expect("WindowsApps test directory");
+        fs::write(windows_apps.join("pwsh.exe"), b"").expect("alias pwsh fixture");
+        fs::write(&cmd, b"").expect("cmd fixture");
+        let path = env::join_paths([windows_apps.as_os_str()]).expect("alias-only PATH");
+        let environment = HashMap::from([
+            (CLIENT_SHELL_ENV.to_owned(), "pwsh.exe".to_owned()),
+            ("PATH".to_owned(), path.to_string_lossy().into_owned()),
+            ("PATHEXT".to_owned(), ".EXE".to_owned()),
+            ("COMSPEC".to_owned(), cmd.to_string_lossy().into_owned()),
+        ]);
+
+        let resolved = resolve_shell_path(&OptionStore::new(), None, &environment);
+
+        assert_eq!(resolved, cmd);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

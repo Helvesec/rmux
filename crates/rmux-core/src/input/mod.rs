@@ -278,6 +278,10 @@ impl InputParser {
         &self.cell
     }
 
+    pub(crate) fn plain_output_forwarding_safe(&self) -> bool {
+        self.state == InputState::Ground && !self.utf8_started && self.cell == CellState::default()
+    }
+
     /// Parse a buffer of bytes, dispatching actions to the screen writer.
     pub fn parse<W: ScreenWriter + ?Sized>(&mut self, buf: &[u8], writer: &mut W) {
         let mut index = 0;

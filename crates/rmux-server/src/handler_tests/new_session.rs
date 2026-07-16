@@ -179,6 +179,65 @@ async fn duplicate_new_session_returns_the_duplicate_session_error() {
 }
 
 #[tokio::test]
+async fn failed_new_session_spawn_does_not_leak_environment_into_reused_name() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("failed-spawn-environment");
+    let sentinel = "RMUX_FAILED_SESSION_ENVIRONMENT";
+
+    let failed = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(alpha.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(DEFAULT_SESSION_SIZE),
+            environment: Some(vec![format!("{sentinel}=stale")]),
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            // Keep the spawn synchronous on Windows so this regression covers
+            // both rollback branches instead of the deferred startup path.
+            print_session_info: true,
+            print_format: None,
+            command: None,
+            process_command: Some(rmux_proto::ProcessCommand::Argv(vec![
+                "/definitely/missing/rmux-new-session-environment".to_owned(),
+            ])),
+            client_environment: None,
+            skip_environment_update: true,
+        })))
+        .await;
+
+    assert!(
+        matches!(failed, Response::Error(_)),
+        "missing executable must fail session creation, got {failed:?}"
+    );
+    {
+        let state = handler.state.lock().await;
+        assert!(state.sessions.session(&alpha).is_none());
+        assert_eq!(state.environment.session_value(&alpha, sentinel), None);
+    }
+
+    let recreated = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(DEFAULT_SESSION_SIZE),
+            environment: None,
+        }))
+        .await;
+    assert!(
+        matches!(recreated, Response::NewSession(_)),
+        "reusing the failed session name must succeed, got {recreated:?}"
+    );
+
+    let state = handler.state.lock().await;
+    assert_eq!(state.environment.session_value(&alpha, sentinel), None);
+}
+
+#[tokio::test]
 async fn attach_if_exists_reports_attach_semantics_without_new_session_hook() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

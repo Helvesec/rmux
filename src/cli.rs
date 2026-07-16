@@ -75,7 +75,7 @@ mod window_commands;
 
 use crate::cli_args::{parse, parse_with_runtime_command_groups, scan_top_level_command, Cli};
 use crate::cli_response::{expect_command_output, expect_command_success};
-use attach_transport::attach_with_connection;
+use attach_transport::{attach_with_connection, require_attach_terminal};
 use client_commands::{
     client_terminal_context_from_cli, optional_client_flags, run_control_mode, run_detach_client,
     run_list_clients, run_refresh_client, run_suspend_client, run_switch_client,

@@ -377,9 +377,24 @@ impl Harness {
         let shutdown = self.rmux().shutdown().await;
         wait_for_child_exit(self, "server did not exit during cleanup").await?;
         if let Err(error) = shutdown {
+            let peer_already_closed = matches!(
+                &error,
+                RmuxError::Transport { source, .. }
+                    if matches!(
+                        source.kind(),
+                        io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::NotFound
+                            | io::ErrorKind::UnexpectedEof
+                    )
+            );
             let rendered = error.to_string();
             assert!(
-                rendered.contains("connect to rmux daemon")
+                peer_already_closed
+                    || rendered.contains("connect to rmux daemon")
                     || rendered.contains("rmux daemon closed the transport")
                     || rendered.contains("rmux transport actor is closed")
                     || rendered.contains("Connection reset by peer"),

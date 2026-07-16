@@ -12,7 +12,7 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             Some(spec('t', Type::Window, Flags::WINDOW_INDEX)),
         )),
         "capture-pane" | "kill-pane" | "paste-buffer" | "pipe-pane" | "resize-pane"
-        | "respawn-pane" | "select-pane" | "send-keys" | "split-window" => {
+        | "respawn-pane" | "select-pane" | "send-keys" | "send-prefix" | "split-window" => {
             Some(metadata(None, Some(spec('t', Type::Pane, Flags::NONE))))
         }
         "copy-mode" => Some(metadata(
@@ -28,8 +28,10 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             Some(spec('t', Type::Pane, Flags::NONE)),
         )),
         "kill-window" | "last-pane" | "list-panes" | "next-layout" | "previous-layout"
-        | "rename-window" | "respawn-window" | "rotate-window" | "select-layout"
-        | "select-window" => Some(metadata(None, Some(spec('t', Type::Window, Flags::NONE)))),
+        | "rename-window" | "resize-window" | "respawn-window" | "rotate-window"
+        | "select-layout" | "select-window" | "unlink-window" => {
+            Some(metadata(None, Some(spec('t', Type::Window, Flags::NONE))))
+        }
         "link-window" | "move-window" => Some(metadata(
             Some(spec('s', Type::Window, Flags::NONE)),
             Some(spec('t', Type::Window, Flags::WINDOW_INDEX)),
@@ -60,7 +62,7 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             None,
             Some(spec('t', Type::Session, Flags::CANFAIL)),
         )),
-        "set-window-option" => Some(metadata(
+        "set-window-option" | "show-window-options" => Some(metadata(
             None,
             Some(spec('t', Type::Window, Flags::CANFAIL)),
         )),

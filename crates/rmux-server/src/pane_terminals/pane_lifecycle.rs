@@ -1021,7 +1021,7 @@ pub(in crate::pane_terminals) fn clone_terminal_for_exit_watcher(
     session_name: &SessionName,
     pane_id: PaneId,
 ) -> Result<rmux_pty::PtyChild, RmuxError> {
-    terminal.clone_child_for_wait().map_err(|error| {
+    terminal.clone_child_for_exit_teardown().map_err(|error| {
         RmuxError::Server(format!(
             "failed to clone pane exit watcher for pane id {} in session {}: {error}",
             pane_id.as_u32(),

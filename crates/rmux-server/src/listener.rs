@@ -134,7 +134,6 @@ pub(crate) async fn serve(
             }
             _ = &mut shutdown => {
                 debug!("shutdown requested");
-                cleanup_on_drop.cleanup_now();
                 break;
             }
             result = wait_server_signal(&server_signals), if server_signals.is_some() => {
@@ -183,6 +182,12 @@ pub(crate) async fn serve(
             }
         }
     }
+
+    // Keep the old endpoint reserved until every accepted lifecycle hook has either
+    // completed or been cancelled. Releasing it earlier lets an old hook reconnect
+    // to a new daemon generation through its inherited RMUX/TMUX environment.
+    drop(listener);
+    cleanup_on_drop.cleanup_now();
 
     Ok(())
 }

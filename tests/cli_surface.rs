@@ -5,6 +5,7 @@ mod common;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -67,10 +68,16 @@ fn assert_absent_server_error(output: &Output, harness: &CliHarness, command_nam
     );
 }
 
+fn prepare_fake_server_socket_parent(socket_path: &Path) -> io::Result<()> {
+    let Some(parent) = socket_path.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+}
+
 fn spawn_incompatible_wire_server(socket_path: &Path) -> io::Result<JoinHandle<io::Result<()>>> {
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    prepare_fake_server_socket_parent(socket_path)?;
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     let handle = thread::spawn(move || {
@@ -132,9 +139,7 @@ fn spawn_wire_v3_kill_server_after_parse_probes(
     socket_path: &Path,
     capability_probe_count: usize,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    prepare_fake_server_socket_parent(socket_path)?;
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     let handle = thread::spawn(move || {
@@ -266,9 +271,7 @@ fn spawn_alias_fallback_incompatible_wire_server(
 fn spawn_same_wire_server_without_runtime_expansion(
     socket_path: &Path,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    prepare_fake_server_socket_parent(socket_path)?;
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     Ok(thread::spawn(move || {
@@ -297,9 +300,7 @@ fn spawn_same_wire_server_without_runtime_expansion(
 fn spawn_same_wire_server_without_runtime_expansion_or_alias(
     socket_path: &Path,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    prepare_fake_server_socket_parent(socket_path)?;
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     Ok(thread::spawn(move || {
@@ -317,9 +318,7 @@ fn spawn_same_wire_server_expecting_raw_alias(
     expected_stdin: &'static str,
     response_stdout: &'static str,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    prepare_fake_server_socket_parent(socket_path)?;
     let _ = fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     Ok(thread::spawn(move || {
@@ -832,6 +831,42 @@ fn list_commands_is_client_local_and_supports_formatting() -> Result<(), Box<dyn
     assert!(stderr(&start_signature).is_empty());
 
     assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn list_commands_does_not_probe_an_existing_socket() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("list-commands-no-socket-probe")?;
+    prepare_fake_server_socket_parent(harness.socket_path())?;
+    let listener = UnixListener::bind(harness.socket_path())?;
+    listener.set_nonblocking(true)?;
+    let accept_probe = thread::spawn(move || -> io::Result<bool> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match listener.accept() {
+                Ok(_) => return Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Ok(false);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    });
+
+    let output = harness.run(&["list-commands", "new-window"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout(&output).contains("new-window"));
+    assert!(stderr(&output).is_empty());
+    assert!(
+        !accept_probe
+            .join()
+            .expect("socket accept probe should join")?,
+        "list-commands must remain local even when a socket endpoint exists"
+    );
     Ok(())
 }
 
@@ -2312,23 +2347,77 @@ fn new_session_detached_auto_starts_and_then_has_session_succeeds() -> Result<()
 }
 
 #[test]
-fn new_session_auto_start_survives_immediate_restart_after_kill_server(
+fn new_session_auto_start_waits_for_old_generation_hook_before_restart(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("new-session-restart-after-kill")?;
     let _cleanup = harness.auto_start_cleanup()?;
+    let hook_path = harness.tmpdir().join("old-generation-hook.sh");
+    let hook_started = harness.tmpdir().join("old-generation-hook.started");
+    let hook_release = harness.tmpdir().join("old-generation-hook.release");
+    let hook_finished = harness.tmpdir().join("old-generation-hook.finished");
+    // Bound the nested client so this test exercises the generation handoff
+    // without waiting for the daemon's five-second hook cancellation deadline.
+    fs::write(
+        &hook_path,
+        format!(
+            "#!/bin/sh\n\
+             printf 'started\\n' > {started}\n\
+             while [ ! -f {release} ]; do sleep 0.01; done\n\
+             tmux kill-server >/dev/null 2>&1 &\n\
+             child=$!\n\
+             sleep 0.2\n\
+             kill \"$child\" >/dev/null 2>&1 || true\n\
+             wait \"$child\" >/dev/null 2>&1 || true\n\
+             printf 'finished\\n' > {finished}\n",
+            started = shell_quote(&hook_started),
+            release = shell_quote(&hook_release),
+            finished = shell_quote(&hook_finished),
+        ),
+    )?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&hook_path)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&hook_path, permissions)?;
+    }
 
     let first = harness.run_with(&["new-session", "-d", "-s", "alpha"], |command| {
         command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
     })?;
     assert_success(&first);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "session-closed",
+        &format!("run-shell {}", shell_quote(&hook_path)),
+    ])?);
 
-    let kill = harness.run(&["kill-server"])?;
+    let mut kill_command = harness.base_command();
+    let kill_child = kill_command
+        .arg("kill-server")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    wait_for_file_contents(&hook_started, "started\n", ATTACH_TIMEOUT)?;
+
+    let endpoint_reserved = harness.socket_path().exists();
+    fs::write(&hook_release, b"release\n")?;
+
+    let kill = kill_child.wait_with_output()?;
     assert_success(&kill);
+    assert!(
+        endpoint_reserved,
+        "the old endpoint must remain reserved while an accepted shutdown hook is pending"
+    );
+    assert_eq!(fs::read_to_string(&hook_finished)?, "finished\n");
 
     let second = harness.run_with(&["new-session", "-d", "-s", "beta"], |command| {
         command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
     })?;
     assert_success(&second);
+    thread::sleep(Duration::from_secs(1));
     assert_success(&harness.run(&["has-session", "-t", "beta"])?);
     Ok(())
 }

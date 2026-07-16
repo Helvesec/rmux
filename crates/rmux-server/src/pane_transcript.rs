@@ -304,6 +304,10 @@ impl PaneTranscript {
         }
     }
 
+    pub(crate) fn plain_output_forwarding_safe(&self) -> bool {
+        self.terminal.plain_output_forwarding_safe()
+    }
+
     pub(crate) fn capture_saved(
         &self,
         range: ScreenCaptureRange,

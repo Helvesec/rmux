@@ -500,60 +500,10 @@ fn queue_compact_bare_flags(command_name: &str) -> Option<&'static str> {
 }
 
 fn queue_target_resolution_enabled(command_name: &str) -> bool {
-    matches!(
-        command_name,
-        "attach-session"
-            | "break-pane"
-            | "capture-pane"
-            | "copy-mode"
-            | "display-message"
-            | "display-menu"
-            | "display-popup"
-            | "has-session"
-            | "if-shell"
-            | "join-pane"
-            | "kill-pane"
-            | "kill-session"
-            | "kill-window"
-            | "last-pane"
-            | "last-window"
-            | "link-window"
-            | "list-panes"
-            | "list-windows"
-            | "move-pane"
-            | "move-window"
-            | "new-window"
-            | "next-layout"
-            | "next-window"
-            | "paste-buffer"
-            | "pipe-pane"
-            | "previous-layout"
-            | "previous-window"
-            | "rename-session"
-            | "rename-window"
-            | "resize-pane"
-            | "resize-window"
-            | "respawn-pane"
-            | "respawn-window"
-            | "rotate-window"
-            | "select-layout"
-            | "select-pane"
-            | "send-prefix"
-            | "select-window"
-            | "send-keys"
-            | "set-environment"
-            | "set-hook"
-            | "set-option"
-            | "set-window-option"
-            | "show-environment"
-            | "show-hooks"
-            | "show-options"
-            | "show-window-options"
-            | "split-window"
-            | "swap-pane"
-            | "swap-window"
-            | "switch-client"
-    )
+    // run-shell and source-file preserve CMD_FIND_CANFAIL through command-specific
+    // parsers; display-panes -t names a client rather than a command target.
+    command_target_metadata(command_name).is_some()
+        && !matches!(command_name, "display-panes" | "run-shell" | "source-file")
 }
 
 pub(super) struct QueueTargetFindContextInput<'a> {

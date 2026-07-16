@@ -1748,6 +1748,120 @@ async fn source_file_set_window_option_alias_uses_explicit_window_target_metadat
 }
 
 #[tokio::test]
+async fn source_file_resolves_announced_window_and_pane_target_metadata() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("metadata-alpha");
+    let beta = session_name("metadata-beta");
+    for session in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some("metadata-logs".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                direction: SplitDirection::Vertical,
+                environment: None,
+                before: false,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 1)),
+                option: OptionName::AutomaticRename,
+                value: "off".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(1))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id().to_string())
+            .expect("linked window pane id exists")
+    };
+    let root = temp_root("source-announced-target-metadata");
+    write_config(
+        &root.join("metadata.conf"),
+        &format!(
+            "resize-window -t metadata-logs -x 91 -y 23\n\
+             show-window-options -v -t {pane_id} automatic-rename\n\
+             send-prefix -t{pane_id}\n\
+             link-window -s metadata-alpha:1 -t metadata-beta:1\n\
+             unlink-window -t :+\n"
+        ),
+    );
+    let parsed = CommandParser::new()
+        .parse("source-file -t metadata-alpha:0.0 metadata.conf")
+        .expect("source-file command parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::new(Some(root.clone())),
+        )
+        .await
+        .expect("source-file target metadata should resolve");
+    assert_eq!(output.stdout(), b"off\n");
+
+    let state = handler.state.lock().await;
+    assert!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("alpha exists")
+            .window_at(1)
+            .is_none(),
+        "relative unlink-window should remove alpha's linked slot"
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .expect("beta exists")
+            .window_at(1)
+            .expect("beta linked window survives")
+            .size(),
+        TerminalSize { cols: 91, rows: 23 }
+    );
+    drop(state);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn nested_source_file_preserves_implicit_target_canfail_behavior() {
     let handler = RequestHandler::new();
     for session in [session_name("alpha"), session_name("beta")] {
@@ -2000,6 +2114,80 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
             .stdout(),
         b"yes\n"
     );
+}
+
+#[tokio::test]
+async fn source_file_new_window_k_validates_environment_before_replacing_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("source-new-window-k-env-validation");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some("protected".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    let protected_window_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.window_at(1))
+        .expect("protected window exists")
+        .id();
+
+    let root = temp_root("new-window-k-env-validation");
+    write_config(
+        &root.join("invalid.conf"),
+        "new-window -d -k -t source-new-window-k-env-validation:1 -e NOT_AN_ASSIGNMENT\n",
+    );
+    let response = handler
+        .handle(source_file_request(
+            vec!["invalid.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+    fs::remove_dir_all(root).expect("remove source-file test root");
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should report invalid environment, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert!(
+        String::from_utf8_lossy(response.stderr())
+            .contains("environment assignment must be NAME=VALUE"),
+        "{}",
+        String::from_utf8_lossy(response.stderr())
+    );
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session survives");
+    assert_eq!(session.windows().len(), 2);
+    let protected = session
+        .window_at(1)
+        .expect("invalid replacement must preserve the target window");
+    assert_eq!(protected.id(), protected_window_id);
+    assert_eq!(protected.name(), Some("protected"));
 }
 
 #[tokio::test]

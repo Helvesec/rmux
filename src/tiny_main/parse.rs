@@ -1131,41 +1131,16 @@ where
 pub(super) fn invoking_client_shell() -> Option<String> {
     let parent_pid = rmux_os::process::parent_pid(std::process::id())?;
     let parent_name = rmux_os::process::command_name(parent_pid)?;
-    windows_client_shell_for_parent_name(&parent_name)
+    let environment = crate::windows_shell::WindowsShellEnvironment::current();
+    windows_client_shell_for_parent_name(&parent_name, &environment)
 }
 
 #[cfg(windows)]
-pub(super) fn windows_client_shell_for_parent_name(parent_name: &str) -> Option<String> {
-    let lower = parent_name.to_ascii_lowercase();
-    match lower.as_str() {
-        "cmd.exe" | "cmd" => Some(
-            env::var_os("COMSPEC")
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "cmd.exe".into())
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        "powershell.exe" | "powershell" => {
-            if windows_command_available_on_path("pwsh.exe") {
-                Some("pwsh.exe".to_owned())
-            } else {
-                Some("powershell.exe".to_owned())
-            }
-        }
-        "pwsh.exe" | "pwsh" => Some("pwsh.exe".to_owned()),
-        "bash.exe" | "bash" | "sh.exe" | "sh" | "zsh.exe" | "zsh" | "nu.exe" | "nu" => {
-            Some(parent_name.to_owned())
-        }
-        _ => None,
-    }
-}
-
-#[cfg(windows)]
-fn windows_command_available_on_path(name: &str) -> bool {
-    let Some(path) = env::var_os("PATH") else {
-        return false;
-    };
-    env::split_paths(&path).any(|directory| directory.join(name).is_file())
+pub(super) fn windows_client_shell_for_parent_name(
+    parent_name: &str,
+    environment: &crate::windows_shell::WindowsShellEnvironment,
+) -> Option<String> {
+    crate::windows_shell::client_shell_for_parent_name(parent_name, environment)
 }
 
 #[cfg(not(windows))]

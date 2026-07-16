@@ -64,8 +64,8 @@ impl PaneTerminal {
     }
 
     #[cfg(windows)]
-    pub(crate) fn clone_child_for_wait(&self) -> rmux_pty::Result<PtyChild> {
-        self.child.try_clone_for_wait()
+    pub(crate) fn clone_child_for_exit_teardown(&self) -> rmux_pty::Result<PtyChild> {
+        self.child.try_clone_for_exit_teardown()
     }
 
     pub(crate) fn pid(&self) -> u32 {

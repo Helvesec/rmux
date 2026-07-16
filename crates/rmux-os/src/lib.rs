@@ -14,5 +14,7 @@ pub mod memory;
 pub mod path;
 pub mod process;
 pub mod process_tree;
+#[cfg(windows)]
+pub mod shell;
 pub mod signals;
 pub mod terminal;

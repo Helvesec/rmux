@@ -11,6 +11,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(unix)]
+use crate::managed_socket_unix::ManagedSocketDirectoryGuard;
+#[cfg(unix)]
 use crate::LocalEndpoint;
 use rmux_os::identity::UserIdentity;
 
@@ -175,6 +177,31 @@ pub fn connect_blocking(
     endpoint: &LocalEndpoint,
     timeout: Duration,
 ) -> io::Result<BlockingLocalStream> {
+    connect_blocking_with(endpoint, timeout, connect_blocking_unchecked)
+}
+
+#[cfg(unix)]
+fn connect_blocking_with<Connect>(
+    endpoint: &LocalEndpoint,
+    timeout: Duration,
+    connect: Connect,
+) -> io::Result<BlockingLocalStream>
+where
+    Connect: FnOnce(&LocalEndpoint, Duration) -> io::Result<BlockingLocalStream>,
+{
+    let directory_guard = ManagedSocketDirectoryGuard::before_connect(endpoint)?;
+    let stream = connect(endpoint, timeout)?;
+    if let Some(directory_guard) = directory_guard {
+        directory_guard.revalidate()?;
+    }
+    Ok(stream)
+}
+
+#[cfg(unix)]
+fn connect_blocking_unchecked(
+    endpoint: &LocalEndpoint,
+    timeout: Duration,
+) -> io::Result<BlockingLocalStream> {
     use rustix::net::sockopt::socket_error;
     use rustix::net::{connect as socket_connect, socket_with, AddressFamily, SocketType};
 
@@ -220,6 +247,55 @@ pub fn connect_blocking(
     let stream = BlockingLocalStream::from(socket);
     stream.set_nonblocking(false)?;
     Ok(stream)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use crate::LocalEndpoint;
+
+    static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn managed_socket_directory_is_revalidated_after_connect() {
+        let root = unique_root("post-connect");
+        let managed = root.join(format!("rmux-{}", rmux_os::identity::real_user_id()));
+        fs::create_dir_all(&managed).expect("create managed socket directory");
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o700))
+            .expect("secure managed socket directory");
+        let endpoint = LocalEndpoint::from_path(managed.join("default"));
+        let changed = managed.clone();
+
+        let error = super::connect_blocking_with(
+            &endpoint,
+            Duration::from_secs(1),
+            move |_endpoint, _timeout| {
+                fs::set_permissions(&changed, fs::Permissions::from_mode(0o755))?;
+                let (client, server) = UnixStream::pair()?;
+                drop(server);
+                Ok(client)
+            },
+        )
+        .expect_err("post-connect permission change must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let _ = fs::set_permissions(&managed, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn unique_root(label: &str) -> PathBuf {
+        let unique = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rmux-ipc-managed-socket-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -5,7 +5,9 @@ use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EXECUTABLES: [(&str, u32); 3] = [
     ("libexec/rmux/rmux", 0o701),
@@ -89,7 +91,11 @@ fn write_file(path: &Path, contents: &[u8], mode: u32) {
 }
 
 fn setup_archive(root: &TempRoot) -> PathBuf {
-    let archive = root.join("archive");
+    setup_named_archive(root, "archive")
+}
+
+fn setup_named_archive(root: &TempRoot, name: &str) -> PathBuf {
+    let archive = root.join(name);
     fs::create_dir_all(&archive).expect("create archive root");
     let source_script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/install-unix-archive.sh");
@@ -192,13 +198,7 @@ fn run_installer(
     fail_at: Option<&str>,
     signal_at: Option<&str>,
 ) -> Output {
-    let mut command = Command::new(archive.join("install.sh"));
-    command
-        .args(["--prefix"])
-        .arg(prefix)
-        .env("PATH", "/usr/bin:/bin")
-        .env_remove("RMUX_INSTALL_TEST_FAIL_AT")
-        .env_remove("RMUX_INSTALL_TEST_SIGNAL_AT");
+    let mut command = installer_command(archive, prefix);
     if let Some(checkpoint) = fail_at {
         command.env("RMUX_INSTALL_TEST_FAIL_AT", checkpoint);
     }
@@ -206,6 +206,33 @@ fn run_installer(
         command.env("RMUX_INSTALL_TEST_SIGNAL_AT", checkpoint);
     }
     command.output().expect("run Unix archive installer")
+}
+
+fn installer_command(archive: &Path, prefix: &Path) -> Command {
+    let mut command = Command::new(archive.join("install.sh"));
+    command
+        .args(["--prefix"])
+        .arg(prefix)
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("RMUX_INSTALL_TEST_LOCK_WAIT_FILE")
+        .env_remove("RMUX_INSTALL_TEST_LOCK_ACQUIRED_FILE")
+        .env_remove("RMUX_INSTALL_TEST_LOCK_RESUME_FILE")
+        .env_remove("RMUX_INSTALL_TEST_VERIFY_STARTED")
+        .env_remove("RMUX_INSTALL_TEST_VERIFY_RESUME")
+        .env_remove("RMUX_INSTALL_TEST_FAIL_AT")
+        .env_remove("RMUX_INSTALL_TEST_SIGNAL_AT");
+    command
+}
+
+fn wait_until_exists(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    path.exists()
 }
 
 fn output_details(output: &Output) -> String {
@@ -440,4 +467,170 @@ fn archive_without_assets_installs_without_transaction_residue() {
     }
     assert!(!prefix.join("share").exists());
     assert_no_transaction_residue(&prefix);
+}
+
+#[test]
+fn sigkill_after_lock_owner_is_reclaimed_by_a_clean_retry() {
+    let root = TempRoot::new("stale-lock");
+    let archive = setup_archive(&root);
+    let prefix = root.join("prefix");
+    setup_old_layout(&prefix);
+    setup_old_assets(&prefix);
+    let old = snapshot_layout(&prefix);
+    let old_assets = snapshot_old_assets(&prefix);
+    let lock_acquired = root.join("lock-acquired");
+    let never_resume = root.join("never-resume");
+
+    let mut interrupted = installer_command(&archive, &prefix)
+        .env("RMUX_INSTALL_TEST_LOCK_ACQUIRED_FILE", &lock_acquired)
+        .env("RMUX_INSTALL_TEST_LOCK_RESUME_FILE", &never_resume)
+        .spawn()
+        .expect("spawn installer held after writing lock owner");
+    if !wait_until_exists(&lock_acquired, Duration::from_secs(5)) {
+        let _ = interrupted.kill();
+        let _ = interrupted.wait();
+        panic!("installer never reported writing its lock owner");
+    }
+
+    let lock_owner = prefix.join(".rmux-install.lock/owner");
+    let owner = fs::read_to_string(&lock_owner).expect("read stale lock owner");
+    let expected_owner_pid = interrupted.id().to_string();
+    assert_eq!(
+        fs::metadata(&lock_owner)
+            .expect("stale lock owner metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "lock ownership must not be readable by other users"
+    );
+    assert_eq!(
+        owner.lines().next(),
+        Some(expected_owner_pid.as_str()),
+        "lock owner should identify the installer process"
+    );
+    interrupted.kill().expect("SIGKILL held installer");
+    let interrupted_status = interrupted.wait().expect("reap killed installer");
+    assert!(!interrupted_status.success());
+    assert_eq!(snapshot_layout(&prefix), old);
+    assert_eq!(snapshot_old_assets(&prefix), old_assets);
+    assert!(lock_owner.is_file(), "SIGKILL should leave a stale lock");
+
+    let retry = run_installer(&archive, &prefix, None, None);
+    assert!(retry.status.success(), "{}", output_details(&retry));
+    assert_new_layout(&prefix);
+}
+
+#[test]
+fn concurrent_install_waits_until_failed_rollback_is_complete() {
+    let root = TempRoot::new("concurrent-rollback");
+    let failing_archive = setup_named_archive(&root, "archive-failing");
+    let succeeding_archive = setup_named_archive(&root, "archive-succeeding");
+    let prefix = root.join("prefix");
+    setup_old_layout(&prefix);
+    setup_old_assets(&prefix);
+
+    let verify_started = root.join("verify-started");
+    let verify_resume = root.join("verify-resume");
+    let lock_waiting = root.join("lock-waiting");
+    write_file(
+        &failing_archive.join("bin/rmux"),
+        br##"#!/bin/sh
+: > "${RMUX_INSTALL_TEST_VERIFY_STARTED:?}"
+while [ ! -e "${RMUX_INSTALL_TEST_VERIFY_RESUME:?}" ]; do
+  sleep 0.01
+done
+exit 42
+"##,
+        0o755,
+    );
+
+    let (first_tx, first_rx) = mpsc::channel();
+    let first_archive = failing_archive.clone();
+    let first_prefix = prefix.clone();
+    let first_started = verify_started.clone();
+    let first_resume = verify_resume.clone();
+    let first_thread = thread::spawn(move || {
+        let output = installer_command(&first_archive, &first_prefix)
+            .env("RMUX_INSTALL_TEST_VERIFY_STARTED", first_started)
+            .env("RMUX_INSTALL_TEST_VERIFY_RESUME", first_resume)
+            .output()
+            .expect("run failing concurrent installer");
+        first_tx
+            .send(output)
+            .expect("report first installer output");
+    });
+
+    let first_reached_verify = wait_until_exists(&verify_started, Duration::from_secs(5));
+    let live_owner_before = first_reached_verify.then(|| {
+        fs::read(prefix.join(".rmux-install.lock/owner")).expect("read live installer lock owner")
+    });
+
+    let (second_tx, second_rx) = mpsc::channel();
+    let second_archive = succeeding_archive.clone();
+    let second_prefix = prefix.clone();
+    let second_waiting = lock_waiting.clone();
+    let second_thread = thread::spawn(move || {
+        let output = installer_command(&second_archive, &second_prefix)
+            .env("RMUX_INSTALL_TEST_LOCK_WAIT_FILE", second_waiting)
+            .output()
+            .expect("run succeeding concurrent installer");
+        second_tx
+            .send(output)
+            .expect("report second installer output");
+    });
+
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let mut second_early = None;
+    let mut second_waited = false;
+    while Instant::now() < wait_deadline {
+        if lock_waiting.exists() {
+            second_waited = true;
+            break;
+        }
+        match second_rx.try_recv() {
+            Ok(output) => {
+                second_early = Some(output);
+                break;
+            }
+            Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(10)),
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    if let Some(live_owner_before) = live_owner_before {
+        assert_eq!(
+            fs::read(prefix.join(".rmux-install.lock/owner"))
+                .expect("read live lock after concurrent waiter"),
+            live_owner_before,
+            "a concurrent installer must not reclaim a live owner's lock"
+        );
+    }
+
+    write_file(&verify_resume, b"resume\n", 0o600);
+    let first = first_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("failing installer should finish after release");
+    let second = second_early.unwrap_or_else(|| {
+        second_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("waiting installer should finish after rollback")
+    });
+    first_thread.join().expect("join failing installer thread");
+    second_thread
+        .join()
+        .expect("join succeeding installer thread");
+
+    assert!(
+        first_reached_verify,
+        "first installer never reached its verification barrier: {}",
+        output_details(&first)
+    );
+    assert!(
+        second_waited,
+        "second installer did not wait for the active transaction: {}",
+        output_details(&second)
+    );
+    assert!(!first.status.success(), "{}", output_details(&first));
+    assert!(second.status.success(), "{}", output_details(&second));
+    assert_new_layout(&prefix);
 }
