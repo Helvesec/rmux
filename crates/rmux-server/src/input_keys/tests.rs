@@ -1,6 +1,7 @@
 use super::{
-    decode_extended_key, decode_mouse, encode_key, encode_mouse_event, ExtendedKeyDecode,
-    ExtendedKeyFormat, MouseDecode, MouseForwardEvent,
+    decode_extended_key, decode_mouse, encode_key, encode_key_with_backspace, encode_mouse_event,
+    ExtendedKeyDecode, ExtendedKeyFormat, MouseDecode, MouseForwardEvent,
+    MAX_SGR_MOUSE_FRAME_BYTES,
 };
 use rmux_core::{
     input::mode, key_string_lookup_string, KeyCode, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_KEYPAD,
@@ -452,6 +453,20 @@ fn meta_backspace_encodes_escape_del() {
 }
 
 #[test]
+fn configured_backspace_byte_controls_plain_and_meta_backspace() {
+    let backspace = parse_key("BSpace");
+    assert_eq!(
+        encode_key_with_backspace(0, ExtendedKeyFormat::Xterm, backspace, 0x08).as_deref(),
+        Some(b"\x08".as_slice())
+    );
+    assert_eq!(
+        encode_key_with_backspace(0, ExtendedKeyFormat::Xterm, backspace | KEYC_META, 0x08,)
+            .as_deref(),
+        Some(b"\x1b\x08".as_slice())
+    );
+}
+
+#[test]
 fn mouse_decode_rejects_non_esc_start() {
     assert_eq!(decode_mouse(b"X", None), MouseDecode::Invalid);
 }
@@ -464,6 +479,21 @@ fn mouse_decode_partial_on_short_legacy() {
 #[test]
 fn mouse_decode_sgr_partial_on_incomplete() {
     assert_eq!(decode_mouse(b"\x1b[<0;1;", None), MouseDecode::Partial);
+}
+
+#[test]
+fn mouse_decode_sgr_rejects_invalid_or_missing_decimal_fields() {
+    for sequence in [
+        b"\x1b[<a".as_slice(),
+        b"\x1b[<;1;1M".as_slice(),
+        b"\x1b[<0M1;1M".as_slice(),
+    ] {
+        assert_eq!(
+            decode_mouse(sequence, None),
+            MouseDecode::Invalid,
+            "{sequence:?} must not poison retained input"
+        );
+    }
 }
 
 #[test]
@@ -536,14 +566,86 @@ fn mouse_output_requires_mouse_mode_enabled() {
 }
 
 #[test]
-fn mouse_decode_overflowing_decimal_returns_partial() {
-    // 70000 overflows u16::MAX (65535), checked_mul/checked_add returns None
-    // which makes parse_mouse_decimal return None, treated as Partial
-    let result = decode_mouse(b"\x1b[<70000;1;1M", None);
+fn mouse_decode_retains_lexically_incomplete_overflow_in_every_decimal_field() {
+    for sequence in [
+        b"\x1b[<700000".as_slice(),
+        b"\x1b[<700000;".as_slice(),
+        b"\x1b[<700000;1".as_slice(),
+        b"\x1b[<700000;1;".as_slice(),
+        b"\x1b[<1;700000".as_slice(),
+        b"\x1b[<1;700000;".as_slice(),
+        b"\x1b[<1;700000;1".as_slice(),
+        b"\x1b[<1;1;700000".as_slice(),
+    ] {
+        assert_eq!(
+            decode_mouse(sequence, None),
+            MouseDecode::Overlong,
+            "an inevitable overflow stays on the bounded control path until the frame terminates"
+        );
+    }
+}
+
+#[test]
+fn mouse_decode_discards_complete_overflow_in_every_decimal_field() {
+    for sequence in [
+        b"\x1b[<700000;1;1M".as_slice(),
+        b"\x1b[<700000;1;1m".as_slice(),
+        b"\x1b[<1;700000;1M".as_slice(),
+        b"\x1b[<1;700000;1m".as_slice(),
+        b"\x1b[<1;1;700000M".as_slice(),
+        b"\x1b[<1;1;700000m".as_slice(),
+    ] {
+        assert_eq!(
+            decode_mouse(sequence, None),
+            MouseDecode::Discard {
+                size: sequence.len()
+            },
+            "a complete impossible mouse frame is consumed without forwarding"
+        );
+    }
+
+    let frame_with_tail = b"\x1b[<700000;1;1Mtail";
     assert_eq!(
-        result,
-        MouseDecode::Partial,
-        "overflow in decimal parse returns Partial"
+        decode_mouse(frame_with_tail, None),
+        MouseDecode::Discard {
+            size: frame_with_tail.len() - b"tail".len()
+        },
+        "only the complete invalid frame is discarded so ordinary trailing input can resume"
+    );
+}
+
+#[test]
+fn mouse_decode_consumes_a_fixed_prefix_of_attacker_sized_decimal_input() {
+    let mut fragmented = b"\x1b[<".to_vec();
+    for total_len in fragmented.len() + 1..MAX_SGR_MOUSE_FRAME_BYTES {
+        fragmented.push(b'9');
+        assert_eq!(fragmented.len(), total_len);
+        assert!(
+            matches!(
+                decode_mouse(&fragmented, None),
+                MouseDecode::Partial | MouseDecode::Overlong
+            ),
+            "the bounded prefix remains retained before the syntax limit"
+        );
+    }
+
+    fragmented.push(b'9');
+    assert_eq!(fragmented.len(), MAX_SGR_MOUSE_FRAME_BYTES);
+    assert_eq!(
+        decode_mouse(&fragmented, None),
+        MouseDecode::Discard {
+            size: MAX_SGR_MOUSE_FRAME_BYTES
+        },
+        "reaching the bound consumes the dangerous control opener"
+    );
+
+    fragmented.resize(1024 * 1024, b'9');
+    assert_eq!(
+        decode_mouse(&fragmented, None),
+        MouseDecode::Discard {
+            size: fragmented.len()
+        },
+        "bounded decoding drops the malformed batch so its tail cannot become input"
     );
 }
 

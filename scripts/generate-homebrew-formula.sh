@@ -9,6 +9,7 @@ Generate the RMUX Homebrew tap formula from GitHub Release checksums.
 
 Options:
   --version <semver|vsemver>   Release version, for example 1.2.3 or v1.2.3
+  --release-tag <tag>          GitHub tag containing the assets (default: v<version>)
   --checksums <path>           SHA256SUMS file from the GitHub Release
   --output <path>              Write formula to path instead of stdout
   --repository <owner/repo>    GitHub repository (default: Helvesec/rmux)
@@ -35,6 +36,26 @@ normalize_version() {
   esac
 }
 
+normalize_release_tag() {
+  local raw tag_version rc_number
+  raw="$1"
+  case "$raw" in v*) ;; *) die "release tag must start with v: $raw" ;; esac
+  tag_version="${raw#v}"
+  case "$tag_version" in *[!0-9A-Za-z.-]*|""|*..*|.*|*.) die "invalid release tag: $raw" ;; esac
+  if [ "$tag_version" = "$version" ]; then
+    printf '%s\n' "$raw"
+    return
+  fi
+  case "$tag_version" in
+    "$version"-rc.*)
+      rc_number="${tag_version#"$version-rc."}"
+      case "$rc_number" in ''|*[!0-9]*|0|0*) die "release tag RC suffix must be -rc.N with N >= 1 and no leading zero: $raw" ;; esac
+      printf '%s\n' "$raw"
+      ;;
+    *) die "release tag $raw does not contain package version $version" ;;
+  esac
+}
+
 asset_sha256() {
   local asset hash
   asset="$1"
@@ -54,9 +75,8 @@ asset_sha256() {
 }
 
 formula() {
-  local tag base_url macos_arm macos_intel
-  tag="v$version"
-  base_url="https://github.com/$repository/releases/download/$tag"
+  local base_url macos_arm macos_intel
+  base_url="https://github.com/$repository/releases/download/$release_tag"
 
   macos_arm="rmux-$version-macos-aarch64.tar.gz"
   macos_intel="rmux-$version-macos-x86_64.tar.gz"
@@ -112,6 +132,7 @@ EOF
 }
 
 version=""
+release_tag=""
 checksums=""
 output=""
 repository="${RMUX_GITHUB_REPO:-Helvesec/rmux}"
@@ -127,6 +148,11 @@ while [ "$#" -gt 0 ]; do
     --checksums)
       [ "$#" -ge 2 ] || die "--checksums requires a value"
       checksums="$2"
+      shift 2
+      ;;
+    --release-tag)
+      [ "$#" -ge 2 ] || die "--release-tag requires a value"
+      release_tag="$2"
       shift 2
       ;;
     --output)
@@ -155,6 +181,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$version" ] || die "--version is required"
+[ -n "$release_tag" ] || release_tag="v$version"
+release_tag="$(normalize_release_tag "$release_tag")"
 [ -n "$checksums" ] || die "--checksums is required"
 [ -f "$checksums" ] || die "checksums file not found: $checksums"
 

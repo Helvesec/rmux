@@ -19,6 +19,33 @@ fn set_option_accepts_default_scope_like_tmux() {
 }
 
 #[test]
+fn set_option_unset_pane_overrides_accepts_missing_value() {
+    let cli = parse_args(&["set-option", "-U", "-t", "alpha:0.1", "@agent.state"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SetOption(args) => {
+            assert!(args.unset_pane_overrides);
+            assert!(!args.unset);
+            assert_eq!(
+                args.target
+                    .as_ref()
+                    .and_then(|target| target.exact().cloned()),
+                Some(rmux_proto::Target::Pane(
+                    rmux_proto::PaneTarget::with_window(
+                        rmux_proto::SessionName::new("alpha").unwrap(),
+                        0,
+                        1
+                    )
+                ))
+            );
+            assert_eq!(args.option, "@agent.state");
+            assert_eq!(args.value, None);
+        }
+        _ => panic!("expected SetOption command"),
+    }
+}
+
+#[test]
 fn set_option_accepts_global_and_target_for_server_scope_compatibility() {
     let cli = parse_args(&["set-option", "-gs", "-t", "alpha", "buffer-limit", "10"]).unwrap();
 
@@ -118,6 +145,46 @@ fn set_option_accepts_window_scope_and_optional_value() {
 }
 
 #[test]
+fn set_option_combined_scope_flags_use_tmux_precedence() {
+    for (flags, server, window, pane) in [
+        ("-sw", true, false, false),
+        ("-ws", true, false, false),
+        ("-sp", true, false, false),
+        ("-ps", true, false, false),
+        ("-pw", false, false, true),
+        ("-wp", false, false, true),
+    ] {
+        let cli = parse_args(&["set-option", flags, "status", "off"]).unwrap();
+
+        match cli.command.expect("parsed command") {
+            super::super::Command::SetOption(args) => {
+                assert_eq!(args.server, server, "{flags}");
+                assert_eq!(args.window, window, "{flags}");
+                assert_eq!(args.pane, pane, "{flags}");
+            }
+            _ => panic!("expected SetOption command"),
+        }
+    }
+}
+
+#[test]
+fn set_option_scope_scanner_stops_at_mid_cluster_target_value() {
+    let cli = parse_args(&["set-option", "-wtvps", "@y", "2"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SetOption(args) => {
+            assert!(!args.server);
+            assert!(args.window);
+            assert!(!args.pane);
+            assert_eq!(target_text(&args.target), "vps");
+            assert_eq!(args.option, "@y");
+            assert_eq!(args.value.as_deref(), Some("2"));
+        }
+        _ => panic!("expected SetOption command"),
+    }
+}
+
+#[test]
 fn set_option_rejects_dash_dash_before_value() {
     let error = parse_args(&["set-option", "-g", "status-left", "--", "-abc"]).unwrap_err();
     assert!(
@@ -210,6 +277,26 @@ fn show_window_options_rejects_server_only_include_inherited_flag() {
         error
             .to_string()
             .contains("command show-window-options: unknown flag -A"),
+        "{error}"
+    );
+}
+
+#[test]
+fn show_options_accepts_include_hooks_but_show_window_options_rejects_it() {
+    let cli = parse_args(&["show-options", "-gH"]).expect("show-options -H parses");
+    match cli.command.expect("parsed command") {
+        super::super::Command::ShowOptions(args) => {
+            assert!(args.global);
+            assert!(args.include_hooks);
+        }
+        _ => panic!("expected ShowOptions command"),
+    }
+
+    let error = parse_args(&["show-window-options", "-H"]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("command show-window-options: unknown flag -H"),
         "{error}"
     );
 }

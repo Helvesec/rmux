@@ -1,5 +1,9 @@
+use std::path::Path;
+
 use rmux_core::command_parser::ParsedCommand;
-use rmux_proto::{DisplayMessageRequest, Request, Response, RmuxError, Target};
+use rmux_proto::{
+    DisplayMessageRequest, Request, Response, RmuxError, SplitWindowExtRequest, Target,
+};
 
 use super::format_context_for_target_with_server_values;
 use super::pane_parse::ParsedSplitWindowCommand;
@@ -15,6 +19,10 @@ impl RequestHandler {
         mut command: ParsedSplitWindowCommand,
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
+        command.request =
+            split_window_with_caller_cwd(command.request, context.caller_cwd.as_deref());
         command.request = self
             .render_queued_split_window_command(command.request, context)
             .await?;
@@ -109,5 +117,36 @@ impl RequestHandler {
             )
             .await;
         queue_action_from_response(printed)
+    }
+}
+
+fn split_window_with_caller_cwd(request: Request, caller_cwd: Option<&Path>) -> Request {
+    let Some(caller_cwd) = caller_cwd else {
+        return request;
+    };
+
+    match request {
+        Request::SplitWindow(request) => Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
+            target: request.target,
+            direction: request.direction,
+            before: request.before,
+            environment: request.environment,
+            command: None,
+            process_command: None,
+            start_directory: Some(caller_cwd.to_path_buf()),
+            keep_alive_on_exit: None,
+            detached: false,
+            size: None,
+            preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
+        })),
+        Request::SplitWindowExt(mut request) => {
+            if request.start_directory.is_none() {
+                request.start_directory = Some(caller_cwd.to_path_buf());
+            }
+            Request::SplitWindowExt(request)
+        }
+        request => request,
     }
 }

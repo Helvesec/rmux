@@ -2,13 +2,14 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Write};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
 use rmux_core::{alternate_screen_enter_sequence, alternate_screen_exit_sequence};
+use rmux_os::process_tree::ProcessTreeChild;
 use rmux_proto::{AttachShellCommand, TerminalSize};
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{
@@ -25,8 +26,8 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
+use super::console_coordination::ATTACH_CONSOLE_IO;
 use super::shell_command::{command_from_legacy, command_from_spec};
-use super::terminal_cleanup::fallback_attach_stop_sequence;
 
 /// Result type for raw-terminal lifecycle operations.
 pub type Result<T> = std::result::Result<T, AttachError>;
@@ -173,12 +174,14 @@ impl ConsoleControlHandlerGuard {
             *state = None;
             return Err(AttachError::Io(io::Error::last_os_error()));
         }
+        CTRL_C_EVENT_ROUTER.enable();
         Ok(Self)
     }
 }
 
 impl Drop for ConsoleControlHandlerGuard {
     fn drop(&mut self) {
+        CTRL_C_EVENT_ROUTER.disable();
         if let Ok(mut state) = CTRL_HANDLER_STATE.lock() {
             *state = None;
         }
@@ -229,21 +232,124 @@ impl ConsoleRestorePoint {
     }
 
     fn restore(self) {
-        let _ = unsafe {
+        let _ = ATTACH_CONSOLE_IO.synchronized(|| unsafe {
             // SAFETY: The handle and mode were captured from a successful
             // GetConsoleMode call while entering raw mode. Restoration is best
             // effort because this may run from a console-control callback.
             SetConsoleMode(self.handle as HANDLE, self.mode)
-        };
+        });
     }
 }
 
 static CTRL_HANDLER_STATE: Mutex<Option<ConsoleModeSnapshot>> = Mutex::new(None);
-static PENDING_CTRL_C_EVENT: AtomicBool = AtomicBool::new(false);
+static CTRL_C_EVENT_ROUTER: CtrlCEventRouter = CtrlCEventRouter::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum CtrlCEventState {
+    Disabled = 0,
+    Active = 1,
+    Pending = 2,
+    Suppressed = 3,
+}
+
+#[derive(Debug)]
+struct CtrlCEventRouter {
+    state: AtomicU8,
+}
+
+impl CtrlCEventRouter {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(CtrlCEventState::Disabled as u8),
+        }
+    }
+
+    fn enable(&self) {
+        self.state
+            .store(CtrlCEventState::Active as u8, Ordering::SeqCst);
+    }
+
+    fn disable(&self) {
+        self.state
+            .store(CtrlCEventState::Disabled as u8, Ordering::SeqCst);
+    }
+
+    fn suppress(&self) {
+        self.transition_to_suppressed();
+    }
+
+    fn resume(&self) {
+        let _ = self.state.compare_exchange(
+            CtrlCEventState::Suppressed as u8,
+            CtrlCEventState::Active as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn record(&self) {
+        loop {
+            match self.state.load(Ordering::SeqCst) {
+                state if state == CtrlCEventState::Active as u8 => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            CtrlCEventState::Active as u8,
+                            CtrlCEventState::Pending as u8,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn take_pending(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CtrlCEventState::Pending as u8,
+                CtrlCEventState::Active as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn transition_to_suppressed(&self) {
+        loop {
+            let current = self.state.load(Ordering::SeqCst);
+            if matches!(
+                current,
+                state if state == CtrlCEventState::Disabled as u8
+                    || state == CtrlCEventState::Suppressed as u8
+            ) {
+                return;
+            }
+            if self
+                .state
+                .compare_exchange(
+                    current,
+                    CtrlCEventState::Suppressed as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+}
 
 unsafe extern "system" fn raw_terminal_ctrl_handler(event: u32) -> i32 {
     if event == CTRL_C_EVENT {
-        PENDING_CTRL_C_EVENT.store(true, Ordering::SeqCst);
+        CTRL_C_EVENT_ROUTER.record();
         return 1;
     }
     if should_restore_for_console_event(event) {
@@ -257,7 +363,15 @@ unsafe extern "system" fn raw_terminal_ctrl_handler(event: u32) -> i32 {
 }
 
 pub(super) fn take_pending_ctrl_c_event() -> bool {
-    PENDING_CTRL_C_EVENT.swap(false, Ordering::SeqCst)
+    CTRL_C_EVENT_ROUTER.take_pending()
+}
+
+pub(super) fn suppress_ctrl_c_input() {
+    CTRL_C_EVENT_ROUTER.suppress();
+}
+
+pub(super) fn resume_ctrl_c_input() {
+    CTRL_C_EVENT_ROUTER.resume();
 }
 
 const fn should_restore_for_console_event(event: u32) -> bool {
@@ -269,14 +383,6 @@ const fn should_restore_for_console_event(event: u32) -> bool {
             | CTRL_LOGOFF_EVENT
             | CTRL_SHUTDOWN_EVENT
     )
-}
-
-pub(super) fn restore_attach_terminal_state() -> Result<()> {
-    let mut stdout = io::stdout();
-    let term = std::env::var("TERM").unwrap_or_default();
-    stdout.write_all(&fallback_attach_stop_sequence(&term))?;
-    stdout.flush()?;
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -427,37 +533,46 @@ impl ConsoleApi for Win32Console {
     }
 
     fn get_console_mode(&self, handle: Self::Handle) -> Result<Option<u32>> {
-        let mut mode = 0;
-        let ok = unsafe {
-            // SAFETY: handle is a valid std handle and mode points to writable storage.
-            GetConsoleMode(handle, &mut mode)
-        };
-        if ok == 0 {
-            return console_mode_absent_or_error();
-        }
-        Ok(Some(mode))
+        ATTACH_CONSOLE_IO.synchronized(|| {
+            let mut mode = 0;
+            let ok = unsafe {
+                // SAFETY: handle is a valid std handle and mode points to
+                // writable storage.
+                GetConsoleMode(handle, &mut mode)
+            };
+            if ok == 0 {
+                return console_mode_absent_or_error();
+            }
+            Ok(Some(mode))
+        })?
     }
 
     fn set_console_mode(&self, handle: Self::Handle, mode: u32) -> Result<()> {
-        let ok = unsafe {
-            // SAFETY: handle is a console handle and mode is a bitmask accepted by Win32.
-            SetConsoleMode(handle, mode)
-        };
-        if ok == 0 {
-            return Err(AttachError::Io(io::Error::last_os_error()));
-        }
-        Ok(())
+        ATTACH_CONSOLE_IO.synchronized(|| {
+            let ok = unsafe {
+                // SAFETY: handle is a console handle and mode is a bitmask
+                // accepted by Win32.
+                SetConsoleMode(handle, mode)
+            };
+            if ok == 0 {
+                return Err(AttachError::Io(io::Error::last_os_error()));
+            }
+            Ok(())
+        })?
     }
 
     fn flush_console_input(&self, handle: Self::Handle) -> Result<()> {
-        let ok = unsafe {
-            // SAFETY: handle is a valid console input handle captured by ConsoleMode.
-            FlushConsoleInputBuffer(handle)
-        };
-        if ok == 0 {
-            return Err(AttachError::Io(io::Error::last_os_error()));
-        }
-        Ok(())
+        ATTACH_CONSOLE_IO.synchronized(|| {
+            let ok = unsafe {
+                // SAFETY: handle is a valid console input handle captured by
+                // ConsoleMode.
+                FlushConsoleInputBuffer(handle)
+            };
+            if ok == 0 {
+                return Err(AttachError::Io(io::Error::last_os_error()));
+            }
+            Ok(())
+        })?
     }
 }
 
@@ -557,15 +672,17 @@ pub(super) fn wait_for_key_input(handle: HANDLE, timeout_ms: u32) -> io::Result<
 }
 
 fn console_input_is_readable(handle: HANDLE) -> io::Result<bool> {
-    let mut event_count = 0;
-    let ok = unsafe {
-        // SAFETY: handle is borrowed and event_count points to writable storage.
-        GetNumberOfConsoleInputEvents(handle, &mut event_count)
-    };
-    if ok == 0 {
-        return invalid_console_input_as_readable();
-    }
-    Ok(event_count > 0)
+    ATTACH_CONSOLE_IO.synchronized(|| {
+        let mut event_count = 0;
+        let ok = unsafe {
+            // SAFETY: handle is borrowed and event_count points to writable storage.
+            GetNumberOfConsoleInputEvents(handle, &mut event_count)
+        };
+        if ok == 0 {
+            return invalid_console_input_as_readable();
+        }
+        Ok(event_count > 0)
+    })?
 }
 
 fn invalid_console_input_as_readable() -> io::Result<bool> {
@@ -630,11 +747,11 @@ fn run_shell_command(mut child: std::process::Command) -> Result<()> {
     stdout.write_all(alternate_screen_enter_sequence(&term))?;
     stdout.flush()?;
 
-    let status_result = child
+    child
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
+        .stderr(Stdio::inherit());
+    let status_result = ProcessTreeChild::spawn(&mut child).and_then(|mut child| child.wait());
 
     stdout.write_all(alternate_screen_exit_sequence(&term))?;
     stdout.flush()?;

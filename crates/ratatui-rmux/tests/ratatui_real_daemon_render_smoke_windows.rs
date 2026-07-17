@@ -217,25 +217,30 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
     }
 
     let target_dir = target_dir()?;
-    let candidate = target_dir.join("debug").join("rmux.exe");
-    if candidate.is_file() {
-        return Ok(candidate);
-    }
+    let build_target_dir = windows_cargo_build::private_target_dir(&target_dir);
+    let candidate = build_target_dir.join("debug").join("rmux.exe");
 
-    let _cargo_build_guard = windows_cargo_build::acquire()?;
-    let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .arg("build")
-        .arg("--bin")
-        .arg("rmux")
-        .arg("--locked")
-        .arg("--manifest-path")
-        .arg(workspace_root().join("Cargo.toml"))
-        .env("CARGO_TARGET_DIR", &target_dir)
-        .status()?;
-    if !status.success() {
-        return Err(
-            format!("failed to build rmux binary for ratatui Windows smoke: {status}").into(),
-        );
+    let _cargo_build_guard = windows_cargo_build::acquire(&target_dir)?;
+
+    let output = windows_cargo_build::run_cargo_build_with_lnk1104_retry(|| {
+        let mut command = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        command
+            .arg("build")
+            .arg("--bin")
+            .arg("rmux")
+            .arg("--locked")
+            .arg("--manifest-path")
+            .arg(workspace_root().join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", &build_target_dir);
+        command
+    })?;
+    windows_cargo_build::emit_command_output(&output)?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to build rmux binary for ratatui Windows smoke: {}",
+            output.status
+        )
+        .into());
     }
     if !candidate.is_file() {
         return Err(format!(
@@ -244,7 +249,10 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
         )
         .into());
     }
-    Ok(candidate)
+    Ok(windows_cargo_build::copy_binary_for_current_process(
+        &candidate,
+        &target_dir,
+    )?)
 }
 
 fn target_dir() -> TestResult<PathBuf> {

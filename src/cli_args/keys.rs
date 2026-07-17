@@ -137,11 +137,11 @@ pub(crate) struct ListKeysArgs {
     pub(crate) include_unnoted: bool,
     #[arg(short = 'N', action = ArgAction::SetTrue)]
     pub(crate) notes: bool,
-    #[arg(short = 'r', action = ArgAction::SetTrue, hide = true)]
+    #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) reversed: bool,
-    #[arg(short = 'F', hide = true)]
+    #[arg(short = 'F')]
     pub(crate) format: Option<String>,
-    #[arg(short = 'O', hide = true)]
+    #[arg(short = 'O')]
     pub(crate) sort_order: Option<String>,
     #[arg(short = 'P')]
     pub(crate) prefix: Option<String>,
@@ -153,15 +153,6 @@ pub(crate) struct ListKeysArgs {
 
 impl ListKeysArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.reversed {
-            return Err(unknown_flag_error("list-keys", "-r"));
-        }
-        if self.sort_order.is_some() {
-            return Err(unknown_flag_error("list-keys", "-O"));
-        }
-        if self.format.is_some() {
-            return Err(unknown_flag_error("list-keys", "-F"));
-        }
         Ok(self)
     }
 }
@@ -196,13 +187,6 @@ impl UnbindKeyArgs {
             "prefix".to_owned()
         }
     }
-}
-
-fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command {command_name}: unknown flag {flag}"),
-    )
 }
 
 fn parse_send_keys_wait_mode(value: &str) -> Result<SendKeysWaitMode, String> {

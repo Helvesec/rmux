@@ -1,6 +1,9 @@
-use crate::utf8::{text_width, truncate_right_to_width, truncate_to_width, Utf8Config};
+use crate::utf8::Utf8Config;
 
 use super::regex_cache::cached_regex;
+use super::styled_text::{
+    styled_text_width, truncate_styled_text_right_to_width, truncate_styled_text_to_width,
+};
 use super::FormatModifier;
 
 /// Shell quoting: backslash-escapes tmux shell special characters.
@@ -105,7 +108,35 @@ fn substitute_regex(value: &str, regex: &regex::Regex, replacement: &str) -> Str
         }
 
         let suffix = &value[offset..];
-        let Some(captures) = regex.captures(suffix) else {
+        let Some(suffix_captures) = regex.captures(suffix) else {
+            output.push_str(&value[offset..]);
+            return output;
+        };
+        let Some(suffix_match) = suffix_captures.get(0) else {
+            output.push_str(&value[offset..]);
+            return output;
+        };
+
+        if suffix_match.is_empty() {
+            let match_start = offset + suffix_match.start();
+            output.push_str(&value[offset..match_start]);
+
+            if match_start >= value.len() {
+                push_tmux_replacement(&suffix_captures, replacement, &mut output);
+                offset = value.len();
+                continue;
+            }
+            let byte = value.as_bytes()[match_start];
+            push_tmux_byte(byte, &mut output);
+            let next_offset = match_start + 1;
+            if !has_non_empty_match_at(regex, value, next_offset) {
+                push_tmux_replacement(&suffix_captures, replacement, &mut output);
+            }
+            offset = next_offset;
+            continue;
+        }
+
+        let Some(captures) = regex.captures_at(value, offset) else {
             output.push_str(suffix);
             return output;
         };
@@ -114,25 +145,9 @@ fn substitute_regex(value: &str, regex: &regex::Regex, replacement: &str) -> Str
             return output;
         };
 
-        let match_start = offset + match_.start();
-        let match_end = offset + match_.end();
+        let match_start = match_.start();
+        let match_end = match_.end();
         output.push_str(&value[offset..match_start]);
-
-        if match_.is_empty() {
-            if match_start >= value.len() {
-                push_tmux_replacement(&captures, replacement, &mut output);
-                offset = value.len();
-                continue;
-            }
-            let byte = value.as_bytes()[match_start];
-            push_tmux_byte(byte, &mut output);
-            let next_offset = match_start + 1;
-            if !has_non_empty_match_at(regex, value, next_offset) {
-                push_tmux_replacement(&captures, replacement, &mut output);
-            }
-            offset = next_offset;
-            continue;
-        }
 
         push_tmux_replacement(&captures, replacement, &mut output);
         offset = match_end;
@@ -199,18 +214,18 @@ fn push_tmux_byte(byte: u8, output: &mut String) {
 
 pub(super) fn truncate_left(s: &str, max: usize) -> String {
     let config = Utf8Config::default();
-    if text_width(s, &config) <= max {
+    if styled_text_width(s, &config) <= max {
         s.to_owned()
     } else {
-        truncate_to_width(s, max, &config)
+        truncate_styled_text_to_width(s, max, &config)
     }
 }
 
 pub(super) fn truncate_right(s: &str, max: usize) -> String {
     let config = Utf8Config::default();
-    if text_width(s, &config) <= max {
+    if styled_text_width(s, &config) <= max {
         return s.to_owned();
     }
 
-    truncate_right_to_width(s, max, &config)
+    truncate_styled_text_right_to_width(s, max, &config)
 }

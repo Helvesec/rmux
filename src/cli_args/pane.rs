@@ -452,7 +452,7 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) start_directory: Option<PathBuf>,
     #[arg(short = 'l', allow_hyphen_values = true, group = "size_spec")]
     pub(crate) size: Option<String>,
-    #[arg(short = 'p', hide = true, allow_hyphen_values = true)]
+    #[arg(short = 'p', allow_hyphen_values = true)]
     pub(crate) percentage: Option<String>,
     #[arg(short = 'F', allow_hyphen_values = true)]
     pub(crate) format: Option<String>,
@@ -462,6 +462,8 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) preserve_zoom: bool,
     #[arg(short = 'I', action = ArgAction::SetTrue)]
     pub(crate) stdin: bool,
+    #[arg(short = 'k', action = ArgAction::SetTrue)]
+    pub(crate) keep_alive_on_exit: bool,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -610,16 +612,10 @@ impl SelectLayoutArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("input")
-        .required(false)
-        .multiple(false)
-        .args(["disable_input", "enable_input"])
-))]
 pub(crate) struct LastPaneArgs {
-    #[arg(short = 'd', action = ArgAction::SetTrue, group = "input")]
+    #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) disable_input: bool,
-    #[arg(short = 'e', action = ArgAction::SetTrue, group = "input")]
+    #[arg(short = 'e', action = ArgAction::SetTrue)]
     pub(crate) enable_input: bool,
     #[arg(short = 'Z', action = ArgAction::SetTrue)]
     pub(crate) keep_zoom: bool,
@@ -729,8 +725,8 @@ pub(crate) struct SelectPaneArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct CopyModeArgs {
-    #[arg(short = 'd', action = ArgAction::SetTrue, hide = true)]
-    unsupported_page_down: bool,
+    #[arg(short = 'd', action = ArgAction::SetTrue)]
+    pub(crate) page_down: bool,
     #[arg(short = 'e', action = ArgAction::SetTrue)]
     pub(crate) exit_on_scroll: bool,
     #[arg(short = 'H', action = ArgAction::SetTrue)]
@@ -739,8 +735,8 @@ pub(crate) struct CopyModeArgs {
     pub(crate) mouse_drag_start: bool,
     #[arg(short = 'q', action = ArgAction::SetTrue)]
     pub(crate) cancel_mode: bool,
-    #[arg(short = 'S', action = ArgAction::SetTrue, hide = true)]
-    unsupported_scrollbar_scroll: bool,
+    #[arg(short = 'S', action = ArgAction::SetTrue)]
+    pub(crate) scrollbar_scroll: bool,
     #[arg(short = 's', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) source: Option<TargetSpec>,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
@@ -751,21 +747,8 @@ pub(crate) struct CopyModeArgs {
 
 impl CopyModeArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.unsupported_page_down {
-            return Err(unknown_flag_error("copy-mode", "-d"));
-        }
-        if self.unsupported_scrollbar_scroll {
-            return Err(unknown_flag_error("copy-mode", "-S"));
-        }
         Ok(self)
     }
-}
-
-fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command {command_name}: unknown flag {flag}"),
-    )
 }
 
 #[derive(Debug, Clone, Args)]
@@ -782,8 +765,8 @@ pub(crate) struct DisplayPanesArgs {
     pub(crate) duration_ms: Option<u64>,
     #[arg(short = 'N', action = ArgAction::SetTrue)]
     pub(crate) no_command: bool,
-    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
-    pub(crate) target: Option<TargetSpec>,
+    #[arg(short = 't', allow_hyphen_values = true)]
+    pub(crate) target_client: Option<String>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) template: Vec<String>,
 }
@@ -802,16 +785,14 @@ pub(crate) struct ListPanesArgs {
     pub(crate) json: bool,
     #[arg(short = 'f', allow_hyphen_values = true)]
     pub(crate) filter: Option<String>,
+    #[arg(short = 'O')]
+    pub(crate) sort_order: Option<String>,
+    #[arg(short = 'r', action = ArgAction::SetTrue)]
+    pub(crate) reversed: bool,
 }
 
 impl SplitWindowArgs {
     fn validate(self) -> Result<Self, clap::Error> {
-        if self.percentage.is_some() && self.size.is_none() {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ValueValidation,
-                "size missing",
-            ));
-        }
         Ok(self)
     }
 
@@ -824,7 +805,9 @@ impl SplitWindowArgs {
     }
 
     pub(crate) fn size_spec(&self) -> Option<String> {
-        self.size.clone()
+        self.size
+            .clone()
+            .or_else(|| self.percentage.as_ref().map(|value| format!("{value}%")))
     }
 }
 
@@ -835,13 +818,7 @@ impl SwapPaneArgs {
 }
 
 impl JoinPaneArgs {
-    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
-        if self.percentage.is_some() && self.size.is_none() {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ValueValidation,
-                format!("command {command_name}: size missing"),
-            ));
-        }
+    fn validate(self, _command_name: &'static str) -> Result<Self, clap::Error> {
         Ok(self)
     }
 
@@ -854,7 +831,9 @@ impl JoinPaneArgs {
     }
 
     pub(crate) fn size_spec(&self) -> Option<String> {
-        self.size.clone()
+        self.size
+            .clone()
+            .or_else(|| self.percentage.as_ref().map(|value| format!("{value}%")))
     }
 }
 

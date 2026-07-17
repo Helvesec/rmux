@@ -102,13 +102,17 @@ impl Session {
         Ok(())
     }
 
-    /// Opens a destination slot for link-window style insertion by shifting existing winlinks upward.
-    pub fn make_room_for_window(&mut self, window_index: u32) -> Result<(), RmuxError> {
+    /// Opens a destination slot for insertion and returns every shifted old-to-new winlink index.
+    pub fn make_room_for_window(
+        &mut self,
+        window_index: u32,
+    ) -> Result<BTreeMap<u32, u32>, RmuxError> {
         let first_gap = self.lowest_available_window_index_at_or_above(window_index)?;
         if first_gap == window_index {
-            return Ok(());
+            return Ok(BTreeMap::new());
         }
 
+        let mut index_map = BTreeMap::new();
         for source_index in (window_index..first_gap).rev() {
             let destination_index = source_index.checked_add(1).ok_or_else(|| {
                 RmuxError::Server(format!(
@@ -117,9 +121,10 @@ impl Session {
                 ))
             })?;
             let _ = self.move_window(source_index, destination_index, false, false)?;
+            index_map.insert(source_index, destination_index);
         }
 
-        Ok(())
+        Ok(index_map)
     }
 
     /// Inserts a linked copy of an existing window at the destination slot.
@@ -139,7 +144,9 @@ impl Session {
         }
 
         let removed = if kill_destination {
-            self.replace_window(window_index, window)?
+            let removed = self.replace_window(window_index, window)?;
+            let _ = self.clear_all_winlink_alert_flags(window_index);
+            removed
         } else {
             self.insert_existing_window(window_index, window)?;
             return if select_destination {

@@ -64,6 +64,10 @@ impl OptionStore {
 
         match mode {
             ShowOptionsMode::Resolved | ShowOptionsMode::ResolvedWithInheritanceMarkers => {
+                for (name, value) in self.resolved_user_values_for_show_scope(&show_scope) {
+                    lines.push(render_show_line(&name, &value, value_only));
+                }
+
                 for metadata in registry()
                     .iter()
                     .filter(|metadata| metadata.visible_in(show_scope.mask()))
@@ -76,24 +80,20 @@ impl OptionStore {
                         mode,
                     ));
                 }
-
-                for (name, value) in self.resolved_user_values_for_show_scope(&show_scope) {
-                    lines.push(render_show_line(&name, &value, value_only));
-                }
             }
             ShowOptionsMode::Explicit => {
                 if let Some(node) = self.node_for_show_scope(&show_scope) {
-                    for entry in node.entries.values() {
-                        if entry.known_option.is_some() {
-                            lines.extend(render_entry_show_lines(entry, value_only));
-                        }
-                    }
                     for entry in node
                         .entries
                         .values()
                         .filter(|entry| entry.known_option.is_none())
                     {
                         lines.extend(render_entry_show_lines(entry, value_only));
+                    }
+                    for entry in node.entries.values() {
+                        if entry.known_option.is_some() {
+                            lines.extend(render_entry_show_lines(entry, value_only));
+                        }
                     }
                 }
             }
@@ -359,6 +359,13 @@ impl OptionStore {
             return *scope;
         };
         if metadata.visible_in(scope.mask()) {
+            return *scope;
+        }
+
+        if self
+            .node_for_show_scope(scope)
+            .is_some_and(|node| node.contains(query.canonical_name(), query.index()))
+        {
             return *scope;
         }
 

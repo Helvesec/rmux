@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
@@ -60,10 +60,23 @@ pub struct OptionNotification {
 pub struct OptionMutationOutcome {
     /// The canonical option name.
     pub name: String,
+    /// The exact scope mutated by this outcome.
+    pub scope: OptionScopeSelector,
     /// The known wire option, when the option is part of the closed V1 registry.
     pub known_option: Option<OptionName>,
+    /// Exact explicit value before the mutation at the mutated scope.
+    pub old_explicit: Option<String>,
+    /// Exact explicit value after the mutation at the mutated scope.
+    pub new_explicit: Option<String>,
+    /// Whether the exact explicit value changed.
+    ///
+    /// Idempotent sets and no-op unsets return `false`; event producers should
+    /// use this bit to avoid echoing mutations that did not change pane state.
+    pub changed: bool,
     /// Side effects the server may react to.
     pub notifications: Vec<OptionNotification>,
+    /// Additional exact-scope mutations caused by this operation.
+    pub related: Vec<OptionMutationOutcome>,
 }
 
 type SessionOptions = HashMap<SessionName, OptionNode>;
@@ -131,23 +144,27 @@ impl OptionStore {
         unset: bool,
         unset_pane_overrides: bool,
     ) -> Result<OptionMutationOutcome, RmuxError> {
-        if unset_pane_overrides && !matches!(scope, OptionScopeSelector::Window(_)) {
-            return Err(RmuxError::InvalidSetOption(
-                "unset pane overrides only supports window scope".to_owned(),
-            ));
-        }
-
+        // tmux 3.7b -U (oracle-probed 2026-07-09): acts like -u at the
+        // resolved scope, and additionally clears the window's pane
+        // overrides only when that scope is a window. Plain `set -U` unsets
+        // the session copy alone; `set -pU` unsets the pane copy alone.
         let query = validate_option_name_mutation(name, &scope, mode, value.as_deref(), unset)?;
+        let unset_pane_scope = (unset_pane_overrides
+            && matches!(scope, OptionScopeSelector::Window(_)))
+        .then(|| scope.clone());
 
-        if unset_pane_overrides {
-            self.unset_window_pane_overrides(&scope, query.canonical_name());
-        }
-
-        if unset {
+        let mut outcome = if unset {
             self.unset_query(scope, &query, only_if_unset)
         } else {
             self.set_query(scope, &query, value.as_deref(), mode, only_if_unset)
-        }
+        }?;
+        let related = if let Some(scope) = unset_pane_scope {
+            self.unset_window_pane_overrides(&scope, &query)
+        } else {
+            Vec::new()
+        };
+        outcome.related.extend(related);
+        Ok(outcome)
     }
 
     /// Removes all option overrides owned by the given session.
@@ -337,6 +354,126 @@ impl OptionStore {
         self.panes.remove(target).map(OptionNode::into_known_values)
     }
 
+    /// Copies exact pane-local overrides between two aliases of one pane.
+    pub fn copy_pane_overrides(&mut self, source: &PaneTarget, target: &PaneTarget) {
+        if source == target {
+            return;
+        }
+        if let Some(source_pane) = self.panes.get(source).cloned() {
+            self.panes.insert(
+                target.clone(),
+                source_pane.with_scope(OptionScopeSelector::Pane(target.clone())),
+            );
+        } else {
+            self.panes.remove(target);
+        }
+    }
+
+    /// Rekeys pane-local overrides after pane indices change within one window.
+    pub fn remap_pane_indices(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        index_map: &BTreeMap<u32, u32>,
+    ) -> Result<(), RmuxError> {
+        if index_map.is_empty() {
+            return Ok(());
+        }
+
+        let mut remapped_panes = HashMap::with_capacity(self.panes.len());
+        for (target, values) in &self.panes {
+            let next_target =
+                remapped_pane_index_target(target, session_name, window_index, index_map);
+            if remapped_panes
+                .insert(
+                    next_target.clone(),
+                    values
+                        .clone()
+                        .with_scope(OptionScopeSelector::Pane(next_target.clone())),
+                )
+                .is_some()
+            {
+                return Err(RmuxError::Server(format!(
+                    "pane options already exist for {next_target}"
+                )));
+            }
+        }
+
+        self.panes = remapped_panes;
+        Ok(())
+    }
+
+    /// Moves exact pane-local overrides from one pane slot to another.
+    pub fn transfer_pane_overrides(&mut self, source: &PaneTarget, target: &PaneTarget) {
+        self.rekey_pane_overrides(&[(source.clone(), Some(target.clone()))])
+            .expect("single pane override transfer cannot collide");
+    }
+
+    /// Swaps exact pane-local overrides between two pane slots.
+    pub fn swap_pane_overrides(&mut self, source: &PaneTarget, target: &PaneTarget) {
+        self.rekey_pane_overrides(&[
+            (source.clone(), Some(target.clone())),
+            (target.clone(), Some(source.clone())),
+        ])
+        .expect("two-way pane override swap cannot collide");
+    }
+
+    /// Atomically rekeys or removes exact pane-local overrides.
+    pub fn rekey_pane_overrides(
+        &mut self,
+        mappings: &[(PaneTarget, Option<PaneTarget>)],
+    ) -> Result<(), RmuxError> {
+        if mappings.is_empty() {
+            return Ok(());
+        }
+
+        let mut targets = HashSet::new();
+        for (_, target) in mappings {
+            if let Some(target) = target {
+                if !targets.insert(target.clone()) {
+                    return Err(RmuxError::Server(format!(
+                        "pane options remap has duplicate destination {target}"
+                    )));
+                }
+            }
+        }
+
+        let mut removed = Vec::with_capacity(mappings.len());
+        for (source, _) in mappings {
+            if let Some(node) = self.panes.remove(source) {
+                removed.push((source.clone(), node));
+            }
+        }
+
+        for (_, target) in mappings {
+            if let Some(target) = target {
+                let _ = self.panes.remove(target);
+            }
+        }
+
+        for (source, node) in removed {
+            let Some((_, Some(target))) = mappings
+                .iter()
+                .find(|(mapped_source, _)| *mapped_source == source)
+            else {
+                continue;
+            };
+            if self
+                .panes
+                .insert(
+                    target.clone(),
+                    node.with_scope(OptionScopeSelector::Pane(target.clone())),
+                )
+                .is_some()
+            {
+                return Err(RmuxError::Server(format!(
+                    "pane options already exist for {target}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Rekeys window and pane option overrides after a session window reindex.
     pub fn remap_session_window_indices(
         &mut self,
@@ -400,7 +537,12 @@ impl OptionStore {
             && query.index().is_none()
             && value.unwrap_or_default().is_empty()
         {
-            return Ok(build_mutation_outcome(query, scope));
+            return Ok(build_mutation_outcome(
+                query,
+                scope,
+                explicit_before.clone(),
+                explicit_before,
+            ));
         }
 
         if query.is_array() {
@@ -452,7 +594,13 @@ impl OptionStore {
             );
         }
 
-        Ok(build_mutation_outcome(query, scope))
+        let explicit_after = self.explicit_value_for_scope(&scope, query);
+        Ok(build_mutation_outcome(
+            query,
+            scope,
+            explicit_before,
+            explicit_after,
+        ))
     }
 
     fn unset_query(
@@ -461,6 +609,7 @@ impl OptionStore {
         query: &OptionQuery,
         only_if_unset: bool,
     ) -> Result<OptionMutationOutcome, RmuxError> {
+        let explicit_before = self.explicit_value_for_scope(&scope, query);
         let default_entry = self.default_entry_for_scope(query, scope.clone());
         let node = self.node_for_exact_scope_mut(&scope);
         if only_if_unset && node.contains(query.canonical_name(), query.index()) {
@@ -491,21 +640,47 @@ impl OptionStore {
             node.entries.remove(query.canonical_name());
         }
 
-        Ok(build_mutation_outcome(query, scope))
+        let explicit_after = self.explicit_value_for_scope(&scope, query);
+        Ok(build_mutation_outcome(
+            query,
+            scope,
+            explicit_before,
+            explicit_after,
+        ))
     }
 
-    fn unset_window_pane_overrides(&mut self, scope: &OptionScopeSelector, name: &str) {
+    fn unset_window_pane_overrides(
+        &mut self,
+        scope: &OptionScopeSelector,
+        query: &OptionQuery,
+    ) -> Vec<OptionMutationOutcome> {
         let OptionScopeSelector::Window(target) = scope else {
-            return;
+            return Vec::new();
         };
+        let name = query.canonical_name();
+        let mut outcomes = Vec::new();
         self.panes.retain(|pane_target, node| {
             let matches_window = pane_target.session_name() == target.session_name()
                 && pane_target.window_index() == target.window_index();
             if matches_window {
+                if let Some(old_explicit) = node
+                    .entries
+                    .get(name)
+                    .and_then(|entry| entry.value(query.index()))
+                    .map(str::to_owned)
+                {
+                    outcomes.push(build_mutation_outcome(
+                        query,
+                        OptionScopeSelector::Pane(pane_target.clone()),
+                        Some(old_explicit),
+                        None,
+                    ));
+                }
                 node.entries.remove(name);
             }
             !node.is_empty()
         });
+        outcomes
     }
 }
 
@@ -575,6 +750,21 @@ fn remapped_pane_target(
         |window_index| {
             PaneTarget::with_window(session_name.clone(), window_index, target.pane_index())
         },
+    )
+}
+
+fn remapped_pane_index_target(
+    target: &PaneTarget,
+    session_name: &SessionName,
+    window_index: u32,
+    index_map: &BTreeMap<u32, u32>,
+) -> PaneTarget {
+    if target.session_name() != session_name || target.window_index() != window_index {
+        return target.clone();
+    }
+    index_map.get(&target.pane_index()).copied().map_or_else(
+        || target.clone(),
+        |pane_index| PaneTarget::with_window(session_name.clone(), window_index, pane_index),
     )
 }
 

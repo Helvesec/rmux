@@ -254,6 +254,7 @@ async fn kill_session(socket_path: &Path, name: &str) -> Result<(), Box<dyn Erro
             target: session_name(name),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -291,7 +292,8 @@ async fn register_hook_for(
     output_path: &Path,
     lifecycle: HookLifecycle,
 ) -> Result<(), Box<dyn Error>> {
-    let command = command_template.replace("{path}", &shell_quote(output_path));
+    let shell_command = command_template.replace("{path}", &shell_quote(output_path));
+    let command = format!("run-shell {}", shell_quote_str(&shell_command));
     let response = send_request(
         socket_path,
         &Request::SetHook(SetHookRequest {
@@ -336,6 +338,10 @@ fn hook_output_path(socket_path: &Path) -> std::path::PathBuf {
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn shell_quote_str(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 async fn wait_for_file_contents(path: &Path, expected: &str) -> Result<(), Box<dyn Error>> {

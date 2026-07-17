@@ -161,7 +161,7 @@ impl RequestHandler {
         };
         for (attach_pid, session_name) in attached {
             if self
-                .send_attach_control(attach_pid, AttachControl::Detach, "server-access", None)
+                .send_attach_control(attach_pid, AttachControl::Detach, "server-access")
                 .await
                 .is_ok()
             {

@@ -20,26 +20,32 @@ fn layout() -> MouseLayout {
         status: Some(StatusLineLayout {
             ranges: vec![
                 StatusRange {
+                    line: 0,
                     x: 0..=3,
                     kind: StatusRangeType::Left,
                 },
                 StatusRange {
+                    line: 0,
                     x: 4..=7,
                     kind: StatusRangeType::Right,
                 },
                 StatusRange {
+                    line: 0,
                     x: 8..=11,
                     kind: StatusRangeType::Window(9),
                 },
                 StatusRange {
+                    line: 0,
                     x: 12..=15,
                     kind: StatusRangeType::Session(4),
                 },
                 StatusRange {
+                    line: 0,
                     x: 16..=19,
                     kind: StatusRangeType::User,
                 },
                 StatusRange {
+                    line: 0,
                     x: 20..=23,
                     kind: StatusRangeType::Control(3),
                 },
@@ -85,6 +91,13 @@ fn layout() -> MouseLayout {
     }
 }
 
+#[test]
+fn status_line_count_accepts_numeric_status_values() {
+    assert_eq!(super::status_line_count(Some("on"), 10), 1);
+    assert_eq!(super::status_line_count(Some("2"), 10), 2);
+    assert_eq!(super::status_line_count(Some("5"), 3), 3);
+}
+
 fn raw(b: u16, x: u16, y: u16) -> MouseForwardEvent {
     MouseForwardEvent {
         b,
@@ -122,6 +135,31 @@ fn status_ranges_hit_left_right_window_session_user_and_control() {
 
     let control = classify_mouse_event(&mut state, &layout(), raw(0, 22, 0), now).expect("control");
     assert_eq!(control.event.location, MouseLocation::Control(3));
+}
+
+#[test]
+fn status_ranges_are_matched_on_the_clicked_status_line() {
+    let mut state = super::ClientMouseState::default();
+    let now = Instant::now();
+    let mut layout = layout();
+    layout.status_lines = 2;
+    layout.status = Some(StatusLineLayout {
+        ranges: vec![StatusRange {
+            line: 1,
+            x: 0..=3,
+            kind: StatusRangeType::Window(42),
+        }],
+    });
+
+    let first_line =
+        classify_mouse_event(&mut state, &layout, raw(0, 1, 0), now).expect("first line");
+    assert_eq!(first_line.event.location, MouseLocation::StatusDefault);
+    assert_eq!(first_line.event.window_id, None);
+
+    let second_line =
+        classify_mouse_event(&mut state, &layout, raw(0, 1, 1), now).expect("second line");
+    assert_eq!(second_line.event.location, MouseLocation::Status);
+    assert_eq!(second_line.event.window_id, Some(42));
 }
 
 #[test]
@@ -450,6 +488,195 @@ fn border_controls_win_over_plain_border_hits() {
     let event =
         classify_mouse_event(&mut state, &layout(), raw(0, 41, 5), Instant::now()).expect("border");
     assert_eq!(event.event.location, MouseLocation::Control(2));
+}
+
+#[test]
+fn border_drag_stays_routed_to_border_after_cursor_moves_into_pane() {
+    let mut state = super::ClientMouseState::default();
+    let now = Instant::now();
+    let layout = layout();
+
+    let down = classify_mouse_event(&mut state, &layout, raw(0, 41, 6), now).expect("down");
+    assert_eq!(down.event.location, MouseLocation::Border);
+    assert_eq!(
+        down.key,
+        key_string_lookup_string("MouseDown1Border").unwrap()
+    );
+
+    let first_drag = classify_mouse_event(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            b: 32,
+            lb: 0,
+            x: 39,
+            y: 6,
+            lx: 41,
+            ly: 6,
+            sgr_b: 32,
+            sgr_type: ' ',
+            ignore: false,
+        },
+        now + std::time::Duration::from_millis(5),
+    )
+    .expect("first drag");
+    assert_eq!(first_drag.event.location, MouseLocation::Border);
+    assert_eq!(first_drag.event.raw.lx, 41);
+    assert_eq!(first_drag.event.raw.ly, 6);
+    assert_eq!(
+        first_drag.key,
+        key_string_lookup_string("MouseDrag1Border").unwrap()
+    );
+
+    let later_drag = classify_mouse_event(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            b: 32,
+            lb: 0,
+            x: 38,
+            y: 6,
+            lx: 39,
+            ly: 6,
+            sgr_b: 32,
+            sgr_type: ' ',
+            ignore: false,
+        },
+        now + std::time::Duration::from_millis(10),
+    )
+    .expect("later drag");
+    assert_eq!(later_drag.event.location, MouseLocation::Border);
+    assert_eq!(later_drag.event.raw.lx, 39);
+    assert_eq!(later_drag.event.raw.ly, 6);
+    assert_eq!(
+        later_drag.key,
+        key_string_lookup_string("MouseDrag1Border").unwrap()
+    );
+
+    let release = classify_mouse_event(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            b: 3,
+            lb: 0,
+            x: 38,
+            y: 6,
+            lx: 38,
+            ly: 6,
+            sgr_b: 0,
+            sgr_type: 'm',
+            ignore: false,
+        },
+        now + std::time::Duration::from_millis(15),
+    )
+    .expect("release");
+    assert_eq!(release.event.location, MouseLocation::Border);
+    assert_eq!(
+        release.key,
+        key_string_lookup_string("MouseDragEnd1Border").unwrap()
+    );
+    assert_eq!(state.drag_flag, 0);
+    assert!(state.drag_start_event.is_none());
+}
+
+#[test]
+fn pane_drag_crossing_border_stays_routed_to_press_pane() {
+    let mut state = super::ClientMouseState::default();
+    let now = Instant::now();
+    let mut layout = layout();
+    layout.panes[0].scrollbar = None;
+
+    let down = classify_mouse_event(&mut state, &layout, raw(0, 39, 6), now).expect("down");
+    assert_eq!(down.event.location, MouseLocation::Pane);
+    assert_eq!(
+        down.key,
+        key_string_lookup_string("MouseDown1Pane").unwrap()
+    );
+
+    let drag = classify_mouse_event(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            b: 32,
+            lb: 0,
+            x: 42,
+            y: 6,
+            lx: 39,
+            ly: 6,
+            sgr_b: 32,
+            sgr_type: ' ',
+            ignore: false,
+        },
+        now + std::time::Duration::from_millis(5),
+    )
+    .expect("drag");
+    assert_eq!(drag.event.location, MouseLocation::Pane);
+    assert_eq!(drag.event.pane_id, Some(PaneId::new(0)));
+    assert_eq!(drag.event.pane_target, Some(pane_target(0)));
+    assert_eq!(drag.event.raw.x, 42);
+    assert_eq!(drag.event.raw.y, 6);
+    assert_eq!(
+        drag.key,
+        key_string_lookup_string("MouseDrag1Pane").unwrap()
+    );
+
+    let release = classify_mouse_event(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            b: 3,
+            lb: 0,
+            x: 42,
+            y: 6,
+            lx: 42,
+            ly: 6,
+            sgr_b: 0,
+            sgr_type: 'm',
+            ignore: false,
+        },
+        now + std::time::Duration::from_millis(10),
+    )
+    .expect("release");
+    assert_eq!(release.event.location, MouseLocation::Pane);
+    assert_eq!(release.event.pane_id, Some(PaneId::new(0)));
+    assert_eq!(
+        release.key,
+        key_string_lookup_string("MouseDragEnd1Pane").unwrap()
+    );
+}
+
+#[test]
+fn adjacent_pane_down_moving_away_from_border_stays_pane_drag() {
+    let mut state = super::ClientMouseState::default();
+    let now = Instant::now();
+    let mut layout = layout();
+    layout.panes[0].scrollbar = None;
+
+    let down = classify_mouse_event(&mut state, &layout, raw(0, 39, 6), now).expect("down");
+    assert_eq!(down.event.location, MouseLocation::Pane);
+
+    let drag = classify_mouse_event(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            b: 32,
+            lb: 0,
+            x: 37,
+            y: 6,
+            lx: 39,
+            ly: 6,
+            sgr_b: 32,
+            sgr_type: ' ',
+            ignore: false,
+        },
+        now + std::time::Duration::from_millis(5),
+    )
+    .expect("drag");
+    assert_eq!(drag.event.location, MouseLocation::Pane);
+    assert_eq!(
+        drag.key,
+        key_string_lookup_string("MouseDrag1Pane").unwrap()
+    );
 }
 
 #[test]

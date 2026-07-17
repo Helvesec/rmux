@@ -104,6 +104,54 @@ async fn parsed_queue_split_window_applies_stateful_compat_flags() {
 }
 
 #[tokio::test]
+async fn parsed_queue_split_window_keep_flag_retains_exited_pane() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("split-keep");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse("split-window -dk -t split-keep:0.0 'exit 7'")
+        .expect("split-window -k parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("split-window -k executes");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (pane_id, dead) = {
+            let state = handler.state.lock().await;
+            let pane_id = state
+                .sessions
+                .session(&alpha)
+                .and_then(|session| session.window_at(0))
+                .and_then(|window| window.pane(1))
+                .map(|pane| pane.id());
+            let dead = pane_id.map(|pane_id| state.pane_is_dead(&alpha, pane_id));
+            (pane_id, dead)
+        };
+        if dead == Some(true) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "split-window -k did not retain a dead pane; pane_id={pane_id:?}, dead={dead:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
 async fn parsed_queue_split_window_direction_flags_follow_tmux_priority() {
     let handler = RequestHandler::new();
     let alpha = session_name("split-priority");

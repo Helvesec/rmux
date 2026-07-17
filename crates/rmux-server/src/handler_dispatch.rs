@@ -1,12 +1,14 @@
 use rmux_proto::request::Request;
-#[cfg(all(any(unix, windows), feature = "web"))]
-use rmux_proto::CAPABILITY_WEB_SHARE;
 use rmux_proto::{
-    ControlModeResponse, ErrorResponse, HandshakeResponse, Response, RmuxError,
-    SUPPORTED_CAPABILITIES,
+    capabilities_for_features, ControlModeResponse, ErrorResponse, HandshakeResponse, Response,
+    RmuxError,
 };
+#[cfg(all(test, any(unix, windows), feature = "web"))]
+use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use tokio::sync::broadcast;
+#[cfg(all(test, any(unix, windows), feature = "web"))]
+use tokio::sync::Notify;
 #[cfg(test)]
 use tracing::warn;
 
@@ -15,6 +17,44 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::HandleOutcome;
 
 use super::{client_environment_snapshot, effective_client_terminal_context, RequestHandler};
+
+#[cfg(all(test, any(unix, windows), feature = "web"))]
+#[derive(Debug, Default)]
+pub(crate) struct WebShareDeliveryPause {
+    reached: Notify,
+    release: Notify,
+}
+
+#[cfg(all(test, any(unix, windows), feature = "web"))]
+impl WebShareDeliveryPause {
+    pub(crate) async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(all(test, any(unix, windows), feature = "web"))]
+static WEB_SHARE_DELIVERY_PAUSES: Mutex<Vec<(usize, Arc<WebShareDeliveryPause>)>> =
+    Mutex::new(Vec::new());
+
+#[cfg(all(test, any(unix, windows), feature = "web"))]
+async fn pause_after_web_share_rollback_is_armed(handler: &RequestHandler) {
+    let handler_key = std::ptr::from_ref(handler).addr();
+    let pause = {
+        let mut pauses = WEB_SHARE_DELIVERY_PAUSES
+            .lock()
+            .expect("web-share delivery pause lock");
+        let position = pauses.iter().position(|(key, _)| *key == handler_key);
+        position.map(|position| pauses.swap_remove(position).1)
+    };
+    if let Some(pause) = pause {
+        pause.reached.notify_one();
+        pause.release.notified().await;
+    }
+}
 
 impl RequestHandler {
     #[cfg(test)]
@@ -58,6 +98,42 @@ impl RequestHandler {
         let (outcome, inline_hooks) = self
             .dispatch_captured(requester_pid, connection_id, request)
             .await;
+        self.run_dispatched_hooks(requester_pid, &request_for_hooks, &outcome, inline_hooks)
+            .await;
+        outcome
+    }
+
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    pub(crate) async fn dispatch_for_connection_with_web_share_guard(
+        &self,
+        requester_pid: u32,
+        connection_id: u64,
+        request: Request,
+    ) -> (HandleOutcome, Option<super::UndeliveredWebShareGuard>) {
+        let request_for_hooks = request.clone();
+        let (outcome, inline_hooks) = self
+            .dispatch_captured(requester_pid, connection_id, request)
+            .await;
+        // The connection loop may cancel this future while a hook is waiting.
+        // Arm rollback before those awaits and transfer it to the response writer.
+        let undelivered_web_share =
+            super::UndeliveredWebShareGuard::for_response(self, &outcome.response);
+        #[cfg(test)]
+        if undelivered_web_share.is_some() {
+            pause_after_web_share_rollback_is_armed(self).await;
+        }
+        self.run_dispatched_hooks(requester_pid, &request_for_hooks, &outcome, inline_hooks)
+            .await;
+        (outcome, undelivered_web_share)
+    }
+
+    async fn run_dispatched_hooks(
+        &self,
+        requester_pid: u32,
+        request: &Request,
+        outcome: &HandleOutcome,
+        inline_hooks: Vec<PendingInlineHook>,
+    ) {
         let inline_hook_names = inline_hooks
             .iter()
             .map(|pending| pending.hook)
@@ -66,13 +142,25 @@ impl RequestHandler {
             .await;
         self.run_request_hooks(
             requester_pid,
-            &request_for_hooks,
+            request,
             &outcome.response,
             None,
             &inline_hook_names,
         )
         .await;
-        outcome
+    }
+
+    #[cfg(all(test, any(unix, windows), feature = "web"))]
+    pub(crate) fn install_web_share_delivery_pause(&self) -> Arc<WebShareDeliveryPause> {
+        let handler_key = std::ptr::from_ref(self).addr();
+        let pause = Arc::new(WebShareDeliveryPause::default());
+        let mut pauses = WEB_SHARE_DELIVERY_PAUSES
+            .lock()
+            .expect("web-share delivery pause lock");
+        let previous = pauses.iter().any(|(key, _)| *key == handler_key);
+        assert!(!previous, "web-share delivery pause already installed");
+        pauses.push((handler_key, Arc::clone(&pause)));
+        pause
     }
 
     #[async_recursion::async_recursion]
@@ -115,8 +203,8 @@ impl RequestHandler {
         client_name: Option<String>,
     ) -> HandleOutcome {
         match (request, client_name) {
-            (Request::RunShell(request), Some(client_name)) => HandleOutcome::response(
-                self.handle_run_shell_with_client_name(requester_pid, *request, Some(client_name))
+            (Request::RunShell(request), client_name) => HandleOutcome::response(
+                self.handle_run_shell_with_client_name(requester_pid, *request, client_name)
                     .await,
             ),
             (Request::IfShell(request), Some(client_name)) => HandleOutcome::response(
@@ -157,15 +245,19 @@ impl RequestHandler {
             return HandleOutcome::response(response);
         }
         if let Request::DaemonStatus(_request) = request {
-            return HandleOutcome::response(self.handle_daemon_status(connection_id).await);
+            return HandleOutcome::response(
+                self.handle_daemon_status(requester_pid, connection_id)
+                    .await,
+            );
         }
 
         #[cfg(windows)]
         self.wait_for_windows_deferred_request(&request).await;
 
+        let refresh_hook_identities = request_changes_hook_identity_aliases(&request);
         let command_name = request.command_name().to_owned();
         #[allow(unreachable_patterns)]
-        match request {
+        let outcome = match request {
             Request::NewSession(request) => {
                 HandleOutcome::response(self.handle_new_session(requester_pid, request).await)
             }
@@ -193,9 +285,10 @@ impl RequestHandler {
             Request::KillWindow(request) => {
                 HandleOutcome::response(self.handle_kill_window(request).await)
             }
-            Request::SelectWindow(request) => {
-                HandleOutcome::response(self.handle_select_window(request).await)
-            }
+            Request::SelectWindow(request) => HandleOutcome::response(
+                self.handle_select_window(Some(requester_pid), request)
+                    .await,
+            ),
             Request::RenameWindow(request) => {
                 HandleOutcome::response(self.handle_rename_window(request).await)
             }
@@ -209,7 +302,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_last_window(request).await)
             }
             Request::ListWindows(request) => {
-                HandleOutcome::response(self.handle_list_windows(request).await)
+                HandleOutcome::response(self.handle_list_windows(*request).await)
             }
             Request::LinkWindow(request) => {
                 HandleOutcome::response(self.handle_link_window(request).await)
@@ -237,6 +330,10 @@ impl RequestHandler {
             }
             Request::SplitWindowTargetAction(request) => HandleOutcome::response(
                 self.handle_split_window_target_action(requester_pid, *request)
+                    .await,
+            ),
+            Request::SplitWindowIdentity(request) => HandleOutcome::response(
+                self.handle_split_window_identity(requester_pid, *request)
                     .await,
             ),
             Request::SwapPane(request) => {
@@ -307,10 +404,10 @@ impl RequestHandler {
                     .await,
             ),
             Request::DisplayPanes(request) => {
-                HandleOutcome::response(self.handle_display_panes(request).await)
+                HandleOutcome::response(self.handle_display_panes(requester_pid, *request).await)
             }
             Request::ListPanes(request) => {
-                HandleOutcome::response(self.handle_list_panes(request).await)
+                HandleOutcome::response(self.handle_list_panes(*request).await)
             }
             Request::SelectPane(request) => {
                 HandleOutcome::response(self.handle_select_pane(*request).await)
@@ -338,6 +435,26 @@ impl RequestHandler {
             ),
             Request::PaneBroadcastInput(request) => {
                 HandleOutcome::response(self.handle_pane_broadcast_input(request).await)
+            }
+            Request::PaneOptionSet(request) => {
+                HandleOutcome::response(self.handle_pane_option_set(request).await)
+            }
+            Request::PaneOptionGet(request) => {
+                HandleOutcome::response(self.handle_pane_option_get(request).await)
+            }
+            Request::SubscribePaneState(request) => HandleOutcome::response(
+                self.handle_subscribe_pane_state(connection_id, request)
+                    .await,
+            ),
+            Request::PaneStateCursor(request) => {
+                HandleOutcome::response(self.handle_pane_state_cursor(connection_id, request).await)
+            }
+            Request::UnsubscribePaneState(request) => HandleOutcome::response(
+                self.handle_unsubscribe_pane_state(connection_id, request)
+                    .await,
+            ),
+            Request::PaneForegroundState(request) => {
+                HandleOutcome::response(self.handle_pane_foreground_state(request).await)
             }
             Request::BindKey(request) => {
                 HandleOutcome::response(self.handle_bind_key(*request).await)
@@ -391,7 +508,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_list_sessions(request).await)
             }
             Request::SetBuffer(request) => {
-                HandleOutcome::response(self.handle_set_buffer(requester_pid, request).await)
+                HandleOutcome::response(self.handle_set_buffer(requester_pid, *request).await)
             }
             Request::ShowBuffer(request) => {
                 HandleOutcome::response(self.handle_show_buffer(request).await)
@@ -406,7 +523,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_delete_buffer(request).await)
             }
             Request::LoadBuffer(request) => {
-                HandleOutcome::response(self.handle_load_buffer(requester_pid, request).await)
+                HandleOutcome::response(self.handle_load_buffer(requester_pid, *request).await)
             }
             Request::SaveBuffer(request) => {
                 HandleOutcome::response(self.handle_save_buffer(request).await)
@@ -526,6 +643,7 @@ impl RequestHandler {
                     crate::control::ControlModeUpgrade {
                         mode: request.mode,
                         terminal_context,
+                        initial_command_count: request.initial_command_count,
                     },
                 )
             }
@@ -555,16 +673,98 @@ impl RequestHandler {
                     "{command_name} is only available through queued command dispatch"
                 )),
             })),
+        };
+        if refresh_hook_identities {
+            let mut state = self.state.lock().await;
+            super::prune_dead_hook_identities(&mut state);
         }
+        outcome
     }
+}
+
+fn request_changes_hook_identity_aliases(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::NewSession(_)
+            | Request::NewSessionExt(_)
+            | Request::KillSession(_)
+            | Request::RenameSession(_)
+            | Request::NewWindow(_)
+            | Request::KillWindow(_)
+            | Request::LinkWindow(_)
+            | Request::MoveWindow(_)
+            | Request::SwapWindow(_)
+            | Request::RotateWindow(_)
+            | Request::RespawnWindow(_)
+            | Request::SplitWindow(_)
+            | Request::SplitWindowExt(_)
+            | Request::SplitWindowTargetAction(_)
+            | Request::SplitWindowIdentity(_)
+            | Request::SwapPane(_)
+            | Request::JoinPane(_)
+            | Request::MovePane(_)
+            | Request::BreakPane(_)
+            | Request::RespawnPane(_)
+            | Request::KillPane(_)
+            | Request::PaneKill(_)
+            | Request::PaneRespawn(_)
+            | Request::UnlinkWindow(_)
+    )
 }
 
 #[cfg(windows)]
 impl RequestHandler {
     async fn wait_for_windows_deferred_request(&self, request: &Request) {
-        if request_waits_for_windows_deferred_panes(request) {
-            self.wait_for_windows_deferred_all_pane_pids().await;
+        if !request_waits_for_windows_deferred_panes(request) {
+            return;
         }
+        // Scope the wait to the request's own target so a still-starting pane in
+        // an unrelated session cannot block a targeted command — e.g. a
+        // select-pane on session alpha must not wait on session beta's deferred
+        // pane. Commands without a single determinable target keep the
+        // conservative wait across every session.
+        match request_deferred_wait_target(request) {
+            Some(target) => {
+                self.wait_for_windows_deferred_target_pane_pids(&target)
+                    .await
+            }
+            None => self.wait_for_windows_deferred_all_pane_pids().await,
+        }
+    }
+}
+
+// Single-pane commands whose deferred-pane wait can be scoped to just their
+// target pane's session. Commands that reference a second location (move-pane,
+// swap-pane) keep the conservative all-session wait so a still-starting
+// destination is not skipped.
+#[cfg(windows)]
+fn request_deferred_wait_target(request: &Request) -> Option<rmux_proto::Target> {
+    use rmux_proto::{PaneTargetRef, Target};
+    fn scope_from_ref(target: &PaneTargetRef) -> Target {
+        match target {
+            PaneTargetRef::Slot(pane) => Target::Pane(pane.clone()),
+            // The id-typed API cannot resolve `pane_id -> (window_index,
+            // pane_index)` without taking the state lock, so scope the wait
+            // to the pane's session — still much better than the all-session
+            // fallback the SDK path used before.
+            PaneTargetRef::Id { session_name, .. } => Target::Session(session_name.clone()),
+        }
+    }
+    match request {
+        Request::SelectPane(request) => Some(Target::Pane(request.target.clone())),
+        Request::SelectPaneAdjacent(request) => Some(Target::Pane(request.target.clone())),
+        Request::SelectPaneMark(request) => Some(Target::Pane(request.target.clone())),
+        Request::LastPane(request) => Some(Target::Window(request.target.clone())),
+        Request::ResizePane(request) => Some(Target::Pane(request.target.clone())),
+        // Request::ResizePaneTargetAction accepts an optional raw -t string;
+        // the parser hasn't resolved the requester's current pane at this
+        // layer, so keep the conservative wait to stay safe against a
+        // still-starting sibling.
+        Request::PaneResize(request) => Some(scope_from_ref(&request.target)),
+        Request::PaneSelect(request) => Some(scope_from_ref(&request.target)),
+        Request::PipePane(request) => Some(Target::Pane(request.target.clone())),
+        Request::PasteBuffer(request) => Some(Target::Pane(request.target.clone())),
+        _ => None,
     }
 }
 
@@ -586,7 +786,17 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::KillServer(_)
             | Request::ShutdownIfIdle(_)
             | Request::KillPane(_)
+            | Request::PaneKill(_)
             | Request::RespawnPane(_)
+            | Request::PaneRespawn(_)
+            | Request::SelectPane(_)
+            | Request::SelectPaneAdjacent(_)
+            | Request::SelectPaneMark(_)
+            | Request::LastPane(_)
+            | Request::SelectWindow(_)
+            | Request::NextWindow(_)
+            | Request::PreviousWindow(_)
+            | Request::LastWindow(_)
             | Request::LockServer(_)
             | Request::LockSession(_)
             | Request::LockClient(_)
@@ -615,11 +825,16 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::SaveBuffer(_)
             | Request::CapturePane(_)
             | Request::CapturePaneTargetAction(_)
+            | Request::PaneOptionGet(_)
             | Request::PaneSnapshot(_)
             | Request::SubscribePaneOutput(_)
             | Request::SubscribePaneOutputRef(_)
             | Request::UnsubscribePaneOutput(_)
             | Request::PaneOutputCursor(_)
+            | Request::SubscribePaneState(_)
+            | Request::PaneStateCursor(_)
+            | Request::UnsubscribePaneState(_)
+            | Request::PaneForegroundState(_)
             | Request::SdkWaitForOutput(_)
             | Request::SdkWaitForOutputRef(_)
             | Request::CancelSdkWait(_)
@@ -648,25 +863,22 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
 }
 
 fn supported_capabilities() -> Vec<&'static str> {
-    #[cfg(all(any(unix, windows), feature = "web"))]
-    {
-        let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
-        capabilities.push(CAPABILITY_WEB_SHARE);
-        capabilities
-    }
-    #[cfg(not(all(any(unix, windows), feature = "web")))]
-    {
-        SUPPORTED_CAPABILITIES.to_vec()
-    }
+    capabilities_for_features(cfg!(all(any(unix, windows), feature = "web")))
 }
 
 #[cfg(all(test, windows))]
 mod windows_deferred_wait_tests {
+    use rmux_core::PaneId;
     use rmux_proto::request::{
-        KillPaneRequest, NewWindowRequest, Request, RespawnPaneRequest, SplitWindowExtRequest,
-        SplitWindowTargetActionRequest,
+        KillPaneRequest, LastPaneRequest, LastWindowRequest, NewWindowRequest, NextWindowRequest,
+        PaneKillRequest, PaneRespawnRequest, PreviousWindowRequest, Request, RespawnPaneRequest,
+        SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
+        SelectWindowRequest, SplitWindowExtRequest, SplitWindowTargetActionRequest,
     };
-    use rmux_proto::{PaneTarget, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget};
+    use rmux_proto::{
+        PaneTarget, PaneTargetRef, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget,
+        WindowTarget,
+    };
 
     use super::request_waits_for_windows_deferred_panes;
 
@@ -742,6 +954,33 @@ mod windows_deferred_wait_tests {
         }))
     }
 
+    fn pane_kill_by_id() -> Request {
+        Request::PaneKill(PaneKillRequest {
+            target: PaneTargetRef::by_id(session_name("bench"), PaneId::new(7)),
+            kill_all_except: false,
+        })
+    }
+
+    fn pane_respawn_by_id() -> Request {
+        Request::PaneRespawn(Box::new(PaneRespawnRequest {
+            target: PaneTargetRef::by_id(session_name("bench"), PaneId::new(7)),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: Some(ProcessCommand::Shell("exit 0".to_owned())),
+            keep_alive_on_exit: None,
+        }))
+    }
+
+    fn pane_target() -> PaneTarget {
+        PaneTarget::with_window(session_name("bench"), 0, 0)
+    }
+
+    fn window_target() -> WindowTarget {
+        WindowTarget::with_window(session_name("bench"), 0)
+    }
+
     #[test]
     fn detached_new_window_does_not_wait_for_windows_deferred_panes() {
         assert!(!request_waits_for_windows_deferred_panes(&new_window(true)));
@@ -751,6 +990,60 @@ mod windows_deferred_wait_tests {
     fn final_pane_lifecycle_mutations_do_not_wait_for_deferred_initial_spawn() {
         assert!(!request_waits_for_windows_deferred_panes(&kill_pane()));
         assert!(!request_waits_for_windows_deferred_panes(&respawn_pane()));
+        assert!(!request_waits_for_windows_deferred_panes(&pane_kill_by_id()));
+        assert!(!request_waits_for_windows_deferred_panes(
+            &pane_respawn_by_id()
+        ));
+    }
+
+    #[test]
+    fn pane_and_window_selection_never_wait_for_unrelated_deferred_panes() {
+        let selection_requests = [
+            Request::SelectPane(Box::new(SelectPaneRequest {
+                target: pane_target(),
+                title: None,
+                input_disabled: None,
+                preserve_zoom: false,
+                style: None,
+            })),
+            Request::SelectPaneAdjacent(SelectPaneAdjacentRequest {
+                target: pane_target(),
+                direction: SelectPaneDirection::Right,
+                preserve_zoom: false,
+            }),
+            Request::SelectPaneMark(SelectPaneMarkRequest {
+                target: pane_target(),
+                clear: false,
+                title: None,
+            }),
+            Request::LastPane(LastPaneRequest {
+                target: window_target(),
+                preserve_zoom: false,
+                input_disabled: None,
+            }),
+            Request::SelectWindow(SelectWindowRequest {
+                target: window_target(),
+            }),
+            Request::NextWindow(NextWindowRequest {
+                target: session_name("bench"),
+                alerts_only: false,
+            }),
+            Request::PreviousWindow(PreviousWindowRequest {
+                target: session_name("bench"),
+                alerts_only: false,
+            }),
+            Request::LastWindow(LastWindowRequest {
+                target: session_name("bench"),
+            }),
+        ];
+
+        for request in selection_requests {
+            assert!(
+                !request_waits_for_windows_deferred_panes(&request),
+                "{} must not wait for unrelated deferred panes",
+                request.command_name()
+            );
+        }
     }
 
     #[test]

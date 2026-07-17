@@ -1,0 +1,4 @@
+repository = "https://github.com/gpakosz/.tmux"
+commit = "af33f07134b76134acca9d01eacbdecca9c9cda6"
+files = [".tmux.conf", "LICENSE.MIT", "LICENSE.WTFPLv2"]
+licenses = ["MIT", "WTFPL-2.0"]

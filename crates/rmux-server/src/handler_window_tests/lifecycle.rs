@@ -41,6 +41,40 @@ async fn new_window_detached_leaves_the_active_window_unchanged() {
 }
 
 #[tokio::test]
+async fn kill_window_removes_latest_client_state_for_removed_window() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("latest-kill-window");
+    let requester_pid = std::process::id();
+    create_session(&handler, "latest-kill-window").await;
+    insert_window(&handler, &alpha, 1).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    {
+        let mut active_attach = handler.active_attach.lock().await;
+        active_attach.seed_active_client_for_window(requester_pid, &alpha, 1);
+    }
+
+    let response = handler
+        .handle(Request::KillWindow(KillWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 1),
+            kill_all_others: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
+
+    let active_attach = handler.active_attach.lock().await;
+    let windows = active_attach
+        .active_client_by_window
+        .get(&alpha)
+        .expect("remaining window latest state survives");
+    assert_eq!(windows.get(&0), Some(&requester_pid));
+    assert_eq!(windows.get(&1), None);
+}
+
+#[tokio::test]
 async fn named_new_window_disables_automatic_rename_option() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-named-new-window");
@@ -528,6 +562,9 @@ async fn new_window_does_not_mutate_the_session_when_existing_terminals_are_miss
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, "alpha").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(alpha.clone(), 0, 0))
+        .await;
 
     let removed_pane_id = {
         let mut state = handler.state.lock().await;

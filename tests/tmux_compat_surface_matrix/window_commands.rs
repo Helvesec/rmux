@@ -9,9 +9,11 @@ fn tmux_compat_new_window_start_directory_when_frozen_tmux_is_available(
     };
     let config = tmux_compat_config();
     let expected_overrides = default_overrides(harness.tmpdir());
-    let start_directory = harness.tmpdir().join("new-window-cwd");
-    fs::create_dir_all(&start_directory)?;
-    let start_directory = start_directory.to_string_lossy().into_owned();
+    let requested_start_directory = harness.tmpdir().join("new-window-cwd");
+    fs::create_dir_all(&requested_start_directory)?;
+    let start_directory = fs::canonicalize(&requested_start_directory)?
+        .to_string_lossy()
+        .into_owned();
 
     let create = harness.run_pair_with(
         &tmux_binary,
@@ -157,9 +159,11 @@ fn tmux_compat_respawn_window_start_directory_when_frozen_tmux_is_available(
     };
     let config = tmux_compat_config();
     let expected_overrides = default_overrides(harness.tmpdir());
-    let start_directory = harness.tmpdir().join("respawn-window-cwd");
-    fs::create_dir_all(&start_directory)?;
-    let start_directory = start_directory.to_string_lossy().into_owned();
+    let requested_start_directory = harness.tmpdir().join("respawn-window-cwd");
+    fs::create_dir_all(&requested_start_directory)?;
+    let start_directory = fs::canonicalize(&requested_start_directory)?
+        .to_string_lossy()
+        .into_owned();
 
     let create = harness.run_pair_with(
         &tmux_binary,

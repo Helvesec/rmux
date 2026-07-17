@@ -4,14 +4,18 @@ use std::pin::Pin;
 
 use rmux_core::{
     command_parser::{CommandArgument, ParsedCommand},
-    HookDispatch, LifecycleEvent,
+    HookDispatch, HookScopeIdentity, HookStore, LifecycleEvent, PaneId, WindowId,
 };
-use rmux_proto::{HookName, PaneTarget, Request, Response, ScopeSelector, Target, WindowTarget};
-use tokio::sync::{broadcast, watch};
+use rmux_proto::{
+    HookName, PaneTarget, Request, Response, ScopeSelector, SessionId, Target, WindowTarget,
+};
+#[cfg(test)]
+use tokio::sync::broadcast;
+use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::hook_runtime::{
-    hooks_disabled, queue_inline_hook, with_hook_execution, PendingInlineHook,
+    hooks_disabled, queue_inline_hook, with_hook_execution, ExactPaneHookTarget, PendingInlineHook,
     PendingInlineHookFormat,
 };
 
@@ -20,38 +24,509 @@ use super::{
     target_for_request_response, target_to_scope, RequestHandler,
 };
 
+#[path = "handler_lifecycle/ordered_wait.rs"]
+mod ordered_wait;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueuedLifecycleEvent {
     pub(in crate::handler) event: LifecycleEvent,
+    pub(in crate::handler) control_session_identity: Option<SessionId>,
     pub(in crate::handler) hook_name: HookName,
     pub(in crate::handler) hooks: Vec<HookDispatch>,
     pub(in crate::handler) formats: Vec<(String, String)>,
     pub(in crate::handler) current_target: Option<Target>,
+    stable_current_target_identity: Option<StableLifecycleTargetIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StableLifecycleTargetIdentity {
+    Session {
+        session_id: SessionId,
+    },
+    Window {
+        session_id: SessionId,
+        window: StableWindowIdentity,
+        window_loss: StableWindowLoss,
+    },
+    Pane {
+        session_id: SessionId,
+        window: StableWindowIdentity,
+        pane_id: PaneId,
+        window_loss: StableWindowLoss,
+    },
+    GlobalWindow {
+        window_id: WindowId,
+    },
+    GlobalPane {
+        pane_id: PaneId,
+        window_id: Option<WindowId>,
+    },
+    Removed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StableWindowLoss {
+    FallbackToSession,
+    RequireWindowIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HookDispatchCurrentTarget {
+    Dynamic(Option<Target>),
+    Stable(StableLifecycleTargetIdentity),
+    ExactPane(ExactPaneHookTarget),
+    ExactSession(SessionId),
+    MissingStable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StableWindowIdentity {
+    window_id: WindowId,
+    preferred_index: u32,
+    occurrence_id: Option<crate::pane_terminals::WindowLinkOccurrenceId>,
+}
+
+impl StableLifecycleTargetIdentity {
+    fn capture_for_event(
+        state: &crate::pane_terminals::HandlerState,
+        target: &Target,
+        event: &LifecycleEvent,
+    ) -> Option<Self> {
+        let window_loss = if matches!(event, LifecycleEvent::WindowUnlinked { .. }) {
+            StableWindowLoss::RequireWindowIdentity
+        } else {
+            StableWindowLoss::FallbackToSession
+        };
+        Self::capture_with_window_loss(state, target, window_loss)
+    }
+
+    fn capture_with_window_loss(
+        state: &crate::pane_terminals::HandlerState,
+        target: &Target,
+        window_loss: StableWindowLoss,
+    ) -> Option<Self> {
+        let session = state.sessions.session(target.session_name())?;
+        let session_id = session.id();
+        match target {
+            Target::Session(_) => Some(Self::Session { session_id }),
+            Target::Window(target) => Some(Self::Window {
+                session_id,
+                window: stable_window_identity(
+                    state,
+                    target.session_name(),
+                    session,
+                    target.window_index(),
+                    window_loss,
+                )?,
+                window_loss,
+            }),
+            Target::Pane(target) => {
+                let window = session.window_at(target.window_index())?;
+                let pane_id = window.pane(target.pane_index())?.id();
+                Some(Self::Pane {
+                    session_id,
+                    window: stable_window_identity(
+                        state,
+                        target.session_name(),
+                        session,
+                        target.window_index(),
+                        window_loss,
+                    )?,
+                    pane_id,
+                    window_loss,
+                })
+            }
+        }
+    }
+
+    fn resolve(&self, state: &crate::pane_terminals::HandlerState) -> Option<Target> {
+        match self {
+            Self::Session { session_id } => resolve_stable_session_target(state, *session_id),
+            Self::Window {
+                session_id,
+                window,
+                window_loss,
+            } => resolve_stable_window_target(state, *session_id, *window)
+                .map(Target::Window)
+                .or_else(|| resolve_stable_window_loss(state, *session_id, *window, *window_loss)),
+            Self::Pane {
+                session_id,
+                window,
+                pane_id,
+                window_loss,
+            } => resolve_stable_pane_target(state, *session_id, *window, *pane_id)
+                .map(Target::Pane)
+                .or_else(|| {
+                    resolve_stable_window_target(state, *session_id, *window).map(Target::Window)
+                })
+                .or_else(|| resolve_stable_window_loss(state, *session_id, *window, *window_loss)),
+            Self::GlobalWindow { window_id } => {
+                resolve_global_window_target(state, *window_id).map(Target::Window)
+            }
+            Self::GlobalPane { pane_id, window_id } => resolve_global_pane_target(state, *pane_id)
+                .map(Target::Pane)
+                .or_else(|| {
+                    window_id.and_then(|window_id| {
+                        resolve_global_window_target(state, window_id).map(Target::Window)
+                    })
+                }),
+            Self::Removed => None,
+        }
+    }
+
+    fn capture_removed_event(event: &LifecycleEvent) -> Option<Self> {
+        match event {
+            LifecycleEvent::SessionClosed { session_id, .. } => Some(match session_id {
+                Some(session_id) => Self::Session {
+                    session_id: SessionId::new(*session_id),
+                },
+                None => Self::Removed,
+            }),
+            LifecycleEvent::WindowUnlinked { window_id, .. } => Some(match window_id {
+                Some(window_id) => Self::GlobalWindow {
+                    window_id: WindowId::new(*window_id),
+                },
+                None => Self::Removed,
+            }),
+            LifecycleEvent::PaneExited {
+                pane_id, window_id, ..
+            }
+            | LifecycleEvent::PaneDied {
+                pane_id, window_id, ..
+            } => Some(match (pane_id, window_id) {
+                (Some(pane_id), window_id) => Self::GlobalPane {
+                    pane_id: PaneId::new(*pane_id),
+                    window_id: window_id.map(WindowId::new),
+                },
+                (None, Some(window_id)) => Self::GlobalWindow {
+                    window_id: WindowId::new(*window_id),
+                },
+                (None, None) => Self::Removed,
+            }),
+            _ => None,
+        }
+    }
+}
+
+fn exact_pane_hook_target(
+    state: &crate::pane_terminals::HandlerState,
+    identity: ExactPaneHookTarget,
+) -> Option<Target> {
+    let target = if let Some(occurrence_id) = identity.window_occurrence_id {
+        state.window_link_occurrence_target(
+            occurrence_id,
+            identity.session_id,
+            identity.window_id,
+        )?
+    } else {
+        let (session_name, session) = state
+            .sessions
+            .iter()
+            .find(|(_, session)| session.id() == identity.session_id)?;
+        let (window_index, _) = session
+            .windows()
+            .iter()
+            .filter(|(_, window)| window.id() == identity.window_id)
+            .min_by_key(|(window_index, _)| {
+                (
+                    **window_index != identity.preferred_window_index,
+                    **window_index,
+                )
+            })?;
+        WindowTarget::with_window(session_name.clone(), *window_index)
+    };
+    let session = state.sessions.session(target.session_name())?;
+    let window = session.window_at(target.window_index())?;
+    window
+        .panes()
+        .iter()
+        .filter(|pane| pane.id() == identity.pane_id)
+        .min_by_key(|pane| pane.index())
+        .map(|pane| {
+            Target::Pane(PaneTarget::with_window(
+                target.session_name().clone(),
+                target.window_index(),
+                pane.index(),
+            ))
+        })
+}
+
+fn resolve_stable_window_loss(
+    state: &crate::pane_terminals::HandlerState,
+    session_id: SessionId,
+    window: StableWindowIdentity,
+    window_loss: StableWindowLoss,
+) -> Option<Target> {
+    match window_loss {
+        StableWindowLoss::FallbackToSession => {
+            resolve_stable_session_parent_target(state, session_id, window)
+        }
+        StableWindowLoss::RequireWindowIdentity => None,
+    }
+}
+
+fn resolve_stable_session_parent_target(
+    state: &crate::pane_terminals::HandlerState,
+    session_id: SessionId,
+    child_window: StableWindowIdentity,
+) -> Option<Target> {
+    if stable_window_slot_was_replaced(state, session_id, child_window) {
+        return None;
+    }
+    resolve_stable_session_target(state, session_id)
+}
+
+fn stable_window_slot_was_replaced(
+    state: &crate::pane_terminals::HandlerState,
+    session_id: SessionId,
+    identity: StableWindowIdentity,
+) -> bool {
+    let Some((session_name, session)) = state
+        .sessions
+        .iter()
+        .find(|(_, session)| session.id() == session_id)
+    else {
+        return false;
+    };
+    session
+        .window_at(identity.preferred_index)
+        .is_some_and(|window| {
+            window.id() != identity.window_id
+                || identity.occurrence_id.is_some_and(|occurrence_id| {
+                    state.window_link_occurrence_id(session_name, identity.preferred_index)
+                        != Some(occurrence_id)
+                })
+        })
+}
+
+fn resolve_stable_session_target(
+    state: &crate::pane_terminals::HandlerState,
+    session_id: SessionId,
+) -> Option<Target> {
+    state
+        .sessions
+        .iter()
+        .find(|(_, session)| session.id() == session_id)
+        .map(|(session_name, _)| Target::Session(session_name.clone()))
+}
+
+fn resolve_global_window_target(
+    state: &crate::pane_terminals::HandlerState,
+    window_id: WindowId,
+) -> Option<WindowTarget> {
+    state
+        .sessions
+        .iter()
+        .filter_map(|(session_name, session)| {
+            first_window_target_with_id(session_name, session, window_id)
+                .map(|target| (session.id(), target))
+        })
+        .max_by_key(|(session_id, _)| *session_id)
+        .map(|(_, target)| target)
+}
+
+fn resolve_global_pane_target(
+    state: &crate::pane_terminals::HandlerState,
+    pane_id: PaneId,
+) -> Option<PaneTarget> {
+    state
+        .sessions
+        .iter()
+        .filter_map(|(session_name, session)| {
+            first_pane_target_with_id(session_name, session, pane_id)
+                .map(|target| (session.id(), target))
+        })
+        .max_by_key(|(session_id, _)| *session_id)
+        .map(|(_, target)| target)
+}
+
+fn first_window_target_with_id(
+    session_name: &rmux_proto::SessionName,
+    session: &rmux_core::Session,
+    window_id: WindowId,
+) -> Option<WindowTarget> {
+    session
+        .windows()
+        .iter()
+        .find(|(_, window)| window.id() == window_id)
+        .map(|(&window_index, _)| WindowTarget::with_window(session_name.clone(), window_index))
+}
+
+fn first_pane_target_with_id(
+    session_name: &rmux_proto::SessionName,
+    session: &rmux_core::Session,
+    pane_id: PaneId,
+) -> Option<PaneTarget> {
+    session
+        .windows()
+        .iter()
+        .find_map(|(&window_index, window)| {
+            window
+                .panes()
+                .iter()
+                .filter(|pane| pane.id() == pane_id)
+                .min_by_key(|pane| pane.index())
+                .map(|pane| {
+                    PaneTarget::with_window(session_name.clone(), window_index, pane.index())
+                })
+        })
+}
+
+fn resolve_stable_window_target(
+    state: &crate::pane_terminals::HandlerState,
+    session_id: SessionId,
+    identity: StableWindowIdentity,
+) -> Option<WindowTarget> {
+    if let Some(occurrence_id) = identity.occurrence_id {
+        return state.window_link_occurrence_target(occurrence_id, session_id, identity.window_id);
+    }
+    let original_session = state
+        .sessions
+        .iter()
+        .find(|(_, session)| session.id() == session_id);
+    if let Some((session_name, session)) = original_session {
+        if let Some((window_index, _)) = resolve_stable_window_identity(session, identity) {
+            return Some(WindowTarget::with_window(
+                session_name.clone(),
+                window_index,
+            ));
+        }
+    }
+
+    resolve_global_window_target(state, identity.window_id)
+}
+
+fn resolve_stable_pane_target(
+    state: &crate::pane_terminals::HandlerState,
+    session_id: SessionId,
+    window_identity: StableWindowIdentity,
+    pane_id: PaneId,
+) -> Option<PaneTarget> {
+    if window_identity.occurrence_id.is_some() {
+        let window_target = resolve_stable_window_target(state, session_id, window_identity)?;
+        let pane_index = state
+            .sessions
+            .session(window_target.session_name())?
+            .window_at(window_target.window_index())?
+            .panes()
+            .iter()
+            .find(|pane| pane.id() == pane_id)?
+            .index();
+        return Some(PaneTarget::with_window(
+            window_target.session_name().clone(),
+            window_target.window_index(),
+            pane_index,
+        ));
+    }
+
+    let pane_in_session = |session_name: &rmux_proto::SessionName,
+                           session: &rmux_core::Session|
+     -> Option<PaneTarget> {
+        let (window_index, window) = resolve_stable_window_identity(session, window_identity)?;
+        let pane_index = window
+            .panes()
+            .iter()
+            .find(|pane| pane.id() == pane_id)?
+            .index();
+        Some(PaneTarget::with_window(
+            session_name.clone(),
+            window_index,
+            pane_index,
+        ))
+    };
+
+    if let Some(target) = state
+        .sessions
+        .iter()
+        .find(|(_, session)| session.id() == session_id)
+        .and_then(|(session_name, session)| pane_in_session(session_name, session))
+    {
+        return Some(target);
+    }
+
+    resolve_global_pane_target(state, pane_id)
+}
+
+fn stable_window_identity(
+    state: &crate::pane_terminals::HandlerState,
+    session_name: &rmux_proto::SessionName,
+    session: &rmux_core::Session,
+    window_index: u32,
+    window_loss: StableWindowLoss,
+) -> Option<StableWindowIdentity> {
+    let window_id = session.window_at(window_index)?.id();
+    Some(StableWindowIdentity {
+        window_id,
+        preferred_index: window_index,
+        occurrence_id: if matches!(window_loss, StableWindowLoss::RequireWindowIdentity) {
+            state.window_link_occurrence_id(session_name, window_index)
+        } else {
+            None
+        },
+    })
+}
+
+fn resolve_stable_window_identity(
+    session: &rmux_core::Session,
+    identity: StableWindowIdentity,
+) -> Option<(u32, &rmux_core::Window)> {
+    if let Some(window) = session
+        .window_at(identity.preferred_index)
+        .filter(|window| window.id() == identity.window_id)
+    {
+        return Some((identity.preferred_index, window));
+    }
+
+    session.windows().iter().find_map(|(window_index, window)| {
+        (window.id() == identity.window_id).then_some((*window_index, window))
+    })
+}
+
+#[derive(Debug)]
+pub(crate) struct LifecycleDispatchItem {
+    event: QueuedLifecycleEvent,
+    completion: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeferredLifecycleEvent {
+    queued: QueuedLifecycleEvent,
+    dispatch_scope: ScopeSelector,
+    dispatch_identity: Option<HookScopeIdentity>,
 }
 
 impl RequestHandler {
+    #[cfg(test)]
     pub(crate) fn subscribe_lifecycle_events(&self) -> broadcast::Receiver<QueuedLifecycleEvent> {
         self.hook_events.subscribe()
     }
 
+    pub(crate) fn take_lifecycle_dispatch_receiver(
+        &self,
+    ) -> Option<mpsc::Receiver<LifecycleDispatchItem>> {
+        self.lifecycle_dispatch.activate()
+    }
+
     pub(crate) async fn consume_lifecycle_hooks(
         &self,
-        mut events: broadcast::Receiver<QueuedLifecycleEvent>,
-        mut shutdown: watch::Receiver<()>,
+        mut events: mpsc::Receiver<LifecycleDispatchItem>,
+        mut shutdown: oneshot::Receiver<()>,
     ) {
         loop {
             tokio::select! {
                 result = events.recv() => {
                     match result {
-                        Ok(event) => self.dispatch_lifecycle_hook(event).await,
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            warn!(skipped, "lifecycle hook consumer lagged; dropping events");
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
+                        Some(item) => self.dispatch_lifecycle_item(item).await,
+                        None => break,
                     }
                 }
-                result = shutdown.changed() => {
+                result = &mut shutdown => {
                     let _ = result;
+                    self.lifecycle_dispatch.deactivate();
+                    events.close();
+                    while let Some(item) = events.recv().await {
+                        self.dispatch_lifecycle_item(item).await;
+                    }
                     self.shutdown_wait_for();
                     break;
                 }
@@ -65,59 +540,162 @@ impl RequestHandler {
                 .await;
         }
         if hooks_disabled() {
+            self.refresh_control_sessions_for_event(&event).await;
             return;
         }
         let queued = {
             let mut state = self.state.lock().await;
             prepare_lifecycle_event(&mut state, &event)
         };
-        self.emit_prepared(queued);
+        self.emit_prepared(queued).await;
     }
 
     pub(in crate::handler) async fn emit_without_attached_refresh(&self, event: LifecycleEvent) {
         if hooks_disabled() {
+            self.refresh_control_sessions_for_event(&event).await;
             return;
         }
         let queued = {
             let mut state = self.state.lock().await;
             prepare_lifecycle_event(&mut state, &event)
         };
-        self.emit_prepared(queued);
+        self.emit_prepared(queued).await;
     }
 
-    pub(in crate::handler) fn emit_prepared(&self, event: QueuedLifecycleEvent) {
+    pub(in crate::handler) async fn emit_prepared(&self, event: QueuedLifecycleEvent) {
         if hooks_disabled() {
+            self.refresh_control_sessions_for_event(&event.event).await;
             return;
         }
-        let _ = self.hook_events.send(event);
+        let _ = self.hook_events.send(event.clone());
+        let item = LifecycleDispatchItem {
+            event,
+            completion: None,
+        };
+        if self.lifecycle_dispatch.send_if_active(item).await.is_err() {
+            warn!("lifecycle dispatch queue closed before server shutdown");
+        }
     }
 
-    pub(in crate::handler) fn shutdown_wait_for(&self) {
+    pub(in crate::handler) async fn emit_prepared_and_wait(&self, event: QueuedLifecycleEvent) {
+        if hooks_disabled() {
+            self.refresh_control_sessions_for_event(&event.event).await;
+            return;
+        }
+        let _ = self.hook_events.send(event.clone());
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let item = LifecycleDispatchItem {
+            event,
+            completion: Some(completion_tx),
+        };
+        ordered_wait::dispatch_without_unbounded_caller_wait(
+            self.lifecycle_dispatch.clone(),
+            item,
+            completion_rx,
+        )
+        .await;
+    }
+
+    async fn dispatch_lifecycle_item(&self, item: LifecycleDispatchItem) {
+        self.dispatch_lifecycle_hook(item.event).await;
+        if let Some(completion) = item.completion {
+            let _ = completion.send(());
+        }
+    }
+
+    pub(crate) fn shutdown_wait_for(&self) {
         if let Ok(mut wait_for) = self.wait_for.lock() {
             wait_for.shutdown();
         }
     }
 
-    pub(crate) async fn emit_client_attached(
+    pub(crate) async fn emit_client_attached_identity(
         &self,
         requester_pid: u32,
         session_name: rmux_proto::SessionName,
+        session_id: SessionId,
     ) {
-        self.emit(LifecycleEvent::ClientAttached {
-            session_name,
-            client_name: Some(requester_pid.to_string()),
-        })
+        self.emit_for_session_identity(
+            LifecycleEvent::ClientAttached {
+                session_name: session_name.clone(),
+                client_name: Some(requester_pid.to_string()),
+            },
+            &session_name,
+            session_id,
+        )
         .await;
     }
 
+    pub(in crate::handler) async fn emit_client_session_changed(
+        &self,
+        requester_pid: u32,
+        session_name: rmux_proto::SessionName,
+        session_id: SessionId,
+    ) {
+        self.emit_for_session_identity(
+            LifecycleEvent::ClientSessionChanged {
+                session_name: session_name.clone(),
+                client_name: Some(requester_pid.to_string()),
+            },
+            &session_name,
+            session_id,
+        )
+        .await;
+    }
+
+    pub(in crate::handler) async fn emit_for_session_identity(
+        &self,
+        event: LifecycleEvent,
+        _session_name: &rmux_proto::SessionName,
+        session_id: SessionId,
+    ) {
+        let prepared = {
+            let mut state = self.state.lock().await;
+            let Some(session_name) = state.sessions.iter().find_map(|(session_name, session)| {
+                (session.id() == session_id).then(|| session_name.clone())
+            }) else {
+                return;
+            };
+            let Some(event) = canonicalize_exact_session_event(event, session_name) else {
+                debug_assert!(
+                    false,
+                    "exact session emission requires a client session event"
+                );
+                return;
+            };
+            if hooks_disabled() {
+                drop(state);
+                self.refresh_control_sessions_for_event(&event).await;
+                return;
+            }
+            let mut queued = prepare_lifecycle_event(&mut state, &event);
+            queued.control_session_identity = Some(session_id);
+            queued
+        };
+        self.emit_prepared(prepared).await;
+    }
+
     pub(in crate::handler) async fn dispatch_lifecycle_hook(&self, event: QueuedLifecycleEvent) {
-        self.dispatch_control_notifications(&event.event).await;
-        self.refresh_control_sessions_for_event(&event.event).await;
+        self.dispatch_lifecycle_control_effects(&event).await;
 
         if event.hooks.is_empty() {
             return;
         }
-        let current_target = self.lifecycle_dispatch_current_target(&event).await;
+        let current_target = if let Some(identity) = event.stable_current_target_identity.clone() {
+            if self.stable_hook_command_target(&identity).await.is_some() {
+                HookDispatchCurrentTarget::Stable(identity)
+            } else if lifecycle_event_allows_missing_stable_target(&event.event, &identity) {
+                HookDispatchCurrentTarget::MissingStable
+            } else {
+                warn!(
+                    hook = ?event.hook_name,
+                    "skipping lifecycle hook dispatch because its stable target was replaced or removed"
+                );
+                return;
+            }
+        } else {
+            HookDispatchCurrentTarget::Dynamic(self.lifecycle_dispatch_current_target(&event).await)
+        };
 
         self.execute_hook_dispatches(
             std::process::id(),
@@ -128,6 +706,11 @@ impl RequestHandler {
             "lifecycle",
         )
         .await;
+    }
+
+    async fn dispatch_lifecycle_control_effects(&self, event: &QueuedLifecycleEvent) {
+        self.dispatch_control_notifications(event).await;
+        self.refresh_control_sessions_for_event(&event.event).await;
     }
 
     pub(in crate::handler) fn queue_inline_hook(
@@ -141,6 +724,70 @@ impl RequestHandler {
             hook,
             scope,
             current_target,
+            exact_pane_target: None,
+            exact_session_id: None,
+            skip_dispatch: false,
+            format_mode,
+        });
+    }
+
+    pub(in crate::handler) fn queue_exact_pane_inline_hook(
+        &self,
+        hook: HookName,
+        target: PaneTarget,
+        identity: ExactPaneHookTarget,
+        format_mode: PendingInlineHookFormat,
+    ) {
+        queue_inline_hook(PendingInlineHook {
+            hook,
+            scope: ScopeSelector::Pane(target.clone()),
+            current_target: Some(Target::Pane(target)),
+            exact_pane_target: Some(identity),
+            exact_session_id: None,
+            skip_dispatch: false,
+            format_mode,
+        });
+    }
+
+    pub(in crate::handler) fn queue_exact_session_inline_hook(
+        &self,
+        hook: HookName,
+        session_name: rmux_proto::SessionName,
+        session_id: SessionId,
+        current_target: Option<Target>,
+        format_mode: PendingInlineHookFormat,
+    ) {
+        queue_inline_hook(PendingInlineHook {
+            hook,
+            scope: ScopeSelector::Session(session_name),
+            current_target,
+            exact_pane_target: None,
+            exact_session_id: Some(session_id),
+            skip_dispatch: false,
+            format_mode,
+        });
+    }
+
+    pub(in crate::handler) fn queue_missing_target_inline_hook(
+        &self,
+        hook: HookName,
+        format_mode: PendingInlineHookFormat,
+    ) {
+        self.queue_suppressed_inline_hook(hook, format_mode);
+    }
+
+    pub(in crate::handler) fn queue_suppressed_inline_hook(
+        &self,
+        hook: HookName,
+        format_mode: PendingInlineHookFormat,
+    ) {
+        queue_inline_hook(PendingInlineHook {
+            hook,
+            scope: ScopeSelector::Global,
+            current_target: None,
+            exact_pane_target: None,
+            exact_session_id: None,
+            skip_dispatch: true,
             format_mode,
         });
     }
@@ -152,17 +799,28 @@ impl RequestHandler {
         parsed_command: Option<&ParsedCommand>,
     ) {
         for pending in inline_hooks {
+            if pending.skip_dispatch {
+                continue;
+            }
             let formats = match pending.format_mode {
                 PendingInlineHookFormat::HookOnly => hook_only_format_values(pending.hook),
                 PendingInlineHookFormat::AfterCommand => {
                     after_hook_format_values(pending.hook, parsed_command)
                 }
             };
-            self.run_built_in_hook_dispatch(
+            let current_target = match (pending.exact_pane_target, pending.exact_session_id) {
+                (Some(identity), None) => HookDispatchCurrentTarget::ExactPane(identity),
+                (None, Some(session_id)) => HookDispatchCurrentTarget::ExactSession(session_id),
+                (None, None) => HookDispatchCurrentTarget::Dynamic(pending.current_target),
+                (Some(_), Some(_)) => {
+                    unreachable!("inline hook cannot carry pane and session identities")
+                }
+            };
+            self.run_built_in_hook_dispatch_with_target(
                 requester_pid,
                 pending.hook,
                 pending.scope,
-                pending.current_target,
+                current_target,
                 formats,
                 "inline",
             )
@@ -262,13 +920,53 @@ impl RequestHandler {
         formats: Vec<(String, String)>,
         source: &'static str,
     ) {
+        self.run_built_in_hook_dispatch_with_target(
+            requester_pid,
+            hook_name,
+            scope,
+            HookDispatchCurrentTarget::Dynamic(current_target),
+            formats,
+            source,
+        )
+        .await;
+    }
+
+    async fn run_built_in_hook_dispatch_with_target(
+        &self,
+        requester_pid: u32,
+        hook_name: HookName,
+        scope: ScopeSelector,
+        current_target: HookDispatchCurrentTarget,
+        formats: Vec<(String, String)>,
+        source: &'static str,
+    ) {
         if hooks_disabled() {
             return;
         }
 
         let hooks = {
             let mut state = self.state.lock().await;
-            state.hooks.dispatch(&scope, hook_name)
+            let scope = match &current_target {
+                HookDispatchCurrentTarget::ExactPane(identity) => {
+                    let Some(target) = exact_pane_hook_target(&state, *identity) else {
+                        return;
+                    };
+                    target_to_scope(&target)
+                }
+                HookDispatchCurrentTarget::ExactSession(session_id) => {
+                    let Some(target) = resolve_stable_session_target(&state, *session_id) else {
+                        return;
+                    };
+                    target_to_scope(&target)
+                }
+                _ => scope,
+            };
+            match super::resolve_hook_scope_identity(&state, &scope) {
+                Ok(identity) => state
+                    .hooks
+                    .dispatch_with_identity_or_scope(&identity, &scope, hook_name),
+                Err(_) => state.hooks.dispatch(&scope, hook_name),
+            }
         };
         if hooks.is_empty() {
             return;
@@ -289,7 +987,7 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         hooks: Vec<HookDispatch>,
-        current_target: Option<Target>,
+        current_target: HookDispatchCurrentTarget,
         formats: Vec<(String, String)>,
         hook_name: HookName,
         source: &'static str,
@@ -297,8 +995,51 @@ impl RequestHandler {
         Box::pin(async move {
             with_hook_execution(formats, async {
                 for hook in hooks {
-                    let command_current_target =
-                        self.valid_hook_command_target(current_target.clone()).await;
+                    let command_current_target = match &current_target {
+                        HookDispatchCurrentTarget::Stable(identity) => {
+                            let Some(target) = self.stable_hook_command_target(identity).await
+                            else {
+                                warn!(
+                                    hook = ?hook_name,
+                                    source,
+                                    "stopping lifecycle hook dispatch because its stable target no longer exists"
+                                );
+                                break;
+                            };
+                            Some(target)
+                        }
+                        HookDispatchCurrentTarget::ExactPane(identity) => {
+                            let state = self.state.lock().await;
+                            let Some(target) = exact_pane_hook_target(&state, *identity) else {
+                                warn!(
+                                    hook = ?hook_name,
+                                    source,
+                                    "stopping inline hook dispatch because its exact pane target no longer exists"
+                                );
+                                break;
+                            };
+                            Some(target)
+                        }
+                        HookDispatchCurrentTarget::ExactSession(session_id) => {
+                            let identity = StableLifecycleTargetIdentity::Session {
+                                session_id: *session_id,
+                            };
+                            let Some(target) = self.stable_hook_command_target(&identity).await
+                            else {
+                                warn!(
+                                    hook = ?hook_name,
+                                    source,
+                                    "stopping inline hook dispatch because its exact session target no longer exists"
+                                );
+                                break;
+                            };
+                            Some(target)
+                        }
+                        HookDispatchCurrentTarget::Dynamic(target) => {
+                            self.valid_hook_command_target(target.clone()).await
+                        }
+                        HookDispatchCurrentTarget::MissingStable => None,
+                    };
                     if let Err(error) = self
                         .execute_hook_command_with_context(
                             requester_pid,
@@ -340,6 +1081,15 @@ impl RequestHandler {
             }
         }
         self.fallback_target_from_current_hook_formats().await
+    }
+
+    async fn stable_hook_command_target(
+        &self,
+        identity: &StableLifecycleTargetIdentity,
+    ) -> Option<Target> {
+        let state = self.state.lock().await;
+        let target = identity.resolve(&state)?;
+        pane_target_for_existing_target(&state, &target).or(Some(target))
     }
 
     async fn lifecycle_dispatch_current_target(
@@ -390,19 +1140,153 @@ impl RequestHandler {
     }
 }
 
+fn lifecycle_event_allows_missing_stable_target(
+    event: &LifecycleEvent,
+    identity: &StableLifecycleTargetIdentity,
+) -> bool {
+    match event {
+        LifecycleEvent::WindowUnlinked { .. } => matches!(
+            identity,
+            StableLifecycleTargetIdentity::GlobalWindow { .. }
+                | StableLifecycleTargetIdentity::Removed
+        ),
+        LifecycleEvent::SessionClosed { .. }
+        | LifecycleEvent::PaneExited { .. }
+        | LifecycleEvent::PaneDied { .. } => true,
+        _ => false,
+    }
+}
+
 pub(in crate::handler) fn prepare_lifecycle_event(
     state: &mut crate::pane_terminals::HandlerState,
     event: &LifecycleEvent,
 ) -> QueuedLifecycleEvent {
+    let deferred = defer_lifecycle_event(state, event);
+    let hooks = match &deferred.dispatch_identity {
+        Some(identity) => state.hooks.dispatch_with_identity_or_scope(
+            identity,
+            &deferred.dispatch_scope,
+            deferred.queued.hook_name,
+        ),
+        None => state
+            .hooks
+            .dispatch(&deferred.dispatch_scope, deferred.queued.hook_name),
+    };
+    deferred.with_hooks(hooks)
+}
+
+pub(in crate::handler) fn prepare_lifecycle_event_if_enabled(
+    state: &mut crate::pane_terminals::HandlerState,
+    event: &LifecycleEvent,
+) -> Option<QueuedLifecycleEvent> {
+    if hooks_disabled() {
+        return None;
+    }
+    Some(prepare_lifecycle_event(state, event))
+}
+
+pub(in crate::handler) fn defer_lifecycle_event(
+    state: &crate::pane_terminals::HandlerState,
+    event: &LifecycleEvent,
+) -> DeferredLifecycleEvent {
     let hook_name = event.hook_name();
-    let current_target = lifecycle_hook_current_target(state, event);
+    let (current_target, stable_current_target_identity) =
+        lifecycle_hook_current_target_snapshot(state, event);
     let dispatch_scope = lifecycle_hook_dispatch_scope(event, current_target.as_ref());
-    QueuedLifecycleEvent {
-        event: event.clone(),
-        hook_name,
-        hooks: state.hooks.dispatch(&dispatch_scope, hook_name),
-        formats: lifecycle_hook_formats(state, event),
-        current_target,
+    let dispatch_identity = super::lifecycle_hook_scope_identity(state, &dispatch_scope, event);
+    DeferredLifecycleEvent {
+        queued: QueuedLifecycleEvent {
+            event: event.clone(),
+            control_session_identity: None,
+            hook_name,
+            hooks: Vec::new(),
+            formats: lifecycle_hook_formats(state, event),
+            current_target,
+            stable_current_target_identity,
+        },
+        dispatch_scope,
+        dispatch_identity,
+    }
+}
+
+pub(in crate::handler) fn prepare_deferred_lifecycle_event(
+    state: &mut crate::pane_terminals::HandlerState,
+    hook_snapshot: &mut HookStore,
+    mut deferred: DeferredLifecycleEvent,
+) -> QueuedLifecycleEvent {
+    deferred.refresh_window_unlinked_current_target(state);
+    if hooks_disabled() {
+        return deferred.queued;
+    }
+    let hooks = match &deferred.dispatch_identity {
+        Some(identity) => state.hooks.dispatch_deferred_with_identity_or_scope(
+            hook_snapshot,
+            identity,
+            &deferred.dispatch_scope,
+            deferred.queued.hook_name,
+        ),
+        None => state.hooks.dispatch_deferred_from(
+            hook_snapshot,
+            &deferred.dispatch_scope,
+            deferred.queued.hook_name,
+        ),
+    };
+    deferred.with_hooks(hooks)
+}
+
+impl DeferredLifecycleEvent {
+    fn refresh_window_unlinked_current_target(
+        &mut self,
+        state: &crate::pane_terminals::HandlerState,
+    ) {
+        if !matches!(self.queued.event, LifecycleEvent::WindowUnlinked { .. }) {
+            return;
+        }
+        let (current_target, stable_current_target_identity) =
+            lifecycle_hook_current_target_snapshot(state, &self.queued.event);
+        self.queued.current_target = current_target;
+        self.queued.stable_current_target_identity = stable_current_target_identity;
+    }
+
+    fn with_hooks(mut self, hooks: Vec<HookDispatch>) -> QueuedLifecycleEvent {
+        self.queued.hooks = hooks;
+        self.queued
+    }
+}
+
+fn canonicalize_exact_session_event(
+    event: LifecycleEvent,
+    session_name: rmux_proto::SessionName,
+) -> Option<LifecycleEvent> {
+    match event {
+        LifecycleEvent::ClientAttached { client_name, .. } => {
+            Some(LifecycleEvent::ClientAttached {
+                session_name,
+                client_name,
+            })
+        }
+        LifecycleEvent::ClientSessionChanged { client_name, .. } => {
+            Some(LifecycleEvent::ClientSessionChanged {
+                session_name,
+                client_name,
+            })
+        }
+        LifecycleEvent::ClientDetached { client_name, .. } => {
+            Some(LifecycleEvent::ClientDetached {
+                session_name,
+                client_name,
+            })
+        }
+        LifecycleEvent::SessionCreated { .. } => {
+            Some(LifecycleEvent::SessionCreated { session_name })
+        }
+        LifecycleEvent::SessionRenamed { .. } => {
+            Some(LifecycleEvent::SessionRenamed { session_name })
+        }
+        LifecycleEvent::SessionWindowChanged { .. } => {
+            Some(LifecycleEvent::SessionWindowChanged { session_name })
+        }
+        _ => None,
     }
 }
 
@@ -515,7 +1399,19 @@ fn lifecycle_hook_formats(
             formats.push(("hook_session_name".to_owned(), session_name.to_string()));
         }
     }
-    if let Some(window_target) = event.window_target() {
+    if let LifecycleEvent::WindowUnlinked {
+        window_id,
+        window_name,
+        ..
+    } = event
+    {
+        if let Some(window_id) = window_id {
+            formats.push(("hook_window".to_owned(), format!("@{window_id}")));
+        }
+        if let Some(window_name) = window_name {
+            formats.push(("hook_window_name".to_owned(), window_name.clone()));
+        }
+    } else if let Some(window_target) = event.window_target() {
         let mut resolved_window = false;
         if let Some(session) = state.sessions.session(window_target.session_name()) {
             if let Some(window) = session.window_at(window_target.window_index()) {
@@ -595,6 +1491,19 @@ fn lifecycle_hook_current_target(
     state: &crate::pane_terminals::HandlerState,
     event: &LifecycleEvent,
 ) -> Option<Target> {
+    if let LifecycleEvent::WindowUnlinked {
+        session_name,
+        window_id,
+        ..
+    } = event
+    {
+        return window_id
+            .map(WindowId::new)
+            .and_then(|window_id| resolve_global_window_target(state, window_id))
+            .and_then(|target| active_window_target(&state.sessions, &target))
+            .or_else(|| active_session_target(&state.sessions, session_name));
+    }
+
     match event.current_target() {
         Some(Target::Session(session_name)) => {
             active_session_target(&state.sessions, &session_name)
@@ -622,6 +1531,18 @@ fn lifecycle_hook_current_target(
         }
         None => None,
     }
+}
+
+fn lifecycle_hook_current_target_snapshot(
+    state: &crate::pane_terminals::HandlerState,
+    event: &LifecycleEvent,
+) -> (Option<Target>, Option<StableLifecycleTargetIdentity>) {
+    let current_target = lifecycle_hook_current_target(state, event);
+    let stable_current_target_identity = current_target
+        .as_ref()
+        .and_then(|target| StableLifecycleTargetIdentity::capture_for_event(state, target, event))
+        .or_else(|| StableLifecycleTargetIdentity::capture_removed_event(event));
+    (current_target, stable_current_target_identity)
 }
 
 fn surviving_pane_event_target(
@@ -763,12 +1684,146 @@ fn pane_target_for_existing_target(
 mod tests {
     use super::*;
     use rmux_proto::{
-        HookLifecycle, NewSessionRequest, NewWindowRequest, ScopeSelector, SplitDirection,
-        SplitWindowRequest, SplitWindowTarget, TerminalSize,
+        HookLifecycle, LinkWindowRequest, NewSessionRequest, NewWindowRequest, ScopeSelector,
+        SetHookMutationRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
+        TerminalSize,
     };
 
     fn session_name(value: &str) -> rmux_proto::SessionName {
         rmux_proto::SessionName::new(value).expect("valid session name")
+    }
+
+    #[tokio::test]
+    async fn pane_output_hooks_capture_stable_pane_target_identity() {
+        let handler = RequestHandler::new();
+        let session = session_name("hook-stable-pane-output");
+        let response = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(response, Response::NewSession(_)));
+
+        let target = PaneTarget::with_window(session, 0, 0);
+        let mut state = handler.state.lock().await;
+        for event in [
+            LifecycleEvent::PaneTitleChanged {
+                target: target.clone(),
+            },
+            LifecycleEvent::PaneSetClipboard {
+                target: target.clone(),
+            },
+        ] {
+            let queued = prepare_lifecycle_event(&mut state, &event);
+            let identity = queued
+                .stable_current_target_identity
+                .expect("pane output hook captures a stable target identity");
+            assert_eq!(identity.resolve(&state), Some(Target::Pane(target.clone())));
+        }
+    }
+
+    #[tokio::test]
+    async fn stable_alert_hook_chain_survives_removing_a_duplicate_alias() {
+        let handler = RequestHandler::new();
+        let session = session_name("hook-stable-duplicate-alias");
+        let response = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(response, Response::NewSession(_)));
+
+        let original = WindowTarget::with_window(session.clone(), 0);
+        let duplicate = WindowTarget::with_window(session.clone(), 1);
+        let response = handler
+            .handle(Request::LinkWindow(LinkWindowRequest {
+                source: original.clone(),
+                target: duplicate.clone(),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: true,
+            }))
+            .await;
+        assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
+
+        for (command, append) in [
+            (format!("unlink-window -t {duplicate}"), false),
+            (
+                "set-buffer -b stable-duplicate-alias continued".to_owned(),
+                true,
+            ),
+        ] {
+            let response = handler
+                .handle(Request::SetHookMutation(SetHookMutationRequest {
+                    scope: ScopeSelector::Window(original.clone()),
+                    hook: HookName::AlertActivity,
+                    command: Some(command),
+                    lifecycle: HookLifecycle::Persistent,
+                    append,
+                    unset: false,
+                    run_immediately: false,
+                    index: None,
+                }))
+                .await;
+            assert!(matches!(response, Response::SetHook(_)), "{response:?}");
+        }
+
+        let (queued, original_window_id) = {
+            let mut state = handler.state.lock().await;
+            let original_window_id = state
+                .sessions
+                .session(&session)
+                .and_then(|session| session.window_at(original.window_index()))
+                .expect("original alias exists before dispatch")
+                .id();
+            (
+                prepare_lifecycle_event(
+                    &mut state,
+                    &LifecycleEvent::AlertActivity {
+                        target: original.clone(),
+                    },
+                ),
+                original_window_id,
+            )
+        };
+        assert_eq!(
+            queued.hooks.len(),
+            2,
+            "both hooks are frozen before dispatch"
+        );
+
+        handler.dispatch_lifecycle_hook(queued).await;
+
+        let state = handler.state.lock().await;
+        let surviving = state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(original.window_index()))
+            .expect("original alias survives the first hook");
+        assert_eq!(surviving.id(), original_window_id);
+        assert!(
+            state
+                .sessions
+                .session(&session)
+                .and_then(|session| session.window_at(duplicate.window_index()))
+                .is_none(),
+            "the first hook removes only the duplicate alias"
+        );
+        assert_eq!(
+            state
+                .buffers
+                .show(Some("stable-duplicate-alias"))
+                .expect("second hook stores its sentinel")
+                .1,
+            b"continued"
+        );
     }
 
     #[tokio::test]

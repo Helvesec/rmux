@@ -76,6 +76,7 @@ fn run_attached_probe(
         .env("TMUX", r"\\.\pipe\outer-tmux,123,0")
         .env("RMUX_PANE", "%outer")
         .env("TMUX_PANE", "%outer")
+        .allow_explicit_job_breakaway()
         .size(TerminalSize::new(100, 30));
     if mode == FakeClaudeMode::CreateMateThroughTmuxInheritance {
         command = command.env("RMUX_CLAUDE_TEST_CREATE_SWARM_FALLBACK", "1");
@@ -97,7 +98,7 @@ fn run_attached_probe(
 
     let output = wait_for_needles_or_error(&mut attached, &needles, Duration::from_secs(45))?;
 
-    let _ = wait_for_needles_or_terminate(&mut attached, &[b"[exited]"], Duration::from_secs(6))?;
+    let _ = wait_for_needles_or_terminate(&mut attached, &[b"[exited]"], Duration::from_secs(1))?;
     terminate_spawned(&mut attached);
     let fake_log = fs::read_to_string(&fake_claude_log).unwrap_or_default();
 
@@ -264,7 +265,7 @@ fn main() {
         }
         let _ = io::stdout().flush();
     }
-    thread::sleep(Duration::from_millis(750));
+    thread::sleep(Duration::from_secs(30));
 }
 "##,
     )?;

@@ -22,16 +22,22 @@ pub use attach::{
     ATTACH_DATA_HEADER_LEN,
 };
 pub use capabilities::{
-    HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
+    capabilities_for_features, HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
     CAPABILITY_ATTACH_RESIZE_GEOMETRY, CAPABILITY_ATTACH_STREAM,
     CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
-    CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_CONTROL_STREAM, CAPABILITY_DAEMON_SHUTDOWN,
-    CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, CAPABILITY_DAEMON_STATUS, CAPABILITY_DETACHED_RPC,
-    CAPABILITY_FRAMED_ERRORS, CAPABILITY_HANDSHAKE, CAPABILITY_SDK_PANE_BROADCAST,
-    CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PROCESS_COMMAND, CAPABILITY_SDK_SESSION_LEASE,
+    CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION, CAPABILITY_CLI_TARGET_ACTIONS,
+    CAPABILITY_CONTROL_STREAM, CAPABILITY_DAEMON_SHUTDOWN, CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE,
+    CAPABILITY_DAEMON_STATUS, CAPABILITY_DETACHED_RPC, CAPABILITY_FRAMED_ERRORS,
+    CAPABILITY_HANDSHAKE, CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
+    CAPABILITY_SDK_PANE_BROADCAST, CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PANE_FOREGROUND,
+    CAPABILITY_SDK_PANE_OPTIONS, CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
+    CAPABILITY_SDK_PANE_STATE_EVENTS, CAPABILITY_SDK_PROCESS_COMMAND, CAPABILITY_SDK_SESSION_LEASE,
+    CAPABILITY_SDK_SESSION_LEASE_BY_ID, CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
     CAPABILITY_SDK_WAITS, CAPABILITY_SDK_WAITS_ARMED, CAPABILITY_TARGET_CLIENT_COMMANDS,
     CAPABILITY_WEB_SHARE, SUPPORTED_CAPABILITIES,
 };
+#[cfg(feature = "fuzzing")]
+pub use codec::fuzz_detached_frame_decoder;
 pub use codec::{
     decode_frame, encode_frame, FrameDecoder, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
     DEFAULT_MAX_FRAME_LENGTH,
@@ -41,7 +47,7 @@ pub use control::{
     format_output_line, format_pause_line, octal_escape, ClientTerminalContext, ControlGuardKind,
     ControlMode, ControlModeRequest, ControlModeResponse, CONTROL_BUFFER_HIGH, CONTROL_BUFFER_LOW,
     CONTROL_CONTROL_END, CONTROL_CONTROL_START, CONTROL_MAXIMUM_AGE_MS, CONTROL_STDIN_EOF_MARKER,
-    CONTROL_WRITE_MINIMUM,
+    CONTROL_WRITE_MINIMUM, MAX_INITIAL_CONTROL_COMMANDS,
 };
 pub use envelope::{RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION};
 pub use error::{
@@ -56,10 +62,99 @@ pub use identity::{PaneId, SessionId, SessionName, WindowId};
 pub use request::*;
 pub use response::*;
 pub use types::*;
-pub use types::{OptionScopeSelector, PaneOutputSubscriptionId, SdkWaitId, SdkWaitOwnerId};
+pub use types::{
+    OptionScopeSelector, PaneOutputSubscriptionId, PaneStateSubscriptionId, SdkWaitId,
+    SdkWaitOwnerId,
+};
 
 /// Detached request/response protocol revision.
 pub const PROTOCOL_VERSION: u16 = RMUX_WIRE_VERSION as u16;
 
+/// Non-filesystem path used by the CLI's internal runtime command
+/// canonicalization request. OS argument vectors cannot contain NUL, so a
+/// public `source-file` invocation cannot collide with this transport.
+pub const INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH: &str = "\0rmux-runtime-command-expansion-v1";
+
+/// Non-filesystem path used to apply parse-time assignments only after the
+/// CLI has validated the canonicalized command queue.
+pub const INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH: &str = "\0rmux-parse-time-assignments-v1";
+
+/// Non-filesystem path used to execute a command queue that the daemon has
+/// already canonicalized. This prevents the public `source-file` parser from
+/// applying the current `command-alias` table a second time.
+pub const INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH: &str = "\0rmux-canonical-command-execution-v1";
+
+/// Prefix for the CLI's internal stable pane-exit probe carried through the
+/// existing `list-panes` format field. OS argument vectors cannot contain NUL,
+/// so a public format cannot collide with this transport-only request.
+pub const INTERNAL_PANE_EXIT_PROBE_PREFIX: &str = "\0rmux-pane-exit-probe-v1:";
+
+/// Encodes stable session and pane identities for an internal pane-exit probe.
+#[must_use]
+pub fn encode_internal_pane_exit_probe(session_id: SessionId, pane_id: PaneId) -> String {
+    format!(
+        "{INTERNAL_PANE_EXIT_PROBE_PREFIX}{}:{}",
+        session_id.as_u32(),
+        pane_id.as_u32()
+    )
+}
+
+/// Decodes stable session and pane identities from an internal pane-exit probe.
+#[must_use]
+pub fn decode_internal_pane_exit_probe(value: &str) -> Option<(SessionId, PaneId)> {
+    let payload = value.strip_prefix(INTERNAL_PANE_EXIT_PROBE_PREFIX)?;
+    let (session_id, pane_id) = payload.split_once(':')?;
+    if pane_id.contains(':') {
+        return None;
+    }
+    Some((
+        SessionId::new(session_id.parse().ok()?),
+        PaneId::new(pane_id.parse().ok()?),
+    ))
+}
+
+/// Serializes an already-tokenized command argv for the internal runtime
+/// canonicalization request.
+pub fn encode_internal_runtime_command_arguments(
+    arguments: &[String],
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(arguments)
+}
+
+/// Deserializes an already-tokenized command argv from the internal runtime
+/// canonicalization request.
+pub fn decode_internal_runtime_command_arguments(
+    payload: &str,
+) -> Result<Vec<String>, serde_json::Error> {
+    serde_json::from_str(payload)
+}
+
 /// Minimum daemon-side TTL accepted for owned-session leases.
 pub const MIN_SESSION_LEASE_TTL_MILLIS: u64 = 500;
+
+#[cfg(test)]
+mod internal_pane_exit_probe_tests {
+    use super::*;
+
+    #[test]
+    fn pane_exit_probe_round_trips_stable_identities() {
+        let encoded = encode_internal_pane_exit_probe(SessionId::new(17), PaneId::new(42));
+
+        assert_eq!(
+            decode_internal_pane_exit_probe(&encoded),
+            Some((SessionId::new(17), PaneId::new(42)))
+        );
+    }
+
+    #[test]
+    fn pane_exit_probe_rejects_public_and_malformed_formats() {
+        for value in [
+            "#{pane_id}",
+            "\0rmux-pane-exit-probe-v1:1",
+            "\0rmux-pane-exit-probe-v1:1:2:3",
+            "\0rmux-pane-exit-probe-v1:session:2",
+        ] {
+            assert_eq!(decode_internal_pane_exit_probe(value), None);
+        }
+    }
+}

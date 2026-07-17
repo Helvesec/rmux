@@ -3,10 +3,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 use rmux_core::{BoxLines, Style};
 use rmux_proto::{Target, TerminalSize};
 
+use super::super::scripting_support::rename_target_session;
 use crate::renderer::{render_popup_overlay, OverlayRect, PopupRenderSpec};
 
 use super::menu::MenuOverlayState;
 use super::popup_job::{PopupDragMode, PopupJob, PopupSurface};
+use super::scrollable::ScrollablePopupText;
 
 #[derive(Debug, Clone)]
 pub(in crate::handler) enum ClientOverlayState {
@@ -15,17 +17,35 @@ pub(in crate::handler) enum ClientOverlayState {
 }
 
 impl ClientOverlayState {
-    pub(super) fn id(&self) -> u64 {
+    pub(in crate::handler) fn id(&self) -> u64 {
         match self {
             Self::Menu(menu) => menu.id,
             Self::Popup(popup) => popup.id,
         }
     }
 
-    pub(super) fn render(&self) -> Vec<u8> {
+    pub(in crate::handler) fn render(&self) -> Vec<u8> {
         match self {
             Self::Menu(menu) => menu.render(),
             Self::Popup(popup) => popup.render(),
+        }
+    }
+
+    pub(in crate::handler) fn rename_session_targets(
+        &mut self,
+        old_name: &rmux_proto::SessionName,
+        new_name: &rmux_proto::SessionName,
+    ) {
+        match self {
+            Self::Menu(menu) => {
+                rename_target_session(&mut menu.current_target, old_name, new_name);
+            }
+            Self::Popup(popup) => {
+                rename_target_session(&mut popup.current_target, old_name, new_name);
+                if let Some(menu) = popup.nested_menu.as_mut() {
+                    rename_target_session(&mut menu.current_target, old_name, new_name);
+                }
+            }
         }
     }
 }
@@ -47,20 +67,30 @@ pub(in crate::handler) struct PopupOverlayState {
     pub(in crate::handler) close_any_key: bool,
     pub(in crate::handler) no_job: bool,
     pub(in crate::handler) surface: Arc<StdMutex<PopupSurface>>,
+    pub(in crate::handler) scrollable_text: Option<ScrollablePopupText>,
     pub(in crate::handler) job: Option<PopupJob>,
     pub(in crate::handler) nested_menu: Option<MenuOverlayState>,
     pub(in crate::handler) dragging: PopupDragMode,
 }
 
 impl PopupOverlayState {
+    #[cfg(test)]
+    pub(in crate::handler) fn begin_resize_for_test(&mut self) {
+        self.dragging = PopupDragMode::Resize;
+    }
+
     fn render(&self) -> Vec<u8> {
+        let content_lines = self.scrollable_text.as_ref().map_or_else(
+            || self.surface.lock().expect("popup surface").lines(),
+            |text| text.visible_lines(self.content_size().rows),
+        );
         let popup_frame = render_popup_overlay(&PopupRenderSpec {
             rect: self.rect,
             title: self.title.clone(),
             style: self.style.clone(),
             border_style: self.border_style.clone(),
             border_lines: self.border_lines,
-            content_lines: self.surface.lock().expect("popup surface").lines(),
+            content_lines,
         });
         if let Some(menu) = &self.nested_menu {
             let mut frame = popup_frame;

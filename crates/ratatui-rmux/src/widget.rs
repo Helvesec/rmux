@@ -84,6 +84,8 @@ impl<'a> PaneWidget<'a> {
                     continue;
                 };
                 let target_x = area.x.saturating_add(col);
+                let available_columns =
+                    (max_cols - col).min(buf.area.right().saturating_sub(target_x));
                 let buffer_cell = buf.cell_mut((target_x, target_y));
                 let Some(buffer_cell) = buffer_cell else {
                     continue;
@@ -93,6 +95,14 @@ impl<'a> PaneWidget<'a> {
                     // Wide-glyph padding occupies a cell in the
                     // snapshot. Clear stale host content without
                     // introducing an extra visible glyph.
+                    buffer_cell.set_symbol(" ");
+                    buffer_cell.set_style(cell_style(cell));
+                    continue;
+                }
+                if u16::from(cell.glyph.width) > available_columns {
+                    // Ratatui treats a wide symbol as occupying cells beyond
+                    // the one being written. Never let a clipped pane claim a
+                    // neighboring widget's first cell in Buffer::diff.
                     buffer_cell.set_symbol(" ");
                     buffer_cell.set_style(cell_style(cell));
                     continue;

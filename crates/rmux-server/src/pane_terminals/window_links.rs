@@ -1,8 +1,14 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
-use rmux_proto::{RmuxError, SessionName, WindowTarget};
+use rmux_proto::SessionName;
 
-use super::{session_not_found, HandlerState};
+use super::HandlerState;
+
+#[path = "window_links/aliases.rs"]
+mod aliases;
+#[path = "window_links/occurrences.rs"]
+mod occurrences;
+pub(crate) use occurrences::WindowLinkOccurrenceId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct WindowLinkSlot {
@@ -30,173 +36,17 @@ impl HandlerState {
         WindowLinkSlot::new(session_name.clone(), window_index)
     }
 
-    pub(crate) fn window_link_count(&self, session_name: &SessionName, window_index: u32) -> usize {
-        self.window_link_group_id_for_slot_or_group_peer(session_name, window_index)
-            .and_then(|group_id| self.window_link_groups.get(group_id))
-            .map(|group| group.slots.len())
-            .unwrap_or(1)
-    }
-
-    pub(crate) fn window_linked_session_count(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> usize {
-        self.window_linked_session_family_list(session_name, window_index)
-            .len()
-    }
-
-    pub(crate) fn window_linked_sessions_list(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Vec<SessionName> {
-        self.window_linked_session_family_list(session_name, window_index)
-    }
-
-    pub(crate) fn window_linked_current_sessions_list(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Vec<SessionName> {
-        let slots = self.window_link_slots_for(session_name, window_index);
-        let mut seen = HashSet::new();
-        let mut sessions = Vec::new();
-        for slot in slots {
-            let mut candidates = vec![slot.session_name.clone()];
-            candidates.extend(
-                self.sessions
-                    .session_group_members(&slot.session_name)
-                    .into_iter()
-                    .filter(|member| member != &slot.session_name),
-            );
-            for candidate in candidates {
-                if !seen.insert(candidate.clone()) {
-                    continue;
-                }
-                let is_current = self
-                    .sessions
-                    .session(&candidate)
-                    .is_some_and(|session| session.active_window_index() == slot.window_index);
-                if is_current {
-                    sessions.push(candidate);
-                }
-            }
-        }
-        sessions
-    }
-
-    pub(crate) fn window_linked_session_family_list(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Vec<SessionName> {
-        let slots = self.window_link_slots_for(session_name, window_index);
-        let mut seen = HashSet::new();
-        let mut sessions = Vec::new();
-        for slot in slots {
-            if seen.insert(slot.session_name.clone()) {
-                sessions.push(slot.session_name.clone());
-            }
-            for member in self
-                .sessions
-                .session_group_members(&slot.session_name)
-                .into_iter()
-                .filter(|member| member != &slot.session_name)
-            {
-                if seen.insert(member.clone()) {
-                    sessions.push(member);
-                }
-            }
-        }
-        sessions
-    }
-
-    pub(in crate::pane_terminals) fn runtime_session_name_for_window(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> SessionName {
-        self.window_link_group_id_for_slot_or_group_peer(session_name, window_index)
-            .and_then(|group_id| self.window_link_groups.get(group_id))
-            .map(|group| group.runtime_session_name.clone())
-            .unwrap_or_else(|| self.runtime_session_name(session_name))
-    }
-
-    pub(in crate::pane_terminals) fn window_link_slots_for(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Vec<WindowLinkSlot> {
-        let slot = self.window_link_slot(session_name, window_index);
-        self.window_link_group_id_for_slot_or_group_peer(session_name, window_index)
-            .and_then(|group_id| self.window_link_groups.get(group_id))
-            .map(|group| group.slots.clone())
-            .unwrap_or_else(|| vec![slot])
-    }
-
-    pub(crate) fn synchronize_linked_window_options_from_slot(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) {
-        let source = WindowTarget::with_window(session_name.clone(), window_index);
-        for slot in self.window_link_slots_for(session_name, window_index) {
-            let target = WindowTarget::with_window(slot.session_name, slot.window_index);
-            if target != source {
-                self.options.copy_window_overrides(&source, &target);
-            }
-        }
-    }
-
-    fn window_link_group_id_for_slot_or_group_peer(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Option<&u64> {
-        self.window_link_group_slot_for_slot_or_group_peer(session_name, window_index)
-            .and_then(|slot| self.window_link_slots.get(&slot))
-    }
-
-    fn window_link_group_slot_for_slot_or_group_peer(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Option<WindowLinkSlot> {
-        let slot = self.window_link_slot(session_name, window_index);
-        if self.window_link_slots.contains_key(&slot) {
-            return Some(slot);
-        }
-
-        self.sessions
-            .session_group_members(session_name)
-            .into_iter()
-            .filter(|member| member != session_name)
-            .find_map(|member| {
-                let member_slot = self.window_link_slot(&member, window_index);
-                self.window_link_slots
-                    .contains_key(&member_slot)
-                    .then_some(member_slot)
-            })
-    }
-
-    fn canonical_window_link_slot(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> WindowLinkSlot {
-        self.window_link_group_slot_for_slot_or_group_peer(session_name, window_index)
-            .unwrap_or_else(|| {
-                self.window_link_slot(&self.runtime_session_name(session_name), window_index)
-            })
-    }
-
     pub(in crate::pane_terminals) fn detach_window_link_slot(
         &mut self,
         session_name: &SessionName,
         window_index: u32,
     ) -> usize {
         let slot = self.canonical_window_link_slot(session_name, window_index);
+        self.detach_canonical_window_link_slot(slot)
+    }
+
+    fn detach_canonical_window_link_slot(&mut self, slot: WindowLinkSlot) -> usize {
+        let _ = self.window_link_occurrences.remove(&slot);
         let Some(group_id) = self.window_link_slots.remove(&slot) else {
             return 1;
         };
@@ -226,11 +76,16 @@ impl HandlerState {
         target_session_name: &SessionName,
         target_window_index: u32,
     ) {
-        let source_auto_named =
-            self.tracks_auto_named_window(source_session_name, source_window_index);
-        let source_slot = self.canonical_window_link_slot(source_session_name, source_window_index);
-        let target_slot = self.canonical_window_link_slot(target_session_name, target_window_index);
-        let _ = self.detach_window_link_slot(target_session_name, target_window_index);
+        let source_auto_named_key =
+            self.auto_named_window_key_by_index(source_session_name, source_window_index);
+        let source_auto_named = self.auto_named_windows.contains(&source_auto_named_key);
+        let source_slot =
+            self.canonical_window_link_slot_by_index(source_session_name, source_window_index);
+        let target_slot =
+            self.canonical_window_link_slot_by_index(target_session_name, target_window_index);
+        let _ = self.ensure_window_link_occurrence(&source_slot);
+        let _ = self.detach_canonical_window_link_slot(target_slot.clone());
+        self.renew_window_link_occurrence(target_slot.clone());
 
         let group_id = self
             .window_link_slots
@@ -262,7 +117,9 @@ impl HandlerState {
         }
         let _ = self.window_link_slots.insert(target_slot, group_id);
         if source_auto_named {
-            self.mark_auto_named_window(target_session_name, target_window_index);
+            let target_key =
+                self.auto_named_window_key_by_index(target_session_name, target_window_index);
+            let _ = self.auto_named_windows.insert(target_key);
         }
     }
 
@@ -292,8 +149,12 @@ impl HandlerState {
             return;
         }
 
-        let source_slot = self.canonical_window_link_slot(source_session_name, source_window_index);
-        let target_slot = self.canonical_window_link_slot(target_session_name, target_window_index);
+        let source_slot =
+            self.canonical_window_link_slot_by_index(source_session_name, source_window_index);
+        let target_slot =
+            self.canonical_window_link_slot_by_index(target_session_name, target_window_index);
+        let source_occurrence = self.window_link_occurrences.remove(&source_slot);
+        let target_occurrence = self.window_link_occurrences.remove(&target_slot);
         let source_group = self.window_link_slots.remove(&source_slot);
         let target_group = self.window_link_slots.remove(&target_slot);
         let source_runtime = self.runtime_session_name(&source_slot.session_name);
@@ -317,10 +178,20 @@ impl HandlerState {
         }
 
         if let Some(group_id) = source_group {
-            let _ = self.window_link_slots.insert(target_slot, group_id);
+            let _ = self.window_link_slots.insert(target_slot.clone(), group_id);
         }
         if let Some(group_id) = target_group {
-            let _ = self.window_link_slots.insert(source_slot, group_id);
+            let _ = self.window_link_slots.insert(source_slot.clone(), group_id);
+        }
+        if let Some(occurrence_id) = source_occurrence {
+            let _ = self
+                .window_link_occurrences
+                .insert(target_slot, occurrence_id);
+        }
+        if let Some(occurrence_id) = target_occurrence {
+            let _ = self
+                .window_link_occurrences
+                .insert(source_slot, occurrence_id);
         }
     }
 
@@ -336,8 +207,12 @@ impl HandlerState {
             return;
         }
 
-        let source_slot = self.canonical_window_link_slot(source_session_name, source_window_index);
-        let target_slot = self.canonical_window_link_slot(target_session_name, target_window_index);
+        let source_slot =
+            self.canonical_window_link_slot_by_index(source_session_name, source_window_index);
+        let target_slot =
+            self.canonical_window_link_slot_by_index(target_session_name, target_window_index);
+        let source_occurrence = self.window_link_occurrences.remove(&source_slot);
+        let _ = self.window_link_occurrences.remove(&target_slot);
         let source_group = self.window_link_slots.get(&source_slot).copied();
         let target_group = self.window_link_slots.get(&target_slot).copied();
         let source_runtime = self.runtime_session_name(&source_slot.session_name);
@@ -346,9 +221,21 @@ impl HandlerState {
         match (source_group, target_group) {
             (None, Some(_)) => {
                 let _ = self.detach_window_link_slot(target_session_name, target_window_index);
+                if let Some(occurrence_id) = source_occurrence {
+                    let _ = self
+                        .window_link_occurrences
+                        .insert(target_slot, occurrence_id);
+                }
                 return;
             }
-            (None, None) => return,
+            (None, None) => {
+                if let Some(occurrence_id) = source_occurrence {
+                    let _ = self
+                        .window_link_occurrences
+                        .insert(target_slot, occurrence_id);
+                }
+                return;
+            }
             (Some(source_group), Some(target_group)) if source_group != target_group => {
                 let _ = self.detach_window_link_slot(target_session_name, target_window_index);
             }
@@ -362,6 +249,11 @@ impl HandlerState {
         }
 
         let Some(group_id) = self.window_link_slots.remove(&source_slot) else {
+            if let Some(occurrence_id) = source_occurrence {
+                let _ = self
+                    .window_link_occurrences
+                    .insert(target_slot, occurrence_id);
+            }
             return;
         };
 
@@ -379,7 +271,12 @@ impl HandlerState {
             }
         }
 
-        let _ = self.window_link_slots.insert(target_slot, group_id);
+        let _ = self.window_link_slots.insert(target_slot.clone(), group_id);
+        if let Some(occurrence_id) = source_occurrence {
+            let _ = self
+                .window_link_occurrences
+                .insert(target_slot, occurrence_id);
+        }
     }
 
     pub(in crate::pane_terminals) fn linked_runtime_transfer_slot_for_detached_window(
@@ -416,8 +313,10 @@ impl HandlerState {
         target_session_name: &SessionName,
         target_window_index: u32,
     ) {
-        let source_key = self.auto_named_window_key(source_session_name, source_window_index);
-        let target_key = self.auto_named_window_key(target_session_name, target_window_index);
+        let source_key =
+            self.auto_named_window_key_by_index(source_session_name, source_window_index);
+        let target_key =
+            self.auto_named_window_key_by_index(target_session_name, target_window_index);
         if source_key == target_key {
             return;
         }
@@ -436,8 +335,10 @@ impl HandlerState {
         target_session_name: &SessionName,
         target_window_index: u32,
     ) {
-        let source_key = self.auto_named_window_key(source_session_name, source_window_index);
-        let target_key = self.auto_named_window_key(target_session_name, target_window_index);
+        let source_key =
+            self.auto_named_window_key_by_index(source_session_name, source_window_index);
+        let target_key =
+            self.auto_named_window_key_by_index(target_session_name, target_window_index);
         if source_key == target_key {
             return;
         }
@@ -481,6 +382,13 @@ impl HandlerState {
         }
         self.window_link_slots = remapped_slots;
 
+        let mut remapped_occurrences = HashMap::with_capacity(self.window_link_occurrences.len());
+        for (slot, occurrence_id) in &self.window_link_occurrences {
+            let next_slot = remapped_window_link_slot(slot, session_name, index_map);
+            remapped_occurrences.insert(next_slot, *occurrence_id);
+        }
+        self.window_link_occurrences = remapped_occurrences;
+
         for group in self.window_link_groups.values_mut() {
             group.slots = group
                 .slots
@@ -504,6 +412,15 @@ impl HandlerState {
         }
         self.window_link_slots = renamed_slots;
 
+        let mut renamed_occurrences = HashMap::with_capacity(self.window_link_occurrences.len());
+        for (slot, occurrence_id) in &self.window_link_occurrences {
+            renamed_occurrences.insert(
+                renamed_window_link_slot(slot, session_name, new_name),
+                *occurrence_id,
+            );
+        }
+        self.window_link_occurrences = renamed_occurrences;
+
         for group in self.window_link_groups.values_mut() {
             rename_window_link_runtime_session(group, session_name, new_name);
             group.slots = group
@@ -511,16 +428,6 @@ impl HandlerState {
                 .iter()
                 .map(|slot| renamed_window_link_slot(slot, session_name, new_name))
                 .collect();
-        }
-    }
-
-    pub(in crate::pane_terminals) fn rename_window_link_runtime_session(
-        &mut self,
-        session_name: &SessionName,
-        new_name: &SessionName,
-    ) {
-        for group in self.window_link_groups.values_mut() {
-            rename_window_link_runtime_session(group, session_name, new_name);
         }
     }
 
@@ -587,117 +494,8 @@ impl HandlerState {
         for slot in slots {
             let _ = self.detach_window_link_slot(&slot.session_name, slot.window_index);
         }
-    }
-
-    pub(crate) fn synchronize_linked_window_from_slot(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Result<(), RmuxError> {
-        let source_slot = self.window_link_slot(session_name, window_index);
-        let Some(group_id) = self
-            .window_link_group_id_for_slot_or_group_peer(session_name, window_index)
-            .copied()
-        else {
-            return Ok(());
-        };
-        let Some(group) = self.window_link_groups.get(&group_id).cloned() else {
-            return Ok(());
-        };
-        if group.slots.len() <= 1 {
-            return Ok(());
-        }
-
-        let source_window = self
-            .sessions
-            .session(session_name)
-            .and_then(|session| session.window_at(window_index))
-            .cloned()
-            .ok_or_else(|| {
-                RmuxError::invalid_target(
-                    format!("{session_name}:{window_index}"),
-                    "window index does not exist in session",
-                )
-            })?;
-
-        for slot in group.slots {
-            if slot == source_slot {
-                continue;
-            }
-            self.sessions
-                .session_mut(&slot.session_name)
-                .ok_or_else(|| session_not_found(&slot.session_name))?
-                .replace_window(slot.window_index, source_window.clone())?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn synchronize_linked_window_family_from_slot(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> Result<Vec<SessionName>, RmuxError> {
-        let linked_slots = self.window_link_slots_for(session_name, window_index);
-        self.synchronize_linked_window_from_slot(session_name, window_index)?;
-        let mut synchronized = HashSet::new();
-        for slot in linked_slots {
-            if synchronized.insert(slot.session_name.clone()) {
-                self.synchronize_session_group_from(&slot.session_name)?;
-            }
-        }
-        Ok(self.window_linked_session_family_list(session_name, window_index))
-    }
-
-    fn auto_named_window_key(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> (SessionName, u32) {
-        (self.runtime_session_name(session_name), window_index)
-    }
-
-    pub(crate) fn tracks_auto_named_window(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> bool {
-        self.auto_named_windows
-            .contains(&self.auto_named_window_key(session_name, window_index))
-    }
-
-    pub(crate) fn mark_auto_named_window(&mut self, session_name: &SessionName, window_index: u32) {
-        let key = self.auto_named_window_key(session_name, window_index);
-        let _ = self.auto_named_windows.insert(key);
-    }
-
-    pub(in crate::pane_terminals) fn clear_auto_named_window(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) {
-        let key = self.auto_named_window_key(session_name, window_index);
-        let _ = self.auto_named_windows.remove(&key);
-    }
-
-    pub(in crate::pane_terminals) fn clear_auto_named_window_family(
-        &mut self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) {
-        let linked_slots = self.window_link_slots_for(session_name, window_index);
-        let mut slots = linked_slots.clone();
-        for linked_slot in linked_slots {
-            for member in self
-                .sessions
-                .session_group_members(&linked_slot.session_name)
-            {
-                slots.push(self.window_link_slot(&member, linked_slot.window_index));
-            }
-        }
-        for slot in slots.into_iter().collect::<HashSet<_>>() {
-            self.clear_auto_named_window(&slot.session_name, slot.window_index);
-        }
+        self.window_link_occurrences
+            .retain(|slot, _| slot.session_name != *session_name);
     }
 }
 

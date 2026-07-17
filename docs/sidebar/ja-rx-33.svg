@@ -11,7 +11,7 @@
 <path d="M110 68 L118 64 L126 68 V84 L118 88 L110 84 Z M118 64 V80 M110 68 L118 72 L126 68" stroke="#c9d1d9" stroke-width="1.6" stroke-linejoin="round" />
 <text x="146" y="80" class="label">rmux</text>
 <rect x="258" y="62" width="58" height="24" rx="4" fill="#3478f6" />
-<text x="267" y="78" class="badge">0.7.0</text>
+<text x="267" y="78" class="badge">0.9.0</text>
 <line x1="90" y1="108" x2="486" y2="108" stroke="#3d444d" stroke-width="1" />
 <circle cx="118" cy="118" r="10" stroke="#39c5cf" stroke-width="2.2" />
 <path d="M113 118 L117 122 L125 114" stroke="#39c5cf" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />

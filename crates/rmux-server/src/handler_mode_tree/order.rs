@@ -1,23 +1,46 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use rmux_proto::SessionName;
+use rmux_proto::{PaneId, SessionId, WindowId};
+
+use crate::pane_terminals::WindowLinkOccurrenceId;
 
 use super::mode_tree_model::{ModeTreeBuild, ModeTreeClientState, ModeTreeItem};
 
-pub(super) fn session_item_id(session_name: &SessionName) -> String {
-    format!("session:{session_name}")
+pub(super) fn session_item_id(session_id: SessionId) -> String {
+    format!("session:{session_id}")
 }
 
-pub(super) fn window_item_id(session_name: &SessionName, window_index: u32) -> String {
-    format!("window:{session_name}:{window_index}")
+pub(super) fn client_item_id(pid: u32, attach_id: u64) -> String {
+    format!("client:{pid}:{attach_id}")
+}
+
+pub(super) fn buffer_item_id(name: &str, order: u64) -> String {
+    format!("buffer:{order}:{name}")
+}
+
+pub(super) fn window_item_id(
+    session_id: SessionId,
+    window_index: u32,
+    window_id: WindowId,
+    occurrence_id: WindowLinkOccurrenceId,
+) -> String {
+    format!(
+        "window:{session_id}:{window_index}:{window_id}:{}",
+        occurrence_id.as_u64()
+    )
 }
 
 pub(super) fn pane_item_id(
-    session_name: &SessionName,
+    session_id: SessionId,
     window_index: u32,
-    pane_index: u32,
+    window_id: WindowId,
+    occurrence_id: WindowLinkOccurrenceId,
+    pane_id: PaneId,
 ) -> String {
-    format!("pane:{session_name}:{window_index}:{pane_index}")
+    format!(
+        "pane:{session_id}:{window_index}:{window_id}:{}:{pane_id}",
+        occurrence_id.as_u64()
+    )
 }
 
 pub(super) fn finalize_mode_tree(

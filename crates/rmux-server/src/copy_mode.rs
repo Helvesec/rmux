@@ -7,6 +7,8 @@ mod args;
 mod commands;
 #[path = "copy_mode/motion.rs"]
 mod motion;
+#[path = "copy_mode/render.rs"]
+mod render;
 #[path = "copy_mode/search.rs"]
 mod search;
 #[path = "copy_mode/selection.rs"]
@@ -29,7 +31,8 @@ pub(crate) use transfer::run_pipe_command;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
     CopyBufferTarget, CopyModeCommandContext, CopyModeCommandOutcome, CopyModeMouseContext,
-    CopyModePipeCommand, CopyModeSummary, CopyModeTransfer, CopyPosition, ModeKeys,
+    CopyModeOverlayRange, CopyModePipeCommand, CopyModeRenderOverlays, CopyModeRenderSnapshot,
+    CopyModeSummary, CopyModeTransfer, CopyPosition, ModeKeys,
 };
 use types::{JumpState, SearchDirection, SearchMatch, SelectionState};
 
@@ -59,6 +62,30 @@ pub(crate) struct CopyModeState {
     search_count_partial: bool,
     search_highlighted: bool,
     jump: Option<JumpState>,
+    recentre_top_bottom: Option<RecentreTopBottomState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecentreTopBottomState {
+    line: usize,
+    next: RecentreTopBottomPosition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecentreTopBottomPosition {
+    Middle,
+    Top,
+    Bottom,
+}
+
+impl RecentreTopBottomPosition {
+    const fn next(self) -> Self {
+        match self {
+            Self::Middle => Self::Top,
+            Self::Top => Self::Bottom,
+            Self::Bottom => Self::Middle,
+        }
+    }
 }
 
 impl CopyModeState {
@@ -96,6 +123,7 @@ impl CopyModeState {
             search_count_partial: false,
             search_highlighted: false,
             jump: None,
+            recentre_top_bottom: None,
             backing,
         };
         state.top_line = state.bottom_top_line();
@@ -177,16 +205,6 @@ impl CopyModeState {
             let plain = !pattern_looks_like_regex(&self.search_pattern);
             self.rebuild_search_results(plain);
         }
-    }
-
-    pub(crate) fn render_screen(&self) -> Screen {
-        let mut viewport = self
-            .backing
-            .clone_viewport(self.top_line, self.cursor.x, self.cursor.y);
-        if let Some(selection) = self.selection_snapshot() {
-            self.mark_selection_in_viewport(&mut viewport, selection);
-        }
-        viewport
     }
 
     pub(crate) fn summary(&self) -> CopyModeSummary {

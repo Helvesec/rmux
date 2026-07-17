@@ -43,6 +43,12 @@ Signed-off-by: Your Name <you@example.com>
 
 For Linux, macOS, Windows, terminal, PTY, or shell compatibility changes, mention which platform was tested in the pull request.
 
+## Rust toolchain bumps
+
+`rust-toolchain.toml` pins the exact workspace compiler. Bump it in its own
+reviewable change or in a release stabilization change that runs the full
+workspace build, test, clippy, and format gates on every supported platform.
+
 ## Security issues
 
 Do not open a public issue for security problems. See [SECURITY.md](SECURITY.md).

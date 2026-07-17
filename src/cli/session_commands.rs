@@ -7,7 +7,10 @@ use rmux_proto::request::{KillSessionRequest, ListSessionsRequest, NewSessionExt
 use rmux_proto::{ClientTerminalContext, ErrorResponse, Response};
 
 use super::json_output::{list_sessions_json_format, write_list_sessions_json};
-use super::{attach_with_connection, current_terminal_size, run_switch_client_on_connection};
+use super::{
+    attach_with_connection, current_terminal_size, require_attach_terminal,
+    run_switch_client_on_connection,
+};
 use super::{
     build_terminal_size, connect_with_startserver, expect_command_success, optional_client_flags,
     resolve_current_session_target, resolve_session_target_or_current, resolve_session_target_spec,
@@ -33,7 +36,13 @@ pub(super) fn run_new_session(
         ));
     }
 
+    let client_context = detect_context();
     let mut connection = connect_with_startserver(socket_path, startup)?;
+    if !args.detached && client_context == ClientContext::Outside {
+        reject_existing_session_before_attach_preflight(&args, &mut connection)?;
+        require_attach_terminal()?;
+    }
+
     let client_flags = optional_client_flags(args.flags.clone());
     let working_directory = args
         .working_directory
@@ -76,7 +85,7 @@ pub(super) fn run_new_session(
         return Ok(0);
     }
 
-    match detect_context() {
+    match client_context {
         ClientContext::Nested => run_switch_client_on_connection(
             &mut connection,
             SwitchClientExt3Request {
@@ -107,6 +116,31 @@ pub(super) fn run_new_session(
                 client_size: current_terminal_size(),
             },
         ),
+    }
+}
+
+fn reject_existing_session_before_attach_preflight(
+    args: &NewSessionArgs,
+    connection: &mut rmux_client::Connection,
+) -> Result<(), ExitFailure> {
+    let Some(session_name) = args
+        .session_name
+        .as_ref()
+        .filter(|_| !args.attach_if_exists)
+    else {
+        return Ok(());
+    };
+    let response = connection
+        .has_session(session_name.clone())
+        .map_err(ExitFailure::from_client)?;
+    match response {
+        Response::HasSession(response) if response.exists => Err(ExitFailure::new(
+            1,
+            format!("duplicate session: {session_name}"),
+        )),
+        Response::HasSession(_) => Ok(()),
+        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error.to_string())),
+        other => Err(unexpected_response("has-session", &other)),
     }
 }
 
@@ -173,7 +207,8 @@ where
 fn invoking_client_shell() -> Option<String> {
     let parent_pid = rmux_os::process::parent_pid(std::process::id())?;
     let parent_name = rmux_os::process::command_name(parent_pid)?;
-    windows_client_shell_for_parent_name(&parent_name)
+    let environment = crate::windows_shell::WindowsShellEnvironment::current();
+    windows_client_shell_for_parent_name(&parent_name, &environment)
 }
 
 #[cfg(windows)]
@@ -201,37 +236,11 @@ where
 }
 
 #[cfg(windows)]
-fn windows_client_shell_for_parent_name(parent_name: &str) -> Option<String> {
-    let lower = parent_name.to_ascii_lowercase();
-    match lower.as_str() {
-        "cmd.exe" | "cmd" => Some(
-            std::env::var_os("COMSPEC")
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "cmd.exe".into())
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        "powershell.exe" | "powershell" => {
-            if windows_command_available_on_path("pwsh.exe") {
-                Some("pwsh.exe".to_owned())
-            } else {
-                Some("powershell.exe".to_owned())
-            }
-        }
-        "pwsh.exe" | "pwsh" => Some("pwsh.exe".to_owned()),
-        "bash.exe" | "bash" | "sh.exe" | "sh" | "zsh.exe" | "zsh" | "nu.exe" | "nu" => {
-            Some(parent_name.to_owned())
-        }
-        _ => None,
-    }
-}
-
-#[cfg(windows)]
-fn windows_command_available_on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|directory| directory.join(name).is_file())
+fn windows_client_shell_for_parent_name(
+    parent_name: &str,
+    environment: &crate::windows_shell::WindowsShellEnvironment,
+) -> Option<String> {
+    crate::windows_shell::client_shell_for_parent_name(parent_name, environment)
 }
 
 #[cfg(not(windows))]
@@ -297,6 +306,7 @@ pub(super) fn run_kill_session(
             target,
             kill_all_except_target: args.kill_all_except_target,
             clear_alerts: args.clear_alerts,
+            kill_group: args.kill_group,
         })
         .map_err(ExitFailure::from_client)?;
     expect_command_success(response, "kill-session")?;
@@ -366,10 +376,12 @@ mod tests {
 
     #[cfg(windows)]
     use super::{
-        internal_client_shell_handoff_from_vars, windows_invoking_client_environment,
-        INTERNAL_CLIENT_SHELL_ENV, INTERNAL_TMUX_COMPAT_ENV, PUBLIC_BINARY_OVERRIDE_ENV,
-        RMUX_CLIENT_SHELL_ENV,
+        internal_client_shell_handoff_from_vars, windows_client_shell_for_parent_name,
+        windows_invoking_client_environment, INTERNAL_CLIENT_SHELL_ENV, INTERNAL_TMUX_COMPAT_ENV,
+        PUBLIC_BINARY_OVERRIDE_ENV, RMUX_CLIENT_SHELL_ENV,
     };
+    #[cfg(windows)]
+    use crate::windows_shell::WindowsShellEnvironment;
 
     #[cfg(windows)]
     fn env_pair(name: &str, value: &str) -> (OsString, OsString) {
@@ -428,5 +440,56 @@ mod tests {
         assert!(!environment
             .iter()
             .any(|entry| entry.starts_with("RMUX_INTERNAL_INVOKED_AS_TMUX=")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_full_cli_shell_mapping_skips_alias_and_uses_real_pwsh() {
+        let root =
+            std::env::temp_dir().join(format!("rmux-full-shell-hint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let alias_dir = root.join("Microsoft").join("WindowsApps");
+        let regular_dir = root.join("PowerShell").join("7");
+        let powershell = root
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let cmd = root.join("System32").join("cmd.exe");
+        std::fs::create_dir_all(&alias_dir).expect("WindowsApps fixture directory");
+        std::fs::create_dir_all(&regular_dir).expect("regular shell fixture directory");
+        std::fs::create_dir_all(powershell.parent().expect("PowerShell fixture parent"))
+            .expect("PowerShell fixture directory");
+        std::fs::create_dir_all(cmd.parent().expect("cmd fixture parent"))
+            .expect("cmd fixture directory");
+        std::fs::write(alias_dir.join("pwsh.exe"), b"").expect("alias pwsh fixture");
+        std::fs::write(regular_dir.join("pwsh.exe"), b"").expect("regular pwsh fixture");
+        std::fs::write(&powershell, b"").expect("Windows PowerShell fixture");
+        std::fs::write(&cmd, b"").expect("cmd fixture");
+
+        let real_path = std::env::join_paths([alias_dir.as_os_str(), regular_dir.as_os_str()])
+            .expect("PATH with real pwsh");
+        let real_environment = WindowsShellEnvironment::for_test(
+            Some(real_path),
+            Some(root.clone().into_os_string()),
+            Some(cmd.clone().into_os_string()),
+        );
+        assert_eq!(
+            windows_client_shell_for_parent_name("powershell.exe", &real_environment).as_deref(),
+            Some("pwsh.exe")
+        );
+
+        let alias_path = std::env::join_paths([alias_dir.as_os_str()]).expect("alias-only PATH");
+        let alias_environment = WindowsShellEnvironment::for_test(
+            Some(alias_path),
+            Some(root.clone().into_os_string()),
+            Some(cmd.into_os_string()),
+        );
+        assert_eq!(
+            windows_client_shell_for_parent_name("pwsh.exe", &alias_environment).as_deref(),
+            Some("powershell.exe")
+        );
+
+        std::fs::remove_dir_all(root).expect("remove full shell fixture");
     }
 }

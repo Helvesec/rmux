@@ -48,10 +48,9 @@ pub(super) fn open_attach_target(
 ) -> io::Result<OpenAttachTarget> {
     let AttachTarget {
         session_name,
-        input_target,
-        pane_master,
+        pane_master: _,
         pane_output,
-        pane_output_start_sequence,
+        pane_output_start_sequence: _,
         render_frame,
         outer_terminal,
         cursor_style,
@@ -64,11 +63,9 @@ pub(super) fn open_attach_target(
     } = target;
     Ok(OpenAttachTarget {
         session_name,
-        input_target,
-        pane_master,
         predicted_echo: Default::default(),
         predicted_echo_started_at: None,
-        pane_output: Some(pane_output.subscribe_live_from_sequence(pane_output_start_sequence)),
+        pane_output: Some(pane_output),
         render_frame,
         outer_terminal,
         cursor_style,

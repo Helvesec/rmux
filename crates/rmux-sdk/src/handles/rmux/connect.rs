@@ -1,8 +1,9 @@
-use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -12,20 +13,19 @@ use crate::bootstrap::discovery;
 use crate::diagnostics::FEATURE_TRANSPORT_UNIX_SOCKET;
 #[cfg(unix)]
 use crate::diagnostics::FEATURE_TRANSPORT_WINDOWS_PIPE;
-use crate::transport::TransportClient;
+use crate::transport::{OperationDeadline, TransportClient};
 use crate::{Result, RmuxEndpoint, RmuxError};
-#[cfg(windows)]
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED,
 };
 
 const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";
+#[cfg(any(unix, windows))]
+#[path = "connect/startup_config.rs"]
+mod startup_config;
 #[cfg(windows)]
 const WINDOWS_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-#[cfg(windows)]
-const WINDOWS_STARTUP_READY_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 pub(super) async fn connect_transport(
@@ -65,51 +65,68 @@ pub(crate) async fn connect_or_start_transport(
     endpoint: &RmuxEndpoint,
     default_timeout: Option<Duration>,
 ) -> Result<TransportClient> {
-    connect_or_start_transport_for_platform(endpoint, default_timeout).await
+    let deadline = OperationDeadline::from_timeout(startup_operation_timeout(default_timeout));
+    let caller_cwd = std::env::current_dir().ok();
+    connect_or_start_transport_for_platform(endpoint, deadline, caller_cwd).await
 }
 
 #[cfg(unix)]
 async fn connect_or_start_transport_for_platform(
     endpoint: &RmuxEndpoint,
-    default_timeout: Option<Duration>,
+    deadline: OperationDeadline,
+    caller_cwd: Option<PathBuf>,
 ) -> Result<TransportClient> {
-    let timeout = startup_operation_timeout(default_timeout);
     let RmuxEndpoint::UnixSocket(socket_path) = endpoint else {
-        return connect_transport(endpoint, timeout).await;
+        return connect_transport(endpoint, deadline.remaining_timeout()).await;
     };
     let socket_path = socket_path.clone();
+    let launcher_cwd = caller_cwd.clone();
     let outcome = crate::bootstrap::startup_unix::connect_or_start_with_timeout(
         &socket_path,
         || {
             let socket_path = socket_path.clone();
-            async move { spawn_hidden_daemon(socket_path.as_os_str()) }
+            async move {
+                startup_config::spawn_hidden_daemon(
+                    socket_path.as_os_str(),
+                    launcher_cwd.as_deref(),
+                    deadline,
+                )
+            }
         },
-        timeout,
+        deadline.remaining_timeout(),
         crate::bootstrap::startup_unix::STARTUP_POLL_INTERVAL,
     )
     .await
     .map_err(startup_error)?;
-    Ok(TransportClient::spawn(outcome.into_stream()))
+    let transport = TransportClient::spawn(outcome.into_stream()).with_operation_deadline(deadline);
+    startup_config::wait_until_loaded(&transport, deadline).await?;
+    Ok(transport.reusable())
 }
 
 #[cfg(windows)]
 async fn connect_or_start_transport_for_platform(
     endpoint: &RmuxEndpoint,
-    default_timeout: Option<Duration>,
+    startup_deadline: OperationDeadline,
+    caller_cwd: Option<PathBuf>,
 ) -> Result<TransportClient> {
-    let timeout = startup_operation_timeout(default_timeout);
-    let startup_deadline = StartupDeadline::from_timeout(timeout);
     let RmuxEndpoint::WindowsPipe(pipe) = endpoint else {
-        return connect_transport(endpoint, timeout).await;
+        return connect_transport(endpoint, startup_deadline.remaining_timeout()).await;
     };
     let pipe_path = std::path::PathBuf::from(pipe);
+    let launcher_cwd = caller_cwd.clone();
     let outcome = crate::bootstrap::startup_windows::connect_or_start_with_timeout(
         &pipe_path,
         || {
             let pipe_path = pipe_path.clone();
-            async move { spawn_hidden_daemon(pipe_path.as_os_str()) }
+            async move {
+                startup_config::spawn_hidden_daemon(
+                    pipe_path.as_os_str(),
+                    launcher_cwd.as_deref(),
+                    startup_deadline,
+                )
+            }
         },
-        startup_deadline.requested_timeout(),
+        startup_deadline.remaining_timeout(),
         crate::bootstrap::startup_windows::STARTUP_POLL_INTERVAL,
     )
     .await
@@ -121,7 +138,11 @@ async fn connect_or_start_transport_for_platform(
     // startup budget so connect_or_start never becomes startup timeout plus
     // another full connect timeout.
     drop_windows_startup_probe_stream(outcome).await?;
-    connect_transport(endpoint, startup_deadline.remaining_timeout()).await
+    let transport = connect_transport(endpoint, startup_deadline.remaining_timeout())
+        .await?
+        .with_operation_deadline(startup_deadline);
+    startup_config::wait_until_loaded(&transport, startup_deadline).await?;
+    Ok(transport.reusable())
 }
 
 #[cfg(windows)]
@@ -141,69 +162,14 @@ async fn drop_windows_startup_probe_stream(
 #[cfg(not(any(unix, windows)))]
 async fn connect_or_start_transport_for_platform(
     endpoint: &RmuxEndpoint,
-    default_timeout: Option<Duration>,
+    deadline: OperationDeadline,
+    _caller_cwd: Option<PathBuf>,
 ) -> Result<TransportClient> {
-    connect_transport(endpoint, startup_operation_timeout(default_timeout)).await
+    connect_transport(endpoint, deadline.remaining_timeout()).await
 }
 
 pub(super) fn startup_operation_timeout(default_timeout: Option<Duration>) -> Option<Duration> {
     discovery::resolve_timeout(None, default_timeout)
-}
-
-fn spawn_hidden_daemon(endpoint: &OsStr) -> io::Result<()> {
-    let candidates = hidden_daemon_binary_candidates();
-    let mut last_error = None;
-    for (index, binary) in candidates.iter().enumerate() {
-        let result = match spawn_hidden_daemon_with_binary(endpoint, binary, true) {
-            Ok(()) => return Ok(()),
-            Err(error) if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) => {
-                spawn_hidden_daemon_with_binary(endpoint, binary, false)
-            }
-            Err(error) => Err(error),
-        };
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound && index + 1 < candidates.len() =>
-            {
-                last_error = Some(error);
-                continue;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                last_error = Some(error);
-                break;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    Err(hidden_daemon_not_found_error(&candidates, last_error))
-}
-
-fn spawn_hidden_daemon_with_binary(
-    endpoint: &OsStr,
-    binary: &OsStr,
-    allow_job_breakaway: bool,
-) -> io::Result<()> {
-    #[cfg(windows)]
-    let ready = rmux_os::daemon::StartupReadyEvent::new()?;
-    let mut command = Command::new(binary);
-    command
-        .arg(INTERNAL_DAEMON_FLAG)
-        .arg(endpoint)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    command.arg("--startup-ready-event").arg(ready.name());
-    rmux_os::daemon::configure_hidden_daemon_command(&mut command, allow_job_breakaway);
-    let child = rmux_os::daemon::spawn_hidden_daemon_command(&mut command)?;
-    drop(child);
-    #[cfg(windows)]
-    {
-        let _ = ready.wait(WINDOWS_STARTUP_READY_EVENT_TIMEOUT);
-    }
-    Ok(())
 }
 
 pub(super) fn daemon_binary() -> std::ffi::OsString {
@@ -375,13 +341,19 @@ pub(super) async fn connect_transport(
 }
 
 #[cfg(windows)]
-async fn connect_windows_pipe(pipe: &str, timeout: Option<Duration>) -> Result<NamedPipeClient> {
+async fn connect_windows_pipe(
+    pipe: &str,
+    timeout: Option<Duration>,
+) -> Result<rmux_ipc::WindowsPipeClient> {
     let deadline = StartupDeadline::from_timeout(timeout);
     loop {
-        match ClientOptions::new().open(std::path::Path::new(pipe)) {
+        match rmux_ipc::connect_windows_pipe(OsStr::new(pipe)).await {
             Ok(stream) => return Ok(stream),
             Err(error) if windows_pipe_connect_retryable(&error) => {
-                if deadline.is_elapsed() {
+                if deadline
+                    .remaining_timeout()
+                    .is_some_and(|remaining| remaining.is_zero())
+                {
                     return Err(RmuxError::transport(
                         "connect to rmux daemon",
                         timeout_error(

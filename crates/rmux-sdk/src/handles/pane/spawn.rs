@@ -84,8 +84,8 @@ impl<'a> PaneSpawnBuilder<'a> {
                 message: rmux_proto::PROCESS_COMMAND_EMPTY_MESSAGE.to_owned(),
             });
         }
-        let target = self
-            .pane
+        let pane = self.pane.begin_operation_handle();
+        let target = pane
             .respawn(PaneRespawnOptions {
                 kill: self.kill_existing,
                 start_directory: self.cwd,
@@ -98,7 +98,7 @@ impl<'a> PaneSpawnBuilder<'a> {
             })
             .await?;
         if let Some(title) = self.title {
-            self.pane.set_title(title).await?;
+            pane.set_title(title).await?;
         }
         Ok(target)
     }

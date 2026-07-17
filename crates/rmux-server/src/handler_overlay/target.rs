@@ -1,48 +1,44 @@
 use rmux_proto::{PaneTarget, RmuxError, Target};
 
+use super::super::attach_support::ActiveAttachIdentity;
 use super::super::RequestHandler;
 use super::support::{find_session_name_by_id, find_window_target_by_id};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 
 impl RequestHandler {
-    pub(in crate::handler) async fn attached_mouse_target(
+    pub(in crate::handler) async fn attached_mouse_target_for_session_identity(
         &self,
-        attach_pid: u32,
+        identity: ActiveAttachIdentity,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
         event: &AttachedMouseEvent,
     ) -> Result<Option<Target>, RmuxError> {
-        let session_name = self.attached_session_name(attach_pid).await?;
-        self.overlay_target_from_mouse(session_name, Some(event))
+        {
+            let active_attach = self.active_attach.lock().await;
+            let Some(_active) = active_attach
+                .by_pid
+                .get(&identity.attach_pid())
+                .filter(|active| {
+                    identity.matches_active_session(active, session_name, session_id)
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+            else {
+                return Ok(None);
+            };
+        }
+        self.overlay_target_from_mouse(session_name.clone(), Some(session_id), Some(event))
             .await
     }
 
-    pub(super) async fn resolve_overlay_client(
+    pub(in crate::handler) async fn resolve_overlay_client(
         &self,
         requester_pid: u32,
         target_client: Option<&str>,
         command_name: &str,
     ) -> Result<u32, RmuxError> {
-        if let Some(target_client) = target_client {
-            if target_client == "=" {
-                return self
-                    .resolve_attached_client_pid(requester_pid, command_name)
-                    .await;
-            }
-            let pid = target_client.parse::<u32>().map_err(|_| {
-                RmuxError::Server(format!("invalid {command_name} client '{target_client}'"))
-            })?;
-            let active_attach = self.active_attach.lock().await;
-            if active_attach.by_pid.contains_key(&pid) {
-                Ok(pid)
-            } else {
-                Err(RmuxError::Server(format!(
-                    "{command_name} client {pid} is not attached"
-                )))
-            }
-        } else {
-            self.resolve_attached_client_pid(requester_pid, command_name)
-                .await
-                .map_err(|error| overlay_client_error(error, command_name))
-        }
+        self.resolve_target_attach_client_pid(requester_pid, target_client, command_name)
+            .await
+            .map_err(|error| overlay_client_error(error, command_name))
     }
 
     pub(super) async fn resolve_overlay_target(
@@ -67,7 +63,7 @@ impl RequestHandler {
                 .and_then(|active| active.mouse.current_event.clone())
         };
         if let Some(target) = self
-            .overlay_target_from_mouse(session_name.clone(), mouse_event.as_ref())
+            .overlay_target_from_mouse(session_name.clone(), None, mouse_event.as_ref())
             .await?
         {
             return Ok(target);
@@ -78,6 +74,7 @@ impl RequestHandler {
     async fn overlay_target_from_mouse(
         &self,
         attached_session: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
         event: Option<&AttachedMouseEvent>,
     ) -> Result<Option<Target>, RmuxError> {
         let Some(event) = event else {
@@ -87,6 +84,14 @@ impl RequestHandler {
             return Ok(Some(Target::Pane(target)));
         }
         let state = self.state.lock().await;
+        if expected_session_id.is_some_and(|expected| {
+            state
+                .sessions
+                .session(&attached_session)
+                .is_none_or(|session| session.id() != expected)
+        }) {
+            return Err(RmuxError::Server("attached session disappeared".to_owned()));
+        }
         match event.location {
             MouseLocation::StatusLeft => Ok(Some(Target::Session(attached_session))),
             MouseLocation::Status | MouseLocation::StatusDefault | MouseLocation::StatusRight => {

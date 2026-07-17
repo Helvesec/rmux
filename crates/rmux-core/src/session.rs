@@ -189,6 +189,28 @@ impl Session {
         direction: SplitDirection,
         before: bool,
     ) -> Result<u32, RmuxError> {
+        self.split_pane_in_window_with_id_and_direction_before_detached(
+            window_index,
+            pane_index,
+            pane_id,
+            direction,
+            before,
+            false,
+        )
+    }
+
+    /// Splits like [`Self::split_pane_in_window_with_id_and_direction_before`]
+    /// but honors tmux `-d`: a detached spawn leaves the active pane, the
+    /// last pane, and the active_point counters untouched.
+    pub fn split_pane_in_window_with_id_and_direction_before_detached(
+        &mut self,
+        window_index: u32,
+        pane_index: u32,
+        pane_id: PaneId,
+        direction: SplitDirection,
+        before: bool,
+        detached: bool,
+    ) -> Result<u32, RmuxError> {
         let window = self
             .window_at(window_index)
             .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
@@ -206,7 +228,9 @@ impl Session {
         Ok(self
             .window_at_mut(window_index)
             .expect("addressed session window must exist")
-            .split_at_position_with_id_and_direction(position, pane_id, direction, before))
+            .split_at_position_with_id_and_direction_detached(
+                position, pane_id, direction, before, detached,
+            ))
     }
 
     /// Splits the full addressed window root and returns the new pane index.
@@ -217,6 +241,27 @@ impl Session {
         pane_id: PaneId,
         direction: SplitDirection,
         before: bool,
+    ) -> Result<u32, RmuxError> {
+        self.split_pane_full_size_in_window_with_id_and_direction_before_detached(
+            window_index,
+            pane_index,
+            pane_id,
+            direction,
+            before,
+            false,
+        )
+    }
+
+    /// Full-size split honoring tmux `-d` like
+    /// [`Self::split_pane_in_window_with_id_and_direction_before_detached`].
+    pub fn split_pane_full_size_in_window_with_id_and_direction_before_detached(
+        &mut self,
+        window_index: u32,
+        pane_index: u32,
+        pane_id: PaneId,
+        direction: SplitDirection,
+        before: bool,
+        detached: bool,
     ) -> Result<u32, RmuxError> {
         let window = self
             .window_at(window_index)
@@ -234,6 +279,10 @@ impl Session {
             .window_at_mut(window_index)
             .expect("addressed session window must exist");
         let previous_active_pane_id = window.active_pane().map(Pane::id);
+        let previous_last_pane_id = window
+            .last_pane_index()
+            .and_then(|pane_index| window.pane(pane_index))
+            .map(Pane::id);
         let new_index = window
             .panes()
             .iter()
@@ -246,7 +295,12 @@ impl Session {
             direction,
             before,
         )?;
-        window.renumber_panes_by_position(pane_id, previous_active_pane_id);
+        window.commit_split_renumber(
+            pane_id,
+            previous_active_pane_id,
+            previous_last_pane_id,
+            detached,
+        );
         window
             .panes()
             .iter()
@@ -439,6 +493,16 @@ impl Session {
         for window in self.windows.values_mut() {
             window.set_size(size);
         }
+    }
+
+    /// Updates the backing terminal size and recalculates only the active window geometry.
+    ///
+    /// Attached clients drive the size of the window they are currently viewing. Inactive
+    /// windows can have independent policies and may share a runtime with another session, so
+    /// resizing every window here would leak the active window's size into unrelated runtimes.
+    pub fn resize_active_window_terminal(&mut self, size: TerminalSize) {
+        self.terminal_size = size;
+        self.window_mut().set_size(size);
     }
 
     fn resolve_window_target_mut(&mut self, window_index: u32) -> Result<&mut Window, RmuxError> {

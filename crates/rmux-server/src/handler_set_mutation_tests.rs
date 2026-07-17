@@ -77,6 +77,87 @@ async fn set_option_updates_the_store_and_session_values_override_global() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn typed_and_named_default_shell_mutations_reject_unsuitable_paths() {
+    let handler = RequestHandler::new();
+    let invalid = "/definitely/missing/rmux-shell";
+    let expected = Response::Error(ErrorResponse {
+        error: RmuxError::Message(format!("not a suitable shell: {invalid}")),
+    });
+
+    assert_eq!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::DefaultShell,
+                value: invalid.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        expected
+    );
+    assert_eq!(
+        handler
+            .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+                scope: OptionScopeSelector::SessionGlobal,
+                name: "default-shell".to_owned(),
+                value: Some(invalid.to_owned()),
+                mode: SetOptionMode::Replace,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                format: false,
+                format_target: None,
+            })))
+            .await,
+        expected
+    );
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .options
+            .global_value(OptionName::DefaultShell),
+        None
+    );
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::DefaultShell,
+                value: "/bin/sh".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    assert_eq!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::DefaultShell,
+                value: ".invalid".to_owned(),
+                mode: SetOptionMode::Append,
+            }))
+            .await,
+        Response::Error(ErrorResponse {
+            error: RmuxError::Message("not a suitable shell: /bin/sh.invalid".to_owned()),
+        })
+    );
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .options
+            .global_value(OptionName::DefaultShell),
+        Some("/bin/sh")
+    );
+}
+
 #[tokio::test]
 async fn terminal_features_append_preserves_order_and_invalid_requests_fail_first() {
     let handler = RequestHandler::new();
@@ -123,25 +204,25 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
         .await;
     assert_eq!(
         scalar_append,
-        Response::Error(rmux_proto::ErrorResponse {
-            error: RmuxError::InvalidSetOption("status is not an array option".to_owned()),
+        Response::SetOption(rmux_proto::SetOptionResponse {
+            scope: ScopeSelector::Global,
+            option: OptionName::Status,
+            mode: SetOptionMode::Append,
         })
     );
 
-    let invalid_scope = handler
+    let invalid_value = handler
         .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Session(session_name("missing")),
-            option: OptionName::TerminalFeatures,
-            value: "rxvt*:ccolour".to_owned(),
+            scope: ScopeSelector::Global,
+            option: OptionName::Status,
+            value: "maybe".to_owned(),
             mode: SetOptionMode::Replace,
         }))
         .await;
     assert_eq!(
-        invalid_scope,
+        invalid_value,
         Response::Error(ErrorResponse {
-            error: RmuxError::InvalidSetOption(
-                "terminal-features is only supported at global scope".to_owned()
-            ),
+            error: RmuxError::InvalidSetOption("unknown value: maybe".to_owned()),
         })
     );
 
@@ -152,7 +233,7 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
             "xterm*:clipboard:ccolour:cstyle:focus:title,screen*:title,rxvt*:ignorefkeys,xterm*:RGB,screen*:AX"
         )
     );
-    assert_eq!(state.options.global_value(OptionName::Status), None);
+    assert_eq!(state.options.global_value(OptionName::Status), Some("off"));
 }
 
 #[tokio::test]

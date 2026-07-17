@@ -27,8 +27,8 @@ use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::termios::{tcgetattr, tcgetwinsize, tcsetattr, OptionalActions, SpecialCodeIndex};
 
 pub(crate) use attach::{
-    drain_attach_output, drain_attach_output_bytes, read_until_contains, read_until_contains_all,
-    AttachedSession,
+    assert_termios_eq, drain_attach_output, drain_attach_output_bytes, prepare_canonical_termios,
+    read_until_contains, read_until_contains_all, AttachedSession,
 };
 pub(crate) use cli::{
     acquire_empty_socket_path_lock, assert_clap_failure, assert_success, stderr, stdout,
@@ -37,7 +37,9 @@ pub(crate) use cli::{
 pub(crate) use tmux_compat::{
     CapturedCommand, EnvironmentOverrides, FrozenTmuxBinary, TmuxCompatHarness, TmuxCompatRun,
     TmuxCompatRunConfig, DEFAULT_FROZEN_TMUX_PATH, DEFAULT_TMUX_COMPAT_TERM, FROZEN_TMUX_ENV,
-    FROZEN_TMUX_REFERENCE_REL_PATH, PTY_SERIALIZATION_NOTE, TMUX_COMPAT_PREREQUISITES_NOTE,
+    FROZEN_TMUX_REFERENCE_REL_PATH, PTY_SERIALIZATION_NOTE, REQUIRE_FROZEN_TMUX_ENV,
+    REQUIRE_TMUX_ENV, TMUX_COMPAT_DIVERGENCE_LEDGER_REL_PATH, TMUX_COMPAT_PREREQUISITES_NOTE,
+    TMUX_ORACLE_ENV,
 };
 pub(crate) use workflow_fixture::{
     verify_fixture_coherence, WorkflowStep, CANONICAL_SESSION_WORKFLOW, EXPECTED_LABELS,

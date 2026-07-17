@@ -70,6 +70,59 @@ fn buffer_operations_with_multibyte_chars() {
 }
 
 #[test]
+fn batched_text_inserts_once_at_the_unicode_cursor() {
+    let plan = CommandPromptPlan {
+        requester_pid: 1,
+        target_client: None,
+        context: QueueExecutionContext::without_caller_cwd(),
+        fields: vec![PromptField {
+            prompt: ":".to_owned(),
+            input: "a日本z".to_owned(),
+        }],
+        template: "%%".to_owned(),
+        flags: 0,
+        prompt_type: PromptType::Command,
+        background: false,
+        format_values: Vec::new(),
+    };
+    let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
+    assert!(prompt.move_left());
+
+    assert!(prompt.insert_batched_text("é🙂"));
+    assert_eq!(prompt.buffer, "a日本é🙂z");
+    assert_eq!(prompt.cursor, 5);
+}
+
+#[test]
+fn per_event_prompt_types_reject_batched_text() {
+    for flags in [
+        PROMPT_FLAG_SINGLE,
+        PROMPT_FLAG_NUMERIC,
+        PROMPT_FLAG_KEY,
+        PROMPT_FLAG_INCREMENTAL,
+    ] {
+        let plan = CommandPromptPlan {
+            requester_pid: 1,
+            target_client: None,
+            context: QueueExecutionContext::without_caller_cwd(),
+            fields: vec![PromptField {
+                prompt: ":".to_owned(),
+                input: String::new(),
+            }],
+            template: "%%".to_owned(),
+            flags,
+            prompt_type: PromptType::Command,
+            background: flags == PROMPT_FLAG_INCREMENTAL,
+            format_values: Vec::new(),
+        };
+        let mut prompt = ClientPromptState::new_command(plan, PromptCompletion::Background);
+        assert!(!prompt.insert_batched_text("é"), "flags={flags:#x}");
+        assert!(prompt.buffer.is_empty());
+        assert_eq!(prompt.cursor, 0);
+    }
+}
+
+#[test]
 fn confirm_key_mode_accepts_correct_key() {
     let plan = ConfirmBeforePlan {
         requester_pid: 1,

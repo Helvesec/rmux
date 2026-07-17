@@ -11,7 +11,10 @@ mod redaction;
 
 use crate::handles::{session, Rmux, Session};
 use crate::transport::TransportClient;
-use crate::{ProcessCommandSpec, ProcessSpec, Result, RmuxError, SessionName, TerminalSizeSpec};
+use crate::{
+    ProcessCommandSpec, ProcessSpec, Result, RmuxEndpoint, RmuxError, SessionId, SessionName,
+    TerminalSizeSpec,
+};
 use redaction::redact_environment_error;
 use rmux_proto::{NewSessionExtRequest, Request, Response};
 
@@ -400,6 +403,83 @@ async fn ensure_session(rmux: &Rmux, builder: EnsureSession) -> Result<Session> 
         created,
         builder.creation_tags,
     ))
+}
+
+pub(crate) async fn create_owned_session(
+    builder: EnsureSession,
+    required_capabilities: &[&str],
+    endpoint: RmuxEndpoint,
+    default_timeout: Option<Duration>,
+    transport: TransportClient,
+) -> Result<(Session, SessionId)> {
+    debug_assert_eq!(builder.policy, EnsureSessionPolicy::CreateOnly);
+    if !required_capabilities.is_empty() {
+        crate::capabilities::require(&transport, required_capabilities).await?;
+    }
+    let mut request = builder.to_new_session_request(false);
+    request.print_session_info = true;
+    request.print_format = Some("#{session_id}".to_owned());
+    crate::capabilities::require_process_command_if_present(
+        &transport,
+        request.process_command.as_ref(),
+    )
+    .await
+    .map_err(|error| redact_builder_environment_error(error, &builder))?;
+    let response = transport
+        .request(Request::NewSessionExt(Box::new(request)))
+        .await
+        .map_err(|error| redact_builder_environment_error(error, &builder))?;
+    let Response::NewSession(response) = response else {
+        return Err(session::unexpected_response("new-session", response));
+    };
+    let session_id = parse_owned_session_id(
+        response
+            .command_output()
+            .ok_or_else(|| owned_session_identity_error("missing print output"))?
+            .stdout(),
+    )?;
+    let session = Session::new(
+        response.session_name,
+        endpoint,
+        default_timeout,
+        transport,
+        true,
+        builder.creation_tags,
+    );
+    Ok((session, session_id))
+}
+
+pub(crate) async fn preflight_owned_session_capabilities(
+    transport: &TransportClient,
+    required_capabilities: &[&str],
+) -> Result<()> {
+    crate::capabilities::require(transport, required_capabilities).await
+}
+
+fn parse_owned_session_id(stdout: &[u8]) -> Result<SessionId> {
+    let rendered = std::str::from_utf8(stdout)
+        .map_err(|_| owned_session_identity_error("print output was not UTF-8"))?;
+    let rendered = rendered
+        .strip_suffix('\n')
+        .ok_or_else(|| owned_session_identity_error("print output was not one line"))?;
+    if rendered.contains(['\n', '\r']) {
+        return Err(owned_session_identity_error(
+            "print output contained multiple lines",
+        ));
+    }
+    let raw_id = rendered
+        .strip_prefix('$')
+        .ok_or_else(|| owned_session_identity_error("print output did not contain a session id"))?;
+    let raw_id = raw_id.parse::<u32>().map_err(|_| {
+        owned_session_identity_error("print output contained an invalid session id")
+    })?;
+    Ok(SessionId::new(raw_id))
+}
+
+fn owned_session_identity_error(reason: &str) -> RmuxError {
+    RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+        "daemon returned invalid owned-session identity: {reason}"
+    )))
 }
 
 async fn create_or_reuse_session(

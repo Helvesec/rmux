@@ -69,6 +69,13 @@ impl RequestHandler {
         }
     }
 
+    pub(crate) fn begin_attach_forwarder(&self) -> AttachForwarderGuard {
+        self.active_attach_forwarders.fetch_add(1, Ordering::SeqCst);
+        AttachForwarderGuard {
+            active_attach_forwarders: self.active_attach_forwarders.clone(),
+        }
+    }
+
     pub(crate) fn request_shutdown_if_pending(&self) -> bool {
         self.request_shutdown_if_pending_excluding_detached_connection(None)
     }
@@ -84,6 +91,7 @@ impl RequestHandler {
             .shutdown_reason
             .lock()
             .expect("shutdown reason mutex must not be poisoned");
+        let force_shutdown = matches!(reason, Some(PendingShutdownReason::KillServer));
         if let Some(
             reason
             @ (PendingShutdownReason::ExitEmpty | PendingShutdownReason::SeamlessUpgradeIdle),
@@ -107,15 +115,16 @@ impl RequestHandler {
                 }
             }
         }
-        if !self
-            .subscriptions
-            .lock()
-            .expect("subscription registry mutex must not be poisoned")
-            .is_empty()
+        if !force_shutdown
+            && !self
+                .subscriptions
+                .lock()
+                .expect("subscription registry mutex must not be poisoned")
+                .is_empty()
         {
             return false;
         }
-        let retained_outputs_empty = {
+        let retained_outputs_empty = force_shutdown || {
             let mut retained_outputs = self
                 .retained_exited_outputs
                 .lock()
@@ -233,6 +242,13 @@ impl RequestHandler {
         }
         drop(active_attach);
 
+        // Closing an attached client removes its registry entry before the
+        // forwarder has drained the terminal exit frame to the client. Keep
+        // exit-empty pending until that wire hand-off has completed.
+        if self.active_attach_forwarders.load(Ordering::SeqCst) != 0 {
+            return IdleShutdownState::Unknown;
+        }
+
         if self.active_detached_requests.load(Ordering::SeqCst) != 0 {
             return IdleShutdownState::Unknown;
         }
@@ -252,10 +268,20 @@ impl RequestHandler {
             return IdleShutdownState::Unknown;
         };
         if active_control.by_pid.is_empty() {
-            IdleShutdownState::StillApplies
-        } else {
-            IdleShutdownState::Stale
+            return IdleShutdownState::StillApplies;
         }
+        if active_control
+            .by_pid
+            .values()
+            .any(|active| active.session_name.is_none() && !active.closing.load(Ordering::SeqCst))
+        {
+            return IdleShutdownState::Stale;
+        }
+        // A control client bound to the now-missing last session is removed by
+        // the ordered lifecycle path. Treat that short hand-off as in flight:
+        // cancelling exit-empty here would lose the only shutdown request
+        // before finish_control removes the registration.
+        IdleShutdownState::Unknown
     }
 }
 
@@ -309,6 +335,16 @@ impl Drop for DetachedRequestGuard {
     }
 }
 
+pub(crate) struct AttachForwarderGuard {
+    active_attach_forwarders: Arc<AtomicUsize>,
+}
+
+impl Drop for AttachForwarderGuard {
+    fn drop(&mut self) {
+        self.active_attach_forwarders.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +394,26 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(500), shutdown_rx)
             .await
             .expect("retry should request shutdown after detached request finishes")
+            .expect("shutdown receiver should complete cleanly");
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_retries_after_attach_forwarder_drain() {
+        let handler = RequestHandler::new();
+        let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
+        handler.install_shutdown_handle(shutdown_handle);
+        let forwarder = handler.begin_attach_forwarder();
+
+        handler.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
+        assert!(
+            !handler.request_shutdown_if_pending(),
+            "an attached wire drain should defer, not cancel, exit-empty shutdown"
+        );
+        drop(forwarder);
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), shutdown_rx)
+            .await
+            .expect("retry should request shutdown after the attach forwarder drains")
             .expect("shutdown receiver should complete cleanly");
     }
 }

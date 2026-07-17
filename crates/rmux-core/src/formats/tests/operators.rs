@@ -145,10 +145,11 @@ fn boolean_or() {
 
 #[test]
 fn bang_prefix_is_not_a_boolean_modifier() {
-    assert_eq!(render_template("#{!:0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{!:1}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{!!:0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{!!:1}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{!:0}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{!:1}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{!!:0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{!!:1}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{!!:foo}", &StaticWindowValues), "1");
     assert_eq!(
         render_template("#{!#{window_active}}", &StaticWindowValues),
         "!1"
@@ -160,30 +161,81 @@ fn bang_prefix_is_not_a_boolean_modifier() {
 }
 
 #[test]
+fn expression_double_percent_is_a_modulo_alias_like_linux_tmux() {
+    // The Linux glibc oracle evaluates both '%' and '%%' as modulo; the
+    // darwin oracle's BSD strftime doubles '%%' into '%' before the format
+    // parser, so both oracles agree the doubled spelling must evaluate.
+    assert_eq!(render_template("#{e|%%|:5,2}", &StaticWindowValues), "1");
+    assert_eq!(
+        render_template("#{e|%%|f:5,2}", &StaticWindowValues),
+        "1.00"
+    );
+}
+
+#[test]
+fn float_comparisons_render_integer_booleans_product_divergence() {
+    for expression in [
+        "#{e|==|f:5,5}",
+        "#{e|!=|f:5,6}",
+        "#{e|<|f:5,6}",
+        "#{e|<=|f:5,5}",
+        "#{e|>|f:6,5}",
+        "#{e|>=|f:5,5}",
+    ] {
+        assert_eq!(render_template(expression, &StaticWindowValues), "1");
+    }
+}
+
+#[test]
+fn expression_operands_trim_spaces_product_divergence() {
+    assert_eq!(render_template("#{e|+|: 5 , 3 }", &StaticWindowValues), "8");
+}
+
+#[test]
+fn expression_float_nan_results_render_deterministically() {
+    // Every NaN producer must render "-nan" (Linux deployment oracle), not
+    // the platform-dependent hardware NaN sign.
+    assert_eq!(render_template("#{e|m|f:5,0}", &StaticWindowValues), "-nan");
+    assert_eq!(
+        render_template("#{e|m|f:inf,2}", &StaticWindowValues),
+        "-nan"
+    );
+    assert_eq!(render_template("#{e|/|f:0,0}", &StaticWindowValues), "-nan");
+    assert_eq!(
+        render_template("#{e|-|f:inf,inf}", &StaticWindowValues),
+        "-nan"
+    );
+    assert_eq!(
+        render_template("#{e|*|f:inf,0}", &StaticWindowValues),
+        "-nan"
+    );
+}
+
+#[test]
 fn expression_arithmetic_defaults_to_integer_output() {
     assert_eq!(render_template("#{e|+|:2,3}", &StaticWindowValues), "5");
     assert_eq!(render_template("#{e|-|:2,3}", &StaticWindowValues), "-1");
     assert_eq!(render_template("#{e|*|:2,3}", &StaticWindowValues), "6");
     assert_eq!(render_template("#{e|/|:5,2}", &StaticWindowValues), "2");
-    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "1");
     assert_eq!(render_template("#{e|+|:2.9,3.9}", &StaticWindowValues), "5");
     assert_eq!(render_template("#{e|*|:2.9,3.9}", &StaticWindowValues), "6");
     assert_eq!(render_template("#{e|m|:7,2}", &StaticWindowValues), "1");
 }
 
 #[test]
-fn expression_integer_overflow_matches_tmux() {
+fn expression_integer_overflow_uses_deterministic_sentinel() {
     assert_eq!(
         render_template("#{e|+|:999999999999999999999,1}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|+|:9223372036854775807,1}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|+|:9223372036854775807,2}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|-|:-9223372036854775808,1}", &StaticWindowValues),
@@ -195,11 +247,11 @@ fn expression_integer_overflow_matches_tmux() {
     );
     assert_eq!(
         render_template("#{e|*|:4611686018427387904,2}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|*|:3037000500,3037000500}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|*|:3037000499,3037000499}", &StaticWindowValues),
@@ -211,7 +263,7 @@ fn expression_integer_overflow_matches_tmux() {
 fn expression_integer_minimum_division_overflow_does_not_panic() {
     assert_eq!(
         render_template("#{e|/|:-9223372036854775808,-1}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|m|:-9223372036854775808,-1}", &StaticWindowValues),
@@ -219,25 +271,34 @@ fn expression_integer_minimum_division_overflow_does_not_panic() {
     );
     assert_eq!(
         render_template("#{e|%|:-9223372036854775808,-1}", &StaticWindowValues),
-        ""
+        "0"
     );
 }
 
 #[test]
-fn expression_division_by_zero_matches_tmux_sentinel() {
+fn expression_division_by_zero_uses_deterministic_sentinel() {
     assert_eq!(
         render_template("#{e|/|:5,0}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
-    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{e|%|:5,0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{e|m|:5,0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{e|m|:5,2}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "1");
+    assert_eq!(
+        render_template("#{e|%|:5,0}", &StaticWindowValues),
+        i64::MIN.to_string()
+    );
+    assert_eq!(
+        render_template("#{e|m|:5,0}", &StaticWindowValues),
+        i64::MIN.to_string()
+    );
     assert_eq!(render_template("#{e|/|f:5,0}", &StaticWindowValues), "inf");
-    assert_eq!(render_template("#{e|m|f:5,0}", &StaticWindowValues), "nan");
+    assert_eq!(render_template("#{e|m|f:5,0}", &StaticWindowValues), "-nan");
+    assert_eq!(render_template("#{e|%|f:5,2}", &StaticWindowValues), "1.00");
+    assert_eq!(render_template("#{e|%|f:5,0}", &StaticWindowValues), "-nan");
 }
 
 #[test]
-fn expression_empty_and_prefixed_integer_operands_match_tmux() {
+fn expression_empty_and_prefixed_integer_operands_use_tmux_parsing() {
     assert_eq!(render_template("#{e|+|:5,}", &StaticWindowValues), "5");
     assert_eq!(render_template("#{e|+|:0x10,1}", &StaticWindowValues), "17");
     assert_eq!(
@@ -246,9 +307,33 @@ fn expression_empty_and_prefixed_integer_operands_match_tmux() {
     );
     assert_eq!(
         render_template("#{e|+|:inf,1}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(render_template("#{e|q|:inf,1}", &StaticWindowValues), "");
+}
+
+#[test]
+fn expression_non_finite_and_wide_integer_operands_use_deterministic_sentinel() {
+    assert_eq!(
+        render_template("#{e|/|:9223372036854775808,2}", &StaticWindowValues),
+        "-4611686018427387904"
+    );
+    assert_eq!(
+        render_template("#{e|*|:9223372036854775808,2}", &StaticWindowValues),
+        i64::MIN.to_string()
+    );
+    assert_eq!(
+        render_template("#{e|m|:9223372036854775808,3}", &StaticWindowValues),
+        "-2"
+    );
+    assert_eq!(
+        render_template("#{e|/|:inf,2}", &StaticWindowValues),
+        "-4611686018427387904"
+    );
+    assert_eq!(
+        render_template("#{e|*|:nan,2}", &StaticWindowValues),
+        i64::MIN.to_string()
+    );
 }
 
 #[test]
@@ -269,6 +354,36 @@ fn expression_arithmetic_float_option_renders_two_decimals() {
 }
 
 #[test]
+fn expression_float_precision_is_bounded_like_tmux_3_7b() {
+    let precision_100 = render_template("#{e|+|f|100:1,2}", &StaticWindowValues);
+    assert_eq!(precision_100.len(), 102);
+    assert!(precision_100.starts_with("3."));
+    assert!(precision_100[2..].bytes().all(|byte| byte == b'0'));
+
+    assert_eq!(render_template("#{e|+|f|101:1,2}", &StaticWindowValues), "");
+    assert_eq!(
+        render_template("#{e|+|f|999999999999999999999:1,2}", &StaticWindowValues),
+        ""
+    );
+    assert_eq!(
+        render_template("#{e|+|f|invalid:1,2}", &StaticWindowValues),
+        ""
+    );
+    assert_eq!(
+        render_template("#{e|+|f|-1:1,2}", &StaticWindowValues),
+        "3.000000"
+    );
+    assert_eq!(
+        render_template("#{e|+|f|-100:1,2}", &StaticWindowValues),
+        "3.000000"
+    );
+    assert_eq!(
+        render_template("#{e|+|f|-101:1,2}", &StaticWindowValues),
+        ""
+    );
+}
+
+#[test]
 fn expression_numeric_comparisons() {
     assert_eq!(render_template("#{e|==|:2,2}", &StaticWindowValues), "1");
     assert_eq!(render_template("#{e|!=|:2,3}", &StaticWindowValues), "1");
@@ -277,9 +392,9 @@ fn expression_numeric_comparisons() {
 }
 
 #[test]
-fn expression_non_finite_comparisons_match_tmux_sentinel() {
-    assert_eq!(render_template("#{e|>|:inf,1}", &StaticWindowValues), "1");
-    assert_eq!(render_template("#{e|<|:inf,1}", &StaticWindowValues), "0");
+fn expression_non_finite_comparisons_use_deterministic_sentinel() {
+    assert_eq!(render_template("#{e|>|:inf,1}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{e|<|:inf,1}", &StaticWindowValues), "1");
     assert_eq!(
         render_template("#{e|==|:inf,inf}", &StaticWindowValues),
         "1"
@@ -296,12 +411,23 @@ fn expression_non_finite_comparisons_match_tmux_sentinel() {
         render_template("#{e|!=|:nan,nan}", &StaticWindowValues),
         "0"
     );
+    assert_eq!(render_template("#{e|==|:nan,0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{e|!=|:nan,0}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{e|<|:nan,1}", &StaticWindowValues), "1");
     assert_eq!(render_template("#{e|>|:nan,1}", &StaticWindowValues), "0");
     assert_eq!(render_template("#{e|<=|:nan,1}", &StaticWindowValues), "1");
+    assert_eq!(
+        render_template("#{e|==|:inf,-inf}", &StaticWindowValues),
+        "1"
+    );
+    assert_eq!(
+        render_template("#{e|>|:inf,-inf}", &StaticWindowValues),
+        "0"
+    );
 }
 
 #[test]
-fn boolean_and_matches_tmux_3_4_binary_semantics() {
+fn boolean_and_matches_tmux_3_7_variadic_semantics() {
     assert_eq!(
         render_template(
             "#{&&:#{window_active},#{session_name},#{window_panes}}",
@@ -314,7 +440,7 @@ fn boolean_and_matches_tmux_3_4_binary_semantics() {
             "#{&&:#{window_active},#{window_last_flag},#{session_name}}",
             &StaticWindowValues
         ),
-        "1"
+        "0"
     );
     assert_eq!(
         render_template(
@@ -323,23 +449,24 @@ fn boolean_and_matches_tmux_3_4_binary_semantics() {
         ),
         "0"
     );
-    assert_eq!(render_template("#{&&:1}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{&&:}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{&&:1}", &StaticWindowValues), "1");
     assert_eq!(render_template("#{&&:1,1,1}", &StaticWindowValues), "1");
-    assert_eq!(render_template("#{&&:1,1,0}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{&&:1,1,0}", &StaticWindowValues), "0");
     assert_eq!(
         render_template("#{&&:1,#{&&:1,0},1}", &StaticWindowValues),
-        "1"
+        "0"
     );
 }
 
 #[test]
-fn boolean_or_matches_tmux_3_4_binary_semantics() {
+fn boolean_or_matches_tmux_3_7_variadic_semantics() {
     assert_eq!(
         render_template(
             "#{||:#{window_last_flag},#{missing},#{missing2}}",
             &StaticWindowValues
         ),
-        "1"
+        "0"
     );
     assert_eq!(
         render_template(
@@ -348,13 +475,14 @@ fn boolean_or_matches_tmux_3_4_binary_semantics() {
         ),
         "1"
     );
-    assert_eq!(render_template("#{||:0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{||:1}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{||:0,0,0}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{||:}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{||:0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{||:1}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{||:0,0,0}", &StaticWindowValues), "0");
     assert_eq!(render_template("#{||:0,1,0}", &StaticWindowValues), "1");
     assert_eq!(
         render_template("#{||:0,#{||:0,0},0}", &StaticWindowValues),
-        "1"
+        "0"
     );
 }
 
@@ -381,15 +509,63 @@ fn conditional_false_branch_preserves_commas() {
             "#{?window_last_flag,first,missing,second,default}tail",
             &StaticWindowValues
         ),
-        "missing,second,defaulttail"
+        "defaulttail"
     );
     assert_eq!(
         render_template(
             "#{?window_last_flag,first,session_name,second,default}tail",
             &StaticWindowValues
         ),
-        "session_name,second,defaulttail"
+        "secondtail"
     );
+}
+
+#[test]
+fn conditional_else_if_matches_tmux_3_7() {
+    assert_eq!(
+        render_template("#{?#{==:a,b},X,#{==:c,c},Y,Z}", &StaticWindowValues),
+        "Y"
+    );
+    assert_eq!(
+        render_template("#{?#{==:a,b},X,#{==:c,d},Y,Z}", &StaticWindowValues),
+        "Z"
+    );
+}
+
+#[test]
+fn repeat_modifier_matches_tmux_3_7() {
+    assert_eq!(render_template("#{R:ab,3}", &StaticWindowValues), "ababab");
+    assert_eq!(render_template("#{R:x,0}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{R:x,-1}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{R:x,2.9}", &StaticWindowValues), "");
+    assert_eq!(
+        render_template("#{R: ,#{n:#{session_name}}}", &StaticWindowValues),
+        "     "
+    );
+    assert_eq!(
+        render_template("#{R:0123456789,1000}", &StaticWindowValues).len(),
+        10_000
+    );
+    assert_eq!(
+        render_template("#{R:0123456789,1001}", &StaticWindowValues).len(),
+        10_010
+    );
+    assert_eq!(
+        render_template("#{n:#{R:#{p10000:a},100}}", &StaticWindowValues),
+        "1000000"
+    );
+    assert_eq!(
+        render_template("#{n:#{R:#{p10000:a},1000}}", &StaticWindowValues),
+        "0"
+    );
+    assert_eq!(
+        render_template(
+            "#{n:#{R:#{R:#{p10000:a},10000},10000}}",
+            &StaticWindowValues
+        ),
+        "0"
+    );
+    assert_eq!(render_template("#{R:x,10001}", &StaticWindowValues), "");
 }
 
 #[test]

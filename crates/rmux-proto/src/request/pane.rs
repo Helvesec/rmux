@@ -2,8 +2,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 
 use crate::{
-    PaneOutputSubscriptionId, PaneTarget, PaneTargetRef, ProcessCommand, ResizePaneAdjustment,
-    SessionName, SplitDirection, WindowTarget,
+    PaneOutputSubscriptionId, PaneStateSubscriptionId, PaneTarget, PaneTargetRef, ProcessCommand,
+    ResizePaneAdjustment, SessionName, SetOptionMode, SplitDirection, WindowTarget,
 };
 
 #[path = "pane/compat.rs"]
@@ -119,6 +119,17 @@ pub struct SplitWindowTargetActionRequest {
     /// Raw bytes read from client stdin for `split-window -I`.
     #[serde(default)]
     pub stdin_payload: Option<Vec<u8>>,
+}
+
+/// SDK split request that returns the new pane's visible slot and stable id
+/// atomically with the mutation.
+///
+/// This is a capability-gated append-only wire extension. The existing
+/// [`SplitWindowTargetActionRequest`] remains unchanged for CLI callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitWindowIdentityRequest {
+    /// Complete split action resolved server-side before the mutation.
+    pub action: SplitWindowTargetActionRequest,
 }
 
 impl<'de> Deserialize<'de> for SplitWindowExtRequest {
@@ -324,6 +335,9 @@ pub struct DisplayPanesRequest {
     /// Optional template command executed after pane selection.
     #[serde(default)]
     pub template: Option<String>,
+    /// Optional attached client that should receive the pane overlay.
+    #[serde(default)]
+    pub target_client: Option<String>,
 }
 
 /// Request payload for `pipe-pane`.
@@ -512,6 +526,86 @@ pub struct PaneSelectRequest {
     /// Optional pane title to set without changing the active pane.
     #[serde(default)]
     pub title: Option<String>,
+}
+
+/// SDK pane option mutation request that can address a stable pane id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneOptionSetRequest {
+    /// The exact pane target or stable pane id.
+    pub target: PaneTargetRef,
+    /// The tmux-style option name.
+    pub name: String,
+    /// The value to set. `None` is valid only when `unset` is true or when the
+    /// option type supports value-less toggles.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// The scalar/array mutation mode.
+    pub mode: SetOptionMode,
+    /// Whether to remove the pane-local explicit value instead of setting it.
+    #[serde(default)]
+    pub unset: bool,
+}
+
+/// SDK pane option lookup request that can address a stable pane id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneOptionGetRequest {
+    /// The exact pane target or stable pane id.
+    pub target: PaneTargetRef,
+    /// The tmux-style option name.
+    pub name: String,
+}
+
+/// SDK pane-state subscription request that can address a stable pane id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscribePaneStateRequest {
+    /// The exact pane target or stable pane id.
+    pub target: PaneTargetRef,
+    /// Whether the initial snapshot and stream should include title changes.
+    #[serde(default = "default_include_pane_state_title")]
+    pub include_title: bool,
+    /// Whether the initial snapshot and stream should include pane options.
+    #[serde(default = "default_include_pane_state_options")]
+    pub include_options: bool,
+    /// Whether the initial snapshot and stream should include foreground state.
+    #[serde(default)]
+    pub include_foreground: bool,
+}
+
+/// SDK pane-state cursor request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneStateCursorRequest {
+    /// The subscription to poll.
+    pub subscription_id: PaneStateSubscriptionId,
+    /// Return records whose revision is strictly greater than this value.
+    pub after_revision: u64,
+    /// Whether the server may hold the request until a new record appears.
+    #[serde(default)]
+    pub wait: bool,
+    /// Optional per-response event cap.
+    #[serde(default)]
+    pub max_events: Option<u16>,
+}
+
+/// SDK pane-state unsubscription request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsubscribePaneStateRequest {
+    /// The subscription to remove.
+    pub subscription_id: PaneStateSubscriptionId,
+}
+
+/// SDK foreground-state request that can address a stable pane id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneForegroundStateRequest {
+    /// The exact pane target or stable pane id.
+    pub target: PaneTargetRef,
+}
+
+const fn default_include_pane_state_title() -> bool {
+    true
+}
+
+const fn default_include_pane_state_options() -> bool {
+    true
 }
 
 /// Direction used by `select-pane -U/-D/-L/-R`.

@@ -7,6 +7,9 @@ async fn replace_transcript_contents(
     size: TerminalSize,
     content: &[u8],
 ) {
+    handler
+        .wait_for_pane_startup_to_finish_for_test(target)
+        .await;
     let transcript = {
         let state = handler.state.lock().await;
         state

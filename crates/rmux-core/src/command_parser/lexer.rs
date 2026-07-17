@@ -75,6 +75,8 @@ impl<'a> Lexer<'a> {
     /// rest of the lexer only ever sees LF. Without this, a trailing `\r` from a
     /// CRLF-saved config is swallowed into the preceding word by `read_word`, and
     /// backslash line-continuation (which only checks for `\n`) fails on `\r\n`.
+    /// This deliberately applies inside quoted text too: it is an RMUX
+    /// portability behavior, not byte-identical tmux 3.7b parsing.
     fn normalize_newlines(input: &str) -> Vec<char> {
         let mut chars = Vec::with_capacity(input.len());
         let mut iter = input.chars().peekable();
@@ -147,7 +149,9 @@ impl<'a> Lexer<'a> {
                         };
                         return Ok(self.spanned(token));
                     }
-                    self.consume_comment(next);
+                    if self.consume_comment(next) {
+                        self.line += 1;
+                    }
                     return Ok(self.spanned(LexToken::Newline));
                 }
                 '%' => {
@@ -250,15 +254,15 @@ impl<'a> Lexer<'a> {
         self.context.expand_tilde(user)
     }
 
-    fn consume_comment(&mut self, first: Option<char>) {
+    fn consume_comment(&mut self, first: Option<char>) -> bool {
         let mut ch = first;
         while let Some(current) = ch {
             if current == '\n' {
-                self.eol = true;
-                break;
+                return true;
             }
             ch = self.get_char();
         }
+        false
     }
 
     fn read_percent_word(&mut self) -> Result<LexToken, CommandParseError> {
@@ -282,7 +286,7 @@ impl<'a> Lexer<'a> {
                 Ok(LexToken::Elif)
             }
             "%endif" => Ok(LexToken::Endif),
-            _ => Ok(LexToken::Token(word)),
+            _ => Err(CommandParseError::structural(self.line, "syntax error")),
         }
     }
 

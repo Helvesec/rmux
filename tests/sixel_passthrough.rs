@@ -118,10 +118,19 @@ fn attach_pty_forwards_pane_osc52_when_clipboard_is_enabled() -> Result<(), Box<
         "printf '\\033]52;c;QQ==\\007'",
         "Enter",
     ])?);
-    let output = read_until_contains(attach.master_mut(), OSC52_SEQUENCE, IO_TIMEOUT)?;
+    let mut output = read_until_contains(attach.master_mut(), OSC52_SEQUENCE, IO_TIMEOUT)?;
+    std::thread::sleep(Duration::from_millis(150));
+    output.push_str(&String::from_utf8_lossy(&drain_attach_output_bytes(
+        attach.master_mut(),
+    )?));
     assert!(
         output.contains(OSC52_SEQUENCE),
         "attached PTY did not receive pane-emitted OSC52 sequence: {output:?}"
+    );
+    assert_eq!(
+        output.match_indices(OSC52_SEQUENCE).count(),
+        1,
+        "the active pane output ring must be the only OSC52 relay path: {output:?}"
     );
 
     assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);

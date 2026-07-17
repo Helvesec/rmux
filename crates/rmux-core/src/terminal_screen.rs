@@ -41,6 +41,13 @@ impl TerminalScreen {
         self.parser.screen_mut()
     }
 
+    /// Returns whether plain printable output can bypass structured rendering
+    /// without losing parser or screen semantics.
+    #[must_use]
+    pub fn plain_output_forwarding_safe(&self) -> bool {
+        self.parser.plain_output_forwarding_safe()
+    }
+
     /// Updates the tmux-style UTF-8 width and combining configuration.
     pub fn set_utf8_config(&mut self, config: Utf8Config) {
         self.parser.set_utf8_config(config);
@@ -80,6 +87,17 @@ impl TerminalScreen {
     #[must_use]
     pub fn pending_bytes(&self) -> Vec<u8> {
         self.parser.pending_bytes()
+    }
+
+    /// Returns whether the parser ground timeout is currently armed.
+    #[must_use]
+    pub fn ground_timer_active(&self) -> bool {
+        self.parser.ground_timer_active()
+    }
+
+    /// Notifies the parser that its ground timeout has expired.
+    pub fn ground_timer_expired(&mut self) {
+        self.parser.ground_timer_expired();
     }
 
     /// Returns and drains passthrough events generated while parsing PTY output.

@@ -71,6 +71,22 @@ fn set_environment_accepts_hyphen_prefixed_values() {
 }
 
 #[test]
+fn set_environment_accepts_compact_clear_and_unset_in_either_order() {
+    // Measured against the pinned tmux 3.7b oracle on 2026-07-14: `-u`
+    // takes precedence over `-r`, independent of their order.
+    for flags in ["-gru", "-gur"] {
+        let cli = parse_args(&["set-environment", flags, "AUDIT_VAR"])
+            .expect("set-environment accepts combined clear and unset flags");
+        let super::Command::SetEnvironment(args) = cli.command.expect("parsed command") else {
+            panic!("expected SetEnvironment command");
+        };
+        assert!(args.global);
+        assert!(args.clear);
+        assert!(args.unset);
+    }
+}
+
+#[test]
 fn show_hooks_accepts_default_current_session_scope() {
     parse_args(&["show-hooks"]).expect("default show-hooks parses");
 }

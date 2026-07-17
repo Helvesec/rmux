@@ -4,14 +4,20 @@ use std::time::Instant;
 
 use rmux_core::events::OutputCursorItem;
 use rmux_proto::{
-    format_extended_output_line, format_output_line, format_pause_line, SessionName,
-    CONTROL_BUFFER_HIGH,
+    format_exit_line, format_extended_output_line, format_output_line, format_pause_line,
+    SessionName, CONTROL_BUFFER_HIGH,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use super::{ControlClientFlags, ControlOutputQueue};
-use crate::handler::RequestHandler;
+use crate::handler::{ControlClientIdentity, RequestHandler};
+
+pub(super) enum PaneSubscriptionStart<'a> {
+    Oldest,
+    Now,
+    Sequences(&'a [(u32, u64)]),
+}
 
 #[derive(Debug)]
 pub(super) enum PaneEvent {
@@ -35,16 +41,18 @@ pub(super) struct PaneSubscription {
 
 pub(super) async fn refresh_subscriptions(
     handler: &RequestHandler,
+    control_identity: ControlClientIdentity,
     session_name: Option<&SessionName>,
     subscriptions: &mut HashMap<u32, PaneSubscription>,
-    pane_event_tx: mpsc::UnboundedSender<PaneEvent>,
+    pane_event_tx: mpsc::Sender<PaneEvent>,
+    start: PaneSubscriptionStart<'_>,
 ) {
     let Some(session_name) = session_name else {
         subscriptions.clear();
         return;
     };
     let panes = handler
-        .control_session_panes(session_name)
+        .control_session_panes_for_identity(control_identity, session_name)
         .await
         .unwrap_or_default();
     let desired = panes
@@ -65,16 +73,42 @@ pub(super) async fn refresh_subscriptions(
         if subscriptions.contains_key(&pane_id) {
             continue;
         }
-        let mut receiver = sender.subscribe_from_oldest();
+        let mut receiver = match &start {
+            PaneSubscriptionStart::Oldest => sender.subscribe_from_oldest(),
+            PaneSubscriptionStart::Now => sender.subscribe(),
+            PaneSubscriptionStart::Sequences(sequences) => sequences
+                .iter()
+                .find_map(|(candidate, sequence)| {
+                    (*candidate == pane_id).then(|| sender.subscribe_from_sequence(*sequence))
+                })
+                .unwrap_or_else(|| sender.subscribe_from_oldest()),
+        };
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let pane_event_tx = pane_event_tx.clone();
         tokio::spawn(async move {
-            replay_retained_output(pane_id, &mut receiver, &pane_event_tx);
+            for event in retained_output_events(pane_id, &mut receiver) {
+                tokio::select! {
+                    _ = &mut stop_rx => return,
+                    result = pane_event_tx.send(event) => {
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => return,
                     item = receiver.recv() => {
-                        send_cursor_item(pane_id, item, &pane_event_tx);
+                        let event = cursor_item_event(pane_id, item);
+                        tokio::select! {
+                            _ = &mut stop_rx => return,
+                            result = pane_event_tx.send(event) => {
+                                if result.is_err() {
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -88,9 +122,9 @@ pub(super) fn handle_pane_event(
     output_queue: &mut ControlOutputQueue,
     paused_panes: &mut HashSet<u32>,
     flags: ControlClientFlags,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if flags.no_output {
-        return Ok(());
+        return Ok(false);
     }
 
     match event {
@@ -126,32 +160,38 @@ pub(super) fn handle_pane_event(
                 missed_events,
                 "control pane output cursor lagged"
             );
+            output_queue.enqueue_line(format_exit_line(Some("too far behind")).into_bytes(), false);
+            return Ok(true);
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 pub(super) fn drain_ready_pane_events(
-    pane_event_rx: &mut mpsc::UnboundedReceiver<PaneEvent>,
+    pane_event_rx: &mut mpsc::Receiver<PaneEvent>,
     output_queue: &mut ControlOutputQueue,
     paused_panes: &mut HashSet<u32>,
     flags: ControlClientFlags,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     loop {
         match pane_event_rx.try_recv() {
-            Ok(event) => handle_pane_event(event, output_queue, paused_panes, flags)?,
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+            Ok(event) => {
+                if handle_pane_event(event, output_queue, paused_panes, flags)? {
+                    return Ok(true);
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(false),
+            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(false),
         }
     }
 }
 
-fn replay_retained_output(
+fn retained_output_events(
     pane_id: u32,
     receiver: &mut crate::pane_io::PaneOutputReceiver,
-    pane_event_tx: &mpsc::UnboundedSender<PaneEvent>,
-) {
+) -> Vec<PaneEvent> {
+    let mut events = Vec::new();
     let mut initial_bytes = Vec::new();
     while let Some(item) = receiver.try_recv() {
         match item {
@@ -159,8 +199,8 @@ fn replay_retained_output(
                 initial_bytes.extend(event.into_bytes());
             }
             OutputCursorItem::Gap(gap) => {
-                send_initial_bytes(pane_id, &mut initial_bytes, pane_event_tx);
-                let _ = pane_event_tx.send(PaneEvent::Lagged {
+                push_initial_bytes(pane_id, &mut initial_bytes, &mut events);
+                events.push(PaneEvent::Lagged {
                     pane_id,
                     expected_sequence: gap.expected_sequence(),
                     resume_sequence: gap.resume_sequence(),
@@ -169,44 +209,33 @@ fn replay_retained_output(
             }
         }
     }
-    send_initial_bytes(pane_id, &mut initial_bytes, pane_event_tx);
+    push_initial_bytes(pane_id, &mut initial_bytes, &mut events);
+    events
 }
 
-fn send_initial_bytes(
-    pane_id: u32,
-    initial_bytes: &mut Vec<u8>,
-    pane_event_tx: &mpsc::UnboundedSender<PaneEvent>,
-) {
+fn push_initial_bytes(pane_id: u32, initial_bytes: &mut Vec<u8>, events: &mut Vec<PaneEvent>) {
     if initial_bytes.is_empty() {
         return;
     }
-    let _ = pane_event_tx.send(PaneEvent::Data {
+    events.push(PaneEvent::Data {
         pane_id,
         bytes: std::mem::take(initial_bytes),
         received_at: Instant::now(),
     });
 }
 
-fn send_cursor_item(
-    pane_id: u32,
-    item: OutputCursorItem,
-    pane_event_tx: &mpsc::UnboundedSender<PaneEvent>,
-) {
+fn cursor_item_event(pane_id: u32, item: OutputCursorItem) -> PaneEvent {
     match item {
-        OutputCursorItem::Event(event) => {
-            let _ = pane_event_tx.send(PaneEvent::Data {
-                pane_id,
-                bytes: event.into_bytes(),
-                received_at: Instant::now(),
-            });
-        }
-        OutputCursorItem::Gap(gap) => {
-            let _ = pane_event_tx.send(PaneEvent::Lagged {
-                pane_id,
-                expected_sequence: gap.expected_sequence(),
-                resume_sequence: gap.resume_sequence(),
-                missed_events: gap.missed_events(),
-            });
-        }
+        OutputCursorItem::Event(event) => PaneEvent::Data {
+            pane_id,
+            bytes: event.into_bytes(),
+            received_at: Instant::now(),
+        },
+        OutputCursorItem::Gap(gap) => PaneEvent::Lagged {
+            pane_id,
+            expected_sequence: gap.expected_sequence(),
+            resume_sequence: gap.resume_sequence(),
+            missed_events: gap.missed_events(),
+        },
     }
 }

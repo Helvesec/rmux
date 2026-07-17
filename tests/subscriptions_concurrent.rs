@@ -473,11 +473,14 @@ fn wait_for_output_sequence(
     let mut last_sequence = 0;
 
     while Instant::now() < deadline {
-        let response = connection.roundtrip(&Request::ListPanes(ListPanesRequest {
+        let response = connection.roundtrip(&Request::ListPanes(Box::new(ListPanesRequest {
             target: target.session_name().clone(),
             format: Some("#{pane_output_sequence}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: Some(target.window_index()),
-        }))?;
+        })))?;
         let Response::ListPanes(response) = response else {
             return Err(format!("unexpected list-panes response: {response:?}").into());
         };
@@ -599,11 +602,14 @@ fn listed_output_sequence(
     connection: &mut Connection,
     target: PaneTarget,
 ) -> Result<u64, Box<dyn Error>> {
-    let response = connection.roundtrip(&Request::ListPanes(ListPanesRequest {
+    let response = connection.roundtrip(&Request::ListPanes(Box::new(ListPanesRequest {
         target: target.session_name().clone(),
         format: Some("#{pane_output_sequence}".to_owned()),
+        filter: None,
+        sort_order: None,
+        reversed: false,
         target_window_index: Some(target.window_index()),
-    }))?;
+    })))?;
     let Response::ListPanes(response) = response else {
         return Err(format!("unexpected list-panes response: {response:?}").into());
     };

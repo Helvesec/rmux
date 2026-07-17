@@ -17,9 +17,12 @@ use crate::cli_response::tmux_cli_error_message;
 const DEFAULT_SPLIT_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
 
 pub(in crate::cli) fn run_split_window(
-    args: SplitWindowArgs,
+    mut args: SplitWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    if args.start_directory.is_none() {
+        args.start_directory = std::env::current_dir().ok();
+    }
     if !cli_target_actions_enabled() {
         return run_split_window_legacy(args, socket_path);
     }
@@ -56,7 +59,7 @@ pub(in crate::cli) fn run_split_window(
         command,
         process_command,
         start_directory: args.start_directory,
-        keep_alive_on_exit: stdin_to_empty_pane.then_some(true),
+        keep_alive_on_exit: (args.keep_alive_on_exit || stdin_to_empty_pane).then_some(true),
         detached: args.detached,
         size,
         preserve_zoom: args.preserve_zoom,
@@ -137,6 +140,7 @@ fn run_split_window_legacy_with_stdin(
         || size.is_some()
         || args.full_size
         || args.preserve_zoom
+        || args.keep_alive_on_exit
         || stdin_payload.is_some()
     {
         connection
@@ -148,7 +152,8 @@ fn run_split_window_legacy_with_stdin(
                 command,
                 process_command,
                 start_directory: args.start_directory,
-                keep_alive_on_exit: stdin_to_empty_pane.then_some(true),
+                keep_alive_on_exit: (args.keep_alive_on_exit || stdin_to_empty_pane)
+                    .then_some(true),
                 detached: args.detached,
                 size,
                 preserve_zoom: args.preserve_zoom,

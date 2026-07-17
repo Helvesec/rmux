@@ -12,6 +12,21 @@ use crate::handler_support::{ensure_option_scope_exists, ensure_scope_session_ex
 use super::target_support::target_for_option_scope;
 use super::{attach_support::option_affects_attached_rendering, RequestHandler};
 
+#[path = "handler_options/default_shell.rs"]
+mod default_shell;
+#[path = "handler_options/pane_sdk.rs"]
+mod pane_sdk;
+#[path = "handler_options/pane_state_events.rs"]
+mod pane_state_events;
+#[path = "handler_options/resize_reconciliation.rs"]
+mod resize_reconciliation;
+
+use default_shell::{validate_named_mutation, validate_typed_mutation};
+use pane_state_events::{
+    pane_option_events_for_outcome, synchronize_pane_option_aliases_for_outcome,
+};
+use resize_reconciliation::ResizePolicyReconcileScope;
+
 impl RequestHandler {
     pub(super) async fn handle_set_option(
         &self,
@@ -28,11 +43,11 @@ impl RequestHandler {
 
         let refresh_scope = option_affects_attached_rendering(request.option)
             .then(|| legacy_scope_to_refresh_scope(&request.scope));
-        let resize_policy_scope = matches!(
+        let resize_policy_requested = matches!(
             request.option,
             OptionName::WindowSize | OptionName::AggressiveResize
-        )
-        .then(|| legacy_scope_to_refresh_scope(&request.scope));
+        );
+        let mut resize_policy_scope = None;
         let destroy_unattached_scope = (request.option == OptionName::DestroyUnattached)
             .then(|| legacy_scope_to_refresh_scope(&request.scope));
         let alert_scope = legacy_scope_to_refresh_scope(&request.scope);
@@ -45,6 +60,18 @@ impl RequestHandler {
             if let Err(error) = ensure_scope_session_exists(&state, &request.scope) {
                 return Response::Error(ErrorResponse { error });
             }
+            if let Err(error) = validate_typed_mutation(&state.options, &request) {
+                return Response::Error(ErrorResponse { error });
+            }
+            if resize_policy_requested {
+                resize_policy_scope = match ResizePolicyReconcileScope::capture(
+                    &state,
+                    &legacy_scope_to_refresh_scope(&request.scope),
+                ) {
+                    Ok(scope) => Some(scope),
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
+            }
 
             match state.options.set(
                 request.scope.clone(),
@@ -53,10 +80,16 @@ impl RequestHandler {
                 request.mode,
             ) {
                 Ok(outcome) => {
+                    if let Err(error) =
+                        synchronize_pane_option_aliases_for_outcome(&mut state, &outcome)
+                    {
+                        return Response::Error(ErrorResponse { error });
+                    }
                     alerts_changed = outcome
                         .notifications
                         .iter()
                         .any(|notification| notification.effects.affects_alerts());
+                    let pane_option_events = pane_option_events_for_outcome(&state, &outcome);
                     state.refresh_transcript_limits_for_scope(&request.scope, request.option);
                     if let rmux_proto::ScopeSelector::Window(target) = &request.scope {
                         state.synchronize_linked_window_options_from_slot(
@@ -67,7 +100,7 @@ impl RequestHandler {
                     if request.option == OptionName::MessageLimit {
                         state.trim_message_log();
                     }
-                    match resize_terminals_for_option_change(
+                    let response = match resize_terminals_for_option_change(
                         &mut state,
                         request.option,
                         &request.scope,
@@ -78,17 +111,31 @@ impl RequestHandler {
                             mode: request.mode,
                         }),
                         Err(error) => Response::Error(ErrorResponse { error }),
+                    };
+                    for (pane_id, generation, outcome) in &pane_option_events {
+                        self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
                     }
+                    response
                 }
                 Err(error) => Response::Error(ErrorResponse { error }),
             }
         };
 
         if matches!(response, Response::SetOption(_)) {
-            if let Some(scope) = resize_policy_scope.as_ref() {
-                self.reconcile_attached_sizes_for_option_scope(scope).await;
-            }
+            let exact_resize_policy_scope = resize_policy_scope
+                .as_ref()
+                .is_some_and(ResizePolicyReconcileScope::is_exact_window);
+            let stable_session_resize_scope = resize_policy_scope
+                .as_ref()
+                .is_some_and(ResizePolicyReconcileScope::is_stable_session);
+            let resize_family_refreshes = match resize_policy_scope.as_ref() {
+                Some(scope) => self.reconcile_attached_sizes_for_option_scope(scope).await,
+                None => Vec::new(),
+            };
             match &refresh_scope {
+                Some(OptionScopeSelector::Window(_) | OptionScopeSelector::Pane(_))
+                    if exact_resize_policy_scope => {}
+                Some(OptionScopeSelector::Session(_)) if stable_session_resize_scope => {}
                 Some(OptionScopeSelector::Session(session_name)) => {
                     self.refresh_attached_session(session_name).await;
                 }
@@ -106,6 +153,9 @@ impl RequestHandler {
                     self.refresh_all_attached_sessions().await;
                 }
                 None => {}
+            }
+            for session_name in resize_family_refreshes {
+                self.refresh_attached_session(&session_name).await;
             }
             if alerts_changed {
                 self.sync_alert_timers_for_option_scope(&alert_scope).await;
@@ -146,6 +196,11 @@ impl RequestHandler {
             if let Err(error) = ensure_option_scope_exists(&state, &request.scope) {
                 return Response::Error(ErrorResponse { error });
             }
+            let candidate_resize_policy_scope =
+                match ResizePolicyReconcileScope::capture(&state, &request.scope) {
+                    Ok(scope) => scope,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
             let socket_path = self.socket_path();
             let value = match request.value.as_deref() {
                 Some(value)
@@ -176,6 +231,10 @@ impl RequestHandler {
             ) {
                 return Response::Error(ErrorResponse { error });
             }
+            if let Err(error) = validate_named_mutation(&state.options, &request, value.as_deref())
+            {
+                return Response::Error(ErrorResponse { error });
+            }
 
             match state.options.set_by_name(
                 request.scope.clone(),
@@ -187,10 +246,16 @@ impl RequestHandler {
                 request.unset_pane_overrides,
             ) {
                 Ok(outcome) => {
+                    if let Err(error) =
+                        synchronize_pane_option_aliases_for_outcome(&mut state, &outcome)
+                    {
+                        return Response::Error(ErrorResponse { error });
+                    }
                     alerts_changed = outcome
                         .notifications
                         .iter()
                         .any(|notification| notification.effects.affects_alerts());
+                    let pane_option_events = pane_option_events_for_outcome(&state, &outcome);
                     if let Some(option) = outcome.known_option {
                         if option == OptionName::DestroyUnattached {
                             destroy_unattached_scope = Some(request.scope.clone());
@@ -199,7 +264,7 @@ impl RequestHandler {
                             option,
                             OptionName::WindowSize | OptionName::AggressiveResize
                         ) {
-                            resize_policy_scope = Some(request.scope.clone());
+                            resize_policy_scope = Some(candidate_resize_policy_scope.clone());
                         }
                         if let Some(scope) = option_scope_to_legacy_scope(&request.scope) {
                             state.refresh_transcript_limits_for_scope(&scope, option);
@@ -222,7 +287,7 @@ impl RequestHandler {
                             target.window_index(),
                         );
                     }
-                    match outcome
+                    let response = match outcome
                         .known_option
                         .map(|option| {
                             resize_terminals_for_named_option_change(
@@ -239,17 +304,31 @@ impl RequestHandler {
                             mode: request.mode,
                         }),
                         Err(error) => Response::Error(ErrorResponse { error }),
+                    };
+                    for (pane_id, generation, outcome) in &pane_option_events {
+                        self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
                     }
+                    response
                 }
                 Err(error) => Response::Error(ErrorResponse { error }),
             }
         };
 
         if matches!(response, Response::SetOptionByName(_)) {
-            if let Some(scope) = resize_policy_scope.as_ref() {
-                self.reconcile_attached_sizes_for_option_scope(scope).await;
-            }
+            let exact_resize_policy_scope = resize_policy_scope
+                .as_ref()
+                .is_some_and(ResizePolicyReconcileScope::is_exact_window);
+            let stable_session_resize_scope = resize_policy_scope
+                .as_ref()
+                .is_some_and(ResizePolicyReconcileScope::is_stable_session);
+            let resize_family_refreshes = match resize_policy_scope.as_ref() {
+                Some(scope) => self.reconcile_attached_sizes_for_option_scope(scope).await,
+                None => Vec::new(),
+            };
             match &refresh_scope {
+                OptionScopeSelector::Window(_) | OptionScopeSelector::Pane(_)
+                    if exact_resize_policy_scope => {}
+                OptionScopeSelector::Session(_) if stable_session_resize_scope => {}
                 OptionScopeSelector::Session(session_name) => {
                     self.refresh_attached_session(session_name).await;
                 }
@@ -264,6 +343,9 @@ impl RequestHandler {
                 | OptionScopeSelector::WindowGlobal => {
                     self.refresh_all_attached_sessions().await;
                 }
+            }
+            for session_name in resize_family_refreshes {
+                self.refresh_attached_session(&session_name).await;
             }
             if alerts_changed {
                 self.sync_alert_timers_for_option_scope(&refresh_scope)
@@ -280,31 +362,6 @@ impl RequestHandler {
         }
 
         response
-    }
-
-    async fn reconcile_attached_sizes_for_option_scope(&self, scope: &OptionScopeSelector) {
-        let session_names = match scope {
-            OptionScopeSelector::ServerGlobal
-            | OptionScopeSelector::SessionGlobal
-            | OptionScopeSelector::WindowGlobal => {
-                let state = self.state.lock().await;
-                state
-                    .sessions
-                    .iter()
-                    .map(|(session_name, _)| session_name.clone())
-                    .collect::<Vec<_>>()
-            }
-            OptionScopeSelector::Session(session_name) => vec![session_name.clone()],
-            OptionScopeSelector::Window(target) => vec![target.session_name().clone()],
-            OptionScopeSelector::Pane(target) => vec![target.session_name().clone()],
-        };
-
-        for session_name in session_names {
-            if let Ok(Some(target)) = self.reconcile_attached_session_size(&session_name).await {
-                self.emit(rmux_core::LifecycleEvent::WindowResized { target })
-                    .await;
-            }
-        }
     }
 
     async fn refresh_automatic_names_after_option_change(&self, scope: OptionScopeSelector) {

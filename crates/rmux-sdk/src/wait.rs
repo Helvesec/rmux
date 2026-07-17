@@ -11,18 +11,19 @@ use std::time::Duration;
 
 use rmux_proto::{
     CancelSdkWaitRequest, PaneOutputSubscriptionStart, Request, Response, RmuxError as ProtoError,
-    SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitId, SdkWaitOutcome,
-    CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_WAITS_ARMED,
+    SdkWaitForOutputRefRequest, SdkWaitId, SdkWaitOutcome, CAPABILITY_SDK_PANE_BY_ID,
+    CAPABILITY_SDK_WAITS_ARMED,
 };
+use tokio::time::Instant;
 
 use crate::handles::{connect_transport_to_endpoint, Pane};
 use crate::transport::{DropGuard, PendingResponse, TransportClient};
-use crate::{Result, RmuxError};
+use crate::{PaneSnapshot, Result, RmuxError};
 
 pub use visible::{VisibleTextExpectation, VisibleTextWait, WaitTimeoutError};
 
 const WAIT_FOR_BYTES_OPERATION: &str = "wait for pane output bytes";
-const WAIT_FOR_TEXT_OPERATION: &str = "wait for pane snapshot text";
+pub(crate) const WAIT_FOR_TEXT_OPERATION: &str = "wait for pane snapshot text";
 const WAIT_FOR_NEXT_BYTES_OPERATION: &str = "wait for next pane output bytes";
 const WAIT_FOR_TEXT_NEXT_OPERATION: &str = "wait for next pane output text";
 const WAIT_FOR_EXIT_OPERATION: &str = "wait for pane process exit";
@@ -63,7 +64,10 @@ impl ArmedWait {
             _wait_client: wait_client,
             wait_id,
             cancel_guard,
-            timeout: timeout.map(|duration| Box::pin(tokio::time::sleep(duration))),
+            // Arm lazily on the first poll so platform dispatch-settle work
+            // performed before this value is returned cannot consume the
+            // caller's wait budget.
+            timeout: None,
             timeout_duration: timeout,
             operation,
         }
@@ -92,6 +96,9 @@ impl Future for ArmedWait {
         }
 
         if let Some(duration) = self.timeout_duration {
+            if self.timeout.is_none() {
+                self.timeout = Some(Box::pin(tokio::time::sleep(duration)));
+            }
             if let Some(timeout) = self.timeout.as_mut() {
                 if timeout.as_mut().poll(cx).is_ready() {
                     self.cancel_guard.trigger();
@@ -122,12 +129,8 @@ pub(crate) async fn wait_for_bytes(pane: &Pane, bytes: Vec<u8>) -> Result<()> {
     }
 
     let timeout = resolved_wait_timeout(pane.configured_default_timeout());
-    with_wait_timeout(
-        WAIT_FOR_BYTES_OPERATION,
-        timeout,
-        wait_for_bytes_without_timeout(pane, bytes, timeout),
-    )
-    .await
+    let armed_wait = arm_sdk_wait(pane, bytes, WAIT_FOR_BYTES_OPERATION, timeout).await?;
+    armed_wait.await
 }
 
 pub(crate) async fn wait_for_next_bytes(pane: &Pane, bytes: Vec<u8>) -> Result<ArmedWait> {
@@ -149,11 +152,11 @@ pub(crate) async fn wait_for_text(pane: &Pane, text: String) -> Result<()> {
     }
 
     let timeout = resolved_wait_timeout(pane.configured_default_timeout());
-    with_wait_timeout(
-        WAIT_FOR_TEXT_OPERATION,
-        timeout,
-        wait_for_text_without_timeout(pane, text),
-    )
+    let pane = pane.begin_operation_handle();
+    with_wait_timeout(WAIT_FOR_TEXT_OPERATION, timeout, async move {
+        let (pane, _) = pane.pin_to_current_identity().await?;
+        wait_for_text_without_timeout(&pane, text).await
+    })
     .await
 }
 
@@ -176,24 +179,34 @@ pub(crate) async fn wait_for_text_next(pane: &Pane, text: String) -> Result<Arme
 
 pub(crate) async fn wait_exit(pane: &Pane) -> Result<Option<crate::PaneExitState>> {
     let timeout = resolved_wait_timeout(pane.configured_default_timeout());
-    with_wait_timeout(
-        WAIT_FOR_EXIT_OPERATION,
-        timeout,
-        wait_exit_without_timeout(pane),
-    )
+    let pane = pane.begin_operation_handle();
+    with_wait_timeout(WAIT_FOR_EXIT_OPERATION, timeout, async move {
+        let (pane, _) = pane.pin_to_current_identity().await?;
+        wait_exit_without_timeout(&pane).await
+    })
     .await
 }
 
-async fn wait_for_bytes_without_timeout(
+async fn arm_sdk_wait(
     pane: &Pane,
     bytes: Vec<u8>,
+    operation: &'static str,
     timeout: Option<Duration>,
-) -> Result<()> {
-    let armed_wait = arm_sdk_wait(pane, bytes, WAIT_FOR_BYTES_OPERATION, timeout).await?;
-    armed_wait.await
+) -> Result<ArmedWait> {
+    let armed_wait = with_wait_timeout(
+        operation,
+        timeout,
+        arm_sdk_wait_inner(pane, bytes, operation, timeout),
+    )
+    .await?;
+
+    #[cfg(windows)]
+    tokio::time::sleep(SDK_WAIT_ARM_DISPATCH_SETTLE).await;
+
+    Ok(armed_wait)
 }
 
-async fn arm_sdk_wait(
+async fn arm_sdk_wait_inner(
     pane: &Pane,
     bytes: Vec<u8>,
     operation: &'static str,
@@ -213,11 +226,7 @@ async fn arm_sdk_wait(
     let cancel_guard = DropGuard::best_effort(cancel_client, cancel_request);
     let request = sdk_wait_request_for_pane(pane, owner_id, wait_id, bytes).await?;
 
-    let response =
-        with_wait_timeout(operation, timeout, wait_client.armed_request(request)).await?;
-
-    #[cfg(windows)]
-    tokio::time::sleep(SDK_WAIT_ARM_DISPATCH_SETTLE).await;
+    let response = wait_client.armed_request(request).await?;
 
     Ok(ArmedWait::new(
         response,
@@ -235,21 +244,11 @@ async fn sdk_wait_request_for_pane(
     wait_id: SdkWaitId,
     bytes: Vec<u8>,
 ) -> Result<Request> {
-    if pane.is_stable_id() {
-        crate::capabilities::require(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await?;
-        return Ok(Request::SdkWaitForOutputRef(SdkWaitForOutputRefRequest {
-            owner_id,
-            wait_id,
-            target: pane.proto_target_ref(),
-            bytes,
-            start: PaneOutputSubscriptionStart::Now,
-        }));
-    }
-
-    Ok(Request::SdkWaitForOutput(SdkWaitForOutputRequest {
+    crate::capabilities::require(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await?;
+    Ok(Request::SdkWaitForOutputRef(SdkWaitForOutputRefRequest {
         owner_id,
         wait_id,
-        target: pane.target().into(),
+        target: pane.required_resolved_proto_target_ref().await?,
         bytes,
         start: PaneOutputSubscriptionStart::Now,
     }))
@@ -293,6 +292,11 @@ pub(crate) enum PaneExitObservation {
     Exited(Option<crate::PaneExitState>),
 }
 
+/// Applies an SDK wait timeout to one protocol phase.
+///
+/// Platform settle delays that run after the daemon has acknowledged success
+/// should happen outside this wrapper so short user timeouts do not fail after
+/// the requested phase already completed.
 pub(crate) async fn with_wait_timeout<F, T>(
     operation: &'static str,
     timeout: Option<Duration>,
@@ -309,8 +313,79 @@ where
     }
 }
 
+pub(crate) async fn with_wait_deadline<F, T>(
+    operation: &'static str,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let Some(deadline) = deadline else {
+        return future.await;
+    };
+    let timeout = timeout.expect("deadline implies timeout");
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(wait_timeout_error(operation, timeout));
+    }
+    match tokio::time::timeout(remaining, future).await {
+        Ok(Err(RmuxError::Transport { source, .. }))
+            if source.kind() == io::ErrorKind::TimedOut =>
+        {
+            // The transport shares this wait's absolute deadline, so its
+            // request timer may win the race against the outer wait timer.
+            // Keep the original typed I/O cause while exposing the stable
+            // public wait operation instead of an internal RPC label.
+            Err(RmuxError::transport(operation, source))
+        }
+        Ok(result) => result,
+        Err(_) => Err(wait_timeout_error(operation, timeout)),
+    }
+}
+
+pub(crate) async fn snapshot_with_wait_deadline(
+    pane: &Pane,
+    operation: &'static str,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    last_snapshot: Option<&PaneSnapshot>,
+    description: impl FnOnce() -> String,
+) -> Result<PaneSnapshot> {
+    match with_wait_deadline(operation, timeout, deadline, pane.snapshot()).await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) if is_wait_deadline_error(&error) && last_snapshot.is_some() => {
+            Err(RmuxError::wait_timeout(WaitTimeoutError::new(
+                description(),
+                timeout.expect("deadline implies timeout"),
+                last_snapshot.expect("checked snapshot presence").clone(),
+            )))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn is_wait_deadline_error(error: &RmuxError) -> bool {
+    matches!(
+        error,
+        RmuxError::Transport { source, .. } if source.kind() == io::ErrorKind::TimedOut
+    )
+}
+
 pub(crate) fn resolved_wait_timeout(default_timeout: Option<Duration>) -> Option<Duration> {
     crate::bootstrap::discovery::resolve_timeout(None, default_timeout)
+}
+
+pub(crate) fn resolved_wait_timeout_override(
+    timeout: Option<Duration>,
+    default_timeout: Option<Duration>,
+) -> Option<Duration> {
+    crate::bootstrap::discovery::resolve_timeout(timeout, default_timeout)
+}
+
+pub(crate) fn wait_deadline(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.and_then(|timeout| Instant::now().checked_add(timeout))
 }
 
 pub(crate) fn wait_timeout_error(operation: &'static str, timeout: Duration) -> RmuxError {
@@ -380,140 +455,4 @@ fn sdk_wait_response_to_result(response: Response, expected_wait_id: SdkWaitId) 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transport::TransportClient;
-    use rmux_proto::{encode_frame, CancelSdkWaitResponse, FrameDecoder, SdkWaitForOutputResponse};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    async fn read_request(stream: &mut tokio::io::DuplexStream) -> Request {
-        let mut decoder = FrameDecoder::new();
-        let mut buffer = [0_u8; 512];
-
-        loop {
-            if let Some(request) = decoder
-                .next_frame::<Request>()
-                .expect("request frame decodes")
-            {
-                return request;
-            }
-
-            let read = stream.read(&mut buffer).await.expect("read request");
-            assert_ne!(read, 0, "stream closed before request");
-            decoder.push_bytes(&buffer[..read]);
-        }
-    }
-
-    async fn write_response(stream: &mut tokio::io::DuplexStream, response: Response) {
-        let frame = encode_frame(&response).expect("response encodes");
-        stream.write_all(&frame).await.expect("write response");
-        stream.flush().await.expect("flush response");
-    }
-
-    #[tokio::test]
-    async fn drop_guard_sends_cancel_request_once_when_wait_future_is_dropped() {
-        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
-        let client = TransportClient::spawn(client_stream);
-        let owner_id = client.sdk_wait_owner_id();
-        let wait_id = client.allocate_sdk_wait_id();
-        let guard = DropGuard::best_effort(
-            client,
-            Request::CancelSdkWait(CancelSdkWaitRequest { owner_id, wait_id }),
-        );
-
-        drop(guard);
-
-        assert_eq!(
-            read_request(&mut server_stream).await,
-            Request::CancelSdkWait(CancelSdkWaitRequest { owner_id, wait_id })
-        );
-        write_response(
-            &mut server_stream,
-            Response::CancelSdkWait(CancelSdkWaitResponse {
-                wait_id,
-                removed: true,
-            }),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn disarmed_drop_guard_does_not_send_stale_cancel() {
-        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
-        let client = TransportClient::spawn(client_stream);
-        let owner_id = client.sdk_wait_owner_id();
-        let mut guard = DropGuard::best_effort(
-            client,
-            Request::CancelSdkWait(CancelSdkWaitRequest {
-                owner_id,
-                wait_id: SdkWaitId::new(9),
-            }),
-        );
-        guard.disarm();
-        drop(guard);
-
-        let mut buffer = [0_u8; 1];
-        let read = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            server_stream.read(&mut buffer),
-        )
-        .await;
-        match read {
-            Err(_) => {}
-            Ok(Ok(0)) => {}
-            Ok(other) => panic!("disarmed guard must not write cancel, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn sdk_wait_response_rejects_mismatched_wait_id() {
-        let result = sdk_wait_response_to_result(
-            Response::SdkWaitForOutput(SdkWaitForOutputResponse {
-                wait_id: SdkWaitId::new(10),
-                outcome: SdkWaitOutcome::Matched,
-            }),
-            SdkWaitId::new(9),
-        );
-
-        match result.expect_err("mismatched wait id must fail") {
-            RmuxError::Protocol {
-                source: ProtoError::Server(message),
-                ..
-            } => assert!(message.contains("did not match request id 9")),
-            error => panic!("expected protocol mismatch, got {error:?}"),
-        }
-    }
-
-    #[test]
-    fn duration_max_resolves_to_no_timeout_for_wait_operations() {
-        assert_eq!(resolved_wait_timeout(Some(Duration::MAX)), None);
-    }
-
-    #[tokio::test]
-    async fn finite_wait_timeout_surfaces_typed_timeout_error() {
-        let error = with_wait_timeout(
-            "test wait operation",
-            Some(Duration::from_millis(1)),
-            std::future::pending::<Result<()>>(),
-        )
-        .await
-        .expect_err("pending wait must time out");
-
-        match error {
-            RmuxError::Transport { operation, source } => {
-                assert_eq!(operation, "test wait operation");
-                assert_eq!(source.kind(), io::ErrorKind::TimedOut);
-            }
-            other => panic!("expected typed transport timeout, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn no_timeout_branch_awaits_future_directly() {
-        let value = with_wait_timeout("test no timeout", None, async { Ok(7_u8) })
-            .await
-            .expect("untimed ready future completes");
-
-        assert_eq!(value, 7);
-    }
-}
+mod tests;

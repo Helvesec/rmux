@@ -141,20 +141,9 @@ impl RequestHandler {
                 .is_some_and(|mode| mode.auto_accept)
         };
         if auto_accept {
-            return match action {
-                ModeTreeDeferredAction::DeleteBuffers => {
-                    self.perform_buffer_delete(attach_pid).await
-                }
-                ModeTreeDeferredAction::DetachClients => {
-                    self.perform_client_detach(attach_pid).await
-                }
-                ModeTreeDeferredAction::KillCurrentTreeSelection => {
-                    self.perform_tree_kill_current(attach_pid).await
-                }
-                ModeTreeDeferredAction::KillTaggedTreeSelections => {
-                    self.perform_tree_kill_tagged(attach_pid).await
-                }
-            };
+            return self
+                .execute_mode_tree_deferred_action(attach_pid, action)
+                .await;
         }
 
         let plan = ConfirmBeforePlan {
@@ -176,24 +165,37 @@ impl RequestHandler {
                     return;
                 };
                 if result.inserted.is_some() {
-                    let _ = match action {
-                        ModeTreeDeferredAction::DeleteBuffers => {
-                            handler.perform_buffer_delete(attach_pid).await
-                        }
-                        ModeTreeDeferredAction::DetachClients => {
-                            handler.perform_client_detach(attach_pid).await
-                        }
-                        ModeTreeDeferredAction::KillCurrentTreeSelection => {
-                            handler.perform_tree_kill_current(attach_pid).await
-                        }
-                        ModeTreeDeferredAction::KillTaggedTreeSelections => {
-                            handler.perform_tree_kill_tagged(attach_pid).await
-                        }
-                    };
+                    let _ = handler
+                        .execute_mode_tree_deferred_action(attach_pid, action)
+                        .await;
                 }
             });
         }
         Ok(())
+    }
+
+    async fn execute_mode_tree_deferred_action(
+        &self,
+        attach_pid: u32,
+        action: ModeTreeDeferredAction,
+    ) -> Result<(), RmuxError> {
+        match action {
+            ModeTreeDeferredAction::DeleteBuffers { targets } => {
+                self.perform_buffer_delete_actions(attach_pid, targets)
+                    .await
+            }
+            ModeTreeDeferredAction::DetachClients { targets } => {
+                self.perform_client_detach_actions(attach_pid, targets)
+                    .await
+            }
+            ModeTreeDeferredAction::KillCurrentTreeSelection { targets } => {
+                self.perform_tree_kill_actions(attach_pid, targets).await
+            }
+            ModeTreeDeferredAction::KillTaggedTreeSelections { targets } => {
+                self.perform_tree_kill_tagged_actions(attach_pid, targets)
+                    .await
+            }
+        }
     }
 
     async fn apply_mode_tree_filter(
@@ -333,7 +335,7 @@ impl RequestHandler {
                 key: rmux_core::key_string_lookup_key(key, false),
                 note: None,
                 repeat: false,
-                command: Some(vec![parsed.to_tmux_string()]),
+                command: Some(vec![parsed.to_tmux_reparse_string()]),
             })
             .await;
         if let Response::Error(error) = response {

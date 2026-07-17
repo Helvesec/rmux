@@ -10,8 +10,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_frame, ClientTerminalContext, ControlMode, ControlModeRequest, FrameDecoder,
-    HasSessionRequest, KillPaneRequest, NewWindowRequest, PaneTarget, Request, Response,
+    encode_frame, BreakPaneRequest, ClientTerminalContext, ControlMode, ControlModeRequest,
+    FrameDecoder, HasSessionRequest, JoinPaneRequest, KillPaneRequest, MovePaneRequest,
+    NewWindowRequest, PaneTarget, Request, Response, SwapPaneRequest, WindowTarget,
 };
 use rmux_sdk::{
     EnsureSession, Input, PaneId, PaneRef, PaneSnapshot, RmuxBuilder, RmuxError, SessionName,
@@ -339,6 +340,8 @@ async fn broadcast_reports_partial_failures_by_pane() -> TestResult {
     .await?;
     wait_for_pane_unlisted(&stale).await?;
 
+    let stale_target = stale.target().clone();
+    let live_target = live.target().clone();
     let panes = vec![stale, live];
     let error = rmux
         .broadcast(&panes, Input::Key("Enter"))
@@ -349,6 +352,9 @@ async fn broadcast_reports_partial_failures_by_pane() -> TestResult {
     };
     assert_eq!(source.successes().len(), 1);
     assert_eq!(source.failures().len(), 1);
+    assert_eq!(source.successes()[0].target(), &live_target);
+    assert_eq!(source.successes()[0].pane_id(), Some(live_id));
+    assert_eq!(source.failures()[0].target(), &stale_target);
     assert!(matches!(
         source.failures()[0].error(),
         RmuxError::PaneNotFound { .. }
@@ -375,6 +381,106 @@ async fn render_stream_emits_snapshot_after_output() -> TestResult {
     drop(stream);
 
     harness.finish().await
+}
+
+#[tokio::test]
+async fn by_id_render_stream_follows_a_pane_moved_to_another_session() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("pane-input-render-stream-move").await?;
+    let rmux = harness.rmux();
+    for transfer in CrossSessionTransfer::ALL {
+        assert_by_id_render_stream_follows_transfer(&harness, &rmux, transfer).await?;
+    }
+    harness.finish().await
+}
+
+async fn assert_by_id_render_stream_follows_transfer(
+    harness: &Harness,
+    rmux: &rmux_sdk::Rmux,
+    transfer: CrossSessionTransfer,
+) -> TestResult {
+    let alpha_name = session_name(&format!("sdkrsa{}", transfer.label()));
+    let beta_name = session_name(&format!("sdkrsb{}", transfer.label()));
+    let alpha = EnsureSession::named(alpha_name.clone())
+        .create_only()
+        .ensure(rmux)
+        .await?;
+    let beta = EnsureSession::named(beta_name.clone())
+        .create_only()
+        .ensure(rmux)
+        .await?;
+    let slot = alpha.pane(0, 0);
+    let pane_id = slot.id().await?.expect("source pane has a stable id");
+    let stable = alpha.pane_by_id(pane_id).await?;
+    let mut render_stream = stable.render_stream().await?;
+
+    raw_transfer_pane(
+        harness.socket_path(),
+        PaneTarget::with_window(alpha_name, 0, 0),
+        PaneTarget::with_window(beta_name, 0, 0),
+        transfer,
+    )
+    .await?;
+
+    assert_eq!(
+        stable.id().await?,
+        Some(pane_id),
+        "a by-id handle must resolve beyond its original session after {}",
+        transfer.label(),
+    );
+    assert_ne!(
+        slot.id().await?,
+        Some(pane_id),
+        "a slot handle must remain scoped to its original session and slot after {}",
+        transfer.label(),
+    );
+
+    let moved = beta.pane_by_id(pane_id).await?;
+    let marker = format!("sdk_render_after_cross_session_{}", transfer.label());
+    moved.send_text(format!("printf '{marker}\\n'\n")).await?;
+    let update = wait_for_render_text(&mut render_stream, &marker).await?;
+    assert!(
+        update.snapshot().visible_text().contains(&marker),
+        "the pre-move output subscription and dynamic snapshot must converge on the same pane id"
+    );
+    assert!(
+        stable.snapshot().await?.visible_text().contains(&marker),
+        "direct snapshots from the original by-id handle must follow the moved pane"
+    );
+    drop(render_stream);
+
+    let mut reopened = stable.render_stream().await?;
+    let reopened_marker = format!("sdk_reopened_after_cross_session_{}", transfer.label());
+    moved
+        .send_text(format!("printf '{reopened_marker}\\n'\n"))
+        .await?;
+    let update = wait_for_render_text(&mut reopened, &reopened_marker).await?;
+    assert!(
+        update.snapshot().visible_text().contains(&reopened_marker),
+        "a render stream opened after the transfer must use the pane's current session"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CrossSessionTransfer {
+    Move,
+    Join,
+    Break,
+    Swap,
+}
+
+impl CrossSessionTransfer {
+    const ALL: [Self; 4] = [Self::Move, Self::Join, Self::Break, Self::Swap];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::Join => "join",
+            Self::Break => "break",
+            Self::Swap => "swap",
+        }
+    }
 }
 
 async fn wait_for_revision_and_text(
@@ -444,21 +550,25 @@ async fn wait_for_render_text(
     stream: &mut rmux_sdk::PaneRenderStream,
     marker: &str,
 ) -> TestResult<rmux_sdk::RenderUpdate> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
-            Ok(Ok(Some(update))) => {
-                if update.snapshot().visible_text().contains(marker) {
-                    return Ok(update);
+    match tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match stream.next().await {
+                Ok(Some(update)) => {
+                    if update.snapshot().visible_text().contains(marker) {
+                        return Ok(update);
+                    }
                 }
+                Ok(None) => {
+                    return Err::<_, Box<dyn Error>>("render stream closed before marker".into());
+                }
+                Err(error) => return Err(error.into()),
             }
-            Ok(Ok(None)) => return Err("render stream closed before marker".into()),
-            Ok(Err(error)) => return Err(error.into()),
-            Err(_) => {}
         }
-        if Instant::now() >= deadline {
-            return Err(format!("render stream did not emit {marker:?} within deadline").into());
-        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(format!("render stream did not emit {marker:?} within deadline").into()),
     }
 }
 
@@ -569,6 +679,64 @@ async fn raw_kill_pane(socket_path: &Path, target: PaneTarget) -> TestResult {
     }
 }
 
+async fn raw_transfer_pane(
+    socket_path: &Path,
+    source: PaneTarget,
+    target: PaneTarget,
+    transfer: CrossSessionTransfer,
+) -> TestResult {
+    let request = match transfer {
+        CrossSessionTransfer::Move => Request::MovePane(MovePaneRequest {
+            source,
+            target,
+            direction: rmux_proto::SplitDirection::Vertical,
+            detached: false,
+            before: false,
+            full_size: false,
+            size: None,
+        }),
+        CrossSessionTransfer::Join => Request::JoinPane(JoinPaneRequest {
+            source,
+            target,
+            direction: rmux_proto::SplitDirection::Vertical,
+            detached: false,
+            before: false,
+            full_size: false,
+            size: None,
+        }),
+        CrossSessionTransfer::Break => Request::BreakPane(Box::new(BreakPaneRequest {
+            source,
+            target: Some(WindowTarget::with_window(target.session_name().clone(), 1)),
+            name: None,
+            detached: false,
+            after: false,
+            before: false,
+            print_target: false,
+            format: None,
+        })),
+        CrossSessionTransfer::Swap => Request::SwapPane(SwapPaneRequest {
+            source,
+            target,
+            direction: None,
+            detached: false,
+            preserve_zoom: false,
+        }),
+    };
+    let response = framed_request(socket_path, request).await?;
+    let succeeded = matches!(
+        (transfer, &response),
+        (CrossSessionTransfer::Move, Response::MovePane(_))
+            | (CrossSessionTransfer::Join, Response::JoinPane(_))
+            | (CrossSessionTransfer::Break, Response::BreakPane(_))
+            | (CrossSessionTransfer::Swap, Response::SwapPane(_))
+    );
+    if succeeded {
+        Ok(())
+    } else {
+        Err(format!("unexpected {} response: {response:?}", transfer.label()).into())
+    }
+}
+
 async fn framed_request(socket_path: &Path, request: Request) -> TestResult<Response> {
     let mut stream = UnixStream::connect(socket_path).await?;
     let frame = encode_frame(&request)?;
@@ -607,6 +775,7 @@ impl ControlClient {
                 terminal_features: Vec::new(),
                 utf8: true,
             },
+            initial_command_count: 0,
         }))?;
         stream.write_all(&frame).await?;
         match read_response(&mut stream).await? {

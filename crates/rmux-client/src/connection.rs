@@ -26,8 +26,9 @@ const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default timeout for ordinary detached RPC response reads.
 const SOCKET_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Legacy wire version kept only for targeted shutdown of pre-0.6 daemons.
-const LEGACY_SHUTDOWN_WIRE_VERSION: u8 = 1;
+/// Old detached wire versions kept only for targeted daemon shutdown recovery.
+const LEGACY_SHUTDOWN_MIN_WIRE_VERSION: u32 = 1;
+const LEGACY_SHUTDOWN_MAX_WIRE_VERSION: u32 = RMUX_WIRE_VERSION - 1;
 
 #[cfg(all(test, unix))]
 const FALLBACK_SOCKET_ROOT: &str = "/tmp";
@@ -318,11 +319,12 @@ impl Connection {
         self.stream.write_all(&frame).map_err(ClientError::Io)
     }
 
-    pub(crate) fn write_legacy_wire_v1_request(
+    pub(crate) fn write_legacy_wire_request(
         &mut self,
         request: &Request,
+        wire_version: u32,
     ) -> Result<(), ClientError> {
-        let frame = encode_legacy_wire_v1_frame(request)?;
+        let frame = encode_legacy_wire_frame(request, wire_version)?;
         self.stream.write_all(&frame).map_err(ClientError::Io)
     }
 
@@ -383,7 +385,17 @@ impl Connection {
     }
 }
 
-fn encode_legacy_wire_v1_frame(request: &Request) -> Result<Vec<u8>, ClientError> {
+fn encode_legacy_wire_frame(request: &Request, wire_version: u32) -> Result<Vec<u8>, ClientError> {
+    if !(LEGACY_SHUTDOWN_MIN_WIRE_VERSION..=LEGACY_SHUTDOWN_MAX_WIRE_VERSION)
+        .contains(&wire_version)
+    {
+        return Err(ClientError::Protocol(RmuxError::UnsupportedWireVersion {
+            got: wire_version,
+            minimum: LEGACY_SHUTDOWN_MIN_WIRE_VERSION,
+            maximum: LEGACY_SHUTDOWN_MAX_WIRE_VERSION,
+        }));
+    }
+
     let mut frame = encode_frame(request).map_err(ClientError::Protocol)?;
     if frame.first().copied() != Some(RMUX_FRAME_MAGIC) {
         return Err(ClientError::Protocol(RmuxError::Encode(
@@ -391,15 +403,15 @@ fn encode_legacy_wire_v1_frame(request: &Request) -> Result<Vec<u8>, ClientError
         )));
     }
 
-    if RMUX_WIRE_VERSION > 0x7f {
+    if RMUX_WIRE_VERSION > 0x7f || wire_version > 0x7f {
         return Err(ClientError::Protocol(RmuxError::Encode(
-            "legacy shutdown recovery expects a single-byte current wire version".to_owned(),
+            "legacy shutdown recovery expects single-byte wire versions".to_owned(),
         )));
     }
 
     match frame.get_mut(1) {
         Some(version) if *version == RMUX_WIRE_VERSION as u8 => {
-            *version = LEGACY_SHUTDOWN_WIRE_VERSION;
+            *version = wire_version as u8;
             Ok(frame)
         }
         _ => Err(ClientError::Protocol(RmuxError::Encode(

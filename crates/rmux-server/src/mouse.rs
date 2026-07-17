@@ -6,11 +6,12 @@ use rmux_core::{
     key_string_lookup_string, KeyCode, PaneGeometry, KEYC_CTRL, KEYC_DRAGGING, KEYC_META,
     KEYC_SHIFT,
 };
-use rmux_proto::{OptionName, PaneTarget, SessionName};
+use rmux_proto::{OptionName, PaneTarget, SessionId, SessionName};
 
 use crate::copy_mode::CopyModeMouseContext;
 use crate::input_keys::MouseForwardEvent;
 use crate::pane_terminals::HandlerState;
+use crate::status_lines::status_line_count;
 
 mod hit;
 mod types;
@@ -48,6 +49,35 @@ const MOUSE_BUTTON_10: u16 = 130;
 const MOUSE_BUTTON_11: u16 = 131;
 
 impl ClientMouseState {
+    pub(crate) fn rename_session_targets(
+        &mut self,
+        old_name: &SessionName,
+        session_id: SessionId,
+        new_name: &SessionName,
+    ) {
+        for event in [
+            self.click_event.as_mut(),
+            self.current_event.as_mut(),
+            self.drag_start_event.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if event.session_id == session_id.as_u32() {
+                if let Some(target) = event.pane_target.as_mut() {
+                    rename_mouse_pane_target(target, old_name, new_name);
+                }
+            }
+        }
+        if let Some(handler) = self.drag_handler.as_mut() {
+            let target = match handler {
+                types::MouseDragHandler::CopyModeSelection { target }
+                | types::MouseDragHandler::CopyModeScrollbar { target } => target,
+            };
+            rename_mouse_pane_target(target, old_name, new_name);
+        }
+    }
+
     pub(crate) fn click_deadline(&self) -> Option<Instant> {
         self.click_deadline
     }
@@ -84,6 +114,17 @@ impl ClientMouseState {
     }
 }
 
+fn rename_mouse_pane_target(
+    target: &mut PaneTarget,
+    old_name: &SessionName,
+    new_name: &SessionName,
+) {
+    if target.session_name() != old_name {
+        return;
+    }
+    *target = PaneTarget::with_window(new_name.clone(), target.window_index(), target.pane_index());
+}
+
 pub(crate) fn layout_for_session(
     state: &HandlerState,
     session_name: &SessionName,
@@ -101,12 +142,21 @@ pub(crate) fn layout_for_session(
             Some("off")
         );
     let (status_at, status_lines) = if status_enabled {
+        let status_lines = status_line_count(
+            state
+                .options
+                .resolve(Some(session_name), OptionName::Status),
+            window.size().rows,
+        );
         match state
             .options
             .resolve(Some(session_name), OptionName::StatusPosition)
         {
-            Some("top") => (Some(0), 1),
-            _ => (Some(window.size().rows.saturating_sub(1)), 1),
+            Some("top") => (Some(0), status_lines),
+            _ => (
+                Some(window.size().rows.saturating_sub(status_lines)),
+                status_lines,
+            ),
         }
     } else {
         (None, 0)
@@ -214,6 +264,19 @@ pub(crate) fn classify_mouse_events(
     expired.into_iter().chain(current).collect()
 }
 
+/// Maps a raw outer-terminal report to the pane under the cursor without
+/// synthesizing tmux click/drag bindings. This is the application passthrough
+/// path used when the pane requested mouse tracking but the RMUX `mouse`
+/// option is off.
+pub(crate) fn mouse_event_for_pane_passthrough(
+    layout: &MouseLayout,
+    raw: MouseForwardEvent,
+) -> Option<AttachedMouseEvent> {
+    let hit = resolve_mouse_hit(layout, raw.x, raw.y, false, None);
+    let event = hit_to_attached_event(layout, raw, hit, false)?;
+    (event.location == MouseLocation::Pane).then_some(event)
+}
+
 fn classify_current_mouse_event(
     state: &mut ClientMouseState,
     layout: &MouseLayout,
@@ -283,6 +346,18 @@ fn classify_current_mouse_event(
     };
     let mut attached_event = hit_to_attached_event(layout, attached_raw, hit, ignore)?;
 
+    if matches!(kind, MouseEventKind::MouseDown)
+        || (matches!(kind, MouseEventKind::MouseDrag) && state.drag_start_event.is_none())
+    {
+        state.drag_start_event = Some(attached_event.clone());
+    }
+
+    if drag_origin_should_lock_location(kind, state.drag_flag, state.drag_start_event.as_ref()) {
+        if let Some(start) = state.drag_start_event.as_ref() {
+            apply_drag_origin_location(&mut attached_event, start);
+        }
+    }
+
     let mut kind = kind;
 
     if matches!(
@@ -337,6 +412,7 @@ fn classify_current_mouse_event(
         state.scrolling_flag = false;
         state.slider_mpos = -1;
         state.drag_handler = None;
+        state.drag_start_event = None;
     }
 
     let focus_target = if matches!(kind, MouseEventKind::MouseMove)
@@ -375,11 +451,34 @@ fn classify_current_mouse_event(
 
     attached_event.ignore = ignore;
     state.current_event = Some(attached_event.clone());
+    if matches!(kind, MouseEventKind::MouseUp) && state.drag_flag == 0 {
+        state.drag_start_event = None;
+    }
     Some(ClassifiedMouseEvent {
         key,
         event: attached_event,
         focus_target,
     })
+}
+
+fn drag_origin_should_lock_location(
+    kind: MouseEventKind,
+    drag_flag: u8,
+    start: Option<&AttachedMouseEvent>,
+) -> bool {
+    start.is_some_and(|event| {
+        matches!(event.location, MouseLocation::Pane | MouseLocation::Border)
+            && (drag_flag != 0
+                || matches!(kind, MouseEventKind::MouseDrag | MouseEventKind::MouseUp))
+    })
+}
+
+fn apply_drag_origin_location(event: &mut AttachedMouseEvent, start: &AttachedMouseEvent) {
+    event.session_id = start.session_id;
+    event.window_id = start.window_id;
+    event.pane_id = start.pane_id;
+    event.pane_target = start.pane_target.clone();
+    event.location = start.location;
 }
 
 pub(crate) fn copy_mode_mouse_context(

@@ -1,27 +1,84 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmux_core::alternate_screen_exit_sequence;
 use rmux_proto::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, TerminalGeometry, TerminalPixels,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand, TerminalGeometry,
+    TerminalPixels,
 };
-use rmux_pty::PtyPair;
+use rmux_pty::{ChildCommand, PtyIo, PtyPair};
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::termios::{tcsetwinsize, Winsize};
 
+use crate::attach_lock_state::AttachLockState;
+
 use super::{
-    attach_with_terminal, drain_resize_events, fallback_attach_stop_sequence, input_loop,
-    output_loop, terminal_size_from_fd, AttachScreenTracker, RawTerminal, ResizeWatcher,
-    SignalMaskGuard, TerminalSize,
+    attach_with_terminal, drain_resize_events, fallback_attach_stop_sequence, handle_attach_action,
+    input_loop, output_loop, terminal_size_from_fd, write_attach_unlock, AttachScreenTracker,
+    ClientAttachAction, RawTerminal, ResizeWatcher, SignalMaskGuard, TerminalSize,
 };
 
 static RESIZE_WATCHER_SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+const CONTROLLING_TTY_CASE_ENV: &str = "RMUX_CLIENT_CONTROLLING_TTY_CASE";
+const LOCK_ACTIONS_TTY_CASE: &str = "lock-actions";
+const STRUCTURED_SHELL_TTY_CASE: &str = "structured-shell";
+
+fn run_test_with_controlling_tty(
+    test_name: &str,
+    case: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let spawned = ChildCommand::new(std::env::current_exe()?)
+        .arg(test_name)
+        .args(["--exact", "--nocapture", "--test-threads=1"])
+        .env(CONTROLLING_TTY_CASE_ENV, case)
+        .size(rmux_pty::TerminalSize::new(80, 24))
+        .spawn()?;
+    let (master, mut child) = spawned.into_parts();
+    let output_io = master.into_io();
+    output_io.release_startup_slave_guard();
+    let output_thread = std::thread::spawn(move || read_test_pty_output(output_io));
+
+    let status = child.wait()?;
+    let output = output_thread
+        .join()
+        .map_err(|_| io::Error::other("controlling-TTY output reader panicked"))??;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "controlling-TTY child {test_name} failed with {status}: {}",
+            String::from_utf8_lossy(&output)
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn read_test_pty_output(output: PtyIo) -> io::Result<Vec<u8>> {
+    let mut collected = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match output.read(&mut buffer) {
+            Ok(0) => return Ok(collected),
+            Ok(bytes_read) => collected.extend_from_slice(&buffer[..bytes_read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(collected),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn attach_stop_payload() -> Vec<u8> {
+    let mut payload = fallback_attach_stop_sequence("xterm-256color");
+    payload.extend_from_slice(b"[detached (from session alpha)]\r\n");
+    payload
+}
 
 #[test]
 fn terminal_size_from_fd_ignores_zero_sized_terminals() -> Result<(), Box<dyn std::error::Error>> {
@@ -117,7 +174,7 @@ fn input_loop_emits_raw_data_frame_for_native_typed_bytes() -> Result<(), Box<dy
     let (mut input_writer, input_reader) = UnixStream::pair()?;
     let (_resize_tx, resize_rx) = mpsc::channel();
     let closed = Arc::new(AtomicBool::new(false));
-    let locked = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
     let (_wakeup, wakeup_reader) = UnixStream::pair()?;
 
     let input_thread = std::thread::spawn(move || {
@@ -148,6 +205,164 @@ fn input_loop_emits_raw_data_frame_for_native_typed_bytes() -> Result<(), Box<dy
     input_thread
         .join()
         .map_err(|_| "input loop thread panicked")??;
+    Ok(())
+}
+
+#[test]
+fn lock_action_waits_for_an_inflight_unix_input_read_and_forward(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server_stream) = UnixStream::pair()?;
+    let (mut readiness_writer, readiness_reader) = UnixStream::pair()?;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let input = PausedInput {
+        readiness: readiness_reader,
+        entered: entered_tx,
+        release: release_rx,
+        pause_next: true,
+    };
+    let (_resize_tx, resize_rx) = mpsc::channel();
+    let closed = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
+    let input_locked = Arc::clone(&locked);
+    let (_wakeup, wakeup_reader) = UnixStream::pair()?;
+    let input_thread = std::thread::spawn(move || {
+        input_loop(
+            client_stream,
+            input,
+            resize_rx,
+            false,
+            closed,
+            input_locked,
+            wakeup_reader,
+        )
+    });
+
+    readiness_writer.write_all(b"a")?;
+    entered_rx.recv_timeout(Duration::from_secs(1))?;
+    locked.lock();
+    let waiter_state = Arc::clone(&locked);
+    let (idle_tx, idle_rx) = mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        waiter_state.wait_until_input_idle();
+        idle_tx.send(()).expect("signal idle input");
+    });
+    assert!(
+        idle_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+        "exclusive terminal action must wait while the input read is active"
+    );
+
+    release_tx.send(())?;
+    let mut frame = [0_u8; 64];
+    let bytes_read = server_stream.read(&mut frame)?;
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&frame[..bytes_read]);
+    assert_eq!(
+        decoder.next_message()?,
+        Some(AttachMessage::Data(b"a".to_vec()))
+    );
+    idle_rx.recv_timeout(Duration::from_secs(1))?;
+    waiter.join().map_err(|_| "lock waiter panicked")?;
+
+    locked.unlock();
+    readiness_writer.shutdown(std::net::Shutdown::Write)?;
+    input_thread
+        .join()
+        .map_err(|_| "input loop thread panicked")??;
+    Ok(())
+}
+
+#[test]
+fn unix_lock_actions_rearm_screen_before_sending_unlock() -> Result<(), Box<dyn std::error::Error>>
+{
+    if std::env::var(CONTROLLING_TTY_CASE_ENV).as_deref() != Ok(LOCK_ACTIONS_TTY_CASE) {
+        return run_test_with_controlling_tty(
+            "attach::tests::unix_lock_actions_rearm_screen_before_sending_unlock",
+            LOCK_ACTIONS_TTY_CASE,
+        );
+    }
+
+    let raw_terminal = RawTerminal::from_fd(&io::stdin())?;
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+
+    for structured in [false, true] {
+        let (mut client_stream, mut server_stream) = UnixStream::pair()?;
+        let locked = Arc::new(AttachLockState::default());
+        let screen_tracker = AttachScreenTracker::default();
+        locked.lock();
+        let stop_generation = screen_tracker.mark_stopped();
+        let action = if structured {
+            ClientAttachAction::LockShell {
+                command: AttachShellCommand::new(
+                    "true".to_owned(),
+                    "/bin/sh".to_owned(),
+                    cwd.clone(),
+                ),
+                stop_generation: Some(stop_generation),
+            }
+        } else {
+            ClientAttachAction::Lock {
+                command: "true".to_owned(),
+                stop_generation: Some(stop_generation),
+            }
+        };
+
+        handle_attach_action(
+            Some(&raw_terminal),
+            &mut client_stream,
+            &locked,
+            &screen_tracker,
+            action,
+        )?;
+
+        assert!(
+            !screen_tracker.was_stopped(),
+            "successful lock action must rearm attach lifecycle"
+        );
+        assert!(!locked.is_locked());
+        let mut frame = [0_u8; 64];
+        let bytes_read = server_stream.read(&mut frame)?;
+        let mut decoder = AttachFrameDecoder::new();
+        decoder.push_bytes(&frame[..bytes_read]);
+        assert_eq!(decoder.next_message()?, Some(AttachMessage::Unlock));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn unix_unlock_write_failure_still_leaves_screen_rearmed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (mut client_stream, server_stream) = UnixStream::pair()?;
+    let screen_tracker = AttachScreenTracker::default();
+    let stop_generation = screen_tracker.mark_stopped();
+    drop(server_stream);
+
+    write_attach_unlock(&mut client_stream, &screen_tracker, Some(stop_generation))
+        .expect_err("closed peer must reject attach unlock");
+    assert!(
+        !screen_tracker.was_stopped(),
+        "failed unlock transport must trigger outer terminal cleanup"
+    );
+    Ok(())
+}
+
+#[test]
+fn unix_lock_completion_preserves_a_later_final_stop() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut client_stream, mut server_stream) = UnixStream::pair()?;
+    let screen_tracker = AttachScreenTracker::default();
+    let lock_prelude = screen_tracker.mark_stopped();
+    let final_stop = screen_tracker.mark_stopped();
+    server_stream.set_nonblocking(true)?;
+
+    write_attach_unlock(&mut client_stream, &screen_tracker, Some(lock_prelude))?;
+
+    assert_eq!(screen_tracker.current_stop_generation(), Some(final_stop));
+    let mut frame = [0_u8; 64];
+    let error = server_stream
+        .read(&mut frame)
+        .expect_err("a stale lock completion must not send unlock");
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     Ok(())
 }
 
@@ -201,7 +416,7 @@ fn output_loop_errors_when_server_hangs_up_before_attach_stop(
     let (client_stream, server_stream) = UnixStream::pair()?;
     let output = Vec::new();
     let closed = Arc::new(AtomicBool::new(false));
-    let locked = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
     let (action_tx, _action_rx) = mpsc::channel();
     let screen_tracker = AttachScreenTracker::default();
 
@@ -227,13 +442,68 @@ fn output_loop_errors_when_server_hangs_up_before_attach_stop(
 }
 
 #[test]
+fn output_loop_treats_literal_exit_banners_as_pane_data() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (client_stream, mut server_stream) = UnixStream::pair()?;
+    let output = SharedOutput::default();
+    let captured = output.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, _action_rx) = mpsc::channel();
+    let screen_tracker = AttachScreenTracker::default();
+    let output_thread = std::thread::spawn(move || {
+        output_loop(
+            client_stream,
+            Vec::new(),
+            output,
+            closed,
+            locked,
+            screen_tracker,
+            action_tx,
+        )
+    });
+
+    for bytes in [
+        b"[exited]\r\n".as_slice(),
+        b"[detached (from session ordinary-pane-output)]\r\n",
+        b"still-attached\n",
+    ] {
+        server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
+            bytes.to_vec(),
+        ))?)?;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !output_thread.is_finished(),
+        "banner-shaped pane output must not terminate attach"
+    );
+
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
+        attach_stop_payload(),
+    ))?)?;
+    server_stream.shutdown(std::net::Shutdown::Write)?;
+    output_thread
+        .join()
+        .map_err(|_| "output loop thread panicked")??;
+
+    let rendered = captured.into_bytes()?;
+    assert!(rendered
+        .windows(b"[exited]\r\n".len())
+        .any(|part| part == b"[exited]\r\n"));
+    assert!(rendered
+        .windows(b"still-attached\n".len())
+        .any(|part| part == b"still-attached\n"));
+    Ok(())
+}
+
+#[test]
 fn output_loop_flushes_pending_render_before_accepting_next_frame(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (client_stream, mut server_stream) = UnixStream::pair()?;
     let output = SharedOutput::default();
     let captured = output.clone();
     let closed = Arc::new(AtomicBool::new(false));
-    let locked = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
     let (action_tx, _action_rx) = mpsc::channel();
     let screen_tracker = AttachScreenTracker::default();
 
@@ -244,7 +514,7 @@ fn output_loop_flushes_pending_render_before_accepting_next_frame(
         b"render-two\n".to_vec(),
     ))?)?;
     server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
-        b"[detached (from session alpha)]\r\n".to_vec(),
+        attach_stop_payload(),
     ))?)?;
     server_stream.shutdown(std::net::Shutdown::Write)?;
 
@@ -277,7 +547,7 @@ fn output_loop_replaces_pending_render_after_first_paint() -> Result<(), Box<dyn
     let output = SharedOutput::default();
     let captured = output.clone();
     let closed = Arc::new(AtomicBool::new(false));
-    let locked = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
     let (action_tx, _action_rx) = mpsc::channel();
     let screen_tracker = AttachScreenTracker::default();
 
@@ -291,7 +561,7 @@ fn output_loop_replaces_pending_render_after_first_paint() -> Result<(), Box<dyn
         b"latest\n".to_vec(),
     ))?)?;
     server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
-        b"[detached (from session alpha)]\r\n".to_vec(),
+        attach_stop_payload(),
     ))?)?;
     server_stream.shutdown(std::net::Shutdown::Write)?;
 
@@ -318,7 +588,7 @@ fn output_loop_waits_briefly_to_coalesce_render_frames() -> Result<(), Box<dyn s
     let output = SharedOutput::default();
     let captured = output.clone();
     let closed = Arc::new(AtomicBool::new(false));
-    let locked = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
     let (action_tx, _action_rx) = mpsc::channel();
     let screen_tracker = AttachScreenTracker::default();
 
@@ -346,7 +616,7 @@ fn output_loop_waits_briefly_to_coalesce_render_frames() -> Result<(), Box<dyn s
     ))?);
     server_stream.write_all(&replacement_burst)?;
     server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
-        b"[detached (from session alpha)]\r\n".to_vec(),
+        attach_stop_payload(),
     ))?)?;
     server_stream.shutdown(std::net::Shutdown::Write)?;
     output_thread
@@ -367,7 +637,7 @@ fn output_loop_flushes_render_before_idle_gap_when_stream_stays_busy(
     let output = SharedOutput::default();
     let captured = output.clone();
     let closed = Arc::new(AtomicBool::new(false));
-    let locked = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
     let (action_tx, _action_rx) = mpsc::channel();
     let screen_tracker = AttachScreenTracker::default();
 
@@ -400,7 +670,7 @@ fn output_loop_flushes_render_before_idle_gap_when_stream_stays_busy(
     }
 
     server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
-        b"[detached (from session alpha)]\r\n".to_vec(),
+        attach_stop_payload(),
     ))?)?;
     server_stream.shutdown(std::net::Shutdown::Write)?;
     output_thread
@@ -419,7 +689,7 @@ fn output_loop_keeps_original_render_deadline_across_replacements(
     let output = SharedOutput::default();
     let captured = output.clone();
     let closed = Arc::new(AtomicBool::new(false));
-    let locked = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AttachLockState::default());
     let (action_tx, _action_rx) = mpsc::channel();
     let screen_tracker = AttachScreenTracker::default();
     let writer_done = Arc::new(AtomicBool::new(false));
@@ -450,10 +720,8 @@ fn output_loop_keeps_original_render_deadline_across_replacements(
             std::thread::sleep(Duration::from_millis(2));
         }
         writer_done_for_thread.store(true, Ordering::SeqCst);
-        let detach = encode_attach_message(&AttachMessage::Data(
-            b"[detached (from session alpha)]\r\n".to_vec(),
-        ))
-        .expect("detach frame should encode");
+        let detach = encode_attach_message(&AttachMessage::Data(attach_stop_payload()))
+            .expect("detach frame should encode");
         server_stream.write_all(&detach)?;
         server_stream.shutdown(std::net::Shutdown::Write)
     });
@@ -514,6 +782,34 @@ impl Write for SharedOutput {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+struct PausedInput {
+    readiness: UnixStream,
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+    pause_next: bool,
+}
+
+impl Read for PausedInput {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.pause_next {
+            self.pause_next = false;
+            self.entered
+                .send(())
+                .map_err(|_| io::Error::other("input-read observer closed"))?;
+            self.release
+                .recv()
+                .map_err(|_| io::Error::other("input-read release closed"))?;
+        }
+        self.readiness.read(buffer)
+    }
+}
+
+impl AsFd for PausedInput {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.readiness.as_fd()
     }
 }
 
@@ -612,6 +908,47 @@ fn fallback_attach_stop_sequence_disables_mouse_and_exits_alt_screen() {
             .any(|window| window == expected_alt_exit),
         "fallback stop should leave the alternate screen"
     );
+}
+
+#[test]
+fn structured_shell_commands_use_server_resolved_shell_and_cwd(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var(CONTROLLING_TTY_CASE_ENV).as_deref() != Ok(STRUCTURED_SHELL_TTY_CASE) {
+        return run_test_with_controlling_tty(
+            "attach::tests::structured_shell_commands_use_server_resolved_shell_and_cwd",
+            STRUCTURED_SHELL_TTY_CASE,
+        );
+    }
+
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "rmux-client-shell-context-{}-{nonce}",
+        std::process::id()
+    ));
+    let cwd = root.join("cwd");
+    std::fs::create_dir_all(&cwd)?;
+    let shell = root.join("shell-wrapper");
+    std::fs::write(
+        &shell,
+        b"#!/bin/sh\nprintf wrapper > wrapper.txt\nexec /bin/sh \"$@\"\n",
+    )?;
+    let mut permissions = std::fs::metadata(&shell)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&shell, permissions)?;
+
+    let raw = RawTerminal::from_fd(&io::stdin())?;
+    let command = AttachShellCommand::new(
+        "printf command > command.txt".to_owned(),
+        shell.to_string_lossy().into_owned(),
+        cwd.to_string_lossy().into_owned(),
+    );
+    raw.run_lock_shell_command(&command)?;
+    drop(raw);
+
+    assert_eq!(std::fs::read_to_string(cwd.join("wrapper.txt"))?, "wrapper");
+    assert_eq!(std::fs::read_to_string(cwd.join("command.txt"))?, "command");
+    std::fs::remove_dir_all(root)?;
+    Ok(())
 }
 
 #[test]

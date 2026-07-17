@@ -12,11 +12,14 @@ use std::time::Duration;
 
 use rmux_proto::{
     encode_frame, CancelSdkWaitResponse, CommandOutput, FrameDecoder, HandshakeResponse,
-    HasSessionRequest, ListPanesResponse, PaneOutputSubscriptionStart, PaneSnapshotCell,
-    PaneSnapshotCursor, PaneSnapshotResponse, Request, Response, SdkWaitForOutputRequest,
-    SdkWaitForOutputResponse, SdkWaitOutcome, CAPABILITY_SDK_WAITS_ARMED,
+    HasSessionRequest, ListPanesResponse, PaneId, PaneOutputSubscriptionStart, PaneSnapshotCell,
+    PaneSnapshotCursor, PaneSnapshotResponse, PaneTargetRef, Request, Response,
+    SdkWaitForOutputRefRequest, SdkWaitForOutputResponse, SdkWaitOutcome,
+    CAPABILITY_SDK_WAITS_ARMED,
 };
-use rmux_sdk::{EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName};
+use rmux_sdk::{
+    EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName, TerminalLoadState,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::time::Instant;
@@ -166,6 +169,45 @@ async fn wait_for_text_succeeds_for_text_already_in_snapshot() -> TestResult {
 
     let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
     pane.wait_for_text("marker").await?;
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pane_snapshot_returns_default_when_resolved_pane_closes_before_fetch() -> TestResult {
+    let socket = TestSocket::new("snapshot-close-race")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_list_panes(&mut peer).await?;
+
+        let mut request = peer.expect_request().await?;
+        if matches!(request, Request::Handshake(_)) {
+            peer.write_response(Response::Handshake(HandshakeResponse::current()))
+                .await?;
+            request = peer.expect_request().await?;
+        }
+        let Request::PaneSnapshotRef(request) = request else {
+            panic!("snapshot must use the resolved pane id, got {request:?}");
+        };
+        let pane_id = rmux_proto::PaneId::new(1);
+        assert_eq!(
+            request.target,
+            rmux_proto::PaneTargetRef::by_id(session_name(), pane_id),
+        );
+        peer.write_response(Response::Error(rmux_proto::ErrorResponse {
+            error: rmux_proto::RmuxError::pane_not_found(session_name(), pane_id),
+        }))
+        .await?;
+        assert_peer_closed_without_request(&mut peer).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let snapshot = pane.snapshot().await?;
+    assert_eq!(snapshot, rmux_sdk::PaneSnapshot::default());
+    assert_eq!(snapshot.revision, 0);
     drop(pane);
     server.await??;
     Ok(())
@@ -488,7 +530,13 @@ async fn expect_visible_text_timeout_includes_last_snapshot() -> TestResult {
                     }))
                     .await?;
                 }
-                Request::PaneSnapshot(_) => {
+                Request::Handshake(_) => {
+                    peer.write_response(Response::Handshake(
+                        rmux_proto::HandshakeResponse::current(),
+                    ))
+                    .await?;
+                }
+                Request::PaneSnapshotRef(_) => {
                     peer.write_response(Response::PaneSnapshot(snapshot_response(
                         "last visible screen",
                         7,
@@ -519,6 +567,116 @@ async fn expect_visible_text_timeout_includes_last_snapshot() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn visible_text_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("visible-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.expect_visible_text()
+            .to_contain("never")
+            .timeout(Duration::from_millis(30)),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for pane snapshot text");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_state_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("load-state-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.wait_for_load_state(TerminalLoadState::Quiet)
+            .timeout(Duration::from_millis(30)),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for terminal load-state snapshot");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn locator_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("locator-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.get_by_text("never")
+            .wait_for()
+            .timeout(Duration::from_millis(30)),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for locator snapshot");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn locator_assertion_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("locator-assert-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.get_by_text("never")
+            .expect()
+            .to_be_visible()
+            .timeout(Duration::from_millis(30)),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for locator snapshot");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn locator_action_timeout_bounds_a_stalled_snapshot_rpc() -> TestResult {
+    let socket = TestSocket::new("locator-action-stalled-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(hold_first_snapshot_response(listener));
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        pane.get_by_text("never")
+            .timeout(Duration::from_millis(30))
+            .click(),
+    )
+    .await
+    .expect("the public wait deadline must beat the external watchdog")
+    .expect_err("a stalled snapshot must time out");
+    assert_timed_out(error, "wait for locator snapshot");
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
 async fn pane_for(socket_path: &Path, timeout: Duration) -> TestResult<Pane> {
     let rmux = RmuxBuilder::new()
         .unix_socket(socket_path)
@@ -543,33 +701,49 @@ async fn accept_peer(listener: &UnixListener) -> TestResult<Peer> {
 async fn accept_sdk_wait(
     listener: &UnixListener,
     expected_bytes: &[u8],
-) -> TestResult<(Peer, Vec<Peer>, SdkWaitForOutputRequest)> {
+) -> TestResult<(Peer, Vec<Peer>, SdkWaitForOutputRefRequest)> {
     let mut peers = Vec::new();
-    let (mut main_index, mut request) =
-        expect_request_from_existing_or_new(listener, &mut peers, Duration::from_secs(1)).await?;
-    if let Request::Handshake(handshake) = &request {
-        assert!(
-            handshake
-                .required_capabilities
-                .iter()
-                .any(|capability| capability == CAPABILITY_SDK_WAITS_ARMED),
-            "armed SDK wait handshake did not require {CAPABILITY_SDK_WAITS_ARMED}: {handshake:?}"
-        );
-        peers[main_index]
-            .write_response(Response::Handshake(HandshakeResponse::current()))
-            .await?;
-        (main_index, request) =
+    let mut saw_armed_handshake = false;
+    loop {
+        let (peer_index, request) =
             expect_request_from_existing_or_new(listener, &mut peers, Duration::from_secs(1))
                 .await?;
+        match request {
+            Request::Handshake(handshake) => {
+                saw_armed_handshake |= handshake
+                    .required_capabilities
+                    .iter()
+                    .any(|capability| capability == CAPABILITY_SDK_WAITS_ARMED);
+                peers[peer_index]
+                    .write_response(Response::Handshake(HandshakeResponse::current()))
+                    .await?;
+            }
+            Request::ListPanes(request) => {
+                assert_eq!(request.target, session_name());
+                assert_eq!(request.target_window_index, Some(0));
+                peers[peer_index]
+                    .write_response(Response::ListPanes(ListPanesResponse {
+                        output: CommandOutput::from_stdout("0:0:%1\n"),
+                    }))
+                    .await?;
+            }
+            Request::SdkWaitForOutputRef(request) => {
+                assert!(
+                    saw_armed_handshake,
+                    "SDK wait transport did not require {CAPABILITY_SDK_WAITS_ARMED}"
+                );
+                assert_eq!(
+                    request.target,
+                    PaneTargetRef::by_id(session_name(), PaneId::new(1))
+                );
+                assert_eq!(request.bytes, expected_bytes);
+                assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
+                let main = peers.swap_remove(peer_index);
+                return Ok((main, peers, request));
+            }
+            request => panic!("wait_for must use server-side SDK byte wait, got {request:?}"),
+        }
     }
-    let main = peers.swap_remove(main_index);
-    let Request::SdkWaitForOutput(request) = request else {
-        panic!("wait_for must use server-side SDK byte wait, got {request:?}");
-    };
-    assert_eq!(request.target, target().to_proto());
-    assert_eq!(request.bytes, expected_bytes);
-    assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
-    Ok((main, peers, request))
 }
 
 async fn expect_sdk_cancel_request(
@@ -642,7 +816,10 @@ async fn expect_list_panes(peer: &mut Peer) -> TestResult {
         panic!("snapshot wait must list panes before capture, got {request:?}");
     };
     assert_eq!(request.target, session_name());
-    assert_eq!(request.target_window_index, Some(0));
+    assert!(
+        matches!(request.target_window_index, Some(0) | None),
+        "snapshot identity lookup must stay in the target session"
+    );
 
     peer.write_response(Response::ListPanes(ListPanesResponse {
         output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
@@ -651,14 +828,59 @@ async fn expect_list_panes(peer: &mut Peer) -> TestResult {
 }
 
 async fn expect_snapshot(peer: &mut Peer, text: &str, revision: u64) -> TestResult {
-    let request = peer.expect_request().await?;
-    let Request::PaneSnapshot(request) = request else {
-        panic!("snapshot wait must capture pane text, got {request:?}");
+    // Slot snapshots probe capabilities once per transport and then route
+    // through the pane id resolved by the preceding list (issue #94).
+    let mut request = peer.expect_request().await?;
+    if let Request::ListPanes(list) = &request {
+        assert_eq!(list.target, session_name());
+        assert_eq!(list.target_window_index, None);
+        peer.write_response(Response::ListPanes(ListPanesResponse {
+            output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
+        }))
+        .await?;
+        request = peer.expect_request().await?;
+    }
+    if matches!(request, Request::Handshake(_)) {
+        peer.write_response(Response::Handshake(rmux_proto::HandshakeResponse::current()))
+            .await?;
+        request = peer.expect_request().await?;
+    }
+    let Request::PaneSnapshotRef(request) = request else {
+        panic!("snapshot wait must capture pane text by id, got {request:?}");
     };
-    assert_eq!(request.target, target().to_proto());
+    assert_eq!(
+        request.target,
+        rmux_proto::PaneTargetRef::by_id(session_name(), rmux_proto::PaneId::new(1)),
+    );
 
     peer.write_response(Response::PaneSnapshot(snapshot_response(text, revision)))
         .await
+}
+
+async fn hold_first_snapshot_response(listener: UnixListener) -> TestResult {
+    let mut peer = accept_peer(&listener).await?;
+    expect_list_panes(&mut peer).await?;
+    let mut request = peer.expect_request().await?;
+    if let Request::ListPanes(list) = &request {
+        assert_eq!(list.target, session_name());
+        assert_eq!(list.target_window_index, None);
+        peer.write_response(Response::ListPanes(ListPanesResponse {
+            output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
+        }))
+        .await?;
+        request = peer.expect_request().await?;
+    }
+    if matches!(request, Request::Handshake(_)) {
+        peer.write_response(Response::Handshake(HandshakeResponse::current()))
+            .await?;
+        request = peer.expect_request().await?;
+    }
+    assert!(
+        matches!(request, Request::PaneSnapshotRef(_)),
+        "snapshot wait must issue a pane snapshot RPC, got {request:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    Ok(())
 }
 
 fn snapshot_response(text: &str, revision: u64) -> PaneSnapshotResponse {

@@ -31,6 +31,10 @@ pub(super) fn write_stdout(bytes: &[u8]) -> io::Result<()> {
     }
 }
 
+pub(super) fn write_stderr(bytes: &[u8]) -> io::Result<()> {
+    io::stderr().lock().write_all(bytes)
+}
+
 fn stdout_write_error_is_tty_compatible_exit(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::BrokenPipe)
 }

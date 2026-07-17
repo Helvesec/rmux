@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant, MissedTickBehavior, Sleep};
 use tracing::{debug, info};
 
+use super::keepalive::{KeepaliveAction, WebSocketKeepalive, PAYLOAD as KEEPALIVE_PAYLOAD};
 use super::rate_limit::OperatorRateLimiter;
 use crate::handler::{
     RequestHandler, WebPaneStream, WebSessionAttachEvent, WebSessionSnapshot, WebSessionStream,
@@ -31,6 +32,8 @@ const SESSION_SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(50);
 const SESSION_SNAPSHOT_MAX_WAIT: Duration = Duration::from_millis(200);
 const SESSION_INTERACTIVE_DEBOUNCE: Duration = Duration::from_millis(8);
 const SESSION_INTERACTIVE_MAX_WAIT: Duration = Duration::from_millis(32);
+const KEEPALIVE_TIMEOUT_CLOSE_CODE: u16 = 4009;
+const KEEPALIVE_TIMEOUT_REASON: &str = "pong_timeout";
 
 pub(super) async fn serve_pane_loop(
     handler: Arc<RequestHandler>,
@@ -49,6 +52,7 @@ pub(super) async fn serve_pane_loop(
     let mut last_connection_counts = pane.connection_counts();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
     alive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut keepalive = WebSocketKeepalive::new();
     let snapshot_sleep = sleep(Duration::from_secs(365 * 24 * 60 * 60));
     tokio::pin!(snapshot_sleep);
     let mut snapshot_pending = false;
@@ -125,7 +129,7 @@ pub(super) async fn serve_pane_loop(
                     WebSocketMessage::Ping(payload) => {
                         outbound.write_pong(&payload).await?;
                     }
-                    WebSocketMessage::Pong => {}
+                    WebSocketMessage::Pong(payload) => keepalive.acknowledge_pong(&payload),
                 }
             }
             changed = pane.revoke_rx.changed() => {
@@ -162,9 +166,15 @@ pub(super) async fn serve_pane_loop(
                 }
             }
             _ = alive_tick.tick() => {
-                if !handler.web_target_alive(pane.target()).await {
-                    notify_revoked_and_close(&outbound, WebShareRevokeReason::PaneGone).await?;
-                    return Ok(());
+                match handler
+                    .current_web_pane_target(pane.session_id(), pane.target())
+                    .await
+                {
+                    Ok(target) => pane.set_target(target),
+                    Err(_) => {
+                        notify_revoked_and_close(&outbound, WebShareRevokeReason::PaneGone).await?;
+                        return Ok(());
+                    }
                 }
                 send_viewer_count_if_changed(
                     &outbound,
@@ -172,6 +182,20 @@ pub(super) async fn serve_pane_loop(
                     pane.connection_counts(),
                 )
                 .await?;
+            }
+            action = keepalive.next_action() => {
+                match action {
+                    KeepaliveAction::Ping => outbound.write_ping(KEEPALIVE_PAYLOAD).await?,
+                    KeepaliveAction::TimedOut => {
+                        let _ = outbound
+                            .write_close_code(
+                                KEEPALIVE_TIMEOUT_CLOSE_CODE,
+                                KEEPALIVE_TIMEOUT_REASON,
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                }
             }
         }
     }
@@ -219,7 +243,11 @@ async fn queue_fresh_pane_snapshot(
     outbound: &WebSocketOutbound,
     pane: &mut WebPaneStream,
 ) -> io::Result<OutboundQueueResult> {
-    let target = pane.target().clone();
+    let target = handler
+        .current_web_pane_target(pane.session_id(), pane.target())
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    pane.set_target(target.clone());
     let (snapshot, output) = handler
         .web_resnapshot(&target)
         .await
@@ -244,6 +272,7 @@ pub(super) async fn serve_session_loop(
     let mut last_connection_counts = session.connection_counts();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
     alive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut keepalive = WebSocketKeepalive::new();
     let ttl_delay = session
         .expires_at()
         .map(duration_until)
@@ -434,7 +463,7 @@ pub(super) async fn serve_session_loop(
                     WebSocketMessage::Ping(payload) => {
                         outbound.write_pong(&payload).await?;
                     }
-                    WebSocketMessage::Pong => {}
+                    WebSocketMessage::Pong(payload) => keepalive.acknowledge_pong(&payload),
                 }
             }
             changed = session.revoke_rx.changed() => {
@@ -521,6 +550,20 @@ pub(super) async fn serve_session_loop(
                     session.connection_counts(),
                 )
                 .await?;
+            }
+            action = keepalive.next_action() => {
+                match action {
+                    KeepaliveAction::Ping => outbound.write_ping(KEEPALIVE_PAYLOAD).await?,
+                    KeepaliveAction::TimedOut => {
+                        let _ = outbound
+                            .write_close_code(
+                                KEEPALIVE_TIMEOUT_CLOSE_CODE,
+                                KEEPALIVE_TIMEOUT_REASON,
+                            )
+                            .await;
+                        return Ok(());
+                    }
+                }
             }
         }
     }

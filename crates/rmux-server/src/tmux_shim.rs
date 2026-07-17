@@ -160,6 +160,11 @@ fn shim_binary_name() -> &'static str {
     "tmux"
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn test_shim_path(socket_path: &Path) -> PathBuf {
+    shim_dir(socket_path).join(shim_binary_name())
+}
+
 fn prepend_path(environment: &mut HashMap<String, String>, dir: &Path) {
     let dir = dir.to_string_lossy();
     let path = remove_environment_value(environment, "PATH").unwrap_or_default();

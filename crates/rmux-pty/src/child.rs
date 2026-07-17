@@ -23,10 +23,13 @@ pub struct ChildCommand {
     pub(crate) program: PathBuf,
     pub(crate) arg0: Option<OsString>,
     pub(crate) args: Vec<OsString>,
+    pub(crate) windows_verbatim_args: Option<OsString>,
     pub(crate) env: Vec<(OsString, OsString)>,
     pub(crate) clear_env: bool,
     pub(crate) current_dir: Option<PathBuf>,
     pub(crate) size: Option<TerminalSize>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) allow_explicit_job_breakaway: bool,
 }
 
 impl ChildCommand {
@@ -37,10 +40,12 @@ impl ChildCommand {
             program: program.into(),
             arg0: None,
             args: Vec::new(),
+            windows_verbatim_args: None,
             env: Vec::new(),
             clear_env: false,
             current_dir: None,
             size: None,
+            allow_explicit_job_breakaway: false,
         }
     }
 
@@ -69,6 +74,17 @@ impl ChildCommand {
         self
     }
 
+    /// Appends raw command-line text on Windows after the normal argument list.
+    ///
+    /// This is reserved for command interpreters such as `cmd.exe` whose `/C`
+    /// tail has quoting rules that cannot be represented as independent argv
+    /// tokens. Non-Windows backends ignore the field.
+    #[must_use]
+    pub fn windows_verbatim_args(mut self, args: impl Into<OsString>) -> Self {
+        self.windows_verbatim_args = Some(args.into());
+        self
+    }
+
     /// Sets or overrides a process environment variable.
     #[must_use]
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
@@ -94,6 +110,16 @@ impl ChildCommand {
     #[must_use]
     pub fn size(mut self, size: TerminalSize) -> Self {
         self.size = Some(size);
+        self
+    }
+
+    /// Allows Windows descendants that explicitly request job breakaway to
+    /// outlive this PTY child while ordinary descendants remain job-scoped.
+    ///
+    /// This is a no-op on non-Windows platforms.
+    #[must_use]
+    pub fn allow_explicit_job_breakaway(mut self) -> Self {
+        self.allow_explicit_job_breakaway = true;
         self
     }
 
@@ -201,11 +227,24 @@ impl PtyChild {
         }
     }
 
-    /// Clones a wait-only handle for observing process exit.
+    /// Clones a wait-only handle without retaining the Windows Job Object.
+    ///
+    /// Popup teardown relies on dropping the owning child to close the last
+    /// kill-on-close Job handle before this clone closes the shared ConPTY.
     #[cfg(windows)]
     pub fn try_clone_for_wait(&self) -> Result<Self> {
         Ok(Self {
             child: backend::try_clone_child_for_wait(&self.child)?,
+            pid: self.pid,
+        })
+    }
+
+    /// Clones the process, ConPTY, and Windows Job Object handles needed by a
+    /// pane exit watcher to terminate surviving descendants before close.
+    #[cfg(windows)]
+    pub fn try_clone_for_exit_teardown(&self) -> Result<Self> {
+        Ok(Self {
+            child: backend::try_clone_child_for_exit_teardown(&self.child)?,
             pid: self.pid,
         })
     }

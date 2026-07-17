@@ -177,6 +177,42 @@ pub enum AutoStartConfigSelection {
     Files(Vec<PathBuf>),
 }
 
+/// Identifies whether the current command started the daemon it connected to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerConnectionProvenance {
+    /// This command won the serialized startup race and launched the daemon.
+    StartedByCaller,
+    /// The daemon already existed, including when another caller won the race.
+    JoinedExisting,
+}
+
+/// A ready server connection together with its startup provenance.
+pub struct EnsuredServerConnection {
+    connection: Connection,
+    provenance: ServerConnectionProvenance,
+}
+
+impl EnsuredServerConnection {
+    fn new(connection: Connection, provenance: ServerConnectionProvenance) -> Self {
+        Self {
+            connection,
+            provenance,
+        }
+    }
+
+    /// Returns how this command obtained the connected daemon.
+    #[must_use]
+    pub const fn provenance(&self) -> ServerConnectionProvenance {
+        self.provenance
+    }
+
+    /// Consumes the outcome and returns the ready connection.
+    #[must_use]
+    pub fn into_connection(self) -> Connection {
+        self.connection
+    }
+}
+
 /// Ensures the RMUX server is reachable, auto-starting it when absent.
 ///
 /// This boundary is reserved for command paths that match tmux's
@@ -188,29 +224,48 @@ pub fn ensure_server_running(socket_path: &Path) -> Result<Connection, AutoStart
 }
 
 /// Ensures the server is reachable, passing config load options if launched.
-#[cfg(unix)]
 pub fn ensure_server_running_with_config(
     socket_path: &Path,
     config: AutoStartConfig,
 ) -> Result<Connection, AutoStartError> {
-    ensure_server_running_unix(socket_path, config)
+    ensure_server_running_with_config_outcome(socket_path, config)
+        .map(EnsuredServerConnection::into_connection)
 }
 
-/// Ensures the server is reachable, passing config load options if launched.
+/// Ensures the server is reachable and preserves who started the daemon.
+///
+/// Callers that conditionally clean up an empty daemon must use this function
+/// instead of inferring ownership from a failed preflight connection. The
+/// startup serializers can report [`ServerConnectionProvenance::JoinedExisting`]
+/// when another process wins the race.
 #[cfg(windows)]
-pub fn ensure_server_running_with_config(
+pub fn ensure_server_running_with_config_outcome(
     socket_path: &Path,
     config: AutoStartConfig,
-) -> Result<Connection, AutoStartError> {
+) -> Result<EnsuredServerConnection, AutoStartError> {
     ensure_server_running_windows(socket_path, config)
 }
 
-/// Ensures the server is reachable, passing config load options if launched.
-#[cfg(not(any(unix, windows)))]
-pub fn ensure_server_running_with_config(
+/// Ensures the server is reachable and preserves who started the daemon.
+///
+/// Callers that conditionally clean up an empty daemon must use this function
+/// instead of inferring ownership from a failed preflight connection. The
+/// startup serializers can report [`ServerConnectionProvenance::JoinedExisting`]
+/// when another process wins the race.
+#[cfg(unix)]
+pub fn ensure_server_running_with_config_outcome(
     socket_path: &Path,
     config: AutoStartConfig,
-) -> Result<Connection, AutoStartError> {
+) -> Result<EnsuredServerConnection, AutoStartError> {
+    ensure_server_running_unix(socket_path, config)
+}
+
+/// Ensures the server is reachable and preserves who started the daemon.
+#[cfg(not(any(unix, windows)))]
+pub fn ensure_server_running_with_config_outcome(
+    socket_path: &Path,
+    config: AutoStartConfig,
+) -> Result<EnsuredServerConnection, AutoStartError> {
     ensure_server_running_polling(socket_path, config)
 }
 
@@ -218,7 +273,7 @@ pub fn ensure_server_running_with_config(
 fn ensure_server_running_unix(
     socket_path: &Path,
     config: AutoStartConfig,
-) -> Result<Connection, AutoStartError> {
+) -> Result<EnsuredServerConnection, AutoStartError> {
     let binary_path = rmux_binary_path(&config).map_err(AutoStartError::BinaryPath)?;
     let launcher_binary_path = binary_path.clone();
     let launcher_socket_path = socket_path.to_path_buf();
@@ -241,12 +296,19 @@ fn ensure_server_running_unix(
         STARTUP_POLL_INTERVAL,
     ));
 
-    let connection = startup_outcome_into_connection(
-        outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?,
-    )?;
+    let outcome =
+        outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?;
+    let provenance = startup_outcome_provenance(&outcome);
+    let connection = startup_outcome_into_connection(outcome)?;
 
     let connection = probe_connected_server(connection, &config, socket_path)?;
-    upgrade_restart::ensure_daemon_fresh_or_restart(connection, socket_path, &binary_path, &config)
+    let connection = upgrade_restart::ensure_daemon_fresh_or_restart(
+        connection,
+        socket_path,
+        &binary_path,
+        &config,
+    )?;
+    Ok(EnsuredServerConnection::new(connection, provenance))
 }
 
 #[cfg(unix)]
@@ -265,7 +327,7 @@ fn startup_outcome_into_connection(outcome: StartupOutcome) -> Result<Connection
 fn ensure_server_running_windows(
     socket_path: &Path,
     config: AutoStartConfig,
-) -> Result<Connection, AutoStartError> {
+) -> Result<EnsuredServerConnection, AutoStartError> {
     let binary_path = rmux_binary_path(&config).map_err(AutoStartError::BinaryPath)?;
     let launcher_binary_path = binary_path.clone();
     let launcher_socket_path = socket_path.to_path_buf();
@@ -284,18 +346,29 @@ fn ensure_server_running_windows(
         STARTUP_POLL_INTERVAL,
     );
 
-    let connection = startup_outcome_into_connection(
-        outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?,
-    )?;
+    let outcome =
+        outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?;
+    let provenance = startup_outcome_provenance(&outcome);
+    let connection = startup_outcome_into_connection(outcome)?;
     let (connection, readiness_status) =
         probe_connected_server_windows(connection, &config, socket_path)?;
-    upgrade_restart::ensure_daemon_fresh_or_restart_after_windows_readiness(
+    let connection = upgrade_restart::ensure_daemon_fresh_or_restart_after_windows_readiness(
         connection,
         socket_path,
         &binary_path,
         &config,
         readiness_status,
-    )
+    )?;
+    Ok(EnsuredServerConnection::new(connection, provenance))
+}
+
+#[cfg(any(unix, windows))]
+fn startup_outcome_provenance(outcome: &StartupOutcome) -> ServerConnectionProvenance {
+    if outcome.is_owner() {
+        ServerConnectionProvenance::StartedByCaller
+    } else {
+        ServerConnectionProvenance::JoinedExisting
+    }
 }
 
 #[cfg(windows)]
@@ -493,9 +566,9 @@ fn startup_error_kind(error: &StartupError) -> io::ErrorKind {
 fn ensure_server_running_polling(
     socket_path: &Path,
     config: AutoStartConfig,
-) -> Result<Connection, AutoStartError> {
+) -> Result<EnsuredServerConnection, AutoStartError> {
     if config.loads_startup_config() {
-        return ensure_server_running_with_probe(
+        return ensure_server_running_with_probe_outcome(
             socket_path,
             AUTO_START_TIMEOUT,
             POLL_INTERVAL,
@@ -505,12 +578,13 @@ fn ensure_server_running_polling(
         );
     }
 
-    ensure_server_running_with(
+    ensure_server_running_with_probe_outcome(
         socket_path,
         AUTO_START_TIMEOUT,
         POLL_INTERVAL,
         || crate::connect_or_absent(socket_path),
         || launch_hidden_daemon(socket_path, &config),
+        probe_server_readiness,
     )
 }
 
@@ -627,10 +701,35 @@ fn ensure_server_running_with_probe<ConnectFn, LaunchFn, ProbeFn>(
     socket_path: &Path,
     timeout: Duration,
     poll_interval: Duration,
+    connect: ConnectFn,
+    launch: LaunchFn,
+    probe: ProbeFn,
+) -> Result<Connection, AutoStartError>
+where
+    ConnectFn: FnMut() -> Result<ConnectResult, ClientError>,
+    LaunchFn: FnMut() -> Result<(), AutoStartError>,
+    ProbeFn: FnMut(&mut Connection) -> Result<(), ClientError>,
+{
+    ensure_server_running_with_probe_outcome(
+        socket_path,
+        timeout,
+        poll_interval,
+        connect,
+        launch,
+        probe,
+    )
+    .map(EnsuredServerConnection::into_connection)
+}
+
+#[cfg(any(all(test, unix), not(any(unix, windows))))]
+fn ensure_server_running_with_probe_outcome<ConnectFn, LaunchFn, ProbeFn>(
+    socket_path: &Path,
+    timeout: Duration,
+    poll_interval: Duration,
     mut connect: ConnectFn,
     mut launch: LaunchFn,
     mut probe: ProbeFn,
-) -> Result<Connection, AutoStartError>
+) -> Result<EnsuredServerConnection, AutoStartError>
 where
     ConnectFn: FnMut() -> Result<ConnectResult, ClientError>,
     LaunchFn: FnMut() -> Result<(), AutoStartError>,
@@ -639,19 +738,26 @@ where
     match connect().map_err(AutoStartError::Client)? {
         ConnectResult::Connected(mut connection) => {
             probe(&mut connection).map_err(AutoStartError::Client)?;
-            return Ok(connection);
+            return Ok(EnsuredServerConnection::new(
+                connection,
+                ServerConnectionProvenance::JoinedExisting,
+            ));
         }
         ConnectResult::Absent => {}
     }
 
     launch()?;
-    wait_for_server(
+    let connection = wait_for_server(
         socket_path,
         timeout,
         poll_interval,
         &mut connect,
         &mut probe,
-    )
+    )?;
+    Ok(EnsuredServerConnection::new(
+        connection,
+        ServerConnectionProvenance::StartedByCaller,
+    ))
 }
 
 #[cfg(any(all(test, unix), not(any(unix, windows))))]
@@ -791,14 +897,7 @@ fn spawn_hidden_daemon_for_polling(
     #[cfg(not(windows))]
     {
         let command = hidden_daemon_command(binary_path, socket_path, config, true);
-        match spawn_hidden_daemon(command) {
-            Ok(()) => Ok(()),
-            Err(error) if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) => {
-                let command = hidden_daemon_command(binary_path, socket_path, config, false);
-                spawn_hidden_daemon(command)
-            }
-            Err(error) => Err(error),
-        }
+        spawn_hidden_daemon(command)
     }
 }
 
@@ -811,21 +910,9 @@ fn spawn_hidden_daemon_for_windows(
     let ready = rmux_os::daemon::StartupReadyEvent::new()?;
     let mut command = hidden_daemon_command(binary_path, socket_path, config, true);
     append_startup_ready_event(&mut command, &ready);
-    match spawn_hidden_daemon(command) {
-        Ok(()) => {
-            let _ = ready.wait(STARTUP_READY_EVENT_TIMEOUT);
-            Ok(())
-        }
-        Err(error) if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) => {
-            let ready = rmux_os::daemon::StartupReadyEvent::new()?;
-            let mut command = hidden_daemon_command(binary_path, socket_path, config, false);
-            append_startup_ready_event(&mut command, &ready);
-            spawn_hidden_daemon(command)?;
-            let _ = ready.wait(STARTUP_READY_EVENT_TIMEOUT);
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    spawn_hidden_daemon(command)?;
+    let _ = ready.wait(STARTUP_READY_EVENT_TIMEOUT);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -843,27 +930,9 @@ fn spawn_hidden_daemon_for_linux(
     let mut command =
         hidden_daemon_command_preserving_fd(binary_path, socket_path, config, true, ready.raw_fd());
     ready.append_hidden_daemon_args(&mut command);
-    match spawn_hidden_daemon(command) {
-        Ok(()) => {
-            ready.wait_for_signal(STARTUP_READY_EVENT_TIMEOUT);
-            Ok(())
-        }
-        Err(error) if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) => {
-            let mut ready = StartupReadyEvent::new()?;
-            let mut command = hidden_daemon_command_preserving_fd(
-                binary_path,
-                socket_path,
-                config,
-                false,
-                ready.raw_fd(),
-            );
-            ready.append_hidden_daemon_args(&mut command);
-            spawn_hidden_daemon(command)?;
-            ready.wait_for_signal(STARTUP_READY_EVENT_TIMEOUT);
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    spawn_hidden_daemon(command)?;
+    ready.wait_for_signal(STARTUP_READY_EVENT_TIMEOUT);
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -958,7 +1027,7 @@ fn hidden_daemon_command_base(
 }
 
 fn spawn_hidden_daemon(mut command: Command) -> io::Result<()> {
-    let child = rmux_os::daemon::spawn_hidden_daemon_command(&mut command)?;
+    let child = rmux_os::daemon::spawn_hidden_daemon_command_requiring_job_breakaway(&mut command)?;
     // Intentionally drop without `wait()`: the daemon must outlive the
     // short-lived client process that launched it.
     drop(child);

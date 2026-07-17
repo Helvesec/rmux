@@ -13,9 +13,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_frame, CancelSdkWaitResponse, ErrorResponse, FrameDecoder, HandshakeResponse,
-    HasSessionRequest, PaneOutputSubscriptionStart, Request, Response, SdkWaitForOutputRequest,
-    SdkWaitForOutputResponse, SdkWaitOutcome, CAPABILITY_SDK_WAITS_ARMED,
+    encode_frame, CancelSdkWaitResponse, CommandOutput, ErrorResponse, FrameDecoder,
+    HandshakeResponse, HasSessionRequest, ListPanesResponse, PaneId, PaneOutputSubscriptionStart,
+    PaneTargetRef, Request, Response, SdkWaitForOutputRefRequest, SdkWaitForOutputResponse,
+    SdkWaitOutcome, CAPABILITY_SDK_WAITS_ARMED,
 };
 use rmux_sdk::{ArmedWait, EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -47,11 +48,11 @@ async fn wait_for_next_arms_before_returned_handle_completes() -> TestResult {
     let (seen_sender, seen) = oneshot::channel();
     let (release, released) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let _handle = accept_peer(&listener).await?;
+        let mut handle = accept_peer(&listener).await?;
         let mut wait = accept_peer(&listener).await?;
         let mut cancel = accept_peer(&listener).await?;
 
-        let request = expect_sdk_wait(&mut wait, b"needle").await?;
+        let request = expect_sdk_wait(&mut handle, &mut wait, b"needle").await?;
         write_armed(&mut wait, &request).await?;
         seen_sender
             .send(())
@@ -86,11 +87,11 @@ async fn wait_for_text_next_arms_daemon_byte_wait_for_text_bytes() -> TestResult
     let socket = TestSocket::new("armed-text")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
-        let _handle = accept_peer(&listener).await?;
+        let mut handle = accept_peer(&listener).await?;
         let mut wait = accept_peer(&listener).await?;
         let mut cancel = accept_peer(&listener).await?;
 
-        let request = expect_sdk_wait(&mut wait, b"hello text").await?;
+        let request = expect_sdk_wait(&mut handle, &mut wait, b"hello text").await?;
         write_armed(&mut wait, &request).await?;
         wait.write_response(Response::SdkWaitForOutput(SdkWaitForOutputResponse {
             wait_id: request.wait_id,
@@ -114,15 +115,15 @@ async fn independent_armed_waits_can_be_stored_and_moved_across_tasks() -> TestR
     let listener = UnixListener::bind(socket.path())?;
     let (seen_sender, seen) = oneshot::channel();
     let server = tokio::spawn(async move {
-        let _handle = accept_peer(&listener).await?;
+        let mut handle = accept_peer(&listener).await?;
         let mut first_wait = accept_peer(&listener).await?;
         let mut first_cancel = accept_peer(&listener).await?;
-        let first = expect_sdk_wait(&mut first_wait, b"first").await?;
+        let first = expect_sdk_wait(&mut handle, &mut first_wait, b"first").await?;
         write_armed(&mut first_wait, &first).await?;
 
         let mut second_wait = accept_peer(&listener).await?;
         let mut second_cancel = accept_peer(&listener).await?;
-        let second = expect_sdk_wait(&mut second_wait, b"second").await?;
+        let second = expect_sdk_wait(&mut handle, &mut second_wait, b"second").await?;
         write_armed(&mut second_wait, &second).await?;
         seen_sender
             .send(())
@@ -171,11 +172,11 @@ async fn dropping_armed_wait_sends_best_effort_cancel() -> TestResult {
     let socket = TestSocket::new("armed-drop")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
-        let _handle = accept_peer(&listener).await?;
+        let mut handle = accept_peer(&listener).await?;
         let mut wait = accept_peer(&listener).await?;
         let mut cancel = accept_peer(&listener).await?;
 
-        let request = expect_sdk_wait(&mut wait, b"drop").await?;
+        let request = expect_sdk_wait(&mut handle, &mut wait, b"drop").await?;
         write_armed(&mut wait, &request).await?;
         expect_cancel(&mut cancel, &request).await?;
         TestResult::Ok(())
@@ -194,11 +195,11 @@ async fn armed_wait_timeout_sends_best_effort_cancel() -> TestResult {
     let socket = TestSocket::new("armed-timeout")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
-        let _handle = accept_peer(&listener).await?;
+        let mut handle = accept_peer(&listener).await?;
         let mut wait = accept_peer(&listener).await?;
         let mut cancel = accept_peer(&listener).await?;
 
-        let request = expect_sdk_wait(&mut wait, b"never").await?;
+        let request = expect_sdk_wait(&mut handle, &mut wait, b"never").await?;
         write_armed(&mut wait, &request).await?;
         expect_cancel(&mut cancel, &request).await?;
         TestResult::Ok(())
@@ -221,11 +222,11 @@ async fn armed_wait_preserves_cancelled_outcome() -> TestResult {
     let socket = TestSocket::new("armed-cancelled")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
-        let _handle = accept_peer(&listener).await?;
+        let mut handle = accept_peer(&listener).await?;
         let mut wait = accept_peer(&listener).await?;
         let mut cancel = accept_peer(&listener).await?;
 
-        let request = expect_sdk_wait(&mut wait, b"cancelled").await?;
+        let request = expect_sdk_wait(&mut handle, &mut wait, b"cancelled").await?;
         write_armed(&mut wait, &request).await?;
         wait.write_response(Response::SdkWaitForOutput(SdkWaitForOutputResponse {
             wait_id: request.wait_id,
@@ -259,11 +260,11 @@ async fn armed_wait_preserves_mismatched_id_failure_and_cancels_expected_wait() 
     let socket = TestSocket::new("armed-mismatch")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
-        let _handle = accept_peer(&listener).await?;
+        let mut handle = accept_peer(&listener).await?;
         let mut wait = accept_peer(&listener).await?;
         let mut cancel = accept_peer(&listener).await?;
 
-        let request = expect_sdk_wait(&mut wait, b"mismatch").await?;
+        let request = expect_sdk_wait(&mut handle, &mut wait, b"mismatch").await?;
         write_armed(&mut wait, &request).await?;
         wait.write_response(Response::SdkWaitForOutput(SdkWaitForOutputResponse {
             wait_id: rmux_proto::SdkWaitId::new(request.wait_id.as_u64() + 1),
@@ -297,11 +298,11 @@ async fn armed_wait_surfaces_stale_pane_failure() -> TestResult {
     let socket = TestSocket::new("armed-stale")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
-        let _handle = accept_peer(&listener).await?;
+        let mut handle = accept_peer(&listener).await?;
         let mut wait = accept_peer(&listener).await?;
         let mut cancel = accept_peer(&listener).await?;
 
-        let _request = expect_sdk_wait(&mut wait, b"stale").await?;
+        let _request = expect_sdk_wait(&mut handle, &mut wait, b"stale").await?;
         wait.write_response(Response::Error(ErrorResponse {
             error: rmux_proto::RmuxError::InvalidTarget {
                 value: "wait:0.0".to_owned(),
@@ -438,8 +439,12 @@ async fn live_wait_for_next_ignores_history_and_matches_split_future_output() ->
     harness.finish().await
 }
 
-async fn expect_sdk_wait(peer: &mut Peer, bytes: &[u8]) -> TestResult<SdkWaitForOutputRequest> {
-    let mut request = peer.expect_request().await?;
+async fn expect_sdk_wait(
+    handle: &mut Peer,
+    wait: &mut Peer,
+    bytes: &[u8],
+) -> TestResult<SdkWaitForOutputRefRequest> {
+    let mut request = wait.expect_request().await?;
     if let Request::Handshake(handshake) = &request {
         assert!(
             handshake
@@ -448,27 +453,51 @@ async fn expect_sdk_wait(peer: &mut Peer, bytes: &[u8]) -> TestResult<SdkWaitFor
                 .any(|capability| capability == CAPABILITY_SDK_WAITS_ARMED),
             "armed SDK wait handshake did not require {CAPABILITY_SDK_WAITS_ARMED}: {handshake:?}"
         );
-        peer.write_response(Response::Handshake(HandshakeResponse::current()))
+        wait.write_response(Response::Handshake(HandshakeResponse::current()))
             .await?;
-        request = peer.expect_request().await?;
+    } else {
+        panic!("armed SDK wait must negotiate capabilities first, got {request:?}");
     }
-    let Request::SdkWaitForOutput(request) = request else {
+
+    request = handle.expect_request().await?;
+    if matches!(request, Request::Handshake(_)) {
+        handle
+            .write_response(Response::Handshake(HandshakeResponse::current()))
+            .await?;
+        request = handle.expect_request().await?;
+    }
+    let Request::ListPanes(list) = request else {
+        panic!("armed wait must resolve the visible pane slot by id, got {request:?}");
+    };
+    assert_eq!(list.target, session_name());
+    assert_eq!(list.target_window_index, Some(0));
+    handle
+        .write_response(Response::ListPanes(ListPanesResponse {
+            output: CommandOutput::from_stdout("0:0:%1\n"),
+        }))
+        .await?;
+
+    let request = wait.expect_request().await?;
+    let Request::SdkWaitForOutputRef(request) = request else {
         panic!("armed wait must use server-side SDK byte wait, got {request:?}");
     };
-    assert_eq!(request.target, target().to_proto());
+    assert_eq!(
+        request.target,
+        PaneTargetRef::by_id(session_name(), PaneId::new(1))
+    );
     assert_eq!(request.bytes, bytes);
     assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
     Ok(request)
 }
 
-async fn write_armed(peer: &mut Peer, request: &SdkWaitForOutputRequest) -> TestResult {
+async fn write_armed(peer: &mut Peer, request: &SdkWaitForOutputRefRequest) -> TestResult {
     peer.write_response(Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(
         request.wait_id,
     )))
     .await
 }
 
-async fn expect_cancel(peer: &mut Peer, wait: &SdkWaitForOutputRequest) -> TestResult {
+async fn expect_cancel(peer: &mut Peer, wait: &SdkWaitForOutputRefRequest) -> TestResult {
     let request = peer.expect_request().await?;
     let Request::CancelSdkWait(cancel) = request else {
         panic!("armed wait drop/timeout must send SDK cancellation, got {request:?}");

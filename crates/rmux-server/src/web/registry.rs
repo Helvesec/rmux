@@ -1,7 +1,9 @@
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rmux_core::PaneId;
 use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest,
     StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest, WebShareConfigResponse,
@@ -18,6 +20,10 @@ mod output;
 #[path = "registry_state.rs"]
 mod state;
 
+use super::auth_wait_limit::{
+    AuthWaitLimit, AuthWaitPermit, DEFAULT_AUTH_WAIT_LIMIT, DEFAULT_AUTH_WAIT_PER_KEY_LIMIT,
+    DEFAULT_AUTH_WAIT_PER_PEER_LIMIT,
+};
 use super::backoff::{AttemptOutcome, AttemptReservation, AuthBackoff};
 use super::connection_limit::{ConnectionLimit, DEFAULT_AUTHENTICATED_CONNECTION_LIMIT};
 use super::leases::LeaseBook;
@@ -33,7 +39,7 @@ use super::secrets::{
 use super::settings::WebShareSettings;
 use super::tunnel::TunnelInfo;
 use output::{created_output, list_output, lookup_output, stopped_output, CreatedOutput};
-pub(crate) use state::ExpiredWebShare;
+pub(crate) use state::{ExpiredWebShare, WebShareExpiryPoll};
 use state::{WebListenerState, WebShareState};
 
 const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -45,6 +51,13 @@ const UNKNOWN_TOKEN_BACKOFF_KEY: &str = "token_id:<unknown>";
 pub(crate) struct WebShareRoleLimits {
     pub(crate) max_spectators: Option<u16>,
     pub(crate) max_operators: Option<u16>,
+}
+
+#[derive(Debug)]
+pub(crate) struct WebShareAuthWaitPermit {
+    backoff_key: String,
+    _permit: AuthWaitPermit,
+    token_id: String,
 }
 
 #[derive(Debug)]
@@ -91,13 +104,19 @@ impl ResolvedCreateWebShareRequest {
             WebShareTarget::Pane(_) => None,
         }
     }
+
+    pub(crate) const fn target(&self) -> &WebShareTarget {
+        &self.target
+    }
 }
 
 #[cfg(test)]
 impl From<CreateWebShareRequest> for ResolvedCreateWebShareRequest {
     fn from(request: CreateWebShareRequest) -> Self {
         let target = match &request.scope {
-            rmux_proto::WebShareScope::Pane(target) => WebShareTarget::pane(target.clone()),
+            rmux_proto::WebShareScope::Pane(target) => {
+                WebShareTarget::pane(target.clone(), rmux_proto::SessionId::new(0))
+            }
             rmux_proto::WebShareScope::Session(name) => {
                 WebShareTarget::session(name.clone(), rmux_proto::SessionId::new(0))
             }
@@ -112,6 +131,7 @@ impl From<CreateWebShareRequest> for ResolvedCreateWebShareRequest {
 
 #[derive(Debug)]
 pub(crate) struct WebShareRegistry {
+    auth_wait_limit: std::sync::Arc<AuthWaitLimit>,
     backoff: AuthBackoff,
     connection_limit: std::sync::Arc<ConnectionLimit>,
     inner: Mutex<WebShareState>,
@@ -137,6 +157,17 @@ impl WebShareRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) async fn connect_from_peer(
+        &self,
+        token: &str,
+        pin: Option<&str>,
+        peer: IpAddr,
+    ) -> Result<WebShareAccess, RmuxError> {
+        let token_id = SecretHash::from_secret(token).token_id();
+        self.connect_token_id_from_peer(&token_id, pin, peer).await
+    }
+
+    #[cfg(test)]
     pub(crate) fn known_token_origin_allowed(&self, token: &str, origin: &str) -> Option<bool> {
         let token_id = SecretHash::from_secret(token).token_id();
         self.pre_auth_token(&token_id, origin)
@@ -145,7 +176,27 @@ impl WebShareRegistry {
 
     #[cfg(test)]
     pub(crate) fn new_with_authenticated_connection_limit(max_connections: usize) -> Self {
+        Self::new_with_authentication_limits(
+            max_connections,
+            DEFAULT_AUTH_WAIT_LIMIT,
+            DEFAULT_AUTH_WAIT_PER_KEY_LIMIT,
+            DEFAULT_AUTH_WAIT_PER_PEER_LIMIT,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_authentication_limits(
+        max_connections: usize,
+        max_waiters: usize,
+        max_waiters_per_key: usize,
+        max_waiters_per_peer: usize,
+    ) -> Self {
         Self {
+            auth_wait_limit: AuthWaitLimit::new(
+                max_waiters,
+                max_waiters_per_key,
+                max_waiters_per_peer,
+            ),
             backoff: AuthBackoff::new(),
             connection_limit: ConnectionLimit::new(max_connections),
             inner: Mutex::new(WebShareState::default()),
@@ -154,8 +205,23 @@ impl WebShareRegistry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn authenticated_connection_count(&self) -> usize {
+        self.connection_limit.active_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authentication_wait_count(&self) -> usize {
+        self.auth_wait_limit.active_count()
+    }
+
     pub(crate) fn new(settings: WebShareSettings) -> Self {
         Self {
+            auth_wait_limit: AuthWaitLimit::new(
+                DEFAULT_AUTH_WAIT_LIMIT,
+                DEFAULT_AUTH_WAIT_PER_KEY_LIMIT,
+                DEFAULT_AUTH_WAIT_PER_PEER_LIMIT,
+            ),
             backoff: AuthBackoff::new(),
             connection_limit: ConnectionLimit::new(DEFAULT_AUTHENTICATED_CONNECTION_LIMIT),
             inner: Mutex::new(WebShareState::default()),
@@ -316,11 +382,23 @@ impl WebShareRegistry {
         })
     }
 
-    pub(crate) fn expire_if_due(&self, share_id: &str) -> Option<ExpiredWebShare> {
+    pub(crate) fn poll_expiry(&self, share_id: &str) -> WebShareExpiryPoll {
         self.inner
             .lock()
             .expect("web-share registry mutex must not be poisoned")
-            .expire_if_due(share_id)
+            .poll_expiry(share_id)
+    }
+
+    pub(crate) fn expiry_revoke_receiver(
+        &self,
+        share_id: &str,
+    ) -> Option<watch::Receiver<Option<WebShareRevokeReason>>> {
+        self.inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .records
+            .get(share_id)
+            .map(|record| record.revoke_tx.subscribe())
     }
 
     pub(crate) fn list(&self, _request: ListWebSharesRequest) -> WebShareListResponse {
@@ -349,6 +427,21 @@ impl WebShareRegistry {
             output: stopped_output(&request.share_id, stopped),
             share_id: request.share_id,
             stopped,
+        }
+    }
+
+    pub(crate) fn discard_undelivered(&self, share_id: &str) {
+        let removed = self
+            .inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .remove(share_id, WebShareRevokeReason::StoppedByOwner);
+        if removed {
+            info!(
+                share_id,
+                reason = "response_undelivered",
+                "web_share_stopped"
+            );
         }
     }
 
@@ -382,6 +475,38 @@ impl WebShareRegistry {
         removed
     }
 
+    pub(crate) fn remove_targets_for_panes(&self, pane_ids: &[PaneId]) -> u32 {
+        if pane_ids.is_empty() {
+            return 0;
+        }
+        let removed = self
+            .inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .remove_targets_for_panes(pane_ids, WebShareRevokeReason::PaneGone);
+        if removed > 0 {
+            info!(removed, reason = "pane_removed", "web_share_pruned");
+        }
+        removed
+    }
+
+    pub(crate) fn rename_session_targets(
+        &self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+        session_id: SessionId,
+    ) -> u32 {
+        let renamed = self
+            .inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .rename_session_targets(old_name, new_name, session_id);
+        if renamed > 0 {
+            info!(renamed, reason = "session_renamed", "web_share_retargeted");
+        }
+        renamed
+    }
+
     pub(crate) fn lookup(&self, request: LookupWebShareRequest) -> WebShareLookupResponse {
         let mut inner = self
             .inner
@@ -410,11 +535,34 @@ impl WebShareRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn connect_token_id(
         &self,
         token_id: &str,
         pin: Option<&str>,
     ) -> Result<WebShareAccess, RmuxError> {
+        let auth_wait = self.reserve_authentication_wait(token_id, None)?;
+        self.connect_token_id_with_wait(token_id, pin, &auth_wait)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn connect_token_id_from_peer(
+        &self,
+        token_id: &str,
+        pin: Option<&str>,
+        peer: IpAddr,
+    ) -> Result<WebShareAccess, RmuxError> {
+        let auth_wait = self.reserve_authentication_wait(token_id, Some(peer))?;
+        self.connect_token_id_with_wait(token_id, pin, &auth_wait)
+            .await
+    }
+
+    pub(crate) fn reserve_authentication_wait(
+        &self,
+        token_id: &str,
+        peer: Option<IpAddr>,
+    ) -> Result<WebShareAuthWaitPermit, RmuxError> {
         if !valid_token_id_shape(token_id) {
             return Err(RmuxError::Server("invalid web-share token id".to_owned()));
         }
@@ -436,11 +584,40 @@ impl WebShareRegistry {
                 )
             })
             .unwrap_or_else(|| UNKNOWN_TOKEN_BACKOFF_KEY.to_owned());
+        // Once the encrypted pre-ready handshake releases its small socket
+        // queue, keep authentication tasks bounded independently by daemon,
+        // role/share key, and network peer. A single leaked share link must not
+        // consume established-client capacity while its PIN attempt sleeps.
+        let permit = self
+            .auth_wait_limit
+            .try_acquire(&backoff_key, peer)
+            .ok_or_else(|| {
+                RmuxError::Server("web-share authentication queue limit reached".to_owned())
+            })?;
+        Ok(WebShareAuthWaitPermit {
+            backoff_key,
+            _permit: permit,
+            token_id: token_id.to_owned(),
+        })
+    }
+
+    pub(crate) async fn connect_token_id_with_wait(
+        &self,
+        token_id: &str,
+        pin: Option<&str>,
+        auth_wait: &WebShareAuthWaitPermit,
+    ) -> Result<WebShareAccess, RmuxError> {
+        if auth_wait.token_id != token_id {
+            return Err(RmuxError::Server(
+                "web-share authentication reservation mismatch".to_owned(),
+            ));
+        }
+        let backoff_key = &auth_wait.backoff_key;
         // Reserve the attempt up front so concurrent guesses are throttled by the
         // in-flight count, not just by past recorded failures. The guard makes
         // this cancellation-safe: if an async timeout or task abort drops the
         // future before an explicit result, the attempt settles as `Other`.
-        let (wait, attempt) = match self.backoff.reserve_attempt(&backoff_key) {
+        let (wait, attempt) = match self.backoff.reserve_attempt(backoff_key) {
             AttemptReservation::Locked => {
                 // Failure budget exhausted: fail closed while the temporary
                 // lock is active. Return the SAME uniform error as a missing
@@ -457,28 +634,28 @@ impl WebShareRegistry {
             sleep(wait).await;
         }
 
-        let result = {
-            let mut inner = self
-                .inner
-                .lock()
-                .expect("web-share registry mutex must not be poisoned");
-            inner.prune_expired();
-            match inner.capability_by_token_id(token_id) {
-                Some(capability) => match inner.records.get(&capability.share_id) {
-                    Some(record) => match self.connection_limit.try_acquire() {
-                        Some(permit) => record.connect(pin, capability.role, permit),
+        let result = match self.connection_limit.try_acquire() {
+            Some(connection_permit) => {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .expect("web-share registry mutex must not be poisoned");
+                inner.prune_expired();
+                match inner.capability_by_token_id(token_id) {
+                    Some(capability) => match inner.records.get(&capability.share_id) {
+                        Some(record) => record.connect(pin, capability.role, connection_permit),
                         None => Err(RmuxError::Server(
-                            "web-share connection limit reached".to_owned(),
+                            "web-share does not exist or has expired".to_owned(),
                         )),
                     },
                     None => Err(RmuxError::Server(
                         "web-share does not exist or has expired".to_owned(),
                     )),
-                },
-                None => Err(RmuxError::Server(
-                    "web-share does not exist or has expired".to_owned(),
-                )),
+                }
             }
+            None => Err(RmuxError::Server(
+                "web-share connection limit reached".to_owned(),
+            )),
         };
 
         match result {

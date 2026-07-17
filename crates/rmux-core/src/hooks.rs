@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use rmux_proto::{
     HookLifecycle, HookName, PaneTarget, RmuxError, ScopeSelector, SessionName, WindowTarget,
@@ -6,16 +6,25 @@ use rmux_proto::{
 
 #[path = "hooks/bindings.rs"]
 mod bindings;
+#[path = "hooks/deferred.rs"]
+mod deferred;
+#[path = "hooks/identity.rs"]
+mod identity;
 #[path = "hooks/rules.rs"]
 mod rules;
+#[path = "hooks/targets.rs"]
+mod targets;
 #[path = "hooks/types.rs"]
 mod types;
 
 use bindings::HookBindings;
 use rules::{hook_class, hook_inventory, hook_is_visible_in_show_hooks, root_for_hook};
-pub use rules::{hook_global_root, validate_hook_registration, validate_hook_scope};
+pub use rules::{
+    hook_explicit_scope_for_target, hook_global_root, hook_natural_scope_for_session_target,
+    hook_natural_scope_for_target, validate_hook_registration, validate_hook_scope,
+};
 use types::HookClass;
-pub use types::{HookBindingView, HookDispatch, HookGlobalRoot, HookSetOptions};
+pub use types::{HookBindingView, HookDispatch, HookGlobalRoot, HookScopeIdentity, HookSetOptions};
 
 /// In-memory storage for tmux-style hook arrays.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -25,6 +34,10 @@ pub struct HookStore {
     sessions: HashMap<SessionName, HookBindings>,
     windows: HashMap<WindowTarget, HookBindings>,
     panes: HashMap<PaneTarget, HookBindings>,
+    windows_by_id: HashMap<rmux_proto::WindowId, HookBindings>,
+    panes_by_id: HashMap<rmux_proto::PaneId, HookBindings>,
+    window_aliases: HashMap<WindowTarget, rmux_proto::WindowId>,
+    pane_aliases: HashMap<PaneTarget, (rmux_proto::WindowId, rmux_proto::PaneId)>,
 }
 
 impl HookStore {
@@ -42,6 +55,8 @@ impl HookStore {
             && self.sessions.values().all(HookBindings::is_empty)
             && self.windows.values().all(HookBindings::is_empty)
             && self.panes.values().all(HookBindings::is_empty)
+            && self.windows_by_id.values().all(HookBindings::is_empty)
+            && self.panes_by_id.values().all(HookBindings::is_empty)
     }
 
     /// Registers or replaces a hook using tmux's default index-zero semantics.
@@ -94,25 +109,49 @@ impl HookStore {
                 }
             }
             ScopeSelector::Window(target) => {
-                let remove_scope = if let Some(bindings) = self.windows.get_mut(&target) {
+                let identity = self.window_aliases.get(&target).copied();
+                let remove_scope = if let Some(window_id) = identity {
+                    if let Some(bindings) = self.windows_by_id.get_mut(&window_id) {
+                        bindings.unset(hook, index);
+                        bindings.is_empty()
+                    } else {
+                        false
+                    }
+                } else if let Some(bindings) = self.windows.get_mut(&target) {
                     bindings.unset(hook, index);
                     bindings.is_empty()
                 } else {
                     false
                 };
                 if remove_scope {
-                    self.windows.remove(&target);
+                    if let Some(window_id) = identity {
+                        self.windows_by_id.remove(&window_id);
+                    } else {
+                        self.windows.remove(&target);
+                    }
                 }
             }
             ScopeSelector::Pane(target) => {
-                let remove_scope = if let Some(bindings) = self.panes.get_mut(&target) {
+                let identity = self.pane_aliases.get(&target).copied();
+                let remove_scope = if let Some((_, pane_id)) = identity {
+                    if let Some(bindings) = self.panes_by_id.get_mut(&pane_id) {
+                        bindings.unset(hook, index);
+                        bindings.is_empty()
+                    } else {
+                        false
+                    }
+                } else if let Some(bindings) = self.panes.get_mut(&target) {
                     bindings.unset(hook, index);
                     bindings.is_empty()
                 } else {
                     false
                 };
                 if remove_scope {
-                    self.panes.remove(&target);
+                    if let Some((_, pane_id)) = identity {
+                        self.panes_by_id.remove(&pane_id);
+                    } else {
+                        self.panes.remove(&target);
+                    }
                 }
             }
         }
@@ -197,6 +236,12 @@ impl HookStore {
         self.windows
             .get(target)
             .and_then(|bindings| bindings.command(hook))
+            .or_else(|| {
+                self.window_aliases
+                    .get(target)
+                    .and_then(|window_id| self.windows_by_id.get(window_id))
+                    .and_then(|bindings| bindings.command(hook))
+            })
     }
 
     /// Returns the first exact pane-local command for the given hook, when present.
@@ -205,6 +250,12 @@ impl HookStore {
         self.panes
             .get(target)
             .and_then(|bindings| bindings.command(hook))
+            .or_else(|| {
+                self.pane_aliases
+                    .get(target)
+                    .and_then(|(_, pane_id)| self.panes_by_id.get(pane_id))
+                    .and_then(|bindings| bindings.command(hook))
+            })
     }
 
     /// Returns the explicit hook bindings for the requested global root.
@@ -238,6 +289,11 @@ impl HookStore {
     ) -> Vec<HookBindingView> {
         self.windows
             .get(target)
+            .or_else(|| {
+                self.window_aliases
+                    .get(target)
+                    .and_then(|window_id| self.windows_by_id.get(window_id))
+            })
             .map_or_else(Vec::new, |bindings| bindings.views(hook))
     }
 
@@ -250,6 +306,11 @@ impl HookStore {
     ) -> Vec<HookBindingView> {
         self.panes
             .get(target)
+            .or_else(|| {
+                self.pane_aliases
+                    .get(target)
+                    .and_then(|(_, pane_id)| self.panes_by_id.get(pane_id))
+            })
             .map_or_else(Vec::new, |bindings| bindings.views(hook))
     }
 
@@ -275,184 +336,6 @@ impl HookStore {
         }
     }
 
-    /// Removes all hooks owned by the given session.
-    pub fn remove_session(&mut self, session_name: &SessionName) -> bool {
-        let mut removed = self.sessions.remove(session_name).is_some();
-        self.windows.retain(|target, _| {
-            let keep = target.session_name() != session_name;
-            removed |= !keep;
-            keep
-        });
-        self.panes.retain(|target, _| {
-            let keep = target.session_name() != session_name;
-            removed |= !keep;
-            keep
-        });
-        removed
-    }
-
-    /// Removes all hooks owned by the given window and its panes.
-    pub fn remove_window(&mut self, target: &WindowTarget) -> bool {
-        let mut removed = self.windows.remove(target).is_some();
-        self.panes.retain(|pane_target, _| {
-            let keep = pane_target.session_name() != target.session_name()
-                || pane_target.window_index() != target.window_index();
-            removed |= !keep;
-            keep
-        });
-        removed
-    }
-
-    /// Swaps window and pane hooks between two winlink slots.
-    pub fn swap_window_hooks(&mut self, source: &WindowTarget, target: &WindowTarget) {
-        if source == target {
-            return;
-        }
-
-        let source_window = self.windows.remove(source);
-        let target_window = self.windows.remove(target);
-        if let Some(bindings) = source_window {
-            self.windows.insert(target.clone(), bindings);
-        }
-        if let Some(bindings) = target_window {
-            self.windows.insert(source.clone(), bindings);
-        }
-
-        let source_panes = remove_window_pane_hooks(&mut self.panes, source);
-        let target_panes = remove_window_pane_hooks(&mut self.panes, target);
-        self.panes
-            .extend(rekey_pane_hooks(source_panes, source, target));
-        self.panes
-            .extend(rekey_pane_hooks(target_panes, target, source));
-    }
-
-    /// Moves window and pane hooks from one winlink slot to another.
-    pub fn move_window_hooks(&mut self, source: &WindowTarget, target: &WindowTarget) {
-        if source == target {
-            return;
-        }
-
-        let source_window = self.windows.remove(source);
-        let _ = self.windows.remove(target);
-        if let Some(bindings) = source_window {
-            self.windows.insert(target.clone(), bindings);
-        }
-
-        let source_panes = remove_window_pane_hooks(&mut self.panes, source);
-        let _ = remove_window_pane_hooks(&mut self.panes, target);
-        self.panes
-            .extend(rekey_pane_hooks(source_panes, source, target));
-    }
-
-    /// Removes all hooks owned by the given pane.
-    pub fn remove_pane(&mut self, target: &PaneTarget) -> bool {
-        self.panes.remove(target).is_some()
-    }
-
-    /// Rekeys window and pane hooks after a session window reindex.
-    pub fn remap_session_window_indices(
-        &mut self,
-        session_name: &SessionName,
-        index_map: &BTreeMap<u32, u32>,
-    ) -> Result<(), RmuxError> {
-        let mut remapped_windows = HashMap::with_capacity(self.windows.len());
-        for (target, bindings) in &self.windows {
-            let next_target = remapped_window_target(target, session_name, index_map);
-            if remapped_windows
-                .insert(next_target.clone(), bindings.clone())
-                .is_some()
-            {
-                return Err(RmuxError::Server(format!(
-                    "hooks already exist for {next_target}"
-                )));
-            }
-        }
-
-        let mut remapped_panes = HashMap::with_capacity(self.panes.len());
-        for (target, bindings) in &self.panes {
-            let next_target = remapped_pane_target(target, session_name, index_map);
-            if remapped_panes
-                .insert(next_target.clone(), bindings.clone())
-                .is_some()
-            {
-                return Err(RmuxError::Server(format!(
-                    "hooks already exist for {next_target}"
-                )));
-            }
-        }
-
-        self.windows = remapped_windows;
-        self.panes = remapped_panes;
-        Ok(())
-    }
-
-    /// Rekeys all hooks owned by the given session.
-    pub fn rename_session(
-        &mut self,
-        session_name: &SessionName,
-        new_name: SessionName,
-    ) -> Result<(), RmuxError> {
-        let mut renamed_sessions = HashMap::with_capacity(self.sessions.len());
-        for (name, bindings) in &self.sessions {
-            let next_name = if name == session_name {
-                new_name.clone()
-            } else {
-                name.clone()
-            };
-            if renamed_sessions
-                .insert(next_name.clone(), bindings.clone())
-                .is_some()
-            {
-                return Err(RmuxError::Server(format!(
-                    "hooks already exist for session {next_name}"
-                )));
-            }
-        }
-
-        let mut renamed_windows = HashMap::with_capacity(self.windows.len());
-        for (target, bindings) in &self.windows {
-            let next_target = if target.session_name() == session_name {
-                WindowTarget::with_window(new_name.clone(), target.window_index())
-            } else {
-                target.clone()
-            };
-            if renamed_windows
-                .insert(next_target.clone(), bindings.clone())
-                .is_some()
-            {
-                return Err(RmuxError::Server(format!(
-                    "hooks already exist for {next_target}"
-                )));
-            }
-        }
-
-        let mut renamed_panes = HashMap::with_capacity(self.panes.len());
-        for (target, bindings) in &self.panes {
-            let next_target = if target.session_name() == session_name {
-                PaneTarget::with_window(
-                    new_name.clone(),
-                    target.window_index(),
-                    target.pane_index(),
-                )
-            } else {
-                target.clone()
-            };
-            if renamed_panes
-                .insert(next_target.clone(), bindings.clone())
-                .is_some()
-            {
-                return Err(RmuxError::Server(format!(
-                    "hooks already exist for {next_target}"
-                )));
-            }
-        }
-
-        self.sessions = renamed_sessions;
-        self.windows = renamed_windows;
-        self.panes = renamed_panes;
-        Ok(())
-    }
-
     fn bindings_for_scope_mut(
         &mut self,
         hook: HookName,
@@ -463,8 +346,20 @@ impl HookStore {
             ScopeSelector::Session(session_name) => {
                 self.sessions.entry(session_name.clone()).or_default()
             }
-            ScopeSelector::Window(target) => self.windows.entry(target.clone()).or_default(),
-            ScopeSelector::Pane(target) => self.panes.entry(target.clone()).or_default(),
+            ScopeSelector::Window(target) => {
+                if let Some(window_id) = self.window_aliases.get(target).copied() {
+                    self.windows_by_id.entry(window_id).or_default()
+                } else {
+                    self.windows.entry(target.clone()).or_default()
+                }
+            }
+            ScopeSelector::Pane(target) => {
+                if let Some((_, pane_id)) = self.pane_aliases.get(target).copied() {
+                    self.panes_by_id.entry(pane_id).or_default()
+                } else {
+                    self.panes.entry(target.clone()).or_default()
+                }
+            }
         }
     }
 
@@ -521,15 +416,21 @@ impl HookStore {
         };
 
         if let Some(target) = target {
-            let (dispatches, remove_scope) = if let Some(bindings) = self.windows.get_mut(&target) {
-                let dispatches = bindings.dispatch(hook);
-                let should_remove = bindings.is_empty();
-                (dispatches, should_remove)
-            } else {
-                (Vec::new(), false)
-            };
+            let identity = self.window_aliases.get(&target).copied();
+            let (dispatches, remove_scope) = self
+                .windows
+                .get_mut(&target)
+                .or_else(|| identity.and_then(|window_id| self.windows_by_id.get_mut(&window_id)))
+                .map_or((Vec::new(), false), |bindings| {
+                    let dispatches = bindings.dispatch(hook);
+                    (dispatches, bindings.is_empty())
+                });
             if remove_scope {
-                self.windows.remove(&target);
+                if let Some(window_id) = identity {
+                    self.windows_by_id.remove(&window_id);
+                } else {
+                    self.windows.remove(&target);
+                }
             }
             if !dispatches.is_empty() {
                 return dispatches;
@@ -542,15 +443,21 @@ impl HookStore {
     fn dispatch_pane(&mut self, scope: &ScopeSelector, hook: HookName) -> Vec<HookDispatch> {
         if let ScopeSelector::Pane(target) = scope {
             let target = target.clone();
-            let (dispatches, remove_scope) = if let Some(bindings) = self.panes.get_mut(&target) {
-                let dispatches = bindings.dispatch(hook);
-                let should_remove = bindings.is_empty();
-                (dispatches, should_remove)
-            } else {
-                (Vec::new(), false)
-            };
+            let identity = self.pane_aliases.get(&target).copied();
+            let (dispatches, remove_scope) = self
+                .panes
+                .get_mut(&target)
+                .or_else(|| identity.and_then(|(_, pane_id)| self.panes_by_id.get_mut(&pane_id)))
+                .map_or((Vec::new(), false), |bindings| {
+                    let dispatches = bindings.dispatch(hook);
+                    (dispatches, bindings.is_empty())
+                });
             if remove_scope {
-                self.panes.remove(&target);
+                if let Some((_, pane_id)) = identity {
+                    self.panes_by_id.remove(&pane_id);
+                } else {
+                    self.panes.remove(&target);
+                }
             }
             if !dispatches.is_empty() {
                 return dispatches;
@@ -559,80 +466,6 @@ impl HookStore {
 
         self.dispatch_window(scope, hook)
     }
-}
-
-fn remove_window_pane_hooks(
-    panes: &mut HashMap<PaneTarget, HookBindings>,
-    window: &WindowTarget,
-) -> Vec<(PaneTarget, HookBindings)> {
-    let pane_targets = panes
-        .keys()
-        .filter(|pane_target| {
-            pane_target.session_name() == window.session_name()
-                && pane_target.window_index() == window.window_index()
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    pane_targets
-        .into_iter()
-        .filter_map(|pane_target| {
-            panes
-                .remove(&pane_target)
-                .map(|bindings| (pane_target, bindings))
-        })
-        .collect()
-}
-
-fn rekey_pane_hooks(
-    panes: Vec<(PaneTarget, HookBindings)>,
-    source: &WindowTarget,
-    target: &WindowTarget,
-) -> Vec<(PaneTarget, HookBindings)> {
-    panes
-        .into_iter()
-        .map(move |(pane_target, bindings)| {
-            debug_assert_eq!(pane_target.session_name(), source.session_name());
-            debug_assert_eq!(pane_target.window_index(), source.window_index());
-            (
-                PaneTarget::with_window(
-                    target.session_name().clone(),
-                    target.window_index(),
-                    pane_target.pane_index(),
-                ),
-                bindings,
-            )
-        })
-        .collect()
-}
-
-fn remapped_window_target(
-    target: &WindowTarget,
-    session_name: &SessionName,
-    index_map: &BTreeMap<u32, u32>,
-) -> WindowTarget {
-    if target.session_name() != session_name {
-        return target.clone();
-    }
-    index_map.get(&target.window_index()).copied().map_or_else(
-        || target.clone(),
-        |window_index| WindowTarget::with_window(session_name.clone(), window_index),
-    )
-}
-
-fn remapped_pane_target(
-    target: &PaneTarget,
-    session_name: &SessionName,
-    index_map: &BTreeMap<u32, u32>,
-) -> PaneTarget {
-    if target.session_name() != session_name {
-        return target.clone();
-    }
-    index_map.get(&target.window_index()).copied().map_or_else(
-        || target.clone(),
-        |window_index| {
-            PaneTarget::with_window(session_name.clone(), window_index, target.pane_index())
-        },
-    )
 }
 
 #[cfg(test)]

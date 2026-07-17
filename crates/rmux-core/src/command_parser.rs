@@ -51,6 +51,23 @@ where
     CommandParser::new().parse_arguments(arguments)
 }
 
+/// Returns whether an argv token has the parse-time `name=value` form.
+///
+/// The identifier grammar is deliberately ASCII and matches tmux's command
+/// parser: a letter or underscore followed by letters, digits, or underscores.
+#[must_use]
+pub fn is_parse_time_assignment(argument: &str) -> bool {
+    let Some((name, _)) = argument.split_once('=') else {
+        return false;
+    };
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
 /// Looks up a frozen tmux command using exact alias then unique name prefix.
 pub fn lookup_command(name: &str) -> Result<&'static CommandEntry, CommandParseError> {
     lookup_command_at(name, 0, &[])
@@ -107,7 +124,8 @@ impl ParsedCommands {
         self.assignments.push(assignment);
     }
 
-    fn push_command(&mut self, command: ParsedCommand) {
+    fn push_command(&mut self, mut command: ParsedCommand) {
+        command.drain_nested_assignments_into(&mut self.assignments);
         self.commands.push(command);
     }
 
@@ -134,11 +152,20 @@ impl ParsedCommands {
     /// Converts the parsed commands back to a tmux-style command string.
     #[must_use]
     pub fn to_tmux_string(&self) -> String {
-        self.commands
-            .iter()
-            .map(ParsedCommand::to_tmux_string)
-            .collect::<Vec<_>>()
-            .join(" ; ")
+        let mut rendered = String::new();
+        let mut previous_line = None;
+        for command in &self.commands {
+            if !rendered.is_empty() {
+                if previous_line.is_some_and(|line| line != command.line()) {
+                    rendered.push_str(" ;; ");
+                } else {
+                    rendered.push_str(" ; ");
+                }
+            }
+            rendered.push_str(&command.to_tmux_string());
+            previous_line = Some(command.line());
+        }
+        rendered
     }
 
     /// Converts the parsed commands to a command string suitable for
@@ -147,9 +174,50 @@ impl ParsedCommands {
     pub fn to_tmux_binding_string(&self) -> String {
         self.commands
             .iter()
-            .map(ParsedCommand::to_tmux_string)
+            .map(ParsedCommand::to_tmux_reparse_string)
             .collect::<Vec<_>>()
             .join(" \\; ")
+    }
+
+    /// Converts the parsed commands to a lossless command string that can be
+    /// parsed again without applying display-only quote escaping twice.
+    #[must_use]
+    pub fn to_tmux_reparse_string(&self) -> String {
+        let mut rendered = self.assignments_to_tmux_reparse_string();
+        let mut previous_line = None;
+        for command in &self.commands {
+            if !rendered.is_empty() {
+                if previous_line.is_some_and(|line| line != command.line()) {
+                    rendered.push_str(" ;; ");
+                } else {
+                    rendered.push_str(" ; ");
+                }
+            }
+            rendered.push_str(&command.to_tmux_reparse_string());
+            previous_line = Some(command.line());
+        }
+        rendered
+    }
+
+    /// Converts only the parse-time assignments to a lossless command string.
+    #[must_use]
+    pub fn assignments_to_tmux_reparse_string(&self) -> String {
+        self.assignments
+            .iter()
+            .map(|assignment| {
+                let rendered = escape_argument_for_reparse(&format!(
+                    "{}={}",
+                    assignment.name(),
+                    assignment.value()
+                ));
+                if assignment.hidden() {
+                    format!("%hidden {rendered}")
+                } else {
+                    rendered
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ; ")
     }
 }
 
@@ -168,6 +236,7 @@ pub enum CommandGrouping {
 pub struct ParsedCommand {
     name: String,
     arguments: Vec<CommandArgument>,
+    start_line: usize,
     line: usize,
 }
 
@@ -194,11 +263,27 @@ impl ParsedCommand {
         Self {
             name,
             arguments,
+            start_line: line,
+            line,
+        }
+    }
+
+    fn with_lines(
+        name: String,
+        arguments: Vec<CommandArgument>,
+        start_line: usize,
+        line: usize,
+    ) -> Self {
+        Self {
+            name,
+            arguments,
+            start_line,
             line,
         }
     }
 
     fn add_line_offset(&mut self, offset: usize) {
+        self.start_line = self.start_line.saturating_add(offset);
         self.line = self.line.saturating_add(offset);
         for argument in &mut self.arguments {
             if let CommandArgument::Commands(commands) = argument {
@@ -207,11 +292,39 @@ impl ParsedCommand {
         }
     }
 
+    fn drain_nested_assignments_into(&mut self, assignments: &mut Vec<EnvironmentAssignment>) {
+        for argument in &mut self.arguments {
+            if let CommandArgument::Commands(commands) = argument {
+                assignments.append(&mut commands.assignments);
+            }
+        }
+    }
+
+    /// Returns the first one-based input line occupied by this command.
+    #[must_use]
+    pub fn start_line(&self) -> usize {
+        self.start_line
+    }
+
     /// Converts this command back to a tmux-style command string.
     #[must_use]
     pub fn to_tmux_string(&self) -> String {
         std::iter::once(self.name.clone())
             .chain(self.arguments.iter().map(CommandArgument::to_tmux_string))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Converts this command to a lossless string for an internal
+    /// parse-execute bridge.
+    #[must_use]
+    pub fn to_tmux_reparse_string(&self) -> String {
+        std::iter::once(self.name.clone())
+            .chain(
+                self.arguments
+                    .iter()
+                    .map(CommandArgument::to_reparse_string),
+            )
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -243,6 +356,22 @@ impl CommandArgument {
             Self::String(value) => escape_argument(value),
             Self::Commands(commands) => format!("{{ {} }}", commands.to_tmux_string()),
         }
+    }
+
+    fn to_reparse_string(&self) -> String {
+        match self {
+            Self::String(value) => escape_argument_for_reparse(value),
+            Self::Commands(commands) => {
+                format!("{{ {} }}", commands.to_tmux_reparse_string())
+            }
+        }
+    }
+
+    /// Converts this argument to a lossless representation for an internal
+    /// parse-execute bridge.
+    #[must_use]
+    pub fn to_tmux_reparse_string(&self) -> String {
+        self.to_reparse_string()
     }
 }
 
@@ -448,8 +577,10 @@ impl CommandParser {
         &self,
         input: &str,
     ) -> Result<ParsedCommands, CommandParseError> {
-        let mut parser =
-            GrammarParser::new(Lexer::new_source_file(input, self), CommandGrouping::ByLine);
+        let mut parser = GrammarParser::new_source_file(
+            Lexer::new_source_file(input, self),
+            CommandGrouping::ByLine,
+        );
         let commands = parser.parse_all()?;
         ensure_parsed_command_lengths(&commands, self.max_command_bytes)?;
         Ok(commands)
@@ -473,6 +604,35 @@ impl CommandParser {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        self.parse_arguments_inner(arguments, false)
+    }
+
+    /// Parses an argv-style command vector for RMUX's internal runtime bridge.
+    ///
+    /// Unlike [`Self::parse_arguments`], this recognizes one leading
+    /// `name=value` assignment in each command group. The direct argv parser
+    /// deliberately keeps tmux's behavior; only the server-owned alias bridge
+    /// opts into assignment classification.
+    pub fn parse_arguments_with_assignments<I, S>(
+        &self,
+        arguments: I,
+    ) -> Result<ParsedCommands, CommandParseError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.parse_arguments_inner(arguments, true)
+    }
+
+    fn parse_arguments_inner<I, S>(
+        &self,
+        arguments: I,
+        classify_assignments: bool,
+    ) -> Result<ParsedCommands, CommandParseError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let arguments = arguments
             .into_iter()
             .map(|argument| argument.as_ref().to_owned())
@@ -486,6 +646,7 @@ impl CommandParser {
 
         let mut commands = ParsedCommands::with_grouping(CommandGrouping::ByLine);
         let mut current = Vec::new();
+        let mut group_has_assignment = false;
 
         for argument in arguments {
             let mut value = argument;
@@ -502,10 +663,22 @@ impl CommandParser {
             }
 
             if !ends_command || !value.is_empty() {
-                current.push(CommandArgument::String(value));
+                if classify_assignments
+                    && current.is_empty()
+                    && !group_has_assignment
+                    && is_parse_time_assignment(&value)
+                {
+                    commands.push_assignment(EnvironmentAssignment::from_equals(value, false));
+                    group_has_assignment = true;
+                } else {
+                    current.push(CommandArgument::String(value));
+                }
             }
             if ends_command && !current.is_empty() {
                 commands.push_command(command_from_arguments(std::mem::take(&mut current), 1)?);
+            }
+            if ends_command {
+                group_has_assignment = false;
             }
         }
 
@@ -534,7 +707,8 @@ impl CommandParser {
         no_alias: bool,
         grouping: CommandGrouping,
     ) -> Result<ParsedCommands, CommandParseError> {
-        let mut parser = GrammarParser::new(Lexer::new_source_file(input, self), grouping);
+        let mut parser =
+            GrammarParser::new_source_file(Lexer::new_source_file(input, self), grouping);
         let commands = parser.parse_all()?;
         ensure_parsed_command_lengths(&commands, self.max_command_bytes)?;
         self.expand_and_lookup(commands, no_alias)
@@ -566,6 +740,7 @@ impl CommandParser {
                         .map_err(|error| error.with_line(command.line))?;
                     for replacement_command in &mut replacement.commands {
                         replacement_command.line = command.line;
+                        replacement_command.start_line = command.start_line;
                     }
                     if let Some(last) = replacement.commands.last_mut() {
                         last.arguments.append(&mut command.arguments);
@@ -593,7 +768,6 @@ impl CommandParser {
     fn find_command_alias(&self, name: &str) -> Option<&str> {
         self.command_aliases
             .iter()
-            .rev()
             .find(|alias| alias.name() == name)
             .map(CommandAlias::value)
     }
@@ -782,38 +956,125 @@ fn command_from_arguments(
     Ok(ParsedCommand::new(name, arguments, line))
 }
 
-fn escape_argument(value: &str) -> String {
+pub(crate) fn escape_argument(value: &str) -> String {
     if value.is_empty() {
         return "''".to_owned();
     }
-    if !value.chars().any(argument_needs_quotes) {
-        return value.replace('\\', r"\\");
+    if is_single_char_escaped_argument(value) {
+        return escape_unquoted_argument(value);
     }
-
-    if value.contains('"') && !value.contains('\'') && !value.contains('$') {
-        return format!("'{value}'");
+    if !value.chars().any(argument_needs_double_quotes) {
+        if value.contains('"') {
+            return format!("'{}'", escape_single_quoted_argument(value));
+        }
+        return escape_unquoted_argument(value);
     }
 
     format!("\"{}\"", escape_double_quoted_argument(value))
 }
 
-fn argument_needs_quotes(ch: char) -> bool {
-    ch.is_whitespace() || matches!(ch, ';' | '{' | '}' | '\'' | '"' | '#' | '$')
+fn escape_argument_for_reparse(value: &str) -> String {
+    let single_quoted_display =
+        value.contains('"') && !value.chars().any(argument_needs_double_quotes);
+    if single_quoted_display && value.chars().any(|ch| ch == '\\' || ch.is_ascii_control()) {
+        return format!("\"{}\"", escape_double_quoted_argument(value));
+    }
+    escape_argument(value)
+}
+
+fn is_single_char_escaped_argument(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    chars.next().is_none() && matches!(ch, ';' | '{' | '}' | '\'' | '"' | '#' | '$' | '%')
+}
+
+fn argument_needs_double_quotes(ch: char) -> bool {
+    matches!(ch, ' ' | ';' | '{' | '}' | '\'' | '#' | '$' | '%')
+        || (ch.is_whitespace() && !matches!(ch, '\n' | '\r' | '\t'))
+}
+
+fn escape_unquoted_argument(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for (index, ch) in value.chars().enumerate() {
+        match ch {
+            '~' if index == 0 => escaped.push_str(r"\~"),
+            ';' | '{' | '}' | '\'' | '"' | '#' | '$' | '%' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            '\n' => escaped.push_str(r"\n"),
+            '\r' => escaped.push_str(r"\r"),
+            '\t' => escaped.push_str(r"\t"),
+            '\\' => escaped.push_str(r"\\"),
+            _ => escape_control_argument_char(&mut escaped, ch),
+        }
+    }
+    escaped
+}
+
+fn escape_single_quoted_argument(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => escaped.push_str(r"\n"),
+            '\r' => escaped.push_str(r"\r"),
+            '\t' => escaped.push_str(r"\t"),
+            '\\' => escaped.push_str(r"\\"),
+            _ => escape_control_argument_char(&mut escaped, ch),
+        }
+    }
+    escaped
 }
 
 fn escape_double_quoted_argument(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
+    let mut chars = value.chars().enumerate().peekable();
+    while let Some((index, ch)) = chars.next() {
         match ch {
-            '$' => escaped.push_str(r"\$"),
+            '~' if index == 0 => escaped.push_str(r"\~"),
+            '\n' => escaped.push_str(r"\n"),
+            '\r' => escaped.push_str(r"\r"),
+            '\t' => escaped.push_str(r"\t"),
+            '\u{7}' => escaped.push_str(r"\a"),
+            '\u{8}' => escaped.push_str(r"\b"),
+            '\u{b}' => escaped.push_str(r"\v"),
+            '\u{c}' => escaped.push_str(r"\f"),
+            '\u{1b}' => escaped.push_str(r"\033"),
+            '$' if chars
+                .peek()
+                .is_some_and(|(_, next)| dollar_starts_variable(*next)) =>
+            {
+                escaped.push_str(r"\$")
+            }
             '\\' | '"' => {
                 escaped.push('\\');
                 escaped.push(ch);
             }
-            _ => escaped.push(ch),
+            _ => escape_control_argument_char(&mut escaped, ch),
         }
     }
     escaped
+}
+
+fn escape_control_argument_char(escaped: &mut String, ch: char) {
+    match ch {
+        '\u{7}' => escaped.push_str(r"\a"),
+        '\u{8}' => escaped.push_str(r"\b"),
+        '\u{b}' => escaped.push_str(r"\v"),
+        '\u{c}' => escaped.push_str(r"\f"),
+        '\u{1b}' => escaped.push_str(r"\033"),
+        '\0'..='\u{1f}' | '\u{7f}' => {
+            escaped.push('\\');
+            escaped.push_str(&format!("{:03o}", ch as u32));
+        }
+        _ => escaped.push(ch),
+    }
+}
+
+fn dollar_starts_variable(ch: char) -> bool {
+    ch == '{' || ch == '_' || ch.is_ascii_alphabetic()
 }
 
 #[cfg(test)]

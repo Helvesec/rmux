@@ -42,11 +42,13 @@ fn resize_pane_zoom_after_columns_follows_tmux_last_wins() {
 }
 
 #[test]
-fn display_panes_accepts_session_targets() {
-    let cli = parse_args(&["display-panes", "-t", "alpha"]).unwrap();
+fn display_panes_accepts_published_client_names() {
+    let cli = parse_args(&["display-panes", "-t", "/dev/pts/7"]).unwrap();
 
     match cli.command.expect("parsed command") {
-        Command::DisplayPanes(args) => assert_eq!(target_text(&args.target), "alpha"),
+        Command::DisplayPanes(args) => {
+            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/7"));
+        }
         _ => panic!("expected DisplayPanes command"),
     }
 }

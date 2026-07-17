@@ -208,17 +208,22 @@ impl CopyModeState {
                     .as_ref()
                     .expect("plain search needle must be initialized");
                 let needle = needle.as_ref();
-                let haystack = if case_insensitive {
-                    Cow::Owned(map.text.to_lowercase())
-                } else {
-                    Cow::Borrowed(map.text.as_str())
-                };
+                let lowercase = case_insensitive.then(|| map.lowercase());
+                let haystack = lowercase
+                    .as_ref()
+                    .map_or(map.text.as_str(), |lowercase| lowercase.text.as_str());
                 let mut offset = 0;
                 while let Some(found) = haystack[offset..].find(needle) {
                     let start = offset + found;
                     let end = start + needle.len();
-                    if let Some(result) = map.match_range(y, start..end) {
-                        self.search_results.push(result);
+                    let original_range = match &lowercase {
+                        Some(lowercase) => lowercase.original_range(start..end),
+                        None => Some(start..end),
+                    };
+                    if let Some(original_range) = original_range {
+                        if let Some(result) = map.match_range(y, original_range) {
+                            self.search_results.push(result);
+                        }
                     }
                     offset = start.saturating_add(needle.len().max(1));
                     if offset >= haystack.len() {

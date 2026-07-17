@@ -2,30 +2,31 @@ use super::{key_code_lookup_bits, key_string_lookup_string, KeyCode};
 
 const DEFAULT_LIST_KEYS_TMUX_3_4: &str = include_str!("default_list_keys_tmux_3_4.txt");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DefaultListKeysDisplay<'a> {
     pub(crate) index: usize,
-    pub(crate) key_string: &'a str,
+    pub(crate) key_string: String,
     pub(crate) command_string: &'a str,
 }
 
-pub(crate) fn list_keys_display(
+pub(crate) fn list_keys_displays(
     table_name: &str,
     key: KeyCode,
-) -> Option<DefaultListKeysDisplay<'static>> {
+) -> Vec<DefaultListKeysDisplay<'static>> {
     DEFAULT_LIST_KEYS_TMUX_3_4
         .lines()
         .enumerate()
         .filter_map(|(index, line)| parse_default_list_keys_line(index, line))
-        .find(|row| {
+        .filter(|row| {
             row.table_name == table_name
                 && default_display_key_matches(row.key_string, key_code_lookup_bits(key))
         })
         .map(|row| DefaultListKeysDisplay {
             index: row.index,
-            key_string: row.key_string,
+            key_string: normalize_default_display_key(row.key_string).into_owned(),
             command_string: row.command_string,
         })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,14 +141,11 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     "bind -N 'Set the main-horizontal layout' M-3 { select-layout main-horizontal }",
     "bind -N 'Set the main-vertical layout' M-4 { select-layout main-vertical }",
     "bind -N 'Select the tiled layout' M-5 { select-layout tiled }",
+    "bind -N 'Set the main-horizontal-mirrored layout' M-6 { select-layout main-horizontal-mirrored }",
+    "bind -N 'Set the main-vertical-mirrored layout' M-7 { select-layout main-vertical-mirrored }",
     "bind -N 'Select the next window with an alert' M-n { next-window -a }",
     "bind -N 'Rotate through the panes in reverse' M-o { rotate-window -D }",
     "bind -N 'Select the previous window with an alert' M-p { previous-window -a }",
-    "bind -N 'Move the visible part of the window up' -r S-Up { refresh-client -U 10 }",
-    "bind -N 'Move the visible part of the window down' -r S-Down { refresh-client -D 10 }",
-    "bind -N 'Move the visible part of the window left' -r S-Left { refresh-client -L 10 }",
-    "bind -N 'Move the visible part of the window right' -r S-Right { refresh-client -R 10 }",
-    "bind -N 'Reset so the visible part of the window follows the cursor' -r DC { refresh-client -c }",
     "bind -N 'Resize the pane up by 5' -r M-Up { resize-pane -U 5 }",
     "bind -N 'Resize the pane down by 5' -r M-Down { resize-pane -D 5 }",
     "bind -N 'Resize the pane left by 5' -r M-Left { resize-pane -L 5 }",
@@ -176,7 +174,7 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
         " '#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}' '<' {send -X history-top}",
         " '#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}' '>' {send -X history-bottom}",
         " ''",
-        " '#{?#{&&:#{buffer_size},#{==:#{pane_in_mode},0}},Paste #[underscore]#{=/9/...:buffer_sample},}' 'p' {paste-buffer}",
+        " '#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste #[underscore]#{=/9/...:buffer_sample},}' 'p' {paste-buffer}",
         " ''",
         " '#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}' 'C-r' {if -F '#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}' 'copy-mode -t='; send -Xt= search-backward -- \"#{q:mouse_word}\"}",
         " '#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}' 'C-y' {copy-mode -q; send-keys -l -- \"#{q:mouse_word}\"}",
@@ -201,12 +199,20 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     ),
     "bind -n MouseDown1Pane { select-pane -t=; send -M }",
     "bind -n MouseDrag1Pane { if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -M } }",
-    "bind -n WheelUpPane { if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -e } }",
+    "bind -n WheelUpPane { if -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -e } }",
     "bind -n MouseDown2Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { paste -p } }",
     "bind -n DoubleClick1Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -Ht=; send -Xt= select-word; run -d0.3; send -Xt= copy-pipe-and-cancel } }",
     "bind -n TripleClick1Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -Ht=; send -Xt= select-line; run -d0.3; send -Xt= copy-pipe-and-cancel } }",
+    "bind -n MouseDown1Border { select-pane -M }",
     "bind -n MouseDrag1Border { resize-pane -M }",
-    "bind -n MouseDown1Status { select-window -t= }",
+    "bind -n MouseDown1Status { switch-client -t= }",
+    "bind -n MouseDown1ScrollbarUp { if -F -t= '#{pane_in_mode}' { send -X page-up } { copy-mode -u } }",
+    "bind -n MouseDown1ScrollbarDown { if -F -t= '#{pane_in_mode}' { send -X page-down } { copy-mode -d } }",
+    "bind -n MouseDrag1ScrollbarSlider { if -F -t= '#{pane_in_mode}' { send -X scroll-to-mouse } { copy-mode -S } }",
+    "bind -n MouseDown1Control8 { resize-pane -Z }",
+    "bind -n MouseDown1Control9 { display-menu -O -T 'Kill pane #{pane_index}?' -t= -xM -yM Yes y { kill-pane -t= } No n {  } }",
+    "bind -n C-MouseDown1Pane { swap-pane -s @ }",
+    "bind -n C-MouseDown1Status { swap-window -t @ }",
     "bind -n WheelDownStatus { next-window }",
     "bind -n WheelUpStatus { previous-window }",
     concat!(
@@ -215,7 +221,8 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
         " 'Previous' 'p' {switch-client -p}",
         " ''",
         " 'Renumber' 'N' {move-window -r}",
-        " 'Rename' 'n' {command-prompt -I \"#S\" {rename-session -- '%%'}}",
+        " 'Rename' 'r' {command-prompt -I \"#S\" {rename-session -- '%%'}}",
+        " 'Detach' 'd' {detach-client}",
         " ''",
         " 'New Session' 's' {new-session}",
         " 'New Window' 'w' {new-window}",
@@ -227,7 +234,8 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
         " 'Previous' 'p' {switch-client -p}",
         " ''",
         " 'Renumber' 'N' {move-window -r}",
-        " 'Rename' 'n' {command-prompt -I \"#S\" {rename-session -- '%%'}}",
+        " 'Rename' 'r' {command-prompt -I \"#S\" {rename-session -- '%%'}}",
+        " 'Detach' 'd' {detach-client}",
         " ''",
         " 'New Session' 's' {new-session}",
         " 'New Window' 'w' {new-window}",
@@ -268,7 +276,7 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
         " '#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}' '<' {send -X history-top}",
         " '#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}' '>' {send -X history-bottom}",
         " ''",
-        " '#{?#{&&:#{buffer_size},#{==:#{pane_in_mode},0}},Paste #[underscore]#{=/9/...:buffer_sample},}' 'p' {paste-buffer}",
+        " '#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste #[underscore]#{=/9/...:buffer_sample},}' 'p' {paste-buffer}",
         " ''",
         " '#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}' 'C-r' {if -F '#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}' 'copy-mode -t='; send -Xt= search-backward -- \"#{q:mouse_word}\"}",
         " '#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}' 'C-y' {copy-mode -q; send-keys -l -- \"#{q:mouse_word}\"}",
@@ -296,7 +304,7 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
         " '#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}' '<' {send -X history-top}",
         " '#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}' '>' {send -X history-bottom}",
         " ''",
-        " '#{?#{&&:#{buffer_size},#{==:#{pane_in_mode},0}},Paste #[underscore]#{=/9/...:buffer_sample},}' 'p' {paste-buffer}",
+        " '#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste #[underscore]#{=/9/...:buffer_sample},}' 'p' {paste-buffer}",
         " ''",
         " '#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}' 'C-r' {if -F '#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}' 'copy-mode -t='; send -Xt= search-backward -- \"#{q:mouse_word}\"}",
         " '#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}' 'C-y' {copy-mode -q; send-keys -l -- \"#{q:mouse_word}\"}",
@@ -327,6 +335,7 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     "bind -Tcopy-mode C-b { send -X cursor-left }",
     "bind -Tcopy-mode C-g { send -X clear-selection }",
     "bind -Tcopy-mode C-k { send -X copy-pipe-end-of-line-and-cancel }",
+    "bind -Tcopy-mode C-l { send -X recentre-top-bottom }",
     "bind -Tcopy-mode C-n { send -X cursor-down }",
     "bind -Tcopy-mode C-p { send -X cursor-up }",
     "bind -Tcopy-mode C-r { command-prompt -T search -ip'(search up)' -I'#{pane_search_string}' { send -X search-backward-incremental -- '%%' } }",
@@ -334,6 +343,7 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     "bind -Tcopy-mode C-v { send -X page-down }",
     "bind -Tcopy-mode C-w { send -X copy-pipe-and-cancel }",
     "bind -Tcopy-mode Escape { send -X cancel }",
+    "bind -Tcopy-mode C-[ { send -X cancel }",
     "bind -Tcopy-mode Space { send -X page-down }",
     "bind -Tcopy-mode , { send -X jump-reverse }",
     "bind -Tcopy-mode \\; { send -X jump-again }",
@@ -379,6 +389,7 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     "bind -Tcopy-mode M-b { send -X previous-word }",
     "bind -Tcopy-mode C-M-b { send -X previous-matching-bracket }",
     "bind -Tcopy-mode M-f { send -X next-word-end }",
+    "bind -Tcopy-mode M-l { send -X cursor-centre-horizontal }",
     "bind -Tcopy-mode C-M-f { send -X next-matching-bracket }",
     "bind -Tcopy-mode M-m { send -X back-to-indentation }",
     "bind -Tcopy-mode M-r { send -X middle-line }",
@@ -405,6 +416,7 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     "bind -Tcopy-mode-vi C-v { send -X rectangle-toggle }",
     "bind -Tcopy-mode-vi C-y { send -X scroll-up }",
     "bind -Tcopy-mode-vi Escape { send -X clear-selection }",
+    "bind -Tcopy-mode-vi C-[ { send -X clear-selection }",
     "bind -Tcopy-mode-vi Space { send -X begin-selection }",
     "bind -Tcopy-mode-vi '$' { send -X end-of-line }",
     "bind -Tcopy-mode-vi , { send -X jump-reverse }",

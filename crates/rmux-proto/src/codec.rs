@@ -222,6 +222,27 @@ impl Default for FrameDecoder {
     }
 }
 
+/// Feeds arbitrary bytes through detached request and response decoders.
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_detached_frame_decoder(data: &[u8]) {
+    fuzz_decoder_type::<crate::Request>(data);
+    fuzz_decoder_type::<crate::Response>(data);
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_decoder_type<T>(data: &[u8])
+where
+    T: DeserializeOwned,
+{
+    let mut decoder = FrameDecoder::new();
+    let chunk_len = data.len().saturating_div(4).max(1);
+    for chunk in data.chunks(chunk_len) {
+        decoder.push_bytes(chunk);
+        let _ = decoder.next_frame::<T>();
+    }
+    let _ = decoder.next_frame::<T>();
+}
+
 fn frame_length(buffer: &[u8]) -> Result<usize, RmuxError> {
     let header = buffer.get(..4).ok_or(RmuxError::IncompleteFrame {
         expected: 4,

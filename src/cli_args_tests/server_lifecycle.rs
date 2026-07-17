@@ -296,31 +296,23 @@ fn server_access_read_only_parses_with_user() {
 }
 
 #[test]
-fn server_access_accepts_combined_add_and_deny_flags() {
-    let cli = parse_args(&["server-access", "-a", "-d", "alice"]).unwrap();
+fn server_access_rejects_combined_add_and_deny_flags() {
+    let error = parse_args(&["server-access", "-a", "-d", "alice"]).unwrap_err();
 
-    match cli.command.expect("parsed command") {
-        super::super::Command::ServerAccess(args) => {
-            assert!(args.add);
-            assert!(args.deny);
-            assert_eq!(args.user.as_deref(), Some("alice"));
-        }
-        _ => panic!("expected ServerAccess command"),
-    }
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert!(error
+        .to_string()
+        .contains("-a and -d cannot be used together"));
 }
 
 #[test]
-fn server_access_accepts_combined_read_and_write_flags() {
-    let cli = parse_args(&["server-access", "-r", "-w", "alice"]).unwrap();
+fn server_access_rejects_combined_read_and_write_flags() {
+    let error = parse_args(&["server-access", "-r", "-w", "alice"]).unwrap_err();
 
-    match cli.command.expect("parsed command") {
-        super::super::Command::ServerAccess(args) => {
-            assert!(args.read_only);
-            assert!(args.write);
-            assert_eq!(args.user.as_deref(), Some("alice"));
-        }
-        _ => panic!("expected ServerAccess command"),
-    }
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    assert!(error
+        .to_string()
+        .contains("-r and -w cannot be used together"));
 }
 
 #[test]
@@ -331,6 +323,22 @@ fn server_access_list_accepts_ignored_user_argument() {
         super::super::Command::ServerAccess(args) => {
             assert!(args.list);
             assert_eq!(args.user.as_deref(), Some("alice"));
+        }
+        _ => panic!("expected ServerAccess command"),
+    }
+}
+
+#[test]
+fn server_access_list_ignores_otherwise_conflicting_flags() {
+    let cli = parse_args(&["server-access", "-l", "-a", "-d", "-r", "-w", "alice"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ServerAccess(args) => {
+            assert!(args.list);
+            assert!(args.add);
+            assert!(args.deny);
+            assert!(args.read_only);
+            assert!(args.write);
         }
         _ => panic!("expected ServerAccess command"),
     }
@@ -350,14 +358,14 @@ fn server_access_missing_user_is_a_runtime_error() {
 }
 
 #[test]
-fn server_access_rejects_unknown_target_flag() {
+fn server_access_rejects_tmux_target_flag_like_tmux_runtime() {
     let error = parse_args(&["server-access", "-t", "%0", "-l"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     assert!(error
         .to_string()
         .contains("command server-access: unknown flag -t"));
 
-    let error = parse_args(&["server-access", "-t", "%0", "root"]).unwrap_err();
+    let error = parse_args(&["server-access", "-t%0", "root"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     assert!(error
         .to_string()
@@ -374,6 +382,41 @@ fn server_access_rejects_unknown_target_flag() {
     assert!(error
         .to_string()
         .contains("command server-access: invalid flag --"));
+}
+
+#[test]
+fn server_access_help_and_completion_omit_rejected_target_flag() {
+    let help =
+        parse_args(&["server-access", "--help"]).expect_err("--help renders server-access help");
+    assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+    let help = help.to_string();
+    assert!(help.lines().any(|line| line.trim_start().starts_with("-a")));
+    assert!(help.lines().any(|line| line.trim_start().starts_with("-w")));
+    assert!(
+        !help.lines().any(|line| line.trim_start().starts_with("-t")),
+        "server-access help advertised rejected -t: {help}"
+    );
+
+    let completion = super::super::completion_command();
+    let server_access = completion
+        .get_subcommands()
+        .find(|command| command.get_name() == "server-access")
+        .expect("server-access completion subcommand");
+    let visible_flags = server_access
+        .get_arguments()
+        .filter(|argument| !argument.is_hide_set())
+        .filter_map(|argument| argument.get_short())
+        .collect::<Vec<_>>();
+    for flag in ['a', 'd', 'l', 'r', 'w'] {
+        assert!(
+            visible_flags.contains(&flag),
+            "missing completion flag -{flag}"
+        );
+    }
+    assert!(
+        !visible_flags.contains(&'t'),
+        "server-access completion advertised rejected -t"
+    );
 }
 
 #[test]

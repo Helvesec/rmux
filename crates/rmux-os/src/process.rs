@@ -15,6 +15,11 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 #[path = "process_windows.rs"]
 mod windows_process;
+#[cfg(target_os = "linux")]
+use linux_impl::{
+    command_name_impl, current_path_impl, environment_impl, executable_path_impl, fd_path_impl,
+    is_live_impl, raw_environment_impl,
+};
 #[cfg(windows)]
 pub use windows_process::ProcessJob;
 
@@ -36,6 +41,11 @@ impl ProcessInspector {
     /// Returns the executable command name for `pid`, when available.
     pub fn command_name(&self, pid: u32) -> io::Result<Option<String>> {
         command_name_impl(pid)
+    }
+
+    /// Returns the executable path for `pid`, when available.
+    pub fn executable_path(&self, pid: u32) -> io::Result<Option<String>> {
+        executable_path_impl(pid)
     }
 
     /// Returns the path for a process file descriptor, when available.
@@ -85,6 +95,12 @@ pub fn current_path(pid: u32) -> Option<String> {
 #[must_use]
 pub fn command_name(pid: u32) -> Option<String> {
     ProcessInspector.command_name(pid).ok().flatten()
+}
+
+/// Returns the executable path for `pid`, when available.
+#[must_use]
+pub fn executable_path(pid: u32) -> Option<String> {
+    ProcessInspector.executable_path(pid).ok().flatten()
 }
 
 /// Returns the path for a process file descriptor, when the platform exposes it.
@@ -149,15 +165,6 @@ fn parent_pid_impl(_pid: u32) -> io::Result<Option<u32>> {
     Ok(None)
 }
 
-#[cfg(target_os = "linux")]
-fn current_path_impl(pid: u32) -> io::Result<Option<String>> {
-    match std::fs::read_link(format!("/proc/{pid}/cwd")) {
-        Ok(path) => Ok(Some(linux_cwd_path_string(path))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 #[allow(dead_code)]
 fn linux_cwd_path_string(path: PathBuf) -> String {
     const DELETED_SUFFIX: &str = " (deleted)";
@@ -170,63 +177,85 @@ fn linux_cwd_path_string(path: PathBuf) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn command_name_impl(pid: u32) -> io::Result<Option<String>> {
-    Ok(command_name_from_linux_cmdline(pid).or_else(|| command_name_from_linux_comm(pid)))
-}
+mod linux_impl {
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::io;
+    use std::path::PathBuf;
 
-#[cfg(target_os = "linux")]
-fn command_name_from_linux_cmdline(pid: u32) -> Option<String> {
-    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let first = cmdline
-        .split(|byte| *byte == 0)
-        .find(|segment| !segment.is_empty())?;
-    executable_name(std::str::from_utf8(first).ok()?)
-}
+    use super::{
+        environment_from_nul_entries, executable_name, linux_cwd_path_string,
+        raw_environment_from_nul_entries,
+    };
 
-#[cfg(target_os = "linux")]
-fn command_name_from_linux_comm(pid: u32) -> Option<String> {
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
-    executable_name(comm.trim())
-}
-
-#[cfg(target_os = "linux")]
-fn fd_path_impl(pid: u32, fd: i32) -> io::Result<Option<PathBuf>> {
-    match std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
-        Ok(path) => Ok(Some(path)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+    pub(super) fn current_path_impl(pid: u32) -> io::Result<Option<String>> {
+        match std::fs::read_link(format!("/proc/{pid}/cwd")) {
+            Ok(path) => Ok(Some(linux_cwd_path_string(path))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
-}
 
-#[cfg(target_os = "linux")]
-fn is_live_impl(pid: u32) -> io::Result<Option<bool>> {
-    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return Ok(Some(false));
-    };
-    let Some((_, tail)) = stat.rsplit_once(") ") else {
-        return Ok(None);
-    };
-    Ok(Some(!matches!(tail.chars().next(), Some('Z' | 'X'))))
-}
+    pub(super) fn command_name_impl(pid: u32) -> io::Result<Option<String>> {
+        Ok(command_name_from_linux_cmdline(pid).or_else(|| command_name_from_linux_comm(pid)))
+    }
 
-#[cfg(target_os = "linux")]
-fn environment_impl(pid: u32) -> io::Result<Option<HashMap<String, String>>> {
-    let environ = match std::fs::read(format!("/proc/{pid}/environ")) {
-        Ok(environ) => environ,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    Ok(environment_from_nul_entries(&environ))
-}
+    pub(super) fn executable_path_impl(pid: u32) -> io::Result<Option<String>> {
+        match std::fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(path) => Ok(Some(path.to_string_lossy().into_owned())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 
-#[cfg(target_os = "linux")]
-fn raw_environment_impl(pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
-    let environ = match std::fs::read(format!("/proc/{pid}/environ")) {
-        Ok(environ) => environ,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    Ok(Some(raw_environment_from_nul_entries(&environ)))
+    fn command_name_from_linux_cmdline(pid: u32) -> Option<String> {
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let first = cmdline
+            .split(|byte| *byte == 0)
+            .find(|segment| !segment.is_empty())?;
+        executable_name(std::str::from_utf8(first).ok()?)
+    }
+
+    fn command_name_from_linux_comm(pid: u32) -> Option<String> {
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        executable_name(comm.trim())
+    }
+
+    pub(super) fn fd_path_impl(pid: u32, fd: i32) -> io::Result<Option<PathBuf>> {
+        match std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
+            Ok(path) => Ok(Some(path)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(super) fn is_live_impl(pid: u32) -> io::Result<Option<bool>> {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return Ok(Some(false));
+        };
+        let Some((_, tail)) = stat.rsplit_once(") ") else {
+            return Ok(None);
+        };
+        Ok(Some(!matches!(tail.chars().next(), Some('Z' | 'X'))))
+    }
+
+    pub(super) fn environment_impl(pid: u32) -> io::Result<Option<HashMap<String, String>>> {
+        let environ = match std::fs::read(format!("/proc/{pid}/environ")) {
+            Ok(environ) => environ,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(environment_from_nul_entries(&environ))
+    }
+
+    pub(super) fn raw_environment_impl(pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
+        let environ = match std::fs::read(format!("/proc/{pid}/environ")) {
+            Ok(environ) => environ,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(raw_environment_from_nul_entries(&environ)))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -269,7 +298,17 @@ fn command_name_impl(pid: u32) -> io::Result<Option<String>> {
 }
 
 #[cfg(target_os = "macos")]
+fn executable_path_impl(pid: u32) -> io::Result<Option<String>> {
+    Ok(macos_pidpath(pid))
+}
+
+#[cfg(target_os = "macos")]
 fn command_name_from_macos_pidpath(pid: u32) -> Option<String> {
+    executable_name(&macos_pidpath(pid)?)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pidpath(pid: u32) -> Option<String> {
     let mut buffer = [0 as libc::c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let written = unsafe {
         // SAFETY: `buffer` is writable for the size passed to `proc_pidpath`.
@@ -282,7 +321,7 @@ fn command_name_from_macos_pidpath(pid: u32) -> Option<String> {
     if written <= 0 {
         return None;
     }
-    executable_name(&string_from_c_chars(buffer.as_ptr())?)
+    string_from_c_chars(buffer.as_ptr())
 }
 
 #[cfg(target_os = "macos")]
@@ -389,6 +428,11 @@ fn current_path_impl(pid: u32) -> io::Result<Option<String>> {
 #[cfg(windows)]
 fn command_name_impl(pid: u32) -> io::Result<Option<String>> {
     windows_process::command_name(pid)
+}
+
+#[cfg(windows)]
+fn executable_path_impl(pid: u32) -> io::Result<Option<String>> {
+    windows_process::executable_path(pid)
 }
 
 #[cfg(windows)]
@@ -546,8 +590,12 @@ fn environment_from_nul_entries(environ: &[u8]) -> Option<HashMap<String, String
         if entry.is_empty() {
             continue;
         }
-        let entry = std::str::from_utf8(entry).ok()?;
-        let (name, value) = entry.split_once('=')?;
+        let Ok(entry) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        let Some((name, value)) = entry.split_once('=') else {
+            continue;
+        };
         values.insert(name.to_owned(), value.to_owned());
     }
     Some(values)

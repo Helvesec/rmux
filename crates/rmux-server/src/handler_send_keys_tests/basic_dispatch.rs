@@ -28,6 +28,38 @@ async fn send_keys_writes_resolved_bytes_to_the_correct_pane() {
 }
 
 #[tokio::test]
+async fn send_keys_uses_configured_backspace_byte() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("send-keys-backspace-option");
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::Backspace,
+            value: "C-h".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "backspace-option", 3).await;
+    let response = handler
+        .handle(Request::SendKeys(SendKeysRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            keys: vec!["BSpace".to_owned(), "M-BSpace".to_owned()],
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 2 })
+    );
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"\x08\x1b\x08").await;
+}
+
+#[tokio::test]
 async fn send_keys_marks_attached_session_input_as_interactive() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -128,11 +160,14 @@ async fn send_keys_plain_input_uses_copy_mode_until_copy_mode_exits() {
     );
 
     let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha,
             format: Some("#{pane_in_mode}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let Response::ListPanes(response) = listed else {
         panic!("expected list-panes response");
@@ -600,7 +635,7 @@ async fn bind_key_and_list_keys_round_trip_through_the_handler() {
             format: None,
             sort_order: None,
             prefix: None,
-            key: Some("C-a".to_owned()),
+            key: None,
         })))
         .await;
 
@@ -680,6 +715,91 @@ async fn send_keys_k_dispatches_prefix_table_bindings() {
 }
 
 #[tokio::test]
+async fn send_keys_k_binding_task_preserves_disabled_hook_context() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("hook-binding-alpha");
+    let requester_pid = std::process::id();
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let hook = handler
+        .handle(Request::SetHook(SetHookRequest {
+            scope: ScopeSelector::Global,
+            hook: HookName::AfterNewWindow,
+            command: "set-buffer -b nested-hook fired".to_owned(),
+            lifecycle: HookLifecycle::Persistent,
+        }))
+        .await;
+    assert!(matches!(hook, Response::SetHook(_)));
+    let bound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "prefix".to_owned(),
+            key: "x".to_owned(),
+            note: Some("create-with-hooks-disabled".to_owned()),
+            repeat: false,
+            command: Some(vec!["new-window".to_owned(), "-d".to_owned()]),
+        })))
+        .await;
+    assert!(matches!(bound, Response::BindKey(_)));
+
+    let dispatched = crate::hook_runtime::with_hook_execution(Vec::new(), async {
+        handler
+            .handle(Request::SendKeysExt(SendKeysExtRequest {
+                target: Some(PaneTarget::new(alpha.clone(), 0)),
+                keys: vec!["C-b".to_owned(), "x".to_owned()],
+                expand_formats: false,
+                hex: false,
+                literal: false,
+                dispatch_key_table: true,
+                copy_mode_command: false,
+                forward_mouse_event: false,
+                reset_terminal: false,
+                repeat_count: None,
+            }))
+            .await
+    })
+    .await;
+    assert_eq!(
+        dispatched,
+        Response::SendKeys(SendKeysResponse { key_count: 2 })
+    );
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("session survives")
+            .windows()
+            .len(),
+        2,
+        "the attached binding still creates its requested window"
+    );
+    drop(state);
+    let shown = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("nested-hook".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(shown, Response::Error(_)),
+        "hook command must stay disabled across the Tokio task boundary"
+    );
+}
+
+#[tokio::test]
 async fn switch_client_t_sets_custom_key_table_for_next_k_dispatch() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -752,6 +872,99 @@ async fn switch_client_t_sets_custom_key_table_for_next_k_dispatch() {
         panic!("expected show-buffer response");
     };
     assert_eq!(response.command_output().stdout(), b"ok");
+}
+
+#[tokio::test]
+async fn send_keys_k_prefix_precedes_a_transient_key_table() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("prefix-precedes-transient-k");
+    let requester_pid = std::process::id();
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let bound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "my-table".to_owned(),
+            key: "C-b".to_owned(),
+            note: Some("must lose to the prefix key".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "set-buffer".to_owned(),
+                "-b".to_owned(),
+                "wrong-table-hit".to_owned(),
+                "yes".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(bound, Response::BindKey(_)));
+
+    let switched = handler
+        .handle(Request::SwitchClientExt(SwitchClientExtRequest {
+            target: None,
+            key_table: Some("my-table".to_owned()),
+        }))
+        .await;
+    assert!(matches!(switched, Response::SwitchClient(_)));
+
+    let dispatched = handler
+        .handle(Request::SendKeysExt(SendKeysExtRequest {
+            target: Some(PaneTarget::new(alpha, 0)),
+            keys: vec!["C-b".to_owned()],
+            expand_formats: false,
+            hex: false,
+            literal: false,
+            dispatch_key_table: true,
+            copy_mode_command: false,
+            forward_mouse_event: false,
+            reset_terminal: false,
+            repeat_count: None,
+        }))
+        .await;
+    assert_eq!(
+        dispatched,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+
+    // tmux 3.7b reports `prefix|1` here and does not execute a C-b binding
+    // from the transient table: the configured prefix key takes precedence.
+    let clients = handler
+        .handle(Request::ListClients(Box::new(
+            rmux_proto::ListClientsRequest {
+                format: Some("#{client_key_table}|#{client_prefix}".to_owned()),
+                target_session: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            },
+        )))
+        .await;
+    let Response::ListClients(clients) = clients else {
+        panic!("expected list-clients response");
+    };
+    assert_eq!(clients.output.stdout(), b"prefix|1\n");
+
+    let wrong_table_hit = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("wrong-table-hit".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(wrong_table_hit, Response::Error(_)),
+        "the transient table's prefix-key binding must not execute"
+    );
 }
 
 #[tokio::test]
@@ -846,11 +1059,14 @@ async fn send_keys_k_uses_copy_mode_bindings_until_copy_mode_exits() {
 
     let listed = handle_boxed(
         &handler,
-        Request::ListPanes(ListPanesRequest {
+        Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha,
             format: Some("#{pane_in_mode}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }),
+        })),
     )
     .await;
     let Response::ListPanes(response) = listed else {
@@ -963,11 +1179,14 @@ async fn send_keys_k_uses_copy_mode_vi_bindings_when_mode_keys_is_vi() {
 
     let listed = handle_boxed(
         &handler,
-        Request::ListPanes(ListPanesRequest {
+        Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha,
             format: Some("#{pane_in_mode}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }),
+        })),
     )
     .await;
     let Response::ListPanes(response) = listed else {

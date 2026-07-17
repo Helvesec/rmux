@@ -18,7 +18,7 @@ pub struct GroupedSessionCreation {
 }
 
 /// In-memory storage for all sessions owned by the server.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionStore {
     sessions: HashMap<SessionName, Session>,
     next_session_id: u32,
@@ -435,6 +435,51 @@ impl SessionStore {
             .ok_or_else(|| RmuxError::SessionNotFound(session_name.to_string()))?;
         self.repair_group_runtime_owner(removed.group_name().cloned());
         Ok(removed)
+    }
+
+    /// Temporarily extracts two distinct sessions for a paired mutation.
+    ///
+    /// Unlike [`Self::remove_session`], this leaves group runtime ownership
+    /// untouched and reinserts both sessions before returning the closure's
+    /// result. The closure cannot observe the store while the pair is absent.
+    pub fn with_extracted_session_pair<T>(
+        &mut self,
+        first_session_name: &SessionName,
+        second_session_name: &SessionName,
+        mutate: impl FnOnce(&mut Session, &mut Session) -> T,
+    ) -> Result<T, RmuxError> {
+        if first_session_name == second_session_name {
+            return Err(RmuxError::Server(
+                "paired session mutation requires distinct sessions".to_owned(),
+            ));
+        }
+        for session_name in [first_session_name, second_session_name] {
+            if !self.sessions.contains_key(session_name) {
+                return Err(RmuxError::SessionNotFound(session_name.to_string()));
+            }
+        }
+
+        let mut first_session = self
+            .sessions
+            .remove(first_session_name)
+            .expect("prevalidated first session must exist");
+        let mut second_session = self
+            .sessions
+            .remove(second_session_name)
+            .expect("prevalidated second session must exist");
+        let result = mutate(&mut first_session, &mut second_session);
+
+        debug_assert_eq!(first_session.name(), first_session_name);
+        debug_assert_eq!(second_session.name(), second_session_name);
+        let replaced_first = self
+            .sessions
+            .insert(first_session_name.clone(), first_session);
+        let replaced_second = self
+            .sessions
+            .insert(second_session_name.clone(), second_session);
+        debug_assert!(replaced_first.is_none());
+        debug_assert!(replaced_second.is_none());
+        Ok(result)
     }
 
     /// Inserts an existing session back into the store without rewriting it.

@@ -11,12 +11,24 @@ pub(super) fn run_load_buffer(
     if args.path == "-" {
         let content = read_stdin_bytes("load-buffer")?;
         return run_command(socket_path, "set-buffer", move |connection| {
-            connection.set_buffer(args.name, content, false, None, args.set_clipboard)
+            connection.set_buffer_target_client(
+                args.name,
+                content,
+                false,
+                None,
+                args.set_clipboard,
+                args.target_client,
+            )
         });
     }
 
     run_command(socket_path, "load-buffer", move |connection| {
-        connection.load_buffer(args.path, args.name, args.set_clipboard)
+        connection.load_buffer_target_client(
+            args.path,
+            args.name,
+            args.set_clipboard,
+            args.target_client,
+        )
     })
 }
 

@@ -32,6 +32,9 @@ pub use options::{OptionName, SetOptionMode};
 #[non_exhaustive]
 pub enum ProcessCommand {
     /// Execute the program directly with the supplied argv vector.
+    ///
+    /// On Windows, `.bat` and `.cmd` targets run through `cmd.exe`, so its
+    /// percent-variable expansion still applies.
     Argv(Vec<String>),
     /// Execute command text through the configured shell.
     Shell(String),
@@ -78,6 +81,26 @@ impl ProcessCommand {
 pub struct PaneOutputSubscriptionId(u64);
 
 impl PaneOutputSubscriptionId {
+    /// Wraps a raw subscription identifier.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw subscription identifier.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Stable identifier for one pane-state event subscription on a live server
+/// connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PaneStateSubscriptionId(u64);
+
+impl PaneStateSubscriptionId {
     /// Wraps a raw subscription identifier.
     #[must_use]
     pub const fn new(value: u64) -> Self {
@@ -345,6 +368,15 @@ impl PaneTargetRef {
         match self {
             Self::Slot(target) => target.session_name(),
             Self::Id { session_name, .. } => session_name,
+        }
+    }
+
+    /// Returns the stable pane identity when this selector is id-based.
+    #[must_use]
+    pub const fn pane_id(&self) -> Option<PaneId> {
+        match self {
+            Self::Slot(_) => None,
+            Self::Id { pane_id, .. } => Some(*pane_id),
         }
     }
 }

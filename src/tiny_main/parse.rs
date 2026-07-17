@@ -17,7 +17,7 @@ pub(super) struct TinyDisplayMessage {
 }
 
 pub(super) struct TinySendKeys {
-    pub(super) target: PaneTarget,
+    pub(super) raw_target: String,
     pub(super) keys: Vec<String>,
 }
 
@@ -222,6 +222,9 @@ pub(super) fn parse_capture_pane(args: &[OsString]) -> Option<CapturePaneTargetA
         alternate: false,
         escape_ansi: false,
         escape_sequences: false,
+        include_format: false,
+        hyperlinks: false,
+        line_numbers: false,
         join_wrapped: false,
         use_mode_screen: false,
         preserve_trailing_spaces: false,
@@ -246,6 +249,7 @@ pub(super) fn parse_split_window(args: &[OsString]) -> Option<SplitWindowTargetA
     let mut size = None;
     let mut preserve_zoom = false;
     let mut full_size = false;
+    let mut keep_alive_on_exit = false;
     let mut command = None;
     let mut index = 0;
     while index < args.len() {
@@ -262,6 +266,7 @@ pub(super) fn parse_split_window(args: &[OsString]) -> Option<SplitWindowTargetA
             "-b" => before = true,
             "-Z" => preserve_zoom = true,
             "-f" => full_size = true,
+            "-k" => keep_alive_on_exit = true,
             "-t" => {
                 index += 1;
                 target = Some(args.get(index)?.to_str()?.to_owned());
@@ -291,7 +296,7 @@ pub(super) fn parse_split_window(args: &[OsString]) -> Option<SplitWindowTargetA
         command,
         process_command: None,
         start_directory,
-        keep_alive_on_exit: None,
+        keep_alive_on_exit: keep_alive_on_exit.then_some(true),
         detached,
         size,
         preserve_zoom,
@@ -697,7 +702,7 @@ pub(super) fn parse_display_message(args: &[OsString]) -> Option<TinyDisplayMess
         match arg {
             "--" => {
                 index += 1;
-                message = parse_joined_tail(&args[index..])?;
+                message = parse_single_tail(&args[index..])?;
                 break;
             }
             "-p" => print = true,
@@ -717,7 +722,7 @@ pub(super) fn parse_display_message(args: &[OsString]) -> Option<TinyDisplayMess
             "-c" | "-d" => return None,
             value if value.starts_with('-') => return None,
             _ => {
-                message = parse_joined_tail(&args[index..])?;
+                message = parse_single_tail(&args[index..])?;
                 break;
             }
         }
@@ -752,7 +757,9 @@ pub(super) fn parse_send_keys(args: &[OsString]) -> Option<TinySendKeys> {
             }
             "-t" => {
                 index += 1;
-                target = Some(parse_pane_target(args.get(index)?.to_str()?)?);
+                let raw_target = args.get(index)?.to_str()?;
+                let _ = parse_pane_target(raw_target)?;
+                target = Some(raw_target.to_owned());
             }
             "-F" | "-H" | "-l" | "-K" | "-M" | "-p" | "-R" | "-X" => return None,
             "-N" | "-c" => return None,
@@ -766,7 +773,7 @@ pub(super) fn parse_send_keys(args: &[OsString]) -> Option<TinySendKeys> {
     }
 
     Some(TinySendKeys {
-        target: target?,
+        raw_target: target?,
         keys,
     })
 }
@@ -909,11 +916,11 @@ fn parse_command_tail(args: &[OsString]) -> Option<Option<Vec<String>>> {
         .map(Some)
 }
 
-fn parse_joined_tail(args: &[OsString]) -> Option<Option<String>> {
-    if args.is_empty() {
+fn parse_single_tail(args: &[OsString]) -> Option<Option<String>> {
+    let [value] = args else {
         return None;
-    }
-    parse_string_tail(args).map(|values| Some(values.join(" ")))
+    };
+    value.to_str().map(|value| Some(value.to_owned()))
 }
 
 fn parse_string_tail(args: &[OsString]) -> Option<Vec<String>> {
@@ -1124,41 +1131,16 @@ where
 pub(super) fn invoking_client_shell() -> Option<String> {
     let parent_pid = rmux_os::process::parent_pid(std::process::id())?;
     let parent_name = rmux_os::process::command_name(parent_pid)?;
-    windows_client_shell_for_parent_name(&parent_name)
+    let environment = crate::windows_shell::WindowsShellEnvironment::current();
+    windows_client_shell_for_parent_name(&parent_name, &environment)
 }
 
 #[cfg(windows)]
-pub(super) fn windows_client_shell_for_parent_name(parent_name: &str) -> Option<String> {
-    let lower = parent_name.to_ascii_lowercase();
-    match lower.as_str() {
-        "cmd.exe" | "cmd" => Some(
-            env::var_os("COMSPEC")
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "cmd.exe".into())
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        "powershell.exe" | "powershell" => {
-            if windows_command_available_on_path("pwsh.exe") {
-                Some("pwsh.exe".to_owned())
-            } else {
-                Some("powershell.exe".to_owned())
-            }
-        }
-        "pwsh.exe" | "pwsh" => Some("pwsh.exe".to_owned()),
-        "bash.exe" | "bash" | "sh.exe" | "sh" | "zsh.exe" | "zsh" | "nu.exe" | "nu" => {
-            Some(parent_name.to_owned())
-        }
-        _ => None,
-    }
-}
-
-#[cfg(windows)]
-fn windows_command_available_on_path(name: &str) -> bool {
-    let Some(path) = env::var_os("PATH") else {
-        return false;
-    };
-    env::split_paths(&path).any(|directory| directory.join(name).is_file())
+pub(super) fn windows_client_shell_for_parent_name(
+    parent_name: &str,
+    environment: &crate::windows_shell::WindowsShellEnvironment,
+) -> Option<String> {
+    crate::windows_shell::client_shell_for_parent_name(parent_name, environment)
 }
 
 #[cfg(not(windows))]

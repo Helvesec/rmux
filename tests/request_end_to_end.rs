@@ -432,7 +432,7 @@ fn extract_enum_variant_commands(
 
         let variant = extract_variant_name(trimmed);
         if let Some(variant) = variant {
-            if variant == "Unsupported" {
+            if is_internal_command_variant(&variant) {
                 continue;
             }
             let command = public_command_name(&variant);
@@ -459,7 +459,7 @@ fn extract_match_variant_commands(
         }
 
         if let Some(variant) = extract_prefixed_variant_name(trimmed, prefix) {
-            if variant == "Unsupported" {
+            if is_internal_command_variant(&variant) {
                 continue;
             }
             let command = public_command_name(&variant);
@@ -468,6 +468,13 @@ fn extract_match_variant_commands(
     }
 
     Ok(commands)
+}
+
+fn is_internal_command_variant(variant: &str) -> bool {
+    matches!(
+        variant,
+        "Noop" | "Unsupported" | "ApplyParseTimeAssignments"
+    )
 }
 
 fn extract_list_commands(output: &str) -> BTreeSet<String> {

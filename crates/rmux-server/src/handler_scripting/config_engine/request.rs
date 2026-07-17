@@ -5,13 +5,6 @@ use rmux_proto::Target;
 use super::super::source_files::{ParsedSourceFileCommand, SourceSyntax};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConfigLoadOrigin {
-    Startup,
-    ExplicitSourceFile,
-    NestedSourceFile,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigLoadMode {
     Execute,
     ParseOnly,
@@ -25,7 +18,6 @@ pub(crate) enum ConfigReadPolicy {
 
 pub(crate) struct ConfigLoadRequest<'a> {
     pub(super) command: &'a ParsedSourceFileCommand,
-    pub(super) origin: ConfigLoadOrigin,
     pub(super) syntax: SourceSyntax,
     pub(super) mode: ConfigLoadMode,
     pub(super) read_policy: ConfigReadPolicy,
@@ -42,14 +34,12 @@ pub(crate) struct ConfigLoadRequest<'a> {
 impl<'a> ConfigLoadRequest<'a> {
     pub(crate) fn from_source_command(
         command: &'a ParsedSourceFileCommand,
-        origin: ConfigLoadOrigin,
         explicit_target: bool,
         implicit_target_refresh: bool,
         depth: usize,
     ) -> Self {
         Self {
             command,
-            origin,
             syntax: command.syntax,
             mode: if command.parse_only {
                 ConfigLoadMode::ParseOnly
@@ -57,7 +47,7 @@ impl<'a> ConfigLoadRequest<'a> {
                 ConfigLoadMode::Execute
             },
             read_policy: match command.syntax {
-                SourceSyntax::Rmux => ConfigReadPolicy::Strict,
+                SourceSyntax::Rmux | SourceSyntax::Canonical => ConfigReadPolicy::Strict,
                 SourceSyntax::TmuxCompat => ConfigReadPolicy::ImportCompat,
             },
             quiet: command.quiet,
@@ -97,7 +87,6 @@ impl<'a> ConfigLoadRequest<'a> {
             !(self.explicit_target && self.implicit_target_refresh),
             "explicit target and implicit target refresh are mutually exclusive"
         );
-        let _ = self.origin;
         let _ = self.is_import_compat();
     }
 }

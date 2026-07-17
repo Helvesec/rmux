@@ -42,10 +42,6 @@ where
             return expand_conditional_branch(state, true_body, variables);
         }
 
-        if !conditional_chain_name(false_body).is_some_and(|name| name.ends_with("_format")) {
-            return expand_conditional_branch(state, false_body, variables);
-        }
-
         let ConditionalParts::Full {
             condition: next_condition,
             true_body: next_true,
@@ -106,11 +102,6 @@ fn split_conditional_body(body: &str) -> ConditionalParts<'_> {
     }
 }
 
-fn conditional_chain_name(body: &str) -> Option<&str> {
-    let condition_end = format_skip(body.as_bytes(), b",")?;
-    Some(&body[..condition_end])
-}
-
 fn condition_value<V>(state: &ExpandState, raw: &str, variables: &V) -> String
 where
     V: FormatVariables + ?Sized,
@@ -134,9 +125,7 @@ where
     }
 }
 
-/// tmux 3.4 treats boolean operators as binary. Extra comma-separated text
-/// remains part of the right operand, even when newer tmux releases evaluate
-/// every operand independently.
+/// tmux 3.7 evaluates each top-level comma-separated boolean operand.
 pub(super) fn format_bool_op<V>(
     state: &mut ExpandState,
     body: &str,
@@ -147,19 +136,27 @@ where
     V: FormatVariables + ?Sized,
 {
     if body.is_empty() {
-        return String::new();
+        return "0".to_owned();
     }
 
-    let Some(split) = format_skip(body.as_bytes(), b",") else {
-        return String::new();
-    };
-    let left = format_expand1(state, &body[..split], variables);
-    let right = format_expand1(state, &body[split + 1..], variables);
-    let result = if and {
-        is_truthy(&left) && is_truthy(&right)
-    } else {
-        is_truthy(&left) || is_truthy(&right)
-    };
+    let mut rest = body;
+    loop {
+        let (raw, next) = match format_skip(rest.as_bytes(), b",") {
+            Some(split) => (&rest[..split], Some(&rest[split + 1..])),
+            None => (rest, None),
+        };
+        let truthy = is_truthy(&format_expand1(state, raw, variables));
+        if and && !truthy {
+            return "0".to_owned();
+        }
+        if !and && truthy {
+            return "1".to_owned();
+        }
+        let Some(next) = next else {
+            break;
+        };
+        rest = next;
+    }
 
-    if result { "1" } else { "0" }.to_owned()
+    if and { "1" } else { "0" }.to_owned()
 }

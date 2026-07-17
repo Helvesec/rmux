@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{
-    PaneTargetRef, RmuxError, SessionId, SessionName, WebShareScope, WebShareSummary,
+    PaneTarget, PaneTargetRef, RmuxError, SessionId, SessionName, WebShareScope, WebShareSummary,
     WebShareUrlOptions, WebTerminalPalette,
 };
 use serde::Serialize;
@@ -164,13 +164,13 @@ impl WebShareRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WebShareTarget {
-    Pane(PaneTargetRef),
+    Pane(WebPaneTarget),
     Session(WebSessionTarget),
 }
 
 impl WebShareTarget {
-    pub(crate) fn pane(target: PaneTargetRef) -> Self {
-        Self::Pane(target)
+    pub(crate) fn pane(target: PaneTargetRef, session_id: SessionId) -> Self {
+        Self::Pane(WebPaneTarget::new(target, session_id))
     }
 
     pub(crate) fn session(name: SessionName, id: SessionId) -> Self {
@@ -179,8 +179,64 @@ impl WebShareTarget {
 
     pub(crate) fn scope(&self) -> WebShareScope {
         match self {
-            Self::Pane(target) => WebShareScope::Pane(target.clone()),
+            Self::Pane(target) => WebShareScope::Pane(target.target.clone()),
             Self::Session(target) => WebShareScope::Session(target.name.clone()),
+        }
+    }
+
+    pub(crate) fn rename_session(
+        &mut self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+        session_id: SessionId,
+    ) {
+        match self {
+            Self::Pane(target) if target.session_id == session_id => {
+                target.rename_session(old_name, new_name);
+            }
+            Self::Session(target) if target.id() == session_id => {
+                target.name = new_name.clone();
+            }
+            Self::Pane(_) | Self::Session(_) => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebPaneTarget {
+    target: PaneTargetRef,
+    session_id: SessionId,
+}
+
+impl WebPaneTarget {
+    fn new(target: PaneTargetRef, session_id: SessionId) -> Self {
+        Self { target, session_id }
+    }
+
+    pub(crate) fn target(&self) -> &PaneTargetRef {
+        &self.target
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    fn rename_session(&mut self, old_name: &SessionName, new_name: &SessionName) {
+        match &self.target {
+            PaneTargetRef::Id {
+                session_name,
+                pane_id,
+            } if session_name == old_name => {
+                self.target = PaneTargetRef::by_id(new_name.clone(), *pane_id);
+            }
+            PaneTargetRef::Slot(target) if target.session_name() == old_name => {
+                self.target = PaneTargetRef::slot(PaneTarget::with_window(
+                    new_name.clone(),
+                    target.window_index(),
+                    target.pane_index(),
+                ));
+            }
+            PaneTargetRef::Id { .. } | PaneTargetRef::Slot(_) => {}
         }
     }
 }

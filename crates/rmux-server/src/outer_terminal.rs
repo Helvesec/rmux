@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use rmux_core::{
-    alternate_screen_enter_sequence, alternate_screen_exit_sequence, parse_colour, OptionStore,
-    Session,
+    alternate_screen_enter_sequence, alternate_screen_exit_sequence, input::mode, parse_colour,
+    OptionStore, Session,
 };
 #[cfg(test)]
 use rmux_core::{COLOUR_DEFAULT, COLOUR_FLAG_256, COLOUR_NONE, COLOUR_TERMINAL};
@@ -29,12 +29,38 @@ use templates::{
 };
 
 const ATTACH_SCREEN_RESET_SEQUENCE: &[u8] = b"\x1b[0m\x1b[?25l\x1b[H\x1b[2J";
+const THEME_REPORT_ENABLE_SEQUENCE: &[u8] = b"\x1b[?2031h";
+const THEME_REPORT_DISABLE_SEQUENCE: &[u8] = b"\x1b[?2031l";
+const THEME_REPORT_QUERY_SEQUENCE: &[u8] = b"\x1b[?996n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorScope {
     Pane,
     Prompt,
     CommandPrompt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+enum MouseTrackingMode {
+    #[default]
+    Off,
+    Standard,
+    Button,
+    All,
+}
+
+impl MouseTrackingMode {
+    fn from_pane_mode(mode_bits: u32) -> Self {
+        if mode_bits & mode::MODE_MOUSE_ALL != 0 {
+            Self::All
+        } else if mode_bits & mode::MODE_MOUSE_BUTTON != 0 {
+            Self::Button
+        } else if mode_bits & mode::MODE_MOUSE_STANDARD != 0 {
+            Self::Standard
+        } else {
+            Self::Off
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -125,14 +151,21 @@ pub(crate) struct OuterTerminal {
     supports_overline: bool,
     supports_usstyle: bool,
     supports_mouse: bool,
-    mouse_reporting_enabled: bool,
+    mouse_tracking_mode: MouseTrackingMode,
     ignore_function_keys: bool,
     no_bright: bool,
     bidi: bool,
     vt100_like: bool,
     focus_events_enabled: bool,
     extended_keys_enabled: bool,
+    // `set-clipboard on|external`: forwards tmux's own selections (copy-mode
+    // yank, `set-buffer -w`) to the outer terminal.
     clipboard_writes_enabled: bool,
+    // `set-clipboard on` only: relays an application's inbound OSC 52 to the
+    // outer terminal. tmux gates this stricter than its own selections
+    // (input.c input_osc_52 requires set-clipboard == 2), so untrusted pane
+    // output cannot drive the system clipboard under the `external` default.
+    app_clipboard_writes_enabled: bool,
     xt_flag: bool,
     tc_flag: bool,
     title_open: Option<String>,
@@ -173,6 +206,8 @@ impl OuterTerminal {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(alternate_screen_enter_sequence(self.context.term_name()));
         bytes.extend_from_slice(ATTACH_SCREEN_RESET_SEQUENCE);
+        bytes.extend_from_slice(THEME_REPORT_ENABLE_SEQUENCE);
+        bytes.extend_from_slice(THEME_REPORT_QUERY_SEQUENCE);
         if let Some(sequence) = &self.enable_bpaste {
             bytes.extend_from_slice(sequence.as_bytes());
         }
@@ -223,6 +258,7 @@ impl OuterTerminal {
         if let Some(sequence) = self.disable_mouse_sequence().as_deref() {
             bytes.extend_from_slice(sequence.as_bytes());
         }
+        bytes.extend_from_slice(THEME_REPORT_DISABLE_SEQUENCE);
         if let Some(sequence) = &self.disable_bpaste {
             bytes.extend_from_slice(sequence.as_bytes());
         }
@@ -383,7 +419,7 @@ impl OuterTerminal {
     }
 
     pub(crate) fn clipboard_passthrough_enabled(&self) -> bool {
-        self.clipboard_writes_enabled && self.clipboard_template.is_some()
+        self.app_clipboard_writes_enabled && self.clipboard_template.is_some()
     }
 
     fn focus_sequence(&self) -> Option<String> {
@@ -392,24 +428,35 @@ impl OuterTerminal {
             .flatten()
     }
 
+    /// Folds the active pane's exact mouse-tracking request into the outer
+    /// mouse decision. The `mouse` option requires button tracking, while an
+    /// application may request standard, button, or all-motion tracking. Keep
+    /// the strongest requested mode so DECSET 1003 is not degraded to 1002.
+    pub(crate) fn with_active_pane_mouse_mode(mut self, pane_mode_bits: u32) -> Self {
+        self.mouse_tracking_mode = self
+            .mouse_tracking_mode
+            .max(MouseTrackingMode::from_pane_mode(pane_mode_bits));
+        self
+    }
+
     fn mouse_sequence(&self) -> Option<String> {
-        // Enable in the same order tmux uses in tty_mouse_mode():
-        //   ?1006h  SGR extended coordinates
-        //   ?1000h  normal button tracking   ← must come before ?1002h
-        //   ?1002h  button-event tracking
-        //
-        // Some terminals (e.g. Termius) require ?1000h to be set before
-        // ?1002h; reversing the order causes them to fall back to sending
-        // cursor keys (ESC [ A / ESC [ B) for scroll instead of SGR mouse
-        // events, so WheelUpPane / WheelDownPane bindings never fire.
-        (self.supports_mouse && self.mouse_reporting_enabled)
-            .then_some("\x1b[?1006h\x1b[?1000h\x1b[?1002h".to_owned())
+        if !self.supports_mouse {
+            return None;
+        }
+        let sequence = match self.mouse_tracking_mode {
+            MouseTrackingMode::Off => return None,
+            MouseTrackingMode::Standard => "\x1b[?1006h\x1b[?1000h",
+            // Some terminals require 1000 before the stronger tracking mode.
+            MouseTrackingMode::Button => "\x1b[?1006h\x1b[?1000h\x1b[?1002h",
+            MouseTrackingMode::All => "\x1b[?1006h\x1b[?1000h\x1b[?1003h",
+        };
+        Some(sequence.to_owned())
     }
 
     fn disable_mouse_sequence(&self) -> Option<String> {
         // Disable in reverse order.
         self.supports_mouse
-            .then_some("\x1b[?1002l\x1b[?1000l\x1b[?1006l".to_owned())
+            .then_some("\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l".to_owned())
     }
 
     fn extkeys_sequence(&self) -> Option<String> {

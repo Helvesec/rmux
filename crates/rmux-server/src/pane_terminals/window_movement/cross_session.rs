@@ -1,19 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use rmux_core::{EnvironmentStore, PaneId, Session};
+use rmux_core::{AlertFlags, EnvironmentStore, PaneId, Session};
 use rmux_proto::{
     LinkWindowRequest, MoveWindowResponse, RmuxError, SessionName, SwapWindowResponse, WindowTarget,
 };
 
-use crate::pane_terminals::{WindowLinkGroup, WindowLinkSlot};
+use crate::pane_terminals::{WindowLinkGroup, WindowLinkOccurrenceId, WindowLinkSlot};
 
 use super::super::{session_not_found, window_pane_ids, HandlerState};
-
-pub(super) struct DetachedWindowLinkRuntimeTransfer {
-    source_runtime: SessionName,
-    destination_runtime: SessionName,
-    pane_ids: Vec<PaneId>,
-}
 
 impl HandlerState {
     pub(super) fn swap_window_across_sessions(
@@ -39,6 +33,7 @@ impl HandlerState {
         let previous_auto_named_windows = self.auto_named_windows.clone();
         let previous_window_link_slots = self.window_link_slots.clone();
         let previous_window_link_groups = self.window_link_groups.clone();
+        let previous_window_link_occurrences = self.window_link_occurrences.clone();
         let source_window = previous_source_session
             .window_at(source.window_index())
             .cloned()
@@ -57,6 +52,8 @@ impl HandlerState {
                     "window index does not exist in session",
                 )
             })?;
+        let source_alert_flags = previous_source_session.winlink_alert_flags(source.window_index());
+        let target_alert_flags = previous_target_session.winlink_alert_flags(target.window_index());
         let source_pane_ids = window_pane_ids(
             &previous_source_session,
             &source_session_name,
@@ -85,6 +82,20 @@ impl HandlerState {
             .session_mut(&target_session_name)
             .ok_or_else(|| session_not_found(&target_session_name))?
             .replace_window(target.window_index(), source_window)?;
+        replace_winlink_alert_flags(
+            self.sessions
+                .session_mut(&source_session_name)
+                .expect("validated swap source session exists"),
+            source.window_index(),
+            target_alert_flags,
+        );
+        replace_winlink_alert_flags(
+            self.sessions
+                .session_mut(&target_session_name)
+                .expect("validated swap target session exists"),
+            target.window_index(),
+            source_alert_flags,
+        );
         self.options.swap_window_overrides(&source, &target);
         self.hooks.swap_window_hooks(&source, &target);
         self.swap_window_link_slots_between(
@@ -129,6 +140,7 @@ impl HandlerState {
             self.auto_named_windows = previous_auto_named_windows;
             self.window_link_slots = previous_window_link_slots;
             self.window_link_groups = previous_window_link_groups;
+            self.window_link_occurrences = previous_window_link_occurrences;
             self.restore_cross_session_window_change(
                 &source_session_name,
                 previous_source_session,
@@ -158,6 +170,7 @@ impl HandlerState {
             self.auto_named_windows = previous_auto_named_windows;
             self.window_link_slots = previous_window_link_slots;
             self.window_link_groups = previous_window_link_groups;
+            self.window_link_occurrences = previous_window_link_occurrences;
             self.restore_cross_session_window_change(
                 &source_session_name,
                 previous_source_session,
@@ -189,6 +202,7 @@ impl HandlerState {
             self.auto_named_windows = previous_auto_named_windows;
             self.window_link_slots = previous_window_link_slots;
             self.window_link_groups = previous_window_link_groups;
+            self.window_link_occurrences = previous_window_link_occurrences;
             self.restore_cross_session_window_change(
                 &source_session_name,
                 previous_source_session,
@@ -315,6 +329,7 @@ impl HandlerState {
         target: WindowTarget,
         kill_destination: bool,
         detached: bool,
+        target_group_index_map: Option<&BTreeMap<u32, u32>>,
     ) -> Result<MoveWindowResponse, RmuxError> {
         let source_session_name = source.session_name().clone();
         let target_session_name = target.session_name().clone();
@@ -337,6 +352,7 @@ impl HandlerState {
         let previous_auto_named_windows = self.auto_named_windows.clone();
         let previous_window_link_slots = self.window_link_slots.clone();
         let previous_window_link_groups = self.window_link_groups.clone();
+        let previous_window_link_occurrences = self.window_link_occurrences.clone();
         let source_was_last_window = previous_source_session.windows().len() == 1;
         let source_group_members_before = if source_was_last_window {
             self.sessions.session_group_members(&source_session_name)
@@ -352,6 +368,7 @@ impl HandlerState {
                     "window index does not exist in session",
                 )
             })?;
+        let source_alert_flags = previous_source_session.winlink_alert_flags(source.window_index());
         let target_exists = previous_target_session
             .window_at(target.window_index())
             .is_some();
@@ -367,6 +384,7 @@ impl HandlerState {
                 target,
                 kill_destination,
                 detached,
+                target_group_index_map,
                 previous_source_session,
                 previous_target_session,
                 previous_options,
@@ -434,6 +452,13 @@ impl HandlerState {
                 .ok_or_else(|| session_not_found(&target_session_name))?
                 .insert_existing_window(target.window_index(), source_window)?;
         }
+        replace_winlink_alert_flags(
+            self.sessions
+                .session_mut(&target_session_name)
+                .expect("validated move target session exists"),
+            target.window_index(),
+            source_alert_flags,
+        );
 
         if !source_was_last_window {
             let source_removal_result = self
@@ -476,6 +501,7 @@ impl HandlerState {
                         self.auto_named_windows = previous_auto_named_windows;
                         self.window_link_slots = previous_window_link_slots;
                         self.window_link_groups = previous_window_link_groups;
+                        self.window_link_occurrences = previous_window_link_occurrences;
                         self.restore_cross_session_window_change(
                             &source_session_name,
                             previous_source_session,
@@ -510,6 +536,7 @@ impl HandlerState {
                     self.auto_named_windows = previous_auto_named_windows;
                     self.window_link_slots = previous_window_link_slots;
                     self.window_link_groups = previous_window_link_groups;
+                    self.window_link_occurrences = previous_window_link_occurrences;
                     self.restore_cross_session_window_change(
                         &source_session_name,
                         previous_source_session.clone(),
@@ -533,6 +560,7 @@ impl HandlerState {
             self.auto_named_windows = previous_auto_named_windows;
             self.window_link_slots = previous_window_link_slots;
             self.window_link_groups = previous_window_link_groups;
+            self.window_link_occurrences = previous_window_link_occurrences;
             self.replace_two_sessions(
                 &source_session_name,
                 previous_source_session,
@@ -567,6 +595,7 @@ impl HandlerState {
             self.auto_named_windows = previous_auto_named_windows;
             self.window_link_slots = previous_window_link_slots;
             self.window_link_groups = previous_window_link_groups;
+            self.window_link_occurrences = previous_window_link_occurrences;
             self.replace_two_sessions(
                 &source_session_name,
                 previous_source_session,
@@ -612,6 +641,7 @@ impl HandlerState {
             self.auto_named_windows = previous_auto_named_windows;
             self.window_link_slots = previous_window_link_slots;
             self.window_link_groups = previous_window_link_groups;
+            self.window_link_occurrences = previous_window_link_occurrences;
             self.restore_cross_session_window_change(
                 &source_session_name,
                 previous_source_session,
@@ -644,7 +674,14 @@ impl HandlerState {
             self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
         }
         if source_session_name != target_session_name {
-            self.synchronize_session_group_from(&target_session_name)?;
+            if let Some(index_map) = target_group_index_map {
+                self.synchronize_session_group_from_with_window_selection_map(
+                    &target_session_name,
+                    index_map,
+                )?;
+            } else {
+                self.synchronize_session_group_from(&target_session_name)?;
+            }
         }
         removed_target_outputs.abort_output_readers();
         self.remove_pane_lifecycles(&removed_target_pane_ids);
@@ -661,60 +698,6 @@ impl HandlerState {
         })
     }
 
-    pub(super) fn transfer_detached_window_link_runtime(
-        &mut self,
-        source_runtime: &SessionName,
-        survivor_slot: &WindowLinkSlot,
-        pane_ids: &[PaneId],
-    ) -> Result<Option<DetachedWindowLinkRuntimeTransfer>, RmuxError> {
-        let destination_runtime = self.runtime_session_name(&survivor_slot.session_name);
-        self.set_window_link_runtime_session_for_slot(survivor_slot, destination_runtime.clone());
-        if source_runtime == &destination_runtime || pane_ids.is_empty() {
-            return Ok(None);
-        }
-
-        self.terminals.move_panes_between_sessions(
-            source_runtime,
-            &destination_runtime,
-            pane_ids,
-        )?;
-        if let Err(error) =
-            self.move_pane_outputs_between_sessions(source_runtime, &destination_runtime, pane_ids)
-        {
-            self.terminals.move_panes_between_sessions(
-                &destination_runtime,
-                source_runtime,
-                pane_ids,
-            )?;
-            return Err(error);
-        }
-
-        Ok(Some(DetachedWindowLinkRuntimeTransfer {
-            source_runtime: source_runtime.clone(),
-            destination_runtime,
-            pane_ids: pane_ids.to_vec(),
-        }))
-    }
-
-    pub(super) fn rollback_detached_window_link_runtime(
-        &mut self,
-        transfer: &Option<DetachedWindowLinkRuntimeTransfer>,
-    ) -> Result<(), RmuxError> {
-        let Some(transfer) = transfer else {
-            return Ok(());
-        };
-        self.move_pane_outputs_between_sessions(
-            &transfer.destination_runtime,
-            &transfer.source_runtime,
-            &transfer.pane_ids,
-        )?;
-        self.terminals.move_panes_between_sessions(
-            &transfer.destination_runtime,
-            &transfer.source_runtime,
-            &transfer.pane_ids,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn move_linked_window_across_sessions(
         &mut self,
@@ -722,6 +705,7 @@ impl HandlerState {
         target: WindowTarget,
         kill_destination: bool,
         detached: bool,
+        target_group_index_map: Option<&BTreeMap<u32, u32>>,
         previous_source_session: Session,
         previous_target_session: Session,
         previous_options: rmux_core::OptionStore,
@@ -732,22 +716,31 @@ impl HandlerState {
         let previous_auto_named_windows = self.auto_named_windows.clone();
         let previous_window_link_slots = self.window_link_slots.clone();
         let previous_window_link_groups = self.window_link_groups.clone();
+        let previous_window_link_occurrences = self.window_link_occurrences.clone();
         let previous_environment = self.environment.clone();
+        let source_occurrence_id =
+            self.window_link_occurrence_id(&source_session_name, source.window_index());
         let source_was_last_window = previous_source_session.windows().len() == 1;
+        let source_alert_flags = previous_source_session.winlink_alert_flags(source.window_index());
         let source_group_members_before = if source_was_last_window {
             self.sessions.session_group_members(&source_session_name)
         } else {
             Vec::new()
         };
 
-        if let Err(error) = self.link_window(LinkWindowRequest {
-            source: source.clone(),
-            target: target.clone(),
-            after: false,
-            before: false,
-            kill_destination,
-            detached,
-        }) {
+        if let Err(error) = self.link_window_with_existing_target_index_map(
+            LinkWindowRequest {
+                source: source.clone(),
+                target: target.clone(),
+                after: false,
+                before: false,
+                kill_destination,
+                // Selection happens after the moved winlink's alert flags are
+                // installed, matching the atomic same-session move path.
+                detached: true,
+            },
+            target_group_index_map,
+        ) {
             self.restore_linked_window_move_state(
                 &source_session_name,
                 previous_source_session,
@@ -759,9 +752,17 @@ impl HandlerState {
                 previous_auto_named_windows,
                 previous_window_link_slots,
                 previous_window_link_groups,
+                previous_window_link_occurrences,
             )?;
             return Err(error);
         }
+        replace_winlink_alert_flags(
+            self.sessions
+                .session_mut(&target_session_name)
+                .expect("validated linked move target session exists"),
+            target.window_index(),
+            source_alert_flags,
+        );
 
         self.hooks.move_window_hooks(&source, &target);
 
@@ -804,8 +805,17 @@ impl HandlerState {
                 previous_auto_named_windows,
                 previous_window_link_slots,
                 previous_window_link_groups,
+                previous_window_link_occurrences,
             )?;
             return Err(error);
+        }
+
+        if let Some(occurrence_id) = source_occurrence_id {
+            self.set_window_link_occurrence_id(
+                &target_session_name,
+                target.window_index(),
+                occurrence_id,
+            );
         }
 
         if !detached {
@@ -843,6 +853,7 @@ impl HandlerState {
         previous_auto_named_windows: HashSet<(SessionName, u32)>,
         previous_window_link_slots: HashMap<WindowLinkSlot, u64>,
         previous_window_link_groups: HashMap<u64, WindowLinkGroup>,
+        previous_window_link_occurrences: HashMap<WindowLinkSlot, WindowLinkOccurrenceId>,
     ) -> Result<(), RmuxError> {
         self.replace_two_sessions(
             source_session_name,
@@ -856,6 +867,7 @@ impl HandlerState {
         self.auto_named_windows = previous_auto_named_windows;
         self.window_link_slots = previous_window_link_slots;
         self.window_link_groups = previous_window_link_groups;
+        self.window_link_occurrences = previous_window_link_occurrences;
         Ok(())
     }
 
@@ -906,5 +918,12 @@ impl HandlerState {
             previous_target_session,
         )?;
         self.resize_two_sessions(source_session_name, target_session_name)
+    }
+}
+
+fn replace_winlink_alert_flags(session: &mut Session, window_index: u32, flags: AlertFlags) {
+    let _ = session.clear_all_winlink_alert_flags(window_index);
+    if !flags.is_empty() {
+        let _ = session.add_winlink_alert_flags(window_index, flags);
     }
 }

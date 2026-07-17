@@ -32,6 +32,14 @@ impl AttachedSession {
         Self::spawn_configured(harness, session_name, size, |_| {})
     }
 
+    pub(crate) fn spawn_command(
+        harness: &CliHarness,
+        args: &[&str],
+        size: TerminalSize,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_command_configured(harness, args, size, |_| {})
+    }
+
     pub(crate) fn spawn_with_env(
         harness: &CliHarness,
         session_name: &str,
@@ -54,6 +62,19 @@ impl AttachedSession {
     where
         F: FnOnce(&mut Command),
     {
+        let args = ["attach-session", "-t", session_name];
+        Self::spawn_command_configured(harness, &args, size, configure)
+    }
+
+    fn spawn_command_configured<F>(
+        harness: &CliHarness,
+        args: &[&str],
+        size: TerminalSize,
+        configure: F,
+    ) -> Result<Self, Box<dyn Error>>
+    where
+        F: FnOnce(&mut Command),
+    {
         let pty = PtyPair::open_with_size(size)?;
         let master = File::from(pty.master().try_clone()?.into_owned_fd()?);
         let terminal = File::from(pty.slave().try_clone()?.into_owned_fd());
@@ -61,7 +82,7 @@ impl AttachedSession {
 
         let mut attach = harness.base_command();
         attach
-            .args(["attach-session", "-t", session_name])
+            .args(args)
             .stdin(Stdio::from(pty.slave().try_clone()?.into_owned_fd()))
             .stdout(Stdio::from(pty.slave().try_clone()?.into_owned_fd()))
             .stderr(Stdio::from(pty.slave().try_clone()?.into_owned_fd()));
@@ -141,7 +162,7 @@ impl Drop for AttachedSession {
     }
 }
 
-fn prepare_canonical_termios<Fd>(fd: &Fd) -> Result<Termios, Box<dyn Error>>
+pub(crate) fn prepare_canonical_termios<Fd>(fd: &Fd) -> Result<Termios, Box<dyn Error>>
 where
     Fd: std::os::fd::AsFd,
 {
@@ -296,7 +317,7 @@ pub(crate) fn read_until_contains_all(
     .into())
 }
 
-fn assert_termios_eq(expected: &Termios, actual: &Termios) {
+pub(crate) fn assert_termios_eq(expected: &Termios, actual: &Termios) {
     assert_eq!(actual.input_modes, expected.input_modes);
     assert_eq!(actual.output_modes, expected.output_modes);
     assert_eq!(actual.control_modes, expected.control_modes);

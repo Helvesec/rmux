@@ -41,6 +41,12 @@ fn current_process_command_name_is_available() {
 }
 
 #[test]
+fn current_process_executable_path_is_available() {
+    let path = executable_path(std::process::id()).expect("current process exe should be visible");
+    assert!(!path.is_empty());
+}
+
+#[test]
 fn current_process_environment_is_available() {
     let environment =
         environment(std::process::id()).expect("current process environment should be visible");
@@ -160,6 +166,25 @@ fn parses_nul_separated_environment() {
 
     assert_eq!(environment.get("A").map(String::as_str), Some("1"));
     assert_eq!(environment.get("B").map(String::as_str), Some("two"));
+}
+
+#[test]
+fn utf8_environment_snapshot_skips_only_unrepresentable_entries() {
+    let environment = environment_from_nul_entries(
+        b"PATH=/client/bin\0BAD=foo\xffbar\0MALFORMED\0HOME=/client/home\0\0",
+    )
+    .expect("valid environment entries should remain available");
+
+    assert_eq!(
+        environment.get("PATH").map(String::as_str),
+        Some("/client/bin")
+    );
+    assert_eq!(
+        environment.get("HOME").map(String::as_str),
+        Some("/client/home")
+    );
+    assert_eq!(environment.get("BAD"), None);
+    assert_eq!(environment.get("MALFORMED"), None);
 }
 
 #[cfg(unix)]

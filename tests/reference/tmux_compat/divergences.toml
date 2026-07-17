@@ -1,0 +1,302 @@
+schema = 1
+
+[policy]
+oracle = "tmux 3.7b"
+unlisted_divergences_are_bugs = true
+
+[[entry]]
+id = "C-D1"
+summary = "The pinned tmux binary is the blocking compatibility oracle"
+inventory = "none"
+evidence = ["tests/reference/tmux_compat/frozen_reference.yaml", "tests/common/tmux_compat.rs"]
+
+[[entry]]
+id = "C-D2"
+summary = "Oracle source changes require an explicit repin"
+inventory = "none"
+evidence = ["scripts/oracle/build-tmux37.sh"]
+
+[[entry]]
+id = "C-D10"
+summary = "Measured binary behavior takes precedence over prose descriptions"
+inventory = "none"
+evidence = ["tests/common/tmux_compat.rs"]
+
+[[entry]]
+id = "C-D11"
+summary = "Detached RPC peers must use the exact wire version"
+inventory = "bounded"
+evidence = ["crates/rmux-proto/src/codec/tests.rs", "crates/rmux-proto/src/capabilities.rs", "scripts/fuzz/fuzz_targets/detached_frame_decoder.rs", "crates/rmux-server/src/listener/legacy_shutdown.rs"]
+
+[[entry]]
+id = "C-D12"
+summary = "Armed SDK waits cancel through a second best-effort transport"
+inventory = "bounded"
+evidence = ["crates/rmux-sdk/tests/armed_wait.rs", "crates/rmux-sdk/src/wait.rs"]
+
+[[entry]]
+id = "C-D13"
+summary = "Windows status-right defaults to host_short"
+inventory = "bounded"
+evidence = ["crates/rmux-core/src/options/tests/effects_defaults.rs", "crates/rmux-server/src/handler_attach_tests/attach_render.rs"]
+
+[[entry]]
+id = "C-D32"
+summary = "Floating panes and new-pane are not implemented"
+inventory = "deferred"
+evidence = ["crates/rmux-core/src/command_inventory/signatures.rs"]
+deferred = ["floating-pane", "new-pane"]
+
+[[entry]]
+id = "C-D33"
+summary = "Scrollbar flags are accepted without rendering a scrollbar"
+inventory = "deferred"
+evidence = ["src/cli_args_tests/pane_io.rs"]
+
+[[entry]]
+id = "C-D34"
+summary = "Copy-mode line-number options do not render a gutter"
+inventory = "deferred"
+evidence = ["crates/rmux-core/src/options/tests/registry_metadata.rs"]
+accepted_options = ["copy-mode-line-numbers"]
+limitations = ["line-number-gutter-rendering"]
+
+[[entry]]
+id = "C-D35"
+summary = "Invalid capture-pane bounds are rejected"
+inventory = "bounded"
+evidence = ["tests/capture.rs", "tests/cli_surface.rs"]
+
+[[entry]]
+id = "C-D36"
+summary = "A trailing bare format marker remains literal"
+inventory = "bounded"
+tests = ["crates/rmux-core/src/formats/tests/transformations.rs::trailing_bare_hash_is_literal_product_divergence"]
+
+[[entry]]
+id = "C-D37"
+summary = "Float comparison expressions render integer booleans"
+inventory = "bounded"
+tests = ["crates/rmux-core/src/formats/tests/operators.rs::float_comparisons_render_integer_booleans_product_divergence"]
+
+[[entry]]
+id = "C-D38"
+summary = "Expression operands permit surrounding spaces"
+inventory = "bounded"
+tests = ["crates/rmux-core/src/formats/tests/operators.rs::expression_operands_trim_spaces_product_divergence"]
+
+[[entry]]
+id = "C-D39"
+summary = "Unsupported split-window extension flags are rejected"
+inventory = "deferred"
+evidence = ["src/cli_args_tests/surface_docs.rs"]
+
+[[entry]]
+id = "C-D41"
+summary = "Unsupported refresh-client subscription flags are rejected"
+inventory = "deferred"
+evidence = ["src/cli_args_tests/surface_docs.rs", "crates/rmux-server/src/handler_scripting_tests/source_file_core.rs"]
+
+[[entry]]
+id = "C-D44"
+summary = "Asynchronous run-shell hooks are not drained after daemon shutdown"
+inventory = "bounded"
+evidence = ["tests/scripting.rs"]
+
+[[entry]]
+id = "C-D45"
+summary = "Startup config messages may not reach the first attached client"
+inventory = "bounded"
+evidence = ["crates/rmux-server/src/handler_scripting_tests/source_file_core.rs"]
+
+[[entry]]
+id = "C-D46"
+summary = "Bare mouse targets outside mouse events use RMUX diagnostics"
+inventory = "bounded"
+evidence = ["tests/acceptance_target_format_matrix.rs"]
+
+[[entry]]
+id = "C-D47"
+summary = "Last-window CLI fallback preserves SDK error semantics"
+inventory = "bounded"
+evidence = ["crates/rmux-sdk/src/handles/window.rs", "tests/scripting.rs"]
+
+[[entry]]
+id = "C-D48"
+summary = "Queued attach exits omit tmux terminal banners"
+inventory = "bounded"
+evidence = ["tests/cli_attach_flow.rs"]
+
+[[entry]]
+id = "C-D49"
+summary = "Undefined expression arithmetic has deterministic output"
+inventory = "bounded"
+evidence = ["crates/rmux-core/src/formats/tests/operators.rs", "tests/display_message.rs"]
+
+[[entry]]
+id = "C-D50"
+summary = "OSC colour queries return only application-set values"
+inventory = "bounded"
+tests = ["crates/rmux-core/src/input/tests/osc_dcs_misc.rs::osc_11_set_then_query_round_trips_product_divergence"]
+
+[[entry]]
+id = "C-D51"
+summary = "Windows bracketed paste is inferred from bounded console bursts"
+inventory = "bounded"
+evidence = ["crates/rmux-client/src/attach_windows/input.rs", "tests/windows_nested_mouse_issue96.rs", "crates/rmux-server/src/handler_send_keys_tests/live_attach.rs", "tests/windows_prompt_overlay_chain.rs"]
+
+[[entry]]
+id = "C-D52"
+summary = "Windows OSC 52 emission depends on attach and host capabilities"
+inventory = "bounded"
+evidence = ["crates/rmux-server/src/outer_terminal/tests.rs", "src/client_terminal.rs", "crates/rmux-server/src/handler_client_runtime.rs", "crates/rmux-server/src/pane_io/reader.rs", "crates/rmux-server/src/handler_alert_tests.rs"]
+
+[[entry]]
+id = "C-D53"
+summary = "Variable-length terminal controls use a streaming idle budget"
+inventory = "bounded"
+evidence = ["crates/rmux-server/src/pane_io/pending_escape.rs", "crates/rmux-server/src/pane_io/tests.rs"]
+
+[[entry]]
+id = "C-D54"
+summary = "Control EOF closes transport while finite queued work drains"
+inventory = "bounded"
+evidence = ["tests/tmux_compat_surface_matrix/client_control.rs"]
+tests = [
+  "crates/rmux-server/src/control/tests.rs::eof_closes_transport_while_finite_control_queue_continues_product_divergence",
+  "crates/rmux-server/src/control/tests.rs::eof_preserves_active_if_shell_when_wait_is_only_in_unselected_branch_product_divergence",
+  "crates/rmux-server/src/control/tests.rs::eof_queued_if_shell_cancels_only_a_selected_wait_frame_product_divergence",
+  "crates/rmux-server/src/control/tests.rs::eof_queue_skips_parse_errors_and_blocking_frames_before_later_finite_frame_product_divergence",
+  "crates/rmux-server/src/control/tests.rs::eof_after_deferred_exit_with_removed_registration_finishes_only_active_frame_product_divergence",
+  "crates/rmux-server/src/control/tests.rs::external_shutdown_cancels_finite_eof_queue_drain_product_divergence",
+  "crates/rmux-server/src/control/tests.rs::eof_drains_finite_queue_through_kill_server_product_divergence",
+  "crates/rmux-server/src/control/tests.rs::eof_queue_lease_blocks_same_pid_registration_and_preserves_permissions_product_divergence",
+]
+
+[[entry]]
+id = "C-D55"
+summary = "Malformed mouse and timed-out paste fragments fail closed"
+inventory = "bounded"
+evidence = ["crates/rmux-server/src/input_keys/tests.rs", "crates/rmux-server/src/handler_send_keys_tests/attached_input_bounds.rs", "crates/rmux-server/src/handler_pane/attached_input/bracketed_paste.rs"]
+
+[[entry]]
+id = "C-D56"
+summary = "Source files normalize CRLF and lone CR before lexing"
+inventory = "bounded"
+evidence = ["tests/acceptance_source_config_matrix.rs", "crates/rmux-server/src/handler_scripting_tests/source_file_core.rs"]
+
+[[entry]]
+id = "C-D57"
+summary = "XTVERSION identifies RMUX"
+inventory = "bounded"
+tests = ["crates/rmux-core/src/input/tests/csi_modes.rs::csi_xtversion_reports_rmux_identity_product_divergence"]
+
+[[entry]]
+id = "C-D59"
+summary = "Rejected grouped-alias mutations are transactional"
+inventory = "bounded"
+tests = [
+  "crates/rmux-server/src/handler_window_tests/relative_group_transactions.rs::relative_move_between_group_aliases_is_atomic_product_divergence",
+  "crates/rmux-server/src/handler_window_tests/relative_group_transactions.rs::relative_link_between_group_aliases_is_atomic_product_divergence",
+]
+
+[[entry]]
+id = "C-D60"
+summary = "Oversized bracketed paste is split into bounded envelopes"
+inventory = "bounded"
+tests = ["crates/rmux-server/src/handler_send_keys_tests/bracketed_paste_large.rs::live_attach_over_limit_bracketed_mode_uses_bounded_envelopes_product_divergence"]
+
+[[entry]]
+id = "C-D61"
+summary = "Status truncation preserves complete grapheme clusters"
+inventory = "bounded"
+tests = ["crates/rmux-server/src/renderer/tests.rs::status_component_limit_keeps_a_zwj_grapheme_whole_product_divergence"]
+
+[[entry]]
+id = "C-D62"
+summary = "Parse-time assignments may precede a command alias"
+inventory = "bounded"
+tests = [
+  "tests/acceptance_cli_matrix.rs::cold_start_assignment_before_builtin_preserves_later_config_alias_product_divergence",
+  "tests/cli_surface.rs::runtime_alias_fallback_preserves_assignment_before_alias_product_divergence",
+]
+
+[[entry]]
+id = "C-D63"
+summary = "Last-window moves preserve the removed session close hook"
+inventory = "bounded"
+tests = ["crates/rmux-server/src/handler_environment_hook_tests.rs::move_window_last_source_session_preserves_local_closed_hook_product_divergence"]
+
+[[entry]]
+id = "C-D64"
+summary = "Stable pane kills remove only the addressed grouped alias"
+inventory = "bounded"
+tests = ["crates/rmux-server/src/handler_pane_family_lifecycle_tests.rs::pane_id_grouped_last_pane_removes_only_addressed_alias_product_divergence"]
+
+[[entry]]
+id = "C-D65"
+summary = "set-hook validates targets and rejects ignored mutations"
+inventory = "bounded"
+tests = [
+  "tests/scripting.rs::set_hook_run_immediately_missing_target_errors_product_divergence",
+  "tests/scripting.rs::set_hook_run_immediately_rejects_ignored_mutations_product_divergence",
+  "tests/scripting.rs::set_hook_global_target_is_still_resolved_product_divergence",
+]
+
+[[entry]]
+id = "C-D66"
+summary = "Cold-start configuration aliases apply to the first command"
+inventory = "bounded"
+tests = ["tests/acceptance_cli_matrix.rs::cold_start_config_alias_applies_to_first_builtin_product_divergence"]
+
+[[entry]]
+id = "C-D67"
+summary = "Rejected runtime aliases do not commit parse-time assignments"
+inventory = "bounded"
+tests = ["tests/acceptance_cli_matrix.rs::invalid_runtime_alias_does_not_apply_parse_time_assignments_product_divergence"]
+
+[[entry]]
+id = "C-D68"
+summary = "server-access omits the rejected target flag"
+inventory = "bounded"
+tests = ["tests/cli_surface.rs::server_access_inventory_omits_dead_target_flag_product_divergence"]
+
+[[entry]]
+id = "C-D69"
+summary = "Full-suffix character insertion remains meaningful after reflow"
+inventory = "bounded"
+tests = ["crates/rmux-core/src/screen/tests.rs::insert_character_full_suffix_clears_requested_cells_product_divergence"]
+
+[[entry]]
+id = "C-D70"
+summary = "Main-screen resize retains bounded reflow state"
+inventory = "bounded"
+tests = [
+  "crates/rmux-core/src/screen/tests.rs::width_resize_keeps_cursor_content_visible_when_only_empty_tail_rows_move_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::zero_history_reflow_overflow_never_becomes_scrollable_history_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::reflow_overflow_capacity_freezes_on_normal_output_after_growth_product_divergence",
+]
+
+[[entry]]
+id = "C-D71"
+summary = "Alternate-screen resize preserves physical cursor state"
+inventory = "bounded"
+tests = [
+  "crates/rmux-core/src/screen/tests.rs::alternate_screen_width_resize_preserves_physical_cursor_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::alternate_screen_narrow_resize_clamps_cursor_with_pending_wrap_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::alternate_screen_resize_remaps_pending_wrap_by_physical_column_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::alternate_screen_width_and_height_resize_preserves_physical_cursor_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::alternate_screen_wide_reflow_preserves_physical_cursor_without_fragments_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::alternate_screen_full_viewport_truncates_each_hard_line_before_tail_rows_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::alternate_screen_resize_preserves_main_history_product_divergence",
+]
+
+[[entry]]
+id = "C-D72"
+summary = "Wide-cell insertion uses logical cell boundaries"
+inventory = "bounded"
+tests = [
+  "crates/rmux-core/src/screen/tests.rs::insert_character_on_wide_padding_uses_the_next_logical_boundary_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::insert_mode_on_wide_padding_preserves_valid_cells_product_divergence",
+  "crates/rmux-core/src/screen/tests.rs::insert_mode_on_wide_padding_handles_edges_product_divergence",
+]

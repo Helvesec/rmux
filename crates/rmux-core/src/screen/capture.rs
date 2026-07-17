@@ -22,6 +22,12 @@ impl Screen {
         capture_grid_bytes(&self.grid, &self.hyperlinks, range, options)
     }
 
+    /// Captures tmux-style per-line format flags for the selected physical rows.
+    #[must_use]
+    pub fn capture_line_format_flags(&self, range: ScreenCaptureRange) -> Vec<u8> {
+        capture_grid_line_format_flags(&self.grid, range)
+    }
+
     /// Captures physical lines with each line rendered from a fresh ANSI state.
     ///
     /// This is intended for renderers that repaint individual terminal rows:
@@ -90,6 +96,14 @@ impl Screen {
             .as_ref()
             .map(|saved| capture_grid_bytes(&saved.grid, &self.hyperlinks, range, options))
     }
+
+    /// Captures tmux-style per-line format flags from the saved alternate screen.
+    #[must_use]
+    pub fn capture_saved_line_format_flags(&self, range: ScreenCaptureRange) -> Option<Vec<u8>> {
+        self.saved_grid
+            .as_ref()
+            .map(|saved| capture_grid_line_format_flags(&saved.grid, range))
+    }
 }
 
 fn capture_grid_lines_independent(
@@ -153,6 +167,26 @@ fn capture_grid_bytes(
         }
     }
     output
+}
+
+fn capture_grid_line_format_flags(grid: &Grid, range: ScreenCaptureRange) -> Vec<u8> {
+    let total_lines = grid.hsize() + usize::try_from(grid.sy()).unwrap_or(usize::MAX);
+    let Some(range) = resolve_screen_capture_range(range, grid.hsize(), total_lines) else {
+        return Vec::new();
+    };
+
+    let mut flags = Vec::new();
+    for absolute_y in range {
+        if grid.absolute_line(absolute_y).is_none() {
+            continue;
+        }
+        flags.push(if grid.absolute_line_wrapped(absolute_y).unwrap_or(false) {
+            b'W'
+        } else {
+            b'-'
+        });
+    }
+    flags
 }
 
 fn capture_capacity_hint(line_count: usize, line_width: usize) -> usize {

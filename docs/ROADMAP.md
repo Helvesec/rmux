@@ -11,8 +11,8 @@ item will land in a specific release.
 - A daemon-backed Rust SDK and Ratatui widget crate.
 - Web Share with local execution, a static browser frontend, and hybrid
   post-quantum end-to-end encryption.
-- Release and package-manager support for crates.io, GitHub Releases, APT, DNF,
-  Homebrew, Scoop, WinGet, and Chocolatey.
+- Release and package-manager support for GitHub Releases, APT, DNF, Homebrew,
+  Scoop, WinGet, Chocolatey, and public SDK crates on crates.io.
 
 ## Current Priorities
 

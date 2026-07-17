@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 #[path = "cli/alias_fallback.rs"]
 mod alias_fallback;
+#[path = "cli/attach_transport.rs"]
+mod attach_transport;
 #[path = "cli/automation/mod.rs"]
 mod automation;
 #[path = "cli/buffer_commands.rs"]
@@ -26,6 +28,8 @@ mod command_inventory;
 mod command_runner;
 #[path = "cli/config_commands.rs"]
 mod config_commands;
+#[path = "cli/control_mode_error.rs"]
+mod control_mode_error;
 #[path = "cli/diagnose.rs"]
 mod diagnose;
 #[path = "cli/dispatch.rs"]
@@ -69,18 +73,14 @@ mod web_share_display;
 #[path = "cli/window_commands.rs"]
 mod window_commands;
 
-use rmux_client::{
-    connect, ensure_server_running_with_config, resolve_socket_path,
-    resolve_tmux_compatible_socket_path, Connection,
-};
-
-use crate::cli_args::parse;
+use crate::cli_args::{parse, parse_with_runtime_command_groups, scan_top_level_command, Cli};
 use crate::cli_response::{expect_command_output, expect_command_success};
-use client_commands::{attach_with_connection, run_switch_client_on_connection};
+use attach_transport::{attach_with_connection, require_attach_terminal};
 use client_commands::{
     client_terminal_context_from_cli, optional_client_flags, run_control_mode, run_detach_client,
     run_list_clients, run_refresh_client, run_suspend_client, run_switch_client,
 };
+use client_commands::{run_switch_client_on_connection, validate_nested_attach_before_connect};
 #[cfg(test)]
 use command_inventory::render_list_commands_line;
 pub(crate) use command_runner::{
@@ -91,28 +91,38 @@ pub(crate) use command_runner::{
 use command_runner::{
     finish_command_success, unexpected_response, write_command_output, write_lines_output,
 };
-use dispatch::dispatch_command_queue;
+use control_mode_error::parse_failure as control_mode_parse_failure;
 #[cfg(test)]
-use dispatch::{command_has_start_server_flag, default_client_command};
-pub(crate) use error::ExitFailure;
+use dispatch::default_client_command;
+use dispatch::{command_has_start_server_flag, dispatch_command_queue};
+pub(crate) use error::{ExitFailure, ExitMessageTermination};
+use rmux_client::{
+    connect, ensure_server_running_with_config, ensure_server_running_with_config_outcome,
+    resolve_socket_path, resolve_tmux_compatible_socket_path, Connection,
+};
 use shell_startup::run_shell_startup;
 #[cfg(test)]
 use shell_startup::{same_file_identity_for_paths, usable_shell_path};
 #[cfg(test)]
 use startup::ServerStartupConfig;
-use startup::{run_foreground_server, startup_config_from_cli, StartupOptions};
+use startup::{
+    run_foreground_server, startup_config_from_cli, startup_config_from_top_level_scan,
+    PrestartedConnection, PrestartedServerConnection, StartupOptions,
+};
 use target_resolution::{
-    list_session_names, resolve_current_pane_target, resolve_current_session_target,
-    resolve_existing_window_target_or_current, resolve_pane_target_or_current,
-    resolve_pane_target_spec, resolve_session_listing_target, resolve_session_target_or_current,
-    resolve_session_target_spec, resolve_split_window_target_spec, resolve_target_spec,
+    list_session_names, listed_pane_index_matches_target, resolve_current_pane_target,
+    resolve_current_session_target, resolve_existing_window_target_or_current,
+    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_session_listing_target,
+    resolve_session_target_or_current, resolve_session_target_spec,
+    resolve_split_window_target_spec, resolve_target_spec,
     resolve_window_index_target_or_current_session, resolve_window_target_or_current,
     resolve_window_target_spec, response_name_for_target,
 };
 use terminal_size::{build_terminal_size, current_terminal_size};
 use top_level::{
-    accept_compatibility_options, infer_client_utf8_from_env, top_level_parse_failure,
-    top_level_version_output, top_level_version_requested, validate_top_level_invocation,
+    accept_compatibility_options, infer_client_utf8_from_env, scan_claude_top_level_invocation,
+    top_level_parse_failure, top_level_version_output, top_level_version_requested,
+    validate_claude_top_level_invocation, validate_top_level_invocation,
 };
 
 const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
@@ -132,6 +142,8 @@ where
             top_level_version_output(invoked_as_tmux(&args)),
         ));
     }
+    let claude_invocation = scan_claude_top_level_invocation(args.get(1..).unwrap_or(&[]));
+    validate_claude_top_level_invocation(claude_invocation.as_ref())?;
     if let Some(invocation) = claude_launcher::parse_internal_runner(args.get(1..).unwrap_or(&[])) {
         return claude_launcher::run_internal_runner(invocation);
     }
@@ -141,24 +153,55 @@ where
     if let Some(invocation) = tmux_dropin::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return tmux_dropin::run(invocation, args.first());
     }
-    if let Some(invocation) = claude_skill::parse_invocation(args.get(1..).unwrap_or(&[]))? {
-        return claude_skill::run(invocation);
-    }
-    if let Some(invocation) = claude_launcher::parse_invocation(args.get(1..).unwrap_or(&[])) {
-        return claude_launcher::run(invocation);
+    if let Some(claude_invocation) = claude_invocation {
+        if let Some(invocation) = claude_skill::parse_invocation(claude_invocation.arguments())? {
+            return claude_skill::run(invocation);
+        }
+        return claude_launcher::run(claude_launcher::ClaudeInvocation::new(
+            claude_invocation.into_arguments(),
+        ));
     }
     if let Some(invocation) = capabilities::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return capabilities::run(invocation);
     }
-    let mut cli = match parse(args.clone()) {
+    let runtime_resolution =
+        alias_fallback::runtime_command_resolution_for_invocation(&args, invoked_as_tmux(&args))?;
+    if let Some(alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(exit_code)) =
+        runtime_resolution.as_ref()
+    {
+        return Ok(*exit_code);
+    }
+    let parsed_cli = parse_with_runtime_resolution(&args, runtime_resolution.as_ref());
+    let mut startup_connection = None;
+    let mut cli = match parsed_cli {
         Ok(cli) => cli,
+        Err(error) if runtime_resolution.is_some() => {
+            let control_mode = scan_top_level_command(args.get(1..).unwrap_or(&[]))
+                .map_or(0, |scan| scan.control_mode);
+            if control_mode != 0 {
+                return Err(control_mode_parse_failure(error, control_mode));
+            }
+            return Err(ExitFailure::from_clap(error));
+        }
+        Err(error) if error.kind() == clap::error::ErrorKind::InvalidSubcommand => {
+            match parse_cold_alias_queue_after_startup(&args, error)? {
+                ColdAliasParseOutcome::NotApplicable(error) => {
+                    return parse_failure_or_absent_server(&args, error);
+                }
+                ColdAliasParseOutcome::Parsed(cold_cli, connection) => {
+                    startup_connection = Some(connection);
+                    *cold_cli
+                }
+                ColdAliasParseOutcome::Dispatched(exit_code) => return Ok(exit_code),
+            }
+        }
         Err(error) => return parse_failure_or_absent_server(&args, error),
     };
     cli.utf8 |= infer_client_utf8_from_env();
     let command_was_provided = cli.command.is_some();
     validate_top_level_invocation(&cli, command_was_provided)?;
     accept_compatibility_options(&cli);
-    let startup_config = startup_config_from_cli(&cli);
+    let mut startup_config = startup_config_from_cli(&cli);
 
     let socket_path = if invoked_as_tmux(&args) {
         resolve_tmux_compatible_socket_path(cli.socket_name(), cli.socket_path())
@@ -166,6 +209,56 @@ where
         resolve_socket_path(cli.socket_name(), cli.socket_path())
     }
     .map_err(ExitFailure::from_client)?;
+
+    if let Some(crate::cli_args::Command::AttachSession(args)) = cli.command.as_ref() {
+        validate_nested_attach_before_connect(args, &socket_path)?;
+    }
+
+    // A start-server command may create the daemon that loads command-alias
+    // definitions from `-f`. Resolve the original argv only after that config
+    // is ready, while retaining the startup connection so the empty daemon
+    // cannot exit between alias resolution and typed dispatch.
+    if startup_connection.is_none()
+        && runtime_resolution.is_none()
+        && cli.control_mode == 0
+        && !cli.no_fork
+        && !cli.no_start_server
+        && cli.shell_command.is_none()
+        && cli
+            .command
+            .as_ref()
+            .is_some_and(command_has_start_server_flag)
+    {
+        let outcome = ensure_server_running_with_config_outcome(
+            &socket_path,
+            startup_config.auto_start.clone(),
+        )
+        .map_err(ExitFailure::from_auto_start)
+        .map_err(|error| error.with_socket_context(&socket_path))?;
+        let connection = PrestartedConnection::new(outcome);
+        let cold_resolution = connection.with_connection_mut(|connection| {
+            alias_fallback::runtime_command_resolution_after_startup(
+                &args,
+                &socket_path,
+                connection,
+            )
+        })?;
+        startup_connection = Some(connection);
+        if let Some(alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(exit_code)) =
+            cold_resolution.as_ref()
+        {
+            return Ok(*exit_code);
+        }
+        if cold_resolution.is_some() {
+            cli = parse_with_runtime_resolution(&args, cold_resolution.as_ref())
+                .map_err(ExitFailure::from_clap)?;
+            cli.utf8 |= infer_client_utf8_from_env();
+            let command_was_provided = cli.command.is_some();
+            validate_top_level_invocation(&cli, command_was_provided)?;
+            accept_compatibility_options(&cli);
+            startup_config = startup_config_from_cli(&cli);
+        }
+    }
 
     if let Some(shell_command) = cli.shell_command.as_deref() {
         return run_shell_startup(
@@ -181,7 +274,8 @@ where
         return run_foreground_server(&socket_path, &startup_config);
     }
 
-    let startup = StartupOptions::new(cli.no_start_server, startup_config.auto_start);
+    let startup = StartupOptions::new(cli.no_start_server, startup_config.auto_start)
+        .with_prestarted_connection(startup_connection);
     if cli.control_mode != 0 {
         return run_control_mode(&cli, &socket_path, startup)
             .map_err(|error| error.with_socket_context(&socket_path));
@@ -190,6 +284,78 @@ where
     let commands = cli.into_command_queue();
     dispatch_command_queue(commands, &socket_path, startup, client_terminal)
         .map_err(|error| error.with_socket_context(&socket_path))
+}
+
+enum ColdAliasParseOutcome {
+    NotApplicable(clap::Error),
+    Parsed(Box<Cli>, PrestartedConnection),
+    Dispatched(i32),
+}
+
+fn parse_cold_alias_queue_after_startup(
+    args: &[OsString],
+    original_error: clap::Error,
+) -> Result<ColdAliasParseOutcome, ExitFailure> {
+    let Ok(scan) = scan_top_level_command(args.get(1..).unwrap_or(&[])) else {
+        return Ok(ColdAliasParseOutcome::NotApplicable(original_error));
+    };
+    if scan.control_mode != 0
+        || scan.no_fork
+        || scan.no_start_server
+        || scan.shell_command.is_some()
+    {
+        return Ok(ColdAliasParseOutcome::NotApplicable(original_error));
+    }
+    let Some(first_command) = alias_fallback::first_cold_start_command(args) else {
+        return Ok(ColdAliasParseOutcome::NotApplicable(original_error));
+    };
+    if !command_has_start_server_flag(&first_command) {
+        return Ok(ColdAliasParseOutcome::NotApplicable(original_error));
+    }
+
+    let socket_path = if invoked_as_tmux(args) {
+        resolve_tmux_compatible_socket_path(
+            scan.socket_name.as_deref(),
+            scan.socket_path.as_deref().map(Path::new),
+        )
+    } else {
+        resolve_socket_path(
+            scan.socket_name.as_deref(),
+            scan.socket_path.as_deref().map(Path::new),
+        )
+    }
+    .map_err(ExitFailure::from_client)?;
+    let startup_config = startup_config_from_top_level_scan(&scan, &first_command);
+    let outcome =
+        ensure_server_running_with_config_outcome(&socket_path, startup_config.auto_start)
+            .map_err(ExitFailure::from_auto_start)
+            .map_err(|error| error.with_socket_context(&socket_path))?;
+    let connection = PrestartedConnection::new(outcome);
+    let resolution = connection.with_connection_mut(|connection| {
+        alias_fallback::runtime_command_resolution_after_startup(args, &socket_path, connection)
+    })?;
+    let Some(resolution) = resolution else {
+        return Err(ExitFailure::from_clap(original_error));
+    };
+    if let alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(exit_code) = resolution {
+        return Ok(ColdAliasParseOutcome::Dispatched(exit_code));
+    }
+    let cli =
+        parse_with_runtime_resolution(args, Some(&resolution)).map_err(ExitFailure::from_clap)?;
+    Ok(ColdAliasParseOutcome::Parsed(Box::new(cli), connection))
+}
+
+fn parse_with_runtime_resolution(
+    args: &[OsString],
+    resolution: Option<&alias_fallback::RuntimeCommandResolution>,
+) -> Result<Cli, clap::Error> {
+    match resolution {
+        Some(alias_fallback::RuntimeCommandResolution::Canonical(groups)) => {
+            parse_with_runtime_command_groups(args.to_vec(), groups)
+        }
+        Some(alias_fallback::RuntimeCommandResolution::LegacyDirect) | None => parse(args.to_vec()),
+        Some(alias_fallback::RuntimeCommandResolution::LegacyServerDispatch(_)) => unreachable!(),
+    }
 }
 
 fn invoked_as_tmux(args: &[OsString]) -> bool {
@@ -348,6 +514,41 @@ fn connect_with_startserver(
     }
 }
 
+impl PrestartedServerConnection {
+    fn into_connection(self) -> Connection {
+        self.connection
+    }
+}
+
+fn connect_with_startserver_outcome(
+    socket_path: &Path,
+    startup: StartupOptions,
+) -> Result<PrestartedServerConnection, ExitFailure> {
+    if startup.no_start_server {
+        let connection = connect(socket_path)
+            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+        Ok(PrestartedServerConnection {
+            connection,
+            provenance: rmux_client::ServerConnectionProvenance::JoinedExisting,
+        })
+    } else {
+        if let Some(prestarted) = startup
+            .prestarted_connection
+            .as_ref()
+            .and_then(PrestartedConnection::take)
+        {
+            return Ok(prestarted);
+        }
+        let outcome = ensure_server_running_with_config_outcome(socket_path, startup.config)
+            .map_err(ExitFailure::from_auto_start)?;
+        let provenance = outcome.provenance();
+        Ok(PrestartedServerConnection {
+            connection: outcome.into_connection(),
+            provenance,
+        })
+    }
+}
+
 fn shell_command_text(command: Vec<String>) -> String {
     if command.len() == 1 {
         return command.into_iter().next().expect("single shell token");
@@ -367,7 +568,7 @@ fn shell_command_token(token: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        command_has_start_server_flag, default_client_command, render_list_commands_line,
+        command_has_start_server_flag, default_client_command, render_list_commands_line, run,
         same_file_identity_for_paths, startup_config_from_cli, top_level_parse_failure,
         usable_shell_path, ServerStartupConfig,
     };
@@ -447,6 +648,63 @@ mod tests {
     fn top_level_preparse_does_not_parse_option_values_as_flags() {
         assert!(top_level_parse_failure(&args(&["-L", "-h", "list-sessions",])).is_none());
         assert!(top_level_parse_failure(&args(&["-Lhas-h", "list-sessions"])).is_none());
+    }
+
+    #[test]
+    fn claude_dispatch_rejects_top_level_modes_it_cannot_honor() {
+        for flag in ["-h", "-V"] {
+            let exit = run(args(&["rmux", flag, "claude"]))
+                .expect_err("top-level display option exits before extension dispatch");
+            assert_eq!(exit.exit_code(), 0, "{flag}");
+            assert!(
+                !exit.message().contains("not supported by the managed"),
+                "{flag} keeps top-level priority"
+            );
+        }
+
+        for values in [
+            &["rmux", "-D", "claude"][..],
+            &["rmux", "-c", "echo ignored", "claude", "install-skill"][..],
+            &["rmux", "-cecho ignored", "claude"][..],
+            &["rmux", "-u", "-D", "-N", "claude"][..],
+        ] {
+            let error = run(args(values)).expect_err("managed launcher mode must be rejected");
+            assert_eq!(error.exit_code(), 1, "{values:?}");
+            assert!(
+                error.message().contains("usage: rmux"),
+                "the scanner must reject the mode before external dispatch: {values:?}"
+            );
+        }
+
+        let no_start = run(args(&["rmux", "-N", "claude"]))
+            .expect_err("-N must not silently start a private server");
+        assert!(no_start.message().contains("-N is incompatible"));
+
+        let control = run(args(&["rmux", "-C", "claude"]))
+            .expect_err("-C must not silently launch an attached client");
+        assert!(control.message().contains("-C control mode"));
+
+        for (values, option) in [
+            (&["rmux", "-2", "claude"][..], "-2"),
+            (&["rmux", "-f", "config", "claude"][..], "-f"),
+            (&["rmux", "-f", "--unknown", "claude"][..], "-f"),
+            (&["rmux", "-l", "claude"][..], "-l"),
+            (&["rmux", "-Ldemo", "claude"][..], "-L"),
+            (&["rmux", "-S/path", "claude"][..], "-S"),
+            (&["rmux", "-TRGB", "claude"][..], "-T"),
+            (&["rmux", "-u", "claude"][..], "-u"),
+            (&["rmux", "-v", "claude"][..], "-v"),
+            (&["rmux", "-v", "-fconfig", "claude"][..], "-f"),
+            (&["rmux", "-u", "-v", "-fconfig", "claude"][..], "-f"),
+            (&["rmux", "-v", "-Ldemo", "claude"][..], "-L"),
+            (&["rmux", "-L", "-f", "claude"][..], "-L"),
+        ] {
+            let error = run(args(values)).expect_err("ignored option must be rejected");
+            assert!(
+                error.message().contains(option),
+                "diagnostic must name {option}: {error:?}"
+            );
+        }
     }
 
     #[test]

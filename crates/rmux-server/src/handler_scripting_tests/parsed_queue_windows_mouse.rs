@@ -155,7 +155,7 @@ async fn parsed_queue_select_pane_style_sets_target_style_and_selects_it() {
     ));
 
     let parsed = CommandParser::new()
-        .parse("select-pane -t alpha:0.1 -P fg=blue,bg=red")
+        .parse("select-pane -talpha:0.1 -Pfg=blue,bg=red")
         .expect("command parses");
     handler
         .execute_parsed_commands(
@@ -166,7 +166,7 @@ async fn parsed_queue_select_pane_style_sets_target_style_and_selects_it() {
             ))),
         )
         .await
-        .expect("select-pane -P should execute");
+        .expect("compact select-pane -P should execute");
 
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");

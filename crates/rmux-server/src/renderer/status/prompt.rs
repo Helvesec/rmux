@@ -1,6 +1,6 @@
 use rmux_core::{
-    text_width as tmux_text_width, truncate_to_width as tmux_truncate_to_width, OptionStore,
-    Session, Utf8Config,
+    text_width as tmux_text_width, truncate_right_to_width as tmux_truncate_right_to_width,
+    truncate_to_width as tmux_truncate_to_width, OptionStore, Session, Utf8Config,
 };
 use rmux_proto::OptionName;
 
@@ -86,16 +86,12 @@ fn prompt_visible_input(
     let input_width = width.saturating_sub(1);
     let cursor = cursor.min(input.chars().count());
     let cursor_byte = byte_index_for_char(input, cursor);
-    let mut start_byte = 0;
-    while tmux_text_width(&input[start_byte..cursor_byte], utf8_config) > input_width {
-        let Some((offset, _)) = input[start_byte..].char_indices().nth(1) else {
-            break;
-        };
-        start_byte += offset;
-    }
-
-    let cursor_x = tmux_text_width(&input[start_byte..cursor_byte], utf8_config).min(input_width);
-    let text = tmux_truncate_to_width(&input[start_byte..], input_width, utf8_config);
+    let visible_prefix =
+        tmux_truncate_right_to_width(&input[..cursor_byte], input_width, utf8_config);
+    let cursor_x = tmux_text_width(&visible_prefix, utf8_config).min(input_width);
+    let mut visible_input = visible_prefix;
+    visible_input.push_str(&input[cursor_byte..]);
+    let text = tmux_truncate_to_width(&visible_input, input_width, utf8_config);
     PromptVisibleInput { text, cursor_x }
 }
 
@@ -123,6 +119,22 @@ mod tests {
         let visible = prompt_visible_input("abcdef", 3, 8, &Utf8Config::default());
 
         assert_eq!(visible.text, "abcdef");
+        assert_eq!(visible.cursor_x, 3);
+    }
+
+    #[test]
+    fn prompt_visible_input_keeps_wide_tail_cells_whole() {
+        let visible = prompt_visible_input("A表B", 3, 4, &Utf8Config::default());
+
+        assert_eq!(visible.text, "表B");
+        assert_eq!(visible.cursor_x, 3);
+    }
+
+    #[test]
+    fn prompt_visible_input_keeps_zwj_tail_cells_whole() {
+        let visible = prompt_visible_input("A👨\u{200D}👩B", 5, 4, &Utf8Config::default());
+
+        assert_eq!(visible.text, "👨\u{200D}👩B");
         assert_eq!(visible.cursor_x, 3);
     }
 }

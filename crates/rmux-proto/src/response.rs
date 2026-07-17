@@ -36,13 +36,18 @@ pub use window::{
 #[path = "response/pane.rs"]
 mod pane;
 pub use pane::{
-    BreakPaneResponse, DisplayPanesResponse, JoinPaneResponse, KillPaneResponse, LastPaneResponse,
-    ListPanesResponse, MovePaneResponse, PaneBroadcastInputFailure, PaneBroadcastInputResponse,
-    PaneBroadcastInputSuccess, PaneOutputCursor, PaneOutputCursorResponse, PaneOutputEvent,
+    BreakPaneResponse, DisplayPanesResponse, ForegroundFieldSource, ForegroundSourcesDto,
+    ForegroundStateDto, JoinPaneResponse, KillPaneResponse, LastPaneResponse, ListPanesResponse,
+    MovePaneResponse, PaneBroadcastInputFailure, PaneBroadcastInputResponse,
+    PaneBroadcastInputSuccess, PaneForegroundStateResponse, PaneOptionEntry, PaneOptionGetResponse,
+    PaneOptionSetResponse, PaneOutputCursor, PaneOutputCursorResponse, PaneOutputEvent,
     PaneOutputLagNotice, PaneOutputLagResponse, PaneRecentOutput, PaneSnapshotCell,
-    PaneSnapshotCursor, PaneSnapshotResponse, PipePaneResponse, ResizePaneResponse,
-    RespawnPaneResponse, SelectPaneResponse, SendKeysResponse, SplitWindowResponse,
-    SubscribePaneOutputResponse, SwapPaneResponse, UnsubscribePaneOutputResponse,
+    PaneSnapshotCursor, PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorResponse,
+    PaneStateEventDto, PaneStateLagResponse, PaneStateSnapshot, PipePaneResponse,
+    ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse, SendKeysResponse,
+    SplitWindowIdentityResponse, SplitWindowResponse, SubscribePaneOutputResponse,
+    SubscribePaneStateResponse, SwapPaneResponse, UnsubscribePaneOutputResponse,
+    UnsubscribePaneStateResponse,
 };
 
 #[path = "response/client.rs"]
@@ -265,6 +270,22 @@ pub enum Response {
     ShutdownIfIdle(ShutdownIfIdleResponse),
     /// Success payload for browser-visible pane sharing.
     WebShare(Box<WebShareResponse>),
+    /// Success payload for SDK pane option mutation.
+    PaneOptionSet(Box<PaneOptionSetResponse>),
+    /// Success payload for SDK pane option lookup.
+    PaneOptionGet(PaneOptionGetResponse),
+    /// Success payload for SDK pane-state subscription.
+    SubscribePaneState(Box<SubscribePaneStateResponse>),
+    /// Success payload for SDK pane-state cursor.
+    PaneStateCursor(PaneStateCursorResponse),
+    /// Lag notice for SDK pane-state cursor.
+    PaneStateLag(Box<PaneStateLagResponse>),
+    /// Success payload for SDK pane-state unsubscription.
+    UnsubscribePaneState(UnsubscribePaneStateResponse),
+    /// Success payload for SDK pane foreground-state lookup.
+    PaneForegroundState(Box<PaneForegroundStateResponse>),
+    /// Atomic visible and stable identity returned by an SDK split.
+    SplitWindowIdentity(SplitWindowIdentityResponse),
 }
 
 impl Response {
@@ -289,7 +310,7 @@ impl Response {
             Self::MoveWindow(_) => "move-window",
             Self::SwapWindow(_) => "swap-window",
             Self::RotateWindow(_) => "rotate-window",
-            Self::SplitWindow(_) => "split-window",
+            Self::SplitWindow(_) | Self::SplitWindowIdentity(_) => "split-window",
             Self::SwapPane(_) => "swap-pane",
             Self::LastPane(_) => "last-pane",
             Self::JoinPane(_) => "join-pane",
@@ -358,6 +379,13 @@ impl Response {
             Self::SdkWaitForOutput(_) => "sdk-wait-output",
             Self::CancelSdkWait(_) => "cancel-sdk-wait",
             Self::PaneBroadcastInput(_) => "send-keys",
+            Self::PaneOptionSet(_) => "pane-option-set",
+            Self::PaneOptionGet(_) => "pane-option-get",
+            Self::SubscribePaneState(_) => "subscribe-pane-state",
+            Self::PaneStateCursor(_) => "pane-state-cursor",
+            Self::PaneStateLag(_) => "pane-state-lag",
+            Self::UnsubscribePaneState(_) => "unsubscribe-pane-state",
+            Self::PaneForegroundState(_) => "pane-foreground-state",
             Self::CreateSessionLease(_) => "create-session-lease",
             Self::RenewSessionLease(_) => "renew-session-lease",
             Self::ReleaseSessionLease(_) => "release-session-lease",
@@ -413,6 +441,14 @@ impl Response {
             | Self::SdkWaitForOutput(_)
             | Self::CancelSdkWait(_)
             | Self::PaneBroadcastInput(_)
+            | Self::PaneOptionSet(_)
+            | Self::PaneOptionGet(_)
+            | Self::SubscribePaneState(_)
+            | Self::PaneStateCursor(_)
+            | Self::PaneStateLag(_)
+            | Self::UnsubscribePaneState(_)
+            | Self::PaneForegroundState(_)
+            | Self::SplitWindowIdentity(_)
             | Self::CreateSessionLease(_)
             | Self::RenewSessionLease(_)
             | Self::ReleaseSessionLease(_)
@@ -754,14 +790,8 @@ where
     match seq.next_element::<T>() {
         Ok(Some(value)) => Ok(value),
         Ok(None) => Ok(T::default()),
-        Err(error) if is_truncated_compat_sequence(&error) => Ok(T::default()),
         Err(error) => Err(error),
     }
-}
-
-fn is_truncated_compat_sequence(error: &impl std::fmt::Display) -> bool {
-    let message = error.to_string();
-    message.contains("UnexpectedEof") || message.contains("unexpected end of file")
 }
 
 /// Response payload for `if-shell`.
@@ -794,13 +824,14 @@ impl IfShellResponse {
 }
 
 /// Response payload for `source-file`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SourceFileResponse {
     /// Verbose parsed-command output, when requested.
     pub output: Option<CommandOutput>,
     /// Exit status surfaced by a nested foreground command.
-    #[serde(default)]
     pub exit_status: Option<i32>,
+    /// File-loading diagnostics that tmux writes to stderr.
+    pub stderr: Vec<u8>,
 }
 
 impl SourceFileResponse {
@@ -809,6 +840,7 @@ impl SourceFileResponse {
     pub const fn no_output() -> Self {
         Self {
             output: None,
+            stderr: Vec::new(),
             exit_status: None,
         }
     }
@@ -818,6 +850,7 @@ impl SourceFileResponse {
     pub fn from_output(output: CommandOutput) -> Self {
         Self {
             output: Some(output),
+            stderr: Vec::new(),
             exit_status: None,
         }
     }
@@ -826,6 +859,19 @@ impl SourceFileResponse {
     #[must_use]
     pub fn command_output(&self) -> Option<&CommandOutput> {
         self.output.as_ref()
+    }
+
+    /// Returns bytes to write to stderr for file-loading diagnostics.
+    #[must_use]
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
+    }
+
+    /// Adds stderr bytes to the response.
+    #[must_use]
+    pub fn with_stderr(mut self, stderr: Vec<u8>) -> Self {
+        self.stderr = stderr;
+        self
     }
 
     /// Adds a command exit status to the response.
@@ -842,11 +888,77 @@ impl SourceFileResponse {
     }
 }
 
+impl<'de> Deserialize<'de> for SourceFileResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "SourceFileResponse",
+            &["output", "exit_status", "stderr"],
+            SourceFileResponseVisitor,
+        )
+    }
+}
+
+struct SourceFileResponseVisitor;
+
+impl<'de> Visitor<'de> for SourceFileResponseVisitor {
+    type Value = SourceFileResponse;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a source-file response")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let output = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let exit_status = compat_next_response_element(&mut seq)?;
+        let stderr = compat_next_response_element(&mut seq)?;
+        Ok(SourceFileResponse {
+            output,
+            exit_status,
+            stderr,
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut output = None;
+        let mut exit_status = None;
+        let mut stderr = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "output" => output = Some(map.next_value()?),
+                "exit_status" => exit_status = Some(map.next_value()?),
+                "stderr" => stderr = Some(map.next_value()?),
+                _ => {
+                    let _: de::IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+
+        Ok(SourceFileResponse {
+            output: output.ok_or_else(|| de::Error::missing_field("output"))?,
+            exit_status: exit_status.unwrap_or_default(),
+            stderr: stderr.unwrap_or_default(),
+        })
+    }
+}
+
 /// Response payload for `wait-for`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitForResponse;
 
 /// Terminal state for a daemon-backed SDK byte wait.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SdkWaitOutcome {
     /// The requested byte sequence was observed.
@@ -877,10 +989,9 @@ pub struct CancelSdkWaitResponse {
 impl CancelSdkWaitResponse {
     /// Returns the compatibility-preserving ACK used by armed SDK waits.
     ///
-    /// `SdkWaitOutcome` is a published exhaustive enum whose terminal outcomes
-    /// must stay source-compatible across patch releases. The daemon therefore
-    /// acknowledges an armed wait with this existing response shape instead of
-    /// adding a third `SdkWaitOutcome` variant.
+    /// Armed acknowledgement is deliberately kept outside the terminal
+    /// `SdkWaitOutcome` enum. This preserves the current release wire while the
+    /// non-exhaustive outcome type remains forward-compatible for SDK callers.
     #[must_use]
     pub const fn armed_ack(wait_id: SdkWaitId) -> Self {
         Self {
@@ -915,16 +1026,31 @@ mod tests {
         output: Option<CommandOutput>,
     }
 
+    #[derive(Serialize)]
+    struct OldSourceFileResponse {
+        output: Option<CommandOutput>,
+        exit_status: Option<i32>,
+    }
+
     #[test]
-    fn run_shell_response_deserializes_old_payloads_with_no_exit_status() {
+    fn run_shell_response_rejects_old_unversioned_payload() {
         let bytes = bincode::serialize(&OldRunShellResponse { output: None })
             .expect("old run-shell response serializes");
 
-        let decoded: RunShellResponse =
-            bincode::deserialize(&bytes).expect("new run-shell response decodes old payload");
+        bincode::deserialize::<RunShellResponse>(&bytes)
+            .expect_err("current response rejects old payload without a matching wire version");
+    }
 
-        assert_eq!(decoded.command_output(), None);
-        assert_eq!(decoded.exit_status(), None);
+    #[test]
+    fn source_file_response_rejects_old_unversioned_payload() {
+        let bytes = bincode::serialize(&OldSourceFileResponse {
+            output: Some(CommandOutput::from_stdout(b"parsed\n".to_vec())),
+            exit_status: Some(1),
+        })
+        .expect("old source-file response serializes");
+
+        bincode::deserialize::<SourceFileResponse>(&bytes)
+            .expect_err("current response rejects old payload without a matching wire version");
     }
 
     #[test]
@@ -980,11 +1106,10 @@ mod tests {
     }
 
     #[test]
-    fn sdk_wait_outcome_patch_surface_stays_terminal_only() {
+    fn known_sdk_wait_outcomes_are_terminal() {
+        #[allow(unreachable_patterns)]
         fn is_terminal(outcome: SdkWaitOutcome) -> bool {
-            match outcome {
-                SdkWaitOutcome::Matched | SdkWaitOutcome::Cancelled => true,
-            }
+            matches!(outcome, SdkWaitOutcome::Matched | SdkWaitOutcome::Cancelled)
         }
 
         assert!(is_terminal(SdkWaitOutcome::Matched));
@@ -995,6 +1120,9 @@ mod tests {
     fn pr6g_response_boxing_keeps_response_size_bounded() {
         assert_eq!(size_of::<Box<WebShareResponse>>(), 8);
         assert_eq!(size_of::<Box<PaneOutputLagResponse>>(), 8);
+        assert_eq!(size_of::<Box<PaneOptionSetResponse>>(), 8);
+        assert_eq!(size_of::<Box<SubscribePaneStateResponse>>(), 8);
+        assert_eq!(size_of::<Box<PaneForegroundStateResponse>>(), 8);
         assert_eq!(
             size_of::<Response>(),
             72,
@@ -1007,6 +1135,18 @@ mod tests {
         assert!(
             size_of::<PaneOutputLagResponse>() > size_of::<Response>(),
             "PaneOutputLagResponse must remain boxed while it is larger than Response"
+        );
+        assert!(
+            size_of::<PaneOptionSetResponse>() > size_of::<Response>(),
+            "PaneOptionSetResponse must remain boxed while it is larger than Response"
+        );
+        assert!(
+            size_of::<SubscribePaneStateResponse>() > size_of::<Response>(),
+            "SubscribePaneStateResponse must remain boxed while it is larger than Response"
+        );
+        assert!(
+            size_of::<PaneForegroundStateResponse>() > size_of::<Response>(),
+            "PaneForegroundStateResponse must remain boxed while it is larger than Response"
         );
     }
 

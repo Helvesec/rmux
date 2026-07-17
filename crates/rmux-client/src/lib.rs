@@ -13,6 +13,7 @@ pub mod attach;
 #[cfg(windows)]
 #[path = "attach_windows.rs"]
 pub mod attach;
+mod attach_lock_state;
 pub mod auto_start;
 pub(crate) mod commands;
 pub mod connection;
@@ -30,8 +31,9 @@ pub use attach::{
     AttachError, RawTerminal,
 };
 pub use auto_start::{
-    ensure_server_running, ensure_server_running_with_config, AutoStartConfig,
-    AutoStartConfigSelection, AutoStartError, INTERNAL_DAEMON_FLAG,
+    ensure_server_running, ensure_server_running_with_config,
+    ensure_server_running_with_config_outcome, AutoStartConfig, AutoStartConfigSelection,
+    AutoStartError, EnsuredServerConnection, ServerConnectionProvenance, INTERNAL_DAEMON_FLAG,
 };
 pub use commands::server::StartServerError;
 pub use commands::window::SplitWindowOptions;

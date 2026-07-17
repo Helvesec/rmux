@@ -304,7 +304,7 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   git_dirty=true
 fi
 release_artifact=true
-if [ "$skip_build" -eq 1 ] || [ "$git_dirty" = true ]; then
+if [ "$configuration" != "release" ] || [ "$skip_build" -eq 1 ] || [ "$git_dirty" = true ]; then
   release_artifact=false
 fi
 generated_at_utc="$(commit_time_iso)"
@@ -313,13 +313,13 @@ cat > "$stage_dir/share/rmux/artifact-metadata.json" <<EOF
 {
   "schema": 1,
   "artifact_kind": "unix-package-binary",
-  "binary_path": "$(printf '%s' "$binary_abs" | json_escape)",
+  "binary_path": "bin/rmux",
   "binary_sha256": "$binary_sha256",
   "binary_bytes": $binary_bytes,
-  "helper_binary_path": "$(printf '%s' "$helper_binary_abs" | json_escape)",
+  "helper_binary_path": "libexec/rmux/rmux",
   "helper_binary_sha256": "$helper_binary_sha256",
   "helper_binary_bytes": $helper_binary_bytes,
-  "daemon_binary_path": "$(printf '%s' "$daemon_binary_abs" | json_escape)",
+  "daemon_binary_path": "bin/rmux-daemon",
   "daemon_binary_sha256": "$daemon_binary_sha256",
   "daemon_binary_bytes": $daemon_binary_bytes,
   "rmux_version": "$version",

@@ -226,6 +226,7 @@ async fn server_access_protects_owner_uid() {
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some(current_owner_uid().to_string()),
         }))
         .await;
@@ -246,6 +247,7 @@ async fn server_access_deny_nonexistent_user_returns_error() {
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some("99999".to_owned()),
         }))
         .await;
@@ -263,6 +265,7 @@ async fn server_access_list_skips_uid_zero() {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: None,
         }))
         .await;
@@ -278,9 +281,8 @@ async fn server_access_list_skips_uid_zero() {
     }
 }
 
-#[cfg(not(windows))]
 #[tokio::test]
-async fn server_access_combined_flags_resolve_user_before_mutation() {
+async fn server_access_rejects_conflicting_flags_before_user_resolution() {
     let handler = RequestHandler::new();
 
     let response = handler
@@ -290,15 +292,16 @@ async fn server_access_combined_flags_resolve_user_before_mutation() {
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some("rmux-no-such-user".to_owned()),
         }))
         .await;
     match response {
         Response::Error(error) => assert_eq!(
             error.error.to_string(),
-            "server error: unknown user: rmux-no-such-user"
+            "server error: -a and -d cannot be used together"
         ),
-        _ => panic!("expected unknown user error"),
+        _ => panic!("expected conflicting flag error"),
     }
 
     let response = handler
@@ -308,51 +311,45 @@ async fn server_access_combined_flags_resolve_user_before_mutation() {
             list: false,
             read_only: true,
             write: true,
+            target: None,
             user: Some("rmux-no-such-user".to_owned()),
         }))
         .await;
     match response {
         Response::Error(error) => assert_eq!(
             error.error.to_string(),
-            "server error: unknown user: rmux-no-such-user"
+            "server error: -r and -w cannot be used together"
         ),
-        _ => panic!("expected unknown user error"),
+        _ => panic!("expected conflicting flag error"),
     }
 }
 
-#[cfg(windows)]
 #[tokio::test]
-async fn server_access_user_mutations_are_rejected_before_user_resolution_windows() {
+async fn server_access_rejects_legacy_target_wire_slot() {
     let handler = RequestHandler::new();
-    let expected = "server error: server-access user mutations are unsupported on Windows; named-pipe access is scoped to the current Windows SID";
 
-    for request in [
-        rmux_proto::ServerAccessRequest {
-            add: true,
-            deny: true,
-            list: false,
-            read_only: false,
-            write: false,
-            user: Some("rmux-no-such-user".to_owned()),
-        },
-        rmux_proto::ServerAccessRequest {
+    let response = handler
+        .handle(Request::ServerAccess(rmux_proto::ServerAccessRequest {
             add: false,
             deny: false,
-            list: false,
-            read_only: true,
-            write: true,
-            user: Some("rmux-no-such-user".to_owned()),
-        },
-    ] {
-        match handler.handle(Request::ServerAccess(request)).await {
-            Response::Error(error) => assert_eq!(error.error.to_string(), expected),
-            _ => panic!("expected Windows server-access unsupported mutation error"),
-        }
+            list: true,
+            read_only: false,
+            write: false,
+            target: Some("%0".to_owned()),
+            user: None,
+        }))
+        .await;
+    match response {
+        Response::Error(error) => assert_eq!(
+            error.error.to_string(),
+            "server error: command server-access: unknown flag -t"
+        ),
+        _ => panic!("expected legacy target rejection"),
     }
 }
 
 #[tokio::test]
-async fn server_access_list_ignores_user_and_mutation_flags() {
+async fn server_access_list_ignores_user_and_compatible_mutation_flags() {
     let handler = RequestHandler::with_owner_uid(1000);
 
     let response = handler
@@ -360,8 +357,9 @@ async fn server_access_list_ignores_user_and_mutation_flags() {
             add: true,
             deny: true,
             list: true,
-            read_only: false,
-            write: false,
+            read_only: true,
+            write: true,
+            target: None,
             user: Some("rmux-no-such-user".to_owned()),
         }))
         .await;

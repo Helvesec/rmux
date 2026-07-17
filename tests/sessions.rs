@@ -169,6 +169,36 @@ fn new_session_attach_if_exists_does_not_silently_succeed_when_detached(
 }
 
 #[test]
+fn non_terminal_new_session_rejects_before_creating_session() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-notty-preflight")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    let attached = harness.run(&["new-session", "-s", "alpha"])?;
+
+    assert_eq!(attached.status.code(), Some(1));
+    assert!(stdout(&attached).is_empty());
+    assert_eq!(stderr(&attached), "open terminal failed: not a terminal\n");
+
+    let detached = harness.run(&["new-session", "-d", "-s", "alpha"])?;
+    assert_success(&detached);
+    Ok(())
+}
+
+#[test]
+fn non_terminal_new_session_preserves_duplicate_error_order() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-notty-duplicate")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let duplicate = harness.run(&["new-session", "-s", "alpha"])?;
+
+    assert_eq!(duplicate.status.code(), Some(1));
+    assert!(stdout(&duplicate).is_empty());
+    assert_eq!(stderr(&duplicate), "duplicate session: alpha\n");
+    Ok(())
+}
+
+#[test]
 fn new_session_rejects_zero_dimensions_before_creating_session() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("new-session-zero-dimensions")?;
 
@@ -405,7 +435,7 @@ fn new_session_environment_option_persists_to_session_environment() -> Result<()
 }
 
 #[test]
-fn list_sessions_supports_filter_and_rejects_sort_order_extensions() -> Result<(), Box<dyn Error>> {
+fn list_sessions_supports_filter_sort_order_surface_and_reverse() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("list-sessions-filter-sort")?;
     let _daemon = harness.start_hidden_daemon()?;
 
@@ -427,14 +457,21 @@ fn list_sessions_supports_filter_and_rejects_sort_order_extensions() -> Result<(
 
     let sort = harness.run(&["list-sessions", "-O"])?;
     assert_eq!(sort.status.code(), Some(1));
-    assert_eq!(stderr(&sort), "command list-sessions: unknown flag -O\n");
-
-    let reversed = harness.run(&["list-sessions", "-r"])?;
-    assert_eq!(reversed.status.code(), Some(1));
     assert_eq!(
-        stderr(&reversed),
-        "command list-sessions: unknown flag -r\n"
+        stderr(&sort),
+        "command list-sessions: -O expects an argument\n"
     );
+
+    let bare_reverse = harness.run(&["list-sessions", "-r", "-F", "#{session_name}"])?;
+    assert_eq!(bare_reverse.status.code(), Some(0));
+    assert_eq!(stdout(&bare_reverse), "alpha\nbeta\ngamma\n");
+    assert!(stderr(&bare_reverse).is_empty());
+
+    let explicit_reverse =
+        harness.run(&["list-sessions", "-O", "name", "-r", "-F", "#{session_name}"])?;
+    assert_eq!(explicit_reverse.status.code(), Some(0));
+    assert_eq!(stdout(&explicit_reverse), "gamma\nbeta\nalpha\n");
+    assert!(stderr(&explicit_reverse).is_empty());
 
     Ok(())
 }

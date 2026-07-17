@@ -850,7 +850,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rmux-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "compact_str",
@@ -864,12 +864,13 @@ name = "rmux-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "rmux-proto",
  "rmux-server",
 ]
 
 [[package]]
 name = "rmux-ipc"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "rmux-os",
@@ -881,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-os"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "rmux-types",
@@ -891,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-proto"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bincode",
  "rmux-types",
@@ -901,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-pty"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "rmux-os",
@@ -913,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-server"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-recursion",
  "base64",
@@ -943,14 +944,14 @@ dependencies = [
 
 [[package]]
 name = "rmux-types"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "rmux-web-crypto"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chacha20poly1305",
  "hkdf",

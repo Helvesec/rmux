@@ -171,6 +171,20 @@ pub(super) fn resolve_pane_target_spec(
     }
 }
 
+pub(super) fn listed_pane_index_matches_target(
+    target: &rmux_proto::PaneTarget,
+    visible_pane_index: &str,
+    pane_base_index: &str,
+) -> bool {
+    let (Ok(visible_pane_index), Ok(pane_base_index)) = (
+        visible_pane_index.parse::<u32>(),
+        pane_base_index.parse::<u32>(),
+    ) else {
+        return false;
+    };
+    target.pane_index().saturating_add(pane_base_index) == visible_pane_index
+}
+
 pub(super) fn resolve_existing_window_target_or_current(
     connection: &mut Connection,
     target: Option<&TargetSpec>,
@@ -234,11 +248,26 @@ pub(super) fn resolve_target_spec(
         .map_err(ExitFailure::from_client)?;
     match response {
         Response::ResolveTarget(response) => Ok(response.target),
-        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(
-            1,
-            target_resolution_error_message(&error, target_type, target.raw()),
-        )),
+        Response::Error(ErrorResponse { error }) => {
+            Err(target_resolution_failure(&error, target_type, target.raw()))
+        }
         other => Err(unexpected_response("resolve-target", &other)),
+    }
+}
+
+fn target_resolution_failure(
+    error: &RmuxError,
+    target_type: ResolveTargetType,
+    raw_target: &str,
+) -> ExitFailure {
+    let message = target_resolution_error_message(error, target_type, raw_target);
+    if matches!(
+        error,
+        RmuxError::InvalidTarget { reason, .. } if reason.starts_with("ambiguous ")
+    ) {
+        ExitFailure::ambiguous_target(message)
+    } else {
+        ExitFailure::new(1, message)
     }
 }
 
@@ -314,16 +343,6 @@ fn window_target_lookup_token(raw_target: &str) -> &str {
         .map_or(raw_target, |(_, window)| window)
 }
 
-pub(super) fn display_panes_client_target_error(raw_target: &str) -> ExitFailure {
-    ExitFailure::new(
-        1,
-        format!(
-            "can't find client: {}",
-            raw_target.strip_suffix(':').unwrap_or(raw_target)
-        ),
-    )
-}
-
 pub(super) fn response_name_for_target(target: &rmux_proto::Target) -> &'static str {
     match target {
         rmux_proto::Target::Session(_) => "session target",
@@ -388,6 +407,35 @@ pub(super) fn resolve_current_pane_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listed_pane_index_matches_visible_base_adjustment() {
+        let target = rmux_proto::PaneTarget::with_window(
+            rmux_proto::SessionName::new("alpha").expect("valid session name"),
+            0,
+            1,
+        );
+
+        assert!(listed_pane_index_matches_target(&target, "2", "1"));
+        assert!(!listed_pane_index_matches_target(&target, "1", "1"));
+        assert!(!listed_pane_index_matches_target(&target, "x", "1"));
+        assert!(!listed_pane_index_matches_target(&target, "1", "x"));
+    }
+
+    #[test]
+    fn listed_pane_index_matches_server_saturation() {
+        let target = rmux_proto::PaneTarget::with_window(
+            rmux_proto::SessionName::new("alpha").expect("valid session name"),
+            0,
+            u32::MAX,
+        );
+
+        assert!(listed_pane_index_matches_target(
+            &target,
+            &u32::MAX.to_string(),
+            "1"
+        ));
+    }
 
     #[test]
     fn window_resolution_no_current_target_reports_missing_window() {

@@ -87,15 +87,15 @@ pub(crate) struct SelectWindowArgs {
     pub(crate) previous: bool,
     #[arg(short = 'T', action = ArgAction::SetTrue)]
     pub(crate) toggle_last: bool,
-    #[arg(short = 'Z', action = ArgAction::SetTrue)]
-    pub(crate) unsupported_zoom: bool,
+    #[arg(short = 'Z', action = ArgAction::SetTrue, hide = true)]
+    reject_zoom: bool,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
 
 impl SelectWindowArgs {
     fn validate(self) -> Result<Self, clap::Error> {
-        if self.unsupported_zoom {
+        if self.reject_zoom {
             return Err(tmux_unknown_flag_error("select-window", "-Z"));
         }
         Ok(self)
@@ -156,6 +156,10 @@ pub(crate) struct ListWindowsArgs {
     pub(crate) json: bool,
     #[arg(short = 'f', allow_hyphen_values = true)]
     pub(crate) filter: Option<String>,
+    #[arg(short = 'O')]
+    pub(crate) sort_order: Option<String>,
+    #[arg(short = 'r', action = ArgAction::SetTrue)]
+    pub(crate) reversed: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -184,7 +188,7 @@ pub(crate) struct MoveWindowArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct SwapWindowArgs {
-    #[arg(short = 'a', action = ArgAction::SetTrue)]
+    #[arg(short = 'a', action = ArgAction::SetTrue, hide = true)]
     reject_after: bool,
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) detached: bool,

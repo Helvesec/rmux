@@ -12,7 +12,7 @@ parser_replies_hex: (empty)
 parser_ground_timer_active: false
 mode_bits: 0x00000011
 cursor_style: 0
-cursor: x=2 y=1
+cursor: x=3 y=1
 cursor_absolute_y: 1
 alternate: false
 history_size: 0

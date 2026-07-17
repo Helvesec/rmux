@@ -4,6 +4,7 @@ use rmux_core::{
 };
 use rmux_proto::{OptionName, PaneTarget, SessionName};
 
+use crate::pane_indices::visible_pane_index;
 use crate::pane_terminals::HandlerState;
 
 use super::mode_tree_model::{ModeTreeAction, ModeTreeClientState, ModeTreeItem};
@@ -170,7 +171,12 @@ fn render_tree_window_preview(
         .into_iter()
         .enumerate()
         .map(|(column_index, pane)| PreviewColumn {
-            label: tree_window_preview_label(pane.index()),
+            label: tree_window_preview_label(visible_pane_index(
+                session,
+                &state.options,
+                window_index,
+                pane.index(),
+            )),
             label_area_width: layout.each,
             lines: preview_lines_for_target(
                 state,

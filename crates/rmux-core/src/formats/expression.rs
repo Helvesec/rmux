@@ -12,7 +12,6 @@ where
     let Some(operator) = modifier.argv.first().map(String::as_str) else {
         return String::new();
     };
-    let float_precision = expression_float_precision(modifier);
     let Some((left, right)) = format_choose(state, body, variables) else {
         return String::new();
     };
@@ -23,16 +22,20 @@ where
             .unwrap_or_default();
     }
 
-    if let Some(precision) = float_precision {
-        let Some(value) = numeric_operation(operator, &left, &right) else {
-            return String::new();
-        };
-        format_float_value(value, precision)
-    } else {
-        let Some(value) = integer_operation(operator, &left, &right) else {
-            return String::new();
-        };
-        value
+    match expression_float_precision(modifier) {
+        ExpressionFloatPrecision::Valid(precision) => {
+            let Some(value) = numeric_operation(operator, &left, &right) else {
+                return String::new();
+            };
+            format_float_value(value, precision)
+        }
+        ExpressionFloatPrecision::Invalid => String::new(),
+        ExpressionFloatPrecision::Disabled => {
+            let Some(value) = integer_operation(operator, &left, &right) else {
+                return String::new();
+            };
+            value
+        }
     }
 }
 
@@ -44,35 +47,42 @@ fn numeric_operation(operator: &str, left: &str, right: &str) -> Option<f64> {
         "-" => left - right,
         "*" => left * right,
         "/" => left / right,
-        "m" => left % right,
+        "m" | "%" | "%%" => {
+            if right == 0.0 {
+                f64::NAN
+            } else {
+                left % right
+            }
+        }
         _ => return None,
     })
 }
 
 fn integer_operation(operator: &str, left: &str, right: &str) -> Option<String> {
-    if !matches!(operator, "+" | "-" | "*" | "/" | "m") {
+    if !matches!(operator, "+" | "-" | "*" | "/" | "m" | "%" | "%%") {
         return None;
     }
 
-    let left = integer_operand(left)?;
-    let right = integer_operand(right)?;
-    if operator == "m" && right == 0.0 {
-        return Some("0".to_owned());
-    }
+    let left = arithmetic_operand(left)?;
+    let right = arithmetic_operand(right)?;
     let value = match operator {
         "+" => left + right,
         "-" => left - right,
         "*" => left * right,
         "/" => left / right,
-        "m" => left % right,
+        // Both spellings reach the operator on glibc; on the darwin oracle
+        // BSD strftime consumes a lone '%' upstream and doubles '%%' into
+        // '%', so accepting both matches the Linux oracle end-to-end and the
+        // darwin oracle's post-strftime behavior.
+        "m" | "%" | "%%" => left % right,
         _ => return None,
     };
     Some(integer_result(value))
 }
 
 fn numeric_compare(operator: &str, left: &str, right: &str) -> Option<bool> {
-    let left = integer_operand(left)?;
-    let right = integer_operand(right)?;
+    let left = comparison_operand(left)?;
+    let right = comparison_operand(right)?;
     Some(match operator {
         "==" => left == right,
         "!=" => left != right,
@@ -84,15 +94,16 @@ fn numeric_compare(operator: &str, left: &str, right: &str) -> Option<bool> {
     })
 }
 
-fn integer_operand(value: &str) -> Option<f64> {
+fn arithmetic_operand(value: &str) -> Option<f64> {
     let value = parse_number(value)?;
-    if value.is_nan() {
-        return Some(0.0);
-    }
     if value.is_finite() && value > i64::MIN as f64 && value < i64::MAX as f64 {
         return Some((value as i64) as f64);
     }
-    Some(value)
+    Some(i64::MIN as f64)
+}
+
+fn comparison_operand(value: &str) -> Option<f64> {
+    arithmetic_operand(value)
 }
 
 fn parse_number(value: &str) -> Option<f64> {
@@ -134,13 +145,12 @@ fn parse_prefixed_integer(value: &str) -> Option<i64> {
 }
 
 fn integer_result(value: f64) -> String {
-    if value.is_nan() {
-        return "0".to_owned();
-    }
-    if value == f64::INFINITY || value >= i64::MAX as f64 {
-        return "9223372036854775808".to_owned();
-    }
-    if value == f64::NEG_INFINITY || value < i64::MIN as f64 {
+    if value.is_nan()
+        || value == f64::INFINITY
+        || value == f64::NEG_INFINITY
+        || value >= i64::MAX as f64
+        || value < i64::MIN as f64
+    {
         return i64::MIN.to_string();
     }
     (value as i64).to_string()
@@ -150,18 +160,41 @@ fn is_comparison_operator(operator: &str) -> bool {
     matches!(operator, "==" | "!=" | ">" | ">=" | "<" | "<=")
 }
 
-fn expression_float_precision(modifier: &FormatModifier) -> Option<usize> {
+const MIN_EXPRESSION_FLOAT_PRECISION: i64 = -100;
+const MAX_EXPRESSION_FLOAT_PRECISION: i64 = 100;
+const DEFAULT_NEGATIVE_FLOAT_PRECISION: usize = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpressionFloatPrecision {
+    Disabled,
+    Valid(usize),
+    Invalid,
+}
+
+fn expression_float_precision(modifier: &FormatModifier) -> ExpressionFloatPrecision {
     let options = modifier.argv.get(1).map(String::as_str).unwrap_or_default();
     if !options.contains('f') {
-        return None;
+        return ExpressionFloatPrecision::Disabled;
     }
-    Some(
-        modifier
-            .argv
-            .get(2)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(2),
-    )
+    let Some(raw_precision) = modifier.argv.get(2) else {
+        return ExpressionFloatPrecision::Valid(2);
+    };
+    if raw_precision.is_empty() {
+        return ExpressionFloatPrecision::Valid(2);
+    }
+    let Ok(precision) = raw_precision.parse::<i64>() else {
+        return ExpressionFloatPrecision::Invalid;
+    };
+    if precision < MIN_EXPRESSION_FLOAT_PRECISION {
+        return ExpressionFloatPrecision::Invalid;
+    }
+    if precision < 0 {
+        return ExpressionFloatPrecision::Valid(DEFAULT_NEGATIVE_FLOAT_PRECISION);
+    }
+    if precision > MAX_EXPRESSION_FLOAT_PRECISION {
+        return ExpressionFloatPrecision::Invalid;
+    }
+    ExpressionFloatPrecision::Valid(precision as usize)
 }
 
 fn bool_string(value: bool) -> String {
@@ -174,7 +207,11 @@ fn bool_string(value: bool) -> String {
 
 fn format_float_value(value: f64, precision: usize) -> String {
     if value.is_nan() {
-        return "nan".to_owned();
+        // All NaN results render as "-nan": the Linux x86_64 deployment
+        // oracle prints "-nan" (glibc + SSE quiet-NaN sign), and normalizing
+        // every NaN producer (modulo-by-zero, inf-inf, 0/0, ...) keeps RMUX
+        // output identical across CPUs, unlike raw hardware NaN signs.
+        return "-nan".to_owned();
     }
     format!("{value:.precision$}")
 }

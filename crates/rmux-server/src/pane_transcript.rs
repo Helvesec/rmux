@@ -1,14 +1,22 @@
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::clock_mode::{ClockModeState, CLOCK_MODE_NAME};
-use crate::copy_mode::{CopyModeState, CopyModeSummary};
+use crate::copy_mode::{CopyModeRenderSnapshot, CopyModeState, CopyModeSummary};
 use rmux_core::{
-    style::Style, GridRenderOptions, Screen, ScreenCaptureRange, TerminalPassthrough,
-    TerminalScreen, Utf8Config,
+    style::Style, GridRenderOptions, Screen, ScreenCaptureRange, TerminalPaletteIndex,
+    TerminalPassthrough, TerminalScreen, Utf8Config,
 };
 use rmux_proto::TerminalSize;
 
+#[path = "pane_transcript/palette_queries.rs"]
+mod palette_queries;
+
+use palette_queries::PendingPaletteQueries;
+
 pub(crate) type SharedPaneTranscript = Arc<Mutex<PaneTranscript>>;
+
+pub(crate) const PANE_INPUT_GROUND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PaneModeState {
@@ -22,17 +30,28 @@ pub(crate) struct PaneTranscript {
     mode: Option<PaneModeState>,
     output_sequence: u64,
     next_clock_generation: u64,
+    ground_timer_started_at: Option<Instant>,
+    ground_timer_token: u64,
+    pending_palette_queries: PendingPaletteQueries,
     #[cfg(test)]
     utf8_config: Utf8Config,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneGroundTimer {
+    pub(crate) deadline: Instant,
+    token: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PaneAppendResult {
     pub(crate) bell_count: u64,
     pub(crate) title_changed: bool,
+    pub(crate) title_change: Option<(String, String)>,
     pub(crate) passthroughs: Vec<TerminalPassthrough>,
     pub(crate) dropped_passthrough_count: u64,
     pub(crate) replies: Vec<u8>,
+    pub(crate) ground_timer: Option<PaneGroundTimer>,
 }
 
 pub(crate) struct PaneTranscriptRenderState {
@@ -66,6 +85,9 @@ impl PaneTranscript {
             mode: None,
             output_sequence: 0,
             next_clock_generation: 1,
+            ground_timer_started_at: None,
+            ground_timer_token: 0,
+            pending_palette_queries: PendingPaletteQueries::default(),
             #[cfg(test)]
             utf8_config: Utf8Config::default(),
         }
@@ -89,22 +111,99 @@ impl PaneTranscript {
     }
 
     pub(crate) fn append_bytes_with_effects(&mut self, bytes: &[u8]) -> PaneAppendResult {
+        let now = Instant::now();
+        self.expire_ground_timer_if_due(now);
         if !bytes.is_empty() {
             self.output_sequence = self.output_sequence.saturating_add(1);
         }
         let title_before = self.terminal.screen().title().to_owned();
         self.terminal.feed(bytes);
-        let title_changed = self.terminal.screen().title() != title_before;
+        let title_after = self.terminal.screen().title().to_owned();
+        let title_changed = title_after != title_before;
         let passthroughs = self.terminal.take_terminal_passthrough();
+        self.pending_palette_queries.register(&passthroughs, now);
         let dropped_passthrough_count = self.terminal.take_terminal_passthrough_dropped_count();
         let replies = self.terminal.take_replies();
+        let ground_timer = self.refresh_ground_timer(now);
         PaneAppendResult {
             bell_count: self.terminal.screen_mut().take_bell_count(),
             title_changed,
+            title_change: title_changed.then_some((title_before, title_after)),
             passthroughs,
             dropped_passthrough_count,
             replies,
+            ground_timer,
         }
+    }
+
+    /// Consumes one correlated OSC 4 response for a recently emitted query.
+    /// Unsolicited, expired, and duplicate terminal responses are rejected so
+    /// attach input cannot become an arbitrary control-sequence injection path.
+    pub(crate) fn consume_palette_query_response(&mut self, index: TerminalPaletteIndex) -> bool {
+        self.pending_palette_queries.consume(index, Instant::now())
+    }
+
+    #[cfg(test)]
+    fn consume_palette_query_response_at(
+        &mut self,
+        index: TerminalPaletteIndex,
+        now: Instant,
+    ) -> bool {
+        self.pending_palette_queries.consume(index, now)
+    }
+
+    fn refresh_ground_timer(&mut self, now: Instant) -> Option<PaneGroundTimer> {
+        if self.terminal.ground_timer_active() {
+            if self.ground_timer_started_at.is_none() {
+                self.ground_timer_started_at = Some(now);
+                self.ground_timer_token = self.ground_timer_token.saturating_add(1);
+                return Some(PaneGroundTimer {
+                    deadline: now + PANE_INPUT_GROUND_TIMEOUT,
+                    token: self.ground_timer_token,
+                });
+            }
+            return None;
+        }
+
+        if self.ground_timer_started_at.take().is_some() {
+            self.ground_timer_token = self.ground_timer_token.saturating_add(1);
+        }
+        None
+    }
+
+    fn expire_ground_timer_if_due(&mut self, now: Instant) -> bool {
+        let Some(started_at) = self.ground_timer_started_at else {
+            return false;
+        };
+        if now.duration_since(started_at) < PANE_INPUT_GROUND_TIMEOUT {
+            return false;
+        }
+        self.expire_ground_timer_now()
+    }
+
+    pub(crate) fn expire_ground_timer(&mut self, timer: PaneGroundTimer) -> bool {
+        if self.ground_timer_token != timer.token || Instant::now() < timer.deadline {
+            return false;
+        }
+        self.expire_ground_timer_now()
+    }
+
+    fn expire_ground_timer_now(&mut self) -> bool {
+        if self.ground_timer_started_at.is_none() || !self.terminal.ground_timer_active() {
+            return false;
+        }
+        self.terminal.ground_timer_expired();
+        self.ground_timer_started_at = None;
+        self.ground_timer_token = self.ground_timer_token.saturating_add(1);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_ground_timer_expired_for_test(&mut self, timer: PaneGroundTimer) -> bool {
+        if self.ground_timer_token != timer.token {
+            return false;
+        }
+        self.expire_ground_timer_now()
     }
 
     pub(crate) fn reset_terminal_state(&mut self) {
@@ -113,6 +212,9 @@ impl PaneTranscript {
         let _ = self.terminal.take_terminal_passthrough();
         let _ = self.terminal.take_terminal_passthrough_dropped_count();
         let _ = self.terminal.take_replies();
+        self.ground_timer_started_at = None;
+        self.ground_timer_token = self.ground_timer_token.saturating_add(1);
+        self.pending_palette_queries.clear();
         self.mode = None;
     }
 
@@ -149,6 +251,10 @@ impl PaneTranscript {
         options: GridRenderOptions,
     ) -> Vec<u8> {
         self.terminal.screen().capture_transcript(range, options)
+    }
+
+    pub(crate) fn capture_main_line_format_flags(&self, range: ScreenCaptureRange) -> Vec<u8> {
+        self.terminal.screen().capture_line_format_flags(range)
     }
 
     pub(crate) fn capture_main_visible_line_changes(
@@ -198,6 +304,10 @@ impl PaneTranscript {
         }
     }
 
+    pub(crate) fn plain_output_forwarding_safe(&self) -> bool {
+        self.terminal.plain_output_forwarding_safe()
+    }
+
     pub(crate) fn capture_saved(
         &self,
         range: ScreenCaptureRange,
@@ -208,6 +318,15 @@ impl PaneTranscript {
             .capture_saved_transcript(range, options)
     }
 
+    pub(crate) fn capture_saved_line_format_flags(
+        &self,
+        range: ScreenCaptureRange,
+    ) -> Option<Vec<u8>> {
+        self.terminal
+            .screen()
+            .capture_saved_line_format_flags(range)
+    }
+
     pub(crate) fn capture_copy_mode(
         &self,
         range: ScreenCaptureRange,
@@ -216,6 +335,18 @@ impl PaneTranscript {
         match &self.mode {
             Some(PaneModeState::Copy(mode)) => {
                 Some(mode.render_screen().capture_transcript(range, options))
+            }
+            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree(_)) | None => None,
+        }
+    }
+
+    pub(crate) fn capture_copy_mode_line_format_flags(
+        &self,
+        range: ScreenCaptureRange,
+    ) -> Option<Vec<u8>> {
+        match &self.mode {
+            Some(PaneModeState::Copy(mode)) => {
+                Some(mode.render_screen().capture_line_format_flags(range))
             }
             Some(PaneModeState::Clock(_) | PaneModeState::ModeTree(_)) | None => None,
         }
@@ -314,6 +445,10 @@ impl PaneTranscript {
         self.copy_mode_state().map(CopyModeState::render_screen)
     }
 
+    pub(crate) fn copy_mode_render_snapshot(&self) -> Option<CopyModeRenderSnapshot> {
+        self.copy_mode_state().map(CopyModeState::render_snapshot)
+    }
+
     pub(crate) fn clear_copy_mode(&mut self) -> bool {
         match self.mode {
             Some(PaneModeState::Copy(_)) => {
@@ -401,8 +536,11 @@ impl PaneTranscript {
         self.terminal.screen().title()
     }
 
-    pub(crate) fn set_title(&mut self, title: impl Into<String>) {
-        self.terminal.screen_mut().set_title(title);
+    pub(crate) fn set_title(&mut self, title: impl Into<String>) -> Option<(String, String)> {
+        let old_title = self.terminal.screen().title().to_owned();
+        let new_title = title.into();
+        self.terminal.screen_mut().set_title(new_title.clone());
+        (old_title != new_title).then_some((old_title, new_title))
     }
 
     pub(crate) fn path(&self) -> &str {
@@ -491,8 +629,9 @@ fn visible_revision_reuse_map(previous: &[u64], next: &[u64]) -> Option<Vec<Opti
 #[cfg(test)]
 mod tests {
     use super::{visible_revision_reuse_map, PaneTranscript};
-    use rmux_core::{GridRenderOptions, ScreenCaptureRange, TerminalScreen};
+    use rmux_core::{GridRenderOptions, ScreenCaptureRange, TerminalPaletteIndex, TerminalScreen};
     use rmux_proto::TerminalSize;
+    use std::time::{Duration, Instant};
 
     fn transcript(cols: u16, rows: u16, limit: usize) -> PaneTranscript {
         PaneTranscript::new(limit, TerminalSize { cols, rows })
@@ -585,6 +724,79 @@ mod tests {
     }
 
     #[test]
+    fn append_bytes_recovers_after_tmux_wrapped_osc_bel_without_outer_st() {
+        let mut transcript = transcript(40, 4, 10);
+        let result = transcript.append_bytes_with_effects(b"\x1bPtmux;\x1b\x1b]4;0;?\x07OpenCode");
+
+        assert_eq!(result.passthroughs.len(), 1);
+        assert_eq!(result.passthroughs[0].payload(), b"\x1b]4;0;?\x07");
+        let capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("capture is utf8");
+        assert!(capture.contains("OpenCode"));
+        assert!(!capture.contains("4;0;?"));
+    }
+
+    #[test]
+    fn append_bytes_recovers_after_unterminated_non_osc_dcs_ground_timer() {
+        let mut transcript = transcript(40, 4, 10);
+        let result = transcript.append_bytes_with_effects(b"\x1bPtmux;not-osc\x07");
+        let timer = result
+            .ground_timer
+            .expect("unterminated DCS should arm the parser ground timer");
+
+        transcript.append_bytes(b"STILL-HIDDEN");
+        let hidden_capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("capture is utf8");
+        assert!(
+            !hidden_capture.contains("STILL-HIDDEN"),
+            "bytes before the DCS timeout should remain swallowed by the unterminated string"
+        );
+
+        assert!(
+            transcript.force_ground_timer_expired_for_test(timer),
+            "matching ground timer should expire the parser"
+        );
+        transcript.append_bytes(b"AFTER");
+
+        let capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("capture is utf8");
+        assert!(capture.contains("AFTER"));
+        assert!(!capture.contains("not-osc"));
+    }
+
+    #[test]
+    fn append_bytes_arms_single_ground_timer_while_parser_remains_blocked() {
+        let mut transcript = transcript(40, 4, 10);
+        let timer = transcript
+            .append_bytes_with_effects(b"\x1bPtmux;not-osc\x07")
+            .ground_timer
+            .expect("unterminated DCS should arm the parser ground timer");
+
+        assert!(
+            transcript
+                .append_bytes_with_effects(b"still blocked")
+                .ground_timer
+                .is_none(),
+            "the same blocked parser state must not arm another timer on each read"
+        );
+
+        assert!(transcript.force_ground_timer_expired_for_test(timer));
+        let next_timer = transcript
+            .append_bytes_with_effects(b"\x1bPtmux;not-osc-again\x07")
+            .ground_timer;
+        assert!(
+            next_timer.is_some(),
+            "a new blocked sequence should arm a fresh timer after recovery"
+        );
+    }
+
+    #[test]
     fn append_bytes_reports_osc52_clipboard_without_capturing_text() {
         let mut transcript = transcript(40, 4, 10);
         let result = transcript.append_bytes_with_effects(b"\x1b]52;c;QQ==\x07");
@@ -596,6 +808,62 @@ mod tests {
         )
         .expect("capture is utf8");
         assert!(!capture.contains("52;c"));
+    }
+
+    #[test]
+    fn osc4_queries_register_only_bounded_correlated_responses() {
+        let mut transcript = transcript(40, 4, 10);
+        let index = TerminalPaletteIndex::from(0);
+
+        let first = transcript.append_bytes_with_effects(b"\x1b]4;0;?\x07");
+        assert_eq!(first.passthroughs.len(), 1);
+        assert_eq!(first.passthroughs[0].render_sequence(), b"\x1b]4;0;?\x1b\\");
+        assert!(transcript.consume_palette_query_response(index));
+        assert!(
+            !transcript.consume_palette_query_response(index),
+            "an unsolicited duplicate response must be rejected"
+        );
+
+        transcript.append_bytes_with_effects(b"\x1b]4;0;?;0;?\x1b\\");
+        assert!(transcript.consume_palette_query_response(index));
+        assert!(transcript.consume_palette_query_response(index));
+        assert!(!transcript.consume_palette_query_response(index));
+
+        for _ in 0..20 {
+            transcript.append_bytes_with_effects(b"\x1b]4;0;?\x07");
+        }
+        for _ in 0..8 {
+            assert!(transcript.consume_palette_query_response(index));
+        }
+        assert!(
+            !transcript.consume_palette_query_response(index),
+            "repeated unanswered queries stay capped"
+        );
+    }
+
+    #[test]
+    fn osc4_query_response_correlation_expires_and_reset_clears_it() {
+        let mut transcript = transcript(40, 4, 10);
+        let index = TerminalPaletteIndex::from(7);
+
+        transcript.append_bytes_with_effects(b"\x1b]4;7;?\x1b\\");
+        assert!(!transcript
+            .consume_palette_query_response_at(index, Instant::now() + Duration::from_secs(9),));
+
+        transcript.append_bytes_with_effects(b"\x1b]4;7;?\x07");
+        transcript.reset_terminal_state();
+        assert!(!transcript.consume_palette_query_response(index));
+    }
+
+    #[test]
+    fn osc4_invalid_indices_and_sets_never_open_a_response_slot() {
+        let mut transcript = transcript(40, 4, 10);
+
+        let result =
+            transcript.append_bytes_with_effects(b"\x1b]4;256;?;0;rgb:0000/0000/0000;bad;?\x07");
+        assert!(result.passthroughs.is_empty());
+        assert!(!transcript.consume_palette_query_response(TerminalPaletteIndex::from(0)));
+        assert!(!transcript.consume_palette_query_response(TerminalPaletteIndex::from(255)));
     }
 
     #[test]
@@ -628,6 +896,38 @@ mod tests {
 
         assert_eq!(result.replies, b"\x1b[?1;2c");
         assert!(transcript.append_bytes_with_effects(b"").replies.is_empty());
+    }
+
+    #[test]
+    fn append_bytes_reports_rmux_xtversion_identity() {
+        let mut transcript = transcript(40, 4, 10);
+        let result = transcript.append_bytes_with_effects(b"\x1b[>q");
+        let version = env!("CARGO_PKG_VERSION");
+
+        assert_eq!(
+            result.replies,
+            format!("\x1bP>|rmux {version}\x1b\\").into_bytes()
+        );
+        assert!(transcript.append_bytes_with_effects(b"").replies.is_empty());
+    }
+
+    #[test]
+    fn append_bytes_ignores_kitty_keyboard_negotiation() {
+        let mut transcript = transcript(40, 4, 10);
+        let initial_mode = transcript.mode();
+
+        for request in [
+            b"\x1b[=8u".as_slice(),
+            b"\x1b[>1u".as_slice(),
+            b"\x1b[<u".as_slice(),
+            b"\x1b[?u".as_slice(),
+        ] {
+            assert!(transcript
+                .append_bytes_with_effects(request)
+                .replies
+                .is_empty());
+            assert_eq!(transcript.mode(), initial_mode, "request {request:?}");
+        }
     }
 
     #[test]
@@ -742,11 +1042,20 @@ mod tests {
 
         let result = transcript.append_bytes_and_take_replies(b"\x1b]2;alpha\x07");
         assert!(result.title_changed);
+        assert_eq!(
+            result.title_change,
+            Some(("".to_owned(), "alpha".to_owned()))
+        );
 
         let result = transcript.append_bytes_and_take_replies(b"\x1b]2;alpha\x07");
         assert!(!result.title_changed);
+        assert_eq!(result.title_change, None);
 
         let result = transcript.append_bytes_and_take_replies(b"\x1b]2;beta\x07");
         assert!(result.title_changed);
+        assert_eq!(
+            result.title_change,
+            Some(("alpha".to_owned(), "beta".to_owned()))
+        );
     }
 }

@@ -92,6 +92,32 @@ async fn process_command_session_sends_request_after_capability() {
     );
 }
 
+#[test]
+fn owned_session_id_parser_accepts_exact_single_line_identity() {
+    assert_eq!(
+        parse_owned_session_id(b"$42\n").expect("valid owned-session identity"),
+        SessionId::new(42)
+    );
+}
+
+#[test]
+fn owned_session_id_parser_rejects_ambiguous_or_malformed_output() {
+    for output in [
+        b"$42".as_slice(),
+        b"$42\r\n".as_slice(),
+        b"42\n".as_slice(),
+        b"$invalid\n".as_slice(),
+        b"$1\n$2\n".as_slice(),
+        b"$1\n\n".as_slice(),
+        b"\xff\n".as_slice(),
+    ] {
+        assert!(
+            parse_owned_session_id(output).is_err(),
+            "unexpected accepted output: {output:?}"
+        );
+    }
+}
+
 fn assert_capability_handshake(request: Request) {
     match request {
         Request::Handshake(HandshakeRequest {

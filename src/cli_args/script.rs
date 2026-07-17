@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, ArgGroup, Args};
-use rmux_proto::{Target, WaitForMode};
+use rmux_proto::WaitForMode;
 
-use super::{parse_command_args, parse_target, parse_target_spec, TargetSpec};
+use super::{parse_command_args, parse_target_spec, QueuedCommand, TargetSpec};
 
 pub(super) fn parse_source_file_args(
     arguments: Vec<String>,
@@ -61,7 +61,7 @@ pub(crate) struct RunShellArgs {
     pub(crate) background: bool,
     #[arg(short = 'C', action = ArgAction::SetTrue)]
     pub(crate) as_commands: bool,
-    #[arg(short = 'E', action = ArgAction::SetTrue, hide = true)]
+    #[arg(short = 'E', action = ArgAction::SetTrue)]
     pub(crate) show_stderr: bool,
     #[arg(short = 'd')]
     pub(crate) delay_seconds: Option<f64>,
@@ -75,12 +75,6 @@ pub(crate) struct RunShellArgs {
 
 impl RunShellArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.show_stderr {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::UnknownArgument,
-                "command run-shell: unknown flag -E",
-            ));
-        }
         Ok(self)
     }
 }
@@ -107,14 +101,22 @@ pub(crate) struct IfShellArgs {
     pub(crate) background: bool,
     #[arg(short = 'F', action = ArgAction::SetTrue)]
     pub(crate) format_mode: bool,
-    #[arg(short = 't', value_parser = parse_target, allow_hyphen_values = true)]
-    pub(crate) target: Option<Target>,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true)]
     pub(crate) condition: String,
     #[arg(allow_hyphen_values = true)]
     pub(crate) then_command: String,
     #[arg(allow_hyphen_values = true)]
     pub(crate) else_command: Option<String>,
+    #[arg(skip = String::new())]
+    pub(crate) queue_command: String,
+}
+
+impl QueuedCommand for IfShellArgs {
+    fn set_queue_command(&mut self, queue_command: String) {
+        self.queue_command = queue_command;
+    }
 }
 
 #[derive(Debug, Clone, Args)]

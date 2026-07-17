@@ -37,7 +37,7 @@
   <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
   <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.8.0"><img src="https://img.shields.io/badge/rmux-0.8.0-informational.svg" alt="rmux 0.8.0"></a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.9.0"><img src="https://img.shields.io/badge/rmux-0.9.0-informational.svg" alt="rmux 0.9.0"></a>
 </p>
 
 </div>
@@ -116,7 +116,6 @@ Use `rmux -V` for the installed version.
 | Platform / manager | Command |
 | :--- | :--- |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/apple.svg"><img src="docs/install/apple-light.svg" width="28" alt="macOS"></picture> / Homebrew | `brew install rmux` |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / installer | `irm https://rmux.io/install.ps1 \| iex` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / WinGet | `winget install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / Scoop | `scoop bucket add rmux https://github.com/Helvesec/scoop-rmux && scoop install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / Chocolatey | `choco install rmux` |
@@ -125,9 +124,14 @@ Use `rmux -V` for the installed version.
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/linux.svg"><img src="docs/install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/apple.svg"><img src="docs/install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/rust.svg"><img src="docs/install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
 
-Direct downloads (`.tar.gz`, `.deb`, `.rpm`, `.zip`) are available from the [v0.8.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.8.0).
+Direct downloads (`.tar.gz`, `.deb`, `.rpm`, `.zip`) are available from the [v0.9.0 GitHub Release](https://github.com/Helvesec/rmux/releases/tag/v0.9.0).
 
-Package managers can lag while registries review new releases; direct downloads and the rmux.io installers track the current GitHub Release.
+Package managers can lag while registries review new releases; use the versioned
+GitHub Release download when a manager has not caught up yet.
+
+On Windows, extract the complete `.zip` and add the extracted package root to
+`PATH`. Keep `rmux.exe`, `rmux-daemon.exe`, and `libexec/rmux/rmux.exe`
+together; copying only the public executable is not a valid installation.
 
 For Unix `.tar.gz` downloads, run `./install.sh --prefix ~/.local` from the
 extracted archive. The installer preserves the required `bin/` and `libexec/`
@@ -259,9 +263,9 @@ The full documentation is available at [rmux.io/docs](https://rmux.io/docs/).
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.8.0-web-share">
-  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.8.0-web-share">
-  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.8.0-web-share" alt="RMUX runtime architecture" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.9.0-web-share">
+  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.9.0-web-share">
+  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.9.0-web-share" alt="RMUX runtime architecture" width="800">
 </picture>
 
 </div>

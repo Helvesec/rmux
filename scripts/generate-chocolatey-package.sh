@@ -9,6 +9,7 @@ Generate the RMUX Chocolatey package source from GitHub Release checksums.
 
 Options:
   --version <semver|vsemver>   Release version, for example 1.2.3 or v1.2.3
+  --release-tag <tag>          GitHub tag containing the assets (default: v<version>)
   --checksums <path>           SHA256SUMS file from the GitHub Release
   --output-dir <dir>           Write rmux.nuspec and tools/ scripts here
   --repository <owner/repo>    GitHub repository (default: Helvesec/rmux)
@@ -32,6 +33,23 @@ normalize_version() {
   case "$version" in
     [0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$version" ;;
     *) die "version must look like 1.2.3 or v1.2.3, got: $raw" ;;
+  esac
+}
+
+normalize_release_tag() {
+  local raw tag_version rc_number
+  raw="$1"
+  case "$raw" in v*) ;; *) die "release tag must start with v: $raw" ;; esac
+  tag_version="${raw#v}"
+  case "$tag_version" in *[!0-9A-Za-z.-]*|""|*..*|.*|*.) die "invalid release tag: $raw" ;; esac
+  if [ "$tag_version" = "$version" ]; then printf '%s\n' "$raw"; return; fi
+  case "$tag_version" in
+    "$version"-rc.*)
+      rc_number="${tag_version#"$version-rc."}"
+      case "$rc_number" in ''|*[!0-9]*|0|0*) die "release tag RC suffix must be -rc.N with N >= 1 and no leading zero: $raw" ;; esac
+      printf '%s\n' "$raw"
+      ;;
+    *) die "release tag $raw does not contain package version $version" ;;
   esac
 }
 
@@ -71,7 +89,7 @@ write_nuspec() {
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <description>Terminal multiplexer with a tmux-style CLI, daemon runtime, Rust SDK, and native Windows support.</description>
     <summary>Terminal multiplexer with a tmux-style CLI and native Windows support.</summary>
-    <releaseNotes>https://github.com/$repository/releases/tag/v$version</releaseNotes>
+    <releaseNotes>https://github.com/$repository/releases/tag/$release_tag</releaseNotes>
     <tags>rmux terminal multiplexer tmux cli rust</tags>
     <dependencies>
       <dependency id="vcredist140" />
@@ -89,7 +107,7 @@ write_install() {
   out="$1"
   asset="rmux-$version-windows-x86_64.zip"
   sha="$(asset_sha256 "$asset")"
-  url="https://github.com/$repository/releases/download/v$version/$asset"
+  url="https://github.com/$repository/releases/download/$release_tag/$asset"
   package_dir="rmux-$version-windows-x86_64"
 
   cat > "$out" <<EOF
@@ -135,6 +153,7 @@ EOF
 }
 
 version=""
+release_tag=""
 checksums=""
 output_dir=""
 repository="${RMUX_GITHUB_REPO:-Helvesec/rmux}"
@@ -150,6 +169,11 @@ while [ "$#" -gt 0 ]; do
     --checksums)
       [ "$#" -ge 2 ] || die "--checksums requires a value"
       checksums="$2"
+      shift 2
+      ;;
+    --release-tag)
+      [ "$#" -ge 2 ] || die "--release-tag requires a value"
+      release_tag="$2"
       shift 2
       ;;
     --output-dir)
@@ -178,6 +202,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$version" ] || die "--version is required"
+[ -n "$release_tag" ] || release_tag="v$version"
+release_tag="$(normalize_release_tag "$release_tag")"
 [ -n "$checksums" ] || die "--checksums is required"
 [ -f "$checksums" ] || die "checksums file not found: $checksums"
 [ -n "$output_dir" ] || die "--output-dir is required"

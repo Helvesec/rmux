@@ -5,7 +5,10 @@ mod common;
 use std::error::Error;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::path::Path;
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use common::{assert_success, stderr, stdout, CliHarness};
 
@@ -130,6 +133,46 @@ fn custom_socket_missing_parent_is_created_owner_only() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn bare_relative_custom_socket_uses_current_directory() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("socket-bare-relative")?;
+    let cwd = harness.tmpdir().join("cwd");
+    fs::create_dir_all(&cwd)?;
+    let socket = cwd.join("bare.sock");
+
+    let created = harness.run_with(
+        &["-S", "bare.sock", "new-session", "-d", "-s", "relative"],
+        |cmd| {
+            cmd.current_dir(&cwd);
+        },
+    )?;
+    assert_success(&created);
+    assert_eq!(stderr(&created), "");
+
+    let listed = harness.run_with(
+        &["-S", "bare.sock", "list-sessions", "-F", "#{session_name}"],
+        |cmd| {
+            cmd.current_dir(&cwd);
+        },
+    )?;
+    assert_status_success(&listed);
+    assert_eq!(stdout(&listed).trim(), "relative");
+
+    let metadata = fs::symlink_metadata(&socket)?;
+    assert_eq!(
+        metadata.mode() & 0o777,
+        0o600,
+        "bare relative -S sockets should still be owner-only"
+    );
+
+    let killed = harness.run_with(&["-S", "bare.sock", "kill-server"], |cmd| {
+        cmd.current_dir(&cwd);
+    })?;
+    assert_success(&killed);
+    wait_for_path_absent(&socket)?;
+    Ok(())
+}
+
+#[test]
 fn version_branding_stays_rmux_for_rmux_binary_and_tmux_for_shim() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("version-shim")?;
     let rmux = harness.run(&["-V"])?;
@@ -188,6 +231,137 @@ fn setup_tmux_shim_creates_local_bin_symlink() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn setup_tmux_shim_targets_stable_rmux_invocation_path() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("setup-tmux-shim-stable-target")?;
+    let home = harness.tmpdir().join("home");
+    let profile_bin = harness.tmpdir().join("profile").join("bin");
+    fs::create_dir_all(&home)?;
+    fs::create_dir_all(&profile_bin)?;
+    let profile_rmux = profile_bin.join("rmux");
+    symlink(env!("CARGO_BIN_EXE_rmux"), &profile_rmux)?;
+
+    let output = Command::new("rmux")
+        .args(["setup", "tmux-shim"])
+        .env("HOME", &home)
+        .env("PATH", &profile_bin)
+        .env(
+            "RMUX_INTERNAL_PUBLIC_BINARY_PATH",
+            env!("CARGO_BIN_EXE_rmux"),
+        )
+        .output()?;
+
+    assert_status_success(&output);
+    let shim = home.join(".local").join("bin").join("tmux");
+    assert_eq!(
+        fs::read_link(&shim)?,
+        profile_rmux,
+        "the shim should follow a stable package/profile entrypoint across upgrades"
+    );
+    Ok(())
+}
+
+#[test]
+fn setup_tmux_shim_refreshes_previous_homebrew_binary() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("setup-tmux-shim-refresh-homebrew")?;
+    let home = harness.tmpdir().join("home");
+    let bin = home.join(".local").join("bin");
+    let cellar = harness
+        .tmpdir()
+        .join("homebrew")
+        .join("Cellar")
+        .join("rmux");
+    let old_store = cellar.join("0.8.0").join("bin");
+    let current_store = cellar.join("0.9.0").join("bin");
+    fs::create_dir_all(&bin)?;
+    fs::create_dir_all(&old_store)?;
+    fs::create_dir_all(&current_store)?;
+    let old_rmux = old_store.join("rmux");
+    let current_rmux = current_store.join("rmux");
+    fs::copy(env!("CARGO_BIN_EXE_rmux"), &old_rmux)?;
+    fs::copy(env!("CARGO_BIN_EXE_rmux"), &current_rmux)?;
+    let shim = bin.join("tmux");
+    symlink(&old_rmux, &shim)?;
+
+    let output = harness.run_with(&["setup", "tmux-shim"], |cmd| {
+        cmd.env("HOME", &home)
+            .env("RMUX_INTERNAL_PUBLIC_BINARY_PATH", &current_rmux);
+    })?;
+
+    assert_status_success(&output);
+    assert!(stdout(&output).contains("updated:"));
+    assert_ne!(fs::read_link(&shim)?, old_rmux);
+    assert_eq!(fs::read_link(&shim)?, current_rmux);
+
+    fs::remove_file(&shim)?;
+    symlink(&old_rmux, &shim)?;
+    fs::remove_file(&old_rmux)?;
+    let dangling_output = harness.run_with(&["setup", "tmux-shim"], |cmd| {
+        cmd.env("HOME", &home)
+            .env("RMUX_INTERNAL_PUBLIC_BINARY_PATH", &current_rmux);
+    })?;
+
+    assert_status_success(&dangling_output);
+    assert!(stdout(&dangling_output).contains("updated:"));
+    assert_eq!(fs::read_link(&shim)?, current_rmux);
+    Ok(())
+}
+
+#[test]
+fn setup_tmux_shim_refreshes_previous_nix_store_binary() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("setup-tmux-shim-refresh-nix")?;
+    let home = harness.tmpdir().join("home");
+    let bin = home.join(".local").join("bin");
+    let store = harness.tmpdir().join("nix").join("store");
+    let old_store = store
+        .join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-rmux-0.8.0")
+        .join("bin");
+    let current_store = store
+        .join("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-rmux-0.9.0")
+        .join("bin");
+    fs::create_dir_all(&bin)?;
+    fs::create_dir_all(&old_store)?;
+    fs::create_dir_all(&current_store)?;
+    let old_rmux = old_store.join("rmux");
+    let current_rmux = current_store.join("rmux");
+    fs::copy(env!("CARGO_BIN_EXE_rmux"), &old_rmux)?;
+    fs::copy(env!("CARGO_BIN_EXE_rmux"), &current_rmux)?;
+    let shim = bin.join("tmux");
+    symlink(&old_rmux, &shim)?;
+
+    let output = harness.run_with(&["setup", "tmux-shim"], |cmd| {
+        cmd.env("HOME", &home)
+            .env("RMUX_INTERNAL_PUBLIC_BINARY_PATH", &current_rmux);
+    })?;
+
+    assert_status_success(&output);
+    assert!(stdout(&output).contains("updated:"));
+    assert_eq!(fs::read_link(&shim)?, current_rmux);
+    Ok(())
+}
+
+#[test]
+fn setup_tmux_shim_does_not_replace_unrelated_symlink() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("setup-tmux-shim-unrelated")?;
+    let home = harness.tmpdir().join("home");
+    let bin = home.join(".local").join("bin");
+    fs::create_dir_all(&bin)?;
+    let unrelated = harness.tmpdir().join("attacker").join("rmux");
+    fs::create_dir_all(unrelated.parent().expect("attacker path has parent"))?;
+    fs::write(&unrelated, b"not rmux")?;
+    let shim = bin.join("tmux");
+    symlink(&unrelated, &shim)?;
+
+    let output = harness.run_with(&["setup", "tmux-shim"], |cmd| {
+        cmd.env("HOME", &home);
+    })?;
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("refusing to overwrite"));
+    assert_eq!(fs::read_link(&shim)?, unrelated);
+    Ok(())
+}
+
+#[test]
 fn explicit_dev_null_config_is_silent_and_not_recorded_as_config_error(
 ) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("dev-null-config")?;
@@ -201,5 +375,16 @@ fn explicit_dev_null_config_is_silent_and_not_recorded_as_config_error(
         !combined.contains("/dev/null") && !combined.contains("config error"),
         "unexpected config message: {combined:?}"
     );
+    Ok(())
+}
+
+fn wait_for_path_absent(path: &Path) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while path.exists() {
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for '{}' to disappear", path.display()).into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
     Ok(())
 }

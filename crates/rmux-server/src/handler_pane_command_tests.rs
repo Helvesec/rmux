@@ -9,14 +9,19 @@ use rmux_proto::{
     BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
     MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneKillRequest,
     PaneRespawnRequest, PaneSnapshotRequest, PaneTarget, PaneTargetRef, PipePaneRequest,
-    ProcessCommand, RenameWindowRequest, Request, RespawnPaneRequest, Response, ScopeSelector,
-    SelectPaneRequest, SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest,
-    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, TerminalSize,
-    WindowTarget,
+    ProcessCommand, RenameWindowRequest, Request, ResizePaneAdjustment, ResizePaneRequest,
+    RespawnPaneRequest, Response, ScopeSelector, SelectPaneRequest, SessionName,
+    SetHookMutationRequest, SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowExtRequest,
+    SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
 };
 use rmux_proto::{HookLifecycle, HookName};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
+
+#[cfg(windows)]
+const PROCESS_OUTPUT_FILE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(not(windows))]
+const PROCESS_OUTPUT_FILE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
@@ -90,6 +95,78 @@ fn expected_spawn_cwd(path: &Path) -> String {
     path.display().to_string()
 }
 
+#[cfg(unix)]
+fn respawn_replay_script(output: &Path, tag: &str) -> String {
+    format!(
+        "printf '%s:%s:{tag}\\n' \"$(pwd)\" \"$RMUX_RESPAWN\" >> {}; sleep 60",
+        shell_quote(output)
+    )
+}
+
+#[cfg(windows)]
+fn respawn_replay_script(output: &Path, tag: &str) -> String {
+    format!(
+        "[System.IO.File]::AppendAllText({}, ((Get-Location).Path + ':' + $env:RMUX_RESPAWN + ':{}' + [char]10)); Start-Sleep -Seconds 60",
+        crate::test_shell::powershell_quote_path(output),
+        tag
+    )
+}
+
+#[cfg(unix)]
+fn respawn_argv_probe_command(output: &Path, tag: &str) -> Vec<String> {
+    vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        respawn_replay_script(output, tag),
+    ]
+}
+
+#[cfg(windows)]
+fn respawn_argv_probe_command(output: &Path, tag: &str) -> Vec<String> {
+    vec![
+        "powershell.exe".to_owned(),
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-Command".to_owned(),
+        respawn_replay_script(output, tag),
+    ]
+}
+
+#[cfg(unix)]
+fn respawn_shell_probe_command(output: &Path, tag: &str) -> String {
+    respawn_replay_script(output, tag)
+}
+
+#[cfg(unix)]
+fn respawn_shell_identity_command(output: &Path, tag: &str) -> String {
+    format!(
+        "printf '%s:%s:{tag}\\n' \"${{0##*/}}\" \"$SHELL\" >> {}; sleep 60",
+        shell_quote(output)
+    )
+}
+
+#[cfg(unix)]
+async fn set_global_default_shell(handler: &RequestHandler, shell: &str) {
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::DefaultShell,
+            value: shell.to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+}
+
+#[cfg(windows)]
+fn respawn_shell_probe_command(output: &Path, tag: &str) -> String {
+    crate::test_shell::powershell_encoded_command(&respawn_replay_script(output, tag))
+}
+
+fn respawn_probe_line(cwd: &str, environment: &str, tag: &str) -> String {
+    format!("{cwd}:{environment}:{tag}\n")
+}
+
 async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
     let created = handler
         .handle(Request::NewSession(NewSessionRequest {
@@ -100,6 +177,79 @@ async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+}
+
+async fn create_grouped_session(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+    group_target: &SessionName,
+) {
+    let created = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session_name.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: Some(group_target.clone()),
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+}
+
+async fn create_three_pane_window(handler: &RequestHandler, session_name: &SessionName) {
+    create_session(handler, session_name).await;
+    for _ in 0..2 {
+        let split = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(session_name.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    }
+}
+
+async fn active_and_last_pane_ids(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+) -> (rmux_core::PaneId, rmux_core::PaneId) {
+    let state = handler.state.lock().await;
+    let window = state
+        .sessions
+        .session(session_name)
+        .expect("session exists")
+        .window_at(0)
+        .expect("window exists");
+    let active_id = window.active_pane().expect("active pane exists").id();
+    let last_id = window
+        .last_pane_index()
+        .and_then(|pane_index| window.pane(pane_index))
+        .expect("last pane exists")
+        .id();
+    (active_id, last_id)
+}
+
+fn list_stdout(response: Response) -> String {
+    match response {
+        Response::ListPanes(response) => {
+            String::from_utf8(response.output.stdout).expect("list-panes stdout is utf8")
+        }
+        response => panic!("expected list-panes success, got {response:?}"),
+    }
 }
 
 async fn attach_to_existing_session(
@@ -129,7 +279,7 @@ async fn wait_for_attached_session_exit(control_rx: &mut mpsc::UnboundedReceiver
 }
 
 async fn wait_for_file_contents(path: &Path, expected: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + PROCESS_OUTPUT_FILE_TIMEOUT;
     loop {
         match fs::read_to_string(path) {
             Ok(contents) if contents == expected => return,
@@ -149,6 +299,157 @@ async fn wait_for_file_contents(path: &Path, expected: &str) {
             ),
         }
     }
+}
+
+async fn wait_for_pipe_child_count_to_return_to(baseline: usize) {
+    let deadline = tokio::time::Instant::now() + PROCESS_OUTPUT_FILE_TIMEOUT;
+    loop {
+        let active = crate::pane_terminals::active_pipe_child_count_for_test();
+        if active <= baseline {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for pipe-pane children to stop; baseline={baseline}, active={active}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn list_panes_activity_sort_follows_selection_counter_like_tmux() {
+    // Oracle probes 2026-07-09 (pinned tmux 3.7b): pane "activity" ordering
+    // is the active_point selection counter, ascending. Scenario A: fresh
+    // window, detached splits, no selections -> index order, identical when
+    // reversed. Scenario B: select pane 1 then pane 0 -> "2 1 0", reversed
+    // "0 1 2". Output/alert activity does not reorder anything.
+    let handler = RequestHandler::new();
+    let session = session_name("list-panes-activity-sort");
+    create_session(&handler, &session).await;
+    for _ in 0..2 {
+        let split = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(session.clone()),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    }
+
+    let list = |reversed: bool| {
+        let handler = handler.clone();
+        let session = session.clone();
+        async move {
+            list_stdout(
+                handler
+                    .handle(Request::ListPanes(Box::new(ListPanesRequest {
+                        target: session,
+                        target_window_index: Some(0),
+                        format: Some("#{pane_index}".to_owned()),
+                        filter: None,
+                        sort_order: Some("activity".to_owned()),
+                        reversed,
+                    })))
+                    .await,
+            )
+        }
+    };
+
+    let select = |pane_index: u32| {
+        let handler = handler.clone();
+        let session = session.clone();
+        async move {
+            let response = handler
+                .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                    target: PaneTarget::with_window(session, 0, pane_index),
+                    title: None,
+                    input_disabled: None,
+                    preserve_zoom: false,
+                    style: None,
+                })))
+                .await;
+            assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
+        }
+    };
+
+    // Scenario A: no explicit selection yet -> index order.
+    assert_eq!(list(false).await, "0\n1\n2\n");
+
+    // Scenario B: selections define the order.
+    select(1).await;
+    select(0).await;
+    assert_eq!(list(false).await, "2\n1\n0\n");
+    assert_eq!(list(true).await, "0\n1\n2\n");
+}
+
+#[tokio::test]
+async fn list_panes_size_sort_uses_area_in_both_directions() {
+    let handler = RequestHandler::new();
+    let session = session_name("list-panes-area-sort");
+    create_session(&handler, &session).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::ResizePane(ResizePaneRequest {
+                target: PaneTarget::with_window(session.clone(), 0, 0),
+                adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 59 },
+            }))
+            .await,
+        Response::ResizePane(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::ResizePane(ResizePaneRequest {
+                target: PaneTarget::with_window(session.clone(), 0, 0),
+                adjustment: ResizePaneAdjustment::AbsoluteHeight { rows: 5 },
+            }))
+            .await,
+        Response::ResizePane(_)
+    ));
+
+    let list = |reversed| {
+        Request::ListPanes(Box::new(ListPanesRequest {
+            target: session.clone(),
+            target_window_index: Some(0),
+            format: Some("#{pane_index}:#{pane_width}x#{pane_height}".to_owned()),
+            filter: None,
+            sort_order: Some("size".to_owned()),
+            reversed,
+        }))
+    };
+
+    assert_eq!(
+        list_stdout(handler.handle(list(false)).await),
+        "0:59x5\n2:20x24\n1:59x18\n"
+    );
+    assert_eq!(
+        list_stdout(handler.handle(list(true)).await),
+        "1:59x18\n2:20x24\n0:59x5\n"
+    );
 }
 
 async fn wait_for_dead_pane(
@@ -242,6 +543,9 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
         })))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+    handler
+        .wait_for_pane_terminal_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
 
     let (session_id, window_id, initial_pane_id, initial_output_sequence) = {
         let state = handler.state.lock().await;
@@ -336,11 +640,14 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
     )
     .to_owned();
     let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha.clone(),
             target_window_index: None,
             format: Some(list_format.clone()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let list_stdout = match listed {
         rmux_proto::Response::ListPanes(response) => {
@@ -354,10 +661,13 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
     assert!(!list_stdout.contains(&split_secret));
 
     let windows = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha.clone(),
             format: Some(list_format),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let windows_stdout = match windows {
         rmux_proto::Response::ListWindows(response) => {
@@ -453,7 +763,7 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
     }
 
     let relisted = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha,
             target_window_index: Some(0),
             format: Some(
@@ -465,7 +775,10 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
                 )
                 .to_owned(),
             ),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let relisted_stdout = match relisted {
         rmux_proto::Response::ListPanes(response) => {
@@ -712,11 +1025,14 @@ async fn pane_output_sequence_advances_when_transcript_changes() {
 
 async fn listed_output_sequence(handler: &RequestHandler, session_name: &SessionName) -> u64 {
     let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: session_name.clone(),
             target_window_index: Some(0),
             format: Some("#{pane_output_sequence}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let stdout = match listed {
         rmux_proto::Response::ListPanes(response) => {
@@ -728,6 +1044,61 @@ async fn listed_output_sequence(handler: &RequestHandler, session_name: &Session
         .trim()
         .parse::<u64>()
         .expect("pane_output_sequence is numeric")
+}
+
+#[tokio::test]
+async fn move_pane_same_window_keeps_last_when_moving_the_active_pane_like_tmux() {
+    // Oracle probe 2026-07-10, pinned tmux 3.7b: moving active %2 next to
+    // %0 keeps %2 active and the pre-move %1 as last-pane.
+    let handler = RequestHandler::new();
+    let alpha = session_name("move-active-keeps-last");
+    create_three_pane_window(&handler, &alpha).await;
+    let selection_before = active_and_last_pane_ids(&handler, &alpha).await;
+
+    let response = handler
+        .handle(Request::MovePane(MovePaneRequest {
+            source: PaneTarget::with_window(alpha.clone(), 0, 2),
+            target: PaneTarget::with_window(alpha.clone(), 0, 0),
+            direction: SplitDirection::Vertical,
+            detached: false,
+            before: false,
+            full_size: false,
+            size: None,
+        }))
+        .await;
+
+    assert!(matches!(response, Response::MovePane(_)), "{response:?}");
+    assert_eq!(
+        active_and_last_pane_ids(&handler, &alpha).await,
+        selection_before
+    );
+}
+
+#[tokio::test]
+async fn join_pane_same_window_keeps_last_when_moving_the_active_pane_like_tmux() {
+    // Same oracle matrix as move-pane: join-pane keeps active %2 and last %1.
+    let handler = RequestHandler::new();
+    let alpha = session_name("join-active-keeps-last");
+    create_three_pane_window(&handler, &alpha).await;
+    let selection_before = active_and_last_pane_ids(&handler, &alpha).await;
+
+    let response = handler
+        .handle(Request::JoinPane(rmux_proto::JoinPaneRequest {
+            source: PaneTarget::with_window(alpha.clone(), 0, 2),
+            target: PaneTarget::with_window(alpha.clone(), 0, 0),
+            direction: SplitDirection::Vertical,
+            detached: false,
+            before: false,
+            full_size: false,
+            size: None,
+        }))
+        .await;
+
+    assert!(matches!(response, Response::JoinPane(_)), "{response:?}");
+    assert_eq!(
+        active_and_last_pane_ids(&handler, &alpha).await,
+        selection_before
+    );
 }
 
 #[tokio::test]
@@ -770,6 +1141,8 @@ async fn move_pane_routes_through_join_semantics() {
                     socket_path: Path::new("/tmp/rmux-test.sock"),
                     spawn_environment: None,
                     environment_overrides: None,
+                    respawn_shell: None,
+                    respawn_environment: None,
                     pane_alert_callback: None,
                     pane_exit_callback: None,
                 },
@@ -906,6 +1279,64 @@ async fn break_pane_print_target_uses_custom_format() {
 }
 
 #[tokio::test]
+async fn break_pane_implicit_destination_starts_at_base_index() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("break-base-index");
+
+    let set_base_index = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::BaseIndex,
+            value: "1".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set_base_index, Response::SetOption(_)));
+    create_session(&handler, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let response = handler
+        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
+            source: PaneTarget::with_window(alpha.clone(), 1, 1),
+            target: None,
+            name: None,
+            detached: true,
+            after: false,
+            before: false,
+            print_target: true,
+            format: Some("#{window_index}.#{pane_index}".to_owned()),
+        })))
+        .await;
+
+    let Response::BreakPane(success) = response else {
+        panic!("expected break-pane response, got {response:?}");
+    };
+    assert_eq!(
+        success
+            .command_output()
+            .expect("break-pane -P output")
+            .stdout(),
+        b"2.0\n"
+    );
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session survives");
+    assert_eq!(
+        session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[tokio::test]
 async fn break_pane_print_target_refreshes_automatic_window_name() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha-break-name");
@@ -952,6 +1383,113 @@ async fn break_pane_print_target_refreshes_automatic_window_name() {
     assert!(
         !current_command.is_empty(),
         "pane_current_command sanity check, got {output:?}"
+    );
+}
+
+#[tokio::test]
+async fn attached_input_to_dead_kept_pane_does_not_fail_liveness_probe() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                option: OptionName::RemainOnExit,
+                value: "on".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    let respawned = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: PaneTarget::with_window(alpha.clone(), 0, 0),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: Some(vec!["exit 0".to_owned()]),
+            process_command: None,
+        })))
+        .await;
+    assert!(matches!(respawned, Response::RespawnPane(_)));
+    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+
+    let requester_pid = 44_200_u32;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let result = handler
+        .handle_attached_live_input_for_test(requester_pid, b"x")
+        .await;
+    assert!(
+        !matches!(&result, Err(error) if error.to_string().contains("target pane has exited")),
+        "attached input must not use child-process liveness as a pane liveness gate: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn respawn_pane_without_command_restarts_dead_remain_on_exit_workload() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-dead-provenance");
+    create_session(&handler, &alpha).await;
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Pane(target.clone()),
+                option: OptionName::RemainOnExit,
+                value: "on".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    let explicit = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: Some(ProcessCommand::Shell("exit 7".to_owned())),
+        })))
+        .await;
+    assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
+    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.pane_id_in_window(0, 0))
+            .expect("dead pane exists")
+    };
+    let (first_generation, _) = wait_for_lifecycle_exit(&handler, pane_id, 7).await;
+
+    let inherited = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target,
+            kill: false,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited, Response::RespawnPane(_)),
+        "{inherited:?}"
+    );
+    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    let (second_generation, _) = wait_for_lifecycle_exit(&handler, pane_id, 7).await;
+    assert!(
+        second_generation > first_generation,
+        "command-less respawn must run and exit the original workload again"
     );
 }
 
@@ -1057,6 +1595,201 @@ async fn respawn_pane_with_kill_flag_applies_directory_environment_and_command()
 }
 
 #[tokio::test]
+async fn respawn_pane_reuses_structured_command_cwd_and_private_environment() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-pane-provenance");
+    let initial_cwd = unique_temp_path("respawn-pane-provenance-initial");
+    let override_cwd = unique_temp_path("respawn-pane-provenance-override");
+    let output = unique_temp_path("respawn-pane-provenance-output");
+    fs::create_dir_all(&initial_cwd).expect("initial respawn cwd");
+    fs::create_dir_all(&override_cwd).expect("override respawn cwd");
+    let initial_argv = respawn_argv_probe_command(&output, "argv");
+    let initial_process_command = ProcessCommand::Argv(initial_argv.clone());
+    let initial_environment = "RMUX_RESPAWN=initial".to_owned();
+
+    let created = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(alpha.clone()),
+            working_directory: Some(initial_cwd.to_string_lossy().into_owned()),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: Some(vec![initial_environment.clone()]),
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: Some(initial_process_command.clone()),
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let initial_cwd_text = expected_spawn_cwd(&initial_cwd);
+    let initial_line = respawn_probe_line(&initial_cwd_text, "initial", "argv");
+    wait_for_file_contents(&output, &initial_line).await;
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let pane_id = {
+        let state = handler.state.lock().await;
+        let pane_id = state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.pane_id_in_window(0, 0))
+            .expect("initial pane exists");
+        let lifecycle = state.pane_lifecycle(pane_id).expect("initial lifecycle");
+        assert_eq!(lifecycle.process_command(), Some(&initial_process_command));
+        assert_eq!(
+            lifecycle.respawn_environment(),
+            std::slice::from_ref(&initial_environment)
+        );
+        pane_id
+    };
+
+    let inherited = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited, Response::RespawnPane(_)),
+        "{inherited:?}"
+    );
+    wait_for_file_contents(&output, &format!("{initial_line}{initial_line}")).await;
+
+    let override_environment = "RMUX_RESPAWN=override".to_owned();
+    let explicit_shell = respawn_shell_probe_command(&output, "shell");
+    let explicit_process_command = ProcessCommand::Shell(explicit_shell);
+    let explicit = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: Some(override_cwd.clone()),
+            environment: Some(vec![override_environment.clone()]),
+            command: None,
+            process_command: Some(explicit_process_command.clone()),
+        })))
+        .await;
+    assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
+    let override_cwd_text = expected_spawn_cwd(&override_cwd);
+    let override_line = respawn_probe_line(&override_cwd_text, "override", "shell");
+    wait_for_file_contents(
+        &output,
+        &format!("{initial_line}{initial_line}{override_line}"),
+    )
+    .await;
+    {
+        let state = handler.state.lock().await;
+        let lifecycle = state.pane_lifecycle(pane_id).expect("override lifecycle");
+        assert_eq!(lifecycle.process_command(), Some(&explicit_process_command));
+        assert_eq!(
+            lifecycle.private_environment(),
+            std::slice::from_ref(&override_environment)
+        );
+        assert_eq!(
+            lifecycle.respawn_environment(),
+            std::slice::from_ref(&initial_environment)
+        );
+    }
+
+    let inherited_after_override = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target,
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited_after_override, Response::RespawnPane(_)),
+        "{inherited_after_override:?}"
+    );
+    let inherited_override_line = respawn_probe_line(&override_cwd_text, "initial", "shell");
+    wait_for_file_contents(
+        &output,
+        &format!("{initial_line}{initial_line}{override_line}{inherited_override_line}"),
+    )
+    .await;
+
+    drop(handler);
+    let _ = fs::remove_file(output);
+    let _ = fs::remove_dir_all(initial_cwd);
+    let _ = fs::remove_dir_all(override_cwd);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn respawn_pane_keeps_the_original_resolved_shell_after_option_changes() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-pane-shell-provenance");
+    let output = unique_temp_path("respawn-pane-shell-provenance-output");
+    set_global_default_shell(&handler, "/bin/sh").await;
+    create_session(&handler, &alpha).await;
+    handler.wait_for_initial_panes_for_test().await;
+    set_global_default_shell(&handler, "/bin/bash").await;
+
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let shell_command = respawn_shell_identity_command(&output, "shell");
+    let explicit = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: Some(ProcessCommand::Shell(shell_command)),
+        })))
+        .await;
+    assert!(matches!(explicit, Response::RespawnPane(_)), "{explicit:?}");
+    let expected_line = "sh:/bin/sh:shell\n";
+    wait_for_file_contents(&output, expected_line).await;
+
+    let inherited = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target,
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited, Response::RespawnPane(_)),
+        "{inherited:?}"
+    );
+    wait_for_file_contents(&output, &format!("{expected_line}{expected_line}")).await;
+
+    let state = handler.state.lock().await;
+    let pane_id = state
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.pane_id_in_window(0, 0))
+        .expect("respawned pane exists");
+    assert_eq!(
+        state
+            .pane_lifecycle(pane_id)
+            .expect("respawned pane lifecycle")
+            .respawn_shell(),
+        Path::new("/bin/sh")
+    );
+    drop(state);
+    drop(handler);
+    let _ = fs::remove_file(output);
+}
+
+#[tokio::test]
 async fn respawn_pane_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("respawn-exit");
@@ -1089,11 +1822,7 @@ async fn respawn_pane_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
         .await;
     assert!(matches!(response, rmux_proto::Response::RespawnPane(_)));
 
-    let maybe_event = timeout(Duration::from_millis(150), lifecycle_events.recv()).await;
-    assert!(
-        maybe_event.is_err(),
-        "forced respawn must not synthesize pane-exited like tmux 3.4/3.6: {maybe_event:?}"
-    );
+    assert_no_pane_exited_event(&mut lifecycle_events, "forced respawn").await;
 
     let state = handler.state.lock().await;
     let pane = state
@@ -1334,13 +2063,14 @@ async fn display_panes_uses_the_default_select_pane_template() {
         .await;
 
     let response = handler
-        .handle(Request::DisplayPanes(DisplayPanesRequest {
+        .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: alpha.clone(),
             duration_ms: Some(5_000),
             non_blocking: true,
             no_command: false,
             template: None,
-        }))
+            target_client: None,
+        })))
         .await;
     assert!(matches!(response, rmux_proto::Response::DisplayPanes(_)));
     let _overlay = control_rx.recv().await.expect("display-panes overlay");
@@ -1411,13 +2141,14 @@ async fn display_panes_default_template_runs_select_pane_hooks() {
         .await;
 
     let response = handler
-        .handle(Request::DisplayPanes(DisplayPanesRequest {
+        .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: alpha.clone(),
             duration_ms: Some(5_000),
             non_blocking: true,
             no_command: false,
             template: None,
-        }))
+            target_client: None,
+        })))
         .await;
     assert!(matches!(response, rmux_proto::Response::DisplayPanes(_)));
     let _overlay = control_rx.recv().await.expect("display-panes overlay");
@@ -1478,13 +2209,14 @@ async fn display_panes_without_a_command_keeps_the_active_pane() {
         .await;
 
     let response = handler
-        .handle(Request::DisplayPanes(DisplayPanesRequest {
+        .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: alpha.clone(),
             duration_ms: Some(5_000),
             non_blocking: true,
             no_command: true,
             template: None,
-        }))
+            target_client: None,
+        })))
         .await;
     assert!(matches!(response, rmux_proto::Response::DisplayPanes(_)));
     let _overlay = control_rx.recv().await.expect("display-panes overlay");
@@ -1529,13 +2261,14 @@ async fn display_panes_uses_the_session_option_duration_by_default() {
         .await;
 
     let response = handler
-        .handle(Request::DisplayPanes(DisplayPanesRequest {
+        .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: alpha.clone(),
             duration_ms: None,
             non_blocking: true,
             no_command: true,
             template: None,
-        }))
+            target_client: None,
+        })))
         .await;
     assert!(matches!(response, rmux_proto::Response::DisplayPanes(_)));
     let _overlay = control_rx.recv().await.expect("display-panes overlay");
@@ -1573,13 +2306,14 @@ async fn display_panes_timeout_emits_a_clear_overlay_to_the_attached_client() {
         .await;
 
     let response = handler
-        .handle(Request::DisplayPanes(DisplayPanesRequest {
+        .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: alpha.clone(),
             duration_ms: Some(25),
             non_blocking: true,
             no_command: true,
             template: None,
-        }))
+            target_client: None,
+        })))
         .await;
     assert!(matches!(response, rmux_proto::Response::DisplayPanes(_)));
 
@@ -1653,6 +2387,119 @@ async fn move_pane_rejects_same_source_and_target() {
         matches!(&response, rmux_proto::Response::Error(error) if error.error.to_string().contains("must be different")),
         "expected same-pane error, got {response:?}"
     );
+}
+
+#[tokio::test]
+async fn cross_session_swap_from_group_owner_preserves_owner_and_session_pair() {
+    let handler = RequestHandler::new();
+    let owner = session_name("swap-owner-success");
+    let peer = session_name("swap-peer-success");
+    let target = session_name("swap-target-success");
+    create_session(&handler, &owner).await;
+    create_grouped_session(&handler, &peer, &owner).await;
+    create_session(&handler, &target).await;
+    let (source_pane_id, target_pane_id) = {
+        let state = handler.state.lock().await;
+        (
+            state
+                .sessions
+                .session(&owner)
+                .and_then(|session| session.pane_id_in_window(0, 0))
+                .expect("source pane exists"),
+            state
+                .sessions
+                .session(&target)
+                .and_then(|session| session.pane_id_in_window(0, 0))
+                .expect("target pane exists"),
+        )
+    };
+
+    let response = handler
+        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+            source: PaneTarget::with_window(owner.clone(), 0, 0),
+            target: PaneTarget::with_window(target.clone(), 0, 0),
+            direction: None,
+            detached: false,
+            preserve_zoom: false,
+        }))
+        .await;
+
+    assert!(matches!(response, Response::SwapPane(_)), "{response:?}");
+    let state = handler.state.lock().await;
+    assert_eq!(state.sessions.runtime_owner(&owner), Some(owner.clone()));
+    assert_eq!(state.sessions.runtime_owner(&peer), Some(owner.clone()));
+    assert_eq!(
+        state
+            .sessions
+            .session(&owner)
+            .and_then(|session| session.pane_id_in_window(0, 0)),
+        Some(target_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&peer)
+            .and_then(|session| session.pane_id_in_window(0, 0)),
+        Some(target_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&target)
+            .and_then(|session| session.pane_id_in_window(0, 0)),
+        Some(source_pane_id)
+    );
+}
+
+#[tokio::test]
+async fn cross_session_swap_rollback_restores_owner_and_session_pair() {
+    let handler = RequestHandler::new();
+    let owner = session_name("swap-owner-rollback");
+    let peer = session_name("swap-peer-rollback");
+    let target = session_name("swap-target-rollback");
+    create_session(&handler, &owner).await;
+    create_grouped_session(&handler, &peer, &owner).await;
+    create_session(&handler, &target).await;
+    handler.wait_for_initial_panes_for_test().await;
+    let (owner_before, peer_before, target_before) = {
+        let mut state = handler.state.lock().await;
+        let snapshots = (
+            state
+                .sessions
+                .session(&owner)
+                .expect("owner exists")
+                .clone(),
+            state.sessions.session(&peer).expect("peer exists").clone(),
+            state
+                .sessions
+                .session(&target)
+                .expect("target exists")
+                .clone(),
+        );
+        state.fail_next_resize_for_test();
+        snapshots
+    };
+
+    let response = handler
+        .handle(Request::SwapPane(rmux_proto::SwapPaneRequest {
+            source: PaneTarget::with_window(owner.clone(), 0, 0),
+            target: PaneTarget::with_window(target.clone(), 0, 0),
+            direction: None,
+            detached: false,
+            preserve_zoom: false,
+        }))
+        .await;
+
+    assert!(
+        matches!(&response, Response::Error(error) if error.error == rmux_proto::RmuxError::Server("injected pane terminal resize failure".to_owned())),
+        "expected injected resize failure, got {response:?}"
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(state.sessions.runtime_owner(&owner), Some(owner.clone()));
+    assert_eq!(state.sessions.runtime_owner(&peer), Some(owner.clone()));
+    assert_eq!(state.sessions.session(&owner), Some(&owner_before));
+    assert_eq!(state.sessions.session(&peer), Some(&peer_before));
+    assert_eq!(state.sessions.session(&target), Some(&target_before));
 }
 
 #[tokio::test]
@@ -1934,6 +2781,7 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, &alpha).await;
+    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
 
     let open = handler
         .handle(Request::PipePane(PipePaneRequest {
@@ -1959,6 +2807,7 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
         matches!(close, rmux_proto::Response::PipePane(_)),
         "empty command should close existing pipe, got {close:?}"
     );
+    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
 
     // Opening a new pipe after an empty-command close should succeed, confirming the previous
     // pipe was cleaned up.
@@ -1985,6 +2834,7 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
             command: None,
         }))
         .await;
+    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
 }
 
 async fn snapshot_response(

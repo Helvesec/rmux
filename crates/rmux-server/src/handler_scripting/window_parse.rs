@@ -44,8 +44,8 @@ pub(super) fn parse_window_request(
     let mut preserve_zoom = false;
     let mut input_disabled = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -72,18 +72,53 @@ pub(super) fn parse_window_request(
             }
             "-d" if command == "last-pane" => {
                 let _ = args.optional();
-                set_last_pane_input(&mut input_disabled, true)?;
+                set_last_pane_input(&mut input_disabled, true);
             }
             "-e" if command == "last-pane" => {
                 let _ = args.optional();
-                set_last_pane_input(&mut input_disabled, false)?;
+                set_last_pane_input(&mut input_disabled, false);
             }
             "-t" => {
                 let _ = args.optional();
                 target = Some(parse_window_target(command, args.required("-t target")?)?);
             }
-            flag if flag.starts_with('-') => return Err(unsupported_flag(command, flag)),
-            _ => break,
+            _ => {
+                let (bare_flags, value_flags) = if command == "last-pane" {
+                    ("deZ", "t")
+                } else {
+                    ("", "")
+                };
+                let Some(cluster) = parse_compact_flag_cluster(&token, bare_flags, value_flags)
+                else {
+                    if token.starts_with('-') {
+                        return Err(unsupported_flag(command, &token));
+                    }
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('Z') if command == "last-pane" => {
+                            preserve_zoom = true;
+                        }
+                        CompactFlag::Bare('d') if command == "last-pane" => {
+                            set_last_pane_input(&mut input_disabled, true);
+                        }
+                        CompactFlag::Bare('e') if command == "last-pane" => {
+                            set_last_pane_input(&mut input_disabled, false);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. }
+                            if command == "last-pane" =>
+                        {
+                            target = Some(parse_window_target(
+                                command,
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        _ => unreachable!("compact window request flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
     args.no_extra(command)?;
@@ -110,14 +145,11 @@ pub(super) fn parse_window_request(
     }
 }
 
-fn set_last_pane_input(current: &mut Option<bool>, disabled: bool) -> Result<(), RmuxError> {
-    if current.is_some() {
-        return Err(RmuxError::Server(
-            "last-pane accepts only one of -d or -e".to_owned(),
-        ));
+fn set_last_pane_input(current: &mut Option<bool>, disabled: bool) {
+    // tmux 3.7b accepts both flags and gives -e precedence regardless of order.
+    if !disabled || current.is_none() {
+        *current = Some(disabled);
     }
-    *current = Some(disabled);
-    Ok(())
 }
 
 fn set_select_window_mode(

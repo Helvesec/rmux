@@ -8,23 +8,42 @@ use rmux_proto::{
 
 use crate::pane_terminals::session_not_found;
 
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::{missing_argument, unsupported_flag};
 use super::{implicit_session_name, parse_session_name};
 
 pub(super) fn parse_list_sessions(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut format = None;
     let mut filter = None;
-    let sort_order = None;
-    let reversed = false;
+    let mut sort_order = None;
+    let mut reversed = false;
 
     while let Some(token) = args.optional() {
         match token.as_str() {
             "-F" => format = Some(args.required("-F format")?),
             "-f" => filter = Some(args.required("-f filter")?),
-            "-O" => return Err(unsupported_flag("list-sessions", "-O")),
-            "-r" => return Err(unsupported_flag("list-sessions", "-r")),
-            flag if flag.starts_with('-') => return Err(unsupported_flag("list-sessions", flag)),
+            "-O" => sort_order = Some(args.required("-O order")?),
+            "-r" => reversed = true,
+            flag if flag.starts_with('-') => {
+                let Some(flags) = parse_compact_flag_cluster(flag, "r", "FfO") else {
+                    return Err(unsupported_flag("list-sessions", flag));
+                };
+                for flag in flags {
+                    match flag {
+                        CompactFlag::Bare('r') => reversed = true,
+                        value @ CompactFlag::Value { flag: 'F', .. } => {
+                            format = Some(value.value_or_next(&mut args, "-F format")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'f', .. } => {
+                            filter = Some(value.value_or_next(&mut args, "-f filter")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'O', .. } => {
+                            sort_order = Some(value.value_or_next(&mut args, "-O order")?)
+                        }
+                        _ => return Err(unsupported_flag("list-sessions", &token)),
+                    }
+                }
+            }
             _ => {
                 return Err(RmuxError::Server(format!(
                     "unexpected argument '{token}' for list-sessions"
@@ -48,12 +67,42 @@ pub(super) fn parse_list_windows(
 ) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut format = None;
+    let mut filter = None;
+    let mut sort_order = None;
+    let mut reversed = false;
 
     while let Some(token) = args.optional() {
         match token.as_str() {
             "-t" => target = Some(parse_session_name(args.required("-t target")?)?),
             "-F" => format = Some(args.required("-F format")?),
-            flag if flag.starts_with('-') => return Err(unsupported_flag("list-windows", flag)),
+            "-f" => filter = Some(args.required("-f filter")?),
+            "-O" => sort_order = Some(args.required("-O order")?),
+            "-r" => reversed = true,
+            flag if flag.starts_with('-') => {
+                let Some(flags) = parse_compact_flag_cluster(flag, "r", "FfOt") else {
+                    return Err(unsupported_flag("list-windows", flag));
+                };
+                for flag in flags {
+                    match flag {
+                        CompactFlag::Bare('r') => reversed = true,
+                        value @ CompactFlag::Value { flag: 'F', .. } => {
+                            format = Some(value.value_or_next(&mut args, "-F format")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'f', .. } => {
+                            filter = Some(value.value_or_next(&mut args, "-f filter")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'O', .. } => {
+                            sort_order = Some(value.value_or_next(&mut args, "-O order")?)
+                        }
+                        value @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_session_name(
+                                value.value_or_next(&mut args, "-t target")?,
+                            )?)
+                        }
+                        _ => return Err(unsupported_flag("list-windows", &token)),
+                    }
+                }
+            }
             _ => {
                 return Err(RmuxError::Server(format!(
                     "unexpected argument '{token}' for list-windows"
@@ -62,14 +111,17 @@ pub(super) fn parse_list_windows(
         }
     }
 
-    Ok(Request::ListWindows(ListWindowsRequest {
+    Ok(Request::ListWindows(Box::new(ListWindowsRequest {
         target: target.unwrap_or(implicit_session_name(
             sessions,
             find_context,
             "list-windows",
         )?),
         format,
-    }))
+        filter,
+        sort_order,
+        reversed,
+    })))
 }
 
 pub(super) fn parse_list_panes(
@@ -80,6 +132,9 @@ pub(super) fn parse_list_panes(
     let mut target = None;
     let mut target_window_index = None;
     let mut format = None;
+    let mut filter = None;
+    let mut sort_order = None;
+    let mut reversed = false;
     let mut session_scope = false;
 
     while let Some(token) = args.optional() {
@@ -92,7 +147,39 @@ pub(super) fn parse_list_panes(
             }
             "-F" => format = Some(args.required("-F format")?),
             "-s" => session_scope = true,
-            flag if flag.starts_with('-') => return Err(unsupported_flag("list-panes", flag)),
+            "-f" => filter = Some(args.required("-f filter")?),
+            "-O" => sort_order = Some(args.required("-O order")?),
+            "-r" => reversed = true,
+            flag if flag.starts_with('-') => {
+                let Some(flags) = parse_compact_flag_cluster(flag, "sr", "FfOt") else {
+                    return Err(unsupported_flag("list-panes", flag));
+                };
+                for flag in flags {
+                    match flag {
+                        CompactFlag::Bare('s') => session_scope = true,
+                        CompactFlag::Bare('r') => reversed = true,
+                        value @ CompactFlag::Value { flag: 'F', .. } => {
+                            format = Some(value.value_or_next(&mut args, "-F format")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'f', .. } => {
+                            filter = Some(value.value_or_next(&mut args, "-f filter")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'O', .. } => {
+                            sort_order = Some(value.value_or_next(&mut args, "-O order")?)
+                        }
+                        value @ CompactFlag::Value { flag: 't', .. } => {
+                            let (session_name, window_index) = parse_list_panes_target(
+                                value.value_or_next(&mut args, "-t target")?,
+                                sessions,
+                                find_context,
+                            )?;
+                            target = Some(session_name);
+                            target_window_index = window_index;
+                        }
+                        _ => return Err(unsupported_flag("list-panes", &token)),
+                    }
+                }
+            }
             _ => {
                 return Err(RmuxError::Server(format!(
                     "unexpected argument '{token}' for list-panes"
@@ -111,16 +198,22 @@ pub(super) fn parse_list_panes(
         target_window_index
     };
 
-    Ok(Request::ListPanes(ListPanesRequest {
+    Ok(Request::ListPanes(Box::new(ListPanesRequest {
         target,
         target_window_index,
         format,
-    }))
+        filter,
+        sort_order,
+        reversed,
+    })))
 }
 
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct ParsedListPanesAllCommand {
     pub(in crate::handler) format: Option<String>,
+    pub(in crate::handler) filter: Option<String>,
+    pub(in crate::handler) sort_order: Option<String>,
+    pub(in crate::handler) reversed: bool,
 }
 
 pub(super) fn parse_queued_list_panes_all(
@@ -128,27 +221,52 @@ pub(super) fn parse_queued_list_panes_all(
 ) -> Result<Option<ParsedListPanesAllCommand>, RmuxError> {
     let mut all_sessions = false;
     let mut format = None;
+    let mut filter = None;
+    let mut sort_order = None;
+    let mut reversed = false;
 
     while let Some(token) = args.optional() {
         match token.as_str() {
             "-a" => all_sessions = true,
             "-F" => format = Some(args.required("-F format")?),
-            flag if flag.starts_with('-') && compact_list_panes_all_flags(flag) => {
-                all_sessions = true;
+            "-f" => filter = Some(args.required("-f filter")?),
+            "-O" => sort_order = Some(args.required("-O order")?),
+            "-r" => reversed = true,
+            flag if flag.starts_with('-') => {
+                let Some(flags) = parse_compact_flag_cluster(flag, "asr", "FfOt") else {
+                    return Ok(None);
+                };
+                for flag in flags {
+                    match flag {
+                        CompactFlag::Bare('a') => all_sessions = true,
+                        CompactFlag::Bare('s') => {}
+                        CompactFlag::Bare('r') => reversed = true,
+                        value @ CompactFlag::Value { flag: 'F', .. } => {
+                            format = Some(value.value_or_next(&mut args, "-F format")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'f', .. } => {
+                            filter = Some(value.value_or_next(&mut args, "-f filter")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'O', .. } => {
+                            sort_order = Some(value.value_or_next(&mut args, "-O order")?)
+                        }
+                        value @ CompactFlag::Value { flag: 't', .. } => {
+                            let _ = value.value_or_next(&mut args, "-t target")?;
+                        }
+                        _ => return Ok(None),
+                    }
+                }
             }
-            flag if flag.starts_with('-') => return Ok(None),
             _ => return Ok(None),
         }
     }
 
-    Ok(all_sessions.then_some(ParsedListPanesAllCommand { format }))
-}
-
-fn compact_list_panes_all_flags(flag: &str) -> bool {
-    let Some(rest) = flag.strip_prefix('-') else {
-        return false;
-    };
-    !rest.is_empty() && rest.chars().all(|ch| matches!(ch, 'a' | 's')) && rest.contains('a')
+    Ok(all_sessions.then_some(ParsedListPanesAllCommand {
+        format,
+        filter,
+        sort_order,
+        reversed,
+    }))
 }
 
 fn implicit_list_panes_target(

@@ -1,4 +1,4 @@
-use rmux_core::{text_width, truncate_to_width, Utf8Config};
+use rmux_core::{text_width, truncate_right_to_width, truncate_to_width, Utf8Config};
 
 use crate::renderer::RenderedPrompt;
 
@@ -15,14 +15,10 @@ pub(super) fn rendered_prompt_input(
         return (prompt_text, String::new());
     }
 
-    let mut visible = prompt.input.clone();
-    while text_width(&visible, utf8) > available {
-        let Some((index, _)) = visible.char_indices().nth(1) else {
-            break;
-        };
-        visible.drain(..index);
-    }
-    (prompt_text, truncate_to_width(&visible, available, utf8))
+    (
+        prompt_text,
+        truncate_right_to_width(&prompt.input, available, utf8),
+    )
 }
 
 #[cfg(test)]
@@ -71,5 +67,19 @@ mod tests {
         let (left, right) = rendered_prompt_input(&prompt, 10, &utf8);
         assert_eq!(left, "cmd: ");
         assert_eq!(right, "hello");
+    }
+
+    #[test]
+    fn prompt_render_keeps_complete_wide_cells_from_the_input_tail() {
+        let utf8 = Utf8Config::default();
+        let prompt = RenderedPrompt {
+            prompt: String::new(),
+            input: "A表B".to_owned(),
+            cursor: 3,
+            command_prompt: true,
+        };
+        let (left, right) = rendered_prompt_input(&prompt, 3, &utf8);
+        assert_eq!(left, "");
+        assert_eq!(right, "表B");
     }
 }

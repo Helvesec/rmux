@@ -510,14 +510,24 @@ fn widget_render_does_not_require_async_runtime() {
 
 #[test]
 fn widget_render_clips_wide_glyph_at_right_edge() {
-    // A wide glyph at the rightmost cell that would overflow must still
-    // not corrupt cells outside the render area; the widget paints the
-    // glyph and ignores its padding when the padding column is clipped.
+    // A wide glyph clipped to a one-column widget must not claim the first
+    // cell of an adjacent widget or suppress that cell from Buffer::diff.
     let cells = vec![PaneCell::new(PaneGlyph::new("漢", 2)), PaneCell::padding()];
     let snapshot = PaneSnapshot::new(2, 1, cells, PaneCursor::default()).unwrap();
     let state = PaneState::from_snapshot(snapshot);
-    let area = Rect::new(0, 0, 1, 1);
-    let mut buf = Buffer::empty(area);
-    PaneWidget::new(&state).render(area, &mut buf);
-    assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "漢");
+    let buffer_area = Rect::new(0, 0, 2, 1);
+    let previous = Buffer::empty(buffer_area);
+    let mut current = Buffer::empty(buffer_area);
+    PaneWidget::new(&state).render(Rect::new(0, 0, 1, 1), &mut current);
+    current.cell_mut((1, 0)).unwrap().set_symbol("X");
+
+    assert_eq!(current.cell((0, 0)).unwrap().symbol(), " ");
+    assert_eq!(current.cell((1, 0)).unwrap().symbol(), "X");
+    assert!(
+        previous
+            .diff(&current)
+            .iter()
+            .any(|(x, y, cell)| (*x, *y, cell.symbol()) == (1, 0, "X")),
+        "clipped wide glyph must not suppress the adjacent widget update"
+    );
 }

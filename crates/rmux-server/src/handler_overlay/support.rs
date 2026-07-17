@@ -4,7 +4,6 @@ use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
 
 use super::parse::ParsedDisplayPopupCommand;
-use super::PromptInputEvent;
 
 pub(super) fn popup_shell_command(
     state: &HandlerState,
@@ -51,8 +50,4 @@ pub(super) fn find_session_name_by_id(
     state.sessions.iter().find_map(|(session_name, session)| {
         (session.id().as_u32() == session_id).then_some(session_name.clone())
     })
-}
-
-pub(super) fn decode_prompt_key_guess(bytes: &[u8]) -> Option<PromptInputEvent> {
-    super::super::pane_support::decode_prompt_input_event(bytes).map(|(event, _)| event)
 }

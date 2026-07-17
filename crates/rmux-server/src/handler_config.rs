@@ -8,6 +8,8 @@ use rmux_proto::{
     ShowEnvironmentResponse, ShowHooksResponse, ShowOptionsResponse, WindowTarget,
 };
 
+#[cfg(windows)]
+use super::pane_support::format_references_pane_pid;
 use super::RequestHandler;
 use crate::format_runtime::render_runtime_template;
 use crate::handler_support::{ensure_option_scope_exists, ensure_scope_session_exists};
@@ -16,6 +18,9 @@ use crate::hook_compat::{
     normalize_set_hook_request,
 };
 use crate::terminal::TerminalProfile;
+
+#[path = "handler_config/show_options.rs"]
+mod show_options;
 
 impl RequestHandler {
     pub(super) async fn handle_set_environment(
@@ -35,6 +40,11 @@ impl RequestHandler {
 
         if let Err(error) = validate_set_environment_request(&request) {
             return Response::Error(ErrorResponse { error });
+        }
+
+        #[cfg(windows)]
+        if request.format && format_references_pane_pid(Some(&request.value)) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
         }
 
         let mut state = self.state.lock().await;
@@ -101,7 +111,11 @@ impl RequestHandler {
             run_immediately: false,
             index: None,
         };
-        let request = match canonicalize_set_hook_mutation_command(request) {
+        let parser = {
+            let state = self.state.lock().await;
+            super::scripting_support::command_parser_from_state(&state)
+        };
+        let request = match canonicalize_set_hook_mutation_command(request, &parser) {
             Ok(request) => request,
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
@@ -113,7 +127,14 @@ impl RequestHandler {
         request: SetHookMutationRequest,
     ) -> Response {
         let request = normalize_set_hook_mutation_request(request);
-        let request = match canonicalize_set_hook_mutation_command(request) {
+        if let Err(error) = validate_hook_mutation_request(&request) {
+            return Response::Error(ErrorResponse { error });
+        }
+        let parser = {
+            let state = self.state.lock().await;
+            super::scripting_support::command_parser_from_state(&state)
+        };
+        let request = match canonicalize_set_hook_mutation_command(request, &parser) {
             Ok(request) => request,
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
@@ -135,11 +156,15 @@ impl RequestHandler {
                 return Response::Error(ErrorResponse { error });
             }
             let current_target = super::target_for_scope_selector(&state, &request.scope);
+            let dispatch_scope = current_target
+                .as_ref()
+                .map(super::target_to_scope)
+                .unwrap_or(ScopeSelector::Global);
             drop(state);
 
             self.queue_inline_hook(
                 request.hook,
-                request.scope.clone(),
+                dispatch_scope,
                 current_target,
                 crate::hook_runtime::PendingInlineHookFormat::HookOnly,
             );
@@ -160,18 +185,23 @@ impl RequestHandler {
             if let Err(error) = validate_hook_registration(request.hook, &request.scope) {
                 return Response::Error(ErrorResponse { error });
             }
+            super::prune_dead_hook_identities(&mut state);
+            let identity = match super::resolve_hook_scope_identity_for_hook(
+                &state,
+                &request.scope,
+                request.hook,
+            ) {
+                Ok(identity) => identity,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
 
             if request.unset {
-                if let Err(error) =
-                    state
-                        .hooks
-                        .unset(request.scope.clone(), request.hook, request.index)
-                {
-                    return Response::Error(ErrorResponse { error });
-                }
+                state
+                    .hooks
+                    .unset_with_identity(&identity, request.hook, request.index);
             } else if let Some(command) = request.command.clone() {
-                if let Err(error) = state.hooks.set_with_options(
-                    request.scope.clone(),
+                state.hooks.set_with_identity(
+                    identity,
                     request.hook,
                     command,
                     request.lifecycle,
@@ -179,9 +209,7 @@ impl RequestHandler {
                         append: request.append,
                         index: request.index,
                     },
-                ) {
-                    return Response::Error(ErrorResponse { error });
-                }
+                );
             }
         }
 
@@ -200,6 +228,13 @@ impl RequestHandler {
 
         if let Err(error) = ensure_option_scope_exists(&state, &request.scope) {
             return Response::Error(ErrorResponse { error });
+        }
+
+        if let Some(lines) = show_options::render_named_hook(&state, &request) {
+            return Response::ShowOptions(ShowOptionsResponse {
+                scope: request.scope,
+                output: command_output_from_lines(&lines),
+            });
         }
 
         let mode = if request.include_inherited {
@@ -221,7 +256,10 @@ impl RequestHandler {
             mode,
         ) {
             Ok(lines) => {
-                let lines = self.render_runtime_show_options_lines(&state, &request, lines);
+                let mut lines = self.render_runtime_show_options_lines(&state, &request, lines);
+                if request.include_hooks && request.name.is_none() {
+                    lines.extend(show_options::render_included_hooks(&state, &request));
+                }
                 Response::ShowOptions(ShowOptionsResponse {
                     scope: request.scope,
                     output: command_output_from_lines(&lines),
@@ -243,7 +281,7 @@ impl RequestHandler {
         request: &rmux_proto::ShowOptionsRequest,
         lines: Vec<String>,
     ) -> Vec<String> {
-        if !matches!(request.name.as_deref(), Some("default-shell")) {
+        if request.name.is_some() && !matches!(request.name.as_deref(), Some("default-shell")) {
             return lines;
         }
         if !matches!(request.scope, OptionScopeSelector::SessionGlobal) {
@@ -257,10 +295,29 @@ impl RequestHandler {
         )
         .to_string_lossy()
         .into_owned();
-        if request.value_only {
-            vec![shell]
+        if request.value_only && matches!(request.name.as_deref(), Some("default-shell")) {
+            if lines.as_slice() == [""] {
+                vec![shell]
+            } else {
+                lines
+            }
+        } else if matches!(request.name.as_deref(), Some("default-shell")) {
+            if lines.as_slice() == ["default-shell ''"] {
+                vec![format!("default-shell {shell}")]
+            } else {
+                lines
+            }
         } else {
-            vec![format!("default-shell {shell}")]
+            lines
+                .into_iter()
+                .map(|line| {
+                    if line == "default-shell ''" {
+                        format!("default-shell {shell}")
+                    } else {
+                        line
+                    }
+                })
+                .collect()
         }
     }
 
@@ -335,24 +392,37 @@ impl RequestHandler {
             Ok(ShowHooksSelection::Session(session_name)) => {
                 Response::ShowHooks(ShowHooksResponse {
                     scope: request.scope,
-                    output: command_output_from_lines(&render_hook_lines(
-                        &state
-                            .hooks
-                            .session_bindings_view(&session_name, request.hook),
-                    )),
+                    output: match super::hook_bindings_view(
+                        &state,
+                        &ScopeSelector::Session(session_name),
+                        request.hook,
+                    ) {
+                        Ok(bindings) => command_output_from_lines(&render_hook_lines(&bindings)),
+                        Err(error) => return Response::Error(ErrorResponse { error }),
+                    },
                 })
             }
             Ok(ShowHooksSelection::Window(target)) => Response::ShowHooks(ShowHooksResponse {
                 scope: request.scope,
-                output: command_output_from_lines(&render_hook_lines(
-                    &state.hooks.window_bindings_view(&target, request.hook),
-                )),
+                output: match super::hook_bindings_view(
+                    &state,
+                    &ScopeSelector::Window(target),
+                    request.hook,
+                ) {
+                    Ok(bindings) => command_output_from_lines(&render_hook_lines(&bindings)),
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                },
             }),
             Ok(ShowHooksSelection::Pane(target)) => Response::ShowHooks(ShowHooksResponse {
                 scope: request.scope,
-                output: command_output_from_lines(&render_hook_lines(
-                    &state.hooks.pane_bindings_view(&target, request.hook),
-                )),
+                output: match super::hook_bindings_view(
+                    &state,
+                    &ScopeSelector::Pane(target),
+                    request.hook,
+                ) {
+                    Ok(bindings) => command_output_from_lines(&render_hook_lines(&bindings)),
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                },
             }),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
@@ -478,14 +548,14 @@ fn resolve_show_hooks_selection(
         ));
     }
 
+    if let (ScopeSelector::Global, Some(hook)) = (&request.scope, request.hook) {
+        return Ok(match hook_global_root(hook) {
+            HookGlobalRoot::Session => ShowHooksSelection::GlobalSession,
+            HookGlobalRoot::Window => ShowHooksSelection::GlobalWindow,
+        });
+    }
+
     match (&request.scope, request.window, request.pane) {
-        (ScopeSelector::Global, false, false)
-            if request
-                .hook
-                .is_some_and(|hook| hook_global_root(hook) == HookGlobalRoot::Window) =>
-        {
-            Ok(ShowHooksSelection::GlobalWindow)
-        }
         (ScopeSelector::Global, false, false) => Ok(ShowHooksSelection::GlobalSession),
         (ScopeSelector::Global, true, false) | (ScopeSelector::Global, false, true) => {
             Ok(ShowHooksSelection::GlobalWindow)

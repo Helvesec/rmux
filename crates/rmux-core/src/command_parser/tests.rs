@@ -43,6 +43,14 @@ fn lookup_rejects_unknown_commands_with_tmux_diagnostic() {
         lookup_command("wait-pane").unwrap_err().to_string(),
         "unknown command: wait-pane"
     );
+    assert_eq!(
+        lookup_command("new-pane").unwrap_err().to_string(),
+        "unknown command: new-pane"
+    );
+    assert_eq!(
+        lookup_command("newp").unwrap_err().to_string(),
+        "unknown command: newp"
+    );
 }
 
 #[test]
@@ -152,6 +160,116 @@ fn preserves_standard_escaped_backslashes_in_windows_drive_paths() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn preserves_literal_and_escaped_windows_unc_paths() {
+    for input in [
+        r#"set-environment -g AUDIT_PATH "\\server\share""#,
+        r#"set-environment -g AUDIT_PATH "\\\\server\\share""#,
+    ] {
+        let commands = CommandParser::new().parse(input).unwrap();
+        assert_eq!(
+            commands.commands()[0].arguments()[2].as_string(),
+            Some(r"\\server\share"),
+            "input: {input}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_literal_and_escaped_windows_device_paths() {
+    for input in [
+        r#"set-environment -g AUDIT_PATH "\\?\C:\Users\RMUXUser""#,
+        r#"set-environment -g AUDIT_PATH "\\\\?\\C:\\Users\\RMUXUser""#,
+    ] {
+        let commands = CommandParser::new().parse(input).unwrap();
+        assert_eq!(
+            commands.commands()[0].arguments()[2].as_string(),
+            Some(r"\\?\C:\Users\RMUXUser"),
+            "input: {input}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_non_path_leading_escaped_text_semantics() {
+    let commands = CommandParser::new()
+        .parse(r#"display-message "\\n""#)
+        .unwrap();
+
+    assert_eq!(
+        commands.commands()[0].arguments()[0].as_string(),
+        Some(r"\n")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_relative_and_embedded_windows_paths() {
+    for (input, expected) in [
+        (
+            r#"display-message ".\scripts\tool.ps1""#,
+            r".\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "..\scripts\tool.ps1""#,
+            r"..\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=.\scripts\tool.ps1""#,
+            r"--script=.\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=C:\scripts\tool.ps1""#,
+            r"--script=C:\scripts\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=C:\folder=one\tool.ps1""#,
+            r"--script=C:\folder=one\tool.ps1",
+        ),
+        (
+            r#"display-message "--script=\\server\share\tool.ps1""#,
+            r"--script=\\server\share\tool.ps1",
+        ),
+    ] {
+        let commands = CommandParser::new().parse(input).unwrap();
+        assert_eq!(
+            commands.commands()[0].arguments()[0].as_string(),
+            Some(expected),
+            "input: {input}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_escape_semantics_when_a_later_separator_exists() {
+    let commands = CommandParser::new()
+        .parse(
+            r#"display-message "\n/later" "\t/later" "\u263A/later" "\101/later" "\a\b\e\f\s\v\r\n\t\101\u263A/later""#,
+        )
+        .unwrap();
+    let args = commands.commands()[0].arguments();
+
+    assert_eq!(args[0].as_string(), Some("\n/later"));
+    assert_eq!(args[1].as_string(), Some("\t/later"));
+    assert_eq!(args[2].as_string(), Some("☺/later"));
+    assert_eq!(args[3].as_string(), Some("A/later"));
+    assert_eq!(
+        args[4].as_string(),
+        Some("\x07\x08\x1b\x0c \x0b\r\n\tA☺/later")
+    );
+
+    for input in [
+        r#"display-message "\400/later""#,
+        r#"display-message "\u12xz/later""#,
+    ] {
+        assert!(CommandParser::new().parse(input).is_err(), "input: {input}");
+    }
+}
+
 #[test]
 fn expands_variables_and_tilde_at_tokenization_boundary() {
     let commands = CommandParser::new()
@@ -167,6 +285,34 @@ fn expands_variables_and_tilde_at_tokenization_boundary() {
         .collect::<Vec<_>>();
 
     assert_eq!(args, ["alpha", "", "/tmp/home/x", "/home/bob/y"]);
+}
+
+#[test]
+fn current_user_tilde_prefers_home_and_uses_an_explicit_fallback() {
+    let primary = CommandParser::new()
+        .with_environment_value("HOME", "/primary/home")
+        .with_home_dir("/fallback/home")
+        .parse("display-message ~/config")
+        .expect("HOME-backed tilde parses");
+    assert_eq!(
+        primary.commands()[0].arguments()[0].as_string(),
+        Some("/primary/home/config")
+    );
+
+    let empty_home = CommandParser::new()
+        .with_environment_value("HOME", "")
+        .with_home_dir("/fallback/home")
+        .parse("display-message ~/config")
+        .expect("empty HOME uses the explicit fallback");
+    assert_eq!(
+        empty_home.commands()[0].arguments()[0].as_string(),
+        Some("/fallback/home/config")
+    );
+
+    let missing_home = CommandParser::new()
+        .parse("display-message ~/config")
+        .expect_err("tilde without HOME or a fallback must remain an error");
+    assert_eq!(missing_home.to_string(), "unknown user: ~");
 }
 
 #[test]
@@ -247,6 +393,23 @@ fn serializes_embedded_command_lists_with_escaped_separators() {
 }
 
 #[test]
+fn binding_serialization_is_lossless_for_double_quotes_backslashes_and_controls() {
+    for input in [
+        r#"set-buffer -b got 'a"b\\c'"#,
+        "set-buffer -b got 'quoted\"tab\there'",
+        "set-buffer -b got 'quoted\"line\nthere'",
+    ] {
+        let commands = CommandParser::new().parse(input).expect("command parses");
+        let serialized = commands.to_tmux_binding_string();
+        let reparsed = CommandParser::new()
+            .parse(&serialized)
+            .expect("binding serialization reparses");
+
+        assert_eq!(reparsed, commands, "serialized={serialized:?}");
+    }
+}
+
+#[test]
 fn serializes_arguments_with_tmux_quote_style() {
     for (input, expected) in [
         (
@@ -261,6 +424,10 @@ fn serializes_arguments_with_tmux_quote_style() {
             r#"display-message 'has"quote'"#,
             r#"display-message 'has"quote'"#,
         ),
+        (r#"display-message 'a b"c'"#, r#"display-message "a b\"c""#),
+        ("display-message 'a\"\\b'", "display-message 'a\"\\\\b'"),
+        (r#"display-message "~ foo""#, r#"display-message "\~ foo""#),
+        (r#"display-message "%""#, r#"display-message \%"#),
         (
             r#"display-message "both'\"quotes""#,
             r#"display-message "both'\"quotes""#,
@@ -285,6 +452,16 @@ fn serializes_arguments_with_tmux_quote_style() {
             r#"display-message 'brace{value}'"#,
             r#"display-message "brace{value}""#,
         ),
+        (
+            r#"display-message '~nosuchuser/file'"#,
+            r#"display-message \~nosuchuser/file"#,
+        ),
+        (r#"display-message '~ foo'"#, r#"display-message "\~ foo""#),
+        (r#"display-message '100%'"#, r#"display-message "100%""#),
+        (
+            "display-message \"has\\\"quote\tthere\"",
+            "display-message 'has\"quote\\tthere'",
+        ),
     ] {
         let commands = CommandParser::new().parse(input).expect("command parses");
         assert_eq!(commands.to_tmux_string(), expected);
@@ -305,6 +482,41 @@ fn serializes_dollar_arguments_for_lossless_reparse() {
 }
 
 #[test]
+fn to_tmux_string_round_trip_preserves_dollar_anchor_in_substitution() {
+    let commands = CommandParser::new()
+        .parse(r#"display-message -p '#{s/$/Z/:session_name}'"#)
+        .expect("command parses");
+    let serialized = commands.to_tmux_string();
+
+    assert!(
+        serialized.contains("#{s/$/Z/:session_name}"),
+        "dollar anchor should not be backslash-escaped in {serialized:?}"
+    );
+
+    let reparsed = CommandParser::new()
+        .parse(&serialized)
+        .expect("serialized command reparses");
+    assert_eq!(reparsed, commands);
+}
+
+#[test]
+fn to_tmux_string_escapes_control_whitespace_like_tmux_verbose_output() {
+    let commands = CommandParser::new()
+        .parse("display-message \"a b\\nc\" \"tab\\there\" \"car\\rret\"")
+        .expect("command parses");
+
+    assert_eq!(
+        commands.to_tmux_string(),
+        r#"display-message "a b\nc" tab\there car\rret"#
+    );
+
+    let reparsed = CommandParser::new()
+        .parse(&commands.to_tmux_string())
+        .expect("serialized command reparses");
+    assert_eq!(reparsed, commands);
+}
+
+#[test]
 fn records_command_start_lines_from_token_stream() {
     let commands = CommandParser::new()
         .parse("list-sessions\n\ndisplay-message ok")
@@ -312,6 +524,54 @@ fn records_command_start_lines_from_token_stream() {
 
     assert_eq!(commands.commands()[0].line(), 1);
     assert_eq!(commands.commands()[1].line(), 3);
+}
+
+#[test]
+fn source_file_records_command_end_lines_for_multiline_tokens() {
+    let commands = CommandParser::new()
+        .parse_source_file("display-message \"a\nb\"\nset -g @after yes\n")
+        .unwrap();
+
+    assert_eq!(commands.commands()[0].start_line(), 1);
+    assert_eq!(commands.commands()[0].line(), 2);
+    assert_eq!(commands.commands()[1].start_line(), 3);
+    assert_eq!(commands.commands()[1].line(), 3);
+}
+
+#[test]
+fn source_file_comment_newline_counts_before_command_grouping() {
+    let commands = CommandParser::new()
+        .parse_source_file("display-message one # trailing comment\ndisplay-message two\n")
+        .unwrap();
+
+    assert_eq!(commands.commands()[0].start_line(), 1);
+    assert_eq!(commands.commands()[0].line(), 2);
+    assert_eq!(commands.commands()[1].start_line(), 2);
+    assert_eq!(commands.commands()[1].line(), 2);
+}
+
+#[test]
+fn source_file_lookup_errors_report_multiline_command_end_line() {
+    let error = CommandParser::new()
+        .parse_source_file("definitely-not-a-command \"a\nb\"\n")
+        .unwrap_err();
+
+    assert_eq!(error.line(), 2);
+    assert_eq!(error.kind(), CommandParseErrorKind::Lookup);
+    assert!(error
+        .to_string()
+        .starts_with("unknown command: definitely-not-a-command"));
+}
+
+#[test]
+fn source_file_rejects_unquoted_unknown_percent_directives_as_syntax_errors() {
+    let error = CommandParser::new()
+        .parse_source_file("%word\n")
+        .unwrap_err();
+
+    assert_eq!(error.line(), 1);
+    assert_eq!(error.kind(), CommandParseErrorKind::Structural);
+    assert_eq!(error.to_string(), "syntax error");
 }
 
 #[test]
@@ -374,6 +634,48 @@ fn classifies_assignments_and_hidden_assignments() {
         commands.commands()[1].arguments()[0].as_string(),
         Some("1BAD=value")
     );
+}
+
+#[test]
+fn hoists_nested_parse_time_assignments_in_lexical_order_and_reparses_losslessly() {
+    let commands = CommandParser::new()
+        .parse(
+            "OUTER=first ; if-shell -F 0 { FALSE_ONLY=no ; %hidden SECRET='two words' } { TRUE_ONLY=yes } ; set-hook -g after-new-window { HOOK=hooked ; if-shell -F 1 { DEEP=deep } } ; OUTER=last",
+        )
+        .expect("nested assignments parse");
+
+    assert_eq!(
+        commands
+            .assignments()
+            .iter()
+            .map(|assignment| (assignment.name(), assignment.value(), assignment.hidden()))
+            .collect::<Vec<_>>(),
+        [
+            ("OUTER", "first", false),
+            ("FALSE_ONLY", "no", false),
+            ("SECRET", "two words", true),
+            ("TRUE_ONLY", "yes", false),
+            ("HOOK", "hooked", false),
+            ("DEEP", "deep", false),
+            ("OUTER", "last", false),
+        ]
+    );
+    for command in commands.commands() {
+        for argument in command.arguments() {
+            if let CommandArgument::Commands(nested) = argument {
+                assert!(
+                    nested.assignments().is_empty(),
+                    "nested assignments must be owned by the parse root"
+                );
+            }
+        }
+    }
+
+    let rendered = commands.to_tmux_reparse_string();
+    let reparsed = CommandParser::new()
+        .parse(&rendered)
+        .expect("rendered assignments reparse");
+    assert_eq!(reparsed, commands, "lossless reparse string: {rendered}");
 }
 
 #[test]
@@ -487,12 +789,12 @@ fn keeps_format_arguments_outside_condition_directives() {
 #[test]
 fn keeps_percent_arguments_outside_condition_directives() {
     let commands = CommandParser::new()
-        .parse("run-shell printf %s value")
+        .parse_arguments(["run-shell", "printf %s value"])
         .unwrap();
 
     assert_eq!(
-        commands.commands()[0].arguments()[1].as_string(),
-        Some("%s")
+        commands.commands()[0].arguments()[0].as_string(),
+        Some("printf %s value")
     );
 }
 
@@ -558,6 +860,23 @@ fn resolved_command_alias_option_entries_replace_default_aliases() {
 }
 
 #[test]
+fn duplicate_command_alias_names_use_the_first_array_entry() {
+    let commands = CommandParser::new()
+        .with_command_aliases([
+            "say=display-message -p first",
+            "say=display-message -p second",
+        ])
+        .parse_arguments(["say"])
+        .expect("duplicate runtime alias should parse");
+
+    assert_eq!(commands.commands()[0].name(), "display-message");
+    assert_eq!(
+        commands.commands()[0].arguments()[1].as_string(),
+        Some("first")
+    );
+}
+
+#[test]
 fn command_alias_reparse_sees_parse_time_assignments() {
     let commands = CommandParser::new()
         .with_command_alias("say=display-message \"$FOO\"")
@@ -569,6 +888,51 @@ fn command_alias_reparse_sees_parse_time_assignments() {
     assert_eq!(
         commands.commands()[0].arguments()[0].as_string(),
         Some("bar")
+    );
+}
+
+#[test]
+fn runtime_argv_assignment_feeds_alias_without_changing_direct_argv_parsing() {
+    let parser = CommandParser::new()
+        .with_command_alias("say=display-message \"$FOO\"")
+        .unwrap();
+
+    assert!(parser.parse_arguments(["FOO=bar", "say"]).is_err());
+
+    let commands = parser
+        .parse_arguments_with_assignments(["FOO=bar", "say"])
+        .expect("runtime argv assignment should feed alias expansion");
+    assert_eq!(commands.assignments()[0].name(), "FOO");
+    assert_eq!(commands.assignments()[0].value(), "bar");
+    assert_eq!(commands.commands()[0].name(), "display-message");
+    assert_eq!(
+        commands.commands()[0].arguments()[0].as_string(),
+        Some("bar")
+    );
+
+    let terminated_assignment = parser
+        .parse_arguments_with_assignments(["FOO=group;", "say"])
+        .expect("assignment-only group should feed the following alias");
+    assert_eq!(
+        terminated_assignment.commands()[0].arguments()[0].as_string(),
+        Some("group")
+    );
+
+    let literal_semicolon = parser
+        .parse_arguments_with_assignments(["FOO=value\\;", "say"])
+        .expect("escaped semicolon should remain in the assignment value");
+    assert_eq!(literal_semicolon.assignments()[0].value(), "value;");
+    assert_eq!(
+        literal_semicolon.commands()[0].arguments()[0].as_string(),
+        Some("value;")
+    );
+
+    assert_eq!(
+        parser
+            .parse_arguments_with_assignments(["1FOO=bar", "say"])
+            .unwrap_err()
+            .to_string(),
+        "unknown command: 1FOO=bar"
     );
 }
 
@@ -780,7 +1144,7 @@ fn only_whitespace_produces_no_commands() {
 #[test]
 fn deeply_nested_command_blocks_fail_closed_instead_of_overflowing() {
     // `{ … }` blocks recurse through parse_command -> parse_until. Without a cap
-    // this overflows the native stack (SIGABRT). 400 > the 256 cap, and the cap
+    // this overflows the native stack (SIGABRT). 400 > the depth cap, and the cap
     // returns a parse error before the recursion ever reaches the stack limit.
     let depth = 400;
     let input = "if-shell true { ".repeat(depth) + &"}".repeat(depth);
@@ -806,8 +1170,8 @@ fn deeply_nested_conditionals_fail_closed_instead_of_overflowing() {
 
 #[test]
 fn modest_block_and_conditional_nesting_still_parses() {
-    // The cap must not regress real configs: nesting well under 256 still parses.
-    let depth = 64;
+    // The cap must not regress real configs: moderate nesting still parses.
+    let depth = 32;
     let braces = "if-shell true { ".repeat(depth) + "display-message ok " + &"}".repeat(depth);
     CommandParser::new()
         .parse(&braces)

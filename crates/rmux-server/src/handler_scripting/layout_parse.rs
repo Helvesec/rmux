@@ -1,16 +1,25 @@
 use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{
-    DisplayPanesRequest, PaneTarget, Request, ResizePaneAdjustment, ResizePaneRelativeDirection,
-    ResizePaneRequest, RmuxError, SelectCustomLayoutRequest, SelectLayoutRequest,
-    SelectLayoutTarget, SelectOldLayoutRequest, SpreadLayoutRequest, TerminalSize,
+    DisplayPanesRequest, NextLayoutRequest, PaneTarget, PreviousLayoutRequest, Request,
+    ResizePaneAdjustment, ResizePaneRelativeDirection, ResizePaneRequest, RmuxError,
+    SelectCustomLayoutRequest, SelectLayoutRequest, SelectLayoutTarget, SelectOldLayoutRequest,
+    SpreadLayoutRequest, TerminalSize, WindowTarget,
 };
 
-use super::tokens::CommandTokens;
-use super::values::{parse_percentage, parse_u64};
+use crate::pane_terminals::session_not_found;
+
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
+use super::values::{parse_percentage, parse_u64, reject_unknown_option_before_positional};
 use super::{
-    implicit_pane_target, implicit_session_name, implicit_window_target,
-    is_unsupported_named_layout, parse_layout_name, parse_pane_target, parse_select_layout_target,
+    implicit_pane_target, implicit_session_name, implicit_window_target, parse_layout_name,
+    parse_pane_target, parse_select_layout_target,
 };
+
+#[derive(Debug)]
+pub(super) enum ParsedSelectLayout {
+    NoOp,
+    Request(Request),
+}
 
 pub(super) fn parse_display_panes(
     mut args: CommandTokens,
@@ -20,9 +29,10 @@ pub(super) fn parse_display_panes(
     let mut duration_ms = None;
     let mut non_blocking = false;
     let mut no_command = false;
+    let mut target_client = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -45,40 +55,55 @@ pub(super) fn parse_display_panes(
             }
             "-t" => {
                 let _ = args.optional();
-                return Err(display_panes_client_target_not_found(
-                    &args.required("-t target-client")?,
-                ));
+                target_client = Some(args.required("-t target-client")?);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "bN", "dt") else {
+                    reject_unknown_option_before_positional("display-panes", &token)?;
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('b') => non_blocking = true,
+                        CompactFlag::Bare('N') => no_command = true,
+                        compact_flag @ CompactFlag::Value { flag: 'd', .. } => {
+                            let value = compact_flag.value_or_next(&mut args, "-d duration")?;
+                            duration_ms = Some(parse_u64("display-panes", "-d", &value)?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target_client =
+                                Some(compact_flag.value_or_next(&mut args, "-t target-client")?);
+                        }
+                        _ => unreachable!("compact display-panes flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 
     let template = (!args.is_empty()).then(|| args.remaining_joined());
 
-    Ok(Request::DisplayPanes(DisplayPanesRequest {
+    Ok(Request::DisplayPanes(Box::new(DisplayPanesRequest {
         target: implicit_session_name(sessions, find_context, "display-panes")?,
         duration_ms,
         non_blocking,
         no_command,
         template,
-    }))
-}
-
-fn display_panes_client_target_not_found(raw_target: &str) -> RmuxError {
-    RmuxError::Message(format!(
-        "can't find client: {}",
-        raw_target.strip_suffix(':').unwrap_or(raw_target)
-    ))
+        target_client,
+    })))
 }
 
 pub(super) fn parse_select_layout(
     mut args: CommandTokens,
     sessions: &SessionStore,
     find_context: &TargetFindContext,
-) -> Result<Request, RmuxError> {
+) -> Result<ParsedSelectLayout, RmuxError> {
     let mut target = None;
     let mut spread = false;
+    let mut next_layout = false;
     let mut old_layout = false;
+    let mut previous_layout = false;
 
     while let Some(token) = args.peek() {
         match token {
@@ -90,9 +115,17 @@ pub(super) fn parse_select_layout(
                 let _ = args.optional();
                 spread = true;
             }
+            "-n" => {
+                let _ = args.optional();
+                next_layout = true;
+            }
             "-o" => {
                 let _ = args.optional();
                 old_layout = true;
+            }
+            "-p" => {
+                let _ = args.optional();
+                previous_layout = true;
             }
             "-t" => {
                 let _ = args.optional();
@@ -107,35 +140,76 @@ pub(super) fn parse_select_layout(
         find_context,
         "select-layout",
     )?));
-    if spread && old_layout {
+    let mode_count = [spread, next_layout, old_layout, previous_layout]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+    if mode_count > 1 {
         return Err(RmuxError::Server(
-            "select-layout accepts only one of -E or -o".to_owned(),
+            "select-layout accepts only one mode flag".to_owned(),
+        ));
+    }
+    if mode_count == 1 && !args.is_empty() {
+        return Err(RmuxError::Server(
+            "command select-layout: too many arguments (need at most 0)".to_owned(),
         ));
     }
     if spread {
-        args.no_extra("select-layout")?;
-        return Ok(Request::SpreadLayout(SpreadLayoutRequest { target }));
+        return Ok(ParsedSelectLayout::Request(Request::SpreadLayout(
+            SpreadLayoutRequest { target },
+        )));
+    }
+    if next_layout {
+        return Ok(ParsedSelectLayout::Request(Request::NextLayout(
+            NextLayoutRequest {
+                target: select_layout_window_target(&target, sessions)?,
+            },
+        )));
     }
     if old_layout {
-        args.no_extra("select-layout")?;
-        return Ok(Request::SelectOldLayout(SelectOldLayoutRequest { target }));
+        return Ok(ParsedSelectLayout::Request(Request::SelectOldLayout(
+            SelectOldLayoutRequest { target },
+        )));
+    }
+    if previous_layout {
+        return Ok(ParsedSelectLayout::Request(Request::PreviousLayout(
+            PreviousLayoutRequest {
+                target: select_layout_window_target(&target, sessions)?,
+            },
+        )));
+    }
+    if args.is_empty() {
+        return Ok(ParsedSelectLayout::NoOp);
     }
 
     let layout = args.required("select-layout layout")?;
     args.no_extra("select-layout")?;
 
     match parse_layout_name(&layout) {
-        Ok(layout) if is_unsupported_named_layout(layout) => {
-            Err(RmuxError::Server(format!("invalid layout: {layout}")))
+        Ok(layout) => Ok(ParsedSelectLayout::Request(Request::SelectLayout(
+            SelectLayoutRequest { target, layout },
+        ))),
+        Err(_) => Ok(ParsedSelectLayout::Request(Request::SelectCustomLayout(
+            SelectCustomLayoutRequest { target, layout },
+        ))),
+    }
+}
+
+fn select_layout_window_target(
+    target: &SelectLayoutTarget,
+    sessions: &SessionStore,
+) -> Result<WindowTarget, RmuxError> {
+    match target {
+        SelectLayoutTarget::Window(target) => Ok(target.clone()),
+        SelectLayoutTarget::Session(session_name) => {
+            let session = sessions
+                .session(session_name)
+                .ok_or_else(|| session_not_found(session_name))?;
+            Ok(WindowTarget::with_window(
+                session_name.clone(),
+                session.active_window_index(),
+            ))
         }
-        Ok(layout) => Ok(Request::SelectLayout(SelectLayoutRequest {
-            target,
-            layout,
-        })),
-        Err(_) => Ok(Request::SelectCustomLayout(SelectCustomLayoutRequest {
-            target,
-            layout,
-        })),
     }
 }
 

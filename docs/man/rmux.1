@@ -1,4 +1,4 @@
-.TH RMUX 1 "2026-06-24" "RMUX 0.8.0" "RMUX Manual"
+.TH RMUX 1 "2026-07-08" "RMUX 0.9.0" "RMUX Manual"
 .SH NAME
 rmux \- tmux-compatible terminal multiplexer CLI
 .SH SYNOPSIS
@@ -23,16 +23,17 @@ resolution, common diagnostics, config loading, and scriptable output should
 match tmux where that behavior is intentional and useful.
 .PP
 When tmux behavior is a known quirk that silently hides errors or leaks an
-internal sentinel, RMUX keeps safer product semantics. For example, RMUX
-treats only the empty string and exact
-.B 0
-as false for
-.BR "if-shell -F" ,
-rejects non-numeric
+internal sentinel, RMUX keeps safer product semantics only when the release
+divergence ledger lists the behavior. For example, RMUX rejects non-numeric
 .B capture-pane
 bounds, and preserves a trailing literal
 .B #
 in format strings.
+.PP
+For
+.BR "if-shell -F" ,
+RMUX follows the pinned tmux oracle's numeric false handling, including
+zero-prefixed numeric strings.
 .PP
 Very large positive absolute pane sizes may be clamped to the available layout
 space, while zero, negative, non-numeric, and overflowed sizes are rejected.

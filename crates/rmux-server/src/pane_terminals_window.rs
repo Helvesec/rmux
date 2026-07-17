@@ -1,13 +1,16 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::path::Path;
 
 use rmux_core::{
-    formats::{render_list_windows_line, FormatContext},
-    Session,
+    formats::{is_truthy, render_list_windows_line, FormatContext},
+    OptionStore, Session,
 };
 use rmux_proto::{
     CommandOutput, KillWindowResponse, LastWindowResponse, ListWindowsResponse, NewWindowResponse,
-    NextWindowResponse, OptionName, PreviousWindowResponse, RenameWindowResponse, RmuxError,
-    ScopeSelector, SelectWindowResponse, SessionName, SetOptionMode, WindowListEntry, WindowTarget,
+    NextWindowResponse, OptionName, PaneId, PreviousWindowResponse, RenameWindowResponse,
+    RmuxError, ScopeSelector, SelectWindowResponse, SessionName, SetOptionMode, WindowListEntry,
+    WindowTarget,
 };
 
 #[path = "pane_terminals/window_link_commands.rs"]
@@ -16,16 +19,34 @@ mod window_link_commands;
 mod window_movement;
 
 use super::{
-    session_not_found, HandlerState, KilledWindowResult, NewWindowOptions,
-    RemovedWindowHookContext, RespawnWindowOptions,
+    session_not_found, HandlerState, KilledWindowResult, NewWindowOptions, PreparedWindowTerminal,
+    RemovedWindowHookContext, RespawnWindowOptions, SessionTransferSnapshot, WindowSpawnOptions,
 };
-use crate::format_runtime::RuntimeFormatContext;
+use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::terminal::validate_process_command;
 
 #[path = "pane_terminals/window_removal.rs"]
 mod window_removal;
 
+pub(crate) struct ListWindowsSelection<'a> {
+    pub(crate) session_name: &'a SessionName,
+    pub(crate) socket_path: &'a Path,
+    pub(crate) format: Option<&'a str>,
+    pub(crate) attached_count: usize,
+    pub(crate) filter: Option<&'a str>,
+    pub(crate) sort_order: Option<&'a str>,
+    pub(crate) reversed: bool,
+}
+
 use window_removal::build_window_removal_plan;
 pub(super) use window_removal::window_pane_ids;
+
+pub(crate) struct RespawnWindowResult {
+    pub(crate) response: rmux_proto::RespawnWindowResponse,
+    pub(crate) retained_pane_id: PaneId,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) refresh_sessions: Vec<SessionName>,
+}
 
 impl HandlerState {
     pub(crate) fn create_window(
@@ -62,26 +83,31 @@ impl HandlerState {
             .resolve(Some(session_name), OptionName::BaseIndex)
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
+        let mutation_snapshot = SessionTransferSnapshot::capture(self);
         let pane_id = self.sessions.allocate_pane_id();
-        let (window_index, pane_id) = {
+        let session_mutation = (|| -> Result<_, RmuxError> {
             let session = self
                 .sessions
                 .session_mut(session_name)
                 .ok_or_else(|| session_not_found(session_name))?;
-            let (window_index, pane_id) = match target_window_index {
+            let (window_index, pane_id, index_map) = match target_window_index {
                 Some(window_index) => {
-                    if insert_at_target {
-                        session.make_room_for_window(window_index)?;
+                    let index_map = if insert_at_target {
+                        session.make_room_for_window(window_index)?
                     } else if session.window_at(window_index).is_some() {
                         return Err(RmuxError::Server(format!(
                             "create window failed: index {window_index} in use"
                         )));
-                    }
+                    } else {
+                        std::collections::BTreeMap::new()
+                    };
                     session.insert_window_with_initial_pane_with_id(window_index, size, pane_id)?;
-                    (window_index, pane_id)
+                    (window_index, pane_id, index_map)
                 }
                 None => {
-                    session.create_window_at_or_above_with_pane_id(size, base_index, pane_id)?
+                    let (window_index, pane_id) = session
+                        .create_window_at_or_above_with_pane_id(size, base_index, pane_id)?;
+                    (window_index, pane_id, std::collections::BTreeMap::new())
                 }
             };
             if let Some(name) = name {
@@ -90,11 +116,23 @@ impl HandlerState {
             if !detached {
                 session.select_window(window_index)?;
             }
-            (window_index, pane_id)
+            Ok((window_index, pane_id, index_map))
+        })();
+        let (window_index, pane_id, index_map) = match session_mutation {
+            Ok(result) => result,
+            Err(error) => {
+                mutation_snapshot.restore(self);
+                return Err(error);
+            }
         };
 
+        if let Err(error) = self.remap_session_group_window_metadata(session_name, &index_map) {
+            mutation_snapshot.restore(self);
+            return Err(error);
+        }
+
         if let Err(error) = self.insert_window_terminal(session_name, window_index, spawn) {
-            self.replace_session(session_name, previous_session)?;
+            mutation_snapshot.restore(self);
             return Err(error);
         }
         let target = WindowTarget::with_window(session_name.clone(), window_index);
@@ -108,7 +146,7 @@ impl HandlerState {
                 .and_then(|session| session.pane_id_in_window(window_index, 0)),
             Some(pane_id)
         );
-        self.synchronize_session_group_from(session_name)?;
+        self.synchronize_session_group_from_with_window_selection_map(session_name, &index_map)?;
         self.sync_pane_lifecycle_dimensions_for_session(session_name);
 
         Ok(NewWindowResponse { target })
@@ -200,8 +238,12 @@ impl HandlerState {
             }
         }
 
+        let mut reindexed_windows = Vec::new();
         for synchronized_session in &sessions_to_synchronize {
-            self.renumber_windows_if_enabled(synchronized_session)?;
+            let index_map = self.renumber_windows_if_enabled(synchronized_session)?;
+            if !index_map.is_empty() {
+                reindexed_windows.push((synchronized_session.clone(), index_map));
+            }
         }
         let active_window = self
             .sessions
@@ -211,6 +253,7 @@ impl HandlerState {
         for synchronized_session in sessions_to_synchronize {
             self.synchronize_session_group_from(&synchronized_session)?;
         }
+        let removed_pane_ids = self.pane_ids_no_longer_referenced(removed_pane_ids);
 
         Ok(KilledWindowResult {
             response: KillWindowResponse {
@@ -218,6 +261,7 @@ impl HandlerState {
             },
             removed_windows,
             removed_pane_ids,
+            reindexed_windows,
         })
     }
 
@@ -253,7 +297,7 @@ impl HandlerState {
             target.window_index(),
         );
         self.clear_auto_named_window_family(target.session_name(), target.window_index());
-        self.synchronize_linked_window_family_from_slot(
+        self.synchronize_window_alias_family_from_slot(
             target.session_name(),
             target.window_index(),
         )?;
@@ -399,31 +443,24 @@ impl HandlerState {
         &mut self,
         target: rmux_proto::WindowTarget,
         options: RespawnWindowOptions<'_>,
-    ) -> Result<rmux_proto::RespawnWindowResponse, RmuxError> {
+    ) -> Result<RespawnWindowResult, RmuxError> {
         let RespawnWindowOptions { kill, spawn } = options;
         let session_name = target.session_name().clone();
         let window_index = target.window_index();
 
-        // Check that the window exists and collect its pane IDs.
-        let pane_ids = {
-            let session = self
-                .sessions
-                .session(&session_name)
-                .ok_or_else(|| session_not_found(&session_name))?;
-            let window = session.window_at(window_index).ok_or_else(|| {
-                RmuxError::invalid_target(
-                    format!("{session_name}:{window_index}"),
-                    "window index does not exist in session",
-                )
-            })?;
-            window.panes().iter().map(|p| p.id()).collect::<Vec<_>>()
-        };
+        let previous_session = self
+            .sessions
+            .session(&session_name)
+            .cloned()
+            .ok_or_else(|| session_not_found(&session_name))?;
+        let pane_ids = window_pane_ids(&previous_session, &session_name, window_index)?;
 
         // Without -k, reject if any pane terminal is still present (i.e. process may be running).
         if !kill
-            && pane_ids
-                .iter()
-                .any(|id| self.ensure_panes_exist(&session_name, &[*id]).is_ok())
+            && pane_ids.iter().any(|id| {
+                self.ensure_window_panes_exist(&session_name, window_index, &[*id])
+                    .is_ok()
+            })
         {
             return Err(RmuxError::Server(
                 "window still active; use -k to force respawn".to_owned(),
@@ -434,69 +471,278 @@ impl HandlerState {
             .first()
             .copied()
             .ok_or_else(|| RmuxError::Server("window has no panes".to_owned()))?;
+        let provenance = self.pane_respawn_provenance(pane_id);
+        let process_command = spawn.command.cloned().or_else(|| {
+            provenance
+                .as_ref()
+                .and_then(|provenance| provenance.process_command.clone())
+        });
+        validate_process_command(process_command.as_ref())?;
+        let start_directory = spawn
+            .start_directory
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| {
+                provenance
+                    .as_ref()
+                    .and_then(|provenance| provenance.working_directory.clone())
+            });
+        let respawn_environment = provenance
+            .as_ref()
+            .map(|provenance| provenance.private_environment.clone());
+        let respawn_shell = provenance
+            .as_ref()
+            .map(|provenance| provenance.shell.as_path());
+        let environment_overrides = spawn
+            .environment_overrides
+            .map(<[String]>::to_vec)
+            .or_else(|| respawn_environment.clone());
+        let spawn = WindowSpawnOptions {
+            start_directory: start_directory.as_deref(),
+            command: process_command.as_ref(),
+            socket_path: spawn.socket_path,
+            spawn_environment: spawn.spawn_environment,
+            environment_overrides: environment_overrides.as_deref(),
+            respawn_shell,
+            respawn_environment: respawn_environment.as_deref(),
+            pane_alert_callback: spawn.pane_alert_callback,
+            pane_exit_callback: spawn.pane_exit_callback,
+        };
+        let removed_pane_ids = pane_ids
+            .iter()
+            .copied()
+            .filter(|id| *id != pane_id)
+            .collect::<Vec<_>>();
         let runtime_session_name =
             self.runtime_session_name_for_window(&session_name, window_index);
+        let previous_output_generation =
+            self.pane_output_generation(&runtime_session_name, pane_id);
         let base_environment =
             self.session_base_environment_for_window(&session_name, window_index);
-
-        // Kill terminals for panes that disappear with the old window layout.
-        for removed_pane_id in pane_ids.iter().copied().filter(|id| *id != pane_id) {
-            self.remove_pane_terminal_from_runtime(&runtime_session_name, removed_pane_id);
+        let mut pane_option_sessions =
+            self.window_linked_session_family_list(&session_name, window_index);
+        if pane_option_sessions.is_empty() {
+            pane_option_sessions.push(session_name.clone());
         }
-        if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, pane_id) {
-            pipe.stop();
-        }
-        let _ = self.terminals.remove_pane(&runtime_session_name, pane_id);
+        pane_option_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        pane_option_sessions.dedup();
+        let before_pane_options = pane_option_sessions
+            .into_iter()
+            .map(|affected_session| {
+                self.pane_option_slots_for_session(&affected_session)
+                    .map(|snapshot| (affected_session, snapshot))
+            })
+            .collect::<Result<Vec<_>, RmuxError>>()?;
 
-        // tmux respawns a window by retaining the first pane's identity and
-        // destroying the rest, rather than allocating a new pane identity.
-        {
-            let session = self
-                .sessions
-                .session_mut(&session_name)
-                .ok_or_else(|| session_not_found(&session_name))?;
-            session.respawn_window_with_pane_id(window_index, pane_id)?;
-            session.select_window(window_index)?;
-        }
-
-        // Spawn the new terminal for the single fresh pane.
-        self.reset_window_terminal_with_base_environment(
-            &session_name,
+        // Prepare the replacement process against a preview of the new layout.
+        // No old runtime state is touched until every fallible spawn step has
+        // succeeded, so profile/PTY/output-reader failures are true no-ops.
+        let mut respawned_session = previous_session.clone();
+        respawned_session.respawn_window_with_pane_id(window_index, pane_id)?;
+        respawned_session.select_window(window_index)?;
+        let prepared = self.prepare_window_terminal(
+            &respawned_session,
             window_index,
             spawn,
             base_environment.as_ref(),
         )?;
+        let automatic_name_applied = apply_prepared_automatic_window_name(
+            &self.options,
+            self.tracks_auto_named_window(&session_name, window_index),
+            &mut respawned_session,
+            window_index,
+            &prepared,
+        );
 
-        self.synchronize_session_group_from(&session_name)?;
-        self.sync_pane_lifecycle_dimensions_for_session(&session_name);
+        let mut removed_terminals = pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                self.terminals
+                    .remove_pane(&runtime_session_name, *pane_id)
+                    .map(|terminal| (*pane_id, terminal))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut removed_outputs = self.remove_pane_outputs(&runtime_session_name, &pane_ids);
+        // Keep the output channel for the stable pane identity. Existing SDK
+        // subscribers own receivers for this sender; replacing the channel
+        // would leave a registry record that can never observe the respawned
+        // process. Generation advancement below rejects any late output from
+        // the old reader while preserving the receiver identity.
+        let retained_output_sender = removed_outputs.pane_output_sender(pane_id);
+        self.seed_pane_output_generation(
+            &runtime_session_name,
+            pane_id,
+            previous_output_generation,
+        );
+        self.replace_session(&session_name, respawned_session)?;
 
-        Ok(rmux_proto::RespawnWindowResponse { target })
+        if let Err(error) = self.install_prepared_window_terminal(
+            &runtime_session_name,
+            window_index,
+            prepared,
+            retained_output_sender,
+        ) {
+            self.replace_session(&session_name, previous_session)?;
+            self.terminals
+                .insert_existing_panes(&runtime_session_name, removed_terminals)?;
+            self.insert_existing_pane_outputs(&runtime_session_name, removed_outputs);
+            return Err(error);
+        }
+
+        for old_pane_id in &pane_ids {
+            if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, *old_pane_id) {
+                pipe.stop();
+            }
+        }
+        for removed_pane_id in &removed_pane_ids {
+            self.clear_marked_pane_if_id(*removed_pane_id);
+        }
+        self.remove_pane_lifecycles(&removed_pane_ids);
+        if automatic_name_applied {
+            self.mark_auto_named_window(&session_name, window_index);
+        }
+        removed_outputs.abort_output_readers();
+        super::terminate_removed_terminals(&mut removed_terminals);
+
+        // The window model is shared through explicit link aliases as well as
+        // session groups. Synchronize every alias before deciding which pane
+        // identities disappeared; otherwise a linked slot can keep destroyed
+        // sibling panes artificially reachable after the runtime was replaced.
+        let mut synchronized_sessions =
+            self.synchronize_linked_window_family_from_slot(&session_name, window_index)?;
+        synchronized_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        synchronized_sessions.dedup();
+        for synchronized_session in &synchronized_sessions {
+            self.sync_pane_lifecycle_dimensions_for_session(synchronized_session);
+        }
+        for (affected_session, before) in before_pane_options {
+            self.rekey_pane_options_after_session_change(&before, &affected_session)?;
+        }
+        let removed_pane_ids = self.pane_ids_no_longer_referenced(removed_pane_ids);
+
+        Ok(RespawnWindowResult {
+            response: rmux_proto::RespawnWindowResponse { target },
+            retained_pane_id: pane_id,
+            removed_pane_ids,
+            refresh_sessions: synchronized_sessions,
+        })
     }
 
     pub(crate) fn list_windows(
         &self,
-        session_name: &SessionName,
-        format: Option<&str>,
-        attached_count: usize,
+        selection: ListWindowsSelection<'_>,
     ) -> Result<ListWindowsResponse, RmuxError> {
+        let ListWindowsSelection {
+            session_name,
+            socket_path,
+            format,
+            attached_count,
+            filter,
+            sort_order,
+            reversed,
+        } = selection;
         let session = self
             .sessions
             .session(session_name)
             .ok_or_else(|| session_not_found(session_name))?;
-        let windows = collect_window_entries(self, session, session_name, format, attached_count);
+        let sort_order = match WindowListSortOrder::parse(sort_order) {
+            Some(sort_order) => sort_order,
+            None if sort_order.is_some() => {
+                return Err(RmuxError::Message(rmux_core::INVALID_SORT_ORDER.to_owned()));
+            }
+            None => WindowListSortOrder::Index,
+        };
+        let mut rows = collect_window_entries(
+            self,
+            session,
+            session_name,
+            socket_path,
+            format,
+            attached_count,
+            filter,
+        );
+        if sort_order != WindowListSortOrder::Index || reversed && sort_order.is_explicit() {
+            sort_window_entries(&mut rows, sort_order, reversed);
+        }
+        let windows = rows.into_iter().map(|row| row.entry).collect::<Vec<_>>();
         let output = build_command_output(&windows);
 
         Ok(ListWindowsResponse { windows, output })
     }
 }
 
+fn apply_prepared_automatic_window_name(
+    options: &OptionStore,
+    tracked: bool,
+    session: &mut Session,
+    window_index: u32,
+    prepared: &PreparedWindowTerminal,
+) -> bool {
+    let Some(name) = prepared.automatic_window_name() else {
+        return false;
+    };
+    let session_name = session.name().clone();
+    let should_apply = session.window_at(window_index).is_some_and(|window| {
+        window.name().is_none()
+            && crate::automatic_rename::window_allows_automatic_rename(
+                options,
+                &session_name,
+                window_index,
+                window,
+                tracked,
+            )
+    });
+    if should_apply {
+        session
+            .window_at_mut(window_index)
+            .expect("prevalidated respawn window exists")
+            .set_automatic_name(name.to_owned());
+    }
+    should_apply
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowListSortOrder {
+    Index,
+    Name,
+    Size,
+    Activity,
+    Creation,
+    ExplicitIndex,
+}
+
+impl WindowListSortOrder {
+    fn parse(value: Option<&str>) -> Option<Self> {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") => Some(Self::Index),
+            Some("index" | "order") => Some(Self::ExplicitIndex),
+            Some("name" | "title") => Some(Self::Name),
+            Some("size") => Some(Self::Size),
+            Some("activity") => Some(Self::Activity),
+            Some("creation") => Some(Self::Creation),
+            Some(_) => None,
+        }
+    }
+
+    const fn is_explicit(self) -> bool {
+        !matches!(self, Self::Index)
+    }
+}
+
+struct WindowListRow {
+    entry: WindowListEntry,
+    created_at: i64,
+    activity_at: i64,
+}
+
 fn collect_window_entries(
     state: &HandlerState,
     session: &Session,
     session_name: &SessionName,
+    socket_path: &Path,
     format: Option<&str>,
     attached_count: usize,
-) -> Vec<WindowListEntry> {
+    filter: Option<&str>,
+) -> Vec<WindowListRow> {
     let active_window = session.active_window_index();
     let last_window = session.last_window_index();
     let session_context =
@@ -505,7 +751,7 @@ fn collect_window_entries(
     session
         .windows()
         .iter()
-        .map(|(window_index, window)| {
+        .filter_map(|(window_index, window)| {
             let active = *window_index == active_window;
             let last = Some(*window_index) == last_window;
             let mut context =
@@ -517,6 +763,7 @@ fn collect_window_entries(
             }
             let mut runtime = RuntimeFormatContext::new(context)
                 .with_state(state)
+                .with_socket_path(socket_path)
                 .with_session(session)
                 .with_window(*window_index, window);
             if let Some(pane) = window.active_pane() {
@@ -525,21 +772,74 @@ fn collect_window_entries(
             if attached_count == 0 {
                 runtime = runtime.with_unclipped_geometry();
             }
+            if let Some(filter) = filter {
+                let expanded = render_runtime_template(filter, &runtime, false);
+                if !is_truthy(&expanded) {
+                    return None;
+                }
+            }
+            let rendered_name = render_runtime_template("#{window_name}", &runtime, false);
             let rendered = render_list_windows_line(&runtime, format);
 
-            WindowListEntry {
-                target: WindowTarget::with_window(session_name.clone(), *window_index),
-                window_id: window.id().to_string(),
-                name: window.name().map(str::to_owned),
-                pane_count: u32::try_from(window.pane_count()).expect("pane count fits in u32"),
-                size: window.size(),
-                layout: window.layout(),
-                active,
-                last,
-                rendered,
-            }
+            Some(WindowListRow {
+                entry: WindowListEntry {
+                    target: WindowTarget::with_window(session_name.clone(), *window_index),
+                    window_id: window.id().to_string(),
+                    name: (!rendered_name.is_empty()).then_some(rendered_name),
+                    pane_count: u32::try_from(window.pane_count()).expect("pane count fits in u32"),
+                    size: window.size(),
+                    layout: window.layout(),
+                    active,
+                    last,
+                    rendered,
+                },
+                created_at: window.created_at(),
+                activity_at: window.activity_at(),
+            })
         })
         .collect()
+}
+
+fn sort_window_entries(
+    entries: &mut [WindowListRow],
+    sort_order: WindowListSortOrder,
+    reversed: bool,
+) {
+    entries.sort_by(|left, right| {
+        let primary = match sort_order {
+            WindowListSortOrder::Index | WindowListSortOrder::ExplicitIndex => left
+                .entry
+                .target
+                .window_index()
+                .cmp(&right.entry.target.window_index()),
+            WindowListSortOrder::Name => left.entry.name.cmp(&right.entry.name),
+            WindowListSortOrder::Size => {
+                terminal_area(left.entry.size).cmp(&terminal_area(right.entry.size))
+            }
+            WindowListSortOrder::Activity => right.activity_at.cmp(&left.activity_at),
+            WindowListSortOrder::Creation => left.created_at.cmp(&right.created_at),
+        };
+        let primary = if reversed { primary.reverse() } else { primary };
+        if matches!(sort_order, WindowListSortOrder::Size) {
+            return primary;
+        }
+        primary
+            .then_with(|| stable_window_name_cmp(left, right))
+            .then_with(|| {
+                left.entry
+                    .target
+                    .window_index()
+                    .cmp(&right.entry.target.window_index())
+            })
+    });
+}
+
+fn terminal_area(size: rmux_proto::TerminalSize) -> u64 {
+    u64::from(size.cols) * u64::from(size.rows)
+}
+
+fn stable_window_name_cmp(left: &WindowListRow, right: &WindowListRow) -> Ordering {
+    left.entry.name.cmp(&right.entry.name)
 }
 
 fn build_command_output(windows: &[WindowListEntry]) -> CommandOutput {
@@ -609,4 +909,63 @@ fn ensure_session_panes_exist(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_proto::{LayoutName, TerminalSize};
+
+    fn window_list_row(window_index: u32, name: &str, cols: u16, rows: u16) -> WindowListRow {
+        WindowListRow {
+            entry: WindowListEntry {
+                target: WindowTarget::with_window(
+                    SessionName::new("sort-area").expect("valid session name"),
+                    window_index,
+                ),
+                window_id: format!("@{window_index}"),
+                name: Some(name.to_owned()),
+                pane_count: 1,
+                size: TerminalSize { cols, rows },
+                layout: LayoutName::Tiled,
+                active: false,
+                last: false,
+                rendered: window_index.to_string(),
+            },
+            created_at: 0,
+            activity_at: 0,
+        }
+    }
+
+    #[test]
+    fn window_size_sort_uses_area_and_preserves_equal_area_order() {
+        let rows = || {
+            vec![
+                window_list_row(9, "z", 21, 10),
+                window_list_row(1, "a", 10, 21),
+                window_list_row(7, "middle", 59, 5),
+                window_list_row(3, "large", 20, 24),
+            ]
+        };
+
+        let mut ascending = rows();
+        sort_window_entries(&mut ascending, WindowListSortOrder::Size, false);
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|row| row.entry.target.window_index())
+                .collect::<Vec<_>>(),
+            [9, 1, 7, 3]
+        );
+
+        let mut descending = rows();
+        sort_window_entries(&mut descending, WindowListSortOrder::Size, true);
+        assert_eq!(
+            descending
+                .iter()
+                .map(|row| row.entry.target.window_index())
+                .collect::<Vec<_>>(),
+            [3, 7, 9, 1]
+        );
+    }
 }

@@ -138,6 +138,84 @@ async fn lock_client_accepts_tty_path_targets() {
     terminate_child(&mut child);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn overlay_commands_resolve_names_published_by_list_clients() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let mut child = spawn_tty_child().expect("spawn tty child");
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler.register_attach(child.id(), alpha, control_tx).await;
+    let other_pid = child.id().saturating_add(10_000);
+    let (other_tx, _other_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(other_pid, session_name("alpha"), other_tx)
+        .await;
+    let published_name = handler
+        .list_clients_snapshot()
+        .await
+        .into_iter()
+        .find(|client| client.pid == child.id())
+        .expect("attached client is listed")
+        .name;
+
+    for command in ["display-menu", "display-popup"] {
+        assert_eq!(
+            handler
+                .resolve_overlay_client(999_999, Some(&published_name), command)
+                .await
+                .expect("published client name resolves"),
+            child.id(),
+            "{command} must accept the name emitted by list-clients"
+        );
+    }
+
+    let menu = handler
+        .parse_control_commands(&format!("display-menu -c {published_name} Item i true"))
+        .await
+        .expect("inventory client name parses for display-menu");
+    handler
+        .execute_parsed_commands_for_test(other_pid, menu)
+        .await
+        .expect("display-menu targets the published client name");
+    let _ = recv_matching_attach_control(&mut control_rx, "targeted menu overlay", |control| {
+        matches!(control, AttachControl::Overlay(_))
+    })
+    .await;
+    {
+        let active = handler.active_attach.lock().await;
+        assert!(active.by_pid[&child.id()].overlay.is_some());
+        assert!(active.by_pid[&other_pid].overlay.is_none());
+    }
+
+    let close = handler
+        .parse_control_commands(&format!("display-popup -C -c {published_name}"))
+        .await
+        .expect("inventory client name parses for display-popup");
+    handler
+        .execute_parsed_commands_for_test(other_pid, close)
+        .await
+        .expect("display-popup targets the published client name");
+    let active = handler.active_attach.lock().await;
+    assert!(active.by_pid[&child.id()].overlay.is_none());
+    assert!(active.by_pid[&other_pid].overlay.is_none());
+    drop(active);
+
+    terminate_child(&mut child);
+}
+
 #[tokio::test]
 async fn server_access_list_returns_server_access_response() {
     let handler = RequestHandler::with_owner_uid(1000);
@@ -149,6 +227,7 @@ async fn server_access_list_returns_server_access_response() {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: None,
         }))
         .await;
@@ -414,7 +493,7 @@ async fn refresh_client_flags_merge_incrementally() {
 }
 
 #[tokio::test]
-async fn refresh_client_unimplemented_control_mode_flags_are_rejected() {
+async fn refresh_client_reserved_wire_fields_from_old_clients_are_rejected() {
     use rmux_proto::request::RefreshClientRequest;
 
     let handler = RequestHandler::new();
@@ -435,37 +514,67 @@ async fn refresh_client_unimplemented_control_mode_flags_are_rejected() {
         .register_attach(std::process::id(), alpha, control_tx)
         .await;
 
-    let response = handler
-        .dispatch(
-            std::process::id(),
-            Request::RefreshClient(Box::new(RefreshClientRequest {
-                target_client: None,
-                adjustment: None,
-                clear_pan: false,
-                pan_left: false,
-                pan_right: false,
-                pan_up: false,
-                pan_down: false,
-                status_only: false,
-                clipboard_query: false,
-                flags: None,
-                flags_alias: None,
-                subscriptions: vec!["%0:on".to_owned()],
-                subscriptions_format: vec!["name:%0:#{pane_id}".to_owned()],
-                control_size: Some("80x24".to_owned()),
-                colour_report: Some("%0".to_owned()),
-            })),
-        )
-        .await
-        .response;
+    let base_request = || RefreshClientRequest {
+        target_client: None,
+        adjustment: None,
+        clear_pan: false,
+        pan_left: false,
+        pan_right: false,
+        pan_up: false,
+        pan_down: false,
+        status_only: false,
+        clipboard_query: false,
+        flags: None,
+        flags_alias: None,
+        subscriptions: Vec::new(),
+        subscriptions_format: Vec::new(),
+        control_size: Some("80x24".to_owned()),
+        colour_report: None,
+    };
 
-    assert!(
-        matches!(
+    let mut clear_pan = base_request();
+    clear_pan.clear_pan = true;
+    let mut pan_down = base_request();
+    pan_down.pan_down = true;
+    let mut pan_left = base_request();
+    pan_left.pan_left = true;
+    let mut pan_right = base_request();
+    pan_right.pan_right = true;
+    let mut pan_up = base_request();
+    pan_up.pan_up = true;
+    let mut adjustment = base_request();
+    adjustment.adjustment = Some(10);
+    let mut subscriptions = base_request();
+    subscriptions.subscriptions = vec!["%0:on".to_owned()];
+    let mut subscriptions_format = base_request();
+    subscriptions_format.subscriptions_format = vec!["name:%0:#{pane_id}".to_owned()];
+    let mut colour_report = base_request();
+    colour_report.colour_report = Some("%0".to_owned());
+
+    for (request, expected) in [
+        (clear_pan, "refresh-client -c is not supported"),
+        (pan_down, "refresh-client -D is not supported"),
+        (pan_left, "refresh-client -L is not supported"),
+        (pan_right, "refresh-client -R is not supported"),
+        (pan_up, "refresh-client -U is not supported"),
+        (adjustment, "refresh-client adjustment is not supported"),
+        (subscriptions, "refresh-client -A is not supported"),
+        (subscriptions_format, "refresh-client -B is not supported"),
+        (colour_report, "refresh-client -r is not supported"),
+    ] {
+        let response = handler
+            .dispatch(
+                std::process::id(),
+                Request::RefreshClient(Box::new(request)),
+            )
+            .await
+            .response;
+
+        assert_eq!(
             response,
             Response::Error(rmux_proto::ErrorResponse {
-                error: RmuxError::Server(ref message)
-            }) if message.contains("-A/-B/-r")
-        ),
-        "unimplemented control-mode refresh-client flags should fail explicitly, got {response:?}"
-    );
+                error: RmuxError::Server(expected.to_owned()),
+            })
+        );
+    }
 }

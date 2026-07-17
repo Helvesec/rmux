@@ -86,6 +86,97 @@ fn ensure_server_running_auto_starts_windows_hidden_daemon() -> Result<(), Box<d
 }
 
 #[test]
+fn attach_session_cleans_up_only_daemon_started_by_command_windows() -> Result<(), Box<dyn Error>> {
+    for (label, args) in [
+        ("direct", &["attach-session"][..]),
+        ("queued", &["attach-session", ";", "list-sessions"][..]),
+    ] {
+        let socket_path = socket_path_for_label(format!(
+            "attach-started-{label}-windows-{}",
+            std::process::id()
+        ))?;
+        let output = run_rmux_command_with_auto_start_binary(&socket_path, args)?;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "attach-session should reject an empty daemon: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            "no sessions"
+        );
+        wait_for_daemon_process_absent(&socket_path)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn attach_session_preserves_preexisting_empty_windows_daemon_and_state(
+) -> Result<(), Box<dyn Error>> {
+    let socket_path = socket_path_for_label(format!(
+        "attach-preexisting-empty-windows-{}",
+        std::process::id()
+    ))?;
+    let mut daemon = spawn_hidden_daemon(&socket_path)?;
+    let connection = match wait_for_connection(&socket_path, &mut daemon) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            return Err(error);
+        }
+    };
+    drop(connection);
+
+    let set_buffer = run_rmux_command(&socket_path, &["set-buffer", "-b", "sentinel", "alive"])?;
+    assert!(
+        set_buffer.status.success(),
+        "set-buffer failed: stderr={}",
+        String::from_utf8_lossy(&set_buffer.stderr)
+    );
+
+    for args in [
+        &["attach-session"][..],
+        &["attach-session", ";", "list-sessions"][..],
+    ] {
+        let output = run_rmux_command(&socket_path, args)?;
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "attach-session should reject an empty daemon: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim(),
+            "no sessions"
+        );
+        assert!(
+            daemon.try_wait()?.is_none(),
+            "attach-session must not stop a preexisting empty daemon"
+        );
+
+        let buffer = run_rmux_command(&socket_path, &["show-buffer", "-b", "sentinel"])?;
+        assert!(
+            buffer.status.success(),
+            "show-buffer failed after attach-session: stderr={}",
+            String::from_utf8_lossy(&buffer.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&buffer.stdout).trim(), "alive");
+    }
+
+    let output = run_rmux_command(&socket_path, &["kill-server"])?;
+    assert!(
+        output.status.success(),
+        "kill-server failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_child_exit(&mut daemon)?;
+    Ok(())
+}
+
+#[test]
 fn start_server_with_captured_output_returns_after_spawning_windows_daemon(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = env_lock().lock().expect("lock env");
@@ -228,6 +319,20 @@ fn run_client_as_newer_version(
 fn run_rmux_command(socket_path: &Path, args: &[&str]) -> Result<Output, Box<dyn Error>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
     command.arg("-S").arg(socket_path).args(args);
+    run_command_output(command)
+}
+
+fn run_rmux_command_with_auto_start_binary(
+    socket_path: &Path,
+    args: &[&str],
+) -> Result<Output, Box<dyn Error>> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rmux"));
+    command
+        .arg("-S")
+        .arg(socket_path)
+        .args(args)
+        .env(BINARY_OVERRIDE_ENV, env!("CARGO_BIN_EXE_rmux"))
+        .env(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1");
     run_command_output(command)
 }
 

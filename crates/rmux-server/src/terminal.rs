@@ -17,9 +17,11 @@ mod shell_spec;
 
 #[cfg(windows)]
 use shell_resolver::cmd_shell_path;
+#[cfg(unix)]
+pub(crate) use shell_resolver::is_suitable_shell;
 #[cfg(windows)]
 use shell_resolver::CLIENT_SHELL_ENV;
-use shell_resolver::{resolve_program_path, resolve_shell_path};
+use shell_resolver::{resolve_program_path_from, resolve_shell_path};
 use shell_spec::ShellSpec;
 
 /// Immutable pane-spawn metadata captured when a pane terminal is created.
@@ -437,6 +439,20 @@ impl TerminalProfile {
         &self.shell
     }
 
+    /// Reuses the shell resolved for an existing pane when that pane is
+    /// respawned. tmux binds a pane to its original shell even when the
+    /// `default-shell` option changes later; keeping `SHELL` aligned with the
+    /// executable avoids exposing a contradictory child environment.
+    pub(crate) fn with_respawn_shell(mut self, shell: PathBuf) -> Self {
+        set_raw_environment_value(
+            Arc::make_mut(&mut self.raw_environment),
+            OsString::from("SHELL"),
+            shell.as_os_str().to_os_string(),
+        );
+        self.shell = shell;
+        self
+    }
+
     pub(crate) fn resolved_default_shell(
         environment: &EnvironmentStore,
         options: &OptionStore,
@@ -648,6 +664,7 @@ pub(crate) fn spawn_pane_process(
     validate_process_command(command)?;
     let mut command = spawn_command(profile, command)
         .size(size)
+        .allow_explicit_job_breakaway()
         .clear_env()
         .current_dir(profile.cwd());
 
@@ -681,7 +698,8 @@ fn spawn_command(profile: &TerminalProfile, command: Option<&ProcessCommand>) ->
         Some(ProcessCommand::Shell(command)) => profile.shell_child_command(command),
         Some(ProcessCommand::Argv(argv)) if !argv.is_empty() => {
             let environment = profile.environment_map();
-            let program = resolve_program_path(Path::new(&argv[0]), &environment);
+            let program =
+                resolve_program_path_from(Path::new(&argv[0]), &environment, profile.cwd());
             #[cfg(windows)]
             if let Some(command) = windows_batch_child_command(&program, &argv[1..], &environment) {
                 return command;
@@ -708,9 +726,21 @@ fn windows_batch_child_command(
             .arg("/D")
             .arg("/S")
             .arg("/C")
-            .arg(program.as_os_str())
-            .args(args),
+            .windows_verbatim_args(windows_batch_cmd_tail(program, args)),
     )
+}
+
+#[cfg(windows)]
+fn windows_batch_cmd_tail(program: &Path, args: &[String]) -> OsString {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(cmd_double_quoted(&program.to_string_lossy()));
+    parts.extend(args.iter().map(|arg| cmd_double_quoted(arg)));
+    format!("\"{}\"", parts.join(" ")).into()
+}
+
+#[cfg(windows)]
+fn cmd_double_quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 #[cfg(windows)]

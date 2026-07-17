@@ -17,26 +17,12 @@ pub(super) enum ClaudeSkillInvocation {
 pub(super) fn parse_invocation(
     arguments: &[OsString],
 ) -> Result<Option<ClaudeSkillInvocation>, ExitFailure> {
-    let Some(command_index) = split_top_level_prefix(arguments) else {
-        return Ok(None);
-    };
-    let Some(command) = arguments
-        .get(command_index)
-        .and_then(|value| value.to_str())
-    else {
-        return Ok(None);
-    };
-    if command != "claude" {
-        return Ok(None);
-    }
-
-    let rest = &arguments[command_index + 1..];
-    if rest
+    if arguments
         .first()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value == INSTALL_SKILL_COMMAND)
     {
-        if rest.len() != 1 {
+        if arguments.len() != 1 {
             return Err(ExitFailure::new(1, "usage: rmux claude install-skill"));
         }
         return Ok(Some(ClaudeSkillInvocation::InstallSkill));
@@ -301,44 +287,6 @@ fn write_stdout(output: &str) -> Result<i32, ExitFailure> {
     }
 }
 
-fn split_top_level_prefix(arguments: &[OsString]) -> Option<usize> {
-    let mut index = 0;
-    while let Some(argument) = arguments.get(index) {
-        let value = argument.to_str()?;
-        if value == "--" {
-            return Some(index + 1);
-        }
-        if !value.starts_with('-') || value == "-" {
-            return Some(index);
-        }
-        match value {
-            "-2" | "-C" | "-D" | "-N" | "-l" | "-u" | "-v" => {}
-            "-L" | "-S" | "-f" | "-T" | "-c" => index += 1,
-            _ if compact_top_level_option_with_value(value, 'L')
-                || compact_top_level_option_with_value(value, 'S')
-                || compact_top_level_option_with_value(value, 'f')
-                || compact_top_level_option_with_value(value, 'T')
-                || compact_top_level_option_with_value(value, 'c') => {}
-            _ if compact_top_level_flag_cluster(value, "2CDNluv") => {}
-            _ => return None,
-        }
-        index += 1;
-    }
-    None
-}
-
-fn compact_top_level_option_with_value(value: &str, flag: char) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some('-')) && chars.next() == Some(flag) && chars.next().is_some()
-}
-
-fn compact_top_level_flag_cluster(value: &str, allowed: &str) -> bool {
-    value.len() > 2
-        && value.starts_with('-')
-        && !value.starts_with("--")
-        && value.chars().skip(1).all(|flag| allowed.contains(flag))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{parse_invocation, ClaudeSkillInvocation, SKILL_CONTENT};
@@ -349,10 +297,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_install_skill_after_top_level_flags() {
+    fn parses_install_skill_subcommand() {
         assert_eq!(
-            parse_invocation(&args(&["-Ldemo", "claude", "install-skill"]))
-                .expect("parse succeeds"),
+            parse_invocation(&args(&["install-skill"])).expect("parse succeeds"),
             Some(ClaudeSkillInvocation::InstallSkill)
         );
     }
@@ -360,8 +307,7 @@ mod tests {
     #[test]
     fn leaves_regular_claude_args_to_launcher() {
         assert_eq!(
-            parse_invocation(&args(&["claude", "--dangerously-skip-permissions"]))
-                .expect("parse succeeds"),
+            parse_invocation(&args(&["--dangerously-skip-permissions"])).expect("parse succeeds"),
             None
         );
     }
@@ -369,14 +315,14 @@ mod tests {
     #[test]
     fn leaves_delimited_install_skill_arg_to_launcher() {
         assert_eq!(
-            parse_invocation(&args(&["claude", "--", "install-skill"])).expect("parse succeeds"),
+            parse_invocation(&args(&["--", "install-skill"])).expect("parse succeeds"),
             None
         );
     }
 
     #[test]
     fn rejects_extra_install_skill_args() {
-        let error = parse_invocation(&args(&["claude", "install-skill", "--force"]))
+        let error = parse_invocation(&args(&["install-skill", "--force"]))
             .expect_err("extra args should fail");
         assert_eq!(error.message(), "usage: rmux claude install-skill");
     }

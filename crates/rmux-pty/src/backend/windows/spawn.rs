@@ -15,7 +15,7 @@ use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
@@ -62,7 +62,7 @@ pub(crate) fn spawn_child(command: ChildCommand, pty: Arc<WindowsPty>) -> Result
 
     let job = {
         let _span = perf::span("conpty_create_job_object");
-        JobObjectGuard::new()?
+        JobObjectGuard::new(command.allow_explicit_job_breakaway)?
     };
     let process = create_suspended_process_with_conpty_fallback(&command, &pty, 0)?;
 
@@ -90,7 +90,7 @@ pub(crate) fn spawn_child(command: ChildCommand, pty: Arc<WindowsPty>) -> Result
 fn spawn_child_breakaway(command: ChildCommand, pty: Arc<WindowsPty>) -> Result<WindowsChild> {
     let job = {
         let _span = perf::span("conpty_create_job_object");
-        JobObjectGuard::new()?
+        JobObjectGuard::new(command.allow_explicit_job_breakaway)?
     };
     match create_suspended_process_with_conpty_fallback(&command, &pty, CREATE_BREAKAWAY_FROM_JOB) {
         Ok(process) => {
@@ -299,10 +299,23 @@ pub(crate) fn try_wait_child(child: &mut WindowsChild) -> Result<Option<ExitStat
 }
 
 pub(crate) fn try_clone_child_for_wait(child: &WindowsChild) -> Result<WindowsChild> {
+    clone_child_with_job(child, None)
+}
+
+pub(crate) fn try_clone_child_for_exit_teardown(child: &WindowsChild) -> Result<WindowsChild> {
+    let job = child
+        .job
+        .as_ref()
+        .map(JobObjectGuard::try_clone)
+        .transpose()?;
+    clone_child_with_job(child, job)
+}
+
+fn clone_child_with_job(child: &WindowsChild, job: Option<JobObjectGuard>) -> Result<WindowsChild> {
     Ok(WindowsChild {
         process: duplicate_handle(&child.process)?,
         thread: duplicate_handle(&child.thread)?,
-        job: None,
+        job,
         pty: Arc::clone(&child.pty),
         pid: child.pid,
     })
@@ -321,18 +334,17 @@ pub(crate) fn kill_child(child: &WindowsChild, signal: Signal) -> Result<()> {
         Signal::INT => interrupt_child(child),
         Signal::CONT => Ok(()),
         Signal::TERM | Signal::KILL | Signal::HUP => {
-            child.pty.close_pseudoconsole();
-            if let Some(job) = &child.job {
-                job.terminate(1)?;
-                if process_is_still_running(&child.process)? {
-                    let _ = terminate_process(&child.process, 1);
-                }
-            } else {
+            let Some(job) = &child.job else {
                 return Err(io::Error::other(
                     "Windows child has no Job Object cleanup guard; refusing unsafe fallback kill",
                 )
                 .into());
+            };
+            job.terminate(1)?;
+            if process_is_still_running(&child.process)? {
+                let _ = terminate_process(&child.process, 1);
             }
+            child.pty.close_pseudoconsole();
             Ok(())
         }
     }
@@ -414,7 +426,7 @@ struct JobObjectGuard {
 }
 
 impl JobObjectGuard {
-    fn new() -> io::Result<Self> {
+    fn new(allow_explicit_breakaway: bool) -> io::Result<Self> {
         // SAFETY: Null security attributes and name request the default unnamed
         // job object; the returned handle is checked before ownership transfer.
         let handle = unsafe { CreateJobObjectW(null(), null()) };
@@ -425,7 +437,7 @@ impl JobObjectGuard {
         // function transfers it exactly once into `OwnedHandle`.
         let handle = unsafe { OwnedHandle::from_raw_handle(handle as _) };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limits.BasicLimitInformation.LimitFlags = child_job_limit_flags(allow_explicit_breakaway);
         // SAFETY: `handle` is a live job handle, `limits` points to an
         // initialized structure of the declared size, and the API borrows it
         // only for the duration of the call.
@@ -458,6 +470,12 @@ impl JobObjectGuard {
         Ok(())
     }
 
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            handle: duplicate_handle(&self.handle)?,
+        })
+    }
+
     fn terminate(&self, exit_code: u32) -> io::Result<()> {
         // SAFETY: `self.handle` is a live job handle owned by this guard; the
         // API does not take ownership of it.
@@ -466,6 +484,14 @@ impl JobObjectGuard {
             return Err(last_os_error());
         }
         Ok(())
+    }
+}
+
+const fn child_job_limit_flags(allow_explicit_breakaway: bool) -> u32 {
+    if allow_explicit_breakaway {
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
+    } else {
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
     }
 }
 
@@ -536,4 +562,31 @@ fn last_os_error() -> io::Error {
     // no preconditions.
     let code = unsafe { GetLastError() };
     io::Error::from_raw_os_error(code as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::child_job_limit_flags;
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    };
+
+    #[test]
+    fn child_job_defaults_to_strict_cleanup() {
+        let flags = child_job_limit_flags(false);
+
+        assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, 0);
+    }
+
+    #[test]
+    fn opted_in_child_job_allows_only_explicit_breakaway() {
+        let flags = child_job_limit_flags(true);
+
+        assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
+        assert_ne!(flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, 0);
+    }
 }

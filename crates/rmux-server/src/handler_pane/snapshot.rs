@@ -6,13 +6,20 @@ use rmux_core::input::mode;
 use rmux_core::PaneId;
 use rmux_proto::{
     ErrorResponse, PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotRequest, PaneSnapshotResponse,
-    Response, RmuxError,
+    Response, RmuxError, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
 use super::super::RequestHandler;
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_terminals::HandlerState;
 use crate::pane_transcript::SharedPaneTranscript;
+
+// A blank snapshot cell occupies 29 bytes in the current bincode payload.
+// Reserve 32 bytes per cell so a maximally sized blank grid remains below the
+// detached RPC frame cap, while also bounding the much larger in-memory cell
+// representation before allocation. Variable-length glyph text is still
+// protected by the encoder's exact byte limit.
+const MAX_PANE_SNAPSHOT_CELLS: usize = DEFAULT_MAX_DETACHED_FRAME_LENGTH / 32;
 
 pub(in crate::handler) struct PaneSnapshotInputs {
     pane_id: PaneId,
@@ -216,7 +223,7 @@ fn collect_cells(
 ) -> Result<Vec<PaneSnapshotCell>, RmuxError> {
     let cols_usize = usize::from(cols);
     let rows_usize = usize::from(rows);
-    let total = cols_usize.saturating_mul(rows_usize);
+    let total = snapshot_cell_count(cols, rows)?;
     let mut cells = Vec::with_capacity(total);
     if cols_usize == 0 || rows_usize == 0 {
         return Ok(cells);
@@ -246,6 +253,18 @@ fn collect_cells(
     }
 
     Ok(cells)
+}
+
+fn snapshot_cell_count(cols: u16, rows: u16) -> Result<usize, RmuxError> {
+    let total = usize::from(cols)
+        .checked_mul(usize::from(rows))
+        .ok_or_else(|| RmuxError::Server("pane snapshot dimensions overflow".to_owned()))?;
+    if total > MAX_PANE_SNAPSHOT_CELLS {
+        return Err(RmuxError::Server(format!(
+            "pane snapshot grid has {total} cells, exceeding the {MAX_PANE_SNAPSHOT_CELLS}-cell limit"
+        )));
+    }
+    Ok(total)
 }
 
 fn blank_cell() -> PaneSnapshotCell {
@@ -392,6 +411,24 @@ mod tests {
         let screen = screen_with_size(4, 0);
         let cells = collect_cells(&screen, 4, 0, 0).expect("zero rows ok");
         assert!(cells.is_empty());
+    }
+
+    #[test]
+    fn snapshot_cell_count_rejects_oversized_grids_before_allocation() {
+        assert_eq!(
+            snapshot_cell_count(512, 512).expect("limit-sized snapshot is allowed"),
+            MAX_PANE_SNAPSHOT_CELLS
+        );
+
+        let error = snapshot_cell_count(513, 512).expect_err("oversized snapshot must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding the 262144-cell limit"),
+            "unexpected error: {error}"
+        );
+
+        assert!(snapshot_cell_count(u16::MAX, u16::MAX).is_err());
     }
 
     #[test]

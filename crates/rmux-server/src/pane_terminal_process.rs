@@ -3,7 +3,7 @@ use std::os::fd::BorrowedFd;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmux_core::PaneGeometry;
 use rmux_proto::{ProcessCommand, RmuxError, TerminalPixels, TerminalSize};
@@ -14,10 +14,9 @@ use rmux_pty::{
 
 use crate::terminal::{spawn_pane_process, TerminalProfile};
 
-const GRACEFUL_TERMINATION_ATTEMPTS: usize = 100;
-const GRACEFUL_TERMINATION_SLEEP: Duration = Duration::from_millis(1);
-const HARD_TERMINATION_ATTEMPTS: usize = 500;
-const HARD_TERMINATION_SLEEP: Duration = Duration::from_millis(1);
+const GRACEFUL_TERMINATION_TIMEOUT: Duration = Duration::from_millis(100);
+const HARD_TERMINATION_TIMEOUT: Duration = Duration::from_millis(500);
+const TERMINATION_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Debug)]
 pub(crate) struct PaneTerminal {
@@ -65,8 +64,8 @@ impl PaneTerminal {
     }
 
     #[cfg(windows)]
-    pub(crate) fn clone_child_for_wait(&self) -> rmux_pty::Result<PtyChild> {
-        self.child.try_clone_for_wait()
+    pub(crate) fn clone_child_for_exit_teardown(&self) -> rmux_pty::Result<PtyChild> {
+        self.child.try_clone_for_exit_teardown()
     }
 
     pub(crate) fn pid(&self) -> u32 {
@@ -117,12 +116,12 @@ impl PaneTerminal {
         self.termination_attempted = true;
 
         self.signal_process_tree(Signal::HUP);
-        if self.wait_for_exit(GRACEFUL_TERMINATION_ATTEMPTS, GRACEFUL_TERMINATION_SLEEP) {
+        if self.wait_for_exit(GRACEFUL_TERMINATION_TIMEOUT) {
             return;
         }
 
         self.signal_process_tree(Signal::KILL);
-        let _ = self.wait_for_exit(HARD_TERMINATION_ATTEMPTS, HARD_TERMINATION_SLEEP);
+        let _ = self.wait_for_exit(HARD_TERMINATION_TIMEOUT);
     }
 
     pub(crate) fn terminate_in_background(self) {
@@ -139,18 +138,24 @@ impl PaneTerminal {
         let _ = self.child.kill_session_leader(signal);
     }
 
-    fn wait_for_exit(&mut self, attempts: usize, sleep_duration: Duration) -> bool {
-        for _ in 0..attempts {
+    fn wait_for_exit(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
                     self.exit_status = Some(status);
                     return true;
                 }
-                Ok(None) => std::thread::sleep(sleep_duration),
+                Ok(None) => {}
                 Err(_) => return true,
             }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            std::thread::sleep(TERMINATION_POLL_INTERVAL.min(deadline - now));
         }
-        false
     }
 }
 

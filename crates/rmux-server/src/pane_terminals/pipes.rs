@@ -5,6 +5,8 @@ use rmux_proto::{PaneTarget, RmuxError, SessionName};
 
 use super::pane_pipe::ActivePanePipe;
 use super::HandlerState;
+#[cfg(test)]
+use super::PipeProcessGroupProbe;
 use crate::pane_terminal_lookup::pane_id_for_target;
 
 impl HandlerState {
@@ -67,6 +69,24 @@ impl HandlerState {
     ) -> bool {
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
         self.pipes.contains(&runtime_session_name, pane_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pane_pipe_process_group_probe_for_test(
+        &self,
+        target: &PaneTarget,
+    ) -> Option<PipeProcessGroupProbe> {
+        let pane_id = pane_id_for_target(
+            &self.sessions,
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )
+        .ok()?;
+        let runtime_session_name =
+            self.runtime_session_name_for_window(target.session_name(), target.window_index());
+        self.pipes
+            .process_group_probe(&runtime_session_name, pane_id)
     }
 
     pub(in crate::pane_terminals) fn remove_session_pipes(

@@ -15,7 +15,9 @@
 //! * UTF-8: emoji + ZWJ + skin tone interleaved at #{=N} boundaries.
 
 use rmux_core::input::{InputParser, ScreenWriter};
-use rmux_core::{text_width, truncate_to_width, Screen, Utf8Config};
+use rmux_core::{
+    text_width, truncate_to_width, GridRenderOptions, Screen, ScreenCaptureRange, Utf8Config,
+};
 use rmux_proto::TerminalSize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -336,6 +338,135 @@ fn fuzz_sgr_truecolor_missing_components() {
     ];
     for input in cases {
         drive(input);
+    }
+}
+
+fn joined_screen_text(screen: &Screen) -> String {
+    let range = ScreenCaptureRange {
+        start_is_absolute: true,
+        ..ScreenCaptureRange::default()
+    };
+    String::from_utf8(screen.capture_transcript(
+        range,
+        GridRenderOptions {
+            join_wrapped: true,
+            ..GridRenderOptions::default()
+        },
+    ))
+    .expect("screen capture must be UTF-8")
+}
+
+#[test]
+fn fuzz_resize_reflow_preserves_ascii_end_cursor_matrix() {
+    let alphabet = b"abcdefghijklmnopqrstuvwxyz";
+    for old_width in 2..=12_u16 {
+        for new_width in 1..=12_u16 {
+            if old_width == new_width {
+                continue;
+            }
+            for length in 1..=30_usize {
+                let text = (0..length)
+                    .map(|index| alphabet[index % alphabet.len()])
+                    .collect::<Vec<_>>();
+                let mut parser = InputParser::new();
+                let mut screen = Screen::new(
+                    TerminalSize {
+                        cols: old_width,
+                        rows: 40,
+                    },
+                    200,
+                );
+                parser.parse(&text, &mut screen);
+                screen.resize(TerminalSize {
+                    cols: new_width,
+                    rows: 40,
+                });
+                parser.parse(b"X", &mut screen);
+
+                let expected = format!("{}X", String::from_utf8_lossy(&text));
+                let captured = joined_screen_text(&screen);
+                assert!(
+                    captured.contains(&expected),
+                    "old_width={old_width} new_width={new_width} length={length} \
+                     cursor={:?} expected={expected:?} capture={captured:?}",
+                    screen.cursor_position()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fuzz_resize_reflow_preserves_wide_gap_end_cursor_matrix() {
+    for old_width in 8..=12_u16 {
+        for new_width in 2..=7_u16 {
+            if old_width == new_width {
+                continue;
+            }
+            let text = "abc表d";
+            let mut parser = InputParser::new();
+            let mut screen = Screen::new(
+                TerminalSize {
+                    cols: old_width,
+                    rows: 12,
+                },
+                100,
+            );
+            parser.parse(text.as_bytes(), &mut screen);
+            screen.resize(TerminalSize {
+                cols: new_width,
+                rows: 12,
+            });
+            parser.parse(b"X", &mut screen);
+
+            let captured = joined_screen_text(&screen);
+            assert!(
+                captured.contains("abc表dX"),
+                "old_width={old_width} new_width={new_width} cursor={:?} capture={captured:?}",
+                screen.cursor_position()
+            );
+        }
+    }
+}
+
+#[test]
+fn fuzz_resize_reflow_wide_placement_gap_cycles_match_tmux_text() {
+    let prefixes = ["", "a", "ab", "abc", "abcd", "abcde"];
+    let middles = ["", "x", "xy", "xyz"];
+    let suffixes = ["d", "def", "defgh"];
+
+    for prefix in prefixes {
+        for middle in middles {
+            for suffix in suffixes {
+                let text = format!("{prefix}表{middle}界{suffix}");
+                for narrow_width in 2..=7_u16 {
+                    for intermediate_width in 3..=11_u16 {
+                        let mut parser = InputParser::new();
+                        let mut screen = Screen::new(TerminalSize { cols: 20, rows: 40 }, 200);
+                        parser.parse(text.as_bytes(), &mut screen);
+                        screen.resize(TerminalSize {
+                            cols: narrow_width,
+                            rows: 40,
+                        });
+                        screen.resize(TerminalSize {
+                            cols: intermediate_width,
+                            rows: 40,
+                        });
+                        screen.resize(TerminalSize { cols: 20, rows: 40 });
+                        parser.parse(b"X", &mut screen);
+
+                        let expected = format!("{text}X");
+                        let captured = joined_screen_text(&screen);
+                        assert!(
+                            captured.contains(&expected),
+                            "narrow={narrow_width} intermediate={intermediate_width} \
+                             cursor={:?} expected={expected:?} capture={captured:?}",
+                            screen.cursor_position()
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

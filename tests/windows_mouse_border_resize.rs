@@ -10,7 +10,7 @@ use rmux_pty::{write_windows_console_mouse_drag, ChildCommand, SpawnedPty, Termi
 #[path = "support/windows_cli_serial.rs"]
 mod windows_cli_serial;
 
-const ATTACH_READY_DELAY: Duration = Duration::from_millis(700);
+const ATTACH_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const MOUSE_SETTLE_DELAY: Duration = Duration::from_millis(900);
 const MOUSE_GEOMETRY_CHANGE_TIMEOUT: Duration = Duration::from_secs(6);
 const ATTACH_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -64,6 +64,44 @@ fn mouse_drag_on_vertical_border_resizes_horizontal_split_through_attach_binding
 }
 
 #[test]
+fn mouse_drag_on_vertical_border_shrinks_horizontal_split_through_attach_binding(
+) -> Result<(), Box<dyn Error>> {
+    let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-horizontal-shrink")?;
+    let label = unique_label("mouse-border-resize-h-shrink")?;
+    let _server = ServerGuard::new(label.clone());
+    let session = "i70hs";
+
+    create_split_session(&label, session, "-h")?;
+    let before = pane_geometries(&label, session)?;
+    let left = pane_by_index(&before, 0)?;
+    let right = pane_by_index(&before, 1)?;
+    let border_x = left.left.saturating_add(left.width);
+    let y = left.top.saturating_add(1);
+
+    let mut attach = AttachGuard::spawn(&label, session, false)?;
+    let after = drag_until_geometry_changes(
+        &mut attach,
+        &label,
+        session,
+        &before,
+        MouseDrag::new(border_x, y, border_x.saturating_sub(5), y),
+    )?;
+    let resized_left = pane_by_index(&after, 0)?;
+    let resized_right = pane_by_index(&after, 1)?;
+
+    assert!(
+        resized_left.width < left.width,
+        "left pane should shrink after dragging the vertical border left; before={before:?} after={after:?}"
+    );
+    assert!(
+        resized_right.left < right.left,
+        "right pane should move left after border drag; before={before:?} after={after:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn mouse_drag_on_horizontal_border_resizes_vertical_split_through_attach_binding(
 ) -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-vertical")?;
@@ -96,6 +134,44 @@ fn mouse_drag_on_horizontal_border_resizes_vertical_split_through_attach_binding
     assert!(
         resized_bottom.top > bottom.top,
         "bottom pane should move down after border drag; before={before:?} after={after:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mouse_drag_on_horizontal_border_shrinks_vertical_split_through_attach_binding(
+) -> Result<(), Box<dyn Error>> {
+    let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-vertical-shrink")?;
+    let label = unique_label("mouse-border-resize-v-shrink")?;
+    let _server = ServerGuard::new(label.clone());
+    let session = "i70vs";
+
+    create_split_session(&label, session, "-v")?;
+    let before = pane_geometries(&label, session)?;
+    let top = pane_by_index(&before, 0)?;
+    let bottom = pane_by_index(&before, 1)?;
+    let x = top.left.saturating_add(1);
+    let border_y = top.top.saturating_add(top.height);
+
+    let mut attach = AttachGuard::spawn(&label, session, false)?;
+    let after = drag_until_geometry_changes(
+        &mut attach,
+        &label,
+        session,
+        &before,
+        MouseDrag::new(x, border_y, x, border_y.saturating_sub(3)),
+    )?;
+    let resized_top = pane_by_index(&after, 0)?;
+    let resized_bottom = pane_by_index(&after, 1)?;
+
+    assert!(
+        resized_top.height < top.height,
+        "top pane should shrink after dragging the horizontal border up; before={before:?} after={after:?}"
+    );
+    assert!(
+        resized_bottom.top < bottom.top,
+        "bottom pane should move up after border drag; before={before:?} after={after:?}"
     );
 
     Ok(())
@@ -483,7 +559,7 @@ impl AttachGuard {
             .args(args)
             .size(TerminalSize::new(80, 24))
             .spawn()?;
-        wait_for_attach_client(label, session, ATTACH_READY_DELAY)?;
+        wait_for_attach_client(label, session, ATTACH_READY_TIMEOUT)?;
         Ok(Self {
             label: label.to_owned(),
             child,

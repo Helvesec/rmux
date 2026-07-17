@@ -44,6 +44,7 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             target: alpha.clone(),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
         Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
@@ -78,10 +79,13 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
         Request::LastWindow(LastWindowRequest {
             target: alpha.clone(),
         }),
-        Request::ListWindows(ListWindowsRequest {
+        Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha.clone(),
             format: Some("#{window_index}".to_owned()),
-        }),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })),
         Request::MoveWindow(MoveWindowRequest {
             source: Some(WindowTarget::with_window(alpha.clone(), 1)),
             target: MoveWindowTarget::Window(WindowTarget::with_window(beta.clone(), 3)),
@@ -154,13 +158,14 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             target: pane.clone(),
             adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 34 },
         }),
-        Request::DisplayPanes(DisplayPanesRequest {
+        Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: beta.clone(),
             duration_ms: None,
             non_blocking: false,
             no_command: false,
             template: None,
-        }),
+            target_client: None,
+        })),
         Request::SelectPane(Box::new(SelectPaneRequest {
             target: pane.clone(),
             title: None,
@@ -236,13 +241,14 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             run_immediately: false,
             index: Some(3),
         }),
-        Request::SetBuffer(SetBufferRequest {
+        Request::SetBuffer(Box::new(SetBufferRequest {
             name: Some("named".to_owned()),
             content: b"buffer".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
         Request::ShowBuffer(ShowBufferRequest {
             name: Some("named".to_owned()),
         }),
@@ -257,12 +263,13 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
         })),
         Request::ListBuffers(ListBuffersRequest::default()),
         Request::DeleteBuffer(DeleteBufferRequest { name: None }),
-        Request::LoadBuffer(LoadBufferRequest {
+        Request::LoadBuffer(Box::new(LoadBufferRequest {
             path: "/tmp/input".to_owned(),
             cwd: None,
             name: Some("loaded".to_owned()),
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
         Request::SaveBuffer(SaveBufferRequest {
             path: "/tmp/output".to_owned(),
             cwd: None,
@@ -278,6 +285,9 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -326,11 +336,14 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             sort_order: None,
             reversed: false,
         }),
-        Request::ListPanes(ListPanesRequest {
+        Request::ListPanes(Box::new(ListPanesRequest {
             target: SessionName::new("alpha").unwrap(),
             format: Some("#{pane_id}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }),
+        })),
         Request::SourceFile(Box::new(SourceFileRequest {
             paths: vec!["/tmp/rmux.conf".to_owned()],
             quiet: false,
@@ -369,6 +382,7 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
         Request::ControlMode(ControlModeRequest {
             mode: ControlMode::ControlControl,
             client_terminal: crate::ClientTerminalContext::default(),
+            initial_command_count: 2,
         }),
         Request::ClockMode(ClockModeRequest {
             target: Some(PaneTarget::with_window(
@@ -396,6 +410,7 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: None,
         }),
         Request::RefreshClient(Box::new(RefreshClientRequest {
@@ -580,6 +595,7 @@ fn server_lifecycle_request_variants_append_after_spread_layout() {
                 list: true,
                 read_only: false,
                 write: false,
+                target: None,
                 user: None,
             }),
         ),
@@ -812,6 +828,74 @@ fn decode_frame_rejects_truncated_payloads() {
 }
 
 #[test]
+fn current_wire_request_rejects_semantically_truncated_payload() {
+    let request = Request::NewWindow(Box::new(NewWindowRequest {
+        target: SessionName::new("alpha").expect("valid session"),
+        name: Some("logs".to_owned()),
+        detached: true,
+        start_directory: None,
+        environment: None,
+        command: None,
+        process_command: None,
+        target_window_index: None,
+        insert_at_target: false,
+    }));
+    let full_frame = encode_frame(&request).expect("current request encodes");
+    assert_eq!(
+        decode_frame::<Request>(&full_frame).expect("current request decodes"),
+        request
+    );
+
+    let mut payload = bincode::serialize(&request).expect("current request payload serializes");
+    payload.pop().expect("request payload has a trailing field");
+    let mut truncated_frame = test_frame_header(payload.len() as u32);
+    truncated_frame.extend_from_slice(&payload);
+
+    assert!(matches!(
+        decode_frame::<Request>(&truncated_frame),
+        Err(crate::RmuxError::Decode(_))
+    ));
+
+    let mut decoder = FrameDecoder::new();
+    decoder.push_bytes(&truncated_frame);
+    assert!(matches!(
+        decoder.next_frame::<Request>(),
+        Err(crate::RmuxError::Decode(_))
+    ));
+    assert!(decoder.remaining_bytes().is_empty());
+}
+
+#[test]
+fn current_wire_response_rejects_semantically_truncated_payload() {
+    let response = crate::Response::RunShell(crate::RunShellResponse::background());
+    let full_frame = encode_frame(&response).expect("current response encodes");
+    assert_eq!(
+        decode_frame::<crate::Response>(&full_frame).expect("current response decodes"),
+        response
+    );
+
+    let mut payload = bincode::serialize(&response).expect("current response payload serializes");
+    payload
+        .pop()
+        .expect("response payload has a trailing field");
+    let mut truncated_frame = test_frame_header(payload.len() as u32);
+    truncated_frame.extend_from_slice(&payload);
+
+    assert!(matches!(
+        decode_frame::<crate::Response>(&truncated_frame),
+        Err(crate::RmuxError::Decode(_))
+    ));
+
+    let mut decoder = FrameDecoder::new();
+    decoder.push_bytes(&truncated_frame);
+    assert!(matches!(
+        decoder.next_frame::<crate::Response>(),
+        Err(crate::RmuxError::Decode(_))
+    ));
+    assert!(decoder.remaining_bytes().is_empty());
+}
+
+#[test]
 fn decode_frame_rejects_trailing_bytes() {
     let request = Request::HasSession(HasSessionRequest {
         target: SessionName::new("alpha").expect("valid session"),
@@ -851,6 +935,7 @@ fn decoder_handles_multiple_consecutive_frames() {
         target: SessionName::new("beta").expect("valid session"),
         kill_all_except_target: false,
         clear_alerts: false,
+        kill_group: false,
     });
     let frame_a = encode_frame(&req_a).expect("encodes");
     let frame_b = encode_frame(&req_b).expect("encodes");

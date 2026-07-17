@@ -2,12 +2,14 @@ use rmux_core::{
     command_parser::{CommandParser, ParsedCommand},
     formats::{FormatContext, FormatVariables},
 };
-use rmux_proto::RmuxError;
+use rmux_proto::{RmuxError, SessionId, SessionName};
 
 use super::super::prompt_support::{
     CommandPromptPlan, ConfirmBeforePlan, PromptField, PromptQueueResult, PromptStartOutcome,
 };
-use super::super::RequestHandler;
+use super::super::{
+    attach_support::ActiveAttachIdentity, with_expected_attach_and_session_identity, RequestHandler,
+};
 use super::command_args::CommandListArgument;
 use super::format_context::{collect_parse_time_values, format_context_for_target};
 use super::parser_context::command_parser_from_state;
@@ -32,6 +34,7 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    source_file_error: None,
                     exit_status: None,
                 });
             }
@@ -55,7 +58,37 @@ impl RequestHandler {
             return Ok(());
         };
 
-        self.finish_attached_prompt_binding(requester_pid, receiver);
+        self.finish_attached_prompt_binding(requester_pid, None, receiver);
+        Ok(())
+    }
+
+    pub(super) async fn start_attached_command_prompt_binding_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        session_name: SessionName,
+        session_id: SessionId,
+        requester_pid: u32,
+        command: ParsedCommandPromptCommand,
+        context: &QueueExecutionContext,
+    ) -> Result<(), RmuxError> {
+        let plan = self
+            .build_command_prompt_plan(requester_pid, command, context)
+            .await?;
+        let PromptStartOutcome::Waiting(receiver) = with_expected_attach_and_session_identity(
+            identity,
+            session_name.clone(),
+            session_id,
+            self.start_command_prompt(plan),
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        self.finish_attached_prompt_binding(
+            requester_pid,
+            Some((identity, session_name, session_id)),
+            receiver,
+        );
         Ok(())
     }
 
@@ -89,7 +122,7 @@ impl RequestHandler {
                 None => RuntimeFormatContext::new(FormatContext::new()).with_state(&state),
             };
             let template = match &command.template {
-                Some(CommandListArgument::Parsed(commands)) => commands.to_tmux_string(),
+                Some(CommandListArgument::Parsed(commands)) => commands.to_tmux_reparse_string(),
                 Some(CommandListArgument::String(value)) if command.format_template => {
                     render_runtime_template(value, &runtime, true)
                 }
@@ -155,6 +188,7 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    source_file_error: None,
                     exit_status: None,
                 });
             }
@@ -178,17 +212,48 @@ impl RequestHandler {
             return Ok(());
         };
 
-        self.finish_attached_prompt_binding(requester_pid, receiver);
+        self.finish_attached_prompt_binding(requester_pid, None, receiver);
+        Ok(())
+    }
+
+    pub(super) async fn start_attached_confirm_before_binding_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        session_name: SessionName,
+        session_id: SessionId,
+        requester_pid: u32,
+        command: ParsedConfirmBeforeCommand,
+        context: &QueueExecutionContext,
+    ) -> Result<(), RmuxError> {
+        let plan = self
+            .build_confirm_before_plan(requester_pid, command, context)
+            .await?;
+        let PromptStartOutcome::Waiting(receiver) = with_expected_attach_and_session_identity(
+            identity,
+            session_name.clone(),
+            session_id,
+            self.start_confirm_before(plan),
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        self.finish_attached_prompt_binding(
+            requester_pid,
+            Some((identity, session_name, session_id)),
+            receiver,
+        );
         Ok(())
     }
 
     fn finish_attached_prompt_binding(
         &self,
         requester_pid: u32,
+        identity: Option<(ActiveAttachIdentity, SessionName, SessionId)>,
         receiver: tokio::sync::oneshot::Receiver<PromptQueueResult>,
     ) {
         let handler = self.clone();
-        let task = finish_attached_prompt_binding_task(handler, requester_pid, receiver);
+        let task = finish_attached_prompt_binding_task(handler, requester_pid, identity, receiver);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(task);
         } else {
@@ -238,7 +303,7 @@ impl RequestHandler {
                         .map_err(super::command_parse_error_to_rmux)?
                 }
             };
-            let template = parsed.to_tmux_string();
+            let template = parsed.to_tmux_reparse_string();
             let prompt = match &command.prompt {
                 Some(prompt) => format!("{} ", render_runtime_template(prompt, &runtime, true)),
                 None => {
@@ -270,13 +335,30 @@ impl RequestHandler {
 async fn finish_attached_prompt_binding_task(
     handler: RequestHandler,
     requester_pid: u32,
+    identity: Option<(ActiveAttachIdentity, SessionName, SessionId)>,
     receiver: tokio::sync::oneshot::Receiver<PromptQueueResult>,
 ) {
     let result = receiver.await.unwrap_or_else(|_| PromptQueueResult::noop());
     if let Some((commands, context)) = result.inserted {
-        let _ = handler
-            .execute_parsed_commands(requester_pid, commands, context)
-            .await;
+        match identity {
+            Some((identity, session_name, session_id)) => {
+                if !handler.current_live_attach_input(identity).await {
+                    return;
+                }
+                let _ = with_expected_attach_and_session_identity(
+                    identity,
+                    session_name,
+                    session_id,
+                    handler.execute_parsed_commands(requester_pid, commands, context),
+                )
+                .await;
+            }
+            None => {
+                let _ = handler
+                    .execute_parsed_commands(requester_pid, commands, context)
+                    .await;
+            }
+        }
     }
 }
 

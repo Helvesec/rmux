@@ -1,3 +1,4 @@
+use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
@@ -7,7 +8,16 @@ use rmux_proto::{
     RunShellRequest, RunShellResponse, SessionName, Target,
 };
 
-use super::super::RequestHandler;
+use super::super::control_support::{
+    current_control_queue_identity, with_control_queue_identity, ControlClientIdentity,
+};
+#[cfg(windows)]
+use super::super::pane_support::format_references_pane_pid;
+use super::super::target_support::{pane_id_target, requester_environment_pane_id};
+use super::super::{
+    attach_support::ActiveAttachIdentity, current_expected_attach_identity,
+    validate_expected_attach_identity, with_expected_attach_registration, RequestHandler,
+};
 use super::command_args::CommandListArgument;
 use super::format_context::{format_context_for_target_with_server_values, global_format_context};
 use super::queue::{QueueCommandAction, QueueExecutionContext};
@@ -20,14 +30,73 @@ use crate::format_runtime::render_runtime_template;
 use crate::hook_runtime::current_hook_formats;
 use crate::terminal::{SessionBaseEnvironment, TerminalProfile};
 
+async fn with_background_control_identity<T, F>(
+    identity: Option<ControlClientIdentity>,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    match identity {
+        Some(identity) => with_control_queue_identity(identity, future).await,
+        None => future.await,
+    }
+}
+
+async fn with_background_client_identities<T, F>(
+    control_identity: Option<ControlClientIdentity>,
+    attach_identity: Option<ActiveAttachIdentity>,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    let control_scoped = with_background_control_identity(control_identity, future);
+    match attach_identity {
+        Some(identity) => with_expected_attach_registration(identity, control_scoped).await,
+        None => control_scoped.await,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellTargetPolicy {
+    Fixed,
+    FollowAttachedSession,
+}
+
+impl ShellTargetPolicy {
+    fn follows_attached_session(self) -> bool {
+        self == Self::FollowAttachedSession
+    }
+}
+
 impl RequestHandler {
     pub(in crate::handler) async fn handle_run_shell(
         &self,
         requester_pid: u32,
         request: RunShellRequest,
     ) -> Response {
-        self.handle_run_shell_with_client_name(requester_pid, request, None)
-            .await
+        let explicit_target = match request.target.as_ref() {
+            Some(target) => self
+                .pane_id_for_slot_target(target)
+                .await
+                .map(|pane_id| (target.clone(), pane_id)),
+            None => None,
+        };
+        let mut response = self
+            .handle_run_shell_with_client_name(requester_pid, request, None)
+            .await;
+        if let Some((target, pane_id)) = explicit_target {
+            if self
+                .deliver_targeted_run_shell_output(requester_pid, &target, pane_id, &response)
+                .await
+            {
+                if let Response::RunShell(response) = &mut response {
+                    response.output = None;
+                }
+            }
+        }
+        response
     }
 
     pub(in crate::handler) async fn handle_run_shell_with_client_name(
@@ -36,7 +105,53 @@ impl RequestHandler {
         request: RunShellRequest,
         client_name: Option<String>,
     ) -> Response {
+        self.handle_run_shell_with_client_name_and_target_state(
+            requester_pid,
+            request,
+            client_name,
+            false,
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn handle_queued_run_shell_with_client_name(
+        &self,
+        requester_pid: u32,
+        request: RunShellRequest,
+        client_name: Option<String>,
+        target_missing_canfail: bool,
+    ) -> Response {
+        self.handle_run_shell_with_client_name_and_target_state(
+            requester_pid,
+            request,
+            client_name,
+            target_missing_canfail,
+        )
+        .await
+    }
+
+    async fn handle_run_shell_with_client_name_and_target_state(
+        &self,
+        requester_pid: u32,
+        mut request: RunShellRequest,
+        client_name: Option<String>,
+        target_missing_canfail: bool,
+    ) -> Response {
+        let target_was_captured = request.target.is_some() || target_missing_canfail;
+        if request.target.is_none() && !target_missing_canfail {
+            request.target = self.inherited_run_shell_target(requester_pid).await;
+        }
         if request.background {
+            let control_identity = current_control_queue_identity(requester_pid);
+            let attach_identity = current_expected_attach_identity();
+            let target_policy = if attach_identity.is_some() && !target_was_captured {
+                ShellTargetPolicy::FollowAttachedSession
+            } else {
+                ShellTargetPolicy::Fixed
+            };
+            if target_policy.follows_attached_session() {
+                request.target = None;
+            }
             if let Some(delay_seconds) = request.delay_seconds {
                 if let Err(error) = run_shell_delay_duration(delay_seconds.as_secs_f64()) {
                     return Response::Error(ErrorResponse { error });
@@ -54,14 +169,23 @@ impl RequestHandler {
                     let _detached_request_guard = detached_request_guard;
                     let _requester_access_guard = requester_access_guard;
                     let _ = handler
-                        .run_shell_task(requester_pid, request, client_name)
+                        .run_shell_task(
+                            requester_pid,
+                            request,
+                            client_name,
+                            target_policy,
+                            target_missing_canfail,
+                        )
                         .await;
                 };
-                if hook_context_active {
-                    crate::hook_runtime::with_hook_execution(hook_formats, task).await;
-                } else {
-                    task.await;
-                }
+                with_background_client_identities(control_identity, attach_identity, async move {
+                    if hook_context_active {
+                        crate::hook_runtime::with_hook_execution(hook_formats, task).await;
+                    } else {
+                        task.await;
+                    }
+                })
+                .await;
             }) {
                 return Response::Error(ErrorResponse { error });
             }
@@ -69,7 +193,13 @@ impl RequestHandler {
         }
 
         match self
-            .run_shell_task(requester_pid, request, client_name)
+            .run_shell_task(
+                requester_pid,
+                request,
+                client_name,
+                ShellTargetPolicy::Fixed,
+                target_missing_canfail,
+            )
             .await
         {
             Ok(RunShellTaskOutput::CommandOutput(output)) => {
@@ -91,6 +221,30 @@ impl RequestHandler {
         }
     }
 
+    async fn inherited_run_shell_target(&self, requester_pid: u32) -> Option<PaneTarget> {
+        let pane_id = requester_environment_pane_id(requester_pid, &self.socket_path())?;
+        let state = self.state.lock().await;
+        match pane_id_target(&state.sessions, pane_id) {
+            Some(Target::Pane(target)) => Some(target),
+            _ => None,
+        }
+    }
+
+    async fn followed_attached_pane_target(
+        &self,
+        identity: ActiveAttachIdentity,
+    ) -> Result<PaneTarget, RmuxError> {
+        match self
+            .attached_queue_target_for_registration(identity)
+            .await?
+        {
+            Target::Pane(target) => Ok(target),
+            _ => Err(RmuxError::Server(
+                "attached session has no current pane target".to_owned(),
+            )),
+        }
+    }
+
     pub(in crate::handler) async fn handle_if_shell(
         &self,
         requester_pid: u32,
@@ -107,6 +261,13 @@ impl RequestHandler {
         client_name: Option<String>,
     ) -> Response {
         if request.background {
+            let control_identity = current_control_queue_identity(requester_pid);
+            let attach_identity = current_expected_attach_identity();
+            let target_policy = if attach_identity.is_some() && request.target.is_none() {
+                ShellTargetPolicy::FollowAttachedSession
+            } else {
+                ShellTargetPolicy::Fixed
+            };
             let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
             let requester_access_guard =
@@ -119,14 +280,17 @@ impl RequestHandler {
                     let _detached_request_guard = detached_request_guard;
                     let _requester_access_guard = requester_access_guard;
                     let _ = handler
-                        .if_shell_task(requester_pid, request, client_name)
+                        .if_shell_task(requester_pid, request, client_name, target_policy)
                         .await;
                 };
-                if hook_context_active {
-                    crate::hook_runtime::with_hook_execution(hook_formats, task).await;
-                } else {
-                    task.await;
-                }
+                with_background_client_identities(control_identity, attach_identity, async move {
+                    if hook_context_active {
+                        crate::hook_runtime::with_hook_execution(hook_formats, task).await;
+                    } else {
+                        task.await;
+                    }
+                })
+                .await;
             }) {
                 return Response::Error(ErrorResponse { error });
             }
@@ -134,7 +298,12 @@ impl RequestHandler {
         }
 
         match self
-            .if_shell_task(requester_pid, request, client_name)
+            .if_shell_task(
+                requester_pid,
+                request,
+                client_name,
+                ShellTargetPolicy::Fixed,
+            )
             .await
         {
             Ok(Some(output)) if !output.stdout().is_empty() => {
@@ -148,11 +317,28 @@ impl RequestHandler {
     async fn run_shell_task(
         &self,
         requester_pid: u32,
-        request: RunShellRequest,
+        mut request: RunShellRequest,
         client_name: Option<String>,
+        target_policy: ShellTargetPolicy,
+        target_missing_canfail: bool,
     ) -> Result<RunShellTaskOutput, RmuxError> {
         if let Some(delay_seconds) = request.delay_seconds {
             tokio::time::sleep(run_shell_delay_duration(delay_seconds.as_secs_f64())?).await;
+        }
+
+        if target_policy.follows_attached_session() {
+            let identity = validate_expected_attach_identity(self, requester_pid)
+                .await?
+                .ok_or_else(|| {
+                    RmuxError::Server(
+                        "background command lost its attached client identity".to_owned(),
+                    )
+                })?;
+            request.target = Some(self.followed_attached_pane_target(identity).await?);
+        } else if request.as_commands {
+            // Command-mode jobs can act on the attached registration even
+            // with a fixed pane target, so retain the same-PID reuse guard.
+            let _ = validate_expected_attach_identity(self, requester_pid).await?;
         }
 
         if request.command.is_empty() {
@@ -160,15 +346,33 @@ impl RequestHandler {
         }
 
         if request.as_commands {
-            let parsed = self
-                .parse_command_string_one_group(&request.command)
+            let has_fixed_target = request.target.is_some();
+            let command = self
+                .expand_run_shell_command(&request, client_name.as_deref(), target_missing_canfail)
                 .await?;
-            let current_target = self
-                .run_shell_commands_current_target(requester_pid, request.target)
-                .await;
-            let context = QueueExecutionContext::new(request.start_directory.clone())
-                .with_current_target(current_target)
-                .with_client_name(client_name.clone());
+            let parsed = self.parse_command_string_one_group(&command).await?;
+            if parsed_contains_attach_session(&parsed) {
+                return Err(RmuxError::Server(
+                    "open terminal failed: not a terminal".to_owned(),
+                ));
+            }
+            let current_target = if target_missing_canfail {
+                None
+            } else {
+                self.run_shell_commands_current_target(requester_pid, request.target)
+                    .await
+            };
+            let context = QueueExecutionContext::new(request.start_directory.clone());
+            let context = match target_policy {
+                ShellTargetPolicy::FollowAttachedSession => context
+                    .with_implicit_current_target(current_target)
+                    .following_attached_session(),
+                ShellTargetPolicy::Fixed if has_fixed_target => {
+                    context.with_current_target(current_target)
+                }
+                ShellTargetPolicy::Fixed => context.with_implicit_current_target(current_target),
+            }
+            .with_client_name(client_name.clone());
             let context = match request.source_depth {
                 Some(depth) => context.for_sourced_commands(depth, None),
                 None => context,
@@ -185,16 +389,25 @@ impl RequestHandler {
 
         let profile = self.run_shell_profile(&request).await?;
         let command = self
-            .expand_run_shell_command(
-                &request.command,
-                request.target.as_ref(),
-                client_name.as_deref(),
-            )
+            .expand_run_shell_command(&request, client_name.as_deref(), target_missing_canfail)
             .await?;
-        let output = run_shell_foreground(command, &profile, request.show_stderr).await?;
+        let output = run_shell_foreground(
+            command.clone(),
+            &profile,
+            request.show_stderr,
+            Some(self.shell_processes.clone()),
+        )
+        .await?;
         let exit_status = shell_exit_status(&output.status);
+        let stdout = run_shell_stdout_for_response(
+            output.stdout,
+            &command,
+            exit_status,
+            shell_exit_signal(&output.status),
+        );
+        let output = (!stdout.is_empty()).then(|| CommandOutput::from_stdout(stdout));
         Ok(RunShellTaskOutput::Shell {
-            output: None,
+            output,
             exit_status,
         })
     }
@@ -205,7 +418,9 @@ impl RequestHandler {
         target: Option<PaneTarget>,
     ) -> Option<Target> {
         if let Some(target) = target {
-            return Some(Target::Pane(target));
+            return self
+                .existing_target_or_none(Some(Target::Pane(target)))
+                .await;
         }
 
         let session_name = match self.current_session_candidate(requester_pid).await {
@@ -216,12 +431,40 @@ impl RequestHandler {
         active_session_target(&state.sessions, &session_name)
     }
 
+    async fn existing_target_or_none(&self, target: Option<Target>) -> Option<Target> {
+        let target = target?;
+        let state = self.state.lock().await;
+        let exists = match &target {
+            Target::Session(session_name) => state.sessions.contains_session(session_name),
+            Target::Window(target) => state
+                .sessions
+                .session(target.session_name())
+                .is_some_and(|session| session.window_at(target.window_index()).is_some()),
+            Target::Pane(target) => state
+                .sessions
+                .session(target.session_name())
+                .and_then(|session| session.window_at(target.window_index()))
+                .is_some_and(|window| window.pane(target.pane_index()).is_some()),
+        };
+        exists.then_some(target)
+    }
+
     async fn if_shell_task(
         &self,
         requester_pid: u32,
-        request: IfShellRequest,
+        mut request: IfShellRequest,
         client_name: Option<String>,
+        target_policy: ShellTargetPolicy,
     ) -> Result<Option<CommandOutput>, RmuxError> {
+        let expected_attach = validate_expected_attach_identity(self, requester_pid).await?;
+        if target_policy.follows_attached_session() {
+            let identity = expected_attach.ok_or_else(|| {
+                RmuxError::Server("background command lost its attached client identity".to_owned())
+            })?;
+            request.target = Some(Target::Pane(
+                self.followed_attached_pane_target(identity).await?,
+            ));
+        }
         let expanded_condition = self
             .expand_if_shell_condition(&request, client_name.as_deref())
             .await?;
@@ -230,7 +473,12 @@ impl RequestHandler {
             if_shell_format_condition_is_true(&expanded_condition)
         } else {
             let profile = self.if_shell_profile(&request).await?;
-            shell_condition_is_true(expanded_condition, &profile).await?
+            shell_condition_is_true(
+                expanded_condition,
+                &profile,
+                Some(self.shell_processes.clone()),
+            )
+            .await?
         };
 
         let selected_command = if condition_is_true {
@@ -245,24 +493,35 @@ impl RequestHandler {
         let parsed = self
             .parse_command_string_one_group(&selected_command)
             .await?;
+        let current_target = self.existing_target_or_none(request.target).await;
+        let context = QueueExecutionContext::new(request.caller_cwd);
+        let context = match target_policy {
+            ShellTargetPolicy::FollowAttachedSession => context
+                .with_implicit_current_target(current_target)
+                .following_attached_session(),
+            ShellTargetPolicy::Fixed if current_target.is_some() => {
+                context.with_current_target(current_target)
+            }
+            ShellTargetPolicy::Fixed => context.with_implicit_current_target(current_target),
+        }
+        .with_client_name(client_name);
         let output = self
-            .execute_parsed_commands(
-                requester_pid,
-                parsed,
-                QueueExecutionContext::new(request.caller_cwd)
-                    .with_current_target(request.target)
-                    .with_client_name(client_name),
-            )
+            .execute_parsed_commands(requester_pid, parsed, context)
             .await?;
         Ok((!output.stdout().is_empty()).then_some(output))
     }
 
     async fn expand_run_shell_command(
         &self,
-        command: &str,
-        target: Option<&PaneTarget>,
+        request: &RunShellRequest,
         client_name: Option<&str>,
+        target_missing_canfail: bool,
     ) -> Result<String, RmuxError> {
+        #[cfg(windows)]
+        if format_references_pane_pid(Some(&request.command)) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
+        let target = request.target.as_ref();
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
         } else {
@@ -278,8 +537,9 @@ impl RequestHandler {
                 &Target::Pane(target.clone()),
                 attached_count,
                 &socket_path,
-            )?,
-            None => match hook_formats
+            )
+            .unwrap_or_else(|_| global_format_context(&state, &socket_path)),
+            None if !target_missing_canfail => match hook_formats
                 .iter()
                 .rev()
                 .find(|(name, _)| name == "hook_session_name")
@@ -291,6 +551,7 @@ impl RequestHandler {
                 }
                 None => global_format_context(&state, &socket_path),
             },
+            None => global_format_context(&state, &socket_path),
         };
         let context = match client_name {
             Some(client_name) => context.with_named_value("client_name", client_name.to_owned()),
@@ -301,7 +562,18 @@ impl RequestHandler {
             .fold(context, |context, (name, value)| {
                 context.with_named_value(name, value)
             });
-        Ok(render_runtime_template(command, &context, false))
+        let context = if request.as_commands {
+            context
+        } else {
+            request
+                .arguments
+                .iter()
+                .enumerate()
+                .fold(context, |context, (index, value)| {
+                    context.with_named_value((index + 1).to_string(), value.clone())
+                })
+        };
+        Ok(render_runtime_template(&request.command, &context, false))
     }
 
     async fn run_shell_profile(
@@ -386,6 +658,10 @@ impl RequestHandler {
         request: &IfShellRequest,
         client_name: Option<&str>,
     ) -> Result<String, RmuxError> {
+        #[cfg(windows)]
+        if format_references_pane_pid(Some(&request.condition)) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let fallback_target = if request.target.is_none() {
             self.preferred_session_name().await.ok()
         } else {
@@ -405,7 +681,8 @@ impl RequestHandler {
                 target,
                 attached_count,
                 &socket_path,
-            )?,
+            )
+            .unwrap_or_else(|_| global_format_context(&state, &socket_path)),
             None => fallback_target
                 .as_ref()
                 .and_then(|session_name| active_session_target(&state.sessions, session_name))
@@ -435,13 +712,22 @@ impl RequestHandler {
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
         if command.background {
+            let control_identity = current_control_queue_identity(requester_pid);
+            let attach_identity = current_expected_attach_identity();
+            let follow_attached_session = attach_identity.is_some()
+                && command.target.is_none()
+                && !context.uses_explicit_current_target();
             let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
             let requester_access_guard =
                 self.begin_detached_requester_access(requester_pid, can_write);
             let handler = self.clone();
             let command = command.clone();
-            let context = context.clone();
+            let context = if follow_attached_session {
+                context.clone().following_attached_session()
+            } else {
+                context.clone()
+            };
             let hook_formats = current_hook_formats();
             let hook_context_active = crate::hook_runtime::hooks_disabled();
             if let Err(error) = spawn_background_async("rmux-if-shell-queue", move || async move {
@@ -452,21 +738,26 @@ impl RequestHandler {
                         .execute_queued_if_shell_background(requester_pid, command, context)
                         .await;
                 };
-                if hook_context_active {
-                    crate::hook_runtime::with_hook_execution(hook_formats, task).await;
-                } else {
-                    task.await;
-                }
+                with_background_client_identities(control_identity, attach_identity, async move {
+                    if hook_context_active {
+                        crate::hook_runtime::with_hook_execution(hook_formats, task).await;
+                    } else {
+                        task.await;
+                    }
+                })
+                .await;
             }) {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: Some(error),
+                    source_file_error: None,
                     exit_status: None,
                 });
             }
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -506,6 +797,7 @@ impl RequestHandler {
                 profile
                     .as_ref()
                     .expect("profile exists for shell-mode if-shell"),
+                Some(self.shell_processes.clone()),
             )
             .await?
         };
@@ -520,6 +812,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         };
@@ -538,6 +831,7 @@ impl RequestHandler {
             )],
             output: None,
             error: None,
+            source_file_error: None,
             exit_status: None,
         })
     }
@@ -546,8 +840,16 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         command: ParsedIfShellCommand,
-        context: QueueExecutionContext,
+        mut context: QueueExecutionContext,
     ) -> Result<(), RmuxError> {
+        let expected_attach = validate_expected_attach_identity(self, requester_pid).await?;
+        if context.follows_attached_session() {
+            let identity = expected_attach.ok_or_else(|| {
+                RmuxError::Server("background command lost its attached client identity".to_owned())
+            })?;
+            let target = self.followed_attached_pane_target(identity).await?;
+            context.rebase_current_target_after_attached_switch(Target::Pane(target));
+        }
         let effective_target = command
             .target
             .clone()
@@ -583,6 +885,7 @@ impl RequestHandler {
                 profile
                     .as_ref()
                     .expect("profile exists for shell-mode if-shell"),
+                Some(self.shell_processes.clone()),
             )
             .await?
         };
@@ -654,6 +957,46 @@ impl RequestHandler {
             command.caller_cwd.as_deref(),
         )
     }
+}
+
+fn parsed_contains_attach_session(parsed: &ParsedCommands) -> bool {
+    parsed.commands().iter().any(command_attaches_client)
+}
+
+fn command_attaches_client(command: &rmux_core::command_parser::ParsedCommand) -> bool {
+    if command.name() == "attach-session" {
+        return true;
+    }
+    // Probed 2026-07-08 against the pinned tmux 3.7b oracle: run-shell -C
+    // "new-session" (without -d) fails with "open terminal failed: not a
+    // terminal" and creates no session, and the same applies to commands
+    // nested in brace bodies.
+    if command.name() == "new-session" && !new_session_is_detached(command) {
+        return true;
+    }
+    command.arguments().iter().any(|argument| match argument {
+        rmux_core::command_parser::CommandArgument::Commands(nested) => {
+            parsed_contains_attach_session(nested)
+        }
+        rmux_core::command_parser::CommandArgument::String(_) => false,
+    })
+}
+
+fn new_session_is_detached(command: &rmux_core::command_parser::ParsedCommand) -> bool {
+    command
+        .arguments()
+        .iter()
+        .filter_map(rmux_core::command_parser::CommandArgument::as_string)
+        .any(|argument| {
+            argument.len() >= 2
+                && argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument
+                    .bytes()
+                    .skip(1)
+                    .all(|byte| byte.is_ascii_alphabetic())
+                && argument.bytes().skip(1).any(|byte| byte == b'd')
+        })
 }
 
 fn pane_id_for_target(
@@ -729,4 +1072,37 @@ fn shell_exit_status(status: &std::process::ExitStatus) -> i32 {
     {
         1
     }
+}
+
+fn shell_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        status.signal()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn run_shell_stdout_for_response(
+    mut stdout: Vec<u8>,
+    command: &str,
+    exit_status: i32,
+    signal: Option<i32>,
+) -> Vec<u8> {
+    if !stdout.is_empty() && !stdout.ends_with(b"\n") {
+        stdout.push(b'\n');
+    }
+    if exit_status == 0 {
+        return stdout;
+    }
+    if let Some(signal) = signal {
+        stdout.extend_from_slice(format!("'{command}' terminated by signal {signal}\n").as_bytes());
+        return stdout;
+    }
+    stdout.extend_from_slice(format!("'{command}' returned {exit_status}\n").as_bytes());
+    stdout
 }

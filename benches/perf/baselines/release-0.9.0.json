@@ -1,0 +1,52 @@
+{
+  "schema": 2,
+  "kind": "rmux-perf-baseline",
+  "release": "release-0.9.0",
+  "timestamp": "2026-07-10T14:12:12Z",
+  "git": {"commit":"8df9d92385b1cbf2d9eb4281a033ee6e335c9433","describe":"v0.8.0-88-g8df9d9238","dirty":false},
+  "environment": {"platform":"darwin","kernel":"24.6.0","machine":"arm64","host_fingerprint":"be2bd955293487d5","rustc":"rustc 1.95.0 (59807616e 2026-04-14)","rustc_verbose":"rustc 1.95.0 (59807616e 2026-04-14);binary: rustc;commit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860;commit-date: 2026-04-14;host: aarch64-apple-darwin;release: 1.95.0;LLVM version: 22.1.2","toolchain":"1.96.1-aarch64-apple-darwin (workspace rust-toolchain.toml)","allocator":"system","cpu_governor":"unknown"},
+  "versions": {"rmux":"rmux 0.9.0","tmux":"tmux 3.7b","rustc":"rustc 1.95.0 (59807616e 2026-04-14)"},
+  "binary": {"path":"target/release/rmux","size_bytes":2344752},
+  "memory": {"rss_proxy_kib":null,"status":"probe-failed","note":"/usr/bin/time -v diagnose --json proxy"},
+  "parameters": {"iterations":30,"line_count":10000},
+  "artifacts": {"schema1_json":"target/perf-baseline/schema1/unix-20260710-141212.json","schema1_summary":"target/perf-baseline/schema1/unix-20260710-141212.txt","baseline_file":"benches/perf/baselines/release-0.9.0.json","baseline_summary":"target/perf-baseline/baselines.md","fixture_manifest":"benches/perf/fixtures/MANIFEST.sha256"},
+  "required_targets": [
+    {"name":"attach_render","status":"collected","source_metric":"attach_render_10000_line_scrollback","note":"PTY attach render until the final scrollback marker is visible"},
+    {"name":"source_file_large_corpus","status":"collected","source_metric":"source_file_1000_commands","note":"large source-file corpus of set-option commands"},
+    {"name":"status_format_heavy","status":"collected","source_metric":"status_format_heavy_expand","note":"heavy status-format expansion through display-message -F"},
+    {"name":"hook_storm","status":"collected","source_metric":"hook_storm_25_after_set_option","note":"after-set-option hook storm driven by source-file"},
+    {"name":"daemon_churn","status":"collected","source_metric":"daemon_churn_10_create_kill","note":"repeated release-artifact daemon create/kill cycles"},
+    {"name":"cold_path_size","status":"collected","source_metric":"binary.size_bytes","note":"release binary byte size"}
+  ],
+  "notes": [
+    "Release 0.9.0 records p50/p95 baselines for attach render, large source-file, status format, hook storm, and daemon churn.",
+    "Benchmarks must use a release artifact; debug binaries are rejected by perf-bench.sh and perf-baseline.sh."
+  ],
+  "source": {
+  "schema": 2,
+  "kind": "rmux-perf-current",
+  "timestamp": "2026-07-10T14:12:12Z",
+  "git": {"commit":"8df9d92385b1cbf2d9eb4281a033ee6e335c9433","describe":"v0.8.0-88-g8df9d9238","dirty":false},
+  "environment": {"platform":"darwin","machine":"arm64","host_fingerprint":"be2bd955293487d5"},
+  "binary": {"path":"target/release/rmux","sha256":"7321575eefd6efec760bede9d2f11024c2ef7f8963be82016768f75422d0c62e","size_bytes":2344752,"version":"rmux 0.9.0","configuration":"release"},
+  "layout": {"schema":1,"public":{"path":"target/release/rmux","sha256":"7321575eefd6efec760bede9d2f11024c2ef7f8963be82016768f75422d0c62e","size_bytes":2344752},"helper":{"path":"target/release/libexec/rmux/rmux","sha256":"aec69cc0a2101f4a94d515c49392a455eda3dd3abba76dda7d18354d6b16fdfa","size_bytes":11511920},"daemon":{"path":"target/release/rmux-daemon","sha256":"a263cc9a9b0dd4dac15f474f4fc8d15b7c9b4aed9e71b06052b0d43a00ed5947","size_bytes":9211856}},
+  "provenance": {"generator":"scripts/perf-bench.sh","invocation":"baseline:release-0.9.0:8df9d92385b1cbf2d9eb4281a033ee6e335c9433","expected_git_commit":"8df9d92385b1cbf2d9eb4281a033ee6e335c9433","expected_platform":"darwin","build_mode":"rebuilt"},
+  "parameters": {"iterations":30,"line_count":10000,"source_command_count":1000,"hook_storm_events":25,"daemon_churn_cycles":10},
+  "metrics": [
+    {"name":"diagnose_json_cold","p50_ms":30.300,"p95_ms":55.964,"mean_ms":35.840,"min_ms":17.759,"max_ms":165.714,"budget_p95_ms":250,"status":"pass","samples_ms":[165.714,18.360,17.759,17.929,21.573,23.627,26.384,32.360,29.507,30.112,31.133,24.852,39.184,43.260,37.233,39.173,32.838,31.033,26.879,28.261,55.964,37.702,38.085,44.941,30.173,28.945,28.811,31.925,30.300,31.178]},
+    {"name":"daemon_startup","p50_ms":30.363,"p95_ms":33.665,"mean_ms":36.817,"min_ms":27.344,"max_ms":219.928,"budget_p95_ms":750,"status":"pass","samples_ms":[219.928,29.376,30.467,29.539,29.475,28.596,29.397,29.814,33.280,29.645,32.876,31.050,32.543,33.665,27.541,29.930,29.714,32.661,27.344,31.327,31.735,31.036,30.648,29.657,29.539,32.665,30.363,27.413,32.079,31.211]},
+    {"name":"new_session_detached_sh","p50_ms":32.381,"p95_ms":35.914,"mean_ms":32.400,"min_ms":29.168,"max_ms":36.149,"budget_p95_ms":500,"status":"pass","samples_ms":[36.149,35.194,33.500,34.562,32.512,32.631,32.075,33.483,33.188,34.322,35.914,29.967,29.642,33.173,32.887,32.724,31.867,33.350,30.479,31.466,32.256,31.743,29.286,33.420,30.519,31.821,32.381,30.687,29.168,31.642]},
+    {"name":"split_window_detached_sh","p50_ms":15.968,"p95_ms":16.790,"mean_ms":15.633,"min_ms":13.146,"max_ms":17.710,"budget_p95_ms":150,"status":"pass","samples_ms":[17.710,14.508,14.288,15.987,16.270,15.137,16.768,16.241,16.455,14.709,16.146,14.205,16.600,15.252,16.370,15.936,14.503,16.790,13.146,14.959,15.411,14.287,13.632,16.765,14.902,16.560,16.746,16.282,15.968,16.454]},
+    {"name":"send_keys_detached_round_trip","p50_ms":22.192,"p95_ms":23.964,"mean_ms":22.329,"min_ms":19.631,"max_ms":24.178,"budget_p95_ms":50,"status":"pass","samples_ms":[23.884,20.754,23.391,21.994,22.670,21.244,21.899,21.457,23.344,20.514,21.270,22.070,23.535,22.375,23.423,22.917,21.351,24.178,23.078,21.105,22.960,21.699,22.192,23.628,21.190,23.940,22.535,19.631,21.666,23.964]},
+    {"name":"resize_pane_round_trip","p50_ms":13.333,"p95_ms":14.190,"mean_ms":13.245,"min_ms":11.664,"max_ms":15.554,"budget_p95_ms":100,"status":"pass","samples_ms":[13.681,13.514,11.897,15.554,13.058,13.332,13.676,11.664,12.740,13.005,12.434,14.190,13.370,14.163,11.746,13.707,12.393,13.202,13.102,12.144,12.692,13.835,12.451,13.333,13.366,13.576,13.425,13.919,14.166,14.029]},
+    {"name":"pane_output_10000_lines_ready","p50_ms":330.141,"p95_ms":423.090,"mean_ms":318.135,"min_ms":216.455,"max_ms":434.624,"budget_p95_ms":3000,"status":"pass","samples_ms":[231.973,224.205,229.612,359.846,277.843,236.996,360.254,237.668,235.705,418.836,394.268,374.048,402.871,434.624,373.937,423.090,330.141,388.515,362.602,224.061,233.713,322.310,391.324,400.612,400.671,230.580,365.507,232.326,229.464,216.455]},
+    {"name":"capture_pane_10000_lines","p50_ms":13.445,"p95_ms":14.980,"mean_ms":13.307,"min_ms":11.381,"max_ms":15.469,"budget_p95_ms":75,"status":"pass","samples_ms":[13.806,12.735,12.057,15.469,14.353,13.013,13.946,12.336,14.386,13.445,12.435,14.142,13.698,11.381,14.980,13.310,12.858,12.073,12.501,13.766,13.568,14.789,13.450,11.402,12.817,12.156,14.479,13.631,13.609,12.615]},
+    {"name":"attach_render_10000_line_scrollback","p50_ms":10.825,"p95_ms":12.258,"mean_ms":10.965,"min_ms":9.559,"max_ms":12.436,"budget_p95_ms":1000,"status":"pass","samples_ms":[9.866,11.584,11.031,10.825,10.184,10.507,9.735,10.188,11.832,10.307,9.739,9.559,11.009,10.420,9.636,11.399,10.740,9.729,12.171,12.179,12.248,11.134,11.977,11.944,10.313,11.227,10.754,12.436,12.258,12.005]},
+    {"name":"source_file_1000_commands","p50_ms":312.971,"p95_ms":350.105,"mean_ms":319.452,"min_ms":291.558,"max_ms":368.456,"budget_p95_ms":2000,"status":"pass","samples_ms":[305.299,303.865,305.182,301.038,308.472,312.725,310.627,340.772,323.131,318.609,323.499,341.072,325.395,318.876,312.971,350.105,341.197,339.131,337.955,291.558,310.198,312.476,308.402,315.160,317.631,317.274,311.795,368.456,300.882,309.819]},
+    {"name":"status_format_heavy_expand","p50_ms":14.100,"p95_ms":15.987,"mean_ms":14.145,"min_ms":11.850,"max_ms":16.039,"budget_p95_ms":250,"status":"pass","samples_ms":[11.850,14.947,13.311,13.817,15.488,13.785,14.858,14.765,13.443,11.918,13.743,13.561,12.174,14.833,15.092,12.354,13.848,15.539,14.544,13.165,14.724,14.100,14.869,14.052,14.019,16.039,14.670,14.377,14.486,15.987]},
+    {"name":"hook_storm_25_after_set_option","p50_ms":30.922,"p95_ms":40.960,"mean_ms":31.956,"min_ms":23.517,"max_ms":44.261,"budget_p95_ms":500,"status":"pass","samples_ms":[31.149,35.885,38.125,40.960,27.815,28.892,36.588,23.517,36.046,31.977,39.045,30.922,39.041,30.185,25.765,25.389,40.290,31.937,29.690,26.305,28.356,25.800,24.927,34.820,33.565,26.847,44.261,26.569,37.009,26.989]},
+    {"name":"daemon_churn_10_create_kill","p50_ms":570.595,"p95_ms":733.586,"mean_ms":590.794,"min_ms":502.349,"max_ms":747.351,"budget_p95_ms":5000,"status":"pass","samples_ms":[647.506,636.423,694.632,733.586,747.351,654.733,588.155,588.542,551.194,562.722,598.404,545.785,582.601,559.346,542.948,600.544,570.595,540.393,502.349,523.569,652.796,546.665,528.857,542.968,571.661,556.385,571.932,546.836,537.090,697.241]}
+  ]
+}
+
+}

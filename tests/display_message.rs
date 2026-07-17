@@ -43,12 +43,26 @@ fn display_message_keeps_tmux_format_edge_semantics() -> Result<(), Box<dyn Erro
         ("#{?#{?b},yes,no}Z", "noZ"),
         ("#{x}", ""),
         ("#{#{#{x}}}", ""),
-        ("#{&&:1,1,0}", "1"),
-        ("#{&&:1,0,1}", "1"),
-        ("#{||:0,0,0}", "1"),
-        ("#{e|+|:999999999999999999999,1}", "9223372036854775808"),
-        ("#{e|/|:-9223372036854775808,-1}", "9223372036854775808"),
-        ("#{e|%|:-9223372036854775808,-1}", ""),
+        ("#{&&:1,1,0}", "0"),
+        ("#{&&:1,0,1}", "0"),
+        ("#{||:0,0,0}", "0"),
+        ("#{||:0,1,0}", "1"),
+        ("#{!:0}", "1"),
+        ("#{!!:foo}", "1"),
+        (
+            "#{&&:1,1,0}#{!:0}#{!!:foo}#{?#{==:a,b},X,#{==:c,c},Y,Z}",
+            "011Y",
+        ),
+        ("#{R:ab,3}", "ababab"),
+        ("#{R: ,#{n:#{session_name}}}", "     "),
+        ("pre#{R:x}tail", "pre"),
+        ("pre#{R:x,10001}tail", "pretail"),
+        ("#{p10001:session_name}tail", "alphatail"),
+        ("#{p-10001:session_name}tail", "alphatail"),
+        ("#{e|+|:999999999999999999999,1}", "-9223372036854775808"),
+        ("#{e|/|:-9223372036854775808,-1}", "-9223372036854775808"),
+        ("#{e|m|:-9223372036854775808,-1}", "0"),
+        ("#{e|%|:-9223372036854775808,-1}", "0"),
         ("#{s//Z/:session_name}", "alpha"),
         ("#{s//Z/:#{l:hi}}", "hi"),
         ("#{s/[0-9]*/Z/:session_name}", "aZlZpZhZaZ"),
@@ -65,6 +79,34 @@ fn display_message_keeps_tmux_format_edge_semantics() -> Result<(), Box<dyn Erro
         );
         assert!(stderr(&output).is_empty(), "template={template}");
     }
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn display_message_repeat_expansion_budget_survives_nested_dos_probe() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("display-message-repeat-budget")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{n:#{R:#{R:#{p10000:a},10000},10000}}",
+    ])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "0\n");
+    assert!(stderr(&output).is_empty());
+
+    let still_alive = harness.run(&["list-sessions", "-F", "#{session_name}"])?;
+    assert_eq!(still_alive.status.code(), Some(0));
+    assert!(stderr(&still_alive).is_empty());
+    assert_eq!(stdout(&still_alive), "alpha\n");
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -143,6 +185,87 @@ fn display_message_keeps_pane_zoomed_flag_empty_for_tmux34() -> Result<(), Box<d
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(stdout(&output), "0::1\n1::1\n");
     assert!(stderr(&output).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn display_message_reports_pane_input_disabled_state() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("display-message-pane-input-off")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let enabled = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{pane_input_off}",
+    ])?;
+    assert_eq!(enabled.status.code(), Some(0));
+    assert_eq!(stdout(&enabled), "0\n");
+    assert!(stderr(&enabled).is_empty());
+
+    assert_success(&harness.run(&["select-pane", "-d", "-t", "alpha:0.0"])?);
+
+    let disabled = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{pane_input_off}",
+    ])?;
+    assert_eq!(disabled.status.code(), Some(0));
+    assert_eq!(stdout(&disabled), "1\n");
+    assert!(stderr(&disabled).is_empty());
+
+    let listed = harness.run(&["list-panes", "-t", "alpha", "-F", "#{pane_input_off}"])?;
+    assert_eq!(listed.status.code(), Some(0));
+    assert_eq!(stdout(&listed), "1\n");
+    assert!(stderr(&listed).is_empty());
+
+    assert_success(&harness.run(&[
+        "if-shell",
+        "-F",
+        "-t",
+        "alpha:0.0",
+        "#{pane_input_off}",
+        "set-buffer -b pane-input-state disabled",
+        "set-buffer -b pane-input-state enabled",
+    ])?);
+    let selected = harness.run(&["show-buffer", "-b", "pane-input-state"])?;
+    assert_eq!(selected.status.code(), Some(0));
+    assert_eq!(stdout(&selected), "disabled");
+    assert!(stderr(&selected).is_empty());
+
+    assert_success(&harness.run(&["select-pane", "-e", "-t", "alpha:0.0"])?);
+    let config = harness.tmpdir().join("pane-input-off.conf");
+    std::fs::write(
+        &config,
+        "select-pane -d -t alpha:0.0\n\
+         if-shell -F -t alpha:0.0 '#{pane_input_off}' \
+         'set-buffer -b sourced-pane-input-state disabled' \
+         'set-buffer -b sourced-pane-input-state enabled'\n",
+    )?;
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?);
+    let sourced = harness.run(&["show-buffer", "-b", "sourced-pane-input-state"])?;
+    assert_eq!(sourced.status.code(), Some(0));
+    assert_eq!(stdout(&sourced), "disabled");
+    assert!(stderr(&sourced).is_empty());
+
+    assert_success(&harness.run(&["select-pane", "-e", "-t", "alpha:0.0"])?);
+    let reenabled = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{pane_input_off}",
+    ])?;
+    assert_eq!(reenabled.status.code(), Some(0));
+    assert_eq!(stdout(&reenabled), "0\n");
+    assert!(stderr(&reenabled).is_empty());
 
     terminate_child(daemon.child_mut())?;
     Ok(())

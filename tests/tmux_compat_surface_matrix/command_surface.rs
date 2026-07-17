@@ -136,10 +136,7 @@ fn tmux_compat_hook_allow_list_show_hooks_and_prefix_binding_surface_on_rmux_rel
     );
     assert_eq!(list_keys.status_code, Some(0));
     assert!(!list_keys.timed_out);
-    assert_eq!(
-        list_keys.stdout_string(),
-        "bind-key -T prefix C-b send-prefix\n"
-    );
+    assert_eq!(list_keys.stdout_string(), "");
     assert!(list_keys.stderr.is_empty());
 
     Ok(())
@@ -184,8 +181,9 @@ fn tmux_compat_key_tables_and_list_keys_exact_surface_when_frozen_tmux_is_availa
     assert_eq!(list_keys.tmux.timed_out, list_keys.rmux.timed_out);
     assert_eq!(list_keys.tmux.stderr, list_keys.rmux.stderr);
     assert_eq!(
-        drop_frozen_mirrored_layout_bindings(&list_keys.tmux.stdout),
-        list_keys.rmux.stdout
+        drop_deferred_prefix_bindings(&list_keys.tmux.stdout),
+        list_keys.rmux.stdout,
+        "RMUX must not advertise deferred bindings whose commands are not implemented"
     );
     assert_run_metadata(
         &list_keys,

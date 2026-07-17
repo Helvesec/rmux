@@ -1,22 +1,23 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
-    CreateWebShareRequest, ErrorResponse, KillPaneRequest, KillSessionRequest, KillWindowRequest,
-    NewWindowRequest, PaneInputRequest, PaneResizeRequest, PaneSelectRequest, PaneTarget,
-    PaneTargetRef, RenameWindowRequest, ResizePaneAdjustment, Response, RmuxError,
+    CreateWebShareRequest, ErrorResponse, KillSessionRequest, KillWindowRequest, NewWindowRequest,
+    OptionName, PaneInputRequest, PaneKillRequest, PaneResizeRequest, PaneSelectRequest,
+    PaneTargetRef, RenameWindowRequest, Request, ResizePaneAdjustment, Response, RmuxError,
     SelectWindowRequest, SessionId, SessionName, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, WebShareRequest, WebShareScope, WindowTarget,
+    SplitWindowTarget, WebShareRequest, WebShareScope, WindowId, WindowTarget,
 };
 use tokio::sync::{mpsc, watch};
 
 use super::attach_support::{
     attach_render_target_for_session_window, attach_target_for_session, AttachRegistration,
-    ClientFlags, ATTACH_CONTROL_BACKLOG_LIMIT,
+    ClientFlags,
 };
 use super::pane_support::resolve_pane_target_ref;
 use super::RequestHandler;
@@ -24,7 +25,10 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
-use crate::web::{ResolvedCreateWebShareRequest, WebSessionTarget, WebShareAccess, WebShareTarget};
+use crate::web::{
+    ResolvedCreateWebShareRequest, WebPaneTarget, WebSessionTarget, WebShareAccess,
+    WebShareAuthWaitPermit, WebShareExpiryPoll, WebShareTarget,
+};
 use rmux_core::{input::mode, PaneId};
 
 const WEB_ATTACH_PID_BASE: u32 = 0x8000_0000;
@@ -44,7 +48,63 @@ pub(crate) use stream::{
     WebPaneStream, WebSessionAttachEvent, WebSessionAttachReader, WebSessionStream, WebShareStream,
 };
 
+pub(crate) struct UndeliveredWebShareGuard {
+    registry: Arc<crate::web::WebShareRegistry>,
+    share_id: Option<String>,
+}
+
+impl UndeliveredWebShareGuard {
+    pub(crate) fn for_response(handler: &RequestHandler, response: &Response) -> Option<Self> {
+        let Response::WebShare(response) = response else {
+            return None;
+        };
+        let rmux_proto::WebShareResponse::Created(created) = response.as_ref() else {
+            return None;
+        };
+        Some(Self {
+            registry: Arc::clone(&handler.web_shares),
+            share_id: Some(created.share_id.clone()),
+        })
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.share_id = None;
+    }
+}
+
+impl Drop for UndeliveredWebShareGuard {
+    fn drop(&mut self) {
+        if let Some(share_id) = self.share_id.take() {
+            self.registry.discard_undelivered(&share_id);
+        }
+    }
+}
+
 impl RequestHandler {
+    #[cfg(test)]
+    pub(crate) fn new_with_web_authentication_limits(
+        max_connections: usize,
+        max_waiters: usize,
+        max_waiters_per_key: usize,
+        max_waiters_per_peer: usize,
+    ) -> Self {
+        let mut handler = Self::new();
+        handler.web_shares = Arc::new(
+            crate::web::WebShareRegistry::new_with_authentication_limits(
+                max_connections,
+                max_waiters,
+                max_waiters_per_key,
+                max_waiters_per_peer,
+            ),
+        );
+        handler
+    }
+
+    #[cfg(test)]
+    pub(crate) fn web_authentication_wait_count(&self) -> usize {
+        self.web_shares.authentication_wait_count()
+    }
+
     #[cfg(test)]
     pub(crate) async fn open_web_share(
         &self,
@@ -105,12 +165,21 @@ impl RequestHandler {
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 };
                 let expiry_kill_target = request.expiry_kill_target();
-                match self.web_shares.create(request) {
+                let created = {
+                    let state = self.state.lock().await;
+                    if let Err(error) = validate_resolved_web_target(&state, request.target()) {
+                        return Response::Error(ErrorResponse { error });
+                    }
+                    self.web_shares.create(request)
+                };
+                match created {
                     Ok(created) => {
+                        let revoke_rx = self.web_shares.expiry_revoke_receiver(&created.share_id);
                         self.spawn_web_share_expiry_task(
                             created.share_id.clone(),
                             created.expires_at_unix,
                             expiry_kill_target,
+                            revoke_rx,
                         );
                         Ok(rmux_proto::WebShareResponse::Created(created))
                     }
@@ -131,12 +200,34 @@ impl RequestHandler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn open_web_share_token_id(
         &self,
         token_id: &str,
         pin: Option<&str>,
     ) -> Result<WebShareStream, RmuxError> {
         let access = self.web_shares.connect_token_id(token_id, pin).await?;
+        self.open_web_share_access(access).await
+    }
+
+    pub(crate) fn reserve_web_share_authentication(
+        &self,
+        token_id: &str,
+        peer: Option<IpAddr>,
+    ) -> Result<WebShareAuthWaitPermit, RmuxError> {
+        self.web_shares.reserve_authentication_wait(token_id, peer)
+    }
+
+    pub(crate) async fn open_web_share_token_id_with_wait(
+        &self,
+        token_id: &str,
+        pin: Option<&str>,
+        auth_wait: &WebShareAuthWaitPermit,
+    ) -> Result<WebShareStream, RmuxError> {
+        let access = self
+            .web_shares
+            .connect_token_id_with_wait(token_id, pin, auth_wait)
+            .await?;
         self.open_web_share_access(access).await
     }
 
@@ -154,12 +245,27 @@ impl RequestHandler {
         }
     }
 
+    pub(in crate::handler) fn prune_web_panes(&self, pane_ids: &[PaneId]) {
+        self.web_shares.remove_targets_for_panes(pane_ids);
+    }
+
+    pub(in crate::handler) fn rekey_web_session(
+        &self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+        session_id: SessionId,
+    ) {
+        self.web_shares
+            .rename_session_targets(old_name, new_name, session_id);
+    }
+
     async fn open_web_share_access(
         &self,
         access: WebShareAccess,
     ) -> Result<WebShareStream, RmuxError> {
         match access.target().clone() {
             WebShareTarget::Pane(target) => {
+                let session_id = target.session_id();
                 let target = self.stable_web_target(&target).await?;
                 let (snapshot, output) = self.web_resnapshot(&target).await?;
                 let revoke_rx = access.revoke_receiver();
@@ -168,6 +274,7 @@ impl RequestHandler {
                     output,
                     revoke_rx,
                     snapshot,
+                    session_id,
                     target,
                 })))
             }
@@ -225,10 +332,15 @@ impl RequestHandler {
             )?;
             (current_target.clone(), target, snapshot)
         };
-        let attach_id = self
-            .register_attach_with_access(
+        // Bridge registration through the in-process forwarder's final wire
+        // drain. Closing the last session removes the active-attach entry
+        // before the browser has received its terminal exit frame.
+        let attach_forwarder_guard = self.begin_attach_forwarder();
+        let attach_identity = self
+            .register_attach_identity_with_access(
                 attach_pid,
                 session_target.name().clone(),
+                Some(session_target.id()),
                 AttachRegistration {
                     control_tx,
                     control_backlog: control_backlog.clone(),
@@ -243,7 +355,8 @@ impl RequestHandler {
                     client_size: None,
                 },
             )
-            .await;
+            .await
+            .ok_or_else(|| session_not_found_web(session_target.name()))?;
         let (_shutdown_tx, shutdown_rx) = watch::channel(());
         let task_handler = self.clone();
         tokio::spawn(async move {
@@ -257,14 +370,15 @@ impl RequestHandler {
                 control_backlog,
                 closing,
                 persistent_overlay_epoch,
-                LiveAttachInputContext {
-                    handler: Arc::new(task_handler.clone()),
-                    attach_pid,
-                },
+                LiveAttachInputContext::new(Arc::new(task_handler.clone()), attach_identity),
                 true,
             )
             .await;
-            task_handler.finish_attach(attach_pid, attach_id).await;
+            task_handler
+                .finish_attach(attach_pid, attach_identity.attach_id())
+                .await;
+            drop(attach_forwarder_guard);
+            let _ = task_handler.request_shutdown_if_pending();
             if let Err(error) = result {
                 tracing::debug!(attach_pid, "web session attach ended: {error}");
             }
@@ -361,7 +475,11 @@ impl RequestHandler {
         let Some(pane) = panes.into_iter().find(|pane| pane.id() == pane_id) else {
             return Ok(None);
         };
-        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
+        let status = state
+            .options
+            .resolve(Some(session.name()), OptionName::Status);
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size(), status)
+        else {
             return Ok(None);
         };
         let Some(scrollback) =
@@ -474,33 +592,45 @@ impl RequestHandler {
     pub(crate) async fn web_session_logout(
         &self,
         session_target: &WebSessionTarget,
+        requester_pid: u32,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_kill_session(KillSessionRequest {
-                target: session_target.name().clone(),
-                kill_all_except_target: false,
-                clear_alerts: false,
-            })
+            .dispatch_web_request(
+                requester_pid,
+                &session_target,
+                Request::KillSession(KillSessionRequest {
+                    target: session_target.name().clone(),
+                    kill_all_except_target: false,
+                    clear_alerts: false,
+                    kill_group: false,
+                }),
+            )
             .await;
+        self.refresh_hook_identity_aliases().await;
         response_to_result(response)
     }
 
     pub(crate) async fn web_session_select_pane(
         &self,
         session_target: &WebSessionTarget,
+        requester_pid: u32,
         pane_id: PaneId,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_pane_select_ref(PaneSelectRequest {
-                target: PaneTargetRef::by_id(session_target.name().clone(), pane_id),
-                title: None,
-            })
+            .dispatch_web_request(
+                requester_pid,
+                &session_target,
+                Request::PaneSelect(PaneSelectRequest {
+                    target: PaneTargetRef::by_id(session_target.name().clone(), pane_id),
+                    title: None,
+                }),
+            )
             .await;
         response_to_result(response)
     }
@@ -508,6 +638,7 @@ impl RequestHandler {
     pub(crate) async fn web_session_resize_pane(
         &self,
         session_target: &WebSessionTarget,
+        requester_pid: u32,
         pane_id: PaneId,
         adjustment: ResizePaneAdjustment,
     ) -> Result<(), RmuxError> {
@@ -515,10 +646,14 @@ impl RequestHandler {
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_pane_resize_ref(PaneResizeRequest {
-                target: PaneTargetRef::by_id(session_target.name().clone(), pane_id),
-                adjustment,
-            })
+            .dispatch_web_request(
+                requester_pid,
+                &session_target,
+                Request::PaneResize(PaneResizeRequest {
+                    target: PaneTargetRef::by_id(session_target.name().clone(), pane_id),
+                    adjustment,
+                }),
+            )
             .await;
         response_to_result(response)
     }
@@ -533,16 +668,18 @@ impl RequestHandler {
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_split_window(
+            .dispatch_web_request(
                 requester_pid,
-                SplitWindowRequest {
+                &session_target,
+                Request::SplitWindow(SplitWindowRequest {
                     target: SplitWindowTarget::Session(session_target.name().clone()),
                     direction,
                     before: false,
                     environment: None,
-                },
+                }),
             )
             .await;
+        self.refresh_hook_identity_aliases().await;
         response_to_result(response)
     }
 
@@ -555,9 +692,10 @@ impl RequestHandler {
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_new_window(
+            .dispatch_web_request(
                 requester_pid,
-                NewWindowRequest {
+                &session_target,
+                Request::NewWindow(Box::new(NewWindowRequest {
                     target: session_target.name().clone(),
                     name: None,
                     detached: false,
@@ -567,40 +705,58 @@ impl RequestHandler {
                     start_directory: None,
                     target_window_index: None,
                     insert_at_target: false,
-                },
+                })),
             )
             .await;
+        self.refresh_hook_identity_aliases().await;
         response_to_result(response)
     }
 
     pub(crate) async fn web_session_kill_active_pane(
         &self,
         session_target: &WebSessionTarget,
+        requester_pid: u32,
     ) -> Result<(), RmuxError> {
-        let target = self.web_session_active_pane_target(session_target).await?;
+        let (session_target, pane_id) = self
+            .web_session_active_pane_identity(session_target)
+            .await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_kill_pane(KillPaneRequest {
-                target,
-                kill_all_except: false,
-            })
+            .dispatch_web_request(
+                requester_pid,
+                &session_target,
+                Request::PaneKill(PaneKillRequest {
+                    target: PaneTargetRef::by_id(session_target.name().clone(), pane_id),
+                    kill_all_except: false,
+                }),
+            )
             .await;
+        self.refresh_hook_identity_aliases().await;
         response_to_result(response)
     }
 
     pub(crate) async fn web_session_select_window(
         &self,
         session_target: &WebSessionTarget,
+        requester_pid: u32,
         window_index: u32,
     ) -> Result<(), RmuxError> {
-        let session_target = self.current_web_session_target(session_target).await?;
+        let (session_target, window_id) = self
+            .current_web_window_identity(session_target, window_index)
+            .await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_select_window(SelectWindowRequest {
-                target: WindowTarget::with_window(session_target.name().clone(), window_index),
-            })
+            .dispatch_web_window_request(
+                requester_pid,
+                &session_target,
+                window_index,
+                window_id,
+                Request::SelectWindow(SelectWindowRequest {
+                    target: WindowTarget::with_window(session_target.name().clone(), window_index),
+                }),
+            )
             .await;
         response_to_result(response)
     }
@@ -623,62 +779,53 @@ impl RequestHandler {
                 active.terminal_context.clone(),
             )
         };
-        let target = {
-            let state = self.state.lock().await;
-            let session = state
-                .sessions
-                .session_by_id(session_target.id())
-                .ok_or_else(|| session_not_found_web(session_target.name()))?;
-            if !session.windows().contains_key(&window_index) {
-                return Ok(false);
-            }
-            attach_render_target_for_session_window(
-                &state,
-                session.name(),
-                Some(window_index),
-                attached_count,
-                &terminal_context,
-                &self.socket_path(),
-            )?
-        };
-
+        let state = self.state.lock().await;
+        let session = state
+            .sessions
+            .session_by_id(session_target.id())
+            .ok_or_else(|| session_not_found_web(session_target.name()))?;
+        if !session.windows().contains_key(&window_index) {
+            return Ok(false);
+        }
+        let target = attach_render_target_for_session_window(
+            &state,
+            session.name(),
+            Some(window_index),
+            attached_count,
+            &terminal_context,
+            &self.socket_path(),
+        )?;
         let mut active_attach = self.active_attach.lock().await;
         let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
             return Err(RmuxError::Server(
                 "web session attach disappeared".to_owned(),
             ));
         };
-        if &active.session_name != session_target.name() {
+        if &active.session_name != session_target.name() || active.session_id != session_target.id()
+        {
             return Err(RmuxError::Server(
                 "web session attach changed sessions".to_owned(),
             ));
         }
-        if active.control_backlog.load(Ordering::Acquire) >= ATTACH_CONTROL_BACKLOG_LIMIT {
-            let _ = active.control_tx.send(AttachControl::Detach);
-            active.closing.store(true, Ordering::SeqCst);
-            active_attach.by_pid.remove(&attach_pid);
-            return Err(RmuxError::Server(
-                "web session attach is not draining updates".to_owned(),
-            ));
-        }
         active.render_generation = active.render_generation.saturating_add(1);
         active.render_refresh_pending = false;
-        active.control_backlog.fetch_add(1, Ordering::AcqRel);
-        if active
-            .control_tx
-            .send(AttachControl::switch(target))
-            .is_err()
-        {
-            let _ =
+        if let Err(error) = active.control_tx.send(AttachControl::switch(target)) {
+            if error.is_full() {
                 active
-                    .control_backlog
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                        value.checked_sub(1)
-                    });
-            active_attach.by_pid.remove(&attach_pid);
-            return Err(RmuxError::Server(
-                "web session attach disappeared".to_owned(),
-            ));
+                    .closing
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
+            return if error.is_full() {
+                Err(RmuxError::Server(
+                    "web session attach is not draining updates".to_owned(),
+                ))
+            } else {
+                Err(RmuxError::Server(
+                    "web session attach disappeared".to_owned(),
+                ))
+            };
         }
         Ok(true)
     }
@@ -686,17 +833,26 @@ impl RequestHandler {
     pub(crate) async fn web_session_rename_window(
         &self,
         session_target: &WebSessionTarget,
+        requester_pid: u32,
         window_index: u32,
         name: String,
     ) -> Result<(), RmuxError> {
-        let session_target = self.current_web_session_target(session_target).await?;
+        let (session_target, window_id) = self
+            .current_web_window_identity(session_target, window_index)
+            .await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_rename_window(RenameWindowRequest {
-                target: WindowTarget::with_window(session_target.name().clone(), window_index),
-                name,
-            })
+            .dispatch_web_window_request(
+                requester_pid,
+                &session_target,
+                window_index,
+                window_id,
+                Request::RenameWindow(RenameWindowRequest {
+                    target: WindowTarget::with_window(session_target.name().clone(), window_index),
+                    name,
+                }),
+            )
             .await;
         response_to_result(response)
     }
@@ -704,18 +860,64 @@ impl RequestHandler {
     pub(crate) async fn web_session_kill_window(
         &self,
         session_target: &WebSessionTarget,
+        requester_pid: u32,
         window_index: u32,
     ) -> Result<(), RmuxError> {
-        let session_target = self.current_web_session_target(session_target).await?;
+        let (session_target, window_id) = self
+            .current_web_window_identity(session_target, window_index)
+            .await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_kill_window(KillWindowRequest {
-                target: WindowTarget::with_window(session_target.name().clone(), window_index),
-                kill_all_others: false,
-            })
+            .dispatch_web_window_request(
+                requester_pid,
+                &session_target,
+                window_index,
+                window_id,
+                Request::KillWindow(KillWindowRequest {
+                    target: WindowTarget::with_window(session_target.name().clone(), window_index),
+                    kill_all_others: false,
+                }),
+            )
             .await;
+        self.refresh_hook_identity_aliases().await;
         response_to_result(response)
+    }
+
+    async fn dispatch_web_request(
+        &self,
+        requester_pid: u32,
+        session_target: &WebSessionTarget,
+        request: Request,
+    ) -> Response {
+        super::dispatch_with_expected_session_identity(
+            self,
+            requester_pid,
+            session_target.name().clone(),
+            session_target.id(),
+            request,
+        )
+        .await
+    }
+
+    async fn dispatch_web_window_request(
+        &self,
+        requester_pid: u32,
+        session_target: &WebSessionTarget,
+        window_index: u32,
+        window_id: WindowId,
+        request: Request,
+    ) -> Response {
+        super::dispatch_with_expected_window_identity(
+            self,
+            requester_pid,
+            session_target.name().clone(),
+            session_target.id(),
+            window_index,
+            window_id,
+            request,
+        )
+        .await
     }
 
     fn spawn_web_share_expiry_task(
@@ -723,19 +925,19 @@ impl RequestHandler {
         share_id: String,
         expires_at_unix: Option<u64>,
         kill_target: Option<WebSessionTarget>,
+        revoke_rx: Option<watch::Receiver<Option<crate::web::WebShareRevokeReason>>>,
     ) {
-        let Some(expires_at_unix) = expires_at_unix else {
+        let (Some(_), Some(revoke_rx)) = (expires_at_unix, revoke_rx) else {
             return;
         };
         let handler = self.clone();
         tokio::spawn(async move {
-            // The public response carries whole Unix seconds, while the registry
-            // keeps the exact SystemTime deadline. First wake at the advertised
-            // second, then retry briefly so sub-second TTLs do not check early
-            // and leave the share expired-but-not-enforced.
-            tokio::time::sleep(duration_until_unix(expires_at_unix)).await;
+            // The wire response exposes whole Unix seconds, but the registry
+            // retains the exact SystemTime deadline. Poll that exact deadline
+            // atomically with record presence so rounding cannot leave an
+            // expired share unenforced and stopping a share cannot leak a task.
             let Some(expired) = handler
-                .wait_for_web_share_expiry(&share_id, expires_at_unix)
+                .wait_for_web_share_expiry(&share_id, revoke_rx)
                 .await
             else {
                 return;
@@ -743,7 +945,10 @@ impl RequestHandler {
             tracing::info!(share_id = %expired.share_id, "web_share_expired");
             let target = kill_target.or(expired.kill_session);
             if let Some(target) = target {
-                if let Err(error) = handler.web_session_logout(&target).await {
+                if let Err(error) = handler
+                    .web_session_logout(&target, std::process::id())
+                    .await
+                {
                     tracing::debug!(
                         share_id = %expired.share_id,
                         session = %target.name(),
@@ -757,19 +962,23 @@ impl RequestHandler {
     async fn wait_for_web_share_expiry(
         &self,
         share_id: &str,
-        expires_at_unix: u64,
+        mut revoke_rx: watch::Receiver<Option<crate::web::WebShareRevokeReason>>,
     ) -> Option<crate::web::ExpiredWebShare> {
-        let retry_until = UNIX_EPOCH
-            .checked_add(Duration::from_secs(expires_at_unix))
-            .and_then(|deadline| deadline.checked_add(Duration::from_secs(1)))?;
         loop {
-            if let Some(expired) = self.web_shares.expire_if_due(share_id) {
-                return Some(expired);
+            match self.web_shares.poll_expiry(share_id) {
+                WebShareExpiryPoll::Expired(expired) => return Some(expired),
+                WebShareExpiryPoll::Pending(deadline) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(duration_until(deadline)) => {}
+                        changed = revoke_rx.changed() => {
+                            if changed.is_err() {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                WebShareExpiryPoll::Gone => return None,
             }
-            if SystemTime::now() >= retry_until {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -781,13 +990,20 @@ impl RequestHandler {
         let target = match &request.scope {
             WebShareScope::Pane(raw_target) => {
                 let target = resolve_pane_target_ref(&state, raw_target)?;
+                let session = state
+                    .sessions
+                    .session(target.session_name())
+                    .ok_or_else(|| session_not_found_web(target.session_name()))?;
                 let pane_id = pane_id_for_target(
                     &state.sessions,
                     target.session_name(),
                     target.window_index(),
                     target.pane_index(),
                 )?;
-                WebShareTarget::pane(PaneTargetRef::by_id(target.session_name().clone(), pane_id))
+                WebShareTarget::pane(
+                    PaneTargetRef::by_id(target.session_name().clone(), pane_id),
+                    session.id(),
+                )
             }
             WebShareScope::Session(session_name) => {
                 let session = state
@@ -818,9 +1034,14 @@ impl RequestHandler {
         Ok(request.with_tunnel(tunnel))
     }
 
-    async fn stable_web_target(&self, target: &PaneTargetRef) -> Result<PaneTargetRef, RmuxError> {
+    async fn stable_web_target(&self, target: &WebPaneTarget) -> Result<PaneTargetRef, RmuxError> {
         let state = self.state.lock().await;
-        let target = resolve_pane_target_ref(&state, target)?;
+        state
+            .sessions
+            .session_by_id(target.session_id())
+            .filter(|session| session.name() == target.target().session_name())
+            .ok_or_else(|| session_not_found_web(target.target().session_name()))?;
+        let target = resolve_pane_target_ref(&state, target.target())?;
         let pane_id = pane_id_for_target(
             &state.sessions,
             target.session_name(),
@@ -830,9 +1051,31 @@ impl RequestHandler {
         Ok(PaneTargetRef::by_id(target.session_name().clone(), pane_id))
     }
 
+    #[cfg(test)]
     pub(crate) async fn web_target_alive(&self, target: &PaneTargetRef) -> bool {
         let state = self.state.lock().await;
         resolve_pane_target_ref(&state, target).is_ok()
+    }
+
+    pub(crate) async fn current_web_pane_target(
+        &self,
+        session_id: SessionId,
+        target: &PaneTargetRef,
+    ) -> Result<PaneTargetRef, RmuxError> {
+        let pane_id = target.pane_id().ok_or_else(|| {
+            RmuxError::Server("web pane stream lost its stable pane id".to_owned())
+        })?;
+        let state = self.state.lock().await;
+        let session = state
+            .sessions
+            .session_by_id(session_id)
+            .ok_or_else(|| session_not_found_web(target.session_name()))?;
+        let current = PaneTargetRef::by_id(session.name().clone(), pane_id);
+        let resolved = resolve_pane_target_ref(&state, &current)?;
+        Ok(PaneTargetRef::by_id(
+            resolved.session_name().clone(),
+            pane_id,
+        ))
     }
 
     pub(crate) async fn web_session_alive(&self, session_target: &WebSessionTarget) -> bool {
@@ -853,22 +1096,40 @@ impl RequestHandler {
             .ok_or_else(|| session_not_found_web(session_target.name()))
     }
 
-    async fn web_session_active_pane_target(
+    async fn current_web_window_identity(
         &self,
         session_target: &WebSessionTarget,
-    ) -> Result<PaneTarget, RmuxError> {
-        let session_target = self.current_web_session_target(session_target).await?;
+        window_index: u32,
+    ) -> Result<(WebSessionTarget, WindowId), RmuxError> {
         let state = self.state.lock().await;
         let session = state
             .sessions
             .session_by_id(session_target.id())
             .ok_or_else(|| session_not_found_web(session_target.name()))?;
-        let window_index = session.active_window_index();
-        let pane_index = session.active_pane_index();
-        Ok(PaneTarget::with_window(
-            session_target.name().clone(),
-            window_index,
-            pane_index,
+        let window = session.window_at(window_index).ok_or_else(|| {
+            RmuxError::invalid_target(window_index.to_string(), "window not found")
+        })?;
+        Ok((
+            WebSessionTarget::new(session.name().clone(), session.id()),
+            window.id(),
+        ))
+    }
+
+    async fn web_session_active_pane_identity(
+        &self,
+        session_target: &WebSessionTarget,
+    ) -> Result<(WebSessionTarget, PaneId), RmuxError> {
+        let state = self.state.lock().await;
+        let session = state
+            .sessions
+            .session_by_id(session_target.id())
+            .ok_or_else(|| session_not_found_web(session_target.name()))?;
+        let pane_id = session.active_pane_id().ok_or_else(|| {
+            RmuxError::invalid_target(session.name().to_string(), "pane not found")
+        })?;
+        Ok((
+            WebSessionTarget::new(session.name().clone(), session.id()),
+            pane_id,
         ))
     }
 
@@ -892,10 +1153,26 @@ impl RequestHandler {
     }
 }
 
-fn duration_until_unix(expires_at_unix: u64) -> Duration {
-    let Some(deadline) = UNIX_EPOCH.checked_add(Duration::from_secs(expires_at_unix)) else {
-        return Duration::ZERO;
-    };
+fn validate_resolved_web_target(
+    state: &crate::pane_terminals::HandlerState,
+    target: &WebShareTarget,
+) -> Result<(), RmuxError> {
+    match target {
+        WebShareTarget::Pane(target) => state
+            .sessions
+            .session_by_id(target.session_id())
+            .filter(|session| session.name() == target.target().session_name())
+            .ok_or_else(|| session_not_found_web(target.target().session_name()))
+            .and_then(|_| resolve_pane_target_ref(state, target.target()).map(|_| ())),
+        WebShareTarget::Session(target) => state
+            .sessions
+            .session_by_id(target.id())
+            .map(|_| ())
+            .ok_or_else(|| session_not_found_web(target.name())),
+    }
+}
+
+fn duration_until(deadline: SystemTime) -> Duration {
     deadline
         .duration_since(SystemTime::now())
         .unwrap_or(Duration::ZERO)
@@ -952,7 +1229,11 @@ fn web_session_snapshot_from_state(
             }
             screen.mode
         });
-        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
+        let status = state
+            .options
+            .resolve(Some(session.name()), OptionName::Status);
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size(), status)
+        else {
             continue;
         };
         let scrollback = match scrolls.get(&pane.id()).copied() {

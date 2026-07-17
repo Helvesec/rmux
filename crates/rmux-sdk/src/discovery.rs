@@ -79,20 +79,24 @@ impl<'a> SessionFinder<'a> {
 
     /// Returns every session matching this query.
     pub async fn all(self) -> Result<Vec<DiscoveredSession>> {
-        let names = match &self.name {
+        let exact_name = match &self.name {
+            Some(name) => Some(SessionName::new(name).map_err(RmuxError::protocol)?),
+            None => None,
+        };
+        let rmux = self.rmux.begin_operation_handle().await?;
+        let names = match exact_name {
             Some(name) => {
-                let name = SessionName::new(name).map_err(RmuxError::protocol)?;
-                if self.rmux.has_session(name.clone()).await? {
+                if rmux.has_session(name.clone()).await? {
                     vec![name]
                 } else {
                     Vec::new()
                 }
             }
-            None => self.rmux.list_sessions().await?,
+            None => rmux.list_sessions().await?,
         };
         let mut sessions = Vec::new();
         for name in names {
-            let session = self.rmux.session(name.clone()).await?;
+            let session = rmux.session(name.clone()).await?;
             sessions.push(DiscoveredSession { name, session });
         }
         Ok(sessions)
@@ -223,8 +227,16 @@ impl<'a> PaneFinder<'a> {
 }
 
 async fn discover_panes(rmux: &Rmux, filters: &PaneFilters) -> Result<Vec<DiscoveredPane>> {
-    let session_names = match &filters.session {
-        Some(session_name) => vec![SessionName::new(session_name).map_err(RmuxError::protocol)?],
+    let exact_session = match &filters.session {
+        Some(session_name) => Some(SessionName::new(session_name).map_err(RmuxError::protocol)?),
+        None => None,
+    };
+    let rmux = rmux.begin_operation_handle().await?;
+    let deadline = rmux
+        .operation_deadline()
+        .expect("operation facade always carries a deadline scope");
+    let session_names = match exact_session {
+        Some(session_name) => vec![session_name],
         None => rmux.list_sessions().await?,
     };
 
@@ -235,16 +247,18 @@ async fn discover_panes(rmux: &Rmux, filters: &PaneFilters) -> Result<Vec<Discov
             continue;
         }
         let session = rmux.session(session_name.clone()).await?;
-        for listed in list_session_panes(&session).await? {
+        let operation_session = session.with_operation_deadline(deadline);
+        for listed in list_session_panes(&operation_session).await? {
             if !seen.insert((session_name.clone(), listed.pane_id)) {
                 continue;
             }
-            let pane = session.pane_by_id(listed.pane_id).await?;
-            let snapshot = pane.info().await?;
+            let pane = operation_session.pane_by_id(listed.pane_id).await?;
+            let operation_pane = pane.with_operation_deadline(deadline);
+            let snapshot = operation_pane.info().await?;
             let Some(info) = snapshot.pane(listed.pane_id).cloned() else {
                 continue;
             };
-            let title = pane.title().await?;
+            let title = operation_pane.title().await?;
             let Some(entry) =
                 discovered_from_info(session_name.clone(), listed, pane, info, title, &snapshot)
             else {
@@ -372,11 +386,14 @@ struct ListedPane {
 async fn list_session_panes(session: &crate::Session) -> Result<Vec<ListedPane>> {
     let response = session
         .transport()
-        .request(Request::ListPanes(ListPanesRequest {
+        .request(Request::ListPanes(Box::new(ListPanesRequest {
             target: session.name().clone(),
             target_window_index: None,
             format: Some(PANE_DISCOVERY_FORMAT.to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await?;
 
     let output = match response {
@@ -473,3 +490,7 @@ impl PaneFilters {
 fn parse_error(message: impl Into<String>) -> RmuxError {
     RmuxError::protocol(rmux_proto::RmuxError::Server(message.into()))
 }
+
+#[cfg(test)]
+#[path = "discovery_tests.rs"]
+mod tests;

@@ -281,7 +281,11 @@ impl RequestHandler {
                 target: WindowTarget::with_window(session_name.clone(), window_index),
             })
             .await;
-            self.refresh_attached_session(&session_name).await;
+            // See handle_select_pane: skip the refresh (and its deferred-pane
+            // wait on Windows) when nothing is attached to the session.
+            if self.attached_count(&session_name).await > 0 {
+                self.refresh_attached_session(&session_name).await;
+            }
         }
 
         response

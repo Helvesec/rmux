@@ -11,7 +11,10 @@ use tokio::time::Instant;
 
 use crate::{Pane, PaneSnapshot, Result, RmuxError};
 
-use super::{resolved_wait_timeout, TEXT_POLL_INTERVAL};
+use super::{
+    resolved_wait_timeout_override, snapshot_with_wait_deadline, wait_deadline, TEXT_POLL_INTERVAL,
+    WAIT_FOR_TEXT_OPERATION,
+};
 
 #[cfg(feature = "regex")]
 const REGEX_SIZE_LIMIT: usize = 1_000_000;
@@ -160,13 +163,29 @@ impl<'a> VisibleTextWait<'a> {
     }
 
     async fn run(self) -> Result<PaneSnapshot> {
+        let timeout =
+            resolved_wait_timeout_override(self.timeout, self.pane.configured_default_timeout());
+        let deadline = wait_deadline(timeout);
+        self.run_with_deadline(timeout, deadline).await
+    }
+
+    pub(crate) async fn run_with_deadline(
+        self,
+        timeout: Option<Duration>,
+        deadline: Option<Instant>,
+    ) -> Result<PaneSnapshot> {
         let matcher = self.matcher.compile()?;
-        let timeout = self
-            .timeout
-            .or_else(|| resolved_wait_timeout(self.pane.configured_default_timeout()));
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let mut last_snapshot = None;
         loop {
-            let snapshot = self.pane.snapshot().await?;
+            let snapshot = snapshot_with_wait_deadline(
+                self.pane,
+                WAIT_FOR_TEXT_OPERATION,
+                timeout,
+                deadline,
+                last_snapshot.as_ref(),
+                || matcher.describe(),
+            )
+            .await?;
             if matcher.matches(&snapshot.visible_text()) {
                 return Ok(snapshot);
             }
@@ -188,6 +207,7 @@ impl<'a> VisibleTextWait<'a> {
                     snapshot,
                 )));
             }
+            last_snapshot = Some(snapshot);
         }
     }
 }

@@ -25,6 +25,18 @@ impl RequestHandler {
                 .await
             {
                 Ok(filter) => filter,
+                Err(error)
+                    if request.target_client.is_none()
+                        && matches!(
+                            &error,
+                            RmuxError::Server(message) | RmuxError::Message(message)
+                                if message == "no current client"
+                        ) =>
+                {
+                    return Response::ShowMessages(ShowMessagesResponse::from_output(
+                        command_output_from_lines(&[]),
+                    ));
+                }
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
             let terminals = if request.terminals {
@@ -95,12 +107,9 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         target_client: Option<&str>,
-    ) -> Result<Option<u32>, RmuxError> {
+    ) -> Result<ManagedClient, RmuxError> {
         self.resolve_target_managed_client(requester_pid, target_client, "show-messages")
             .await
-            .map(|client| match client {
-                ManagedClient::Attach(pid) | ManagedClient::Control(pid) => Some(pid),
-            })
     }
 
     async fn resolve_show_messages_log_session(
@@ -112,24 +121,57 @@ impl RequestHandler {
             .resolve_target_managed_client(requester_pid, target_client, "show-messages")
             .await?
         {
-            ManagedClient::Attach(attach_pid) => {
+            ManagedClient::Attach {
+                pid: attach_pid,
+                attach_id,
+            } => {
                 let active_attach = self.active_attach.lock().await;
-                active_attach.session_for_attached_client(attach_pid, "show-messages")
+                active_attach
+                    .by_pid
+                    .get(&attach_pid)
+                    .filter(|active| {
+                        active.id == attach_id
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                    .map(|active| Some(active.session_name.clone()))
+                    .ok_or_else(|| {
+                        crate::handler_support::attached_client_required("show-messages")
+                    })
             }
-            ManagedClient::Control(control_pid) => {
-                Ok(self.current_session_candidate(control_pid).await)
+            ManagedClient::Control(identity) => {
+                let active_control = self.active_control.lock().await;
+                active_control
+                    .by_pid
+                    .get(&identity.requester_pid())
+                    .filter(|active| {
+                        active.id == identity.control_id()
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    })
+                    .map(|active| active.session_name.clone())
+                    .ok_or_else(|| {
+                        crate::handler_support::attached_client_required("show-messages")
+                    })
             }
         }
     }
 
-    async fn show_message_terminals(&self, filter: Option<u32>) -> Vec<String> {
+    async fn show_message_terminals(&self, filter: ManagedClient) -> Vec<String> {
         let terminals = {
             let active_attach = self.active_attach.lock().await;
             let mut terminals = active_attach
                 .by_pid
                 .iter()
                 .filter_map(|(pid, active)| {
-                    (filter.is_none() || filter == Some(*pid)).then_some(TerminalSummary {
+                    matches!(
+                        filter,
+                        ManagedClient::Attach {
+                            pid: expected_pid,
+                            attach_id: expected_attach_id,
+                        } if *pid == expected_pid
+                            && active.id == expected_attach_id
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    )
+                    .then_some(TerminalSummary {
                         attach_pid: *pid,
                         session_name: active.session_name.clone(),
                         cols: active.client_size.cols,
@@ -153,7 +195,7 @@ impl RequestHandler {
             .collect()
     }
 
-    async fn show_message_jobs(&self, filter: Option<u32>) -> Vec<String> {
+    async fn show_message_jobs(&self, filter: ManagedClient) -> Vec<String> {
         let jobs = {
             let active_attach = self.active_attach.lock().await;
             let mut jobs = active_attach
@@ -168,12 +210,19 @@ impl RequestHandler {
                             ClientOverlayState::Menu(_) => None,
                         })
                         .is_some();
-                    (popup_has_job && (filter.is_none() || filter == Some(*pid))).then_some(
-                        JobSummary {
-                            attach_pid: *pid,
-                            session_name: active.session_name.clone(),
-                        },
-                    )
+                    let exact_attach = matches!(
+                        filter,
+                        ManagedClient::Attach {
+                            pid: expected_pid,
+                            attach_id: expected_attach_id,
+                        } if *pid == expected_pid
+                            && active.id == expected_attach_id
+                            && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    );
+                    (popup_has_job && exact_attach).then_some(JobSummary {
+                        attach_pid: *pid,
+                        session_name: active.session_name.clone(),
+                    })
                 })
                 .collect::<Vec<_>>();
             jobs.sort_by_key(|job| job.attach_pid);

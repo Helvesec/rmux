@@ -12,7 +12,7 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             Some(spec('t', Type::Window, Flags::WINDOW_INDEX)),
         )),
         "capture-pane" | "kill-pane" | "paste-buffer" | "pipe-pane" | "resize-pane"
-        | "respawn-pane" | "select-pane" | "send-keys" | "split-window" => {
+        | "respawn-pane" | "select-pane" | "send-keys" | "send-prefix" | "split-window" => {
             Some(metadata(None, Some(spec('t', Type::Pane, Flags::NONE))))
         }
         "copy-mode" => Some(metadata(
@@ -28,8 +28,10 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             Some(spec('t', Type::Pane, Flags::NONE)),
         )),
         "kill-window" | "last-pane" | "list-panes" | "next-layout" | "previous-layout"
-        | "rename-window" | "respawn-window" | "rotate-window" | "select-layout"
-        | "select-window" => Some(metadata(None, Some(spec('t', Type::Window, Flags::NONE)))),
+        | "rename-window" | "resize-window" | "respawn-window" | "rotate-window"
+        | "select-layout" | "select-window" | "unlink-window" => {
+            Some(metadata(None, Some(spec('t', Type::Window, Flags::NONE))))
+        }
         "link-window" | "move-window" => Some(metadata(
             Some(spec('s', Type::Window, Flags::NONE)),
             Some(spec('t', Type::Window, Flags::WINDOW_INDEX)),
@@ -42,8 +44,12 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             Some(spec('s', Type::Window, Flags::DEFAULT_MARKED)),
             Some(spec('t', Type::Window, Flags::NONE)),
         )),
-        "attach-session" | "display-panes" | "has-session" | "kill-session" | "last-window"
-        | "list-windows" | "next-window" | "previous-window" | "rename-session" => {
+        "attach-session" => Some(metadata(
+            None,
+            Some(spec('t', Type::Session, Flags::PREFER_UNATTACHED)),
+        )),
+        "display-panes" | "has-session" | "kill-session" | "last-window" | "list-windows"
+        | "next-window" | "previous-window" | "rename-session" => {
             Some(metadata(None, Some(spec('t', Type::Session, Flags::NONE))))
         }
         "set-hook" => Some(metadata(None, Some(spec('t', Type::Pane, Flags::CANFAIL)))),
@@ -51,13 +57,14 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             None,
             Some(spec('t', Type::Session, Flags::CANFAIL)),
         )),
-        "switch-client" => Some(metadata(
-            None,
-            Some(spec('t', Type::Session, Flags::PREFER_UNATTACHED)),
-        )),
+        "switch-client" => Some(metadata(None, Some(spec('t', Type::Window, Flags::NONE)))),
         "set-option" => Some(metadata(
             None,
             Some(spec('t', Type::Session, Flags::CANFAIL)),
+        )),
+        "set-window-option" | "show-window-options" => Some(metadata(
+            None,
+            Some(spec('t', Type::Window, Flags::CANFAIL)),
         )),
         _ => None,
     }

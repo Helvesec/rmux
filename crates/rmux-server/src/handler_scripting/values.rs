@@ -73,3 +73,20 @@ pub(super) fn missing_argument(command: &str, argument: &str) -> RmuxError {
 pub(super) fn unsupported_flag(command: &str, flag: &str) -> RmuxError {
     RmuxError::Server(format!("command {command}: unknown flag {flag}"))
 }
+
+/// Rejects an option-looking token before a parser starts consuming its
+/// positional tail.
+///
+/// A bare `-` remains a positional value, while an explicit `--` is consumed
+/// by each command parser before this helper is reached. This keeps
+/// dash-prefixed commands available through `--` without silently treating a
+/// misspelled option as a shell command, binding, template, or wait channel.
+pub(super) fn reject_unknown_option_before_positional(
+    command: &str,
+    token: &str,
+) -> Result<(), RmuxError> {
+    if token.starts_with('-') && token != "-" {
+        return Err(unsupported_flag(command, token));
+    }
+    Ok(())
+}

@@ -1,44 +1,53 @@
-use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::AsRawHandle;
-use std::ptr::null_mut;
+use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle as OwnedWindowsHandle};
+use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rmux_os::identity::{IdentityResolver, UserIdentity};
+use rmux_os::identity::{TokenInformationBuffer, UserIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient, NamedPipeServer};
+use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA,
-    ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, HANDLE,
+    ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{
     GetTokenInformation, RevertToSelf, TokenUser, TOKEN_QUERY, TOKEN_USER,
 };
-use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_CREATE_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+};
 use windows_sys::Win32::System::Pipes::{
-    GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, ImpersonateNamedPipeClient,
-    PeekNamedPipe, WaitNamedPipeW,
+    GetNamedPipeClientProcessId, ImpersonateNamedPipeClient, PeekNamedPipe, WaitNamedPipeW,
 };
-use windows_sys::Win32::System::Threading::{
-    GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
 use super::PeerIdentity;
 use crate::LocalEndpoint;
 
+#[path = "server_identity_windows.rs"]
+mod server_identity;
+use server_identity::validate_named_pipe_server_identity;
+
+const RMUX_NAMED_PIPE_CLIENT_ACCESS: u32 =
+    FILE_GENERIC_READ | (FILE_GENERIC_WRITE & !FILE_CREATE_PIPE_INSTANCE);
+const RMUX_NAMED_PIPE_CLIENT_FLAGS: u32 =
+    SECURITY_IDENTIFICATION | SECURITY_SQOS_PRESENT | FILE_FLAG_OVERLAPPED;
 const WINDOWS_SYNTHETIC_UID: u32 = 0;
 
 /// Async local byte stream used by the server runtime.
 pub type LocalStream = NamedPipeServer;
 
+/// Async named-pipe client returned by the verified Windows connector.
+pub type WindowsPipeClient = NamedPipeClient;
+
 /// Blocking local byte stream used by the CLI.
 pub struct BlockingLocalStream {
-    inner: NamedPipeClient,
-    runtime: tokio::runtime::Runtime,
+    inner: Option<NamedPipeClient>,
+    runtime: Option<tokio::runtime::Runtime>,
     timeouts: Mutex<IoTimeouts>,
 }
 
@@ -57,8 +66,16 @@ impl std::fmt::Debug for BlockingLocalStream {
 impl BlockingLocalStream {
     /// Consumes the blocking wrapper and returns its Tokio pipe client plus
     /// the runtime that owns its I/O driver.
-    pub fn into_async_parts(self) -> (NamedPipeClient, tokio::runtime::Runtime) {
-        (self.inner, self.runtime)
+    pub fn into_async_parts(mut self) -> (NamedPipeClient, tokio::runtime::Runtime) {
+        let inner = self
+            .inner
+            .take()
+            .expect("blocking named-pipe stream must own its client");
+        let runtime = self
+            .runtime
+            .take()
+            .expect("blocking named-pipe stream must own its runtime");
+        (inner, runtime)
     }
 
     /// Returns the current read timeout for detached RPC reads.
@@ -85,13 +102,23 @@ impl BlockingLocalStream {
 
 impl PeerIdentity {
     pub(crate) async fn from_windows_pipe(stream: &LocalStream) -> io::Result<Self> {
-        let handle = stream.as_raw_handle() as isize;
-        tokio::task::spawn_blocking(move || peer_identity_from_handle(handle as HANDLE))
-            .await
-            .map_err(|error| {
-                io::Error::other(format!("Windows peer identity task failed: {error}"))
-            })?
+        spawn_peer_identity_query(stream, |handle| {
+            peer_identity_from_handle(handle.as_raw_handle() as HANDLE)
+        })?
+        .await
+        .map_err(|error| io::Error::other(format!("Windows peer identity task failed: {error}")))?
     }
+}
+
+fn spawn_peer_identity_query<Query>(
+    stream: &LocalStream,
+    query: Query,
+) -> io::Result<tokio::task::JoinHandle<io::Result<PeerIdentity>>>
+where
+    Query: FnOnce(OwnedWindowsHandle) -> io::Result<PeerIdentity> + Send + 'static,
+{
+    let handle = stream.as_handle().try_clone_to_owned()?;
+    Ok(tokio::task::spawn_blocking(move || query(handle)))
 }
 
 /// Connects a blocking client stream to a local endpoint.
@@ -110,11 +137,11 @@ pub fn connect_blocking(
         .build()?;
     let deadline = Instant::now() + timeout;
     loop {
-        match runtime.block_on(open_named_pipe_client(&pipe_name)) {
+        match runtime.block_on(connect_windows_pipe(&pipe_name)) {
             Ok(inner) => {
                 return Ok(BlockingLocalStream {
-                    inner,
-                    runtime,
+                    inner: Some(inner),
+                    runtime: Some(runtime),
                     timeouts: Mutex::new(IoTimeouts::default()),
                 });
             }
@@ -200,47 +227,118 @@ fn connect_retryable(error: &io::Error) -> bool {
     )
 }
 
-async fn open_named_pipe_client(pipe_name: &OsString) -> io::Result<NamedPipeClient> {
-    let mut options = ClientOptions::new();
-    options.security_qos_flags(SECURITY_IDENTIFICATION);
-    let client = options.open(pipe_name)?;
+/// Opens a Tokio named-pipe client with RMUX's restricted access rights and
+/// verifies that the server belongs to the current Windows user at the exact
+/// same mandatory integrity level.
+///
+/// Callers should use this boundary instead of Tokio's unrestricted
+/// `ClientOptions::open` so every asynchronous RMUX client applies the same
+/// server-identity policy as [`connect_blocking`].
+pub async fn connect_windows_pipe(pipe_name: &std::ffi::OsStr) -> io::Result<WindowsPipeClient> {
+    let client = open_named_pipe_client_handle(pipe_name)?;
     validate_named_pipe_server_identity(&client)?;
     Ok(client)
 }
 
+fn open_named_pipe_client_handle(pipe_name: &std::ffi::OsStr) -> io::Result<NamedPipeClient> {
+    let wide = pipe_name
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        // SAFETY: `wide` is a nul-terminated UTF-16 pipe name. The client only
+        // needs read/write/synchronize/read-control rights; it must not request
+        // FILE_CREATE_PIPE_INSTANCE, which is a server-side named-pipe right.
+        CreateFileW(
+            wide.as_ptr(),
+            RMUX_NAMED_PIPE_CLIENT_ACCESS,
+            0,
+            null(),
+            OPEN_EXISTING,
+            RMUX_NAMED_PIPE_CLIENT_FLAGS,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+
+    unsafe {
+        // SAFETY: the handle came from CreateFileW with FILE_FLAG_OVERLAPPED
+        // and ownership is transferred to Tokio's named-pipe wrapper.
+        NamedPipeClient::from_raw_handle(handle.cast())
+    }
+}
+
 impl Read for BlockingLocalStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.read_timeout()? {
-            Some(timeout) => self.runtime.block_on(async {
-                tokio::time::timeout(timeout, self.inner.read(buf))
+        let timeout = self.read_timeout()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("blocking named-pipe stream must own its runtime");
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("blocking named-pipe stream must own its client");
+        match timeout {
+            Some(timeout) => runtime.block_on(async {
+                tokio::time::timeout(timeout, inner.read(buf))
                     .await
                     .map_err(|_| timeout_error("read", timeout))?
             }),
-            None => self.runtime.block_on(self.inner.read(buf)),
+            None => runtime.block_on(inner.read(buf)),
         }
     }
 }
 
 impl Write for BlockingLocalStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.write_timeout() {
-            Some(timeout) => self.runtime.block_on(async {
-                tokio::time::timeout(timeout, self.inner.write(buf))
+        let timeout = self.write_timeout();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("blocking named-pipe stream must own its runtime");
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("blocking named-pipe stream must own its client");
+        match timeout {
+            Some(timeout) => runtime.block_on(async {
+                tokio::time::timeout(timeout, inner.write(buf))
                     .await
                     .map_err(|_| timeout_error("write", timeout))?
             }),
-            None => self.runtime.block_on(self.inner.write(buf)),
+            None => runtime.block_on(inner.write(buf)),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        match self.write_timeout() {
-            Some(timeout) => self.runtime.block_on(async {
-                tokio::time::timeout(timeout, self.inner.flush())
+        let timeout = self.write_timeout();
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("blocking named-pipe stream must own its runtime");
+        let inner = self
+            .inner
+            .as_mut()
+            .expect("blocking named-pipe stream must own its client");
+        match timeout {
+            Some(timeout) => runtime.block_on(async {
+                tokio::time::timeout(timeout, inner.flush())
                     .await
                     .map_err(|_| timeout_error("flush", timeout))?
             }),
-            None => self.runtime.block_on(self.inner.flush()),
+            None => runtime.block_on(inner.flush()),
+        }
+    }
+}
+
+impl Drop for BlockingLocalStream {
+    fn drop(&mut self) {
+        drop(self.inner.take());
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
         }
     }
 }
@@ -283,58 +381,6 @@ fn peer_identity_from_handle(handle: HANDLE) -> io::Result<PeerIdentity> {
         uid: WINDOWS_SYNTHETIC_UID,
         user,
     })
-}
-
-fn validate_named_pipe_server_identity(client: &NamedPipeClient) -> io::Result<()> {
-    let server_pid = named_pipe_server_pid(client)?;
-    let expected = IdentityResolver::current()?;
-    let actual = process_user_identity(server_pid)?;
-    if actual != expected {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "named-pipe server pid {server_pid} is owned by {actual:?}; expected {expected:?}"
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn named_pipe_server_pid(client: &NamedPipeClient) -> io::Result<u32> {
-    let mut pid = 0;
-    let ok = unsafe {
-        // SAFETY: client is a connected named-pipe client handle and pid is a valid out pointer.
-        GetNamedPipeServerProcessId(client.as_raw_handle() as HANDLE, &mut pid)
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(pid)
-}
-
-fn process_user_identity(pid: u32) -> io::Result<UserIdentity> {
-    let process = open_process_for_token_query(pid)?;
-    let mut token = null_mut();
-    let ok = unsafe {
-        // SAFETY: process is a live process handle and token is a valid out pointer.
-        OpenProcessToken(process.get(), TOKEN_QUERY, &mut token)
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let token = OwnedHandle(token);
-    token_user_identity(token.get())
-}
-
-fn open_process_for_token_query(pid: u32) -> io::Result<OwnedHandle> {
-    let handle = unsafe {
-        // SAFETY: OpenProcess validates the pid and returns either a handle or null.
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-    };
-    if handle.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(OwnedHandle(handle))
 }
 
 fn named_pipe_client_pid(handle: HANDLE) -> io::Result<u32> {
@@ -382,14 +428,15 @@ fn token_user_identity(token: HANDLE) -> io::Result<UserIdentity> {
         return Err(io::Error::last_os_error());
     }
 
-    let mut buffer = vec![0_u8; usize::try_from(needed).map_err(|_| io::ErrorKind::InvalidData)?];
+    let mut buffer = TokenInformationBuffer::<TOKEN_USER>::new(needed)?;
+    let buffer_len = buffer.byte_len();
     let ok = unsafe {
-        // SAFETY: buffer is writable for the byte count reported by Windows.
+        // SAFETY: buffer is writable for the aligned byte count allocated above.
         GetTokenInformation(
             token,
             TokenUser,
-            buffer.as_mut_ptr().cast(),
-            needed,
+            buffer.as_mut_ptr(),
+            buffer_len,
             &mut needed,
         )
     };
@@ -398,8 +445,9 @@ fn token_user_identity(token: HANDLE) -> io::Result<UserIdentity> {
     }
 
     let token_user = unsafe {
-        // SAFETY: A successful TokenUser query initializes TOKEN_USER at the buffer start.
-        &*(buffer.as_ptr().cast::<TOKEN_USER>())
+        // SAFETY: A successful TokenUser query initializes a valid TOKEN_USER
+        // header and its SID remains backed by `buffer` for this call.
+        buffer.assume_init_header()
     };
     sid_to_identity(token_user.User.Sid)
 }
@@ -473,5 +521,45 @@ impl Drop for RevertGuard {
             // there is no useful recovery path during Drop.
             RevertToSelf();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::endpoint_for_label;
+    use std::sync::mpsc;
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    #[tokio::test]
+    async fn peer_identity_query_owns_handle_after_accept_future_drop() -> io::Result<()> {
+        let endpoint = endpoint_for_label(format!("peer-identity-cancel-{}", std::process::id()))?;
+        let server = ServerOptions::new().create(endpoint.as_pipe_name())?;
+        let _client = connect_windows_pipe(endpoint.as_pipe_name()).await?;
+        server.connect().await?;
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let query = spawn_peer_identity_query(&server, move |handle| {
+            entered_tx
+                .send(())
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(io::Error::other)?;
+            peer_identity_from_handle(handle.as_raw_handle() as HANDLE)
+        })?;
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(io::Error::other)?;
+        // Dropping the stream models cancellation of `LocalListener::accept`
+        // after its blocking identity worker has started.
+        drop(server);
+        release_tx.send(()).map_err(io::Error::other)?;
+
+        let peer = query.await.map_err(io::Error::other)??;
+        assert_eq!(peer.pid, std::process::id());
+        Ok(())
     }
 }

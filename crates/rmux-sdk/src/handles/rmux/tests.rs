@@ -8,11 +8,11 @@ use super::connect::windows_pipe_connect_retryable;
 use super::Rmux;
 use crate::diagnostics::FEATURE_PROTOCOL_CAPABILITIES;
 use crate::transport::TransportClient;
-use crate::{RmuxEndpoint, RmuxError};
+use crate::{EnsureSession, RmuxEndpoint, RmuxError};
 use rmux_proto::{
     encode_frame, ErrorResponse, FrameDecoder, HandshakeResponse, HasSessionRequest,
-    HasSessionResponse, KillServerRequest, KillServerResponse, Request, Response, SessionName,
-    CAPABILITY_DAEMON_SHUTDOWN, CAPABILITY_HANDSHAKE, RMUX_WIRE_VERSION,
+    HasSessionResponse, KillServerRequest, KillServerResponse, NewSessionResponse, Request,
+    Response, SessionName, CAPABILITY_DAEMON_SHUTDOWN, CAPABILITY_HANDSHAKE, RMUX_WIRE_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -106,6 +106,122 @@ async fn write_response(stream: &mut tokio::io::DuplexStream, response: Response
     let frame = encode_frame(&response).expect("response encodes");
     stream.write_all(&frame).await.expect("write response");
     stream.flush().await.expect("flush response");
+}
+
+fn assert_timed_out(error: RmuxError) {
+    match error {
+        RmuxError::Transport { source, .. } => {
+            assert_eq!(source.kind(), io::ErrorKind::TimedOut);
+        }
+        error => panic!("expected transport timeout, got {error:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connected_facade_default_timeout_bounds_a_silent_rpc() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let rmux = Rmux::from_connected_transport(
+        RmuxEndpoint::UnixSocket("/unused/rmux.sock".into()),
+        Some(Duration::from_millis(50)),
+        TransportClient::spawn(client_stream),
+    );
+
+    let request = tokio::spawn(async move { rmux.has_session(alpha()).await });
+    assert!(matches!(
+        read_request(&mut server_stream).await,
+        Request::HasSession(_)
+    ));
+    tokio::time::advance(Duration::from_millis(50)).await;
+
+    assert_timed_out(
+        request
+            .await
+            .expect("facade request task must not panic")
+            .expect_err("silent RPC must time out"),
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ensure_session_shares_one_deadline_across_all_rpcs() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let rmux = Rmux::from_connected_transport(
+        RmuxEndpoint::UnixSocket("/unused/rmux.sock".into()),
+        Some(Duration::from_millis(100)),
+        TransportClient::spawn(client_stream),
+    );
+
+    let ensure = tokio::spawn(async move {
+        rmux.ensure_session(
+            EnsureSession::named(alpha())
+                .create_or_reuse()
+                .timeout(Duration::from_millis(100)),
+        )
+        .await
+    });
+    assert!(matches!(
+        read_request(&mut server_stream).await,
+        Request::HasSession(_)
+    ));
+    tokio::time::advance(Duration::from_millis(60)).await;
+    write_response(
+        &mut server_stream,
+        Response::HasSession(HasSessionResponse { exists: false }),
+    )
+    .await;
+    assert!(matches!(
+        read_request(&mut server_stream).await,
+        Request::NewSessionExt(_)
+    ));
+    tokio::time::advance(Duration::from_millis(40)).await;
+
+    assert_timed_out(
+        ensure
+            .await
+            .expect("ensure task must not panic")
+            .expect_err("the second RPC must use the first RPC's remaining budget"),
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn ensure_session_duration_max_overrides_a_finite_facade_default() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let rmux = Rmux::from_connected_transport(
+        RmuxEndpoint::UnixSocket("/unused/rmux.sock".into()),
+        Some(Duration::from_millis(10)),
+        TransportClient::spawn(client_stream),
+    );
+
+    let ensure = tokio::spawn(async move {
+        rmux.ensure_session(
+            EnsureSession::named(alpha())
+                .create_only()
+                .timeout(Duration::MAX),
+        )
+        .await
+    });
+    assert!(matches!(
+        read_request(&mut server_stream).await,
+        Request::NewSessionExt(_)
+    ));
+    tokio::time::advance(Duration::from_secs(24 * 60 * 60)).await;
+    assert!(
+        !ensure.is_finished(),
+        "Duration::MAX must disable the facade's finite default"
+    );
+    write_response(
+        &mut server_stream,
+        Response::NewSession(NewSessionResponse {
+            session_name: alpha(),
+            detached: true,
+            output: None,
+        }),
+    )
+    .await;
+
+    ensure
+        .await
+        .expect("ensure task must not panic")
+        .expect("unbounded ensure succeeds after a delayed response");
 }
 
 #[tokio::test]

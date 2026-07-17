@@ -92,13 +92,16 @@ async fn list_windows_uses_shared_formatter_through_real_socket() -> Result<(), 
 
     let listed = send_request(
         harness.socket_path(),
-        &Request::ListWindows(ListWindowsRequest {
+        &Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha,
             format: Some(
                 "#{session_name}\x1f#{session_windows}\x1f#{session_attached}\x1f#{session_width}x#{session_height}\x1f#{window_index}\x1f#{window_name}\x1f#{window_raw_flags}\x1f#{window_active}\x1f#{window_last_flag}\x1f#{window_id}\x1f#{missing}\x1f#I#W#S\x1f#{=21:pane_title}\x1f#{?window_active,yes,no}"
                     .to_owned(),
             ),
-            }),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })),
     )
     .await?;
 
@@ -164,13 +167,16 @@ async fn nested_conditionals_expand_inner_templates_through_real_socket(
 
     let listed = send_request(
         harness.socket_path(),
-        &Request::ListWindows(ListWindowsRequest {
+        &Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha,
             format: Some(
                 "#{?window_active,#{window_name},#{?window_last_flag,last,#{session_name}}}"
                     .to_owned(),
             ),
-        }),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })),
     )
     .await?;
 

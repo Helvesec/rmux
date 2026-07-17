@@ -1,18 +1,73 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmux_core::events::{
     OutputCursor, OutputCursorItem, OutputRing, PaneOutputSubscriptionKey, SubscriptionLimits,
 };
 use rmux_proto::{
-    PaneId, PaneOutputCursorRequest, PaneOutputSubscriptionStart, PaneTarget, PaneTargetRef,
-    Response, RmuxError, SessionName, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
+    NewSessionRequest, PaneId, PaneOutputCursorRequest, PaneOutputSubscriptionStart, PaneTarget,
+    PaneTargetRef, RenameSessionRequest, Request, Response, RmuxError, SessionId, SessionName,
+    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
 };
 
 use crate::daemon::ShutdownHandle;
+use crate::handler::exited_output_support::RetainedExitedPaneIdentities;
 use crate::pane_io::pane_output_channel_with_limits;
 
 use super::{lag_dto, OutputSubscriptionState, RequestHandler, MAX_LAG_RECENT_BYTES};
 use crate::handler::PendingShutdownReason;
+
+#[path = "handler_subscriptions_tests/destructive_mutations.rs"]
+mod destructive_mutations;
+#[path = "handler_subscriptions_tests/transfers.rs"]
+mod transfers;
+
+#[derive(Debug, Default)]
+pub(super) struct LiveSubscriptionCommitPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+static LIVE_SUBSCRIPTION_COMMIT_PAUSE: std::sync::Mutex<
+    Option<(PaneOutputSubscriptionKey, Arc<LiveSubscriptionCommitPause>)>,
+> = std::sync::Mutex::new(None);
+
+fn retained_identities() -> RetainedExitedPaneIdentities {
+    RetainedExitedPaneIdentities::new(SessionId::new(1), SessionId::new(1))
+}
+
+fn install_live_subscription_commit_pause(
+    pane: PaneOutputSubscriptionKey,
+) -> Arc<LiveSubscriptionCommitPause> {
+    let pause = Arc::new(LiveSubscriptionCommitPause::default());
+    *LIVE_SUBSCRIPTION_COMMIT_PAUSE
+        .lock()
+        .expect("live subscription commit pause lock") = Some((pane, pause.clone()));
+    pause
+}
+
+pub(super) async fn pause_before_live_subscription_commit(pane: &PaneOutputSubscriptionKey) {
+    let pause = LIVE_SUBSCRIPTION_COMMIT_PAUSE
+        .lock()
+        .expect("live subscription commit pause lock")
+        .as_ref()
+        .filter(|(paused_pane, _)| paused_pane == pane)
+        .map(|(_, pause)| pause.clone());
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+    let mut installed = LIVE_SUBSCRIPTION_COMMIT_PAUSE
+        .lock()
+        .expect("live subscription commit pause lock");
+    if installed
+        .as_ref()
+        .is_some_and(|(_, current)| Arc::ptr_eq(current, &pause))
+    {
+        installed.take();
+    }
+}
 
 #[test]
 fn lag_dto_carries_recent_output_without_replaying_missed_bytes() {
@@ -114,6 +169,88 @@ async fn cursor_handler_trims_lag_recent_hint_for_subscription_response() {
     assert!(lag.lag.recent.bytes.iter().all(|byte| *byte == b'b'));
     assert_eq!(lag.lag.recent.oldest_sequence, None);
     assert_eq!(lag.lag.recent.newest_sequence, Some(1));
+}
+
+#[tokio::test]
+async fn live_subscription_commit_serializes_with_session_rename_rekey() {
+    let handler = RequestHandler::new();
+    let alpha = SessionName::new("subscription-rename-alpha").expect("valid session name");
+    let beta = SessionName::new("subscription-rename-beta").expect("valid session name");
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    handler.wait_for_initial_panes_for_test().await;
+
+    let previous_key = {
+        let state = handler.state.lock().await;
+        state
+            .pane_output_subscription_key_for_target(&target)
+            .expect("live pane has a subscription key")
+    };
+    let pause = install_live_subscription_commit_pause(previous_key.clone());
+    let subscribe_handler = handler.clone();
+    let subscribe_target = target.clone();
+    let subscribe = tokio::spawn(async move {
+        subscribe_handler
+            .handle_subscribe_pane_output(
+                71,
+                SubscribePaneOutputRequest {
+                    target: subscribe_target,
+                    start: PaneOutputSubscriptionStart::Now,
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("subscription reaches its state-locked commit point");
+
+    let rename_handler = handler.clone();
+    let rename_alpha = alpha.clone();
+    let rename_beta = beta.clone();
+    let rename = tokio::spawn(async move {
+        rename_handler
+            .handle(Request::RenameSession(RenameSessionRequest {
+                target: rename_alpha,
+                new_name: rename_beta,
+            }))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !rename.is_finished(),
+        "rename must wait while a live subscription holds the state-to-registry transaction"
+    );
+
+    pause.release.notify_one();
+    let subscribed = tokio::time::timeout(Duration::from_secs(2), subscribe)
+        .await
+        .expect("subscription commit must not deadlock")
+        .expect("subscription task joins");
+    let Response::SubscribePaneOutput(subscribed) = subscribed else {
+        panic!("live subscription should succeed: {subscribed:?}");
+    };
+    let renamed = tokio::time::timeout(Duration::from_secs(2), rename)
+        .await
+        .expect("rename rekey must not deadlock")
+        .expect("rename task joins");
+    assert!(matches!(renamed, Response::RenameSession(_)), "{renamed:?}");
+
+    let current_key = handler
+        .pane_output_subscription_key_for_test(subscribed.subscription_id)
+        .expect("subscription survives rename");
+    assert_eq!(
+        current_key,
+        PaneOutputSubscriptionKey::new(beta, previous_key.pane_id()),
+        "rename must rekey the subscription committed immediately before it"
+    );
 }
 
 #[tokio::test]
@@ -377,7 +514,9 @@ async fn exit_empty_shutdown_does_not_wait_for_unsubscribed_retained_output() {
     let sender = pane_output_channel_with_limits(8, 1024);
     sender.send(b"retained".to_vec());
     sender.send(Vec::new());
-    handler.retain_exited_pane_output(target, pane.clone(), sender);
+    handler
+        .retain_exited_pane_output(target, pane.clone(), retained_identities(), sender)
+        .await;
 
     handler.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
     assert!(
@@ -408,7 +547,9 @@ async fn oldest_subscription_can_attach_to_retained_exited_pane_output() {
     sender.send(b"retained tail".to_vec());
     sender.send(Vec::new());
 
-    handler.retain_exited_pane_output(target.clone(), pane, sender);
+    handler
+        .retain_exited_pane_output(target.clone(), pane, retained_identities(), sender)
+        .await;
 
     let response = handler
         .handle_subscribe_pane_output(
@@ -454,7 +595,9 @@ async fn oldest_subscription_by_id_can_attach_to_retained_exited_pane_output() {
     sender.send(b"retained id tail".to_vec());
     sender.send(Vec::new());
 
-    handler.retain_exited_pane_output(target.clone(), pane, sender);
+    handler
+        .retain_exited_pane_output(target.clone(), pane, retained_identities(), sender)
+        .await;
 
     let response = handler
         .handle_subscribe_pane_output_ref(
@@ -505,8 +648,12 @@ async fn retained_exited_output_by_id_does_not_follow_reused_slot() {
     new_sender.send(b"new retained output".to_vec());
     new_sender.send(Vec::new());
 
-    handler.retain_exited_pane_output(target.clone(), old_pane, old_sender);
-    handler.retain_exited_pane_output(target.clone(), new_pane, new_sender);
+    handler
+        .retain_exited_pane_output(target.clone(), old_pane, retained_identities(), old_sender)
+        .await;
+    handler
+        .retain_exited_pane_output(target.clone(), new_pane, retained_identities(), new_sender)
+        .await;
 
     assert_retained_output_by_id(
         &handler,
@@ -551,7 +698,9 @@ async fn kill_server_does_not_wait_for_retained_exited_pane_output() {
     let sender = pane_output_channel_with_limits(8, 1024);
     sender.send(b"retained".to_vec());
     sender.send(Vec::new());
-    handler.retain_exited_pane_output(target, pane, sender);
+    handler
+        .retain_exited_pane_output(target, pane, retained_identities(), sender)
+        .await;
 
     let Response::KillServer(_) = handler.handle_kill_server().await else {
         panic!("kill-server should acknowledge shutdown");
@@ -564,6 +713,45 @@ async fn kill_server_does_not_wait_for_retained_exited_pane_output() {
         .await
         .expect("shutdown should be requested immediately")
         .expect("shutdown receiver should complete cleanly");
+}
+
+#[tokio::test]
+async fn kill_server_does_not_wait_for_an_active_output_subscription() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+    let connection_id = 60;
+    let pane = PaneOutputSubscriptionKey::new(
+        SessionName::new("active").expect("valid session name"),
+        PaneId::new(45),
+    );
+    let sender = pane_output_channel_with_limits(8, 1024);
+    let receiver = sender.subscribe();
+    {
+        let mut subscriptions = handler
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned");
+        let subscription_id = subscriptions
+            .registry
+            .subscribe(connection_id, pane, Instant::now())
+            .expect("subscription is within limits")
+            .id();
+        subscriptions.receivers.insert(subscription_id, receiver);
+    }
+
+    let Response::KillServer(_) = handler.handle_kill_server().await else {
+        panic!("kill-server should acknowledge shutdown");
+    };
+    assert!(
+        handler.request_shutdown_if_pending(),
+        "explicit kill-server must bypass active SDK subscriptions"
+    );
+    tokio::time::timeout(Duration::from_millis(50), &mut shutdown_rx)
+        .await
+        .expect("shutdown should be requested immediately")
+        .expect("shutdown receiver should complete cleanly");
+    drop(sender);
 }
 
 async fn assert_retained_output_by_id(

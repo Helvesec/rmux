@@ -3,7 +3,7 @@ use std::pin::Pin;
 
 use crate::handles::session::unexpected_response;
 use crate::{Pane, Result};
-use rmux_proto::{CapturePaneRequest, Request, Response};
+use rmux_proto::{CapturePaneTargetActionRequest, Request, Response};
 
 /// Result returned by [`PaneCaptureBuilder`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,9 @@ pub struct PaneCaptureBuilder<'a> {
     alternate: bool,
     escape_ansi: bool,
     escape_sequences: bool,
+    include_format: bool,
+    hyperlinks: bool,
+    line_numbers: bool,
     join_wrapped: bool,
     use_mode_screen: bool,
     preserve_trailing_spaces: bool,
@@ -46,6 +49,9 @@ impl<'a> PaneCaptureBuilder<'a> {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -119,6 +125,24 @@ impl<'a> PaneCaptureBuilder<'a> {
         self
     }
 
+    /// Prefixes each captured line with tmux line flags (`-F`).
+    pub const fn include_format(mut self, enabled: bool) -> Self {
+        self.include_format = enabled;
+        self
+    }
+
+    /// Captures hyperlink metadata instead of rendered text (`-H`).
+    pub const fn hyperlinks(mut self, enabled: bool) -> Self {
+        self.hyperlinks = enabled;
+        self
+    }
+
+    /// Prefixes each captured line with its source line number (`-L`).
+    pub const fn line_numbers(mut self, enabled: bool) -> Self {
+        self.line_numbers = enabled;
+        self
+    }
+
     /// Joins wrapped rows (`-J`).
     pub const fn join_wrapped(mut self, enabled: bool) -> Self {
         self.join_wrapped = enabled;
@@ -156,29 +180,37 @@ impl<'a> PaneCaptureBuilder<'a> {
     }
 
     async fn run(self) -> Result<PaneCapture> {
-        let target = self.pane.current_target().await?.to_proto();
+        let pane = self.pane.begin_operation_handle();
+        let target = pane.required_resolved_proto_target_ref().await?;
+        let pane_id = target
+            .pane_id()
+            .expect("resolved SDK pane capture targets are id-based");
         let print = self.buffer_name.is_none();
-        match self
-            .pane
+        match pane
             .transport()
-            .request(Request::CapturePane(Box::new(CapturePaneRequest {
-                target,
-                start: self.start,
-                end: self.end,
-                print,
-                buffer_name: self.buffer_name,
-                alternate: self.alternate,
-                escape_ansi: self.escape_ansi,
-                escape_sequences: self.escape_sequences,
-                join_wrapped: self.join_wrapped,
-                use_mode_screen: self.use_mode_screen,
-                preserve_trailing_spaces: self.preserve_trailing_spaces,
-                do_not_trim_spaces: self.do_not_trim_spaces,
-                pending_input: self.pending_input,
-                quiet: self.quiet,
-                start_is_absolute: self.start_is_absolute,
-                end_is_absolute: self.end_is_absolute,
-            })))
+            .request(Request::CapturePaneTargetAction(Box::new(
+                CapturePaneTargetActionRequest {
+                    target: Some(pane_id.to_string()),
+                    start: self.start,
+                    end: self.end,
+                    print,
+                    buffer_name: self.buffer_name,
+                    alternate: self.alternate,
+                    escape_ansi: self.escape_ansi,
+                    escape_sequences: self.escape_sequences,
+                    include_format: self.include_format,
+                    hyperlinks: self.hyperlinks,
+                    line_numbers: self.line_numbers,
+                    join_wrapped: self.join_wrapped,
+                    use_mode_screen: self.use_mode_screen,
+                    preserve_trailing_spaces: self.preserve_trailing_spaces,
+                    do_not_trim_spaces: self.do_not_trim_spaces,
+                    pending_input: self.pending_input,
+                    quiet: self.quiet,
+                    start_is_absolute: self.start_is_absolute,
+                    end_is_absolute: self.end_is_absolute,
+                },
+            )))
             .await?
         {
             Response::CapturePane(response) => Ok(PaneCapture {
@@ -206,7 +238,9 @@ impl<'a> IntoFuture for PaneCaptureBuilder<'a> {
 mod tests {
     use super::*;
     use crate::{PaneRef, RmuxEndpoint};
-    use rmux_proto::{encode_frame, CapturePaneResponse, CommandOutput, FrameDecoder, PaneTarget};
+    use rmux_proto::{
+        encode_frame, CapturePaneResponse, CommandOutput, FrameDecoder, ListPanesResponse,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn alpha() -> rmux_proto::SessionName {
@@ -244,6 +278,23 @@ mod tests {
         stream.flush().await.expect("flush response");
     }
 
+    async fn resolve_visible_slot(stream: &mut tokio::io::DuplexStream) {
+        match read_request(stream).await {
+            Request::ListPanes(request) => {
+                assert_eq!(request.target, alpha());
+                assert_eq!(request.target_window_index, Some(1));
+            }
+            request => panic!("expected list-panes slot resolution, got {request:?}"),
+        }
+        write_response(
+            stream,
+            Response::ListPanes(ListPanesResponse {
+                output: CommandOutput::from_stdout("1:3:%7\n"),
+            }),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn pane_capture_builder_sends_capture_pane_options() {
         let (client_stream, mut server_stream) = tokio::io::duplex(4096);
@@ -257,19 +308,26 @@ mod tests {
                     .end(0)
                     .alternate(true)
                     .escape_ansi(true)
+                    .include_format(true)
+                    .hyperlinks(true)
+                    .line_numbers(true)
                     .join_wrapped(true)
                     .await
             }
         });
 
+        resolve_visible_slot(&mut server_stream).await;
         match read_request(&mut server_stream).await {
-            Request::CapturePane(request) => {
-                assert_eq!(request.target, PaneTarget::with_window(alpha(), 1, 3));
+            Request::CapturePaneTargetAction(request) => {
+                assert_eq!(request.target.as_deref(), Some("%7"));
                 assert_eq!(request.start, Some(-20));
                 assert_eq!(request.end, Some(0));
                 assert!(request.print);
                 assert!(request.alternate);
                 assert!(request.escape_ansi);
+                assert!(request.include_format);
+                assert!(request.hyperlinks);
+                assert!(request.line_numbers);
                 assert!(request.join_wrapped);
                 assert!(!request.escape_sequences);
             }
@@ -306,8 +364,10 @@ mod tests {
             }
         });
 
+        resolve_visible_slot(&mut server_stream).await;
         match read_request(&mut server_stream).await {
-            Request::CapturePane(request) => {
+            Request::CapturePaneTargetAction(request) => {
+                assert_eq!(request.target.as_deref(), Some("%7"));
                 assert_eq!(request.start, None);
                 assert_eq!(request.end, None);
                 assert!(request.start_is_absolute);
@@ -340,8 +400,10 @@ mod tests {
             async move { pane.capture_pane().buffer("clip").await }
         });
 
+        resolve_visible_slot(&mut server_stream).await;
         match read_request(&mut server_stream).await {
-            Request::CapturePane(request) => {
+            Request::CapturePaneTargetAction(request) => {
+                assert_eq!(request.target.as_deref(), Some("%7"));
                 assert!(!request.print);
                 assert_eq!(request.buffer_name.as_deref(), Some("clip"));
             }

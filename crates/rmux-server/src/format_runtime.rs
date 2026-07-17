@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::pane_terminals::HandlerState;
@@ -27,6 +27,8 @@ mod process;
 mod variables;
 #[path = "format_runtime/window.rs"]
 mod window;
+
+pub(crate) use path::pane_path_from_osc7;
 
 pub(crate) struct RuntimeFormatContext<'a> {
     base: FormatContext,
@@ -115,6 +117,10 @@ impl<'a> RuntimeFormatContext<'a> {
     ) -> Self {
         self.base = self.base.with_named_value(name, value);
         self
+    }
+
+    pub(crate) fn with_socket_path(self, socket_path: &Path) -> Self {
+        self.with_named_value("socket_path", socket_path.to_string_lossy().into_owned())
     }
 
     pub(crate) fn status_job_profile(&self) -> Option<crate::terminal::TerminalProfile> {

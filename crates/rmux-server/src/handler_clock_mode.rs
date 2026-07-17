@@ -9,6 +9,7 @@ use rmux_proto::{
 use super::pane_support::resolve_input_target;
 use super::RequestHandler;
 use crate::clock_mode::{next_clock_tick_delay, CLOCK_MODE_NAME};
+use crate::handler_support::attached_client_required;
 use crate::pane_io::{AttachControl, OverlayFrame};
 use crate::pane_terminals::HandlerState;
 use crate::renderer::{self, ClockPaneRestoreData};
@@ -120,6 +121,90 @@ impl RequestHandler {
         if !pane_indexes.is_empty() && !frame.is_empty() {
             self.send_session_overlay(session_name, frame, true).await;
         }
+    }
+
+    pub(super) async fn refresh_clock_overlay_for_client_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        session_name: &SessionName,
+    ) -> Result<(), RmuxError> {
+        self.refresh_clock_overlay_with_expected_identity(
+            attach_pid,
+            expected_attach_id,
+            session_name,
+            None,
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn refresh_clock_overlay_for_session_identity(
+        &self,
+        identity: super::attach_support::ActiveAttachIdentity,
+        session_name: &SessionName,
+        session_id: rmux_proto::SessionId,
+    ) -> Result<(), RmuxError> {
+        self.refresh_clock_overlay_with_expected_identity(
+            identity.attach_pid(),
+            identity.attach_id(),
+            session_name,
+            Some(session_id),
+        )
+        .await
+    }
+
+    async fn refresh_clock_overlay_with_expected_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        session_name: &SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
+    ) -> Result<(), RmuxError> {
+        let frame = {
+            let state = self.state.lock().await;
+            let Some(session) = state.sessions.session(session_name) else {
+                return Err(attached_client_required("refresh-client"));
+            };
+            if expected_session_id.is_some_and(|expected| session.id() != expected) {
+                return Err(attached_client_required("refresh-client"));
+            }
+            let pane_indexes = visible_clock_pane_indexes(&state, session_name);
+            let frame = renderer::render_clock_overlay(
+                session,
+                &state.options,
+                &pane_indexes,
+                Local::now(),
+            );
+            (!pane_indexes.is_empty() && !frame.is_empty()).then_some(frame)
+        };
+
+        let mut active_attach = self.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&attach_pid)
+            .filter(|active| {
+                active.id == expected_attach_id
+                    && &active.session_name == session_name
+                    && expected_session_id.is_none_or(|expected| active.session_id == expected)
+                    && (expected_session_id.is_none() || active.prompt.is_none())
+                    && !active.suspended
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .ok_or_else(|| attached_client_required("refresh-client"))?;
+        let Some(frame) = frame else {
+            return Ok(());
+        };
+        if active.mode_tree.is_some() {
+            return Ok(());
+        }
+
+        active.overlay_generation = active.overlay_generation.saturating_add(1);
+        let overlay =
+            OverlayFrame::persistent(frame, active.render_generation, active.overlay_generation);
+        active
+            .control_tx
+            .send(AttachControl::Overlay(overlay))
+            .map_err(|_| attached_client_required("refresh-client"))
     }
 
     fn spawn_clock_mode_timer(&self, target: PaneTarget, generation: u64) {

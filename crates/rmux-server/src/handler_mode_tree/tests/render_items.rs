@@ -1,6 +1,79 @@
 use super::*;
 
 #[test]
+fn choose_tree_uses_window_local_visible_pane_indices_in_rows_and_previews() {
+    let mut state = HandlerState::default();
+    let session_name = SessionName::new("visible-indices").expect("valid session name");
+    state
+        .sessions
+        .create_session(session_name.clone(), TerminalSize { cols: 80, rows: 24 })
+        .expect("session creation succeeds");
+    state
+        .sessions
+        .session_mut(&session_name)
+        .expect("session exists")
+        .split_active_pane()
+        .expect("split succeeds");
+    state
+        .options
+        .set(
+            ScopeSelector::Window(rmux_proto::WindowTarget::with_window(
+                session_name.clone(),
+                0,
+            )),
+            OptionName::PaneBaseIndex,
+            "10".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("window-local pane-base-index set succeeds");
+
+    let session = state
+        .sessions
+        .session(&session_name)
+        .expect("session exists");
+    let window = session.window_at(0).expect("window exists");
+    let pane = window.pane(0).expect("pane exists");
+    let mode = test_mode(20);
+    let row = super::super::mode_tree_tree_build::render_tree_pane_line(
+        &mode, &state, session, 0, 0, window, pane,
+    );
+    assert!(
+        row.0 == "10" || row.0.starts_with("10: "),
+        "choose-tree row should expose pane index 10, got {:?}",
+        row.0
+    );
+
+    let item = ModeTreeItem {
+        id: "window".to_owned(),
+        parent: None,
+        children: Vec::new(),
+        depth: 1,
+        line: String::new(),
+        search_text: String::new(),
+        preview: Vec::new(),
+        no_tag: false,
+        action: ModeTreeAction::TreeTarget {
+            session_name,
+            session_id: session.id(),
+            window_index: Some(0),
+            window_id: None,
+            window_occurrence_id: None,
+            pane_index: None,
+            pane_id: None,
+        },
+    };
+    let preview = mode_tree_preview_lines(&state, &mode, &item, 60, 7, &Utf8Config::default());
+    assert!(
+        preview.iter().any(|line| line.contains(" 10 ")),
+        "choose-tree preview should label the first pane 10, got {preview:?}"
+    );
+    assert!(
+        preview.iter().any(|line| line.contains(" 11 ")),
+        "choose-tree preview should label the second pane 11, got {preview:?}"
+    );
+}
+
+#[test]
 fn render_visible_item_hides_single_pane_branch_marker_in_window_tree() {
     let state = HandlerState::default();
     let utf8 = Utf8Config::default();
@@ -255,4 +328,27 @@ fn render_mode_tree_overlay_keeps_cursor_hidden_while_active() {
     let rendered = String::from_utf8_lossy(&frame);
     assert!(rendered.contains("\u{1b}[?25l"));
     assert!(!rendered.contains("\u{1b}[?25h"));
+}
+
+#[test]
+fn render_mode_tree_overlay_uses_compact_plain_lines() {
+    let mut state = HandlerState::default();
+    state
+        .sessions
+        .create_session(
+            SessionName::new("test").expect("valid session"),
+            rmux_proto::TerminalSize { cols: 80, rows: 24 },
+        )
+        .expect("session create succeeds");
+    let mut mode = test_mode(10);
+    mode.selected_id = Some("root".to_owned());
+    let build = flat_build(&["root"]);
+
+    let frame = render_mode_tree_overlay(&state, &mode, &build);
+
+    assert!(
+        frame.len() < 2_000,
+        "plain choose-tree overlay should stay below common tty output queues, got {} bytes",
+        frame.len()
+    );
 }

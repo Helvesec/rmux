@@ -4,34 +4,18 @@ use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RefreshClientArgs {
-    #[arg(short = 'A')]
-    pub(crate) subscriptions: Vec<String>,
-    #[arg(short = 'B')]
-    pub(crate) subscriptions_format: Vec<String>,
-    #[arg(short = 'c', action = ArgAction::SetTrue)]
-    pub(crate) clear_pan: bool,
     #[arg(short = 'C')]
     pub(crate) control_size: Option<String>,
-    #[arg(short = 'D', action = ArgAction::SetTrue)]
-    pub(crate) pan_down: bool,
     #[arg(short = 'f')]
     pub(crate) flags: Option<String>,
     #[arg(short = 'F')]
     pub(crate) flags_alias: Option<String>,
     #[arg(short = 'l', action = ArgAction::SetTrue)]
     pub(crate) clipboard_query: bool,
-    #[arg(short = 'L', action = ArgAction::SetTrue)]
-    pub(crate) pan_left: bool,
-    #[arg(short = 'R', action = ArgAction::SetTrue)]
-    pub(crate) pan_right: bool,
     #[arg(short = 'S', action = ArgAction::SetTrue)]
     pub(crate) status_only: bool,
     #[arg(short = 't', allow_hyphen_values = true)]
     pub(crate) target_client: Option<String>,
-    #[arg(short = 'U', action = ArgAction::SetTrue)]
-    pub(crate) pan_up: bool,
-    #[arg(allow_hyphen_values = true)]
-    pub(crate) adjustment: Option<u32>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -42,24 +26,12 @@ pub(crate) struct ListClientsArgs {
     pub(crate) filter: Option<String>,
     #[arg(long = "json", action = ArgAction::SetTrue)]
     pub(crate) json: bool,
-    #[arg(short = 'O', hide = true)]
-    unsupported_sort_order: Option<String>,
+    #[arg(short = 'O')]
+    pub(crate) sort_order: Option<String>,
     #[arg(short = 'r', action = ArgAction::SetTrue, hide = true)]
-    unsupported_reversed: bool,
+    pub(crate) reversed: bool,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target_session: Option<TargetSpec>,
-}
-
-impl ListClientsArgs {
-    pub(crate) fn unsupported_flag(&self) -> Option<&'static str> {
-        if self.unsupported_reversed {
-            Some("-r")
-        } else if self.unsupported_sort_order.is_some() {
-            Some("-O")
-        } else {
-            None
-        }
-    }
 }
 
 #[derive(Debug, Clone, Args)]

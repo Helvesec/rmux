@@ -1,35 +1,12 @@
-use rmux_proto::{HookName, RmuxError, ScopeSelector};
+use rmux_proto::{HookName, RmuxError, ScopeSelector, SessionName, Target, WindowTarget};
 
 use super::types::{HookClass, HookGlobalRoot};
 
 /// Validates that a hook may be stored at the requested scope.
 pub fn validate_hook_scope(hook: HookName, scope: &ScopeSelector) -> Result<(), RmuxError> {
-    let is_valid = matches!(
-        (hook_class(hook), scope),
-        (
-            HookClass::Session,
-            ScopeSelector::Global | ScopeSelector::Session(_)
-        ) | (
-            HookClass::Window,
-            ScopeSelector::Global | ScopeSelector::Window(_)
-        ) | (
-            HookClass::Pane,
-            ScopeSelector::Global
-                | ScopeSelector::Session(_)
-                | ScopeSelector::Window(_)
-                | ScopeSelector::Pane(_),
-        )
-    );
-
-    if is_valid {
-        Ok(())
-    } else {
-        Err(RmuxError::Server(format!(
-            "{} does not support {} scope",
-            hook_name(hook),
-            scope_name(scope)
-        )))
-    }
+    let _ = hook_class(hook);
+    let _ = scope;
+    Ok(())
 }
 
 /// Validates that rmux ships the requested hook and that it may be stored at
@@ -43,6 +20,61 @@ pub fn validate_hook_registration(hook: HookName, scope: &ScopeSelector) -> Resu
     }
 
     validate_hook_scope(hook, scope)
+}
+
+/// Resolves the measured natural hook storage scope after target-pane lookup.
+#[must_use]
+pub fn hook_natural_scope_for_target(hook: HookName, target: Target) -> ScopeSelector {
+    match target {
+        Target::Session(session_name) => ScopeSelector::Session(session_name),
+        Target::Window(target) => match hook_class(hook) {
+            HookClass::Session => ScopeSelector::Session(target.session_name().clone()),
+            HookClass::Window | HookClass::Pane => ScopeSelector::Window(target),
+        },
+        Target::Pane(target) => match hook_class(hook) {
+            HookClass::Session => ScopeSelector::Session(target.session_name().clone()),
+            HookClass::Window | HookClass::Pane => ScopeSelector::Window(
+                WindowTarget::with_window(target.session_name().clone(), target.window_index()),
+            ),
+        },
+    }
+}
+
+/// Normalizes a scope selected explicitly with `-w` or `-p` for the hook.
+#[must_use]
+pub fn hook_explicit_scope_for_target(hook: HookName, target: Target) -> ScopeSelector {
+    match target {
+        Target::Session(session_name) => ScopeSelector::Session(session_name),
+        Target::Window(target) => match hook_class(hook) {
+            HookClass::Session => ScopeSelector::Session(target.session_name().clone()),
+            HookClass::Window | HookClass::Pane => ScopeSelector::Window(target),
+        },
+        Target::Pane(target) => match hook_class(hook) {
+            HookClass::Session => ScopeSelector::Session(target.session_name().clone()),
+            HookClass::Window => ScopeSelector::Window(WindowTarget::with_window(
+                target.session_name().clone(),
+                target.window_index(),
+            )),
+            HookClass::Pane => ScopeSelector::Pane(target),
+        },
+    }
+}
+
+/// Resolves tmux's natural `-t <session>` storage scope after the session's
+/// current window and pane have been looked up by the server.
+#[must_use]
+pub fn hook_natural_scope_for_session_target(
+    hook: HookName,
+    session_name: SessionName,
+    window_index: u32,
+    _pane_index: u32,
+) -> ScopeSelector {
+    match hook_class(hook) {
+        HookClass::Session => ScopeSelector::Session(session_name),
+        HookClass::Window | HookClass::Pane => {
+            ScopeSelector::Window(WindowTarget::with_window(session_name, window_index))
+        }
+    }
 }
 
 pub(super) const fn hook_inventory() -> [HookName; 70] {
@@ -211,34 +243,17 @@ pub const fn hook_global_root(hook: HookName) -> HookGlobalRoot {
 pub(super) const fn hook_is_visible_in_show_hooks(hook: HookName) -> bool {
     !matches!(
         hook,
-        HookName::ClientLightTheme
-            | HookName::ClientDarkTheme
-            | HookName::CommandError
-            | HookName::PasteBufferChanged
-            | HookName::PasteBufferDeleted
+        HookName::PasteBufferChanged | HookName::PasteBufferDeleted
     )
 }
 
 const fn hook_is_supported_for_registration(hook: HookName) -> bool {
     !matches!(
         hook,
-        HookName::ClientLightTheme
-            | HookName::ClientDarkTheme
-            | HookName::CommandError
-            | HookName::PasteBufferChanged
-            | HookName::PasteBufferDeleted
+        HookName::PasteBufferChanged | HookName::PasteBufferDeleted
     )
 }
 
 const fn hook_name(hook: HookName) -> &'static str {
     hook.as_str()
-}
-
-const fn scope_name(scope: &ScopeSelector) -> &'static str {
-    match scope {
-        ScopeSelector::Global => "global",
-        ScopeSelector::Session(_) => "session",
-        ScopeSelector::Window(_) => "window",
-        ScopeSelector::Pane(_) => "pane",
-    }
 }

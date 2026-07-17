@@ -2,7 +2,7 @@ use std::io;
 
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke,
-    AttachedWindowsConsoleKey, PaneTargetRef, TerminalSize, WebTerminalPalette,
+    AttachedWindowsConsoleKey, PaneTargetRef, SessionId, TerminalSize, WebTerminalPalette,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
@@ -20,6 +20,7 @@ pub(crate) struct WebPaneStream {
     pub(crate) output: PaneOutputReceiver,
     pub(crate) snapshot: WebPaneSnapshot,
     pub(crate) revoke_rx: tokio::sync::watch::Receiver<Option<WebShareRevokeReason>>,
+    pub(crate) session_id: SessionId,
     pub(crate) target: PaneTargetRef,
 }
 
@@ -81,6 +82,14 @@ impl WebPaneStream {
 
     pub(crate) fn target(&self) -> &PaneTargetRef {
         &self.target
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) fn set_target(&mut self, target: PaneTargetRef) {
+        self.target = target;
     }
 
     pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {

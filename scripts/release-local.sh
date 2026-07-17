@@ -6,7 +6,6 @@ usage() {
 Usage: scripts/release-local.sh [options]
 
 Run the local-first RMUX packaging and verification pipeline on Linux or macOS.
-See RELEASING.md for the signed-tag publication process.
 
 Options:
   --platform linux|macos       Platform override (default: host detection)

@@ -39,6 +39,93 @@ fn rmux_extension_commands_are_exact_only_cli_commands() {
 }
 
 #[test]
+fn with_session_accepts_options_after_session_before_child_separator() {
+    let mut queue = parse_args(&[
+        "with-session",
+        "owned",
+        "--kill-on-owner-exit",
+        "--ttl",
+        "45s",
+        "--",
+        "sh",
+        "-c",
+        "true",
+    ])
+    .expect("with-session options after the session name must parse")
+    .into_command_queue();
+    let super::super::Command::WithSession(args) = queue.remove(0) else {
+        panic!("expected with-session command");
+    };
+    assert_eq!(args.session_name.as_str(), "owned");
+    assert!(args.kill_on_owner_exit);
+    assert_eq!(args.ttl.as_secs(), 45);
+    assert_eq!(args.command, ["sh", "-c", "true"]);
+}
+
+#[test]
+fn with_session_keeps_supporting_options_before_session() {
+    let mut queue = parse_args(&[
+        "with-session",
+        "--ttl",
+        "2m",
+        "--kill-on-owner-exit",
+        "owned",
+        "--",
+        "sh",
+        "-c",
+        "true",
+    ])
+    .expect("with-session options before the session name must parse")
+    .into_command_queue();
+    let super::super::Command::WithSession(args) = queue.remove(0) else {
+        panic!("expected with-session command");
+    };
+    assert_eq!(args.session_name.as_str(), "owned");
+    assert!(args.kill_on_owner_exit);
+    assert_eq!(args.ttl.as_secs(), 120);
+    assert_eq!(args.command, ["sh", "-c", "true"]);
+}
+
+#[test]
+fn with_session_separator_scopes_child_flags_and_invalid_outer_options_still_fail() {
+    let mut queue = parse_args(&[
+        "with-session",
+        "owned",
+        "--",
+        "sh",
+        "--kill-on-owner-exit",
+        "--ttl",
+        "forever",
+    ])
+    .expect("child flags after the separator must stay in the child command")
+    .into_command_queue();
+    let super::super::Command::WithSession(args) = queue.remove(0) else {
+        panic!("expected with-session command");
+    };
+    assert!(!args.kill_on_owner_exit);
+    assert_eq!(args.ttl.as_secs(), 30);
+    assert_eq!(
+        args.command,
+        ["sh", "--kill-on-owner-exit", "--ttl", "forever"]
+    );
+
+    let unknown = parse_args(&["with-session", "--unknown", "owned", "--", "sh"])
+        .expect_err("unknown outer options must remain invalid");
+    assert_eq!(unknown.kind(), clap::error::ErrorKind::UnknownArgument);
+
+    let invalid_ttl = parse_args(&["with-session", "owned", "--ttl", "forever", "--", "sh"])
+        .expect_err("invalid with-session options after the session name must fail");
+    assert_eq!(invalid_ttl.kind(), clap::error::ErrorKind::ValueValidation);
+
+    let missing_child = parse_args(&["with-session", "owned", "--kill-on-owner-exit", "--"])
+        .expect_err("with-session still requires a child command");
+    assert_eq!(
+        missing_child.kind(),
+        clap::error::ErrorKind::ValueValidation
+    );
+}
+
+#[test]
 fn wait_pane_rejects_multiple_conditions_and_short_extension_flags() {
     let error = parse_args(&["wait-pane", "--text", "Done", "--quiet"])
         .expect_err("multiple wait conditions should fail");

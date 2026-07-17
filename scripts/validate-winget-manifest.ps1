@@ -3,6 +3,7 @@ param(
     [string]$Manifest,
     [Parameter(Mandatory = $true)]
     [string]$Version,
+    [string]$ReleaseTag = "",
     [string]$Checksums = "",
     [string]$Repository = "Helvesec/rmux",
     [string]$Identifier = "Helvesec.RMUX",
@@ -174,6 +175,15 @@ function ReadChecksum([string]$ChecksumsPath, [string]$Asset) {
 }
 
 $versionValue = NormalizeVersion $Version
+if ([string]::IsNullOrWhiteSpace($ReleaseTag)) {
+    $ReleaseTag = "v$versionValue"
+}
+if ($ReleaseTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[1-9][0-9]*)?$') {
+    Fail "invalid release tag: $ReleaseTag"
+}
+if ($ReleaseTag -ne "v$versionValue" -and $ReleaseTag -notmatch ('^v' + [regex]::Escape($versionValue) + '-rc\.[1-9][0-9]*$')) {
+    Fail "release tag $ReleaseTag does not contain package version $versionValue"
+}
 
 if ($Repository -notmatch '^[^/\s]+/[^/\s]+$') {
     Fail "repository must look like owner/repo: $Repository"
@@ -195,7 +205,7 @@ $localeManifest = "$stem.locale.en-US.yaml"
 
 $asset = "rmux-$versionValue-windows-x86_64.zip"
 $packageDir = "rmux-$versionValue-windows-x86_64"
-$expectedUrl = "https://github.com/$Repository/releases/download/v$versionValue/$asset"
+$expectedUrl = "https://github.com/$Repository/releases/download/$ReleaseTag/$asset"
 $expectedRelativePath = "$packageDir\rmux.exe"
 $expectedSha256 = ReadChecksum $Checksums $asset
 $owner = $Repository.Split('/')[0]
@@ -216,6 +226,7 @@ AssertManifestValue "InstallerType" "zip"
 AssertManifestValue "NestedInstallerType" "portable"
 AssertManifestValue "RelativeFilePath" $expectedRelativePath
 AssertManifestValue "PortableCommandAlias" "rmux"
+AssertManifestValue "ArchiveBinariesDependOnPath" "true"
 AssertManifestLine "Dependencies:"
 AssertManifestLine "PackageDependencies:"
 AssertManifestLine "- PackageIdentifier: Microsoft.VCRedist.2015+.x64"
@@ -250,7 +261,7 @@ AssertManifestValue "PackageName" "RMUX"
 AssertManifestValue "PackageUrl" $Homepage
 AssertManifestValue "License" "MIT OR Apache-2.0"
 AssertManifestValue "Moniker" "rmux"
-AssertManifestValue "ReleaseNotesUrl" "https://github.com/$Repository/releases/tag/v$versionValue"
+AssertManifestValue "ReleaseNotesUrl" "https://github.com/$Repository/releases/tag/$ReleaseTag"
 AssertManifestValue "ManifestType" "defaultLocale"
 AssertManifestValue "ManifestVersion" "1.10.0"
 

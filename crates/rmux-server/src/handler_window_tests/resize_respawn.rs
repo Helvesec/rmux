@@ -489,6 +489,248 @@ async fn respawn_window_succeeds_with_kill_flag() {
 }
 
 #[tokio::test]
+async fn respawn_window_reuses_shell_command_cwd_and_private_environment() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-window-provenance");
+    let initial_cwd = unique_window_temp_path("respawn-provenance-initial");
+    let override_cwd = unique_window_temp_path("respawn-provenance-override");
+    let output = unique_window_temp_path("respawn-provenance-output");
+    fs::create_dir_all(&initial_cwd).expect("initial respawn-window cwd");
+    fs::create_dir_all(&override_cwd).expect("override respawn-window cwd");
+    let initial_command = window_respawn_replay_command(&output, "initial-command");
+    let initial_process_command = ProcessCommand::Shell(initial_command.clone());
+    let initial_environment = "RMUX_RESPAWN=initial".to_owned();
+
+    let created = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(alpha.clone()),
+            working_directory: Some(initial_cwd.to_string_lossy().into_owned()),
+            detached: true,
+            size: Some(TerminalSize {
+                cols: 120,
+                rows: 40,
+            }),
+            environment: Some(vec![initial_environment.clone()]),
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: Some(initial_process_command.clone()),
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let initial_cwd_text = expected_window_spawn_cwd(&initial_cwd);
+    let initial_line = window_respawn_probe_line(&initial_cwd_text, "initial", "initial-command");
+    wait_for_window_file_contents(&output, &initial_line).await;
+    let pane_id = {
+        let state = handler.state.lock().await;
+        let pane_id = state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.pane_id_in_window(0, 0))
+            .expect("initial pane exists");
+        let lifecycle = state.pane_lifecycle(pane_id).expect("initial lifecycle");
+        assert_eq!(lifecycle.process_command(), Some(&initial_process_command));
+        assert_eq!(
+            lifecycle.respawn_environment(),
+            std::slice::from_ref(&initial_environment)
+        );
+        pane_id
+    };
+
+    let target = WindowTarget::with_window(alpha.clone(), 0);
+    let inherited = handler
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited, Response::RespawnWindow(_)),
+        "{inherited:?}"
+    );
+    wait_for_window_file_contents(&output, &format!("{initial_line}{initial_line}")).await;
+
+    let override_environment = "RMUX_RESPAWN=override".to_owned();
+    let override_command = window_respawn_replay_command(&output, "override-command");
+    let override_process_command = ProcessCommand::Shell(override_command.clone());
+    let explicit = handler
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: Some(override_cwd.clone()),
+            environment: Some(vec![override_environment.clone()]),
+            command: Some(vec![override_command]),
+        })))
+        .await;
+    assert!(
+        matches!(explicit, Response::RespawnWindow(_)),
+        "{explicit:?}"
+    );
+    let override_cwd_text = expected_window_spawn_cwd(&override_cwd);
+    let override_line =
+        window_respawn_probe_line(&override_cwd_text, "override", "override-command");
+    wait_for_window_file_contents(
+        &output,
+        &format!("{initial_line}{initial_line}{override_line}"),
+    )
+    .await;
+    {
+        let state = handler.state.lock().await;
+        let lifecycle = state.pane_lifecycle(pane_id).expect("override lifecycle");
+        assert_eq!(lifecycle.process_command(), Some(&override_process_command));
+        assert_eq!(
+            lifecycle.private_environment(),
+            std::slice::from_ref(&override_environment)
+        );
+        assert_eq!(
+            lifecycle.respawn_environment(),
+            std::slice::from_ref(&initial_environment)
+        );
+    }
+
+    let inherited_after_override = handler
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+            target,
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited_after_override, Response::RespawnWindow(_)),
+        "{inherited_after_override:?}"
+    );
+    let inherited_override_line =
+        window_respawn_probe_line(&override_cwd_text, "initial", "override-command");
+    wait_for_window_file_contents(
+        &output,
+        &format!("{initial_line}{initial_line}{override_line}{inherited_override_line}"),
+    )
+    .await;
+
+    drop(handler);
+    let _ = fs::remove_file(output);
+    let _ = fs::remove_dir_all(initial_cwd);
+    let _ = fs::remove_dir_all(override_cwd);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn respawn_window_keeps_the_original_resolved_shell_after_option_changes() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-window-shell-provenance");
+    let output = unique_window_temp_path("respawn-window-shell-provenance-output");
+    set_window_test_default_shell(&handler, "/bin/sh").await;
+    create_session(&handler, alpha.as_str()).await;
+    handler.wait_for_initial_panes_for_test().await;
+    set_window_test_default_shell(&handler, "/bin/bash").await;
+
+    let target = WindowTarget::with_window(alpha.clone(), 0);
+    let shell_command = window_respawn_shell_identity_command(&output, "shell");
+    let explicit = handler
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: Some(vec![shell_command]),
+        })))
+        .await;
+    assert!(
+        matches!(explicit, Response::RespawnWindow(_)),
+        "{explicit:?}"
+    );
+    let expected_line = "sh:/bin/sh:shell\n";
+    wait_for_window_file_contents(&output, expected_line).await;
+
+    let inherited = handler
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+            target,
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+        })))
+        .await;
+    assert!(
+        matches!(inherited, Response::RespawnWindow(_)),
+        "{inherited:?}"
+    );
+    wait_for_window_file_contents(&output, &format!("{expected_line}{expected_line}")).await;
+
+    let state = handler.state.lock().await;
+    let pane_id = state
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.pane_id_in_window(0, 0))
+        .expect("respawned window pane exists");
+    assert_eq!(
+        state
+            .pane_lifecycle(pane_id)
+            .expect("respawned window lifecycle")
+            .respawn_shell(),
+        Path::new("/bin/sh")
+    );
+    drop(state);
+    drop(handler);
+    let _ = fs::remove_file(output);
+}
+
+#[tokio::test]
+async fn failed_respawn_window_preserves_the_old_layout_terminal_and_lifecycle() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-window-rollback");
+    create_session(&handler, alpha.as_str()).await;
+    handler.wait_for_initial_panes_for_test().await;
+    let (session_before, pane_id, lifecycle_before) = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        let pane_id = session
+            .pane_id_in_window(0, 0)
+            .expect("initial pane exists");
+        (
+            session.clone(),
+            pane_id,
+            state
+                .pane_lifecycle(pane_id)
+                .expect("pane lifecycle exists")
+                .clone(),
+        )
+    };
+
+    let response = handler
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 0),
+            kill: true,
+            start_directory: None,
+            environment: Some(vec!["INVALID".to_owned()]),
+            command: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::Error(_)), "{response:?}");
+
+    let state = handler.state.lock().await;
+    assert_eq!(state.sessions.session(&alpha), Some(&session_before));
+    state
+        .ensure_panes_exist(&alpha, &[pane_id])
+        .expect("failed respawn must retain the old terminal");
+    assert_eq!(state.pane_lifecycle(pane_id), Some(&lifecycle_before));
+}
+
+#[tokio::test]
 async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_env() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -618,13 +860,16 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
     };
 
     let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha.clone(),
             target_window_index: Some(0),
             format: Some(
                 "#{pane_id}\t#{pane_lifecycle_generation}\t#{pane_lifecycle_revision}\t#{pane_output_sequence}\t#{pane_start_command}".to_owned(),
             ),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let list_stdout = match listed {
         Response::ListPanes(response) => {
@@ -641,13 +886,16 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
     assert!(!list_stdout.contains(&respawn_secret));
 
     let windows = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha,
             format: Some(
                 "#{window_id}\t#{pane_id}\t#{pane_lifecycle_generation}\t#{pane_output_sequence}"
                     .to_owned(),
             ),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let windows_stdout = match windows {
         Response::ListWindows(response) => {

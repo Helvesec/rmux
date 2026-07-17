@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 
 use rmux_os::identity::{IdentityResolver, UserIdentity};
 use rmux_proto::request::{AttachSessionExt2Request, AttachSessionExt3Request};
+#[cfg(test)]
+use rmux_proto::INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH;
 use rmux_proto::{
     AttachSessionExtRequest, CommandOutput, Request, RmuxError, ServerAccessRequest, SessionName,
-    Target,
+    SourceFileRequest, Target, INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +296,7 @@ fn read_only_request_allowed(request: &Request) -> bool {
         }
         Request::DisplayMessage(request) => display_message_request_is_read_only(request.print),
         Request::DisplayMessageExt(request) => display_message_request_is_read_only(request.print),
+        Request::SourceFile(request) => internal_runtime_command_expansion_is_read_only(request),
         _ => matches!(
             request,
             Request::HasSession(_)
@@ -315,6 +318,11 @@ fn read_only_request_allowed(request: &Request) -> bool {
                 | Request::PaneOutputCursor(_)
                 | Request::PaneSnapshot(_)
                 | Request::PaneSnapshotRef(_)
+                | Request::PaneOptionGet(_)
+                | Request::SubscribePaneState(_)
+                | Request::PaneStateCursor(_)
+                | Request::UnsubscribePaneState(_)
+                | Request::PaneForegroundState(_)
                 | Request::ResolveTarget(_)
                 | Request::SdkWaitForOutput(_)
                 | Request::SdkWaitForOutputRef(_)
@@ -330,6 +338,16 @@ fn read_only_request_allowed(request: &Request) -> bool {
     }
 }
 
+fn internal_runtime_command_expansion_is_read_only(request: &SourceFileRequest) -> bool {
+    request.paths.as_slice() == [INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH]
+        && !request.quiet
+        && request.parse_only
+        && request.verbose
+        && !request.expand_paths
+        && request.target.is_none()
+        && request.stdin.is_some()
+}
+
 fn capture_pane_request_is_read_only(print: bool, buffer_name: Option<&str>) -> bool {
     print && buffer_name.is_none()
 }
@@ -341,8 +359,23 @@ fn display_message_request_is_read_only(print: bool) -> bool {
 pub(crate) fn validate_server_access_request(
     request: &ServerAccessRequest,
 ) -> Result<(), RmuxError> {
+    if request.target.is_some() {
+        return Err(RmuxError::Server(
+            "command server-access: unknown flag -t".to_owned(),
+        ));
+    }
     if request.list {
         return Ok(());
+    }
+    if request.add && request.deny {
+        return Err(RmuxError::Server(
+            "-a and -d cannot be used together".to_owned(),
+        ));
+    }
+    if request.read_only && request.write {
+        return Err(RmuxError::Server(
+            "-r and -w cannot be used together".to_owned(),
+        ));
     }
     #[cfg(windows)]
     {
@@ -459,6 +492,60 @@ mod tests {
     }
 
     #[test]
+    fn read_only_access_allows_only_the_non_mutating_internal_source_shape() {
+        let expansion = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH.to_owned()],
+            quiet: false,
+            parse_only: true,
+            verbose: true,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("[\"list-sessions\"]".to_owned()),
+        }));
+        assert_eq!(
+            apply_access_policy(expansion.clone(), false).expect("runtime expansion is read-only"),
+            expansion
+        );
+
+        let assignments = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![rmux_proto::INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("FOO=bar".to_owned()),
+        }));
+        assert!(apply_access_policy(assignments, false).is_err());
+
+        let canonical_execution = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("list-sessions".to_owned()),
+        }));
+        assert!(apply_access_policy(canonical_execution, false).is_err());
+
+        let public_source = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec!["-".to_owned()],
+            quiet: false,
+            parse_only: true,
+            verbose: true,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some("list-sessions".to_owned()),
+        }));
+        assert!(apply_access_policy(public_source, false).is_err());
+    }
+
+    #[test]
     fn read_only_access_allows_sdk_target_discovery_and_snapshot() {
         let session = session_name();
         let pane = PaneTarget::new(session.clone(), 0);
@@ -480,6 +567,46 @@ mod tests {
                 .expect("pane snapshot is read-only observation"),
             snapshot
         );
+    }
+
+    #[test]
+    fn read_only_access_allows_pane_state_observation() {
+        let session = session_name();
+        let pane = PaneTarget::new(session.clone(), 0);
+        let pane_ref = rmux_proto::PaneTargetRef::slot(pane.clone());
+        let subscription_id = rmux_proto::PaneStateSubscriptionId::new(1);
+        let requests = [
+            Request::PaneOptionGet(rmux_proto::PaneOptionGetRequest {
+                target: pane_ref.clone(),
+                name: "@agent.kind".to_owned(),
+            }),
+            Request::SubscribePaneState(rmux_proto::SubscribePaneStateRequest {
+                target: pane_ref.clone(),
+                include_title: true,
+                include_options: true,
+                include_foreground: true,
+            }),
+            Request::PaneStateCursor(rmux_proto::PaneStateCursorRequest {
+                subscription_id,
+                after_revision: 0,
+                wait: true,
+                max_events: Some(1),
+            }),
+            Request::UnsubscribePaneState(rmux_proto::UnsubscribePaneStateRequest {
+                subscription_id,
+            }),
+            Request::PaneForegroundState(rmux_proto::PaneForegroundStateRequest {
+                target: pane_ref,
+            }),
+        ];
+
+        for request in requests {
+            assert_eq!(
+                apply_access_policy(request.clone(), false)
+                    .expect("pane-state SDK request is read-only observation"),
+                request
+            );
+        }
     }
 
     #[test]
@@ -575,13 +702,14 @@ mod tests {
                 empty_target_context: false,
             },
         )));
-        assert_read_only_rejected(Request::DisplayPanes(DisplayPanesRequest {
+        assert_read_only_rejected(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: session_name(),
             duration_ms: None,
             non_blocking: false,
             no_command: false,
             template: None,
-        }));
+            target_client: None,
+        })));
     }
 
     #[test]
@@ -850,6 +978,9 @@ mod tests {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -871,6 +1002,9 @@ mod tests {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -891,6 +1025,7 @@ mod tests {
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some("someone".to_owned()),
         })
         .expect_err("Windows cannot safely map server-access users to Unix UIDs");
@@ -909,6 +1044,7 @@ mod tests {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: None,
         })
         .expect("server-access -l remains read-only and portable");

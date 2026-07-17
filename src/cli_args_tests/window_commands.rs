@@ -405,8 +405,8 @@ fn list_sessions_accepts_optional_compatibility_format() {
 }
 
 #[test]
-fn list_sessions_rejects_sort_order_and_reverse() {
-    let error = parse_args(&[
+fn list_sessions_accepts_sort_order_and_reverse() {
+    let cli = parse_args(&[
         "list-sessions",
         "-f",
         "#{==:#{session_name},alpha}",
@@ -414,15 +414,28 @@ fn list_sessions_rejects_sort_order_and_reverse() {
         "index",
         "-r",
     ])
-    .unwrap_err();
+    .unwrap();
 
-    assert!(error.to_string().contains("unknown flag -O"), "{error}");
+    match cli.command.expect("parsed command") {
+        super::super::Command::ListSessions(args) => {
+            assert_eq!(args.filter.as_deref(), Some("#{==:#{session_name},alpha}"));
+            assert_eq!(args.sort_order.as_deref(), Some("index"));
+            assert!(args.reversed);
+        }
+        _ => panic!("expected ListSessions command"),
+    }
 
     let error = parse_args(&["list-sessions", "-O"]).unwrap_err();
-    assert!(error.to_string().contains("unknown flag -O"), "{error}");
+    assert_eq!(
+        error.to_string(),
+        "error: command list-sessions: -O expects an argument"
+    );
 
-    let error = parse_args(&["list-sessions", "-r"]).unwrap_err();
-    assert!(error.to_string().contains("unknown flag -r"), "{error}");
+    let cli = parse_args(&["list-sessions", "-r"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::ListSessions(args) => assert!(args.reversed),
+        _ => panic!("expected ListSessions command"),
+    }
 }
 
 #[test]

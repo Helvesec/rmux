@@ -173,14 +173,18 @@ async fn copy_mode_search_prompt_bounds_unterminated_sgr_mouse_without_pane_leak
         "slash should leave a search prompt active before the partial-input guard"
     );
 
-    let partial = oversized_unterminated_sgr_mouse_input();
-    let result = handler
+    let partial = bounded_unterminated_sgr_mouse_input();
+    let forwarded = handler
         .handle_attached_live_input_inner(requester_pid, &mut pending_input, &partial)
-        .await;
-    assert_partial_control_bound(result, "prompt input");
+        .await
+        .expect("bounded invalid mouse input is consumed");
+    assert!(
+        !forwarded,
+        "invalid prompt mouse input must not reach pane IO"
+    );
     assert!(
         pending_input.is_empty(),
-        "overflowing partial prompt input should be cleared after rejection"
+        "overflowing partial prompt input should be consumed at the syntax bound"
     );
     assert_eq!(
         capture_pane_print(&handler, target.clone()).await,
@@ -191,17 +195,30 @@ async fn copy_mode_search_prompt_bounds_unterminated_sgr_mouse_without_pane_leak
     let recovered = handler
         .handle_attached_live_input_inner(requester_pid, &mut pending_input, b"\x1b")
         .await
-        .expect("escape should still be handled after partial-input rejection");
+        .expect("escape should still be handled after the bounded discard");
     assert!(
         !recovered,
         "search prompt escape must not be forwarded to pane IO"
     );
+    assert_eq!(
+        pending_input, b"\x1b",
+        "a lone Escape remains ambiguous with a fragmented terminal response until escape-time"
+    );
+    let recovered = handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("escape-time should resolve the retained Escape after the bounded discard");
+    assert!(
+        !recovered,
+        "the resolved search prompt Escape must not be forwarded to pane IO"
+    );
+    assert!(pending_input.is_empty());
     assert!(
         handler
             .attached_prompt_render(requester_pid)
             .await
             .is_none(),
-        "search prompt should remain recoverable after the partial-input guard fires"
+        "search prompt should remain recoverable after the bounded discard"
     );
 }
 

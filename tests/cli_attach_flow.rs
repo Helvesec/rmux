@@ -14,6 +14,7 @@ use rmux_proto::TerminalSize as ScreenTerminalSize;
 use rmux_pty::TerminalSize;
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+const ATTACH_OUTPUT_QUIET_PERIOD: Duration = Duration::from_millis(100);
 
 type PaneWidthRow = (usize, usize, bool);
 type TestResult<T> = Result<T, Box<dyn Error>>;
@@ -49,6 +50,286 @@ fn list_pane_widths(harness: &CliHarness, target: &str) -> TestResult<Vec<PaneWi
             Ok((pane_index, pane_width, pane_active))
         })
         .collect()
+}
+
+#[test]
+fn queued_attach_session_detach_client_requires_terminal_when_detached() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-detach-notty")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&["attach-session", "-t", "alpha", ";", "detach-client"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(common::stdout(&output), "");
+    assert_eq!(
+        common::stderr(&output),
+        "open terminal failed: not a terminal\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_detach_client_completes_in_terminal() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-detach-pty")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha", ";", "detach-client"],
+        TerminalSize::new(80, 24),
+    )?;
+
+    let (status, output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert!(status.success(), "attach ; detach-client failed: {status}");
+    assert!(
+        output.is_empty(),
+        "queued attach/detach should not draw an attach frame, got {}",
+        String::from_utf8_lossy(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_runs_intermediate_commands_before_detach() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-select-detach")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["new-window", "-t", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &[
+            "attach-session",
+            "-t",
+            "alpha",
+            ";",
+            "select-window",
+            "-t",
+            "0",
+            ";",
+            "detach-client",
+        ],
+        TerminalSize::new(80, 24),
+    )?;
+
+    let (status, _output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert!(
+        status.success(),
+        "attach ; select-window ; detach-client failed: {status}"
+    );
+    let windows = harness.run(&[
+        "list-windows",
+        "-t",
+        "alpha",
+        "-F",
+        "#{window_index}:#{window_active}",
+    ])?;
+    assert_eq!(windows.status.code(), Some(0));
+    assert!(
+        common::stdout(&windows).lines().any(|line| line == "0:1"),
+        "select-window in queued attach sequence did not make window 0 active:\n{}",
+        common::stdout(&windows)
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_detach_all_other_clients_keeps_requester_attached() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-detach-others")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha", ";", "detach-client", "-a"],
+        TerminalSize::new(80, 24),
+    )?;
+
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), "[alpha]", IO_TIMEOUT)?;
+    assert!(
+        attach.child_mut().try_wait()?.is_none(),
+        "detach-client -a must preserve the queued attach requester"
+    );
+    attach.send_bytes(b"\x02d")?;
+    assert!(attach.wait_for_exit(IO_TIMEOUT)?.success());
+    Ok(())
+}
+
+#[test]
+fn queued_targeted_detach_of_another_client_keeps_requester_attached() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-detach-other-target")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut other = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha"],
+        TerminalSize::new(80, 24),
+    )?;
+    other.wait_for_raw_mode(IO_TIMEOUT)?;
+    let other_pid = other.child_mut().id().to_string();
+
+    let mut requester = AttachedSession::spawn_command(
+        &harness,
+        &[
+            "attach-session",
+            "-t",
+            "alpha",
+            ";",
+            "detach-client",
+            "-t",
+            &other_pid,
+        ],
+        TerminalSize::new(80, 24),
+    )?;
+
+    requester.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(requester.master_mut(), "[alpha]", IO_TIMEOUT)?;
+    assert!(
+        requester.child_mut().try_wait()?.is_none(),
+        "targeting another client must not discard the queued requester upgrade"
+    );
+    assert!(
+        other.wait_for_exit(IO_TIMEOUT)?.success(),
+        "the explicitly targeted client should detach"
+    );
+    requester.send_bytes(b"\x02d")?;
+    assert!(requester.wait_for_exit(IO_TIMEOUT)?.success());
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_kill_server_stops_attached_server() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-kill-server")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha", ";", "kill-server"],
+        TerminalSize::new(80, 24),
+    )?;
+
+    let (status, _output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "attach ; kill-server should exit like an attached client whose server exited"
+    );
+    let sessions = harness.run(&["list-sessions"])?;
+    assert_eq!(sessions.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn queued_attach_switch_client_accepts_exact_session_prefix() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-switch-exact")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "w"])?);
+    assert_success(&harness.run(&["new-window", "-t", "w"])?);
+    assert_success(&harness.run(&["new-window", "-t", "w"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "2"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &[
+            "attach-session",
+            "-t",
+            "w",
+            ";",
+            "switch-client",
+            "-t",
+            "=2",
+            ";",
+            "detach-client",
+        ],
+        TerminalSize::new(80, 24),
+    )?;
+
+    let (status, _output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert!(
+        status.success(),
+        "attach ; switch-client -t =2 ; detach-client failed: {status}"
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_without_terminal_tail_stays_interactive() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-list-panes")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha", ";", "list-panes"],
+        TerminalSize::new(80, 24),
+    )?;
+
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    assert!(
+        attach.child_mut().try_wait()?.is_none(),
+        "attach ; list-panes exited before the interactive attach was detached"
+    );
+    attach.send_bytes(b"\x02d")?;
+    let (status, output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert!(
+        status.success(),
+        "detach from attach ; list-panes failed: {status}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains(": ["),
+        "list-panes did not run after detaching from interactive attach:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_without_detach_enters_terminal_attach() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-final")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &[
+            "new-window",
+            "-t",
+            "alpha",
+            ";",
+            "attach-session",
+            "-t",
+            "alpha",
+        ],
+        TerminalSize::new(80, 24),
+    )?;
+
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), "[alpha]", IO_TIMEOUT)?;
+    assert!(
+        attach.child_mut().try_wait()?.is_none(),
+        "attach command exited instead of staying attached"
+    );
+    attach.send_bytes(b"\x02d")?;
+    let status = attach.wait_for_exit(IO_TIMEOUT)?;
+    assert!(
+        status.success(),
+        "detach from queued attach failed: {status}"
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_before_non_detach_stops_queue_when_terminal_is_missing() -> TestResult<()>
+{
+    let harness = CliHarness::new("queued-attach-before-tail")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&["attach-session", "-t", "alpha", ";", "kill-server"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        common::stderr(&output),
+        "open terminal failed: not a terminal\n"
+    );
+    let sessions = harness.run(&["list-sessions"])?;
+    assert_eq!(sessions.status.code(), Some(0));
+    assert!(common::stdout(&sessions).contains("alpha:"));
+    Ok(())
 }
 
 fn list_pane_geometry(harness: &CliHarness, target: &str) -> Result<Vec<String>, Box<dyn Error>> {
@@ -153,6 +434,38 @@ fn apply_quiescent_attach_output(
     std::thread::sleep(wait);
     let bytes = drain_attach_output_bytes(attach.master_mut())?;
     capture_attach_transcript(screen, parser, &bytes)
+}
+
+fn observe_attach_output_until_quiet(
+    attach: &mut AttachedSession,
+    screen: &mut Screen,
+    parser: &mut InputParser,
+    minimum_observation: Duration,
+    timeout: Duration,
+) -> Result<String, Box<dyn Error>> {
+    let started_at = std::time::Instant::now();
+    let deadline = started_at + timeout;
+    let mut quiet_since = started_at;
+
+    loop {
+        let bytes = drain_attach_output_bytes(attach.master_mut())?;
+        if bytes.is_empty() {
+            let now = std::time::Instant::now();
+            if now.duration_since(started_at) >= minimum_observation
+                && now.duration_since(quiet_since) >= ATTACH_OUTPUT_QUIET_PERIOD
+            {
+                return capture_attach_transcript(screen, parser, &[]);
+            }
+            if now >= deadline {
+                return Err("attach output did not become quiet".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+
+        capture_attach_transcript(screen, parser, &bytes)?;
+        quiet_since = std::time::Instant::now();
+    }
 }
 
 fn wait_for_attach_transcript_matching<F>(
@@ -278,13 +591,12 @@ fn wait_for_layout(
 
 fn drain_attach_output_until_quiet(attach: &mut AttachedSession) -> Result<(), Box<dyn Error>> {
     let deadline = std::time::Instant::now() + IO_TIMEOUT;
-    let quiet_period = Duration::from_millis(100);
     let mut quiet_since = std::time::Instant::now();
 
     loop {
         let bytes = drain_attach_output_bytes(attach.master_mut())?;
         if bytes.is_empty() {
-            if std::time::Instant::now().duration_since(quiet_since) >= quiet_period {
+            if std::time::Instant::now().duration_since(quiet_since) >= ATTACH_OUTPUT_QUIET_PERIOD {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -653,7 +965,8 @@ fn attach_session_display_panes_renders_overlay_to_the_real_client() -> Result<(
     std::thread::sleep(Duration::from_millis(200));
     drain_attach_output(attach.master_mut())?;
 
-    assert_success(&harness.run(&["display-panes", "-t", "alpha"])?);
+    let attach_pid = attach.child_mut().id().to_string();
+    assert_success(&harness.run(&["display-panes", "-t", attach_pid.as_str()])?);
 
     let overlay = read_until_contains_all(attach.master_mut(), &["\x1b[?25l", "x"], IO_TIMEOUT)?;
     assert!(
@@ -1666,11 +1979,12 @@ fn choose_tree_q_restores_the_four_pane_layout_on_the_real_attached_client(
         "choose-tree q should restore pane content instead of mode-tree content\n--- restored ---\n{restored_panes}"
     );
 
-    let settled = apply_quiescent_attach_output(
+    let settled = observe_attach_output_until_quiet(
         &mut attach,
         &mut screen,
         &mut parser,
         Duration::from_millis(1200),
+        IO_TIMEOUT,
     )?;
     let settled_panes = transcript_without_status_line(&settled);
     let settled_geometry = list_pane_geometry(&harness, "alpha")?;

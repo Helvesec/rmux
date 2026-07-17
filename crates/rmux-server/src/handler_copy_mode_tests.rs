@@ -4,6 +4,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use super::super::RequestHandler;
 use super::session_name;
 use crate::outer_terminal::OuterTerminalContext;
@@ -12,7 +15,7 @@ use rmux_core::{input::InputParser, Screen};
 use rmux_proto::{
     CapturePaneRequest, CopyModeRequest, ListPanesRequest, NewSessionExtRequest,
     OptionScopeSelector, PaneTarget, Request, Response, SendKeysExtRequest, SetOptionByNameRequest,
-    SetOptionMode, ShowBufferRequest, TerminalSize,
+    SetOptionMode, ShowBufferRequest, SwitchClientRequest, TerminalSize,
 };
 use tokio::time::sleep;
 
@@ -26,6 +29,9 @@ fn capture_request(target: PaneTarget, use_mode_screen: bool) -> CapturePaneRequ
         alternate: false,
         escape_ansi: false,
         escape_sequences: false,
+        include_format: false,
+        hyperlinks: false,
+        line_numbers: false,
         join_wrapped: false,
         use_mode_screen,
         preserve_trailing_spaces: false,
@@ -89,6 +95,9 @@ async fn replace_transcript_contents(
     size: TerminalSize,
     content: &[u8],
 ) {
+    handler
+        .wait_for_pane_startup_to_finish_for_test(target)
+        .await;
     let transcript = {
         let state = handler.state.lock().await;
         state
@@ -273,6 +282,27 @@ async fn set_copy_command(handler: &RequestHandler, command: String) {
     );
 }
 
+#[cfg(unix)]
+async fn set_default_shell(handler: &RequestHandler, shell: &Path) {
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::ServerGlobal,
+            name: "default-shell".to_owned(),
+            value: Some(shell.to_string_lossy().into_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(response, Response::SetOptionByName(_)),
+        "set-option default-shell returned {response:?}"
+    );
+}
+
 async fn set_set_clipboard(handler: &RequestHandler, value: &str) {
     let response = handler
         .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
@@ -359,13 +389,16 @@ async fn copy_mode_formats_report_live_state() {
     ));
 
     let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: target.session_name().clone(),
             format: Some(
                 "#{pane_in_mode} #{pane_mode} #{search_present} #{selection_present} #{copy_cursor_word}".to_owned(),
             ),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let output = listed
         .command_output()
@@ -444,6 +477,7 @@ async fn copy_mode_command_table_dispatches_all_tmux_commands() {
         ("rectangle-off", &[]),
         ("rectangle-toggle", &[]),
         ("refresh-from-pane", &[]),
+        ("recentre-top-bottom", &[]),
         ("scroll-bottom", &[]),
         ("scroll-down", &[]),
         ("scroll-down-and-cancel", &[]),
@@ -573,6 +607,67 @@ async fn copy_mode_copy_selection_and_cancel_writes_buffer() {
         .await;
     let output = buffer.command_output().expect("show-buffer returns output");
     assert!(String::from_utf8_lossy(output.stdout()).contains("needle"));
+}
+
+#[tokio::test]
+async fn attached_copy_mode_switch_after_mutation_is_not_a_fatal_input_error() {
+    let handler = std::sync::Arc::new(RequestHandler::new());
+    let requester_pid = 71_404;
+    let alpha = create_session(
+        &handler,
+        "copy-switch-alpha",
+        TerminalSize { cols: 40, rows: 4 },
+    )
+    .await;
+    let beta = create_session(
+        &handler,
+        "copy-switch-beta",
+        TerminalSize { cols: 40, rows: 4 },
+    )
+    .await;
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.session_name().clone(), control_tx)
+        .await;
+    assert!(matches!(
+        enter_copy_mode(&handler, &alpha, false).await,
+        Response::CopyMode(_)
+    ));
+
+    let pause = super::super::copy_mode_support::install_copy_mode_mutation_pause(requester_pid);
+    let input_handler = std::sync::Arc::clone(&handler);
+    let input = tokio::spawn(async move {
+        input_handler
+            .handle_attached_live_input_for_test(requester_pid, b"q")
+            .await
+    });
+    pause.reached.notified().await;
+
+    let switched = handler
+        .dispatch(
+            requester_pid,
+            Request::SwitchClient(SwitchClientRequest {
+                target: beta.session_name().clone(),
+            }),
+        )
+        .await
+        .response;
+    assert!(
+        matches!(switched, Response::SwitchClient(_)),
+        "{switched:?}"
+    );
+    pause.release.notify_one();
+
+    let result = input.await.expect("copy-mode input task joins");
+    assert!(
+        result.is_ok(),
+        "post-mutation switch must not fail input: {result:?}"
+    );
+    let active_session = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach.current_session_candidate(requester_pid)
+    };
+    assert_eq!(active_session.as_ref(), Some(beta.session_name()));
 }
 
 #[tokio::test]
@@ -740,6 +835,14 @@ async fn copy_mode_buffer_yank_emits_clipboard_when_set_clipboard_enabled() {
 }
 
 #[cfg(unix)]
+fn write_executable_script(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write script");
+    let mut permissions = fs::metadata(path).expect("script metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("script permissions");
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn copy_pipe_uses_local_osc7_file_url_as_working_directory() {
     let handler = RequestHandler::new();
@@ -805,4 +908,82 @@ async fn copy_pipe_uses_local_osc7_file_url_as_working_directory() {
     let _ = fs::remove_file(&output_path);
     let _ = fs::remove_dir(&temp_dir);
     assert!(output.contains("needle osc7 cwd"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn copy_pipe_uses_bin_sh_instead_of_default_shell_like_tmux() {
+    let handler = RequestHandler::new();
+    let root = std::env::temp_dir().join(format!(
+        "rmux-copy-pipe-bin-sh-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir_all(&root).expect("temp dir exists");
+    let fake_shell = root.join("fake-shell.sh");
+    let marker_path = root.join("default-shell-used.txt");
+    let output_path = root.join("copy-pipe-output.txt");
+    write_executable_script(
+        &fake_shell,
+        &format!(
+            "#!/bin/sh\nprintf used > {}\nexit 42\n",
+            crate::test_shell::sh_quote_path(&marker_path)
+        ),
+    );
+    set_default_shell(&handler, &fake_shell).await;
+
+    let target = create_session(
+        &handler,
+        "copy-pipe-bin-sh",
+        TerminalSize { cols: 40, rows: 4 },
+    )
+    .await;
+    replace_transcript_contents(
+        &handler,
+        &target,
+        TerminalSize { cols: 40, rows: 4 },
+        b"alpha\r\nneedle bin sh\r\nomega\r\n",
+    )
+    .await;
+    wait_for_capture(&handler, &target, "needle bin sh", false).await;
+
+    assert!(matches!(
+        enter_copy_mode(&handler, &target, false).await,
+        Response::CopyMode(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
+        Response::SendKeys(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command(&handler, &target, &["select-line"]).await,
+        Response::SendKeys(_)
+    ));
+    let explicit_command = stdin_to_file_command(&output_path);
+    assert!(matches!(
+        send_copy_mode_command_values(
+            &handler,
+            &target,
+            vec![
+                "copy-pipe-and-cancel".to_owned(),
+                "--".to_owned(),
+                explicit_command,
+            ],
+        )
+        .await,
+        Response::SendKeys(_)
+    ));
+
+    let output = fs::read_to_string(&output_path).expect("copy-pipe output");
+    assert!(output.contains("needle bin sh"));
+    assert!(
+        !marker_path.exists(),
+        "copy-pipe should not execute default-shell for tmux jobs"
+    );
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(&fake_shell);
+    let _ = fs::remove_dir_all(&root);
 }

@@ -149,13 +149,11 @@ fn completion_subcommand(entry: &'static CommandEntry) -> clap::Command {
         "switch-client" => completion_typed_subcommand::<SwitchClientArgs>(entry.name),
         "detach-client" => completion_typed_subcommand::<DetachClientArgs>(entry.name),
         "suspend-client" => completion_typed_subcommand::<SuspendClientArgs>(entry.name),
-        "set-option" | "set-window-option" => {
-            completion_typed_subcommand::<SetOptionArgs>(entry.name)
-        }
+        "set-option" => completion_typed_subcommand::<SetOptionArgs>(entry.name),
+        "set-window-option" => completion_typed_subcommand::<SetWindowOptionArgs>(entry.name),
         "set-environment" => completion_typed_subcommand::<SetEnvironmentArgs>(entry.name),
-        "show-options" | "show-window-options" => {
-            completion_typed_subcommand::<ShowOptionsArgs>(entry.name)
-        }
+        "show-options" => completion_typed_subcommand::<ShowOptionsArgs>(entry.name),
+        "show-window-options" => completion_typed_subcommand::<ShowWindowOptionsArgs>(entry.name),
         "show-environment" => completion_typed_subcommand::<ShowEnvironmentArgs>(entry.name),
         "set-hook" => completion_typed_subcommand::<SetHookArgs>(entry.name),
         "show-hooks" => completion_typed_subcommand::<ShowHooksArgs>(entry.name),

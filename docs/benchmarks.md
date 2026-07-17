@@ -2,8 +2,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/hero-v0.8.0-rmux-dark.svg">
-  <img src="benchmarks/hero-v0.8.0-rmux-light.svg" width="100%" alt="RMUX benchmark overview">
+  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/hero-v0.9.0-rmux-dark.svg">
+  <img src="benchmarks/hero-v0.9.0-rmux-light.svg" width="100%" alt="RMUX benchmark overview">
 </picture>
 
 </div>
@@ -14,7 +14,7 @@
   <img src="install/linux-light.svg" width="32" alt="Linux">
 </picture><br>Linux</h2>
 
-<p align="center"><sub>e41a1867dec0 · p50 latency, lower is faster. <a href="benchmarks/linux.csv">Full Raw Benchmarks</a></sub></p>
+<p align="center"><sub>70b68ca083f6 · p50 latency, lower is faster. <a href="benchmarks/linux.csv">Full Raw Benchmarks</a></sub></p>
 
 <div align="center">
 
@@ -23,16 +23,16 @@
 <tr><th align="left">Scenario</th><th align="right">rmux</th><th align="right">tmux</th><th align="right">zellij</th><th align="right">vs tmux</th></tr>
 </thead>
 <tbody>
-<tr><td>Create background session (default shell)</td><td align="right"><code>3.424 ms</code></td><td align="right"><code>15.556 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 4.5x faster</kbd></strong></td></tr>
-<tr><td>List sessions</td><td align="right"><code>1.234 ms</code></td><td align="right"><code>3.349 ms</code></td><td align="right"><code>15.772 ms</code></td><td align="right"><strong><kbd>🟢 2.7x faster</kbd></strong></td></tr>
-<tr><td>Split pane left/right</td><td align="right"><code>3.345 ms</code></td><td align="right"><code>7.508 ms</code></td><td align="right"><code>32.393 ms</code></td><td align="right"><strong><kbd>🟢 2.2x faster</kbd></strong></td></tr>
-<tr><td>Split pane top/bottom</td><td align="right"><code>3.311 ms</code></td><td align="right"><code>7.533 ms</code></td><td align="right"><code>32.505 ms</code></td><td align="right"><strong><kbd>🟢 2.3x faster</kbd></strong></td></tr>
-<tr><td>Send keys to pane/window</td><td align="right"><code>1.301 ms</code></td><td align="right"><code>3.380 ms</code></td><td align="right"><code>16.397 ms</code></td><td align="right"><strong><kbd>🟢 2.6x faster</kbd></strong></td></tr>
-<tr><td>Capture visible output</td><td align="right"><code>1.329 ms</code></td><td align="right"><code>3.356 ms</code></td><td align="right"><code>16.265 ms</code></td><td align="right"><strong><kbd>🟢 2.5x faster</kbd></strong></td></tr>
-<tr><td>Capture full scrollback</td><td align="right"><code>3.322 ms</code></td><td align="right"><code>7.441 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 2.2x faster</kbd></strong></td></tr>
-<tr><td>List tabs/windows</td><td align="right"><code>3.501 ms</code></td><td align="right"><code>3.590 ms</code></td><td align="right"><code>15.593 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
-<tr><td>Grow pane by 1 cell</td><td align="right"><code>1.334 ms</code></td><td align="right"><code>3.353 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 2.5x faster</kbd></strong></td></tr>
-<tr><td>Terminate session</td><td align="right"><code>1.292 ms</code></td><td align="right"><code>3.362 ms</code></td><td align="right"><code>15.566 ms</code></td><td align="right"><strong><kbd>🟢 2.6x faster</kbd></strong></td></tr>
+<tr><td>Create background session (default shell)</td><td align="right"><code>3.565 ms</code></td><td align="right"><code>7.565 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 2.1x faster</kbd></strong></td></tr>
+<tr><td>List sessions</td><td align="right"><code>1.744 ms</code></td><td align="right"><code>3.374 ms</code></td><td align="right"><code>16.358 ms</code></td><td align="right"><strong><kbd>🟢 1.9x faster</kbd></strong></td></tr>
+<tr><td>Split pane left/right</td><td align="right"><code>3.456 ms</code></td><td align="right"><code>3.386 ms</code></td><td align="right"><code>63.832 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Split pane top/bottom</td><td align="right"><code>3.418 ms</code></td><td align="right"><code>3.399 ms</code></td><td align="right"><code>63.769 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Send keys to pane/window</td><td align="right"><code>1.332 ms</code></td><td align="right"><code>3.422 ms</code></td><td align="right"><code>31.715 ms</code></td><td align="right"><strong><kbd>🟢 2.6x faster</kbd></strong></td></tr>
+<tr><td>Capture visible output</td><td align="right"><code>1.305 ms</code></td><td align="right"><code>3.476 ms</code></td><td align="right"><code>16.806 ms</code></td><td align="right"><strong><kbd>🟢 2.7x faster</kbd></strong></td></tr>
+<tr><td>Capture full scrollback</td><td align="right"><code>3.470 ms</code></td><td align="right"><code>3.514 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>List tabs/windows</td><td align="right"><code>3.646 ms</code></td><td align="right"><code>3.939 ms</code></td><td align="right"><code>15.966 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Grow pane by 1 cell</td><td align="right"><code>1.715 ms</code></td><td align="right"><code>3.461 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 2.0x faster</kbd></strong></td></tr>
+<tr><td>Terminate session</td><td align="right"><code>2.060 ms</code></td><td align="right"><code>3.392 ms</code></td><td align="right"><code>16.264 ms</code></td><td align="right"><strong><kbd>🟢 1.6x faster</kbd></strong></td></tr>
 </tbody>
 </table>
 
@@ -45,7 +45,7 @@
   <img src="install/windows-light.svg" width="32" alt="Windows">
 </picture><br>Windows</h2>
 
-<p align="center"><sub>e41a1867dec0 · p50 latency, lower is faster. <a href="benchmarks/windows.csv">Full Raw Benchmarks</a></sub></p>
+<p align="center"><sub>70b68ca083f6 · p50 latency, lower is faster. <a href="benchmarks/windows.csv">Full Raw Benchmarks</a></sub></p>
 
 <div align="center">
 
@@ -54,16 +54,16 @@
 <tr><th align="left">Scenario</th><th align="right">rmux</th><th align="right">tmux (WSL)</th><th align="right">zellij</th><th align="right">vs tmux (WSL)</th></tr>
 </thead>
 <tbody>
-<tr><td>Create background session (default shell)</td><td align="right"><code>24.660 ms</code></td><td align="right"><code>82.498 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 3.3x faster</kbd></strong></td></tr>
-<tr><td>List sessions</td><td align="right"><code>36.795 ms</code></td><td align="right"><code>86.960 ms</code></td><td align="right"><code>117.267 ms</code></td><td align="right"><strong><kbd>🟢 2.4x faster</kbd></strong></td></tr>
-<tr><td>Split pane left/right</td><td align="right"><code>32.928 ms</code></td><td align="right"><code>98.884 ms</code></td><td align="right"><code>90.698 ms</code></td><td align="right"><strong><kbd>🟢 3.0x faster</kbd></strong></td></tr>
-<tr><td>Split pane top/bottom</td><td align="right"><code>31.234 ms</code></td><td align="right"><code>100.911 ms</code></td><td align="right"><code>93.240 ms</code></td><td align="right"><strong><kbd>🟢 3.2x faster</kbd></strong></td></tr>
-<tr><td>Send keys to pane/window</td><td align="right"><code>21.089 ms</code></td><td align="right"><code>85.427 ms</code></td><td align="right"><code>78.848 ms</code></td><td align="right"><strong><kbd>🟢 4.1x faster</kbd></strong></td></tr>
-<tr><td>Capture visible output</td><td align="right"><code>23.426 ms</code></td><td align="right"><code>83.049 ms</code></td><td align="right"><code>74.897 ms</code></td><td align="right"><strong><kbd>🟢 3.5x faster</kbd></strong></td></tr>
-<tr><td>Capture full scrollback</td><td align="right"><code>23.939 ms</code></td><td align="right"><code>85.449 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 3.6x faster</kbd></strong></td></tr>
-<tr><td>List tabs/windows</td><td align="right"><code>20.099 ms</code></td><td align="right"><code>83.230 ms</code></td><td align="right"><code>75.030 ms</code></td><td align="right"><strong><kbd>🟢 4.1x faster</kbd></strong></td></tr>
-<tr><td>Grow pane by 1 cell</td><td align="right"><code>21.817 ms</code></td><td align="right"><code>85.571 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 3.9x faster</kbd></strong></td></tr>
-<tr><td>Terminate session</td><td align="right"><code>21.323 ms</code></td><td align="right"><code>88.383 ms</code></td><td align="right"><code>86.781 ms</code></td><td align="right"><strong><kbd>🟢 4.1x faster</kbd></strong></td></tr>
+<tr><td>Create background session (default shell)</td><td align="right"><code>25.381 ms</code></td><td align="right"><code>86.820 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 3.4x faster</kbd></strong></td></tr>
+<tr><td>List sessions</td><td align="right"><code>22.345 ms</code></td><td align="right"><code>92.790 ms</code></td><td align="right"><code>128.624 ms</code></td><td align="right"><strong><kbd>🟢 4.2x faster</kbd></strong></td></tr>
+<tr><td>Split pane left/right</td><td align="right"><code>32.816 ms</code></td><td align="right"><code>89.223 ms</code></td><td align="right"><code>95.949 ms</code></td><td align="right"><strong><kbd>🟢 2.7x faster</kbd></strong></td></tr>
+<tr><td>Split pane top/bottom</td><td align="right"><code>32.704 ms</code></td><td align="right"><code>90.214 ms</code></td><td align="right"><code>95.584 ms</code></td><td align="right"><strong><kbd>🟢 2.8x faster</kbd></strong></td></tr>
+<tr><td>Send keys to pane/window</td><td align="right"><code>20.829 ms</code></td><td align="right"><code>87.857 ms</code></td><td align="right"><code>83.411 ms</code></td><td align="right"><strong><kbd>🟢 4.2x faster</kbd></strong></td></tr>
+<tr><td>Capture visible output</td><td align="right"><code>21.019 ms</code></td><td align="right"><code>86.296 ms</code></td><td align="right"><code>82.153 ms</code></td><td align="right"><strong><kbd>🟢 4.1x faster</kbd></strong></td></tr>
+<tr><td>Capture full scrollback</td><td align="right"><code>21.259 ms</code></td><td align="right"><code>89.079 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 4.2x faster</kbd></strong></td></tr>
+<tr><td>List tabs/windows</td><td align="right"><code>19.537 ms</code></td><td align="right"><code>85.845 ms</code></td><td align="right"><code>78.786 ms</code></td><td align="right"><strong><kbd>🟢 4.4x faster</kbd></strong></td></tr>
+<tr><td>Grow pane by 1 cell</td><td align="right"><code>21.172 ms</code></td><td align="right"><code>85.812 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 4.1x faster</kbd></strong></td></tr>
+<tr><td>Terminate session</td><td align="right"><code>20.941 ms</code></td><td align="right"><code>88.374 ms</code></td><td align="right"><code>92.412 ms</code></td><td align="right"><strong><kbd>🟢 4.2x faster</kbd></strong></td></tr>
 </tbody>
 </table>
 
@@ -76,7 +76,7 @@
   <img src="install/apple-light.svg" width="32" alt="macOS">
 </picture><br>macOS</h2>
 
-<p align="center"><sub>e41a1867dec0 · p50 latency, lower is faster. <a href="benchmarks/macos.csv">Full Raw Benchmarks</a></sub></p>
+<p align="center"><sub>70b68ca083f6 · p50 latency, lower is faster. <a href="benchmarks/macos.csv">Full Raw Benchmarks</a></sub></p>
 
 <p align="center"><sub>macOS note: measured on a MacBook Pro. Most operations finish around 5 ms on this machine; read those rows as "same speed".</sub></p>
 
@@ -87,16 +87,16 @@
 <tr><th align="left">Scenario</th><th align="right">rmux</th><th align="right">tmux</th><th align="right">zellij</th><th align="right">vs tmux</th></tr>
 </thead>
 <tbody>
-<tr><td>Create background session (default shell)</td><td align="right"><code>9.939 ms</code></td><td align="right"><code>19.127 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 1.9x faster</kbd></strong></td></tr>
-<tr><td>List sessions</td><td align="right"><code>4.858 ms</code></td><td align="right"><code>4.825 ms</code></td><td align="right"><code>19.389 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
-<tr><td>Split pane left/right</td><td align="right"><code>4.932 ms</code></td><td align="right"><code>4.884 ms</code></td><td align="right"><code>19.197 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
-<tr><td>Split pane top/bottom</td><td align="right"><code>4.861 ms</code></td><td align="right"><code>4.830 ms</code></td><td align="right"><code>20.018 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
-<tr><td>Send keys to pane/window</td><td align="right"><code>4.873 ms</code></td><td align="right"><code>4.800 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
-<tr><td>Capture visible output</td><td align="right"><code>4.883 ms</code></td><td align="right"><code>4.899 ms</code></td><td align="right"><code>19.788 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
-<tr><td>Capture full scrollback</td><td align="right"><code>4.748 ms</code></td><td align="right"><code>4.960 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
-<tr><td>List tabs/windows</td><td align="right"><code>5.716 ms</code></td><td align="right"><code>5.175 ms</code></td><td align="right"><code>20.098 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
-<tr><td>Grow pane by 1 cell</td><td align="right"><code>4.867 ms</code></td><td align="right"><code>4.885 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
-<tr><td>Terminate session</td><td align="right"><code>4.904 ms</code></td><td align="right"><code>4.879 ms</code></td><td align="right"><code>19.445 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Create background session (default shell)</td><td align="right"><code>4.890 ms</code></td><td align="right"><code>9.526 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>🟢 1.9x faster</kbd></strong></td></tr>
+<tr><td>List sessions</td><td align="right"><code>4.630 ms</code></td><td align="right"><code>4.564 ms</code></td><td align="right"><code>19.727 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Split pane left/right</td><td align="right"><code>4.645 ms</code></td><td align="right"><code>4.580 ms</code></td><td align="right"><code>19.657 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Split pane top/bottom</td><td align="right"><code>4.642 ms</code></td><td align="right"><code>4.576 ms</code></td><td align="right"><code>19.846 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Send keys to pane/window</td><td align="right"><code>4.616 ms</code></td><td align="right"><code>4.536 ms</code></td><td align="right"><code>19.867 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Capture visible output</td><td align="right"><code>4.617 ms</code></td><td align="right"><code>4.545 ms</code></td><td align="right"><code>19.497 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Capture full scrollback</td><td align="right"><code>4.666 ms</code></td><td align="right"><code>4.568 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>List tabs/windows</td><td align="right"><code>11.410 ms</code></td><td align="right"><code>11.635 ms</code></td><td align="right"><code>19.845 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Grow pane by 1 cell</td><td align="right"><code>4.685 ms</code></td><td align="right"><code>4.582 ms</code></td><td align="right"><code>-</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
+<tr><td>Terminate session</td><td align="right"><code>4.725 ms</code></td><td align="right"><code>4.623 ms</code></td><td align="right"><code>19.720 ms</code></td><td align="right"><strong><kbd>≈ same speed</kbd></strong></td></tr>
 </tbody>
 </table>
 
@@ -124,4 +124,4 @@ The `render.py` script updates this Markdown file and linked CSVs based on the J
 
 Zellij: Results only show exact equivalents or close approximations.
 
-Generated at `2026-07-01T22:29:34Z` from commit `e41a1867dec0`.
+Generated at `2026-07-16T22:27:58Z` from commit `70b68ca083f6`.

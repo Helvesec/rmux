@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use rmux_proto::{OptionName, RmuxError, SessionName};
 
 use super::{session_not_found, HandlerState};
@@ -13,13 +15,13 @@ impl HandlerState {
     pub(in crate::pane_terminals) fn renumber_windows_if_enabled(
         &mut self,
         session_name: &SessionName,
-    ) -> Result<(), RmuxError> {
+    ) -> Result<BTreeMap<u32, u32>, RmuxError> {
         if self
             .options
             .resolve(Some(session_name), OptionName::RenumberWindows)
             != Some("on")
         {
-            return Ok(());
+            return Ok(BTreeMap::new());
         }
 
         self.reindex_windows_from_base(session_name)
@@ -28,7 +30,7 @@ impl HandlerState {
     pub(in crate::pane_terminals) fn reindex_windows_from_base(
         &mut self,
         session_name: &SessionName,
-    ) -> Result<(), RmuxError> {
+    ) -> Result<BTreeMap<u32, u32>, RmuxError> {
         let base_index = self.session_base_index(session_name);
         let previous_session = self
             .sessions
@@ -40,6 +42,7 @@ impl HandlerState {
         let previous_auto_named_windows = self.auto_named_windows.clone();
         let previous_window_link_slots = self.window_link_slots.clone();
         let previous_window_link_groups = self.window_link_groups.clone();
+        let previous_window_link_occurrences = self.window_link_occurrences.clone();
 
         let session = self
             .sessions
@@ -53,9 +56,10 @@ impl HandlerState {
             self.auto_named_windows = previous_auto_named_windows;
             self.window_link_slots = previous_window_link_slots;
             self.window_link_groups = previous_window_link_groups;
+            self.window_link_occurrences = previous_window_link_occurrences;
             return Err(error);
         }
-        Ok(())
+        Ok(index_map)
     }
 
     pub(in crate::pane_terminals) fn remap_reindexed_window_metadata(

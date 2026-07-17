@@ -1,7 +1,11 @@
 use super::{
-    validate_hook_registration, validate_hook_scope, HookGlobalRoot, HookSetOptions, HookStore,
+    hook_explicit_scope_for_target, hook_natural_scope_for_session_target,
+    hook_natural_scope_for_target, validate_hook_registration, validate_hook_scope, HookGlobalRoot,
+    HookSetOptions, HookStore,
 };
-use rmux_proto::{HookLifecycle, HookName, RmuxError, ScopeSelector, SessionName, WindowTarget};
+use rmux_proto::{
+    HookLifecycle, HookName, PaneTarget, ScopeSelector, SessionName, Target, WindowTarget,
+};
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
@@ -410,19 +414,18 @@ fn moving_windows_rekeys_window_and_pane_hooks() {
 }
 
 #[test]
-fn incompatible_hook_scope_pairs_are_rejected() {
+fn tmux_accepts_hook_storage_at_any_scope() {
     let alpha = session_name("alpha");
+    let window = WindowTarget::with_window(alpha.clone(), 1);
+    let pane = rmux_proto::PaneTarget::with_window(alpha.clone(), 1, 2);
 
-    let error = validate_hook_scope(
+    assert!(validate_hook_scope(
         HookName::WindowLayoutChanged,
-        &ScopeSelector::Session(alpha),
+        &ScopeSelector::Session(alpha)
     )
-    .expect_err("window hooks reject session scope");
-
-    assert_eq!(
-        error,
-        RmuxError::Server("window-layout-changed does not support session scope".to_owned())
-    );
+    .is_ok());
+    assert!(validate_hook_scope(HookName::WindowResized, &ScopeSelector::Pane(pane)).is_ok());
+    assert!(validate_hook_scope(HookName::ClientDetached, &ScopeSelector::Window(window)).is_ok());
 }
 
 #[test]
@@ -630,7 +633,7 @@ fn new_hook_scope_classes_match_tmux_inventory() {
         validate_hook_scope(HookName::AlertBell, &ScopeSelector::Session(alpha.clone())).is_ok()
     );
     assert!(
-        validate_hook_scope(HookName::AlertBell, &ScopeSelector::Window(window.clone())).is_err()
+        validate_hook_scope(HookName::AlertBell, &ScopeSelector::Window(window.clone())).is_ok()
     );
 
     assert!(validate_hook_scope(HookName::WindowResized, &ScopeSelector::Global).is_ok());
@@ -640,7 +643,7 @@ fn new_hook_scope_classes_match_tmux_inventory() {
     )
     .is_ok());
     assert!(
-        validate_hook_scope(HookName::WindowResized, &ScopeSelector::Pane(pane.clone())).is_err()
+        validate_hook_scope(HookName::WindowResized, &ScopeSelector::Pane(pane.clone())).is_ok()
     );
 
     assert!(validate_hook_scope(HookName::PaneTitleChanged, &ScopeSelector::Global).is_ok());
@@ -648,6 +651,44 @@ fn new_hook_scope_classes_match_tmux_inventory() {
         validate_hook_scope(HookName::PaneTitleChanged, &ScopeSelector::Window(window)).is_ok()
     );
     assert!(validate_hook_scope(HookName::PaneTitleChanged, &ScopeSelector::Pane(pane)).is_ok());
+}
+
+#[test]
+fn hook_scope_normalization_matches_tmux_measured_matrix() {
+    let alpha = session_name("alpha");
+    let window = WindowTarget::with_window(alpha.clone(), 1);
+    let pane = PaneTarget::with_window(alpha.clone(), 1, 2);
+
+    for (hook, natural, explicit) in [
+        (
+            HookName::SessionRenamed,
+            ScopeSelector::Session(alpha.clone()),
+            ScopeSelector::Session(alpha.clone()),
+        ),
+        (
+            HookName::WindowLayoutChanged,
+            ScopeSelector::Window(window.clone()),
+            ScopeSelector::Window(window.clone()),
+        ),
+        (
+            HookName::PaneModeChanged,
+            ScopeSelector::Window(window.clone()),
+            ScopeSelector::Pane(pane.clone()),
+        ),
+    ] {
+        assert_eq!(
+            hook_natural_scope_for_target(hook, Target::Pane(pane.clone())),
+            natural.clone()
+        );
+        assert_eq!(
+            hook_natural_scope_for_session_target(hook, alpha.clone(), 1, 2),
+            natural
+        );
+        assert_eq!(
+            hook_explicit_scope_for_target(hook, Target::Pane(pane.clone())),
+            explicit
+        );
+    }
 }
 
 #[test]
@@ -673,9 +714,17 @@ fn shipped_hooks_accept_registration_at_supported_scopes() {
         validate_hook_registration(HookName::PaneTitleChanged, &ScopeSelector::Pane(pane)).is_ok()
     );
     assert!(validate_hook_registration(HookName::AfterShowOptions, &ScopeSelector::Global).is_ok());
+    assert!(validate_hook_registration(HookName::CommandError, &ScopeSelector::Global).is_ok());
+    assert!(validate_hook_registration(HookName::ClientLightTheme, &ScopeSelector::Global).is_ok());
+    assert!(validate_hook_registration(HookName::ClientDarkTheme, &ScopeSelector::Global).is_ok());
 }
 
 #[test]
-fn undispatched_hooks_are_rejected_for_registration() {
-    assert!(validate_hook_registration(HookName::ClientDarkTheme, &ScopeSelector::Global).is_err());
+fn notify_only_paste_buffer_hooks_are_rejected_for_registration() {
+    assert!(
+        validate_hook_registration(HookName::PasteBufferChanged, &ScopeSelector::Global).is_err()
+    );
+    assert!(
+        validate_hook_registration(HookName::PasteBufferDeleted, &ScopeSelector::Global).is_err()
+    );
 }

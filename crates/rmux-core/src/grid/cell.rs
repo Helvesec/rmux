@@ -10,7 +10,7 @@ use super::{
     append_cell_text, append_grid_string_code, append_hyperlink, GridRenderOptions, GridStringState,
 };
 
-/// Per-cell flags matching tmux `GRID_FLAG_*`.
+/// Per-cell flags matching tmux `GRID_FLAG_*`, plus internal-only render metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct GridCellFlags(u8);
 
@@ -28,6 +28,8 @@ impl GridCellFlags {
     pub const SELECTED: Self = Self(0x10);
     /// This cell should not inherit the palette.
     pub const NOPALETTE: Self = Self(0x20);
+    /// Internal marker for an unused physical cell left before a wrapped wide glyph.
+    pub const REFLOW_GAP: Self = Self(0x40);
 
     /// Returns the raw bit value.
     #[must_use]
@@ -247,6 +249,12 @@ impl GridCell {
         self.flags.contains(GridCellFlags::PADDING)
     }
 
+    /// Returns whether this blank cell exists only to place a following wide glyph.
+    #[must_use]
+    pub const fn is_reflow_gap(&self) -> bool {
+        self.flags.contains(GridCellFlags::REFLOW_GAP)
+    }
+
     /// Returns the cell attributes.
     #[must_use]
     pub const fn attr(&self) -> u16 {
@@ -434,6 +442,11 @@ impl GridLine {
 
     pub(crate) fn insert_cells(&mut self, start: u32, count: u32, blank: &GridCell) {
         self.materialize_for_cell_mutation();
+        let reflow_gap_count = self
+            .cells
+            .iter()
+            .filter(|cell| cell.is_reflow_gap())
+            .count();
         let start = start as usize;
         if start >= self.cells.len() {
             return;
@@ -446,10 +459,22 @@ impl GridLine {
         for cell in &mut self.cells[start..start + count] {
             *cell = blank.clone();
         }
+        // tmux 3.7b raises cellused to the row width when ICH moves cells,
+        // but a clear at the final column leaves the existing gap untouched.
+        if start + 1 == self.cells.len() {
+            self.restore_trailing_reflow_gaps(reflow_gap_count);
+        } else {
+            self.materialize_reflow_gaps();
+        }
     }
 
     pub(crate) fn delete_cells(&mut self, start: u32, count: u32, blank: &GridCell) {
         self.materialize_for_cell_mutation();
+        let reflow_gap_count = self
+            .cells
+            .iter()
+            .filter(|cell| cell.is_reflow_gap())
+            .count();
         let start = start as usize;
         if start >= self.cells.len() {
             return;
@@ -463,6 +488,9 @@ impl GridLine {
         for cell in &mut self.cells[fill_start..] {
             *cell = blank.clone();
         }
+        // DCH keeps cellused at max(old cellused, width - count), so only the
+        // overlapping suffix remains a structural placement gap.
+        self.restore_trailing_reflow_gaps(reflow_gap_count.min(count));
     }
 
     pub(crate) fn write_plain_ascii_run(&mut self, start: u32, bytes: &[u8]) -> bool {
@@ -694,6 +722,65 @@ impl GridLine {
             .map_or(0, |index| index + 1)
     }
 
+    pub(super) fn mark_reflow_gap(&mut self, start: u32) {
+        self.materialize_for_cell_mutation();
+        for cell in self.cells.iter_mut().skip(start as usize) {
+            debug_assert!(cell.is_blank());
+            let mut flags = cell.flags();
+            flags.insert(GridCellFlags::REFLOW_GAP);
+            cell.set_flags(flags);
+        }
+    }
+
+    /// Marks only the unused physical suffix skipped before a wide pre-wrap.
+    pub(crate) fn mark_unused_suffix_as_reflow_gap(&mut self, start: u32) {
+        if self.used_end() <= start as usize {
+            self.mark_reflow_gap(start);
+        }
+    }
+
+    fn restore_trailing_reflow_gaps(&mut self, count: usize) {
+        self.materialize_reflow_gaps();
+        for cell in self.cells.iter_mut().rev().take(count) {
+            debug_assert!(cell.is_blank());
+            let mut flags = cell.flags();
+            flags.insert(GridCellFlags::REFLOW_GAP);
+            cell.set_flags(flags);
+        }
+    }
+
+    fn materialize_reflow_gaps(&mut self) {
+        for cell in &mut self.cells {
+            let mut flags = cell.flags();
+            if flags.contains(GridCellFlags::REFLOW_GAP) {
+                flags.remove(GridCellFlags::REFLOW_GAP);
+                cell.set_flags(flags);
+            }
+        }
+    }
+
+    pub(super) fn reflow_logical_width(&self) -> usize {
+        let width = self.width as usize;
+        width.saturating_sub(
+            self.cells
+                .iter()
+                .take(width)
+                .filter(|cell| cell.is_reflow_gap())
+                .count(),
+        )
+    }
+
+    pub(super) fn reflow_logical_column(&self, physical_column: usize) -> usize {
+        let physical_column = physical_column.min(self.width as usize);
+        physical_column.saturating_sub(
+            self.cells
+                .iter()
+                .take(physical_column)
+                .filter(|cell| cell.is_reflow_gap())
+                .count(),
+        )
+    }
+
     pub(super) fn tmux_cell_capacity(&self, line_width: usize) -> usize {
         let used_end = self.used_end();
         if used_end == 0 {
@@ -907,6 +994,9 @@ impl GridLine {
                 time: self.time,
                 revision: self.revision,
             });
+        }
+        if self.cells.iter().any(GridCell::is_reflow_gap) {
+            return None;
         }
         let used_end = self.used_end();
         if used_end == 0 {

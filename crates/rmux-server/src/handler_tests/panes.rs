@@ -157,6 +157,232 @@ async fn target_action_split_and_resize_resolve_raw_targets_server_side() {
 }
 
 #[tokio::test]
+async fn sdk_split_identity_returns_visible_base_index_and_stable_id_atomically() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::PaneBaseIndex,
+                value: "5".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    let response = handler
+        .handle(Request::SplitWindowIdentity(Box::new(
+            SplitWindowIdentityRequest {
+                action: SplitWindowTargetActionRequest {
+                    target: Some("alpha:0.5".to_owned()),
+                    direction: rmux_proto::SplitDirection::Vertical,
+                    before: false,
+                    environment: None,
+                    command: None,
+                    process_command: None,
+                    start_directory: None,
+                    keep_alive_on_exit: None,
+                    detached: false,
+                    size: None,
+                    preserve_zoom: false,
+                    full_size: false,
+                    stdin_payload: None,
+                },
+            },
+        )))
+        .await;
+
+    let Response::SplitWindowIdentity(identity) = response else {
+        panic!("expected atomic split identity response, got {response:?}");
+    };
+    assert_eq!(identity.pane, PaneTarget::new(alpha.clone(), 6));
+
+    let state = handler.state.lock().await;
+    let pane_id = state
+        .sessions
+        .session(&alpha)
+        .expect("session exists")
+        .window()
+        .pane(1)
+        .expect("new raw pane index exists")
+        .id();
+    assert_eq!(identity.pane_id, pane_id);
+}
+
+#[tokio::test]
+async fn sdk_split_identity_accepts_a_stable_pane_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-stable-split");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let original_pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .expect("session exists")
+            .window()
+            .pane(0)
+            .expect("initial pane exists")
+            .id()
+    };
+
+    let response = handler
+        .handle(Request::SplitWindowIdentity(Box::new(
+            SplitWindowIdentityRequest {
+                action: SplitWindowTargetActionRequest {
+                    target: Some(original_pane_id.to_string()),
+                    direction: rmux_proto::SplitDirection::Vertical,
+                    before: false,
+                    environment: None,
+                    command: None,
+                    process_command: None,
+                    start_directory: None,
+                    keep_alive_on_exit: None,
+                    detached: false,
+                    size: None,
+                    preserve_zoom: false,
+                    full_size: false,
+                    stdin_payload: None,
+                },
+            },
+        )))
+        .await;
+
+    let Response::SplitWindowIdentity(identity) = response else {
+        panic!("expected stable split identity response, got {response:?}");
+    };
+    assert_eq!(identity.pane, PaneTarget::new(alpha.clone(), 1));
+    assert_ne!(identity.pane_id, original_pane_id);
+}
+
+#[tokio::test]
+async fn sdk_split_identity_rejects_a_reindexed_replacement_after_resolution() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-stale-split");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: rmux_proto::SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    let (removed_pane_id, surviving_pane_id) = {
+        let state = handler.state.lock().await;
+        let window = state
+            .sessions
+            .session(&alpha)
+            .expect("session exists")
+            .window();
+        (
+            window.pane(0).expect("first pane exists").id(),
+            window.pane(1).expect("second pane exists").id(),
+        )
+    };
+    let pause = super::super::target_action_support::install_split_target_resolution_pause(
+        alpha.clone(),
+        removed_pane_id,
+    );
+    let split_handler = handler.clone();
+    let split_target = removed_pane_id.to_string();
+    let split = tokio::spawn(async move {
+        split_handler
+            .handle(Request::SplitWindowIdentity(Box::new(
+                SplitWindowIdentityRequest {
+                    action: SplitWindowTargetActionRequest {
+                        target: Some(split_target),
+                        direction: rmux_proto::SplitDirection::Vertical,
+                        before: false,
+                        environment: None,
+                        command: None,
+                        process_command: None,
+                        start_directory: None,
+                        keep_alive_on_exit: None,
+                        detached: false,
+                        size: None,
+                        preserve_zoom: false,
+                        full_size: false,
+                        stdin_payload: None,
+                    },
+                },
+            )))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .expect("stable split reaches the post-resolution pause");
+
+    assert!(matches!(
+        handler
+            .handle(Request::KillPane(KillPaneRequest {
+                target: PaneTarget::new(alpha.clone(), 0),
+                kill_all_except: false,
+            }))
+            .await,
+        Response::KillPane(_)
+    ));
+    pause.release.notify_one();
+
+    assert_eq!(
+        split.await.expect("split task completes"),
+        Response::Error(ErrorResponse {
+            error: RmuxError::pane_not_found(alpha.clone(), removed_pane_id),
+        })
+    );
+    let state = handler.state.lock().await;
+    let window = state
+        .sessions
+        .session(&alpha)
+        .expect("session survives")
+        .window();
+    assert_eq!(window.panes().len(), 1);
+    assert_eq!(
+        window.pane(0).map(|pane| pane.id()),
+        Some(surviving_pane_id)
+    );
+}
+
+#[tokio::test]
 async fn select_pane_style_sets_pane_style_and_format_colours() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

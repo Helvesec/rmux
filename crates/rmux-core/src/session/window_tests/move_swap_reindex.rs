@@ -77,6 +77,36 @@ fn move_window_clears_last_tracking_when_the_last_window_becomes_active() {
 }
 
 #[test]
+fn link_window_replacement_clears_the_replaced_winlink_alerts() {
+    let mut session = Session::new(
+        session_name("link-replace-alerts"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    session
+        .insert_window_with_initial_pane(2, TerminalSize { cols: 90, rows: 30 })
+        .expect("replacement source insert succeeds");
+    assert!(session.add_winlink_alert_flags(0, crate::WINLINK_ALERTFLAGS));
+    let replacement = session
+        .window_at(2)
+        .expect("replacement source exists")
+        .clone();
+
+    let removed = session
+        .link_window(0, replacement, true, false)
+        .expect("link-window replacement succeeds")
+        .expect("occupied destination is returned");
+
+    assert_ne!(
+        session.window_at(0).expect("replacement exists").id(),
+        removed.id()
+    );
+    assert!(session.winlink_alert_flags(0).is_empty());
+}
+
+#[test]
 fn swap_windows_keeps_active_and_last_tracking_with_the_same_windows() {
     let mut session = Session::new(
         session_name("alpha"),

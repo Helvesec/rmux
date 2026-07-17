@@ -140,11 +140,35 @@ impl Connection {
         target_window_index: Option<u32>,
         format: Option<String>,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::ListPanes(ListPanesRequest {
+        self.list_panes_in_window_with_options(
             target,
             target_window_index,
             format,
-        }))
+            None,
+            None,
+            false,
+        )
+    }
+
+    /// Sends a `list-panes` request scoped to an optional window index, with
+    /// filtering and ordering options.
+    pub fn list_panes_in_window_with_options(
+        &mut self,
+        target: SessionName,
+        target_window_index: Option<u32>,
+        format: Option<String>,
+        filter: Option<String>,
+        sort_order: Option<String>,
+        reversed: bool,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::ListPanes(Box::new(ListPanesRequest {
+            target,
+            target_window_index,
+            format,
+            filter,
+            sort_order,
+            reversed,
+        })))
     }
 
     /// Sends a `switch-client` request over the detached RPC channel.

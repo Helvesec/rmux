@@ -1,6 +1,4 @@
-use rmux_core::{
-    BreakPaneOptions, PaneId, PaneJoinOptions, PaneSwapOptions, Session, SessionPaneTarget,
-};
+use rmux_core::{PaneId, Session};
 use rmux_proto::{
     BreakPaneRequest, BreakPaneResponse, JoinPaneRequest, JoinPaneResponse, LastPaneResponse,
     MovePaneRequest, MovePaneResponse, PaneTarget, RmuxError, SplitDirection, SwapPaneDirection,
@@ -11,6 +9,12 @@ use super::{session_not_found, HandlerState};
 
 #[path = "pane_transfer/cross_session.rs"]
 mod cross_session;
+#[path = "pane_transfer/grouped.rs"]
+mod grouped;
+#[path = "pane_transfer/linked_last.rs"]
+mod linked_last;
+#[path = "pane_transfer/window_metadata.rs"]
+mod window_metadata;
 
 impl HandlerState {
     pub(crate) fn last_pane(
@@ -44,19 +48,26 @@ impl HandlerState {
         request: SwapPaneRequest,
     ) -> Result<SwapPaneResponse, RmuxError> {
         let (source, target) = resolve_swap_targets(&self.sessions, &request)?;
-        if source.session_name() == target.session_name() {
-            let session_name = source.session_name().clone();
-            self.mutate_session_and_resize_terminals(&session_name, |session| {
-                session.swap_panes(
-                    SessionPaneTarget::from(&source),
-                    SessionPaneTarget::from(&target),
-                    PaneSwapOptions::new(request.detached, request.preserve_zoom),
-                )?;
-                Ok(SwapPaneResponse {
-                    source: source.clone(),
-                    target: target.clone(),
-                })
-            })
+        if pane_targets_share_window_identity(&self.sessions, &source, &target) {
+            let normalized_target = PaneTarget::with_window(
+                source.session_name().clone(),
+                source.window_index(),
+                target.pane_index(),
+            );
+            self.swap_pane_within_group(
+                source.clone(),
+                normalized_target,
+                request.detached,
+                request.preserve_zoom,
+            )?;
+            return Ok(SwapPaneResponse { source, target });
+        }
+        if sessions_share_grouped_window_state(
+            &self.sessions,
+            source.session_name(),
+            target.session_name(),
+        ) {
+            self.swap_pane_within_group(source, target, request.detached, request.preserve_zoom)
         } else {
             self.swap_pane_across_sessions(source, target, request.detached, request.preserve_zoom)
         }
@@ -71,41 +82,21 @@ impl HandlerState {
                 "source and target panes must be different".to_owned(),
             ));
         }
-        if request.source.session_name() == request.target.session_name() {
-            let session_name = request.source.session_name().clone();
-            let target = request.target.clone();
-            let moved_pane_id = self
-                .sessions
-                .session(&session_name)
-                .ok_or_else(|| session_not_found(&session_name))
-                .and_then(|session| pane_id_for_target(session, &request.source))?;
-            let direction = join_pane_internal_direction(request.direction);
-            let response = self.mutate_session_and_resize_terminals(&session_name, |session| {
-                session.join_pane(
-                    SessionPaneTarget::from(&request.source),
-                    SessionPaneTarget::from(&request.target),
-                    PaneJoinOptions::new(
-                        direction,
-                        request.detached,
-                        request.before,
-                        request.full_size,
-                        request.size,
-                    ),
-                )?;
-                let moved_index = pane_index_for_id(session, target.window_index(), moved_pane_id)
-                    .ok_or_else(|| {
-                        RmuxError::Server("moved pane disappeared after join-pane".to_owned())
-                    })?;
-                Ok(JoinPaneResponse {
-                    target: PaneTarget::with_window(
-                        session_name.clone(),
-                        target.window_index(),
-                        moved_index,
-                    ),
-                })
-            })?;
-            self.clear_marked_pane_if_id(moved_pane_id);
-            return Ok(response);
+        if pane_targets_share_window_identity(&self.sessions, &request.source, &request.target) {
+            let mut normalized_request = request;
+            normalized_request.source = PaneTarget::with_window(
+                normalized_request.target.session_name().clone(),
+                normalized_request.target.window_index(),
+                normalized_request.source.pane_index(),
+            );
+            return self.join_pane_within_group(normalized_request);
+        }
+        if sessions_share_grouped_window_state(
+            &self.sessions,
+            request.source.session_name(),
+            request.target.session_name(),
+        ) {
+            return self.join_pane_within_group(request);
         }
 
         self.join_pane_across_sessions(request)
@@ -131,43 +122,94 @@ impl HandlerState {
 
     pub(crate) fn break_pane(
         &mut self,
-        request: BreakPaneRequest,
+        mut request: BreakPaneRequest,
     ) -> Result<BreakPaneResponse, RmuxError> {
+        let explicit_name = request.name.is_some();
         let destination_session_name = request.target.as_ref().map_or_else(
             || request.source.session_name().clone(),
             |target| target.session_name().clone(),
         );
+        if request.target.is_none() && !(request.after || request.before) {
+            let destination_index = self.first_available_window_index(&destination_session_name)?;
+            request.target = Some(WindowTarget::with_window(
+                destination_session_name.clone(),
+                destination_index,
+            ));
+        }
+        let shares_grouped_window_state = sessions_share_grouped_window_state(
+            &self.sessions,
+            request.source.session_name(),
+            &destination_session_name,
+        );
 
-        if request.source.session_name() == &destination_session_name {
-            let session_name = request.source.session_name().clone();
-            let source_pane_id = self
-                .sessions
-                .session(&session_name)
-                .ok_or_else(|| session_not_found(&session_name))
-                .and_then(|session| pane_id_for_target(session, &request.source))?;
-            let destination_index =
-                self.mutate_session_and_resize_terminals(&session_name, |session| {
-                    session.break_pane(
-                        SessionPaneTarget::from(&request.source),
-                        BreakPaneOptions::new(
-                            request.target.as_ref().map(WindowTarget::window_index),
-                            request.name.clone(),
-                            request.detached,
-                            request.after,
-                            request.before,
-                        ),
-                    )
-                })?;
-            self.clear_marked_pane_if_id(source_pane_id);
-
-            return Ok(BreakPaneResponse {
-                target: PaneTarget::with_window(destination_session_name, destination_index, 0),
-                output: None,
-            });
+        if request.source.session_name() != &destination_session_name
+            && shares_grouped_window_state
+            && pane_is_only_pane_in_window(&self.sessions, &request.source)
+        {
+            return Err(RmuxError::Server("sessions are grouped".to_owned()));
         }
 
-        self.break_pane_across_sessions(request, destination_session_name)
+        let response = if shares_grouped_window_state {
+            self.break_pane_within_group(request, destination_session_name)
+        } else {
+            self.break_pane_across_sessions(request, destination_session_name)
+        }?;
+        if explicit_name {
+            // `-n` pins the destination name. A moved window can carry the
+            // source's auto-name marker, which would otherwise override the
+            // explicit name on the next pane activity callback.
+            self.clear_auto_named_window_family(
+                response.target.session_name(),
+                response.target.window_index(),
+            );
+        }
+        Ok(response)
     }
+}
+
+fn pane_targets_share_window_identity(
+    sessions: &rmux_core::SessionStore,
+    first: &PaneTarget,
+    second: &PaneTarget,
+) -> bool {
+    let first_window_id = sessions
+        .session(first.session_name())
+        .and_then(|session| session.window_at(first.window_index()))
+        .map(rmux_core::Window::id);
+    let second_window_id = sessions
+        .session(second.session_name())
+        .and_then(|session| session.window_at(second.window_index()))
+        .map(rmux_core::Window::id);
+    first_window_id.is_some() && first_window_id == second_window_id
+}
+
+fn pane_is_only_pane_in_window(sessions: &rmux_core::SessionStore, target: &PaneTarget) -> bool {
+    let Some(session) = sessions.session(target.session_name()) else {
+        return false;
+    };
+    let Some(window) = session.window_at(target.window_index()) else {
+        return false;
+    };
+
+    window.panes().len() == 1
+        && session
+            .pane_id_in_window(target.window_index(), target.pane_index())
+            .is_some()
+}
+
+fn sessions_share_grouped_window_state(
+    sessions: &rmux_core::SessionStore,
+    first: &rmux_proto::SessionName,
+    second: &rmux_proto::SessionName,
+) -> bool {
+    if first == second {
+        return true;
+    }
+
+    let Some(first_group) = sessions.session_group_name(first) else {
+        return false;
+    };
+    sessions.session_group_name(second) == Some(first_group)
 }
 
 fn join_pane_internal_direction(direction: SplitDirection) -> SplitDirection {

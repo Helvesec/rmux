@@ -8,6 +8,7 @@ use rmux_pty::PtyMaster;
 use crate::pane_io::spawn_pane_exit_watcher;
 use crate::pane_io::{
     pane_output_channel, spawn_pane_output_reader, PaneAlertCallback, PaneExitCallback,
+    PaneOutputSender,
 };
 use crate::pane_terminals::HandlerState;
 use crate::pane_transcript::{PaneTranscript, SharedPaneTranscript};
@@ -298,6 +299,16 @@ impl HandlerState {
         pane_id: PaneId,
         spawn: PaneOutputSpawn,
     ) -> Result<(), RmuxError> {
+        self.reset_pane_output_with_sender(session_name, pane_id, spawn, None)
+    }
+
+    pub(in crate::pane_terminals) fn reset_pane_output_with_sender(
+        &mut self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+        spawn: PaneOutputSpawn,
+        retained_sender: Option<PaneOutputSender>,
+    ) -> Result<(), RmuxError> {
         let transcript = PaneTranscript::shared(
             self.history_limit_for_session(session_name),
             TerminalSize {
@@ -321,6 +332,18 @@ impl HandlerState {
         seed_initial_pane_title(&transcript, spawn.initial_title.as_deref());
         #[cfg(unix)]
         let reader_runtime = self.pane_reader_runtime()?;
+        if retained_sender.is_some()
+            && self
+                .pane_outputs
+                .get(session_name)
+                .is_some_and(|panes| panes.contains_key(&pane_id))
+        {
+            return Err(RmuxError::Server(format!(
+                "pane output channel already exists for pane id {} in session {}",
+                pane_id.as_u32(),
+                session_name
+            )));
+        }
         #[cfg(unix)]
         if let Some(reader) = self
             .pane_output_readers
@@ -333,13 +356,22 @@ impl HandlerState {
             .entry(session_name.clone())
             .or_default()
             .insert(pane_id, transcript.clone());
-        let pane_output = self
-            .pane_outputs
-            .entry(session_name.clone())
-            .or_default()
-            .entry(pane_id)
-            .or_insert_with(pane_output_channel)
-            .clone();
+        let pane_output = match retained_sender {
+            Some(sender) => {
+                self.pane_outputs
+                    .entry(session_name.clone())
+                    .or_default()
+                    .insert(pane_id, sender.clone());
+                sender
+            }
+            None => self
+                .pane_outputs
+                .entry(session_name.clone())
+                .or_default()
+                .entry(pane_id)
+                .or_insert_with(pane_output_channel)
+                .clone(),
+        };
         let generation = self.advance_pane_output_generation(session_name, pane_id);
         pane_output.set_generation(generation);
         pane_output.clear_retained();

@@ -45,6 +45,150 @@ async fn recv_overlay_control(
     }
 }
 
+/// Kills the helper process when the test ends, pass or fail.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+const REQUESTER_ENVIRONMENT_HELPER: &str = "RMUX_TEST_REQUESTER_ENVIRONMENT_HELPER";
+
+#[test]
+fn requester_environment_probe_helper() {
+    if std::env::var_os(REQUESTER_ENVIRONMENT_HELPER).is_some() {
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+}
+
+/// Spawns a quiet, long-lived real process carrying the given environment so
+/// the daemon-side requester-environment probe reads a foreign process environment —
+/// the same mechanism a client-less CLI invocation exercises.
+fn spawn_requester_with_environment(vars: &[(&str, String)]) -> ChildGuard {
+    let executable = std::env::current_exe().expect("current test executable");
+    let mut command = std::process::Command::new(executable);
+    command.args([
+        "--exact",
+        "handler::display_message_tests::requester_environment_probe_helper",
+        "--test-threads=1",
+    ]);
+    command.env(REQUESTER_ENVIRONMENT_HELPER, "1");
+    command.env_remove("RMUX_PANE");
+    command.env_remove("TMUX_PANE");
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    ChildGuard(command.spawn().expect("spawn quiet requester process"))
+}
+
+#[tokio::test]
+async fn client_less_display_message_prefers_requester_tmux_pane_over_attached_client() {
+    // Issue #83: a client-less `display-message -p '#S'` run from inside a
+    // pane of detached session B must resolve #S to B via the requester's
+    // TMUX_PANE environment, not to the session of some other attached
+    // client. The requester is a real child process so the daemon reads its
+    // environment exactly as it would for a CLI invocation.
+    let handler = RequestHandler::new();
+    let socket_path =
+        std::env::temp_dir().join(format!("rmux-issue83-{}.sock", std::process::id()));
+    handler.set_socket_path(&socket_path);
+
+    let attached = session_name("issue83-attached");
+    let detached = session_name("issue83-detached");
+    for name in [&attached, &detached] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: name.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&detached)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id().as_u32())
+            .expect("detached session pane exists")
+    };
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(std::process::id(), attached.clone(), control_tx)
+        .await;
+
+    let expected_rmux = format!("{},1,0", socket_path.display());
+    let expected_tmux_pane = format!("%{pane_id}");
+    let requester = spawn_requester_with_environment(&[
+        ("RMUX", expected_rmux.clone()),
+        ("TMUX_PANE", expected_tmux_pane.clone()),
+    ]);
+    let requester_pid = requester.0.id();
+    // Linux may expose the posix_spawn child in /proc before exec has
+    // installed the requested environment. Wait for the exact fixture values
+    // rather than accepting an empty or inherited pre-exec snapshot.
+    let requester_environment = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(environment) = rmux_os::process::environment(requester_pid) {
+                let ready = environment.get("TMUX_PANE") == Some(&expected_tmux_pane)
+                    && environment.get("RMUX") == Some(&expected_rmux);
+                if ready {
+                    break environment;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("requester process installs its expected environment");
+    assert_eq!(
+        requester_environment.get("TMUX_PANE"),
+        Some(&expected_tmux_pane),
+        "requester fixture carries the detached pane identity"
+    );
+    assert_eq!(
+        requester_environment.get("RMUX"),
+        Some(&expected_rmux),
+        "requester fixture carries the matching server socket"
+    );
+
+    let outcome = handler
+        .dispatch(
+            requester_pid,
+            Request::DisplayMessage(DisplayMessageRequest {
+                target: None,
+                print: true,
+                message: Some("#S".to_owned()),
+                empty_target_context: false,
+            }),
+        )
+        .await;
+    let Response::DisplayMessage(response) = outcome.response else {
+        panic!("expected display-message response: {:?}", outcome.response);
+    };
+    let output = response
+        .command_output()
+        .expect("display-message -p returns output");
+    assert_eq!(
+        String::from_utf8_lossy(output.stdout()),
+        format!("{detached}\n"),
+        "client-less #S must follow the requester's TMUX_PANE, not the attached client"
+    );
+}
+
 #[tokio::test]
 async fn display_message_print_expands_shared_formats_without_attached_client() {
     let handler = RequestHandler::new();

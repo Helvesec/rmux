@@ -8,8 +8,10 @@ use rmux_proto::AttachFrameDecoder;
 use tokio::io::DuplexStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 const ATTACH_READ_BUFFER_SIZE: usize = 8192;
+const ATTACH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(feature = "web")]
 const IN_PROCESS_ATTACH_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -69,14 +71,27 @@ impl AttachTransport {
     }
 
     pub(super) async fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        self.write_all_with_timeout(bytes, ATTACH_WRITE_TIMEOUT)
+            .await
+    }
+
+    async fn write_all_with_timeout(
+        &self,
+        bytes: &[u8],
+        write_timeout: std::time::Duration,
+    ) -> io::Result<()> {
         if bytes.is_empty() {
             return Ok(());
         }
         let mut writer = self.writer.lock().await;
-        match writer.write_all(bytes).await {
-            Ok(()) => Ok(()),
-            Err(error) if is_peer_disconnect(&error) => Ok(()),
-            Err(error) => Err(error),
+        match timeout(write_timeout, writer.write_all(bytes)).await {
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "attach client did not drain server output",
+            )),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) if is_peer_disconnect(&error) => Ok(()),
+            Ok(Err(error)) => Err(error),
         }
     }
 
@@ -94,6 +109,32 @@ impl AttachTransport {
 impl From<LocalStream> for AttachTransport {
     fn from(stream: LocalStream) -> Self {
         Self::from_io(stream)
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    use super::AttachTransport;
+
+    #[tokio::test]
+    async fn saturated_non_reader_is_bounded_by_the_write_timeout() {
+        let (server, _non_reader) = tokio::io::duplex(1);
+        let transport = AttachTransport::from_io(server);
+        let started = Instant::now();
+
+        let error = transport
+            .write_all_with_timeout(&vec![b'x'; 4096], Duration::from_millis(25))
+            .await
+            .expect_err("a saturated attach peer must time out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a non-reading attach peer must not hold shutdown indefinitely"
+        );
     }
 }
 

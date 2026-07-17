@@ -62,6 +62,26 @@ pub(crate) struct CopyModeSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CopyModeRenderSnapshot {
+    pub(crate) screen: Screen,
+    pub(crate) overlays: CopyModeRenderOverlays,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CopyModeRenderOverlays {
+    pub(crate) mark: Option<CopyModeOverlayRange>,
+    pub(crate) matches: Vec<CopyModeOverlayRange>,
+    pub(crate) current_match: Option<CopyModeOverlayRange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CopyModeOverlayRange {
+    pub(crate) row: u32,
+    pub(crate) start_x: u32,
+    pub(crate) end_x: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CopyModeCommandOutcome {
     pub(crate) cancel: bool,
     pub(crate) transfer: Option<CopyModeTransfer>,

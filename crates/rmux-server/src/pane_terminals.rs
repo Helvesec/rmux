@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::Path;
 #[cfg(test)]
@@ -32,10 +32,14 @@ mod deferred_initial;
 mod lifecycle_state;
 #[path = "pane_terminals/marked_pane.rs"]
 mod marked_pane;
+#[path = "pane_terminals/new_pane_command.rs"]
+mod new_pane_command;
 #[path = "pane_terminals/pane_access.rs"]
 mod pane_access;
 #[path = "pane_terminals/pane_lifecycle.rs"]
 mod pane_lifecycle;
+#[path = "pane_terminals/pane_option_rekey.rs"]
+mod pane_option_rekey;
 #[path = "pane_terminals/pane_outputs.rs"]
 mod pane_outputs;
 #[path = "pane_pipe.rs"]
@@ -55,26 +59,37 @@ mod pipes;
 mod rollback;
 #[path = "pane_terminals/session_mutation.rs"]
 mod session_mutation;
+pub(crate) use session_mutation::SessionTransferSnapshot;
 #[path = "pane_terminals/session_runtime.rs"]
 mod session_runtime;
 #[path = "pane_terminals/window_indices.rs"]
 mod window_indices;
+#[path = "pane_terminals/window_link_runtime.rs"]
+mod window_link_runtime;
 #[path = "pane_terminals/window_links.rs"]
 mod window_links;
 #[path = "pane_terminals_window.rs"]
 mod window_support;
+pub(crate) use window_support::ListWindowsSelection;
 
 #[cfg(test)]
 pub(crate) use lifecycle_state::PaneLifecycleProcessState;
 use lifecycle_state::PaneLifecycleSpawn;
 pub(crate) use lifecycle_state::PaneLifecycleState;
 use marked_pane::MarkedPane;
+pub(crate) use new_pane_command::resolve_new_pane_process_command;
+pub(in crate::pane_terminals) use pane_lifecycle::{
+    terminate_removed_terminals, LinkedWindowTransferRemovalPlan, PreparedWindowTerminal,
+};
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
 use pane_pipe::PanePipeStore;
+#[cfg(test)]
+pub(crate) use pane_pipe::{active_pipe_child_count_for_test, PipeProcessGroupProbe};
 use pane_terminal_store::PaneTerminalStore;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use pane_transcripts::PaneCaptureRequest;
+pub(crate) use window_links::WindowLinkOccurrenceId;
 use window_links::{WindowLinkGroup, WindowLinkSlot};
 
 #[derive(Clone)]
@@ -84,6 +99,8 @@ pub(crate) struct WindowSpawnOptions<'a> {
     pub(crate) socket_path: &'a Path,
     pub(crate) spawn_environment: Option<&'a HashMap<String, String>>,
     pub(crate) environment_overrides: Option<&'a [String]>,
+    pub(crate) respawn_shell: Option<&'a Path>,
+    pub(crate) respawn_environment: Option<&'a [String]>,
     pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
     pub(crate) pane_exit_callback: Option<PaneExitCallback>,
 }
@@ -103,21 +120,44 @@ pub(crate) struct InitialPaneSpawnOptions<'a> {
 pub(crate) struct DeferredInitialPaneSpawn {
     pub(crate) runtime_session_name: SessionName,
     pub(crate) visible_session_name: SessionName,
-    pub(crate) pane_id: PaneId,
+    pub(crate) identity: DeferredInitialPaneIdentity,
     pub(crate) geometry: PaneGeometry,
     pub(crate) profile: TerminalProfile,
     pub(crate) runtime_window_name: Option<String>,
     pub(crate) command: Option<ProcessCommand>,
-    pub(crate) generation: u64,
     pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
     pub(crate) pane_exit_callback: Option<PaneExitCallback>,
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DeferredInitialPaneIdentity {
+    pane_id: PaneId,
+    generation: u64,
+}
+
+#[cfg(windows)]
+impl DeferredInitialPaneIdentity {
+    fn new(pane_id: PaneId, generation: u64) -> Self {
+        Self {
+            pane_id,
+            generation,
+        }
+    }
+
+    pub(crate) fn pane_id(self) -> PaneId {
+        self.pane_id
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[cfg(windows)]
 pub(crate) struct CompletedDeferredInitialPane {
-    pub(crate) visible_session_name: SessionName,
-    pub(crate) runtime_session_name: SessionName,
-    pub(crate) pane_id: PaneId,
+    pub(crate) runtime_session_name_hint: SessionName,
+    pub(crate) identity: DeferredInitialPaneIdentity,
     pub(crate) pane_pid: u32,
     pub(crate) input_writer: Option<rmux_pty::PtyMaster>,
     pub(crate) queued_input: Vec<DeferredInitialPaneInput>,
@@ -131,12 +171,23 @@ pub(crate) struct DeferredInitialPaneInputFlush {
 }
 
 #[cfg(windows)]
+pub(crate) enum DeferredInitialPaneInputDrain {
+    Flush {
+        runtime_session_name: SessionName,
+        flush: DeferredInitialPaneInputFlush,
+    },
+    Finished {
+        runtime_session_name: SessionName,
+    },
+    Missing,
+}
+
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DeferredInitialPaneConsoleInputAction {
     Key(WindowsConsoleKeyEvent),
     KeyThenInterrupt(WindowsConsoleKeyEvent),
     Interrupt,
-    Noop,
 }
 
 #[cfg(windows)]
@@ -189,6 +240,7 @@ pub(crate) struct HandlerState {
     pub(crate) buffers: BufferStore,
     pub(crate) key_bindings: KeyBindingStore,
     pub(crate) message_log: VecDeque<MessageEntry>,
+    startup_config_files: String,
     next_message_number: u64,
     terminals: PaneTerminalStore,
     #[cfg(windows)]
@@ -204,13 +256,19 @@ pub(crate) struct HandlerState {
     input_disabled_panes: HashSet<PaneId>,
     #[cfg(test)]
     pane_input_captures: StdMutex<HashMap<String, Vec<u8>>>,
+    #[cfg(test)]
+    window_runtime_resize_count: u64,
     dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
     marked_pane: Option<MarkedPane>,
     pipes: PanePipeStore,
     auto_named_windows: HashSet<(SessionName, u32)>,
     window_link_groups: HashMap<u64, WindowLinkGroup>,
     window_link_slots: HashMap<WindowLinkSlot, u64>,
+    window_link_occurrences: HashMap<WindowLinkSlot, WindowLinkOccurrenceId>,
     next_window_link_group_id: u64,
+    next_window_link_occurrence_id: u64,
+    #[cfg(test)]
+    fail_link_window_after_attach: bool,
     #[cfg(unix)]
     pane_reader_runtime: Option<PaneReaderRuntime>,
 }
@@ -237,6 +295,8 @@ pub(crate) struct KilledPaneResult {
     pub(crate) session_destroyed: bool,
     pub(crate) removed_session_id: Option<u32>,
     pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) affected_sessions: Vec<SessionName>,
+    pub(crate) destroyed_sessions: Vec<(SessionName, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,9 +311,41 @@ pub(crate) struct KilledWindowResult {
     pub(crate) response: KillWindowResponse,
     pub(crate) removed_windows: Vec<RemovedWindowHookContext>,
     pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) reindexed_windows: Vec<(SessionName, BTreeMap<u32, u32>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkedWindowResult {
+    pub(crate) response: rmux_proto::LinkWindowResponse,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) reindexed_windows: BTreeMap<u32, u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MovedWindowResult {
+    pub(crate) response: rmux_proto::MoveWindowResponse,
+    pub(crate) unlinked_window: Option<RemovedWindowHookContext>,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnlinkedWindowResult {
+    pub(crate) response: rmux_proto::UnlinkWindowResponse,
+    pub(crate) removed_window: RemovedWindowHookContext,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) removed_timer_targets: Vec<WindowTarget>,
+    pub(crate) reindexed_windows: Vec<(SessionName, BTreeMap<u32, u32>)>,
 }
 
 impl HandlerState {
+    pub(crate) fn set_startup_config_files(&mut self, paths: &[String]) {
+        self.startup_config_files = paths.join(",");
+    }
+
+    pub(crate) fn startup_config_files(&self) -> &str {
+        &self.startup_config_files
+    }
+
     #[cfg(unix)]
     pub(crate) fn set_pane_reader_runtime(&mut self, runtime: PaneReaderRuntime) {
         self.pane_reader_runtime = Some(runtime);
@@ -312,6 +404,19 @@ impl HandlerState {
                 self.attached_terminal_pixels.remove(session_name);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attached_terminal_pixels_for_test(
+        &self,
+        session_name: &SessionName,
+    ) -> Option<TerminalPixels> {
+        self.attached_terminal_pixels.get(session_name).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn window_runtime_resize_count_for_test(&self) -> u64 {
+        self.window_runtime_resize_count
     }
 
     pub(crate) fn add_message(&mut self, message: impl Into<String>) {
@@ -397,7 +502,7 @@ fn pane_terminal_geometry_for_session(
     window_index: u32,
     geometry: PaneGeometry,
 ) -> PaneGeometry {
-    let content_rows = session_content_rows(session, options);
+    let content_rows = session_content_rows(session, options, window_index);
     visible_pane_content_geometry(
         options,
         session.name(),
@@ -407,8 +512,11 @@ fn pane_terminal_geometry_for_session(
     )
 }
 
-fn session_content_rows(session: &Session, options: &OptionStore) -> u16 {
-    let size = session.window().size();
+fn session_content_rows(session: &Session, options: &OptionStore, window_index: u32) -> u16 {
+    let size = session
+        .window_at(window_index)
+        .map(|window| window.size())
+        .unwrap_or_else(|| session.window().size());
     if size.cols == 0 || size.rows == 0 {
         return size.rows;
     }
@@ -417,14 +525,10 @@ fn session_content_rows(session: &Session, options: &OptionStore) -> u16 {
         return size.rows;
     }
 
-    if matches!(
+    crate::status_lines::content_rows_for_status(
         options.resolve(Some(session.name()), OptionName::Status),
-        Some("off")
-    ) {
-        size.rows
-    } else {
-        size.rows.saturating_sub(1)
-    }
+        size.rows,
+    )
 }
 
 pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
@@ -435,7 +539,8 @@ pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{HandlerState, InitialPaneSpawnOptions};
+    use super::{session_content_rows, HandlerState, InitialPaneSpawnOptions};
+    use rmux_core::Session;
     use rmux_proto::{
         HookLifecycle, HookName, OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName,
         SetOptionMode, TerminalSize, WindowTarget,
@@ -443,6 +548,47 @@ mod tests {
 
     fn session_name(value: &str) -> SessionName {
         SessionName::new(value).expect("valid session name")
+    }
+
+    #[test]
+    fn attached_session_content_rows_use_multi_line_status() {
+        let alpha = session_name("alpha");
+        let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        session.touch_attached();
+        let mut state = HandlerState::default();
+
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha.clone()),
+                OptionName::Status,
+                "2".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options, 0), 22);
+
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha.clone()),
+                OptionName::Status,
+                "5".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options, 0), 19);
+
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha),
+                OptionName::Status,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options, 0), 24);
     }
 
     #[tokio::test]

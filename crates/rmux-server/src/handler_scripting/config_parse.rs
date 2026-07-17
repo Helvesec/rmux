@@ -2,13 +2,13 @@ use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::request::Request;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    OptionName, RmuxError, ScopeSelector, SessionName, SetEnvironmentMode, SetEnvironmentRequest,
-    SetOptionByNameRequest, SetOptionMode, ShowEnvironmentRequest, ShowOptionsRequest, Target,
-    WindowTarget,
+    OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName, SetEnvironmentMode,
+    SetEnvironmentRequest, SetOptionByNameRequest, SetOptionMode, ShowEnvironmentRequest,
+    ShowOptionsRequest, Target, WindowTarget,
 };
 
 use super::targets::{implicit_pane_target, implicit_session_name, implicit_window_target};
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::unsupported_flag;
 use super::{parse_session_name, parse_target_arg};
 
@@ -60,24 +60,24 @@ pub(super) fn parse_set_option_invocation(
                 let _ = args.optional();
                 flags.global = true;
             }
-            "-s" => {
+            "-s" if !force_window => {
                 let _ = args.optional();
-                flags.server = true;
+                flags.select_server();
             }
             "-w" if !force_window => {
                 let _ = args.optional();
-                flags.window = true;
+                flags.select_window();
             }
             "-p" if !force_window => {
                 let _ = args.optional();
-                flags.pane = true;
+                flags.select_pane();
             }
             "-q" => {
                 let _ = args.optional();
                 flags.quiet = true;
             }
-            "-w" if force_window => {
-                let _ = args.optional();
+            "-s" | "-w" | "-p" | "-U" if force_window => {
+                return Err(unsupported_flag(command_name, token));
             }
             "-a" => {
                 let _ = args.optional();
@@ -97,28 +97,24 @@ pub(super) fn parse_set_option_invocation(
             }
             "-U" if !force_window => {
                 let _ = args.optional();
+                // tmux -U acts like -u at whatever scope -p/-w/-g select
+                // (session by default); the pane-override sweep applies only
+                // when the resolved scope is a window.
                 flags.unset_pane_overrides = true;
                 flags.unset = true;
-                flags.window = true;
             }
             "-t" => {
                 let _ = args.optional();
                 target = Some(parse_target_arg("set-option", args.required("-t target")?)?);
             }
-            token if is_set_option_flag_cluster(token, force_window) => {
+            token if is_set_option_flag_cluster(token) => {
                 let token = args
                     .optional()
                     .expect("peeked set-option flag cluster must be present");
-                flags.apply_cluster(command_name, &token)?;
+                flags.apply_cluster(command_name, &token, force_window)?;
             }
             _ => break,
         }
-    }
-
-    if flags.scope_count() > 1 {
-        return Err(RmuxError::Server(
-            "set-option accepts at most one of -s, -w, or -p".to_owned(),
-        ));
     }
 
     let option = args.required("set-option option")?;
@@ -134,7 +130,8 @@ pub(super) fn parse_set_option_invocation(
         return Err(error.into_rmux_error());
     }
 
-    let effective_target = target.clone().or(default_target.clone());
+    let format_target = target.clone().or(default_target.clone());
+    let scope_target = set_option_scope_target(&option, &flags, target, default_target)?;
     let scope = resolve_set_option_scope(
         &option,
         flags.global,
@@ -142,7 +139,7 @@ pub(super) fn parse_set_option_invocation(
         flags.window,
         flags.pane,
         flags.append,
-        effective_target.clone(),
+        scope_target,
     )?;
     let Some(scope) = scope.into_scope() else {
         return Ok(ParsedSetOptionCommand::NoOp);
@@ -172,9 +169,45 @@ pub(super) fn parse_set_option_invocation(
             unset: flags.unset,
             unset_pane_overrides: flags.unset_pane_overrides,
             format: flags.format,
-            format_target: flags.format.then_some(effective_target).flatten(),
+            format_target: flags.format.then_some(format_target).flatten(),
         })),
     )))
+}
+
+fn set_option_scope_target(
+    option: &str,
+    flags: &SetOptionFlags,
+    explicit_target: Option<Target>,
+    default_target: Option<Target>,
+) -> Result<Option<Target>, RmuxError> {
+    if explicit_target.is_some() {
+        return Ok(explicit_target);
+    }
+    if flags.pane || flags.window {
+        return Ok(default_target);
+    }
+    if flags.global {
+        return Ok(None);
+    }
+    if flags.server {
+        if !is_user_option_name(option)
+            && matches!(
+                rmux_core::default_global_scope_for_option_name(option)?,
+                OptionScopeSelector::ServerGlobal
+            )
+        {
+            return Ok(None);
+        }
+        return Ok(default_target);
+    }
+    if is_user_option_name(option) {
+        return Ok(default_target);
+    }
+    let default_scope = rmux_core::default_global_scope_for_option_name(option)?;
+    if matches!(default_scope, OptionScopeSelector::ServerGlobal) {
+        return Ok(None);
+    }
+    Ok(default_target)
 }
 
 fn should_defer_set_option_value_validation(option: &str, value: Option<&str>) -> bool {
@@ -225,45 +258,62 @@ impl SetOptionFlags {
         }
     }
 
-    fn scope_count(&self) -> usize {
-        [self.server, self.window, self.pane]
-            .into_iter()
-            .filter(|flag| *flag)
-            .count()
-    }
-
-    fn apply_cluster(&mut self, command_name: &str, token: &str) -> Result<(), RmuxError> {
+    fn apply_cluster(
+        &mut self,
+        command_name: &str,
+        token: &str,
+        force_window: bool,
+    ) -> Result<(), RmuxError> {
         for flag in token[1..].chars() {
+            if force_window && matches!(flag, 's' | 'w' | 'p' | 'U') {
+                return Err(unsupported_flag(command_name, &format!("-{flag}")));
+            }
             match flag {
                 'g' => self.global = true,
-                's' => self.server = true,
-                'w' => self.window = true,
-                'p' => self.pane = true,
+                's' => self.select_server(),
+                'w' => self.select_window(),
+                'p' => self.select_pane(),
                 'q' => self.quiet = true,
                 'a' => self.append = true,
                 'F' => self.format = true,
                 'o' => self.only_if_unset = true,
                 'u' => self.unset = true,
+                // -U is an unset modifier, not a scope selector: plain
+                // `set -U` targets the session copy (oracle 2026-07-09) and
+                // -p/-w keep their own precedence when combined with it, so
+                // clusters such as -qU or -gU must not coerce window scope.
                 'U' => {
                     self.unset_pane_overrides = true;
                     self.unset = true;
-                    self.window = true;
                 }
                 _ => return Err(unsupported_flag(command_name, &format!("-{flag}"))),
             }
         }
         Ok(())
     }
+
+    fn select_server(&mut self) {
+        self.server = true;
+    }
+
+    fn select_window(&mut self) {
+        self.window = true;
+    }
+
+    fn select_pane(&mut self) {
+        self.pane = true;
+    }
 }
 
-fn is_set_option_flag_cluster(token: &str, force_window: bool) -> bool {
+fn is_set_option_flag_cluster(token: &str) -> bool {
     token.starts_with('-')
         && !token.starts_with("--")
         && token.len() > 2
         && token[1..].chars().all(|flag| {
-            matches!(flag, 'g' | 'a' | 'F' | 'o' | 'q' | 'u')
-                || (!force_window && matches!(flag, 's' | 'w' | 'p' | 'U'))
-                || (force_window && flag == 'w')
+            matches!(
+                flag,
+                'g' | 'a' | 'F' | 'o' | 'q' | 'u' | 's' | 'w' | 'p' | 'U'
+            )
         })
 }
 
@@ -275,11 +325,11 @@ pub(super) fn parse_set_environment(
     let mut global = false;
     let mut format = false;
     let mut hidden = false;
-    let mut mode = Some(SetEnvironmentMode::Set);
+    let mut mode = SetEnvironmentMode::Set;
     let mut target = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -298,7 +348,7 @@ pub(super) fn parse_set_environment(
             }
             "-r" => {
                 let _ = args.optional();
-                mode = Some(SetEnvironmentMode::Clear);
+                select_set_environment_mode(&mut mode, SetEnvironmentMode::Clear);
             }
             "-t" => {
                 let _ = args.optional();
@@ -306,16 +356,40 @@ pub(super) fn parse_set_environment(
             }
             "-u" => {
                 let _ = args.optional();
-                mode = Some(SetEnvironmentMode::Unset);
+                select_set_environment_mode(&mut mode, SetEnvironmentMode::Unset);
             }
-            _ => break,
+            _ => {
+                let Some(cluster) = parse_compact_flag_cluster(&token, "Fghru", "t") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('F') => format = true,
+                        CompactFlag::Bare('g') => global = true,
+                        CompactFlag::Bare('h') => hidden = true,
+                        CompactFlag::Bare('r') => {
+                            select_set_environment_mode(&mut mode, SetEnvironmentMode::Clear);
+                        }
+                        CompactFlag::Bare('u') => {
+                            select_set_environment_mode(&mut mode, SetEnvironmentMode::Unset);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_session_name(
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        _ => unreachable!("compact set-environment flags are prevalidated"),
+                    }
+                }
+            }
         }
     }
 
     let scope =
         build_global_or_session_scope("set-environment", global, target, sessions, find_context)?;
     let name = args.required("set-environment name")?;
-    let value = match mode.unwrap_or(SetEnvironmentMode::Set) {
+    let value = match mode {
         SetEnvironmentMode::Set => args
             .optional()
             .ok_or_else(|| RmuxError::Server("no value specified".to_owned()))?,
@@ -329,10 +403,18 @@ pub(super) fn parse_set_environment(
         scope,
         name,
         value,
-        mode,
+        mode: Some(mode),
         hidden,
         format,
     })))
+}
+
+fn select_set_environment_mode(current: &mut SetEnvironmentMode, requested: SetEnvironmentMode) {
+    if matches!(requested, SetEnvironmentMode::Unset)
+        || !matches!(*current, SetEnvironmentMode::Unset)
+    {
+        *current = requested;
+    }
 }
 
 pub(super) fn parse_show_options(
@@ -352,6 +434,7 @@ pub(super) fn parse_show_options(
     let mut pane = false;
     let mut value_only = false;
     let mut include_inherited = false;
+    let mut include_hooks = false;
     let mut quiet = false;
     let mut target = None;
     let mut name = None;
@@ -398,6 +481,11 @@ pub(super) fn parse_show_options(
                 let _ = args.optional();
                 include_inherited = true;
             }
+            "-H" if force_window => return Err(unsupported_flag(command_name, "-H")),
+            "-H" => {
+                let _ = args.optional();
+                include_hooks = true;
+            }
             "-q" if force_window => return Err(unsupported_flag(command_name, "-q")),
             "-q" => {
                 let _ = args.optional();
@@ -420,6 +508,8 @@ pub(super) fn parse_show_options(
                         'v' => value_only = true,
                         'A' if !force_window => include_inherited = true,
                         'A' => return Err(unsupported_flag(command_name, "-A")),
+                        'H' if !force_window => include_hooks = true,
+                        'H' => return Err(unsupported_flag(command_name, "-H")),
                         'q' if force_window => return Err(unsupported_flag(command_name, "-q")),
                         'q' => quiet = true,
                         's' => return Err(unsupported_flag(command_name, "-s")),
@@ -456,6 +546,7 @@ pub(super) fn parse_show_options(
         value_only,
         include_inherited,
         quiet,
+        include_hooks,
     }))
 }
 
@@ -517,7 +608,7 @@ fn is_show_options_flag_cluster(token: &str) -> bool {
         && token.len() > 2
         && token[1..]
             .chars()
-            .all(|flag| matches!(flag, 'A' | 'g' | 's' | 'w' | 'p' | 'v' | 'q'))
+            .all(|flag| matches!(flag, 'A' | 'H' | 'g' | 's' | 'w' | 'p' | 'v' | 'q'))
 }
 
 fn build_global_or_session_scope(
@@ -551,14 +642,38 @@ fn resolve_set_option_scope(
     target: Option<Target>,
 ) -> Result<ResolvedSetOptionScope, RmuxError> {
     rmux_core::resolve_option_name(option)?;
-    let is_user = option
-        .split('[')
-        .next()
-        .is_some_and(|base| base.starts_with('@'));
-    let supports_scope = |scope: &OptionScopeSelector| {
-        rmux_core::validate_option_name_mutation(option, scope, SetOptionMode::Replace, None, true)
-            .is_ok()
-    };
+    let is_user = is_user_option_name(option);
+    let supports_scope = |scope: &OptionScopeSelector| option_name_supports_scope(option, scope);
+
+    if pane && !server && !window {
+        match target.clone() {
+            Some(Target::Pane(target)) => {
+                let scope = OptionScopeSelector::Pane(target);
+                if is_user || supports_scope(&scope) {
+                    return Ok(scope.into());
+                }
+            }
+            None if is_user || option_supports_pane_scope(option) => {
+                return Ok(ResolvedSetOptionScope::NoOp);
+            }
+            _ => {}
+        }
+    }
+
+    if global && !is_user && (server || pane || window) {
+        let scope = rmux_core::default_global_scope_for_option_name(option)?;
+        if supports_scope(&scope) {
+            return Ok(scope.into());
+        }
+        return Err(RmuxError::Server(
+            "global scope is not supported for this option".to_owned(),
+        ));
+    }
+
+    if !global && !is_user && (server || pane || window) {
+        let scope = natural_known_set_option_scope(option, target)?;
+        return Ok(scope.into());
+    }
 
     if server {
         let scope = OptionScopeSelector::ServerGlobal;
@@ -568,6 +683,10 @@ fn resolve_set_option_scope(
         return Ok(ResolvedSetOptionScope::NoOp);
     }
 
+    if global && pane {
+        return Ok(OptionScopeSelector::WindowGlobal.into());
+    }
+
     if pane {
         let Some(Target::Pane(target)) = target else {
             return Err(RmuxError::Server(
@@ -575,22 +694,12 @@ fn resolve_set_option_scope(
             ));
         };
         let scope = OptionScopeSelector::Pane(target);
-        if !is_user && !supports_scope(&scope) {
-            return Err(RmuxError::Server(
-                "pane scope is not supported for this option".to_owned(),
-            ));
-        }
         return Ok(scope.into());
     }
 
     if window {
         if global {
             let scope = OptionScopeSelector::WindowGlobal;
-            if !is_user && !supports_scope(&scope) {
-                return Err(RmuxError::Server(
-                    "window scope is not supported for this option".to_owned(),
-                ));
-            }
             return Ok(scope.into());
         }
 
@@ -609,11 +718,6 @@ fn resolve_set_option_scope(
                 target.window_index(),
             )),
         };
-        if !is_user && !supports_scope(&scope) {
-            return Err(RmuxError::Server(
-                "window scope is not supported for this option".to_owned(),
-            ));
-        }
         return Ok(scope.into());
     }
 
@@ -628,21 +732,29 @@ fn resolve_set_option_scope(
     }
 
     let Some(target) = target else {
+        let default_scope = rmux_core::default_global_scope_for_option_name(option)?;
+        if matches!(default_scope, OptionScopeSelector::ServerGlobal) {
+            if !is_user && !supports_scope(&default_scope) {
+                return Err(RmuxError::Server(
+                    "global scope is not supported for this option".to_owned(),
+                ));
+            }
+            return Ok(default_scope.into());
+        }
         if !(server && append) {
             return Err(RmuxError::Server(
                 "set-option requires a target or one of -g, -s, -w, or -p".to_owned(),
             ));
         }
-        let scope = rmux_core::default_global_scope_for_option_name(option)?;
-        if !is_user && !supports_scope(&scope) {
+        if !is_user && !supports_scope(&default_scope) {
             return Err(RmuxError::Server(
                 "global scope is not supported for this option".to_owned(),
             ));
         }
-        return Ok(scope.into());
+        return Ok(default_scope.into());
     };
 
-    let scope = match target {
+    let scope = match target.clone() {
         Target::Session(session_name) => OptionScopeSelector::Session(session_name),
         Target::Window(target) => {
             if is_user {
@@ -673,12 +785,79 @@ fn resolve_set_option_scope(
     };
 
     if !is_user && !supports_scope(&scope) {
-        return Err(RmuxError::Server(
-            "target scope is not supported for this option".to_owned(),
-        ));
+        // Fall back to the option's natural table scope (mirroring the
+        // explicit-flag path, which trusts natural_known_set_option_scope):
+        // e.g. a flagless `set -U -t alpha:0 pane-border-style` resolves at
+        // window scope like tmux instead of dead-ending at session scope.
+        return Ok(natural_known_set_option_scope(option, Some(target))?.into());
     }
 
     Ok(scope.into())
+}
+
+fn is_user_option_name(option: &str) -> bool {
+    option
+        .split('[')
+        .next()
+        .is_some_and(|base| base.starts_with('@'))
+}
+
+fn natural_known_set_option_scope(
+    option: &str,
+    target: Option<Target>,
+) -> Result<OptionScopeSelector, RmuxError> {
+    match rmux_core::default_global_scope_for_option_name(option)? {
+        OptionScopeSelector::ServerGlobal => Ok(OptionScopeSelector::ServerGlobal),
+        OptionScopeSelector::SessionGlobal => {
+            let Some(target) = target else {
+                return Err(RmuxError::Server(
+                    "set-option requires a target or one of -g, -s, -w, or -p".to_owned(),
+                ));
+            };
+            Ok(OptionScopeSelector::Session(match target {
+                Target::Session(session_name) => session_name,
+                Target::Window(target) => target.session_name().clone(),
+                Target::Pane(target) => target.session_name().clone(),
+            }))
+        }
+        OptionScopeSelector::WindowGlobal => {
+            let Some(target) = target else {
+                return Err(RmuxError::Server(
+                    "set-window-option requires a window target or -g".to_owned(),
+                ));
+            };
+            Ok(OptionScopeSelector::Window(match target {
+                Target::Session(session_name) => WindowTarget::new(session_name),
+                Target::Window(target) => target,
+                Target::Pane(target) => {
+                    WindowTarget::with_window(target.session_name().clone(), target.window_index())
+                }
+            }))
+        }
+        OptionScopeSelector::Session(session_name) => {
+            Ok(OptionScopeSelector::Session(session_name))
+        }
+        OptionScopeSelector::Window(target) => Ok(OptionScopeSelector::Window(target)),
+        OptionScopeSelector::Pane(target) => Ok(OptionScopeSelector::Pane(target)),
+    }
+}
+
+fn option_supports_pane_scope(option: &str) -> bool {
+    option_name_supports_scope(option, &dummy_pane_scope())
+}
+
+fn dummy_pane_scope() -> OptionScopeSelector {
+    OptionScopeSelector::Pane(PaneTarget::with_window(
+        SessionName::new("set-option").expect("valid session name"),
+        0,
+        0,
+    ))
+}
+
+fn option_name_supports_scope(option: &str, scope: &OptionScopeSelector) -> bool {
+    rmux_core::resolve_option_name(option)
+        .map(|query| query.supports_scope(scope))
+        .unwrap_or(false)
 }
 
 enum ResolvedSetOptionScope {
@@ -729,12 +908,6 @@ fn resolve_show_options_scope(
         sessions,
         find_context,
     } = request;
-    if global && pane {
-        return Err(RmuxError::Server(format!(
-            "{command} does not support combining -g and -p"
-        )));
-    }
-
     if [server, window, pane]
         .into_iter()
         .filter(|flag| *flag)
@@ -744,6 +917,28 @@ fn resolve_show_options_scope(
         return Err(RmuxError::Server(format!(
             "{command} accepts at most one of -s, -w, or -p"
         )));
+    }
+
+    let hook = name.and_then(show_options_hook_name);
+    if !global && !server && !window && !pane {
+        if let Some(hook) = hook {
+            return natural_hook_option_scope(hook, target, sessions, find_context, command);
+        }
+    }
+
+    if !global {
+        if let Some(name) = name {
+            if let Some(scope) = natural_known_show_options_scope(
+                name,
+                pane,
+                target.clone(),
+                sessions,
+                find_context,
+                command,
+            )? {
+                return Ok(scope);
+            }
+        }
     }
 
     if server {
@@ -764,6 +959,14 @@ fn resolve_show_options_scope(
             find_context,
             command,
         )?)),
+        (false, true, target) if global => resolve_show_options_global_pane_scope(
+            name,
+            quiet,
+            target,
+            sessions,
+            find_context,
+            command,
+        ),
         (false, true, Some(Target::Pane(target))) => Ok(OptionScopeSelector::Pane(target)),
         (false, true, Some(_)) => Err(RmuxError::Server(format!(
             "{command} -p requires a pane target"
@@ -795,6 +998,9 @@ fn resolve_show_options_global_scope(
     let Some(name) = name else {
         return Ok(OptionScopeSelector::SessionGlobal);
     };
+    if let Some(hook) = show_options_hook_name(name) {
+        return Ok(global_hook_option_scope(hook));
+    }
     match rmux_core::default_global_scope_for_option_name(name) {
         Ok(scope) => Ok(scope),
         Err(error) if quiet && show_options_quiet_suppresses(&error) => {
@@ -802,6 +1008,115 @@ fn resolve_show_options_global_scope(
         }
         Err(error) => Err(error),
     }
+}
+
+fn resolve_show_options_global_pane_scope(
+    name: Option<&str>,
+    quiet: bool,
+    target: Option<Target>,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+    command: &str,
+) -> Result<OptionScopeSelector, RmuxError> {
+    if let Some(name) = name {
+        if show_options_hook_name(name).is_some() {
+            return resolve_show_options_pane_scope(target, sessions, find_context, command);
+        }
+        match rmux_core::resolve_option_name(name) {
+            Ok(query) if query.is_user() || query.supports_scope(&dummy_pane_scope()) => {
+                return resolve_show_options_pane_scope(target, sessions, find_context, command);
+            }
+            Ok(_) => return resolve_show_options_global_scope(Some(name), quiet),
+            Err(error) if quiet && show_options_quiet_suppresses(&error) => {
+                return resolve_show_options_pane_scope(target, sessions, find_context, command);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    resolve_show_options_pane_scope(target, sessions, find_context, command)
+}
+
+fn resolve_show_options_pane_scope(
+    target: Option<Target>,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+    command: &str,
+) -> Result<OptionScopeSelector, RmuxError> {
+    match target {
+        Some(Target::Pane(target)) => Ok(OptionScopeSelector::Pane(target)),
+        Some(_) => Err(RmuxError::Server(format!(
+            "{command} -p requires a pane target"
+        ))),
+        None => Ok(OptionScopeSelector::Pane(implicit_pane_target(
+            sessions,
+            find_context,
+            command,
+        )?)),
+    }
+}
+
+fn natural_known_show_options_scope(
+    option: &str,
+    pane: bool,
+    target: Option<Target>,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+    command: &str,
+) -> Result<Option<OptionScopeSelector>, RmuxError> {
+    let Ok(query) = rmux_core::resolve_option_name(option) else {
+        return Ok(None);
+    };
+    if query.is_user() {
+        return Ok(None);
+    }
+
+    let server_scope = OptionScopeSelector::ServerGlobal;
+    if query.supports_scope(&server_scope) {
+        return Ok(Some(server_scope));
+    }
+
+    let session_scope = OptionScopeSelector::SessionGlobal;
+    if query.supports_scope(&session_scope) {
+        let session_name = match target {
+            Some(Target::Session(session_name)) => session_name,
+            Some(Target::Window(target)) => target.session_name().clone(),
+            Some(Target::Pane(target)) => target.session_name().clone(),
+            None => implicit_session_name(sessions, find_context, command)?,
+        };
+        return Ok(Some(OptionScopeSelector::Session(session_name)));
+    }
+
+    if pane {
+        let pane_target = match target.clone() {
+            Some(Target::Pane(target)) => target,
+            Some(_) => {
+                return Err(RmuxError::Server(format!(
+                    "{command} -p requires a pane target"
+                )));
+            }
+            None => implicit_pane_target(sessions, find_context, command)?,
+        };
+        let pane_scope = OptionScopeSelector::Pane(pane_target);
+        if query.supports_scope(&pane_scope) {
+            return Ok(Some(pane_scope));
+        }
+    }
+
+    let window_target = match target {
+        Some(Target::Session(session_name)) => WindowTarget::new(session_name),
+        Some(Target::Window(target)) => target,
+        Some(Target::Pane(target)) => {
+            WindowTarget::with_window(target.session_name().clone(), target.window_index())
+        }
+        None => implicit_window_target(sessions, find_context, command)?,
+    };
+    let window_scope = OptionScopeSelector::Window(window_target);
+    if query.supports_scope(&window_scope) {
+        return Ok(Some(window_scope));
+    }
+
+    Ok(None)
 }
 
 fn show_options_quiet_suppresses(error: &RmuxError) -> bool {
@@ -816,4 +1131,61 @@ fn show_options_lookup_error(message: &str) -> bool {
     message.starts_with("unknown option: ")
         || message.starts_with("invalid option: ")
         || message.starts_with("ambiguous option: ")
+}
+
+fn show_options_hook_name(value: &str) -> Option<rmux_proto::HookName> {
+    let name = match value.rsplit_once('[') {
+        Some((name, index)) if index.strip_suffix(']')?.parse::<u32>().is_ok() => name,
+        Some(_) => return None,
+        None => value,
+    };
+    rmux_proto::HookName::from_str(name)
+}
+
+fn global_hook_option_scope(hook: rmux_proto::HookName) -> OptionScopeSelector {
+    match rmux_core::hook_global_root(hook) {
+        rmux_core::HookGlobalRoot::Session => OptionScopeSelector::SessionGlobal,
+        rmux_core::HookGlobalRoot::Window => OptionScopeSelector::WindowGlobal,
+    }
+}
+
+fn natural_hook_option_scope(
+    hook: rmux_proto::HookName,
+    target: Option<Target>,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+    command: &str,
+) -> Result<OptionScopeSelector, RmuxError> {
+    let target = match target {
+        Some(Target::Session(session_name)) => {
+            let session = sessions
+                .session(&session_name)
+                .ok_or_else(|| RmuxError::SessionNotFound(session_name.to_string()))?;
+            rmux_core::hook_natural_scope_for_session_target(
+                hook,
+                session_name,
+                session.active_window_index(),
+                session.active_pane_index(),
+            )
+        }
+        Some(target) => rmux_core::hook_natural_scope_for_target(hook, target),
+        None => {
+            let session_name = implicit_session_name(sessions, find_context, command)?;
+            let session = sessions
+                .session(&session_name)
+                .expect("implicit session exists");
+            rmux_core::hook_natural_scope_for_session_target(
+                hook,
+                session_name,
+                session.active_window_index(),
+                session.active_pane_index(),
+            )
+        }
+    };
+    Ok(match target {
+        ScopeSelector::Global => unreachable!("natural hook scope is local"),
+        ScopeSelector::Session(session_name) => OptionScopeSelector::Session(session_name),
+        ScopeSelector::Window(target) => OptionScopeSelector::Window(target),
+        ScopeSelector::Pane(target) => OptionScopeSelector::Pane(target),
+    })
 }

@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use tokio::runtime::{Builder, Runtime};
 
-const DAEMON_WORKER_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
+// Command-queue/source-file dispatch has a large debug future. A 2 MiB worker
+// stack can abort the daemon before a valid set-option request reaches an
+// await; use the same bounded stack budget as the release test workers.
+const DAEMON_WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 const DAEMON_MIN_WORKER_THREADS: usize = 1;
 const DAEMON_MAX_WORKER_THREADS: usize = 1;
 const DAEMON_MAX_BLOCKING_THREADS: usize = 128;
@@ -60,7 +63,7 @@ mod tests {
 
     #[test]
     fn daemon_runtime_resource_limits_are_intentional() {
-        assert_eq!(super::DAEMON_WORKER_THREAD_STACK_SIZE, 2 * 1024 * 1024);
+        assert_eq!(super::DAEMON_WORKER_THREAD_STACK_SIZE, 8 * 1024 * 1024);
         assert_eq!(super::DAEMON_MIN_WORKER_THREADS, 1);
         assert_eq!(super::DAEMON_MAX_WORKER_THREADS, 1);
         assert_eq!(super::DAEMON_MAX_BLOCKING_THREADS, 128);

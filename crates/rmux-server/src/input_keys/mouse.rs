@@ -4,6 +4,12 @@ const MOUSE_PARAM_MAX: u16 = 0xff;
 const MOUSE_PARAM_UTF8_MAX: u16 = 0x7ff;
 const MOUSE_PARAM_BTN_OFF: u16 = 0x20;
 const MOUSE_PARAM_POS_OFF: u16 = 0x21;
+// Three maximal u16 fields plus separators and a terminator need 21 bytes.
+// Keep a little syntax headroom, but never rescan an attacker-sized retained
+// decimal on every input fragment. Once this bound is reached, discard the
+// current malformed input batch so its tail cannot become prompt, menu, or
+// key-binding input after the control opener is removed.
+pub(crate) const MAX_SGR_MOUSE_FRAME_BYTES: usize = 32;
 
 const MOUSE_MASK_BUTTONS: u16 = 195;
 const MOUSE_MASK_DRAG: u16 = 32;
@@ -44,6 +50,10 @@ impl MouseForwardEvent {
 pub(crate) enum MouseDecode {
     Invalid,
     Partial,
+    /// The syntactic mouse prefix is intact, but a decimal field has already
+    /// exceeded the representable range. Keep it on the timed control path
+    /// until it terminates or reaches the fixed syntax-consumption bound.
+    Overlong,
     Discard {
         size: usize,
     },
@@ -166,20 +176,50 @@ pub(crate) fn decode_mouse(input: &[u8], last: Option<MouseForwardEvent>) -> Mou
         return MouseDecode::Invalid;
     }
 
-    let Some((b, offset_after_b)) = parse_mouse_decimal(input, 3) else {
-        return MouseDecode::Partial;
+    let sgr_input = &input[..input.len().min(MAX_SGR_MOUSE_FRAME_BYTES)];
+    let (b, offset_after_b, mut overflowed) = match parse_mouse_decimal(sgr_input, 3, b";") {
+        MouseDecimalDecode::Matched {
+            value,
+            end,
+            overflowed,
+        } => (value, end, overflowed),
+        MouseDecimalDecode::Partial => return incomplete_sgr_mouse(input.len(), false),
+        MouseDecimalDecode::Overlong => return incomplete_sgr_mouse(input.len(), true),
+        MouseDecimalDecode::Invalid => return MouseDecode::Invalid,
     };
-    let Some((x, offset_after_x)) = parse_mouse_decimal(input, offset_after_b + 1) else {
-        return MouseDecode::Partial;
-    };
-    let Some((y, offset_after_y)) = parse_mouse_decimal(input, offset_after_x + 1) else {
-        return MouseDecode::Partial;
-    };
-    let Some(&terminator) = input.get(offset_after_y) else {
-        return MouseDecode::Partial;
-    };
-    if terminator != b'M' && terminator != b'm' {
-        return MouseDecode::Invalid;
+    let (x, offset_after_x, x_overflowed) =
+        match parse_mouse_decimal(sgr_input, offset_after_b + 1, b";") {
+            MouseDecimalDecode::Matched {
+                value,
+                end,
+                overflowed,
+            } => (value, end, overflowed),
+            MouseDecimalDecode::Partial => {
+                return incomplete_sgr_mouse(input.len(), overflowed);
+            }
+            MouseDecimalDecode::Overlong => return incomplete_sgr_mouse(input.len(), true),
+            MouseDecimalDecode::Invalid => return MouseDecode::Invalid,
+        };
+    overflowed |= x_overflowed;
+    let (y, offset_after_y, y_overflowed) =
+        match parse_mouse_decimal(sgr_input, offset_after_x + 1, b"Mm") {
+            MouseDecimalDecode::Matched {
+                value,
+                end,
+                overflowed,
+            } => (value, end, overflowed),
+            MouseDecimalDecode::Partial => {
+                return incomplete_sgr_mouse(input.len(), overflowed);
+            }
+            MouseDecimalDecode::Overlong => return incomplete_sgr_mouse(input.len(), true),
+            MouseDecimalDecode::Invalid => return MouseDecode::Invalid,
+        };
+    overflowed |= y_overflowed;
+    let terminator = input[offset_after_y];
+    if overflowed {
+        return MouseDecode::Discard {
+            size: offset_after_y + 1,
+        };
     }
     if x < 1 || y < 1 {
         return MouseDecode::Discard {
@@ -221,6 +261,17 @@ pub(crate) fn decode_mouse(input: &[u8], last: Option<MouseForwardEvent>) -> Mou
     }
 }
 
+fn incomplete_sgr_mouse(input_len: usize, overflowed: bool) -> MouseDecode {
+    if input_len >= MAX_SGR_MOUSE_FRAME_BYTES {
+        return MouseDecode::Discard { size: input_len };
+    }
+    if overflowed {
+        MouseDecode::Overlong
+    } else {
+        MouseDecode::Partial
+    }
+}
+
 fn motion_mouse_modes() -> u32 {
     mode::MODE_MOUSE_BUTTON | mode::MODE_MOUSE_ALL
 }
@@ -247,20 +298,55 @@ fn append_utf8_mouse_value(value: u16, output: &mut Vec<u8>) {
     output.push(0b1000_0000 | (value as u8 & 0b0011_1111));
 }
 
-fn parse_mouse_decimal(input: &[u8], start: usize) -> Option<(u16, usize)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseDecimalDecode {
+    Partial,
+    Overlong,
+    Invalid,
+    Matched {
+        value: u16,
+        end: usize,
+        overflowed: bool,
+    },
+}
+
+fn parse_mouse_decimal(input: &[u8], start: usize, terminators: &[u8]) -> MouseDecimalDecode {
     let mut index = start;
     let mut value = 0_u16;
+    let mut has_digit = false;
+    let mut overflowed = false;
     while let Some(&byte) = input.get(index) {
-        if byte == b';' || byte == b'M' || byte == b'm' {
-            return Some((value, index));
+        if terminators.contains(&byte) {
+            return if has_digit {
+                MouseDecimalDecode::Matched {
+                    value,
+                    end: index,
+                    overflowed,
+                }
+            } else {
+                MouseDecimalDecode::Invalid
+            };
         }
         if !byte.is_ascii_digit() {
-            return None;
+            return MouseDecimalDecode::Invalid;
         }
-        value = value.checked_mul(10)?.checked_add(u16::from(byte - b'0'))?;
+        has_digit = true;
+        if !overflowed {
+            match value
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(u16::from(byte - b'0')))
+            {
+                Some(next) => value = next,
+                None => overflowed = true,
+            }
+        }
         index += 1;
     }
-    None
+    if overflowed {
+        MouseDecimalDecode::Overlong
+    } else {
+        MouseDecimalDecode::Partial
+    }
 }
 
 fn mouse_wheel(button: u16) -> bool {

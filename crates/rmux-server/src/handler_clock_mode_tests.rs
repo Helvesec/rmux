@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::RequestHandler;
-use crate::control::{ControlModeUpgrade, ControlServerEvent};
+use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::pane_io::AttachControl;
 use rmux_core::{
     input::{mode, InputParser},
@@ -171,12 +171,13 @@ async fn register_control_client(
     handler: &RequestHandler,
     requester_pid: u32,
     session_name: SessionName,
-) -> mpsc::UnboundedReceiver<ControlServerEvent> {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+) -> mpsc::Receiver<ControlServerEvent> {
+    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: ControlMode::Plain,
                 terminal_context: crate::outer_terminal::OuterTerminalContext::default()
                     .with_client_terminal(&rmux_proto::ClientTerminalContext {
@@ -195,14 +196,16 @@ async fn register_control_client(
     event_rx
 }
 
-fn drain_control_notifications(
-    rx: &mut mpsc::UnboundedReceiver<ControlServerEvent>,
-) -> Vec<String> {
+fn drain_control_notifications(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<String> {
     let mut lines = Vec::new();
     loop {
         match rx.try_recv() {
             Ok(ControlServerEvent::Notification(line)) => lines.push(line),
-            Ok(ControlServerEvent::SessionChanged(_) | ControlServerEvent::Refresh) => {}
+            Ok(
+                ControlServerEvent::SessionChanged(_)
+                | ControlServerEvent::SessionChangedAt { .. }
+                | ControlServerEvent::Refresh,
+            ) => {}
             Ok(ControlServerEvent::Exit(reason)) => {
                 panic!("unexpected control exit: {reason:?}");
             }
@@ -228,11 +231,14 @@ async fn pane_id(handler: &RequestHandler, target: &PaneTarget) -> u32 {
 
 async fn list_panes_text(handler: &RequestHandler, target: &PaneTarget, format: &str) -> String {
     let response = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: target.session_name().clone(),
             format: Some(format.to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let output = response
         .command_output()
@@ -256,6 +262,7 @@ async fn next_overlay(
             Some(AttachControl::DetachKill) => panic!("unexpected detach kill"),
             Some(AttachControl::DetachExecShellCommand(_)) => panic!("unexpected detach exec"),
             Some(AttachControl::Write(_)) => {}
+            Some(AttachControl::ClipboardWrite { .. }) => {}
             Some(AttachControl::LockShellCommand(_)) => {}
             Some(AttachControl::Suspend) => panic!("unexpected suspend"),
             None => panic!("attach control closed"),
@@ -350,6 +357,75 @@ async fn clock_mode_overlay_uses_window_options_for_fallback_rendering() {
     assert!(frame.contains("\u{1b}[?25l"));
     assert!(frame.contains("\u{1b}[31m"));
     assert!(frame.contains("AM") || frame.contains("PM"));
+}
+
+#[tokio::test]
+async fn refresh_client_replays_active_clock_after_base_switch() {
+    let handler = RequestHandler::new();
+    let target = create_session(
+        &handler,
+        "refresh-client-clock",
+        TerminalSize { cols: 20, rows: 8 },
+    )
+    .await;
+    let requester_pid = std::process::id();
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, target.session_name().clone(), control_tx)
+        .await;
+    assert!(matches!(
+        handler
+            .handle(Request::ClockMode(ClockModeRequest {
+                target: Some(target),
+            }))
+            .await,
+        Response::ClockMode(_)
+    ));
+    let _ = next_overlay(&mut control_rx).await;
+    while control_rx.try_recv().is_ok() {}
+
+    let response = handler
+        .handle(Request::RefreshClient(Box::new(
+            rmux_proto::request::RefreshClientRequest {
+                target_client: None,
+                adjustment: None,
+                clear_pan: false,
+                pan_left: false,
+                pan_right: false,
+                pan_up: false,
+                pan_down: false,
+                status_only: false,
+                clipboard_query: false,
+                flags: None,
+                flags_alias: None,
+                subscriptions: Vec::new(),
+                subscriptions_format: Vec::new(),
+                control_size: None,
+                colour_report: None,
+            },
+        )))
+        .await;
+    assert!(
+        matches!(response, Response::RefreshClient(_)),
+        "{response:?}"
+    );
+
+    let mut saw_switch = false;
+    let mut replayed_clock = None;
+    while let Ok(control) = control_rx.try_recv() {
+        match control {
+            AttachControl::Switch(_) => saw_switch = true,
+            AttachControl::Overlay(frame) if saw_switch && frame.persistent => {
+                replayed_clock = Some(frame);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_switch, "refresh-client must queue the base Switch");
+    let frame = replayed_clock.expect("clock overlay must be queued after the base Switch");
+    let rendered = String::from_utf8(frame.frame).expect("clock frame is utf-8");
+    assert!(rendered.contains("\u{1b}[?25l"));
 }
 
 #[tokio::test]

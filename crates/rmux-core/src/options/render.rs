@@ -1,6 +1,7 @@
 use super::mutation::split_array_assignment;
 use super::registry::{DefaultValue, OptionQuery, OptionValueType};
 use super::storage::{OptionEntry, OptionEntryValue};
+use crate::command_parser::escape_argument;
 
 pub(super) fn render_show_line(name: &str, value: &str, value_only: bool) -> String {
     if value_only {
@@ -31,24 +32,7 @@ pub(super) fn render_known_show_line(
 }
 
 fn render_show_value(value: &str) -> String {
-    if !show_value_needs_quotes(value) {
-        return value.to_owned();
-    }
-
-    let escaped = value
-        .chars()
-        .flat_map(|character| match character {
-            '"' | '$' | '\\' => ['\\', character].into_iter().collect::<Vec<_>>(),
-            other => [other].into_iter().collect::<Vec<_>>(),
-        })
-        .collect::<String>();
-    format!("\"{escaped}\"")
-}
-
-fn show_value_needs_quotes(value: &str) -> bool {
-    value
-        .chars()
-        .any(|character| character.is_whitespace() || matches!(character, '#' | '$' | '"' | '\\'))
+    escape_argument(value)
 }
 
 pub(super) fn show_option_name(name: &str, index: Option<u32>) -> String {

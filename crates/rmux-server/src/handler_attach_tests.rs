@@ -1,6 +1,6 @@
 use super::attach_support::AttachRegistration;
 use super::RequestHandler;
-use crate::input_keys::MouseForwardEvent;
+use crate::input_keys::{MouseForwardEvent, MAX_SGR_MOUSE_FRAME_BYTES};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
@@ -15,10 +15,11 @@ use rmux_proto::{
     DetachClientExtRequest, DetachClientRequest, ErrorResponse, KeyDispatched, KillSessionRequest,
     LayoutName, LinkWindowRequest, ListPanesRequest, ListWindowsRequest, NewSessionRequest,
     NewWindowRequest, OptionName, PaneTarget, RenameSessionRequest, Request, ResizePaneAdjustment,
-    Response, RmuxError, ScopeSelector, SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest,
-    SelectWindowRequest, SendKeysRequest, SessionName, SetOptionMode, SetOptionRequest,
-    SplitWindowRequest, SplitWindowTarget, SwitchClientRequest, TerminalSize, WindowTarget,
-    CAPABILITY_ATTACH_RENDER, DEFAULT_MAX_FRAME_LENGTH,
+    ResolveTargetRequest, ResolveTargetType, Response, RmuxError, ScopeSelector,
+    SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest, SelectWindowRequest,
+    SendKeysRequest, SessionName, SetOptionMode, SetOptionRequest, SplitWindowRequest,
+    SplitWindowTarget, SwitchClientRequest, Target, TerminalSize, WindowTarget,
+    CAPABILITY_ATTACH_RENDER,
 };
 #[cfg(unix)]
 use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
@@ -59,9 +60,8 @@ fn default_shell_pane_status() -> String {
 
 fn take_render_frame(control: AttachControl) -> String {
     match control {
-        AttachControl::Switch(target) => {
-            String::from_utf8(target.render_frame).expect("render frame must be utf-8")
-        }
+        AttachControl::Switch(target) => String::from_utf8(target.into_target().render_frame)
+            .expect("render frame must be utf-8"),
         AttachControl::Detach => panic!("expected a switch refresh"),
         AttachControl::Exited => panic!("expected a switch refresh"),
         AttachControl::DetachKill => panic!("expected a switch refresh"),
@@ -70,6 +70,7 @@ fn take_render_frame(control: AttachControl) -> String {
         AttachControl::Refresh => panic!("expected a switch refresh"),
         AttachControl::Overlay(_) => panic!("expected a switch refresh"),
         AttachControl::Write(_) => panic!("expected a switch refresh"),
+        AttachControl::ClipboardWrite { .. } => panic!("expected a switch refresh"),
         AttachControl::LockShellCommand(_) => panic!("expected a switch refresh"),
         AttachControl::AdvancePersistentOverlayState(_) => panic!("expected a switch refresh"),
         AttachControl::Suspend => panic!("expected a switch refresh"),
@@ -78,7 +79,7 @@ fn take_render_frame(control: AttachControl) -> String {
 
 fn take_switch_target(control: AttachControl) -> crate::pane_io::AttachTarget {
     match control {
-        AttachControl::Switch(target) => *target,
+        AttachControl::Switch(target) => *target.into_target(),
         other => panic!("expected a switch refresh, got {other:?}"),
     }
 }
@@ -177,6 +178,7 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
         .register_attach_with_access(
             77,
             session.clone(),
+            None,
             AttachRegistration {
                 control_tx,
                 control_backlog: Arc::new(AtomicUsize::new(0)),
@@ -191,7 +193,8 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
                 client_size: Some(TerminalSize { cols: 80, rows: 24 }),
             },
         )
-        .await;
+        .await
+        .expect("attach registration succeeds");
 
     handler.refresh_attached_session(&session).await;
     handler.refresh_attached_session(&session).await;
@@ -229,6 +232,7 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
         .register_attach_with_access(
             77,
             session.clone(),
+            None,
             AttachRegistration {
                 control_tx,
                 control_backlog: control_backlog.clone(),
@@ -243,7 +247,8 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
                 client_size: Some(TerminalSize { cols: 80, rows: 24 }),
             },
         )
-        .await;
+        .await
+        .expect("attach registration succeeds");
 
     handler.refresh_attached_session(&session).await;
 
@@ -252,8 +257,8 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
     assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Detach)));
     assert_eq!(
         control_backlog.load(Ordering::Acquire),
-        super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT,
-        "refresh should not enqueue another tracked frame once the backlog is saturated"
+        super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT + 1,
+        "saturation should enqueue only one accounted terminal detach sentinel"
     );
 }
 
@@ -485,11 +490,14 @@ fn quiet_attached_command() -> Vec<String> {
 
 async fn active_panes(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: session.clone(),
             format: Some("#{pane_index}:#{pane_active}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let Response::ListPanes(response) = response else {
         panic!("expected list-panes response, got {response:?}");
@@ -518,10 +526,13 @@ async fn pane_terminal_size(
 
 async fn active_windows(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: session.clone(),
             format: Some("#{window_index}:#{window_active}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let Response::ListWindows(response) = response else {
         panic!("expected list-windows response, got {response:?}");
@@ -553,13 +564,16 @@ async fn select_layout(handler: &RequestHandler, session: &SessionName, layout: 
 
 async fn pane_mode_status(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: session.clone(),
             format: Some(
                 "#{pane_in_mode}:#{pane_mode}:#{search_present}:#{selection_present}".to_owned(),
             ),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let Response::ListPanes(response) = response else {
         panic!("expected list-panes response, got {response:?}");
@@ -593,27 +607,10 @@ fn drain_attach_controls(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>
     while control_rx.try_recv().is_ok() {}
 }
 
-fn oversized_unterminated_sgr_mouse_input() -> Vec<u8> {
+fn bounded_unterminated_sgr_mouse_input() -> Vec<u8> {
     let mut bytes = b"\x1b[<".to_vec();
-    bytes.resize(DEFAULT_MAX_FRAME_LENGTH + 1, b'1');
+    bytes.resize(MAX_SGR_MOUSE_FRAME_BYTES, b'1');
     bytes
-}
-
-fn assert_partial_control_bound<T>(result: std::io::Result<T>, context: &str) {
-    let error = match result {
-        Ok(_) => panic!("partial control input should be rejected after the bound"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-    let message = error.to_string();
-    assert!(
-        message.contains(context),
-        "error should name {context:?}, got {message:?}"
-    );
-    assert!(
-        message.contains("maximum"),
-        "error should include the retained byte limit, got {message:?}"
-    );
 }
 
 async fn recv_overlay_frame(
@@ -643,6 +640,9 @@ async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> Str
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -809,6 +809,8 @@ async fn replace_transcript_contents(
 #[path = "handler_attach_tests/lifecycle.rs"]
 mod lifecycle;
 
+#[path = "handler_attach_tests/attached_help.rs"]
+mod attached_help;
 #[path = "handler_attach_tests/prefix_navigation.rs"]
 mod prefix_navigation;
 
@@ -842,11 +844,18 @@ mod attach_render;
 #[path = "handler_attach_tests/attached_prefix_lifecycle.rs"]
 mod attached_prefix_lifecycle;
 
+#[path = "handler_attach_tests/cleanup_identity.rs"]
+mod cleanup_identity;
 #[path = "handler_attach_tests/multi_client.rs"]
 mod multi_client;
+#[path = "handler_attach_tests/resize_selection_race.rs"]
+mod resize_selection_race;
 
 #[path = "handler_attach_tests/server_lifecycle.rs"]
 mod server_lifecycle;
 
 #[path = "handler_attach_tests/client_security.rs"]
 mod client_security;
+
+#[path = "handler_attach_tests/attached_count_identity.rs"]
+mod attached_count_identity;

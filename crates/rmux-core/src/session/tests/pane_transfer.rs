@@ -248,7 +248,7 @@ fn detached_move_pane_before_target_keeps_tmux_geometry_and_active_fallback() {
 }
 
 #[test]
-fn swap_panes_across_windows_clears_last_pane_references_to_swapped_out_panes() {
+fn swap_panes_across_windows_removes_detached_last_pane_without_promoting_incoming() {
     let mut session = Session::new(
         session_name("alpha"),
         TerminalSize {
@@ -306,6 +306,133 @@ fn swap_panes_across_windows_clears_last_pane_references_to_swapped_out_panes() 
             .last_pane_index(),
         None
     );
+    assert_eq!(
+        session
+            .window_at(0)
+            .expect("window 0 exists")
+            .panes()
+            .iter()
+            .map(|pane| pane.index())
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        session
+            .window_at(1)
+            .expect("window 1 exists")
+            .panes()
+            .iter()
+            .map(|pane| pane.index())
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn swap_panes_across_windows_preserves_older_last_when_active_pane_leaves() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    session
+        .split_active_pane()
+        .expect("window 0 split succeeds");
+    session
+        .insert_window_with_initial_pane(
+            1,
+            TerminalSize {
+                cols: 120,
+                rows: 40,
+            },
+        )
+        .expect("window 1 insert succeeds");
+    session
+        .split_pane_in_window(1, 0)
+        .expect("window 1 split succeeds");
+    session
+        .select_pane_in_window(0, 1)
+        .expect("window 0 pane 1 exists");
+    session
+        .select_pane_in_window(1, 1)
+        .expect("window 1 pane 1 exists");
+
+    session
+        .swap_panes(
+            SessionPaneTarget::new(0, 1),
+            SessionPaneTarget::new(1, 1),
+            PaneSwapOptions::new(true, false),
+        )
+        .expect("swap succeeds");
+
+    assert_eq!(
+        session
+            .window_at(0)
+            .expect("window 0 exists")
+            .last_pane_index(),
+        Some(0)
+    );
+    assert_eq!(
+        session
+            .window_at(1)
+            .expect("window 1 exists")
+            .last_pane_index(),
+        Some(0)
+    );
+    assert_eq!(
+        session
+            .last_pane_in_window(0)
+            .expect("window 0 last pane survives"),
+        0
+    );
+    assert_eq!(
+        session
+            .last_pane_in_window(1)
+            .expect("window 1 last pane survives"),
+        0
+    );
+}
+
+#[test]
+fn swap_panes_across_windows_allows_incoming_index_collision() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    session
+        .split_active_pane()
+        .expect("window 0 split succeeds");
+    session
+        .insert_window_with_initial_pane(
+            1,
+            TerminalSize {
+                cols: 120,
+                rows: 40,
+            },
+        )
+        .expect("window 1 insert succeeds");
+    session
+        .split_pane_in_window(1, 0)
+        .expect("window 1 split succeeds");
+
+    let source_id = session.pane_id_in_window(0, 1).expect("source pane exists");
+    let target_id = session.pane_id_in_window(1, 0).expect("target pane exists");
+
+    session
+        .swap_panes(
+            SessionPaneTarget::new(0, 1),
+            SessionPaneTarget::new(1, 0),
+            PaneSwapOptions::new(false, false),
+        )
+        .expect("cross-window swap succeeds despite temporary index collision");
+
+    assert_eq!(session.pane_id_in_window(0, 1), Some(target_id));
+    assert_eq!(session.pane_id_in_window(1, 0), Some(source_id));
     assert_eq!(
         session
             .window_at(0)
@@ -543,4 +670,30 @@ fn break_pane_moves_a_single_pane_window_without_recreating_it() {
     assert_eq!(moved_window.id(), source_window_id);
     assert_eq!(moved_window.name(), Some("moved"));
     assert!(session.window_at(2).is_none());
+}
+
+#[test]
+fn join_pane_clears_alert_flags_for_a_destroyed_source_window() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    session
+        .insert_window_with_initial_pane(1, TerminalSize { cols: 90, rows: 30 })
+        .expect("window 1 insert succeeds");
+    let _ = session.add_winlink_alert_flags(1, crate::WINLINK_ACTIVITY);
+
+    session
+        .join_pane(
+            SessionPaneTarget::new(1, 0),
+            SessionPaneTarget::new(0, 0),
+            PaneJoinOptions::new(SplitDirection::Vertical, true, false, false, None),
+        )
+        .expect("join succeeds");
+
+    assert!(session.window_at(1).is_none());
+    assert!(session.winlink_alert_flags(1).is_empty());
 }

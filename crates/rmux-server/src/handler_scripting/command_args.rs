@@ -62,7 +62,7 @@ pub(super) fn command_arguments_with_blocks_as_strings(
         .iter()
         .map(|argument| match argument {
             CommandArgument::String(value) => value.clone(),
-            CommandArgument::Commands(commands) => commands.to_tmux_string(),
+            CommandArgument::Commands(commands) => commands.to_tmux_reparse_string(),
         })
         .collect()
 }

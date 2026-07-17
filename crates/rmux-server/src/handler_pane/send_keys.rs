@@ -18,7 +18,7 @@ use super::{
     encode_key_for_target, encode_mouse_for_target, encode_tokens_for_target,
     expand_send_key_tokens, pane_id_for_input_target, prepare_pane_input_write,
     prepare_synchronized_pane_input_writes, resolve_input_target, write_bytes_to_targets,
-    PaneInputWrite,
+    PaneInputLiveness, PaneInputWrite,
 };
 use crate::keys::{parse_key_code, resolve_hex_key};
 use crate::limits::bounded_repeat_count;
@@ -283,7 +283,12 @@ impl RequestHandler {
                 Ok(bytes) => bytes,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            let write = match prepare_pane_input_write(&mut state, &target, &bytes) {
+            let write = match prepare_pane_input_write(
+                &mut state,
+                &target,
+                &bytes,
+                PaneInputLiveness::TolerateDead,
+            ) {
                 Ok(write) => write,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };

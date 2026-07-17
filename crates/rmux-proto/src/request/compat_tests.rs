@@ -127,7 +127,7 @@ fn session_name(value: &str) -> SessionName {
 }
 
 #[test]
-fn new_window_request_deserializes_old_payloads_with_defaulted_fields() {
+fn new_window_request_rejects_old_unversioned_payload() {
     let bytes = bincode::serialize(&OldNewWindowRequest {
         target: session_name("alpha"),
         name: Some("logs".to_owned()),
@@ -136,21 +136,12 @@ fn new_window_request_deserializes_old_payloads_with_defaulted_fields() {
     })
     .expect("old new-window request serializes");
 
-    let decoded: NewWindowRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.target, session_name("alpha"));
-    assert_eq!(decoded.name.as_deref(), Some("logs"));
-    assert!(decoded.detached);
-    assert_eq!(decoded.environment, Some(vec!["FOO=1".to_owned()]));
-    assert_eq!(decoded.start_directory, None);
-    assert_eq!(decoded.command, None);
-    assert_eq!(decoded.process_command, None);
-    assert_eq!(decoded.target_window_index, None);
+    bincode::deserialize::<NewWindowRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
-fn respawn_window_request_deserializes_old_payloads_with_defaulted_fields() {
+fn respawn_window_request_rejects_old_unversioned_payload() {
     let target = WindowTarget::with_window(session_name("alpha"), 2);
     let bytes = bincode::serialize(&OldRespawnWindowRequest {
         target: target.clone(),
@@ -159,14 +150,8 @@ fn respawn_window_request_deserializes_old_payloads_with_defaulted_fields() {
     })
     .expect("old respawn-window request serializes");
 
-    let decoded: RespawnWindowRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.target, target);
-    assert!(decoded.kill);
-    assert_eq!(decoded.environment, Some(vec!["FOO=1".to_owned()]));
-    assert_eq!(decoded.start_directory, None);
-    assert_eq!(decoded.command, None);
+    bincode::deserialize::<RespawnWindowRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
@@ -207,7 +192,7 @@ fn new_and_respawn_window_requests_round_trip_with_spawn_fields() {
 }
 
 #[test]
-fn split_window_ext_request_deserializes_old_payloads_with_defaulted_fields() {
+fn split_window_ext_request_rejects_old_unversioned_payload() {
     let target = SplitWindowTarget::Pane(PaneTarget::with_window(session_name("alpha"), 0, 1));
     let bytes = bincode::serialize(&OldSplitWindowExtRequest {
         target: target.clone(),
@@ -218,25 +203,12 @@ fn split_window_ext_request_deserializes_old_payloads_with_defaulted_fields() {
     })
     .expect("old split-window-ext request serializes");
 
-    let decoded: SplitWindowExtRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.target, target);
-    assert_eq!(decoded.direction, SplitDirection::Horizontal);
-    assert!(decoded.before);
-    assert_eq!(decoded.environment, Some(vec!["FOO=1".to_owned()]));
-    assert_eq!(decoded.command, Some(vec!["printf ready".to_owned()]));
-    assert_eq!(decoded.process_command, None);
-    assert_eq!(decoded.start_directory, None);
-    assert_eq!(decoded.keep_alive_on_exit, None);
-    assert!(!decoded.detached);
-    assert_eq!(decoded.size, None);
-    assert!(!decoded.preserve_zoom);
-    assert!(!decoded.full_size);
+    bincode::deserialize::<SplitWindowExtRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
-fn display_message_requests_deserialize_old_payloads_with_defaulted_fields() {
+fn display_message_requests_reject_old_unversioned_payloads() {
     let target = Some(Target::Pane(PaneTarget::with_window(
         session_name("alpha"),
         0,
@@ -249,13 +221,8 @@ fn display_message_requests_deserialize_old_payloads_with_defaulted_fields() {
     })
     .expect("old display-message request serializes");
 
-    let decoded: DisplayMessageRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.target, target);
-    assert!(decoded.print);
-    assert_eq!(decoded.message.as_deref(), Some("#{pane_id}"));
-    assert!(!decoded.empty_target_context);
+    bincode::deserialize::<DisplayMessageRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 
     let ext_target = Some(Target::Session(session_name("alpha")));
     let bytes = bincode::serialize(&OldDisplayMessageExtRequest {
@@ -266,14 +233,8 @@ fn display_message_requests_deserialize_old_payloads_with_defaulted_fields() {
     })
     .expect("old display-message-ext request serializes");
 
-    let decoded: DisplayMessageExtRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.target, ext_target);
-    assert!(!decoded.print);
-    assert_eq!(decoded.message.as_deref(), Some("#{client_name}"));
-    assert_eq!(decoded.target_client.as_deref(), Some("client"));
-    assert!(!decoded.empty_target_context);
+    bincode::deserialize::<DisplayMessageExtRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
@@ -308,23 +269,19 @@ fn split_window_ext_request_round_trips_current_payload_fields() {
 }
 
 #[test]
-fn last_pane_request_deserializes_old_payloads_with_defaulted_fields() {
+fn last_pane_request_rejects_old_unversioned_payload() {
     let target = WindowTarget::with_window(session_name("alpha"), 0);
     let bytes = bincode::serialize(&OldLastPaneRequest {
         target: target.clone(),
     })
     .expect("old last-pane request serializes");
 
-    let decoded: LastPaneRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.target, target);
-    assert!(!decoded.preserve_zoom);
-    assert_eq!(decoded.input_disabled, None);
+    bincode::deserialize::<LastPaneRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
-fn select_pane_request_deserializes_old_payloads_with_defaulted_fields() {
+fn select_pane_request_rejects_old_unversioned_payload() {
     let target = PaneTarget::with_window(session_name("alpha"), 0, 1);
     let bytes = bincode::serialize(&OldSelectPaneRequest {
         target: target.clone(),
@@ -333,18 +290,12 @@ fn select_pane_request_deserializes_old_payloads_with_defaulted_fields() {
     })
     .expect("old select-pane request serializes");
 
-    let decoded: SelectPaneRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.target, target);
-    assert_eq!(decoded.title.as_deref(), Some("logs"));
-    assert_eq!(decoded.input_disabled, None);
-    assert!(!decoded.preserve_zoom);
-    assert_eq!(decoded.style, None);
+    bincode::deserialize::<SelectPaneRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
-fn select_pane_adjacent_request_deserializes_old_payloads_with_defaulted_fields() {
+fn select_pane_adjacent_request_rejects_old_unversioned_payload() {
     let target = PaneTarget::with_window(session_name("alpha"), 0, 1);
     let bytes = bincode::serialize(&OldSelectPaneAdjacentRequest {
         target: target.clone(),
@@ -352,16 +303,12 @@ fn select_pane_adjacent_request_deserializes_old_payloads_with_defaulted_fields(
     })
     .expect("old select-pane-adjacent request serializes");
 
-    let decoded: SelectPaneAdjacentRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.target, target);
-    assert_eq!(decoded.direction, SelectPaneDirection::Left);
-    assert!(!decoded.preserve_zoom);
+    bincode::deserialize::<SelectPaneAdjacentRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
-fn respawn_pane_request_deserializes_old_payloads_with_defaulted_fields() {
+fn respawn_pane_request_rejects_old_unversioned_payload() {
     let target = PaneTarget::with_window(session_name("alpha"), 0, 1);
     let bytes = bincode::serialize(&OldRespawnPaneRequest {
         target: target.clone(),
@@ -372,19 +319,12 @@ fn respawn_pane_request_deserializes_old_payloads_with_defaulted_fields() {
     })
     .expect("old respawn-pane request serializes");
 
-    let decoded: RespawnPaneRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.target, target);
-    assert!(decoded.kill);
-    assert_eq!(decoded.start_directory, Some(PathBuf::from("/tmp")));
-    assert_eq!(decoded.environment, Some(vec!["FOO=1".to_owned()]));
-    assert_eq!(decoded.command, Some(vec!["printf ready".to_owned()]));
-    assert_eq!(decoded.process_command, None);
+    bincode::deserialize::<RespawnPaneRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
-fn new_session_ext_request_deserializes_old_payloads_with_defaulted_fields() {
+fn new_session_ext_request_rejects_old_unversioned_payload() {
     let bytes = bincode::serialize(&OldNewSessionExtRequest {
         session_name: Some(session_name("alpha")),
         working_directory: Some("/tmp".to_owned()),
@@ -403,18 +343,8 @@ fn new_session_ext_request_deserializes_old_payloads_with_defaulted_fields() {
     })
     .expect("old new-session-ext request serializes");
 
-    let decoded: NewSessionExtRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.session_name, Some(session_name("alpha")));
-    assert_eq!(decoded.working_directory.as_deref(), Some("/tmp"));
-    assert!(decoded.detached);
-    assert_eq!(decoded.environment, Some(vec!["FOO=1".to_owned()]));
-    assert_eq!(decoded.window_name.as_deref(), Some("main"));
-    assert_eq!(decoded.command, Some(vec!["printf ready".to_owned()]));
-    assert_eq!(decoded.process_command, None);
-    assert_eq!(decoded.client_environment, None);
-    assert!(!decoded.skip_environment_update);
+    bincode::deserialize::<NewSessionExtRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
@@ -541,7 +471,7 @@ fn request_map_deserialize_respects_option_and_default_fields() {
 }
 
 #[test]
-fn show_options_request_deserializes_old_payloads_with_defaulted_fields() {
+fn show_options_request_rejects_old_unversioned_payload() {
     let scope = OptionScopeSelector::SessionGlobal;
     let bytes = bincode::serialize(&OldShowOptionsRequest {
         scope: scope.clone(),
@@ -550,18 +480,12 @@ fn show_options_request_deserializes_old_payloads_with_defaulted_fields() {
     })
     .expect("old show-options request serializes");
 
-    let decoded: ShowOptionsRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.scope, scope);
-    assert_eq!(decoded.name.as_deref(), Some("status-left"));
-    assert!(decoded.value_only);
-    assert!(!decoded.include_inherited);
-    assert!(!decoded.quiet);
+    bincode::deserialize::<ShowOptionsRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
-fn set_option_by_name_request_deserializes_old_payloads_with_defaulted_fields() {
+fn set_option_by_name_request_rejects_old_unversioned_payload() {
     let scope = OptionScopeSelector::SessionGlobal;
     let bytes = bincode::serialize(&OldSetOptionByNameRequest {
         scope: scope.clone(),
@@ -574,22 +498,12 @@ fn set_option_by_name_request_deserializes_old_payloads_with_defaulted_fields() 
     })
     .expect("old set-option-by-name request serializes");
 
-    let decoded: SetOptionByNameRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.scope, scope);
-    assert_eq!(decoded.name, "@probe");
-    assert_eq!(decoded.value.as_deref(), Some("#{session_name}"));
-    assert_eq!(decoded.mode, SetOptionMode::Replace);
-    assert!(!decoded.only_if_unset);
-    assert!(!decoded.unset);
-    assert!(!decoded.unset_pane_overrides);
-    assert!(!decoded.format);
-    assert_eq!(decoded.format_target, None);
+    bincode::deserialize::<SetOptionByNameRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }
 
 #[test]
-fn move_window_request_deserializes_old_payloads_with_defaulted_fields() {
+fn move_window_request_rejects_old_unversioned_payload() {
     let source = WindowTarget::with_window(session_name("alpha"), 0);
     let target = WindowTarget::with_window(session_name("alpha"), 1);
     let bytes = bincode::serialize(&OldMoveWindowRequest {
@@ -601,14 +515,6 @@ fn move_window_request_deserializes_old_payloads_with_defaulted_fields() {
     })
     .expect("old move-window request serializes");
 
-    let decoded: MoveWindowRequest =
-        bincode::deserialize(&bytes).expect("new request decodes old payload");
-
-    assert_eq!(decoded.source, Some(source));
-    assert_eq!(decoded.target, MoveWindowTarget::Window(target));
-    assert!(!decoded.renumber);
-    assert!(decoded.kill_destination);
-    assert!(!decoded.detached);
-    assert!(!decoded.after);
-    assert!(!decoded.before);
+    bincode::deserialize::<MoveWindowRequest>(&bytes)
+        .expect_err("current request rejects old payload without a matching wire version");
 }

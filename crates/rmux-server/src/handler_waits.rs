@@ -3,15 +3,17 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use rmux_core::events::{OutputCursorItem, OutputGap, SdkWaitKey, SdkWaitRegistry};
 use rmux_proto::{
-    CancelSdkWaitRequest, CancelSdkWaitResponse, ErrorResponse, PaneOutputSubscriptionStart,
-    PaneTarget, PaneTargetRef, Response, RmuxError, SdkWaitForOutputRefRequest,
-    SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId,
+    CancelSdkWaitRequest, CancelSdkWaitResponse, ErrorResponse, PaneId,
+    PaneOutputSubscriptionStart, PaneTarget, PaneTargetRef, Response, RmuxError,
+    SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId,
+    SdkWaitOutcome, SdkWaitOwnerId,
 };
 use tokio::sync::oneshot;
 
 use crate::pane_io::PaneOutputReceiver;
 use crate::pane_terminals::{session_not_found, HandlerState};
 
+use super::sdk_wait_quota::{SdkWaitQuota, SdkWaitQuotaError, SdkWaitQuotaLimits, SdkWaitWeight};
 use super::RequestHandler;
 
 const SDK_WAIT_FINISHED_KEY_LIMIT: usize = 4096;
@@ -21,6 +23,7 @@ const SDK_WAIT_PENDING_CANCEL_LIMIT: usize = 4096;
 pub(in crate::handler) struct SdkWaitState {
     registry: SdkWaitRegistry,
     cancel_senders: HashMap<SdkWaitKey, oneshot::Sender<()>>,
+    quota: SdkWaitQuota,
     finished_waits: BoundedSdkWaitKeys,
     cancelled_before_register: BoundedSdkWaitKeys,
 }
@@ -76,9 +79,16 @@ impl BoundedSdkWaitKeys {
 
 impl Default for SdkWaitState {
     fn default() -> Self {
+        Self::new(SdkWaitQuotaLimits::default())
+    }
+}
+
+impl SdkWaitState {
+    fn new(quota_limits: SdkWaitQuotaLimits) -> Self {
         Self {
             registry: SdkWaitRegistry::default(),
             cancel_senders: HashMap::new(),
+            quota: SdkWaitQuota::new(quota_limits),
             finished_waits: BoundedSdkWaitKeys::new(SDK_WAIT_FINISHED_KEY_LIMIT),
             cancelled_before_register: BoundedSdkWaitKeys::new(SDK_WAIT_PENDING_CANCEL_LIMIT),
         }
@@ -102,6 +112,7 @@ pub(crate) struct ArmedSdkWait {
     receiver: PaneOutputReceiver,
     bytes: Vec<u8>,
     cancel_receiver: oneshot::Receiver<()>,
+    _registration: RegisteredSdkWaitGuard,
 }
 
 impl PreparedSdkWait {
@@ -119,8 +130,6 @@ impl ArmedSdkWait {
     }
 
     pub(crate) async fn wait(mut self) -> Response {
-        let mut guard =
-            RegisteredSdkWaitGuard::new(Arc::clone(&self.state), self.owner_id, self.wait_id);
         let outcome = wait_for_bytes(&mut self.receiver, &self.bytes, self.cancel_receiver).await;
         match outcome {
             SdkWaitOutcome::Matched => {
@@ -129,7 +138,6 @@ impl ArmedSdkWait {
                     .lock()
                     .expect("SDK wait registry mutex must not be poisoned")
                     .complete(self.owner_id, self.wait_id);
-                guard.disarm();
                 if removed {
                     Response::SdkWaitForOutput(SdkWaitForOutputResponse {
                         wait_id: self.wait_id,
@@ -142,8 +150,9 @@ impl ArmedSdkWait {
                     })
                 }
             }
-            SdkWaitOutcome::Cancelled => {
-                guard.disarm();
+            _ => {
+                // Unknown future terminal outcomes fail closed for an older
+                // server; only an explicit Matched result may report success.
                 Response::SdkWaitForOutput(SdkWaitForOutputResponse {
                     wait_id: self.wait_id,
                     outcome: SdkWaitOutcome::Cancelled,
@@ -159,6 +168,8 @@ impl SdkWaitState {
         connection_id: u64,
         owner_id: SdkWaitOwnerId,
         wait_id: SdkWaitId,
+        pane_id: PaneId,
+        weight: SdkWaitWeight,
     ) -> Result<SdkWaitRegistration, RmuxError> {
         let key = SdkWaitKey::new(owner_id, wait_id);
 
@@ -167,7 +178,12 @@ impl SdkWaitState {
             return Ok(SdkWaitRegistration::CancelledBeforeRegistration);
         }
 
+        self.quota
+            .reserve(key, connection_id, pane_id, weight)
+            .map_err(sdk_wait_quota_error)?;
         if !self.registry.register(connection_id, owner_id, wait_id) {
+            let released = self.quota.release(key);
+            debug_assert!(released);
             return Err(RmuxError::Server(format!(
                 "SDK wait {} could not be registered for owner {}",
                 wait_id.as_u64(),
@@ -218,13 +234,25 @@ impl SdkWaitState {
     fn remember_finished(&mut self, key: SdkWaitKey) {
         self.finished_waits.insert(key);
     }
+
+    fn finish_registration(&mut self, owner_id: SdkWaitOwnerId, wait_id: SdkWaitId) {
+        let key = SdkWaitKey::new(owner_id, wait_id);
+        let removed = self.registry.remove(owner_id, wait_id).is_some();
+        if let Some(sender) = self.cancel_senders.remove(&key) {
+            let _ = sender.send(());
+        }
+        if removed {
+            self.remember_finished(key);
+        }
+        let released = self.quota.release(key);
+        debug_assert!(released, "registered SDK wait must own a quota reservation");
+    }
 }
 
 struct RegisteredSdkWaitGuard {
     state: Arc<StdMutex<SdkWaitState>>,
     owner_id: SdkWaitOwnerId,
     wait_id: SdkWaitId,
-    active: bool,
 }
 
 impl RegisteredSdkWaitGuard {
@@ -237,24 +265,36 @@ impl RegisteredSdkWaitGuard {
             state,
             owner_id,
             wait_id,
-            active: true,
         }
-    }
-
-    fn disarm(&mut self) {
-        self.active = false;
     }
 }
 
 impl Drop for RegisteredSdkWaitGuard {
     fn drop(&mut self) {
-        if !self.active {
-            return;
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .finish_registration(self.owner_id, self.wait_id);
+    }
+}
+
+fn sdk_wait_quota_error(error: SdkWaitQuotaError) -> RmuxError {
+    match error {
+        SdkWaitQuotaError::AlreadyReserved => {
+            RmuxError::Server("SDK wait already owns a live quota reservation".to_owned())
         }
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        let _ = state.cancel(self.owner_id, self.wait_id);
+        SdkWaitQuotaError::Global { requested, limit } => RmuxError::Server(format!(
+            "SDK wait global weighted quota exceeded (requested {requested}, limit {limit})"
+        )),
+        SdkWaitQuotaError::PerConnection { requested, limit } => RmuxError::Server(format!(
+            "SDK wait connection weighted quota exceeded (requested {requested}, limit {limit})"
+        )),
+        SdkWaitQuotaError::PerOwner { requested, limit } => RmuxError::Server(format!(
+            "SDK wait owner weighted quota exceeded (requested {requested}, limit {limit})"
+        )),
+        SdkWaitQuotaError::PerPane { requested, limit } => RmuxError::Server(format!(
+            "SDK wait pane weighted quota exceeded (requested {requested}, limit {limit})"
+        )),
     }
 }
 
@@ -328,7 +368,7 @@ impl RequestHandler {
             }));
         }
 
-        let receiver = {
+        let (receiver, pane_id) = {
             let state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &target_ref) {
                 Ok(target) => target,
@@ -346,20 +386,31 @@ impl RequestHandler {
                     return PreparedSdkWait::Immediate(Response::Error(ErrorResponse { error }))
                 }
             };
+            let pane_id = match state.pane_output_subscription_key_for_target(&target) {
+                Ok(key) => key.pane_id(),
+                Err(error) => {
+                    return PreparedSdkWait::Immediate(Response::Error(ErrorResponse { error }))
+                }
+            };
 
-            match start {
+            let receiver = match start {
                 PaneOutputSubscriptionStart::Now => output.subscribe(),
                 PaneOutputSubscriptionStart::Oldest => output.subscribe_from_oldest(),
-            }
+            };
+            (receiver, pane_id)
         };
 
-        let cancel_receiver = {
+        let weight = SdkWaitWeight::for_pattern_len(bytes.len());
+        let (cancel_receiver, registration) = {
             let mut waits = self
                 .sdk_waits
                 .lock()
                 .expect("SDK wait registry mutex must not be poisoned");
-            match waits.register(connection_id, owner_id, wait_id) {
-                Ok(SdkWaitRegistration::Registered(receiver)) => receiver,
+            match waits.register(connection_id, owner_id, wait_id, pane_id, weight) {
+                Ok(SdkWaitRegistration::Registered(receiver)) => (
+                    receiver,
+                    RegisteredSdkWaitGuard::new(Arc::clone(&self.sdk_waits), owner_id, wait_id),
+                ),
                 Ok(SdkWaitRegistration::CancelledBeforeRegistration) => {
                     return PreparedSdkWait::Immediate(Response::SdkWaitForOutput(
                         SdkWaitForOutputResponse {
@@ -381,6 +432,7 @@ impl RequestHandler {
             receiver,
             bytes,
             cancel_receiver,
+            _registration: registration,
         })
     }
 
@@ -528,7 +580,7 @@ fn observe_bytes(tail: &mut Vec<u8>, needle: &[u8], bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pane_io::pane_output_channel_with_limits;
+    use crate::pane_io::{pane_output_channel_with_limits, PaneOutputSender};
 
     fn owner(value: u64) -> SdkWaitOwnerId {
         SdkWaitOwnerId::new(value)
@@ -536,6 +588,70 @@ mod tests {
 
     fn wait(value: u64) -> SdkWaitId {
         SdkWaitId::new(value)
+    }
+
+    fn register(
+        state: &mut SdkWaitState,
+        connection_id: u64,
+        owner_id: SdkWaitOwnerId,
+        wait_id: SdkWaitId,
+    ) -> Result<SdkWaitRegistration, RmuxError> {
+        state.register(
+            connection_id,
+            owner_id,
+            wait_id,
+            PaneId::new(1),
+            SdkWaitWeight::for_pattern_len(1),
+        )
+    }
+
+    fn armed_wait(
+        state: &Arc<StdMutex<SdkWaitState>>,
+        connection_id: u64,
+        owner_id: SdkWaitOwnerId,
+        wait_id: SdkWaitId,
+        pane_id: PaneId,
+        bytes: Vec<u8>,
+    ) -> (PaneOutputSender, ArmedSdkWait) {
+        let output = pane_output_channel_with_limits(4, 64);
+        let receiver = output.subscribe();
+        let cancel_receiver = {
+            let mut state = state
+                .lock()
+                .expect("SDK wait registry mutex must not be poisoned");
+            registered_receiver(
+                state
+                    .register(
+                        connection_id,
+                        owner_id,
+                        wait_id,
+                        pane_id,
+                        SdkWaitWeight::for_pattern_len(bytes.len()),
+                    )
+                    .expect("fixture wait registers"),
+            )
+        };
+        let registration = RegisteredSdkWaitGuard::new(Arc::clone(state), owner_id, wait_id);
+        (
+            output,
+            ArmedSdkWait {
+                state: Arc::clone(state),
+                owner_id,
+                wait_id,
+                receiver,
+                bytes,
+                cancel_receiver,
+                _registration: registration,
+            },
+        )
+    }
+
+    fn assert_wait_outcome(response: Response, expected: SdkWaitOutcome) {
+        assert!(matches!(
+            response,
+            Response::SdkWaitForOutput(SdkWaitForOutputResponse { outcome, .. })
+                if outcome == expected
+        ));
     }
 
     #[test]
@@ -638,22 +754,147 @@ mod tests {
         assert_eq!(wait.await.expect("wait task"), SdkWaitOutcome::Cancelled);
     }
 
+    #[tokio::test]
+    async fn matched_wait_releases_quota_after_its_pattern_is_dropped() {
+        let state = Arc::new(StdMutex::new(SdkWaitState::default()));
+        let (output, armed) = armed_wait(
+            &state,
+            1,
+            owner(10),
+            wait(1),
+            PaneId::new(7),
+            b"needle".to_vec(),
+        );
+        assert_eq!(
+            state.lock().expect("state lock").quota.reservation_count(),
+            1
+        );
+
+        output.send(b"prefix-needle-suffix".to_vec());
+        assert_wait_outcome(armed.wait().await, SdkWaitOutcome::Matched);
+
+        let state = state.lock().expect("state lock");
+        assert!(state.registry.is_empty());
+        assert_eq!(state.quota.reservation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_quota_charged_until_wait_storage_is_gone() {
+        let state = Arc::new(StdMutex::new(SdkWaitState::default()));
+        let (_output, armed) = armed_wait(
+            &state,
+            1,
+            owner(10),
+            wait(1),
+            PaneId::new(7),
+            vec![b'x'; 128 * 1024],
+        );
+
+        {
+            let mut state = state.lock().expect("state lock");
+            assert!(state.cancel(owner(10), wait(1)));
+            assert_eq!(
+                state.quota.reservation_count(),
+                1,
+                "cancellation must not make live pattern storage invisible to the quota"
+            );
+        }
+        assert_wait_outcome(armed.wait().await, SdkWaitOutcome::Cancelled);
+        assert_eq!(
+            state.lock().expect("state lock").quota.reservation_count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_wait_future_releases_quota_via_drop_guard() {
+        let state = Arc::new(StdMutex::new(SdkWaitState::default()));
+        let (_output, armed) = armed_wait(
+            &state,
+            1,
+            owner(10),
+            wait(1),
+            PaneId::new(7),
+            b"never".to_vec(),
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::ZERO, armed.wait()).await;
+        assert!(result.is_err());
+        let state = state.lock().expect("state lock");
+        assert!(state.registry.is_empty());
+        assert_eq!(state.quota.reservation_count(), 0);
+    }
+
+    #[test]
+    fn dropping_unpolled_wait_releases_quota_after_prepare_error_path() {
+        let state = Arc::new(StdMutex::new(SdkWaitState::default()));
+        let (_output, armed) = armed_wait(
+            &state,
+            1,
+            owner(10),
+            wait(1),
+            PaneId::new(7),
+            b"never".to_vec(),
+        );
+
+        drop(armed);
+
+        let state = state.lock().expect("state lock");
+        assert!(state.registry.is_empty());
+        assert_eq!(state.quota.reservation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_teardown_does_not_cancel_or_charge_another_client() {
+        let state = Arc::new(StdMutex::new(SdkWaitState::default()));
+        let (_first_output, first) = armed_wait(
+            &state,
+            1,
+            owner(10),
+            wait(1),
+            PaneId::new(7),
+            b"first".to_vec(),
+        );
+        let (other_output, other) = armed_wait(
+            &state,
+            2,
+            owner(20),
+            wait(1),
+            PaneId::new(8),
+            b"other".to_vec(),
+        );
+
+        state.lock().expect("state lock").remove_connection(1);
+        assert_eq!(
+            state.lock().expect("state lock").quota.reservation_count(),
+            2,
+            "disconnected wait remains charged until its retained bytes are dropped"
+        );
+        assert_wait_outcome(first.wait().await, SdkWaitOutcome::Cancelled);
+        assert_eq!(
+            state.lock().expect("state lock").quota.reservation_count(),
+            1
+        );
+
+        other_output.send(b"other".to_vec());
+        assert_wait_outcome(other.wait().await, SdkWaitOutcome::Matched);
+        assert_eq!(
+            state.lock().expect("state lock").quota.reservation_count(),
+            0
+        );
+    }
+
     #[test]
     fn connection_teardown_cancels_only_that_connections_sdk_waits() {
         let mut state = SdkWaitState::default();
         let mut first = registered_receiver(
-            state
-                .register(1, owner(10), wait(1))
-                .expect("first registration succeeds"),
+            register(&mut state, 1, owner(10), wait(1)).expect("first registration succeeds"),
         );
         let mut second = registered_receiver(
-            state
-                .register(1, owner(10), wait(2))
-                .expect("second registration succeeds"),
+            register(&mut state, 1, owner(10), wait(2)).expect("second registration succeeds"),
         );
         let mut other_connection = registered_receiver(
-            state
-                .register(2, owner(20), wait(1))
+            register(&mut state, 2, owner(20), wait(1))
                 .expect("other connection registration succeeds"),
         );
 
@@ -669,6 +910,10 @@ mod tests {
         assert!(state.cancel(owner(20), wait(1)));
         assert!(matches!(other_connection.try_recv(), Ok(())));
         assert!(!state.cancel(owner(10), wait(1)));
+        state.finish_registration(owner(10), wait(1));
+        state.finish_registration(owner(10), wait(2));
+        state.finish_registration(owner(20), wait(1));
+        assert_eq!(state.quota.reservation_count(), 0);
     }
 
     #[test]
@@ -676,8 +921,7 @@ mod tests {
         let mut state = SdkWaitState::default();
 
         assert!(!state.cancel(owner(9), wait(1)));
-        let registration = state
-            .register(33, owner(9), wait(1))
+        let registration = register(&mut state, 33, owner(9), wait(1))
             .expect("late wait registration succeeds as cancelled");
         assert!(matches!(
             registration,
@@ -690,22 +934,21 @@ mod tests {
     fn sdk_wait_keys_are_reusable_after_completion_or_teardown() {
         let mut state = SdkWaitState::default();
 
-        let registration = state
-            .register(44, owner(10), wait(1))
-            .expect("first registration succeeds");
+        let registration =
+            register(&mut state, 44, owner(10), wait(1)).expect("first registration succeeds");
         assert!(matches!(registration, SdkWaitRegistration::Registered(_)));
         assert!(state.complete(owner(10), wait(1)));
         assert!(!state.cancel(owner(10), wait(1)));
+        state.finish_registration(owner(10), wait(1));
         assert!(matches!(
-            state
-                .register(45, owner(10), wait(1))
+            register(&mut state, 45, owner(10), wait(1))
                 .expect("completed key can be reused by a later connection"),
             SdkWaitRegistration::Registered(_)
         ));
         state.remove_connection(45);
+        state.finish_registration(owner(10), wait(1));
 
-        let registration = state
-            .register(46, owner(10), wait(1))
+        let registration = register(&mut state, 46, owner(10), wait(1))
             .expect("teardown also releases the key for a later connection");
         assert!(matches!(registration, SdkWaitRegistration::Registered(_)));
     }
@@ -714,12 +957,11 @@ mod tests {
     fn active_sdk_wait_keys_still_reject_duplicate_registration() {
         let mut state = SdkWaitState::default();
 
-        let registration = state
-            .register(44, owner(10), wait(1))
-            .expect("first registration succeeds");
+        let registration =
+            register(&mut state, 44, owner(10), wait(1)).expect("first registration succeeds");
         assert!(matches!(registration, SdkWaitRegistration::Registered(_)));
 
-        assert!(state.register(45, owner(10), wait(1)).is_err());
+        assert!(register(&mut state, 45, owner(10), wait(1)).is_err());
     }
 
     #[test]
@@ -727,11 +969,11 @@ mod tests {
         let mut state = SdkWaitState::default();
 
         for id in 1..=(SDK_WAIT_FINISHED_KEY_LIMIT + 128) as u64 {
-            let registration = state
-                .register(id, owner(10), wait(id))
-                .expect("registration succeeds");
+            let registration =
+                register(&mut state, id, owner(10), wait(id)).expect("registration succeeds");
             assert!(matches!(registration, SdkWaitRegistration::Registered(_)));
             assert!(state.complete(owner(10), wait(id)));
+            state.finish_registration(owner(10), wait(id));
         }
 
         assert!(state.registry.is_empty());

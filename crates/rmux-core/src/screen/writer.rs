@@ -1,7 +1,7 @@
 use crate::grid::{Grid, GridCell, GridCellFlags, GridLineFlags};
 use crate::input::mode;
 use crate::input::{CellState, InputEndType, ScreenWriter, COLOUR_DEFAULT};
-use crate::TerminalPassthrough;
+use crate::{TerminalPaletteIndex, TerminalPassthrough};
 
 use super::{SavedGrid, Screen, TITLE_STACK_MAX};
 
@@ -28,15 +28,26 @@ impl ScreenWriter for Screen {
 
     fn cursor_up(&mut self, n: u32) {
         self.clear_pending_wrap();
-        self.cursor_y = self.cursor_y.saturating_sub(n);
+        // Positions above the scroll region keep the screen edge; all others
+        // stop at the region's top margin.
+        let minimum_y = if self.cursor_y >= self.rupper {
+            self.rupper
+        } else {
+            0
+        };
+        self.cursor_y = self.cursor_y.saturating_sub(n).max(minimum_y);
     }
 
     fn cursor_down(&mut self, n: u32) {
         self.clear_pending_wrap();
-        self.cursor_y = self
-            .cursor_y
-            .saturating_add(n)
-            .min(self.grid.sy().saturating_sub(1));
+        // Positions below the scroll region keep the screen edge; all others
+        // stop at the region's bottom margin.
+        let maximum_y = if self.cursor_y <= self.rlower {
+            self.rlower
+        } else {
+            self.grid.sy().saturating_sub(1)
+        };
+        self.cursor_y = self.cursor_y.saturating_add(n).min(maximum_y);
     }
 
     fn cursor_left(&mut self, n: u32) {
@@ -177,8 +188,13 @@ impl ScreenWriter for Screen {
     fn insert_character(&mut self, n: u32, bg: i32) {
         self.clear_pending_wrap();
         self.clear_selected_cells();
-        let x = self.cursor_column();
         let sx = self.grid.sx();
+        let x = self.logical_insert_column();
+        if x >= sx {
+            self.pending_wrap = (self.mode & crate::input::mode::MODE_WRAP) != 0;
+            return;
+        }
+        self.cursor_x = x;
         let count = n.max(1).min(sx.saturating_sub(x));
         let blank = self.blank_cell(bg);
         if let Some(line) = self.current_line_mut() {
@@ -341,29 +357,20 @@ impl ScreenWriter for Screen {
 
         let current_size = self.grid.size();
         let saved_size = saved.grid.size();
-        if current_size.rows == saved_size.rows {
-            self.grid.replace_visible_resized_width_only(
-                saved_size,
-                saved.grid.visible_lines(),
-                COLOUR_DEFAULT,
-            );
-        } else {
-            self.grid
-                .resize_width(u32::from(saved_size.cols), COLOUR_DEFAULT);
-            self.grid.resize_height(
-                u32::from(saved_size.rows),
-                &mut self.cursor_y,
-                COLOUR_DEFAULT,
-            );
-            self.grid.replace_visible(saved.grid.visible_lines());
-        }
+        let alternate_cursor = (self.cursor_x, self.cursor_y, self.pending_wrap);
+        self.grid
+            .restore_visible_at_size(saved_size, saved.grid.visible_lines(), COLOUR_DEFAULT);
         self.grid.set_history_enabled(saved.history_enabled);
-        self.resize(current_size);
         if let Some((x, y, pending_wrap)) = saved_cursor {
             self.restore_cursor_position(x, y, pending_wrap);
         } else {
-            self.pending_wrap = false;
+            self.restore_cursor_position(
+                alternate_cursor.0,
+                alternate_cursor.1,
+                alternate_cursor.2,
+            );
         }
+        self.resize(current_size);
     }
 
     fn tab(&mut self) {
@@ -573,7 +580,27 @@ impl ScreenWriter for Screen {
         }
     }
 
-    fn osc_palette(&mut self, _data: &str, _end: InputEndType) {}
+    fn osc_palette(&mut self, data: &str, _end: InputEndType) {
+        // OSC 4 is a list of index/value pairs. tmux 3.7b forwards each valid
+        // query as its own canonical ST-terminated OSC while handling palette
+        // sets internally. RMUX does not maintain an outer-terminal palette,
+        // so keep set behaviour unchanged and relay only strict, bounded
+        // queries. The dedicated event kind bypasses generic raw-passthrough
+        // policy without reflecting arbitrary OSC payloads.
+        let mut fields = data.split(';');
+        while let Some(index) = fields.next() {
+            let Some(value) = fields.next() else {
+                break;
+            };
+            if value != "?" {
+                continue;
+            }
+            let Some(index) = TerminalPaletteIndex::parse(index) else {
+                continue;
+            };
+            self.push_terminal_passthrough(TerminalPassthrough::palette_query(index));
+        }
+    }
     fn osc_notification(&mut self, _data: &str) {}
     fn osc_fg_colour(&mut self, _data: &str, _end: InputEndType) {}
     fn osc_bg_colour(&mut self, _data: &str, _end: InputEndType) {}

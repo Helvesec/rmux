@@ -110,11 +110,47 @@ fn csi_dsr_cursor_position_report() {
 }
 
 #[test]
-fn csi_xda_reports_tmux_version() {
-    let (p, _w) = parse(b"\x1b[>q");
-    let replies = String::from_utf8_lossy(&p.reply_buf);
+fn csi_xtversion_reports_rmux_identity_product_divergence() {
+    // Oracle probe 2026-07-15, pinned tmux 3.7b: tmux reports its own
+    // `tmux 3.7b` identity for bare and zero-valued XTVERSION queries. RMUX
+    // deliberately preserves the framing and parameter behavior while naming
+    // the product that actually implements the terminal.
     let version = env!("CARGO_PKG_VERSION");
-    assert_eq!(replies.as_ref(), &format!("\x1bP>|tmux {version}\x1b\\"));
+    let expected = format!("\x1bP>|rmux {version}\x1b\\");
+
+    for query in [
+        b"\x1b[>q".as_slice(),
+        b"\x1b[>0q".as_slice(),
+        b"\x1b[>0;7q".as_slice(),
+    ] {
+        let (p, _w) = parse(query);
+        assert_eq!(String::from_utf8_lossy(&p.reply_buf), expected);
+    }
+}
+
+#[test]
+fn csi_xtversion_ignores_nonzero_primary_parameter() {
+    for query in [b"\x1b[>1q".as_slice(), b"\x1b[>999q".as_slice()] {
+        let (p, _w) = parse(query);
+        assert!(p.reply_buf.is_empty());
+    }
+}
+
+#[test]
+fn csi_xtversion_fragmented_query_replies_once() {
+    let mut parser = InputParser::new();
+    let mut writer = RecordingWriter::new(80, 24);
+
+    parser.parse(b"\x1b[>", &mut writer);
+    assert!(parser.take_replies().is_empty());
+    parser.parse(b"q", &mut writer);
+
+    let version = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        parser.take_replies(),
+        format!("\x1bP>|rmux {version}\x1b\\").into_bytes()
+    );
+    assert!(parser.take_replies().is_empty());
 }
 
 #[test]

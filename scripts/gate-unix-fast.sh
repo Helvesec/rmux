@@ -16,9 +16,9 @@ Options:
   --install-nextest            Install cargo-nextest if it is missing
   -h, --help                   Show this help
 
-This gate sets RUST_TEST_THREADS from --test-threads for cargo test. It keeps
-the Cargo target directory outside the repo by default and runs doc/source
-checks separately.
+This gate sets RUST_TEST_THREADS from --test-threads and uses the same minimum
+test-thread stack as CI. It keeps the Cargo target directory outside the repo
+by default and runs doc/source checks separately.
 USAGE
 }
 
@@ -125,6 +125,7 @@ esac
 cd "$repo_root"
 
 export RUST_TEST_THREADS="$test_threads"
+export RUST_MIN_STACK=8388608
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(logical_cpus)}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
@@ -139,6 +140,7 @@ fi
 printf '[gate] platform=%s\n' "$platform"
 printf '[gate] test_threads=%s\n' "$test_threads"
 printf '[gate] rust_test_threads=%s\n' "$RUST_TEST_THREADS"
+printf '[gate] rust_min_stack=%s\n' "$RUST_MIN_STACK"
 printf '[gate] cargo_build_jobs=%s\n' "$CARGO_BUILD_JOBS"
 printf '[gate] cargo_incremental=%s\n' "$CARGO_INCREMENTAL"
 printf '[gate] cargo_target_dir=%s\n' "$CARGO_TARGET_DIR"
@@ -160,6 +162,7 @@ if [ "$skip_doc" -eq 0 ]; then
 fi
 
 if [ "$skip_source_gates" -eq 0 ]; then
+  run_step "worktree hygiene" scripts/check-worktree-hygiene.sh
   run_step "runtime network source scan" scripts/no-network-in-runtime.sh
   run_step "platform neutrality source scan" scripts/check-platform-neutrality.sh
   run_step "debug_assert side-effect scan" scripts/no-debug-assert-side-effects.sh

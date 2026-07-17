@@ -257,13 +257,23 @@ daemon_binary_sha256="$(sha256_file "$packaged_daemon")"
 binary_bytes="$(wc -c < "$packaged_binary" | tr -d ' ')"
 helper_binary_bytes="$(wc -c < "$packaged_helper" | tr -d ' ')"
 daemon_binary_bytes="$(wc -c < "$packaged_daemon" | tr -d ' ')"
+glibc_floor_script="$repo_root/scripts/glibc-symbol-floor.sh"
+binary_glibc_min="$($glibc_floor_script "$packaged_binary")"
+helper_binary_glibc_min="$($glibc_floor_script "$packaged_helper")"
+daemon_binary_glibc_min="$($glibc_floor_script "$packaged_daemon")"
+package_glibc_min="$($glibc_floor_script "$packaged_binary" "$packaged_helper" "$packaged_daemon")"
+max_supported_glibc="${RMUX_MAX_SUPPORTED_GLIBC:-2.35}"
+case "$max_supported_glibc" in ''|*[!0-9.]*|.*|*.|*..*) die "invalid RMUX_MAX_SUPPORTED_GLIBC: $max_supported_glibc" ;; esac
+if [ "$(printf '%s\n%s\n' "$package_glibc_min" "$max_supported_glibc" | LC_ALL=C sort -V | tail -n 1)" != "$max_supported_glibc" ]; then
+  die "packaged binaries require GLIBC_$package_glibc_min, newer than supported GLIBC_$max_supported_glibc; rebuild in the oldest supported sysroot"
+fi
 git_commit="$(git rev-parse HEAD)"
 git_dirty=false
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   git_dirty=true
 fi
 release_artifact=true
-if [ "$git_dirty" = true ] || { [ "$skip_build" -eq 1 ] && [ "$reuse_release_binary" -eq 0 ]; }; then
+if [ "$configuration" != "release" ] || [ "$git_dirty" = true ] || { [ "$skip_build" -eq 1 ] && [ "$reuse_release_binary" -eq 0 ]; }; then
   release_artifact=false
 fi
 generated_at_utc="$(git show -s --format=%cI HEAD)"
@@ -272,15 +282,20 @@ cat > "$stage_dir/usr/share/rmux/artifact-metadata.json" <<EOF
 {
   "schema": 1,
   "artifact_kind": "debian-package-binary",
-  "binary_path": "$(printf '%s' "$binary_abs" | json_escape)",
+  "binary_path": "/usr/bin/rmux",
   "binary_sha256": "$binary_sha256",
   "binary_bytes": $binary_bytes,
-  "helper_binary_path": "$(printf '%s' "$helper_binary_abs" | json_escape)",
+  "helper_binary_path": "/usr/libexec/rmux/rmux",
   "helper_binary_sha256": "$helper_binary_sha256",
   "helper_binary_bytes": $helper_binary_bytes,
-  "daemon_binary_path": "$(printf '%s' "$daemon_binary_abs" | json_escape)",
+  "daemon_binary_path": "/usr/bin/rmux-daemon",
   "daemon_binary_sha256": "$daemon_binary_sha256",
   "daemon_binary_bytes": $daemon_binary_bytes,
+  "binary_glibc_min": "$binary_glibc_min",
+  "helper_binary_glibc_min": "$helper_binary_glibc_min",
+  "daemon_binary_glibc_min": "$daemon_binary_glibc_min",
+  "package_glibc_min": "$package_glibc_min",
+  "max_supported_glibc": "$max_supported_glibc",
   "rmux_version": "$version",
   "git_commit": "$git_commit",
   "git_dirty": $git_dirty,
@@ -325,7 +340,7 @@ Priority: optional
 Architecture: $deb_arch
 Installed-Size: $installed_size
 Maintainer: $maintainer
-Depends: libc6 (>= 2.31), libgcc-s1 (>= 3.0)
+Depends: libc6 (>= $package_glibc_min), libgcc-s1 (>= 3.0)
 Homepage: $homepage
 Description: Terminal multiplexer with a tmux-style CLI
  RMUX is a local terminal multiplexer with a tmux-compatible command surface,

@@ -262,7 +262,11 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "client_height" => self.client_size.map(|size| size.rows.to_string()),
             "client_width" => self.client_size.map(|size| size.cols.to_string()),
             "command" => Some("display-message".to_owned()),
-            "config_files" => Some("/dev/null".to_owned()),
+            "config_files" => Some(
+                self.state
+                    .map(|state| state.startup_config_files().to_owned())
+                    .unwrap_or_default(),
+            ),
             "cursor_character" => Some(" ".to_owned()),
             "cursor_flag" => Some("1".to_owned()),
             "cursor_x" => self
@@ -307,8 +311,14 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "mouse_sgr_flag" => self.pane_mode_flag(mode::MODE_MOUSE_SGR),
             "mouse_standard_flag" => self.pane_mode_flag(mode::MODE_MOUSE_STANDARD),
             "mouse_utf8_flag" => self.pane_mode_flag(mode::MODE_MOUSE_UTF8),
-            "pane_current_path" | "session_path" => self
+            "pane_current_path" => self
                 .pane_current_path()
+                .or_else(|| self.environment_value_by_name("PWD"))
+                .or_else(|| self.environment_value_by_name("HOME")),
+            "session_path" => self
+                .session
+                .and_then(Session::cwd)
+                .map(|path| path.to_string_lossy().into_owned())
                 .or_else(|| self.environment_value_by_name("PWD"))
                 .or_else(|| self.environment_value_by_name("HOME")),
             "pane_path" => Some(String::new()),
@@ -318,6 +328,8 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "pane_dead_status" => self.pane_dead_status(),
             "pane_dead_time" => self.pane_dead_time(),
             "pane_bg" => self.pane_style_colour(false),
+            "pane_activity" => self.pane.map(|pane| pane.activity_at().to_string()),
+            "pane_created" => self.pane.map(|pane| pane.created_at().to_string()),
             "pane_fg" => self.pane_style_colour(true),
             "pane_flags" => self.pane.map(|pane| {
                 let mut flags = String::new();
@@ -339,7 +351,10 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             }),
             "pane_format" => Some(bool_string(self.pane.is_some())),
             "pane_in_mode" => Some(bool_string(self.pane_in_mode())),
-            "pane_input_off" => Some("0".to_owned()),
+            "pane_input_off" => Some(bool_string(self.pane.is_some_and(|pane| {
+                self.state
+                    .is_some_and(|state| state.pane_input_is_disabled(pane.id()))
+            }))),
             "pane_marked" => self.pane_marked(),
             "pane_marked_set" => Some(bool_string(self.marked_pane_set())),
             "pane_last" => self.pane.map(|pane| {
@@ -532,7 +547,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                     .and_then(|_| self.session_name().map(ToString::to_string))
                     .unwrap_or_default(),
             ),
-            "window_activity" => self.session.map(|session| session.activity_at().to_string()),
+            "window_activity" => self.window.map(|window| window.activity_at().to_string()),
             "window_bigger" => Some("0".to_owned()),
             "window_cell_height" => Some("32".to_owned()),
             "window_cell_width" => Some("16".to_owned()),
@@ -544,6 +559,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 )
             }),
             "window_format" => Some(bool_string(self.window.is_some() && self.pane.is_none())),
+            "window_created" => self.window.map(|window| window.created_at().to_string()),
             "window_marked_flag" => Some(bool_string(self.window_marked())),
             "window_offset_x" | "window_offset_y" => Some("0".to_owned()),
             "window_stack_index" => self.window_stack_index(),
@@ -670,21 +686,21 @@ mod tests {
 
     #[test]
     fn user_name_falls_back_to_windows_username() {
-        let values = HashMap::from([("USERNAME", "shadow")]);
+        let values = HashMap::from([("USERNAME", "rmux-user")]);
 
         assert_eq!(
             user_name_from_env(lookup(&values)).as_deref(),
-            Some("shadow")
+            Some("rmux-user")
         );
     }
 
     #[test]
     fn user_name_ignores_empty_values() {
-        let values = HashMap::from([("USER", ""), ("USERNAME", "shadow")]);
+        let values = HashMap::from([("USER", ""), ("USERNAME", "rmux-user")]);
 
         assert_eq!(
             user_name_from_env(lookup(&values)).as_deref(),
-            Some("shadow")
+            Some("rmux-user")
         );
     }
 }

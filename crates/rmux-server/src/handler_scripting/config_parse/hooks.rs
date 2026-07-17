@@ -1,3 +1,4 @@
+use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::request::Request;
 use rmux_proto::{
     HookLifecycle, HookName, RmuxError, ScopeSelector, SetHookMutationRequest, ShowHooksRequest,
@@ -5,10 +6,13 @@ use rmux_proto::{
 };
 
 use super::super::parse_target_arg;
+use super::super::targets::{implicit_pane_target, implicit_session_name, implicit_window_target};
 use super::super::tokens::CommandTokens;
 
 pub(in crate::handler::scripting_support) fn parse_set_hook(
     mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
     let mut global = false;
     let mut window = false;
@@ -52,6 +56,21 @@ pub(in crate::handler::scripting_support) fn parse_set_hook(
                 let _ = args.optional();
                 window = true;
             }
+            token if compact_hook_target_flag_prefix(token, true).is_some() => {
+                let token = args.optional().expect("peeked token exists");
+                let prefix = compact_hook_target_flag_prefix(&token, true)
+                    .expect("validated compact set-hook target flag");
+                apply_set_hook_flag_cluster(
+                    &prefix,
+                    &mut global,
+                    &mut window,
+                    &mut pane,
+                    &mut append,
+                    &mut run_immediately,
+                    &mut unset,
+                );
+                target = Some(parse_target_arg("set-hook", args.required("-t target")?)?);
+            }
             token if is_compact_hook_flag_cluster(token, true) => {
                 let token = args.optional().expect("peeked token exists");
                 apply_set_hook_flag_cluster(
@@ -69,7 +88,17 @@ pub(in crate::handler::scripting_support) fn parse_set_hook(
     }
 
     let hook = parse_hook_spec(&args.required("set-hook hook")?)?;
-    let scope = resolve_hook_scope("set-hook", hook.hook, global, window, pane, target)?;
+    let scope = resolve_hook_scope(HookScopeRequest {
+        command: "set-hook",
+        hook: hook.hook,
+        global,
+        window,
+        pane,
+        target,
+        run_immediately,
+        sessions,
+        find_context,
+    })?;
     let command = if run_immediately || unset {
         args.optional()
     } else {
@@ -91,6 +120,8 @@ pub(in crate::handler::scripting_support) fn parse_set_hook(
 
 pub(in crate::handler::scripting_support) fn parse_show_hooks(
     mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
     let mut global = false;
     let mut window = false;
@@ -119,6 +150,13 @@ pub(in crate::handler::scripting_support) fn parse_show_hooks(
                 let _ = args.optional();
                 window = true;
             }
+            token if compact_hook_target_flag_prefix(token, false).is_some() => {
+                let token = args.optional().expect("peeked token exists");
+                let prefix = compact_hook_target_flag_prefix(&token, false)
+                    .expect("validated compact show-hooks target flag");
+                apply_show_hooks_flag_cluster(&prefix, &mut global, &mut window, &mut pane);
+                target = Some(parse_target_arg("show-hooks", args.required("-t target")?)?);
+            }
             token if is_compact_hook_flag_cluster(token, false) => {
                 let token = args.optional().expect("peeked token exists");
                 apply_show_hooks_flag_cluster(&token, &mut global, &mut window, &mut pane);
@@ -127,11 +165,12 @@ pub(in crate::handler::scripting_support) fn parse_show_hooks(
         }
     }
 
-    let scope = resolve_show_hooks_scope(global, window, pane, target)?;
     let hook = args
         .optional()
         .map(|value| parse_hook_name(&value))
         .transpose()?;
+    let scope =
+        resolve_show_hooks_scope(global, window, pane, target, hook, sessions, find_context)?;
     args.no_extra("show-hooks")?;
 
     Ok(Request::ShowHooks(ShowHooksRequest {
@@ -152,6 +191,22 @@ fn is_compact_hook_flag_cluster(token: &str, set_hook: bool) -> bool {
     flags
         .chars()
         .all(|flag| matches!(flag, 'g' | 'p' | 'w') || set_hook && matches!(flag, 'a' | 'R' | 'u'))
+}
+
+fn compact_hook_target_flag_prefix(token: &str, set_hook: bool) -> Option<String> {
+    let flags = token.strip_prefix('-')?;
+    if flags.len() <= 1 || flags.starts_with('-') || !flags.ends_with('t') {
+        return None;
+    }
+    let prefix = &flags[..flags.len() - 1];
+    if prefix.is_empty()
+        || !prefix.chars().all(|flag| {
+            matches!(flag, 'g' | 'p' | 'w') || set_hook && matches!(flag, 'a' | 'R' | 'u')
+        })
+    {
+        return None;
+    }
+    Some(format!("-{prefix}"))
 }
 
 fn apply_set_hook_flag_cluster(
@@ -206,14 +261,40 @@ struct ParsedHookSpec {
     index: Option<u32>,
 }
 
-fn resolve_hook_scope(
-    command: &str,
+struct HookScopeRequest<'a> {
+    command: &'a str,
     hook: HookName,
     global: bool,
     window: bool,
     pane: bool,
     target: Option<Target>,
-) -> Result<ScopeSelector, RmuxError> {
+    run_immediately: bool,
+    sessions: &'a SessionStore,
+    find_context: &'a TargetFindContext,
+}
+
+fn resolve_hook_scope(request: HookScopeRequest<'_>) -> Result<ScopeSelector, RmuxError> {
+    let HookScopeRequest {
+        command,
+        hook,
+        global,
+        window,
+        pane,
+        target,
+        run_immediately,
+        sessions,
+        find_context,
+    } = request;
+    if run_immediately {
+        let scope = match target {
+            Some(Target::Pane(target)) => ScopeSelector::Pane(target),
+            Some(target) => return Err(RmuxError::Server(format!("can't find pane: {target}"))),
+            None if sessions.is_empty() => ScopeSelector::Global,
+            None => ScopeSelector::Pane(implicit_pane_target(sessions, find_context, command)?),
+        };
+        rmux_core::validate_hook_registration(hook, &scope)?;
+        return Ok(scope);
+    }
     if window && pane {
         return Err(RmuxError::Server(format!(
             "{command} does not support combining -w and -p"
@@ -221,11 +302,6 @@ fn resolve_hook_scope(
     }
 
     if global {
-        if target.is_some() {
-            return Err(RmuxError::Server(format!(
-                "{command} -g does not accept a target"
-            )));
-        }
         return Ok(ScopeSelector::Global);
     }
 
@@ -237,51 +313,62 @@ fn resolve_hook_scope(
         (true, false, Some(Target::Pane(target))) => Ok(ScopeSelector::Window(
             WindowTarget::with_window(target.session_name().clone(), target.window_index()),
         )),
-        (true, false, None) => Err(RmuxError::Server(format!("{command} -w requires a target"))),
+        (true, false, None) => Ok(ScopeSelector::Window(implicit_window_target(
+            sessions,
+            find_context,
+            command,
+        )?)),
         (false, true, Some(Target::Pane(target))) => Ok(ScopeSelector::Pane(target)),
         (false, true, Some(_)) => Err(RmuxError::Server(format!(
             "{command} -p requires a pane target"
         ))),
-        (false, true, None) => Err(RmuxError::Server(format!("{command} -p requires a target"))),
-        (false, false, Some(target)) => resolve_implicit_hook_target_scope(hook, target),
-        (false, false, None) => Err(RmuxError::Server(format!(
-            "{command} requires -g or a target"
-        ))),
+        (false, true, None) => Ok(ScopeSelector::Pane(implicit_pane_target(
+            sessions,
+            find_context,
+            command,
+        )?)),
+        (false, false, Some(target)) => resolve_natural_hook_scope(command, hook, target, sessions),
+        (false, false, None) if sessions.is_empty() => Ok(ScopeSelector::Global),
+        (false, false, None) => resolve_natural_hook_scope(
+            command,
+            hook,
+            Target::Session(implicit_session_name(sessions, find_context, command)?),
+            sessions,
+        ),
         (true, true, _) => unreachable!("validated conflicting hook scope flags"),
     }?;
     rmux_core::validate_hook_registration(hook, &scope)?;
     Ok(scope)
 }
 
-fn resolve_implicit_hook_target_scope(
+fn resolve_natural_hook_scope(
+    command: &str,
     hook: HookName,
     target: Target,
+    sessions: &SessionStore,
 ) -> Result<ScopeSelector, RmuxError> {
-    let candidates = match target {
-        Target::Session(session_name) => vec![ScopeSelector::Session(session_name)],
-        Target::Window(target) => vec![
-            ScopeSelector::Window(target.clone()),
-            ScopeSelector::Session(target.session_name().clone()),
-        ],
-        Target::Pane(target) => vec![
-            ScopeSelector::Pane(target.clone()),
-            ScopeSelector::Window(WindowTarget::with_window(
-                target.session_name().clone(),
-                target.window_index(),
-            )),
-            ScopeSelector::Session(target.session_name().clone()),
-        ],
+    let Target::Session(session_name) = target else {
+        return Ok(rmux_core::hook_natural_scope_for_target(hook, target));
     };
 
-    let mut first_error = None;
-    for scope in candidates {
-        match rmux_core::validate_hook_registration(hook, &scope) {
-            Ok(()) => return Ok(scope),
-            Err(error) if first_error.is_none() => first_error = Some(error),
-            Err(_) => {}
-        }
-    }
-    Err(first_error.unwrap_or_else(|| RmuxError::Server("invalid hook target".to_owned())))
+    let session = sessions
+        .session(&session_name)
+        .ok_or_else(|| RmuxError::SessionNotFound(session_name.to_string()))?;
+    let window_index = session.active_window_index();
+    let pane_index = session.active_pane_index();
+    let target = rmux_core::hook_natural_scope_for_session_target(
+        hook,
+        session_name,
+        window_index,
+        pane_index,
+    );
+    rmux_core::validate_hook_registration(hook, &target).map_err(|error| {
+        RmuxError::Server(format!(
+            "{command} cannot register {}: {error}",
+            hook.as_str()
+        ))
+    })?;
+    Ok(target)
 }
 
 fn resolve_show_hooks_scope(
@@ -289,6 +376,9 @@ fn resolve_show_hooks_scope(
     window: bool,
     pane: bool,
     target: Option<Target>,
+    hook: Option<HookName>,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
 ) -> Result<ScopeSelector, RmuxError> {
     if global {
         if target.is_some() {
@@ -313,24 +403,41 @@ fn resolve_show_hooks_scope(
         (true, false, Some(Target::Pane(target))) => Ok(ScopeSelector::Window(
             WindowTarget::with_window(target.session_name().clone(), target.window_index()),
         )),
-        (true, false, None) => Err(RmuxError::Server(
-            "show-hooks -w requires a target".to_owned(),
-        )),
+        (true, false, None) => Ok(ScopeSelector::Window(implicit_window_target(
+            sessions,
+            find_context,
+            "show-hooks",
+        )?)),
         (false, true, Some(Target::Pane(target))) => Ok(ScopeSelector::Pane(target)),
         (false, true, Some(_)) => Err(RmuxError::Server(
             "show-hooks -p requires a pane target".to_owned(),
         )),
-        (false, true, None) => Err(RmuxError::Server(
-            "show-hooks -p requires a target".to_owned(),
-        )),
-        (false, false, Some(Target::Session(session_name))) => {
-            Ok(ScopeSelector::Session(session_name))
-        }
-        (false, false, Some(Target::Window(target))) => Ok(ScopeSelector::Window(target)),
-        (false, false, Some(Target::Pane(target))) => Ok(ScopeSelector::Pane(target)),
-        (false, false, None) => Err(RmuxError::Server(
-            "show-hooks requires -g or a target".to_owned(),
-        )),
+        (false, true, None) => Ok(ScopeSelector::Pane(implicit_pane_target(
+            sessions,
+            find_context,
+            "show-hooks",
+        )?)),
+        (false, false, Some(target)) => match hook {
+            Some(hook) => resolve_natural_hook_scope("show-hooks", hook, target, sessions),
+            None => Ok(match target {
+                Target::Session(session_name) => ScopeSelector::Session(session_name),
+                Target::Window(target) => ScopeSelector::Session(target.session_name().clone()),
+                Target::Pane(target) => ScopeSelector::Session(target.session_name().clone()),
+            }),
+        },
+        (false, false, None) => match hook {
+            Some(hook) => resolve_natural_hook_scope(
+                "show-hooks",
+                hook,
+                Target::Session(implicit_session_name(sessions, find_context, "show-hooks")?),
+                sessions,
+            ),
+            None => Ok(ScopeSelector::Session(implicit_session_name(
+                sessions,
+                find_context,
+                "show-hooks",
+            )?)),
+        },
         (true, true, _) => unreachable!("validated conflicting show-hooks scope flags"),
     }
 }

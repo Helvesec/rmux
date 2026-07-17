@@ -256,22 +256,25 @@ pub struct RefreshClientRequest {
     /// The optional target-client identifier or `=`.
     #[serde(default)]
     pub target_client: Option<String>,
-    /// Optional pan adjustment used with `-L`, `-R`, `-U`, or `-D`.
+    /// Reserved wire-v5 field for a client-pan adjustment.
+    ///
+    /// RMUX 0.9 does not expose client panning and rejects a populated value
+    /// fail-closed when received from an older client.
     #[serde(default)]
     pub adjustment: Option<u32>,
-    /// Whether client panning should be cleared.
+    /// Reserved wire-v5 field for clearing client panning.
     #[serde(default)]
     pub clear_pan: bool,
-    /// Whether the client view should pan left.
+    /// Reserved wire-v5 field for panning the client view left.
     #[serde(default)]
     pub pan_left: bool,
-    /// Whether the client view should pan right.
+    /// Reserved wire-v5 field for panning the client view right.
     #[serde(default)]
     pub pan_right: bool,
-    /// Whether the client view should pan up.
+    /// Reserved wire-v5 field for panning the client view up.
     #[serde(default)]
     pub pan_up: bool,
-    /// Whether the client view should pan down.
+    /// Reserved wire-v5 field for panning the client view down.
     #[serde(default)]
     pub pan_down: bool,
     /// Whether only the status line should be redrawn.
@@ -286,16 +289,25 @@ pub struct RefreshClientRequest {
     /// Optional client-flag string from `-F`, which tmux treats as an alias for `-f`.
     #[serde(default)]
     pub flags_alias: Option<String>,
-    /// Optional control-mode subscription updates from `-A`.
+    /// Reserved wire-v5 field for control-mode subscription updates.
+    ///
+    /// RMUX 0.9 does not expose `refresh-client -A` and rejects non-empty
+    /// values fail-closed when received from an older client.
     #[serde(default)]
     pub subscriptions: Vec<String>,
-    /// Optional control-mode subscription definitions from `-B`.
+    /// Reserved wire-v5 field for control-mode subscription definitions.
+    ///
+    /// RMUX 0.9 does not expose `refresh-client -B` and rejects non-empty
+    /// values fail-closed when received from an older client.
     #[serde(default)]
     pub subscriptions_format: Vec<String>,
     /// Optional control-mode size string from `-C`.
     #[serde(default)]
     pub control_size: Option<String>,
-    /// Optional control-mode colour report request from `-r`.
+    /// Reserved wire-v5 field for control-mode colour reports.
+    ///
+    /// RMUX 0.9 does not expose `refresh-client -r` and rejects a populated
+    /// value fail-closed when received from an older client.
     #[serde(default)]
     pub colour_report: Option<String>,
 }

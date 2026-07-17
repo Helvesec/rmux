@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
@@ -42,18 +42,34 @@ pub struct ProcessJob {
 impl ProcessJob {
     /// Creates a kill-on-close job object and assigns `child` to it.
     pub fn for_child(child: &impl AsRawHandle) -> io::Result<Self> {
-        Self::for_raw_handle(child.as_raw_handle())
+        Self::for_raw_handle_with_breakaway(child.as_raw_handle(), false)
+    }
+
+    /// Creates a kill-on-close job that permits explicitly detached children.
+    ///
+    /// Ordinary descendants stay in the job. A child escapes only when it is
+    /// itself created with `CREATE_BREAKAWAY_FROM_JOB`, which is required by
+    /// RMUX's independent daemon bootstrap on Windows.
+    pub fn for_child_allowing_breakaway(child: &impl AsRawHandle) -> io::Result<Self> {
+        Self::for_raw_handle_with_breakaway(child.as_raw_handle(), true)
     }
 
     /// Creates a kill-on-close job object and assigns a live process handle to it.
     pub fn for_raw_handle(process_handle: RawHandle) -> io::Result<Self> {
+        Self::for_raw_handle_with_breakaway(process_handle, false)
+    }
+
+    fn for_raw_handle_with_breakaway(
+        process_handle: RawHandle,
+        allow_breakaway: bool,
+    ) -> io::Result<Self> {
         if process_handle.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "process handle is null",
             ));
         }
-        let handle = create_job_object()?;
+        let handle = create_job_object(allow_breakaway)?;
         // SAFETY: Both handles are live for the duration of the call. The API
         // associates the process with the job without taking ownership.
         let ok = unsafe {
@@ -75,9 +91,18 @@ impl ProcessJob {
         }
         Ok(())
     }
+
+    /// Clears the kill-on-close policy while keeping the process assigned to
+    /// the job until this handle is dropped.
+    ///
+    /// This is used after a foreground child exits normally so descendants it
+    /// intentionally left in the background retain standard shell semantics.
+    pub fn disarm_kill_on_close(&self) -> io::Result<()> {
+        set_job_limit_flags(&self.handle, 0)
+    }
 }
 
-fn create_job_object() -> io::Result<OwnedHandle> {
+fn create_job_object(allow_breakaway: bool) -> io::Result<OwnedHandle> {
     // SAFETY: Null security attributes and name request the default unnamed
     // job object. The returned handle is checked before ownership transfer.
     let handle = unsafe { CreateJobObjectW(null(), null()) };
@@ -87,8 +112,21 @@ fn create_job_object() -> io::Result<OwnedHandle> {
     // SAFETY: `CreateJobObjectW` returned a non-null owned handle and this
     // function transfers it exactly once into `OwnedHandle`.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+    set_job_limit_flags(&handle, job_limit_flags(allow_breakaway))?;
+    Ok(handle)
+}
+
+const fn job_limit_flags(allow_breakaway: bool) -> u32 {
+    if allow_breakaway {
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
+    } else {
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    }
+}
+
+fn set_job_limit_flags(handle: &OwnedHandle, flags: u32) -> io::Result<()> {
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    limits.BasicLimitInformation.LimitFlags = flags;
     // SAFETY: `handle` is a live job handle, `limits` points to an initialized
     // structure of the declared size, and the API borrows it only for the call.
     let ok = unsafe {
@@ -102,7 +140,7 @@ fn create_job_object() -> io::Result<OwnedHandle> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(handle)
+    Ok(())
 }
 
 pub(super) fn current_path(pid: u32) -> io::Result<Option<String>> {
@@ -138,6 +176,10 @@ pub(super) fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
 }
 
 pub(super) fn command_name(pid: u32) -> io::Result<Option<String>> {
+    Ok(executable_path(pid)?.and_then(|path| super::executable_name(&path)))
+}
+
+pub(super) fn executable_path(pid: u32) -> io::Result<Option<String>> {
     let handle = unsafe {
         // SAFETY: OpenProcess validates the pid and returns either a handle or null.
         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
@@ -157,8 +199,7 @@ pub(super) fn command_name(pid: u32) -> io::Result<Option<String>> {
         return Err(io::Error::last_os_error());
     }
     buffer.truncate(usize::try_from(len).map_err(|_| io::ErrorKind::InvalidData)?);
-    let path = wide_to_string_lossy(&buffer);
-    Ok(super::executable_name(&path))
+    Ok(Some(wide_to_string_lossy(&buffer)))
 }
 
 pub(super) fn descendant_command_names(pid: u32) -> io::Result<Vec<String>> {
@@ -620,6 +661,15 @@ mod tests {
     };
     #[cfg(windows)]
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+    #[test]
+    fn process_job_breakaway_is_explicit_and_preserves_kill_on_close() {
+        assert_eq!(job_limit_flags(false), JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+        assert_eq!(
+            job_limit_flags(true),
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        );
+    }
 
     #[test]
     fn parses_windows_wide_environment_and_skips_drive_pseudo_vars() {

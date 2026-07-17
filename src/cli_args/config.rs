@@ -51,37 +51,61 @@ pub(crate) struct SetOptionArgs {
 
 impl SetOptionArgs {
     pub(crate) fn validate(self, kind: SetOptionCommandKind) -> Result<Self, clap::Error> {
-        match kind {
-            SetOptionCommandKind::SetOption => {
-                if [self.server, self.window, self.pane]
-                    .into_iter()
-                    .filter(|flag| *flag)
-                    .count()
-                    > 1
-                {
-                    return Err(clap::Error::raw(
-                        clap::error::ErrorKind::ArgumentConflict,
-                        "set-option accepts at most one of -s, -w, or -p",
-                    ));
-                }
-            }
-            SetOptionCommandKind::SetWindowOption => {
-                if self.server {
-                    return Err(unknown_flag_error(kind.command_name(), "-s"));
-                }
-                if self.window {
-                    return Err(unknown_flag_error(kind.command_name(), "-w"));
-                }
-                if self.pane {
-                    return Err(unknown_flag_error(kind.command_name(), "-p"));
-                }
-                if self.unset_pane_overrides {
-                    return Err(unknown_flag_error(kind.command_name(), "-U"));
-                }
-            }
+        if matches!(kind, SetOptionCommandKind::SetOption)
+            && [self.server, self.window, self.pane]
+                .into_iter()
+                .filter(|flag| *flag)
+                .count()
+                > 1
+        {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "set-option accepts at most one of -s, -w, or -p",
+            ));
         }
 
         Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct SetWindowOptionArgs {
+    #[arg(short = 'g', action = ArgAction::SetTrue)]
+    global: bool,
+    #[arg(short = 'a', action = ArgAction::SetTrue)]
+    append: bool,
+    #[arg(short = 'F', action = ArgAction::SetTrue)]
+    format: bool,
+    #[arg(short = 'o', action = ArgAction::SetTrue)]
+    only_if_unset: bool,
+    #[arg(short = 'q', action = ArgAction::SetTrue)]
+    quiet: bool,
+    #[arg(short = 'u', action = ArgAction::SetTrue)]
+    unset: bool,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    target: Option<TargetSpec>,
+    option: String,
+    #[arg(allow_hyphen_values = true)]
+    value: Option<String>,
+}
+
+impl From<SetWindowOptionArgs> for SetOptionArgs {
+    fn from(args: SetWindowOptionArgs) -> Self {
+        Self {
+            global: args.global,
+            server: false,
+            window: false,
+            pane: false,
+            append: args.append,
+            format: args.format,
+            only_if_unset: args.only_if_unset,
+            quiet: args.quiet,
+            unset: args.unset,
+            unset_pane_overrides: false,
+            target: args.target,
+            option: args.option,
+            value: args.value,
+        }
     }
 }
 
@@ -119,9 +143,9 @@ pub(crate) struct SetEnvironmentArgs {
     pub(crate) format: bool,
     #[arg(short = 'h', action = ArgAction::SetTrue)]
     pub(crate) hidden: bool,
-    #[arg(short = 'r', action = ArgAction::SetTrue, conflicts_with = "unset")]
+    #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) clear: bool,
-    #[arg(short = 'u', action = ArgAction::SetTrue, conflicts_with = "clear")]
+    #[arg(short = 'u', action = ArgAction::SetTrue)]
     pub(crate) unset: bool,
     pub(crate) name: String,
     #[arg(allow_hyphen_values = true)]
@@ -138,6 +162,8 @@ pub(crate) struct SetEnvironmentArgs {
 pub(crate) struct ShowOptionsArgs {
     #[arg(short = 'A', action = ArgAction::SetTrue)]
     pub(crate) include_inherited: bool,
+    #[arg(short = 'H', action = ArgAction::SetTrue)]
+    pub(crate) include_hooks: bool,
     #[arg(short = 'g', action = ArgAction::SetTrue)]
     pub(crate) global: bool,
     #[arg(short = 's', action = ArgAction::SetTrue, group = "scope")]
@@ -156,33 +182,32 @@ pub(crate) struct ShowOptionsArgs {
     pub(crate) name: Option<String>,
 }
 
-impl ShowOptionsArgs {
-    pub(crate) fn validate(self, kind: ShowOptionsCommandKind) -> Result<Self, clap::Error> {
-        if self.global && self.pane {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ArgumentConflict,
-                "show-options does not support combining -g and -p",
-            ));
-        }
-        if matches!(kind, ShowOptionsCommandKind::ShowWindowOptions) {
-            if self.quiet {
-                return Err(unknown_flag_error(kind.command_name(), "-q"));
-            }
-            if self.include_inherited {
-                return Err(unknown_flag_error(kind.command_name(), "-A"));
-            }
-            if self.server {
-                return Err(unknown_flag_error(kind.command_name(), "-s"));
-            }
-            if self.window {
-                return Err(unknown_flag_error(kind.command_name(), "-w"));
-            }
-            if self.pane {
-                return Err(unknown_flag_error(kind.command_name(), "-p"));
-            }
-        }
+#[derive(Debug, Clone, Args)]
+pub(crate) struct ShowWindowOptionsArgs {
+    #[arg(short = 'g', action = ArgAction::SetTrue)]
+    global: bool,
+    #[arg(short = 'v', action = ArgAction::SetTrue)]
+    value_only: bool,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    target: Option<TargetSpec>,
+    #[arg(allow_hyphen_values = true)]
+    name: Option<String>,
+}
 
-        Ok(self)
+impl From<ShowWindowOptionsArgs> for ShowOptionsArgs {
+    fn from(args: ShowWindowOptionsArgs) -> Self {
+        Self {
+            include_inherited: false,
+            include_hooks: false,
+            global: args.global,
+            server: false,
+            window: false,
+            pane: false,
+            quiet: false,
+            value_only: args.value_only,
+            target: args.target,
+            name: args.name,
+        }
     }
 }
 
@@ -291,11 +316,4 @@ fn parse_hook_spec(value: &str) -> Result<ParsedHookSpec, String> {
 
 fn parse_hook_name(value: &str) -> Result<HookName, String> {
     HookName::from_str(value).ok_or_else(|| format!("invalid option: {value}"))
-}
-
-fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command {command_name}: unknown flag {flag}"),
-    )
 }

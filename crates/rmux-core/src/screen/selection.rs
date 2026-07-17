@@ -1,5 +1,5 @@
-use crate::grid::GridCellFlags;
-use crate::input::GridAttr;
+use crate::grid::{GridCell, GridCellFlags};
+use crate::input::{GridAttr, COLOUR_DEFAULT, COLOUR_TERMINAL};
 use crate::style::{style_parse, Style, StyleCell};
 
 use super::Screen;
@@ -93,6 +93,9 @@ impl Screen {
             self.clear_selected_cells();
             return;
         }
+        let Some(style) = parse_cell_overlay_style(style_input) else {
+            return;
+        };
 
         let width = self.grid.sx();
         for row in 0..self.grid.sy() {
@@ -107,27 +110,7 @@ impl Screen {
                 if !cell.flags().contains(GridCellFlags::SELECTED) || cell.is_padding() {
                     continue;
                 }
-
-                let base = StyleCell {
-                    fg: cell.fg(),
-                    bg: cell.bg(),
-                    us: cell.us(),
-                    attr: cell.attr(),
-                };
-                let mut style = Style::with_cell(base);
-                if style_parse(&mut style, &base, style_input).is_err() {
-                    return;
-                }
-
-                let attr = if style.cell.attr & GridAttr::NOATTR != 0 {
-                    style.cell.attr & !GridAttr::NOATTR
-                } else {
-                    style.cell.attr
-                };
-                cell.set_attr(attr);
-                cell.set_fg(style.cell.fg);
-                cell.set_bg(style.cell.bg);
-                cell.set_us(style.cell.us);
+                apply_cell_overlay_style(cell, &style);
                 touched = true;
             }
             if touched {
@@ -136,4 +119,83 @@ impl Screen {
         }
         self.clear_selected_cells();
     }
+
+    /// Overlays `style` onto one inclusive visible row range.
+    pub fn overlay_style_on_row_range(
+        &mut self,
+        row: u32,
+        start_x: u32,
+        end_x: u32,
+        style: &Style,
+    ) {
+        if row >= self.grid.sy() || self.grid.sx() == 0 {
+            return;
+        }
+        let line_width = self.grid.sx();
+        let Some(line) = self.grid.visible_line_mut(row) else {
+            return;
+        };
+        let start_x = start_x.min(line_width.saturating_sub(1));
+        let end_x = end_x.min(line_width.saturating_sub(1));
+        if start_x > end_x {
+            return;
+        }
+
+        let start_x = line.owning_cell_x(start_x).unwrap_or(start_x);
+        let end_x = line.owning_cell_x(end_x).unwrap_or(end_x);
+        let mut touched = false;
+        let mut x = start_x;
+        while x <= end_x {
+            let owner_x = line.owning_cell_x(x).unwrap_or(x);
+            let width = line
+                .cell(owner_x)
+                .map(|cell| u32::from(cell.width().max(1)))
+                .unwrap_or(1);
+            if let Some(cell) = line.cell_mut(owner_x) {
+                if !cell.is_padding() {
+                    apply_cell_overlay_style(cell, style);
+                    touched = true;
+                }
+            }
+            let next = owner_x.saturating_add(width.max(1));
+            if next <= x {
+                break;
+            }
+            x = next;
+        }
+        if touched {
+            line.touch();
+        }
+    }
+}
+
+fn parse_cell_overlay_style(style_input: &str) -> Option<Style> {
+    let base = StyleCell::default();
+    let mut style = Style::with_cell(base);
+    style_parse(&mut style, &base, style_input).ok()?;
+    Some(style)
+}
+
+fn apply_cell_overlay_style(cell: &mut GridCell, style: &Style) {
+    // Cell overlay composition, probed against the pinned tmux 3.7b oracle
+    // (2026-07-11): explicit fg/bg replace the cell's colours. A complete
+    // style drops the cell's attributes, while a partial style preserves
+    // them and unions attributes supplied by the overlay. `noattr` always
+    // drops inherited attributes.
+    let fg_set = !matches!(style.cell.fg, COLOUR_DEFAULT | COLOUR_TERMINAL);
+    let bg_set = !matches!(style.cell.bg, COLOUR_DEFAULT | COLOUR_TERMINAL);
+    let style_attr = style.cell.attr & !GridAttr::NOATTR;
+    let attr = if style.cell.attr & GridAttr::NOATTR != 0 || (fg_set && bg_set) {
+        style_attr | (cell.attr() & GridAttr::CHARSET)
+    } else {
+        style_attr | cell.attr()
+    };
+    cell.set_attr(attr);
+    if fg_set {
+        cell.set_fg(style.cell.fg);
+    }
+    if bg_set {
+        cell.set_bg(style.cell.bg);
+    }
+    cell.set_us(style.cell.us);
 }

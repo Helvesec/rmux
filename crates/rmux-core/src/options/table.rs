@@ -13,6 +13,8 @@ use super::{
 const ALLOW_PASSTHROUGH_CHOICES: &[&str] = &["off", "on", "all"];
 const BELL_ACTION_CHOICES: &[&str] = &["none", "any", "current", "other"];
 const CLOCK_MODE_STYLE_CHOICES: &[&str] = &["12", "24", "12-with-seconds", "24-with-seconds"];
+const COPY_MODE_LINE_NUMBERS_CHOICES: &[&str] =
+    &["off", "default", "absolute", "relative", "hybrid"];
 const CURSOR_STYLE_CHOICES: &[&str] = &[
     "default",
     "blinking-block",
@@ -46,10 +48,10 @@ const STATUS_KEYS_CHOICES: &[&str] = &["emacs", "vi"];
 const STATUS_POSITION_CHOICES: &[&str] = &["top", "bottom"];
 const VISUAL_BELL_CHOICES: &[&str] = &["off", "on", "both"];
 const WINDOW_SIZE_CHOICES: &[&str] = &["largest", "smallest", "manual", "latest"];
-const STATUS_FORMAT1: &str = "#[align=left range=left #{E:status-left-style}]#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]#[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{W:#[range=window|#{window_index} #{E:window-status-style}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-format}#[pop-default]#[norange default]#{?window_end_flag,,#{window-status-separator}},#[range=window|#{window_index} list=focus #{?#{!=:#{E:window-status-current-style},default},#{E:window-status-current-style},#{E:window-status-style}}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-current-format}#[pop-default]#[norange list=on default]#{?window_end_flag,,#{window-status-separator}}}#[nolist align=right range=right #{E:status-right-style}]#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]#[norange default]";
-const STATUS_FORMAT2: &str =
-    "#[align=centre]#{P:#{?pane_active,#[reverse],}#{pane_index}[#{pane_width}x#{pane_height}]#[default] }";
-const STATUS_FORMAT_DEFAULT: &[&str] = &[STATUS_FORMAT1, STATUS_FORMAT2];
+const STATUS_FORMAT0: &str = "#[align=left range=left #{E:status-left-style}]#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]#[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{W:#[range=window|#{window_index} #{E:window-status-style}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-format}#[pop-default]#[norange default]#{?loop_last_flag,,#{E:window-status-separator}},#[range=window|#{window_index} list=focus #{?#{!=:#{E:window-status-current-style},default},#{E:window-status-current-style},#{E:window-status-style}}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-current-format}#[pop-default]#[norange list=on default]#{?loop_last_flag,,#{E:window-status-separator}}}#[nolist align=right range=right #{E:status-right-style}]#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]#[norange default]";
+const STATUS_FORMAT1: &str = "#[align=left]#{R: ,#{n:#{session_name}}}P: #[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{P:#[range=pane|#{pane_id} #{E:pane-status-style}]#[push-default]#{T:window-pane-status-format}#[pop-default]#[norange list=on default]  ,#[range=pane|#{pane_id} list=focus #{?#{!=:#{E:pane-status-current-style},default},#{E:pane-status-current-style},#{E:pane-status-style}}]#[push-default]#{T:window-pane-current-status-format}#[pop-default]#[norange list=on default] }";
+const STATUS_FORMAT2: &str = "#[align=left]#{R: ,#{n:#{session_name}}}S: #[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{S:#[range=session|#{session_id} #{E:session-status-style}]#[push-default]#S#{session_alert}#[pop-default]#[norange list=on default]  ,#[range=session|#{session_id} list=focus #{?#{!=:#{E:session-status-current-style},default},#{E:session-status-current-style},#{E:session-status-style}}]#[push-default]#S*#{session_alert}#[pop-default]#[norange list=on default] }";
+const STATUS_FORMAT_DEFAULT: &[&str] = &[STATUS_FORMAT0, STATUS_FORMAT1, STATUS_FORMAT2];
 #[cfg(windows)]
 const STATUS_RIGHT_DEFAULT: &str =
     "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:host_short}\" %H:%M %d-%b-%y";
@@ -200,7 +202,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         SCOPE_SERVER,
         GlobalRoot::Server,
         OptionValueType::Number { minimum: 0 },
-        DefaultValue::Scalar("500"),
+        DefaultValue::Scalar("10"),
         "",
         false,
         EFFECT_NONE,
@@ -303,7 +305,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         0,
         SCOPE_SERVER,
         GlobalRoot::Server,
-        OptionValueType::Number { minimum: 0 },
+        OptionValueType::Number { minimum: 1048576 },
         DefaultValue::Scalar("1048576"),
         "",
         false,
@@ -421,7 +423,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         SCOPE_SERVER,
         GlobalRoot::Server,
         OptionValueType::String,
-        DefaultValue::Scalar(""),
+        DefaultValue::Scalar("linux*:AX@"),
         ",",
         true,
         EFFECT_NONE,
@@ -720,7 +722,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         SCOPE_SESSION,
         GlobalRoot::Session,
         OptionValueType::String,
-        DefaultValue::Scalar("bg=black,fg=yellow"),
+        DefaultValue::Scalar("bg=black,fg=yellow,fill=black"),
         ",",
         false,
         EFFECT_RENDER.union(EFFECT_STYLE_PARSE),
@@ -759,7 +761,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         SCOPE_SESSION,
         GlobalRoot::Session,
         OptionValueType::String,
-        DefaultValue::Scalar("bg=yellow,fg=black"),
+        DefaultValue::Scalar("bg=yellow,fg=black,fill=yellow"),
         ",",
         false,
         EFFECT_RENDER.union(EFFECT_STYLE_PARSE),
@@ -1163,9 +1165,9 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         GlobalRoot::Session,
         OptionValueType::String,
         DefaultValue::Scalar(concat!(
-            "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AUTH_SOCK SSH_",
-            "AG",
-            "ENT_PID SSH_CONNECTION WINDOWID XAUTHORITY"
+            "DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK SSH_",
+            "AGENT_PID SSH_CONNECTION WAYLAND_DISPLAY WINDOWID XAUTHORITY ",
+            "XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE"
         )),
         " ",
         true,
@@ -1380,6 +1382,45 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         EFFECT_RENDER.union(EFFECT_STYLE_PARSE),
     ),
     option(
+        OptionName::CopyModeLineNumbers,
+        "copy-mode-line-numbers",
+        &[],
+        SHOW_WINDOW,
+        SCOPE_WINDOW,
+        GlobalRoot::Window,
+        OptionValueType::Choice(COPY_MODE_LINE_NUMBERS_CHOICES),
+        DefaultValue::Scalar("off"),
+        "",
+        false,
+        EFFECT_RENDER,
+    ),
+    option(
+        OptionName::CopyModeLineNumberStyle,
+        "copy-mode-line-number-style",
+        &[],
+        SHOW_WINDOW,
+        SCOPE_WINDOW,
+        GlobalRoot::Window,
+        OptionValueType::String,
+        DefaultValue::Scalar("fg=white,dim"),
+        ",",
+        false,
+        EFFECT_RENDER.union(EFFECT_STYLE_PARSE),
+    ),
+    option(
+        OptionName::CopyModeCurrentLineNumberStyle,
+        "copy-mode-current-line-number-style",
+        &[],
+        SHOW_WINDOW,
+        SCOPE_WINDOW,
+        GlobalRoot::Window,
+        OptionValueType::String,
+        DefaultValue::Scalar("fg=yellow"),
+        ",",
+        false,
+        EFFECT_RENDER.union(EFFECT_STYLE_PARSE),
+    ),
+    option(
         OptionName::CopyModePositionFormat,
         "copy-mode-position-format",
         &[],
@@ -1478,7 +1519,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::String,
-        DefaultValue::Scalar("bg=yellow,fg=black"),
+        DefaultValue::Scalar("noattr,bg=yellow,fg=black"),
         ",",
         false,
         EFFECT_RENDER.union(EFFECT_STYLE_PARSE),

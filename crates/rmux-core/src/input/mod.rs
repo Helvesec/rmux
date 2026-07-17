@@ -63,6 +63,35 @@ pub enum InputEndType {
     Bel,
 }
 
+/// Colour slots reported to OSC 10/11/12 queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscColourSlot {
+    /// OSC 10 — default foreground.
+    Foreground,
+    /// OSC 11 — default background.
+    Background,
+    /// OSC 12 — cursor colour.
+    Cursor,
+}
+
+impl OscColourSlot {
+    pub(crate) const fn osc_number(self) -> u32 {
+        match self {
+            Self::Foreground => 10,
+            Self::Background => 11,
+            Self::Cursor => 12,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Foreground => 0,
+            Self::Background => 1,
+            Self::Cursor => 2,
+        }
+    }
+}
+
 /// Per-pane VT input parser, matching tmux `input_ctx`.
 pub struct InputParser {
     /// Current parser state.
@@ -115,6 +144,10 @@ pub struct InputParser {
     reply_buf: Vec<u8>,
     /// Dropped terminal passthrough events caused by parser string limits.
     terminal_passthrough_dropped_count: u64,
+
+    /// Application-set OSC 10/11/12 colours (fg, bg, cursor). The daemon does
+    /// not invent colours for an unknown attached terminal palette.
+    osc_colours: [Option<String>; 3],
 }
 
 impl InputParser {
@@ -144,7 +177,36 @@ impl InputParser {
             ground_timer_active: false,
             reply_buf: Vec::new(),
             terminal_passthrough_dropped_count: 0,
+            osc_colours: [None, None, None],
         }
+    }
+
+    /// Returns an application-defined colour for an OSC 10/11/12 query.
+    pub(crate) fn osc_colour(&self, slot: OscColourSlot) -> Option<&str> {
+        self.osc_colours[slot.index()].as_deref()
+    }
+
+    /// Records an application-set OSC 10/11/12 colour so later queries
+    /// round-trip the value.
+    pub(crate) fn set_osc_colour(&mut self, slot: OscColourSlot, value: &str) {
+        // A stored colour is reflected verbatim to every later query, so bound
+        // it to a sane colour-spec length: otherwise a pane could set a huge
+        // (up to input-buffer-sized) value and then flood queries in one read
+        // batch, amplifying it into unbounded reply memory and OOM-ing the
+        // daemon. A real X11 / `rgb:` / `#rrggbb` spec is far shorter; longer
+        // values are not colours and are left unstored, so queries keep
+        // answering the prior value or remain silent when the palette is
+        // unknown.
+        const OSC_COLOUR_MAX_LEN: usize = 64;
+        if value.len() > OSC_COLOUR_MAX_LEN {
+            return;
+        }
+        self.osc_colours[slot.index()] = Some(value.to_owned());
+    }
+
+    /// Resets an OSC colour back to unknown (OSC 110/111/112).
+    pub(crate) fn reset_osc_colour(&mut self, slot: OscColourSlot) {
+        self.osc_colours[slot.index()] = None;
     }
 
     /// Updates the maximum regular string buffer size used for OSC/DCS input.
@@ -214,6 +276,10 @@ impl InputParser {
     #[must_use]
     pub fn cell_state(&self) -> &CellState {
         &self.cell
+    }
+
+    pub(crate) fn plain_output_forwarding_safe(&self) -> bool {
+        self.state == InputState::Ground && !self.utf8_started && self.cell == CellState::default()
     }
 
     /// Parse a buffer of bytes, dispatching actions to the screen writer.
@@ -314,6 +380,13 @@ impl InputParser {
         };
 
         if skip_state {
+            return;
+        }
+
+        if self.should_recover_tmux_passthrough_osc_bel() {
+            self.input_end = InputEndType::Bel;
+            self.handle_dcs_dispatch(writer);
+            self.set_state(InputState::Ground, writer);
             return;
         }
 
@@ -515,6 +588,18 @@ impl InputParser {
             || (matches!(self.state, InputState::DcsHandler | InputState::DcsEscape)
                 && self.interm_len == 0
                 && (self.input_buf.first() == Some(&b'q') || self.input_buf.starts_with(b"tmux;")))
+    }
+
+    fn should_recover_tmux_passthrough_osc_bel(&self) -> bool {
+        if self.state != InputState::DcsHandler || self.ch != 0x07 || self.interm_len != 0 {
+            return false;
+        }
+
+        let Some(payload) = self.input_buf.strip_prefix(b"tmux;") else {
+            return false;
+        };
+
+        payload.starts_with(b"\x1b]") || payload.first() == Some(&0x9d)
     }
 
     fn handle_end_bel(&mut self) -> bool {

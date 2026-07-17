@@ -10,12 +10,21 @@ pub(crate) struct ExitFailure {
     exit_code: i32,
     message: String,
     use_stderr: bool,
+    message_termination: ExitMessageTermination,
     kind: ExitFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitMessageTermination {
+    Line,
+    Exact,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitFailureKind {
     Generic,
+    AmbiguousTarget,
+    ServerAbsent,
     UnsupportedWireVersion,
 }
 
@@ -32,8 +41,28 @@ impl ExitFailure {
         self.use_stderr
     }
 
+    pub(crate) fn message_termination(&self) -> ExitMessageTermination {
+        self.message_termination
+    }
+
+    pub(super) fn is_ambiguous_target(&self) -> bool {
+        self.kind == ExitFailureKind::AmbiguousTarget
+    }
+
+    pub(super) fn is_server_absent(&self) -> bool {
+        self.kind == ExitFailureKind::ServerAbsent
+    }
+
+    pub(super) fn is_unsupported_wire_version(&self) -> bool {
+        self.kind == ExitFailureKind::UnsupportedWireVersion
+    }
+
     pub(crate) fn new(exit_code: i32, message: impl Into<String>) -> Self {
         Self::new_with_kind(exit_code, message, ExitFailureKind::Generic)
+    }
+
+    pub(super) fn ambiguous_target(message: impl Into<String>) -> Self {
+        Self::new_with_kind(1, message, ExitFailureKind::AmbiguousTarget)
     }
 
     fn new_with_kind(exit_code: i32, message: impl Into<String>, kind: ExitFailureKind) -> Self {
@@ -41,6 +70,7 @@ impl ExitFailure {
             exit_code,
             message: message.into(),
             use_stderr: true,
+            message_termination: ExitMessageTermination::Line,
             kind,
         }
     }
@@ -50,6 +80,17 @@ impl ExitFailure {
             exit_code,
             message: message.into(),
             use_stderr: false,
+            message_termination: ExitMessageTermination::Line,
+            kind: ExitFailureKind::Generic,
+        }
+    }
+
+    pub(super) fn new_stdout_exact(exit_code: i32, message: impl Into<String>) -> Self {
+        Self {
+            exit_code,
+            message: message.into(),
+            use_stderr: false,
+            message_termination: ExitMessageTermination::Exact,
             kind: ExitFailureKind::Generic,
         }
     }
@@ -65,6 +106,7 @@ impl ExitFailure {
             exit_code,
             message,
             use_stderr: error.use_stderr(),
+            message_termination: ExitMessageTermination::Line,
             kind: ExitFailureKind::Generic,
         }
     }
@@ -80,7 +122,7 @@ impl ExitFailure {
 
     pub(super) fn from_client_connect(socket_path: &Path, error: ClientError) -> Self {
         if let Some(message) = tmux_client_connect_error_message(socket_path, &error) {
-            return Self::new(1, message);
+            return Self::new_with_kind(1, message, ExitFailureKind::ServerAbsent);
         }
 
         Self::from_client(error)
@@ -138,6 +180,11 @@ fn shell_quote_path(path: &Path) -> String {
         return text;
     }
 
+    #[cfg(windows)]
+    {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    }
+    #[cfg(not(windows))]
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 

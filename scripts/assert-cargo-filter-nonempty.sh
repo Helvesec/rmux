@@ -42,7 +42,10 @@ shift
 [ "$#" -gt 0 ] || die "cargo arguments are required"
 [ "$1" = "test" ] || die "cargo arguments must start with test"
 
-output="$(cargo "$@" -- --list 2>&1)"
+if ! output="$(cargo "$@" -- --list 2>&1)"; then
+  printf '%s\n' "$output" >&2
+  die "cargo $* -- --list failed"
+fi
 count="$(printf '%s\n' "$output" | awk '/: test$/ { count += 1 } END { print count + 0 }')"
 
 if [ "$count" -lt "$min_tests" ]; then

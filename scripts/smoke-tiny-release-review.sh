@@ -9,7 +9,7 @@ Build or reuse a real release layout and run the tiny CLI release-review smoke:
   - bin/rmux is the tiny public CLI
   - libexec/rmux/rmux is the full helper
   - bin/rmux-daemon is the daemon
-  - tmux is used as the authority for known CLI ambiguity cases when available
+  - tmux 3.7b is used as the authority for known CLI ambiguity cases when available
 
 Options:
   --layout DIR         Reuse an existing package layout.
@@ -22,6 +22,9 @@ Options:
 Set RMUX_REQUIRE_TMUX=1 to fail instead of skipping when tmux is unavailable.
 USAGE
 }
+
+DEFAULT_FROZEN_TMUX_PATH="/opt/rmux/reference/tmux-frozen/e802909de06012a4df6209d55e86487c56223163/tmux"
+FROZEN_TMUX_VERSION="tmux 3.7b"
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -75,6 +78,12 @@ assert_stdout_contains() {
     die "$prefix stdout did not contain: $expected"
 }
 
+assert_stderr_contains() {
+  local prefix="$1" expected="$2"
+  grep -Fq "$expected" "$SMOKE_ROOT/${prefix}.err" ||
+    die "$prefix stderr did not contain: $expected"
+}
+
 assert_stdout_not_empty() {
   local prefix="$1"
   [ -s "$SMOKE_ROOT/${prefix}.out" ] || die "$prefix stdout was empty"
@@ -115,44 +124,72 @@ tmux_available() {
   [ -n "$TMUX_BIN" ] && [ -x "$TMUX_BIN" ]
 }
 
+tmux_required() {
+  case "$(printf '%s' "${RMUX_REQUIRE_TMUX:-0}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_tmux_authority() {
+  if [ -n "$TMUX_BIN" ]; then
+    return
+  fi
+  for candidate in "${RMUX_TMUX_ORACLE:-}" "${RMUX_FROZEN_TMUX:-}" "$DEFAULT_FROZEN_TMUX_PATH"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      TMUX_BIN="$candidate"
+      return
+    fi
+  done
+}
+
+assert_tmux_authority_version() {
+  local version
+  version="$("$TMUX_BIN" -V 2>/dev/null)" ||
+    die "tmux authority '$TMUX_BIN' did not run -V"
+  [ "$version" = "$FROZEN_TMUX_VERSION" ] ||
+    die "tmux authority '$TMUX_BIN' reported '$version', expected '$FROZEN_TMUX_VERSION'"
+}
+
 run_tmux_authority_smoke() {
   if [ "$SKIP_TMUX" -eq 1 ]; then
     log "skipping tmux authority checks (--no-tmux)"
     return
   fi
   if ! tmux_available; then
-    if [ "${RMUX_REQUIRE_TMUX:-0}" = "1" ]; then
-      die "tmux authority checks required but tmux was not found"
+    if tmux_required; then
+      die "tmux 3.7b authority checks required but no pinned oracle was found"
     fi
-    log "skipping tmux authority checks (tmux not found)"
+    log "skipping tmux authority checks (pinned tmux 3.7b oracle not found)"
     return
   fi
+  assert_tmux_authority_version
 
   local sock="$SMOKE_ROOT/tmux.sock"
-  "$TMUX_BIN" -S "$sock" kill-server >/dev/null 2>&1 || true
+  "$TMUX_BIN" -f /dev/null -S "$sock" kill-server >/dev/null 2>&1 || true
   cleanup_tmux() {
-    "$TMUX_BIN" -S "$sock" kill-server >/dev/null 2>&1 || true
+    "$TMUX_BIN" -f /dev/null -S "$sock" kill-server >/dev/null 2>&1 || true
   }
   trap cleanup_tmux RETURN
 
-  "$TMUX_BIN" -S "$sock" new-session -d -s alpha sleep 60
-  "$TMUX_BIN" -S "$sock" split-window -h -v -t alpha:0 sleep 60
-  "$TMUX_BIN" -S "$sock" resize-pane -R -x 80 -t alpha:0.0
-  "$TMUX_BIN" -S "$sock" resize-pane -Z -R -t alpha:0.0
-  "$TMUX_BIN" -S "$sock" resize-pane -R -L -t alpha:0.0
-  "$TMUX_BIN" -S "$sock" new-session -d -s beta -s gamma sleep 1
-  "$TMUX_BIN" -S "$sock" send-keys -t alpha:0.0 -t alpha:0.1 Enter
-  "$TMUX_BIN" -S "$sock" capture-pane -p -S 0 -S 1 >/dev/null
-  [ "$("$TMUX_BIN" -S "$sock" display-message -p -F a -F b)" = "b" ] ||
+  "$TMUX_BIN" -f /dev/null -S "$sock" new-session -d -s alpha sleep 60
+  "$TMUX_BIN" -f /dev/null -S "$sock" split-window -h -v -t alpha:0 sleep 60
+  "$TMUX_BIN" -f /dev/null -S "$sock" resize-pane -R -x 80 -t alpha:0.0
+  "$TMUX_BIN" -f /dev/null -S "$sock" resize-pane -Z -R -t alpha:0.0
+  "$TMUX_BIN" -f /dev/null -S "$sock" resize-pane -R -L -t alpha:0.0
+  "$TMUX_BIN" -f /dev/null -S "$sock" new-session -d -s beta -s gamma sleep 1
+  "$TMUX_BIN" -f /dev/null -S "$sock" send-keys -t alpha:0.0 -t alpha:0.1 Enter
+  "$TMUX_BIN" -f /dev/null -S "$sock" capture-pane -p -S 0 -S 1 >/dev/null
+  [ "$("$TMUX_BIN" -f /dev/null -S "$sock" display-message -p -F a -F b)" = "b" ] ||
     die "tmux duplicate -F authority check did not use last value"
   set +e
-  "$TMUX_BIN" -S "$sock" --version >/dev/null 2>"$SMOKE_ROOT/tmux-version.err"
+  "$TMUX_BIN" -f /dev/null -S "$sock" --version >/dev/null 2>"$SMOKE_ROOT/tmux-version.err"
   local version_status=$?
   set -e
   [ "$version_status" -ne 0 ] || die "tmux accepted --version unexpectedly"
 
   set +e
-  "$TMUX_BIN" -S "$sock" resize-pane -R 5 -t alpha:0.0 >/dev/null 2>"$SMOKE_ROOT/tmux-resize.err"
+  "$TMUX_BIN" -f /dev/null -S "$sock" resize-pane -R 5 -t alpha:0.0 >/dev/null 2>"$SMOKE_ROOT/tmux-resize.err"
   local status=$?
   set -e
   [ "$status" -ne 0 ] || die "tmux accepted resize-pane -R 5 -t target unexpectedly"
@@ -162,6 +199,12 @@ run_tmux_authority_smoke() {
 
 run_rmux_smoke() {
   local sock="tiny-review-$$"
+  local cold_new_sock="tiny-cold-new-$$"
+  local cold_start_sock="tiny-cold-start-$$"
+  local cold_attach_sock="tiny-cold-attach-$$"
+  local empty="tiny-empty-$$"
+  local preexisting_empty="tiny-preexisting-empty-$$"
+  local cold_alias_config="$XDG_CONFIG_HOME/rmux/rmux.conf"
   local real="$SMOKE_ROOT/real.sock"
   local link="$SMOKE_ROOT/link.sock"
   local missing="$SMOKE_ROOT/missing.conf"
@@ -170,14 +213,105 @@ run_rmux_smoke() {
   "$RMUX" -L "$sock" kill-server >/dev/null 2>&1 || true
   "$RMUX" -S "$real" kill-server >/dev/null 2>&1 || true
   cleanup_rmux() {
+    "$RMUX" -L "$sock" set-option -s -u 'command-alias[20]' >/dev/null 2>&1 || true
     "$RMUX" -L "$sock" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$cold_new_sock" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$cold_start_sock" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$cold_attach_sock" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$empty" kill-server >/dev/null 2>&1 || true
+    "$RMUX" -L "$preexisting_empty" kill-server >/dev/null 2>&1 || true
     "$RMUX" -S "$real" kill-server >/dev/null 2>&1 || true
+    rm -f "$cold_alias_config"
   }
   trap cleanup_rmux RETURN
+
+  mkdir -p "$(dirname "$cold_alias_config")"
+  cat >"$cold_alias_config" <<'EOF'
+set-option -s command-alias[30] 'new-session=new-session -d -s tiny-cold-new-aliased'
+set-option -s command-alias[31] 'start-server=new-session -d -s tiny-cold-start-aliased'
+set-option -s command-alias[32] 'attach-session=new-session -d -s tiny-cold-attach-aliased'
+EOF
+
+  run_capture cold_new_alias -L "$cold_new_sock" new-session -d
+  assert_rc cold_new_alias 0
+  assert_trace cold_new_alias "rmux tiny: fallback: runtime command-alias"
+  [ "$("$RMUX" -L "$cold_new_sock" list-sessions -F '#{session_name}')" = \
+    "tiny-cold-new-aliased" ] || die "cold tiny new-session bypassed its config alias"
+
+  run_capture cold_start_alias -L "$cold_start_sock" start-server
+  assert_rc cold_start_alias 0
+  assert_trace cold_start_alias "rmux tiny: fallback: runtime command-alias"
+  [ "$("$RMUX" -L "$cold_start_sock" list-sessions -F '#{session_name}')" = \
+    "tiny-cold-start-aliased" ] || die "cold tiny start-server bypassed its config alias"
+
+  run_capture cold_attach_alias -L "$cold_attach_sock" attach-session
+  assert_rc cold_attach_alias 0
+  assert_trace cold_attach_alias "rmux tiny: fallback: runtime command-alias"
+  [ "$("$RMUX" -L "$cold_attach_sock" list-sessions -F '#{session_name}')" = \
+    "tiny-cold-attach-aliased" ] || die "cold tiny attach-session bypassed its config alias"
+
+  rm -f "$cold_alias_config"
 
   "$RMUX" -L "$sock" new-session -d -s alpha sleep 60 >/dev/null
   "$RMUX" -L "$sock" new-session -d -s prefixdemo sleep 60 >/dev/null
   "$RMUX" -L "$sock" new-session -d -s killtarget sleep 60 >/dev/null
+
+  run_capture attach_missing_non_tty -L "$sock" attach-session -t missing
+  [ "$(cat "$SMOKE_ROOT/attach_missing_non_tty.rc")" != "0" ] ||
+    die "tiny non-terminal attach accepted a missing target"
+  assert_trace attach_missing_non_tty "rmux tiny: direct: attach-session"
+  assert_stderr_contains attach_missing_non_tty "can't find session: missing"
+
+  set +e
+  RMUX_TINY_TRACE=1 perl -e 'alarm 5; exec @ARGV' \
+    "$RMUX" -L "$sock" attach-session -t alpha </dev/null \
+    >"$SMOKE_ROOT/attach_non_tty.out" 2>"$SMOKE_ROOT/attach_non_tty.err"
+  local attach_non_tty_status=$?
+  set -e
+  [ "$attach_non_tty_status" -eq 1 ] ||
+    die "tiny non-terminal attach exited $attach_non_tty_status instead of failing immediately"
+  grep -Fq "rmux tiny: direct: attach-session" "$SMOKE_ROOT/attach_non_tty.err" ||
+    die "non-terminal attach did not stay on the tiny direct path"
+  grep -Fq "open terminal failed: not a terminal" "$SMOKE_ROOT/attach_non_tty.err" ||
+    die "tiny non-terminal attach did not report the terminal preflight error"
+
+  "$RMUX" -L "$sock" set-environment -gu TINY_ALIAS_PERSISTED >/dev/null 2>&1 || true
+  "$RMUX" -L "$sock" set-option -s 'command-alias[20]' \
+    'list-sessions=TINY_ALIAS_PERSISTED=from-tiny display-message -p tiny-alias' >/dev/null
+  run_capture list_sessions_alias -L "$sock" list-sessions
+  assert_rc list_sessions_alias 0
+  assert_trace list_sessions_alias "rmux tiny: fallback: runtime command-alias"
+  assert_stdout_line list_sessions_alias "tiny-alias"
+  [ "$("$RMUX" -L "$sock" show-environment -g TINY_ALIAS_PERSISTED)" = \
+      "TINY_ALIAS_PERSISTED=from-tiny" ] ||
+    die "tiny runtime alias did not persist its parse-time assignment"
+  "$RMUX" -L "$sock" set-environment -gu TINY_ALIAS_PERSISTED >/dev/null
+  "$RMUX" -L "$sock" set-option -s -u 'command-alias[20]' >/dev/null
+
+  "$RMUX" -L "$sock" set-environment -gu TINY_ALIAS_ATOMIC >/dev/null 2>&1 || true
+  "$RMUX" -L "$sock" set-option -s 'command-alias[20]' \
+    'list-sessions=TINY_ALIAS_ATOMIC=mutated kill-server unexpected' >/dev/null
+  run_capture list_sessions_alias_invalid -L "$sock" list-sessions
+  [ "$(cat "$SMOKE_ROOT/list_sessions_alias_invalid.rc")" != "0" ] ||
+    die "invalid tiny runtime alias unexpectedly succeeded"
+  assert_trace list_sessions_alias_invalid \
+    "rmux tiny: fallback: runtime command-alias"
+  if "$RMUX" -L "$sock" show-environment -g TINY_ALIAS_ATOMIC >/dev/null 2>&1; then
+    die "invalid tiny runtime alias applied assignments before validation"
+  fi
+  "$RMUX" -L "$sock" has-session -t alpha >/dev/null ||
+    die "invalid tiny runtime alias stopped the server"
+  "$RMUX" -L "$sock" set-option -s -u 'command-alias[20]' >/dev/null
+
+  "$RMUX" -L "$sock" set-option -s 'command-alias[20]' \
+    'kill-server=display-message -p alias-survives' >/dev/null
+  run_capture kill_server_alias -L "$sock" kill-server
+  assert_rc kill_server_alias 0
+  assert_trace kill_server_alias "rmux tiny: fallback: runtime command-alias"
+  assert_stdout_line kill_server_alias "alias-survives"
+  "$RMUX" -L "$sock" list-sessions >/dev/null ||
+    die "tiny kill-server alias stopped the server"
+  "$RMUX" -L "$sock" set-option -s -u 'command-alias[20]' >/dev/null
 
   run_capture has_session_prefix -L "$sock" has-session -t prefixd
   assert_rc has_session_prefix 0
@@ -192,6 +326,37 @@ run_rmux_smoke() {
   assert_rc list_panes_prefix 0
   assert_trace list_panes_prefix "rmux tiny: direct: list-panes"
   assert_stdout_not_empty list_panes_prefix
+
+  run_capture display_message_prefix -L "$sock" display-message -p -t prefixd '#{session_name}'
+  assert_rc display_message_prefix 0
+  assert_trace display_message_prefix "rmux tiny: direct: display-message"
+  assert_stdout_line display_message_prefix "prefixdemo"
+
+  "$RMUX" -L "$sock" set-buffer -b tiny-send-hook seed >/dev/null
+  "$RMUX" -L "$sock" set-hook -g command-error \
+    'set-buffer -a -b tiny-send-hook x' >/dev/null
+
+  run_capture send_keys_prefix -L "$sock" send-keys -t prefixd:0.0 C-l
+  assert_rc send_keys_prefix 0
+  assert_trace send_keys_prefix "rmux tiny: direct: send-keys"
+  [ "$("$RMUX" -L "$sock" show-buffer -b tiny-send-hook)" = "seed" ] ||
+    die "successful tiny send-keys prefix resolution emitted command-error"
+
+  run_capture send_keys_missing -L "$sock" send-keys -t absent:0.0 C-l
+  [ "$(cat "$SMOKE_ROOT/send_keys_missing.rc")" != "0" ] ||
+    die "missing tiny send-keys target unexpectedly succeeded"
+  assert_trace send_keys_missing "rmux tiny: direct: send-keys"
+  [ "$("$RMUX" -L "$sock" show-buffer -b tiny-send-hook)" = "seedx" ] ||
+    die "failed tiny send-keys did not emit command-error exactly once"
+  "$RMUX" -L "$sock" set-hook -gu command-error >/dev/null
+
+  run_capture if_shell_prefix -L "$sock" if-shell -F -t prefixd \
+    '#{==:#{session_name},prefixdemo}' \
+    'display-message -p target-resolved' \
+    'display-message -p wrong-target'
+  assert_rc if_shell_prefix 0
+  assert_trace if_shell_prefix "rmux tiny: fallback: unsupported invocation"
+  assert_stdout_line if_shell_prefix "target-resolved"
 
   run_capture kill_session_prefix -L "$sock" kill-session -t killtar
   assert_rc kill_session_prefix 0
@@ -317,7 +482,7 @@ EOF
   run_capture source_status -L "$sock" source-file "$source_file"
   assert_rc source_status 1
   assert_trace source_status "rmux tiny: direct: source-file"
-  assert_stdout_contains source_status "$missing"
+  assert_stderr_contains source_status "$missing"
   assert_stdout_line source_status "after"
 
   "$RMUX" -S "$real" new-session -d -s base sleep 60 >/dev/null
@@ -327,7 +492,6 @@ EOF
   grep -Fq "refused to follow symlink" "$SMOKE_ROOT/symlink_new.err" ||
     die "symlink startup did not report refusal"
 
-  local empty="tiny-empty-$$"
   run_capture empty_attach -L "$empty" attach-session
   [ "$(cat "$SMOKE_ROOT/empty_attach.rc")" != "0" ] || die "empty attach succeeded"
   grep -Fq "no sessions" "$SMOKE_ROOT/empty_attach.err" ||
@@ -336,6 +500,18 @@ EOF
     "$RMUX" -L "$empty" kill-server >/dev/null 2>&1 || true
     die "empty attach left a usable daemon"
   fi
+
+  "$RMUX" -L "$preexisting_empty" start-server >/dev/null
+  "$RMUX" -L "$preexisting_empty" set-buffer -b tiny-empty-sentinel alive >/dev/null
+  run_capture preexisting_empty_attach -L "$preexisting_empty" attach-session
+  [ "$(cat "$SMOKE_ROOT/preexisting_empty_attach.rc")" != "0" ] ||
+    die "preexisting empty attach succeeded"
+  assert_trace preexisting_empty_attach "rmux tiny: direct: attach-session"
+  grep -Fq "no sessions" "$SMOKE_ROOT/preexisting_empty_attach.err" ||
+    die "preexisting empty attach did not report no sessions"
+  [ "$("$RMUX" -L "$preexisting_empty" show-buffer -b tiny-empty-sentinel)" = "alive" ] ||
+    die "preexisting empty attach destroyed daemon state"
+  "$RMUX" -L "$preexisting_empty" kill-server >/dev/null
 
   set +e
   RMUX_DISABLE_CLI_TARGET_ACTIONS=1 RMUX_TINY_TRACE=1 \
@@ -394,9 +570,7 @@ done
 
 cd "$repo_root"
 
-if [ -z "$TMUX_BIN" ] && command -v tmux >/dev/null 2>&1; then
-  TMUX_BIN="$(command -v tmux)"
-fi
+resolve_tmux_authority
 
 if [ -z "$layout" ]; then
   layout="$(mktemp -d "${TMPDIR:-/tmp}/rmux-review-layout.XXXXXX")"

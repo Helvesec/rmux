@@ -5,7 +5,7 @@ mod common;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -96,6 +96,71 @@ async fn daemon_backed_sdk_happy_path_cleans_tmp_socket_lock_daemon_and_child() 
     assert!(!socket_path.exists(), "socket path remained after cleanup");
     assert!(!lock_path.exists(), "startup lock remained after cleanup");
     assert!(!root.exists(), "endpoint root remained after cleanup");
+    Ok(())
+}
+
+#[tokio::test]
+async fn sdk_autostart_loads_the_default_rmux_config_before_serving_clients() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let root = smoke_root()?;
+    let socket_path = root.join("config-daemon.sock");
+    let config_home = root.join("xdg");
+    let home = root.join("home");
+    let config_path = config_home.join("rmux/rmux.conf");
+    let caller_cwd = root.join("caller dir-é");
+    let relative_config_path = caller_cwd.join("sdk-relative.conf");
+    let wrapper_path = root.join("wrapper dir-é/rmux daemon wrapper");
+    let cleanup = Cleanup::new(root.clone(), socket_path.clone());
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(config_path.parent().expect("config path has parent"))?;
+    fs::create_dir_all(&home)?;
+    fs::create_dir_all(&caller_cwd)?;
+    fs::create_dir_all(wrapper_path.parent().expect("wrapper path has parent"))?;
+    fs::write(&config_path, b"source-file sdk-relative.conf\n")?;
+    fs::write(
+        &relative_config_path,
+        b"set-environment -g SDK_CONFIG_SENTINEL loaded\n",
+    )?;
+    fs::write(
+        &wrapper_path,
+        b"#!/bin/sh\ncd / || exit 1\nexec \"$RMUX_SDK_REAL_DAEMON\" \"$@\"\n",
+    )?;
+    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o700))?;
+
+    let daemon_binary = rmux_binary()?.to_path_buf();
+    let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, wrapper_path.as_os_str());
+    let _real_daemon_env = EnvGuard::set("RMUX_SDK_REAL_DAEMON", daemon_binary.as_os_str());
+    let _home_env = EnvGuard::set("HOME", home.as_os_str());
+    let _xdg_env = EnvGuard::set("XDG_CONFIG_HOME", config_home.as_os_str());
+    let cwd_guard = CurrentDirGuard::set(&caller_cwd)?;
+
+    let rmux = RmuxBuilder::new()
+        .unix_socket(&socket_path)
+        .default_timeout(DEFAULT_TIMEOUT)
+        .connect_or_start()
+        .await?;
+    drop(cwd_guard);
+    let daemon_pid = wait_for_daemon_pid(&socket_path).await?;
+    let output = Command::new(rmux_binary()?)
+        .arg("-S")
+        .arg(&socket_path)
+        .args(["show-environment", "-g", "SDK_CONFIG_SENTINEL"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "show-environment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)?.trim(),
+        "SDK_CONFIG_SENTINEL=loaded"
+    );
+
+    rmux.shutdown().await?;
+    wait_for_daemon_absent(&socket_path, daemon_pid).await?;
+    wait_for_path_absent(&socket_path).await?;
+    fs::remove_dir_all(&root)?;
+    cleanup.disarm();
     Ok(())
 }
 
@@ -402,5 +467,23 @@ impl Drop for EnvGuard {
             Some(value) => std::env::set_var(self.key, value),
             None => std::env::remove_var(self.key),
         }
+    }
+}
+
+struct CurrentDirGuard {
+    previous: PathBuf,
+}
+
+impl CurrentDirGuard {
+    fn set(path: &Path) -> std::io::Result<Self> {
+        let previous = std::env::current_dir()?;
+        std::env::set_current_dir(path)?;
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.previous);
     }
 }

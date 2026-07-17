@@ -220,6 +220,100 @@ fn client_mouse_feature_enables_mouse_attach_sequences_when_mouse_option_is_on()
 }
 
 #[test]
+fn active_pane_mouse_tracking_enables_outer_mouse_with_mouse_option_off() {
+    // Issue #93: tmux enables outer mouse reporting when the `mouse` option
+    // is on OR the active pane's application requested a tracking mode, so
+    // vim/htop over SSH must get mouse events with `mouse off`.
+    let terminal = OuterTerminal::resolve_for_session(
+        &OptionStore::new(),
+        Some(&session_name("alpha")),
+        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
+            terminal_features: vec!["mouse".to_owned()],
+            utf8: true,
+        }),
+    )
+    .with_active_pane_mouse_mode(rmux_core::input::mode::MODE_MOUSE_BUTTON);
+
+    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
+    assert!(
+        start.contains(MOUSE_ENABLE_SEQUENCE),
+        "pane-driven tracking must enable outer mouse despite mouse=off"
+    );
+}
+
+#[test]
+fn without_option_or_pane_tracking_outer_mouse_stays_disabled() {
+    let terminal = OuterTerminal::resolve_for_session(
+        &OptionStore::new(),
+        Some(&session_name("alpha")),
+        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
+            terminal_features: vec!["mouse".to_owned()],
+            utf8: true,
+        }),
+    )
+    .with_active_pane_mouse_mode(0);
+
+    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
+    assert!(
+        !start.contains("\u{1b}[?1000h"),
+        "no option and no pane tracking must not enable outer mouse"
+    );
+}
+
+#[test]
+fn transition_disables_outer_mouse_when_the_pane_stops_tracking() {
+    let context = || {
+        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
+            terminal_features: vec!["mouse".to_owned()],
+            utf8: true,
+        })
+    };
+    let tracking = OuterTerminal::resolve_for_session(
+        &OptionStore::new(),
+        Some(&session_name("alpha")),
+        context(),
+    )
+    .with_active_pane_mouse_mode(rmux_core::input::mode::MODE_MOUSE_BUTTON);
+    let idle = OuterTerminal::resolve_for_session(
+        &OptionStore::new(),
+        Some(&session_name("alpha")),
+        context(),
+    )
+    .with_active_pane_mouse_mode(0);
+
+    let enable = String::from_utf8(tracking.transition_sequence_from(&idle)).expect("utf8");
+    assert!(
+        enable.contains(MOUSE_ENABLE_SEQUENCE),
+        "pane starting to track must enable outer mouse on refresh"
+    );
+    let disable = String::from_utf8(idle.transition_sequence_from(&tracking)).expect("utf8");
+    assert!(
+        disable.contains(MOUSE_DISABLE_SEQUENCE),
+        "pane resetting its tracking mode must disable outer mouse on refresh"
+    );
+}
+
+#[test]
+fn active_pane_all_motion_tracking_preserves_decset_1003() {
+    let terminal = OuterTerminal::resolve_for_session(
+        &OptionStore::new(),
+        Some(&session_name("alpha")),
+        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
+            terminal_features: vec!["mouse".to_owned()],
+            utf8: true,
+        }),
+    )
+    .with_active_pane_mouse_mode(rmux_core::input::mode::MODE_MOUSE_ALL);
+
+    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
+    assert!(start.contains("\u{1b}[?1003h"));
+    assert!(!start.contains("\u{1b}[?1002h"));
+
+    let stop = String::from_utf8(terminal.attach_stop_sequence()).expect("utf8");
+    assert!(stop.contains("\u{1b}[?1003l"));
+}
+
+#[test]
 fn render_prelude_emits_title_path_and_cursor_colour() {
     let mut options = OptionStore::new();
     options
@@ -265,6 +359,21 @@ fn render_prelude_emits_title_path_and_cursor_colour() {
     assert!(prelude.contains("\u{1b}]0;build logs\u{7}"));
     assert!(prelude.contains("\u{1b}]7;file:///tmp/project\u{7}"));
     assert!(prelude.contains("\u{1b}]12;rgb:cd/00/00\u{7}"));
+}
+
+#[test]
+fn attach_start_queries_client_theme_reports() {
+    let terminal = OuterTerminal::resolve(
+        &OptionStore::new(),
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+
+    let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
+    let stop = String::from_utf8(terminal.attach_stop_sequence()).expect("utf8");
+
+    assert!(start.contains("\u{1b}[?2031h"));
+    assert!(start.contains("\u{1b}[?996n"));
+    assert!(stop.contains("\u{1b}[?2031l"));
 }
 
 #[test]
@@ -317,7 +426,30 @@ fn clipboard_encoding_honours_feature_and_set_clipboard_option() {
     )
     .expect("utf8");
     assert_eq!(encoded, "\u{1b}]52;;aGk=\u{7}");
-    assert!(enabled.clipboard_passthrough_enabled());
+    // Under `external` an application's inbound OSC 52 is NOT relayed to the
+    // outer terminal: tmux gates that path on set-clipboard == on only
+    // (input.c input_osc_52 returns early unless set-clipboard == 2), so an
+    // untrusted pane cannot drive the system clipboard under the default.
+    assert!(!enabled.clipboard_passthrough_enabled());
+    // tmux's own selections (copy-mode yank / `set-buffer -w`) still forward
+    // under `external` (window-copy.c gates them on set-clipboard != 0).
+    assert!(enabled.encode_clipboard_set(b"hi").is_some());
+
+    let mut on_options = OptionStore::new();
+    on_options
+        .set(
+            ScopeSelector::Global,
+            OptionName::SetClipboard,
+            "on".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("set-clipboard set succeeds");
+    let on = OuterTerminal::resolve(
+        &on_options,
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+    // `on` is the opt-in that relays inbound application OSC 52 to the outer.
+    assert!(on.clipboard_passthrough_enabled());
 
     let mut disabled_options = OptionStore::new();
     disabled_options

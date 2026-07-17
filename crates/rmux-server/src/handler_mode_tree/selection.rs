@@ -11,7 +11,7 @@ pub(super) fn selected_items<'a>(
         .values()
         .filter(|item| mode.tagged.contains(&item.id))
         .collect::<Vec<_>>();
-    if tagged.is_empty() {
+    if tagged.is_empty() && mode.tagged.is_empty() {
         if let Some(selected) = mode.selected_id.as_ref().and_then(|id| build.items.get(id)) {
             tagged.push(selected);
         }
@@ -55,25 +55,6 @@ fn tree_kill_prompt_for_item(item: &ModeTreeItem) -> Option<String> {
             ..
         } => Some(format!("Kill pane {pane_index}? ")),
         _ => None,
-    }
-}
-
-pub(super) fn tree_kill_sort_key(action: &ModeTreeAction) -> u8 {
-    match action {
-        ModeTreeAction::TreeTarget {
-            window_index: Some(_),
-            pane_index: Some(_),
-            ..
-        } => 0,
-        ModeTreeAction::TreeTarget {
-            window_index: Some(_),
-            pane_index: None,
-            ..
-        } => 1,
-        ModeTreeAction::TreeTarget {
-            window_index: None, ..
-        } => 2,
-        _ => 3,
     }
 }
 

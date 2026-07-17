@@ -8,17 +8,22 @@ use std::thread;
 
 use rmux_ipc::BlockingLocalStream;
 use rmux_proto::{encode_attach_message, AttachMessage, TerminalSize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 
 use crate::ClientError;
 
 #[path = "attach_windows/action.rs"]
 mod action;
+#[path = "attach_windows/console_coordination.rs"]
+mod console_coordination;
+#[path = "attach_windows/console_input_read.rs"]
+mod console_input_read;
+#[cfg(test)]
+#[path = "attach_windows/console_mode_ownership_tests.rs"]
+mod console_mode_ownership_tests;
 #[path = "attach_windows/input.rs"]
 mod input;
-#[path = "attach_windows/lock_state.rs"]
-mod lock_state;
 #[path = "attach_windows/metrics.rs"]
 mod metrics;
 #[path = "attach_windows/output.rs"]
@@ -33,8 +38,14 @@ mod stream;
 mod terminal;
 #[path = "attach/terminal_cleanup.rs"]
 mod terminal_cleanup;
+#[path = "attach_windows/vt_input_passthrough.rs"]
+mod vt_input_passthrough;
+#[path = "attach_windows/vt_mode_scanner.rs"]
+mod vt_mode_scanner;
+#[path = "attach_windows/windows_version.rs"]
+mod windows_version;
 
-use lock_state::AttachLockState;
+use crate::attach_lock_state::AttachLockState;
 use screen::AttachScreenTracker;
 pub use terminal::{AttachError, RawTerminal, Result};
 
@@ -64,11 +75,13 @@ pub fn attach_terminal_with_initial_bytes_and_windows_console_key(
     windows_console_key_enabled: bool,
 ) -> std::result::Result<(), ClientError> {
     let input = io::stdin();
-    let output = output::AttachStdout::new(io::stdout());
+    let raw_terminal = RawTerminal::enter().map_err(ClientError::from)?;
+    let output = output::AttachStdout::for_managed_terminal(io::stdout());
 
-    attach_with_stdio(
+    attach_with_stdio_and_raw_terminal(
         stream,
         initial_bytes,
+        raw_terminal,
         input,
         output,
         windows_console_key_enabled,
@@ -104,9 +117,31 @@ where
     Output: Write + Send + 'static,
 {
     let raw_terminal = RawTerminal::enter().map_err(ClientError::from)?;
+    attach_with_stdio_and_raw_terminal(
+        stream,
+        initial_bytes,
+        raw_terminal,
+        input,
+        output,
+        windows_console_key_enabled,
+    )
+}
+
+fn attach_with_stdio_and_raw_terminal<Input, Output>(
+    stream: BlockingLocalStream,
+    initial_bytes: Vec<u8>,
+    raw_terminal: RawTerminal,
+    input: Input,
+    output: Output,
+    windows_console_key_enabled: bool,
+) -> std::result::Result<(), ClientError>
+where
+    Input: Read + AsRawHandle + Send + 'static,
+    Output: Write + Send + 'static,
+{
     let _ = raw_terminal.flush_pending_input();
     let screen_tracker = AttachScreenTracker::default();
-    let result = drive_attach_stream_with_terminal_state(
+    drive_attach_stream_with_terminal_state(
         stream,
         initial_bytes,
         raw_terminal,
@@ -114,11 +149,7 @@ where
         input,
         output,
         windows_console_key_enabled,
-    );
-    if result.is_err() && !screen_tracker.was_stopped() {
-        let _ = terminal::restore_attach_terminal_state();
-    }
-    result
+    )
 }
 
 fn drive_attach_stream_with_terminal_state<Input, Output>(
@@ -151,6 +182,9 @@ where
             resize_rx,
             actions: action::ManagedTerminalActions::new(raw_terminal),
             windows_console_key_enabled,
+            error_cleanup: Some(terminal_cleanup::fallback_attach_stop_sequence(
+                &std::env::var("TERM").unwrap_or_default(),
+            )),
         },
     )
 }
@@ -175,6 +209,7 @@ where
             resize_rx: closed_resize_rx(),
             actions: action::StreamOnlyActions,
             windows_console_key_enabled: false,
+            error_cleanup: None,
         },
     )
 }
@@ -183,6 +218,7 @@ struct AttachLoopInputs<Actions> {
     resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
     actions: Actions,
     windows_console_key_enabled: bool,
+    error_cleanup: Option<Vec<u8>>,
 }
 
 fn drive_attach_stream_inner<Input, Output, Actions>(
@@ -202,16 +238,19 @@ where
         resize_rx,
         actions,
         windows_console_key_enabled,
+        error_cleanup,
     } = loop_inputs;
     let input_join_policy = input_join_policy(input.as_raw_handle());
     let (input_tx, input_rx) = mpsc::channel(ATTACH_INPUT_QUEUE_CAPACITY);
     let lock_state = Arc::new(AttachLockState::default());
     let input_lock_state = Arc::clone(&lock_state);
-    let input_thread = thread::spawn(move || input_loop(input, input_tx, input_lock_state));
+    let (input_thread, input_completion_rx) = spawn_input_worker(input, input_tx, input_lock_state);
     let (action_tx, action_rx) = std_mpsc::channel();
     let (action_completion_tx, action_completion_rx) = mpsc::unbounded_channel();
-    let action_thread =
-        thread::spawn(move || action_loop(actions, action_rx, action_completion_tx));
+    let action_lock_state = Arc::clone(&lock_state);
+    let action_thread = thread::spawn(move || {
+        action_loop(actions, action_rx, action_completion_tx, action_lock_state)
+    });
     let (pipe, runtime) = stream.into_async_parts();
     let output_result = runtime.block_on(async {
         let (reader, writer) = tokio::io::split(pipe);
@@ -228,14 +267,19 @@ where
                 action_completion_rx,
                 Arc::clone(&lock_state),
                 windows_console_key_enabled,
-            ),
+            )
+            .with_input_completion(input_completion_rx)
+            .with_error_cleanup(error_cleanup),
         )
         .await
     });
 
     lock_state.close();
     let input_result = match input_join_policy {
-        InputJoinPolicy::JoinOnClose => join_attach_thread(input_thread)?,
+        InputJoinPolicy::JoinOnClose => {
+            join_attach_thread(input_thread)?;
+            Ok(())
+        }
         InputJoinPolicy::DetachOnClose => Ok(()),
     };
     let action_result = join_attach_thread(action_thread)?;
@@ -245,23 +289,88 @@ where
     input_result
 }
 
+fn spawn_input_worker<Input>(
+    input: Input,
+    input_tx: mpsc::Sender<input::AttachInput>,
+    lock_state: Arc<AttachLockState>,
+) -> (
+    thread::JoinHandle<()>,
+    oneshot::Receiver<std::result::Result<(), ClientError>>,
+)
+where
+    Input: Read + AsRawHandle + Send + 'static,
+{
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let worker = thread::spawn(move || {
+        let result = input_loop(input, input_tx, lock_state);
+        let _ = completion_tx.send(result);
+    });
+    (worker, completion_rx)
+}
+
 fn action_loop<Actions>(
     mut actions: Actions,
     action_rx: std_mpsc::Receiver<action::AttachAction>,
     completion_tx: mpsc::UnboundedSender<
         std::result::Result<action::AttachActionOutcome, ClientError>,
     >,
+    lock_state: Arc<AttachLockState>,
 ) -> std::result::Result<(), ClientError>
 where
     Actions: action::AttachActionExecutor,
 {
     while let Ok(request) = action_rx.recv() {
+        if request.requires_exclusive_input() {
+            lock_state.wait_until_input_idle();
+        }
         let result = action::run_attach_action(&mut actions, request);
         if completion_tx.send(result).is_err() {
             return Ok(());
         }
     }
     Ok(())
+}
+
+struct AttachInputReadLease<'a> {
+    state: &'a AttachLockState,
+}
+
+impl<'a> AttachInputReadLease<'a> {
+    fn acquire(state: &'a AttachLockState) -> Option<Self> {
+        state.begin_input_read().then_some(Self { state })
+    }
+}
+
+impl Drop for AttachInputReadLease<'_> {
+    fn drop(&mut self) {
+        self.state.finish_input_read();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingCtrlCForward {
+    None,
+    Sent,
+    InputClosed,
+}
+
+fn forward_pending_ctrl_c_event(
+    input_tx: &mpsc::Sender<input::AttachInput>,
+    lock_state: &AttachLockState,
+) -> PendingCtrlCForward {
+    let Some(_input_read_lease) = AttachInputReadLease::acquire(lock_state) else {
+        return PendingCtrlCForward::None;
+    };
+    if !terminal::take_pending_ctrl_c_event() {
+        return PendingCtrlCForward::None;
+    }
+    if input_tx
+        .blocking_send(input::synthetic_ctrl_c_input())
+        .is_err()
+    {
+        return PendingCtrlCForward::InputClosed;
+    }
+    PendingCtrlCForward::Sent
 }
 
 fn input_loop<Input>(
@@ -284,47 +393,66 @@ where
         if lock_state.is_closed() || input_tx.is_closed() {
             return Ok(());
         }
-        if terminal::take_pending_ctrl_c_event() && !lock_state.is_locked() {
-            let input = input::synthetic_ctrl_c_input();
-            if input_tx.blocking_send(input).is_err() {
-                return Ok(());
-            }
+        if lock_state.is_locked() {
+            lock_state.wait_while_locked();
             continue;
         }
+        match forward_pending_ctrl_c_event(&input_tx, &lock_state) {
+            PendingCtrlCForward::None => {}
+            PendingCtrlCForward::Sent => continue,
+            PendingCtrlCForward::InputClosed => return Ok(()),
+        }
 
-        let locked = lock_state.is_locked();
         if !terminal::wait_for_key_input(input_handle, 50).map_err(ClientError::Io)? {
             if lock_state.is_closed() || input_tx.is_closed() {
                 return Ok(());
             }
-            if terminal::take_pending_ctrl_c_event() && !lock_state.is_locked() {
-                let input = input::synthetic_ctrl_c_input();
-                if input_tx.blocking_send(input).is_err() {
-                    return Ok(());
-                }
+            match forward_pending_ctrl_c_event(&input_tx, &lock_state) {
+                PendingCtrlCForward::None | PendingCtrlCForward::Sent => {}
+                PendingCtrlCForward::InputClosed => return Ok(()),
             }
+            continue;
+        }
+
+        if !lock_state.begin_input_read() {
             continue;
         }
 
         let inputs = if let Some(console_input) = console_input.as_mut() {
             match console_input.read_key_inputs() {
-                Ok(inputs) => inputs,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(ClientError::Io(error)),
+                Ok(inputs) => Ok(inputs),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(None),
+                Err(error) => Err(Some(ClientError::Io(error))),
             }
         } else {
             let bytes_read = match input.read(&mut read_buffer) {
-                Ok(0) => return Ok(()),
+                Ok(0) => 0,
                 Ok(bytes_read) => bytes_read,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(ClientError::Io(error)),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    lock_state.finish_input_read();
+                    continue;
+                }
+                Err(error) => {
+                    lock_state.finish_input_read();
+                    return Err(ClientError::Io(error));
+                }
             };
-            vec![input::AttachInput::bytes(
+            if bytes_read == 0 {
+                lock_state.finish_input_read();
+                return Ok(());
+            }
+            Ok(vec![input::AttachInput::bytes(
                 read_buffer[..bytes_read].to_vec(),
-            )]
+            )])
+        };
+        lock_state.finish_input_read();
+        let inputs = match inputs {
+            Ok(inputs) => inputs,
+            Err(None) => continue,
+            Err(Some(error)) => return Err(error),
         };
 
-        if inputs.is_empty() || locked || lock_state.is_locked() {
+        if inputs.is_empty() || lock_state.is_locked() {
             continue;
         }
 
@@ -368,9 +496,9 @@ fn closed_resize_rx() -> mpsc::UnboundedReceiver<TerminalSize> {
     resize_rx
 }
 
-fn join_attach_thread(
-    thread: thread::JoinHandle<std::result::Result<(), ClientError>>,
-) -> std::result::Result<std::result::Result<(), ClientError>, ClientError> {
+fn join_attach_thread<Output>(
+    thread: thread::JoinHandle<Output>,
+) -> std::result::Result<Output, ClientError> {
     thread
         .join()
         .map_err(|_| ClientError::Io(io::Error::other("attach thread panicked")))
@@ -379,15 +507,32 @@ fn join_attach_thread(
 #[cfg(test)]
 mod tests {
     use std::fs::File;
-    use std::io::{self, Write};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::io::{self, Read, Write};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::sync::Arc;
 
     use tokio::sync::mpsc;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::Pipes::CreatePipe;
 
-    use super::{input_join_policy, input_loop, AttachLockState, InputJoinPolicy};
+    use super::{
+        input_join_policy, input_loop, join_attach_thread, spawn_input_worker, AttachLockState,
+        ClientError, InputJoinPolicy,
+    };
+
+    struct InvalidHandleInput;
+
+    impl Read for InvalidHandleInput {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            panic!("an invalid wait handle must fail before attempting a read")
+        }
+    }
+
+    impl AsRawHandle for InvalidHandleInput {
+        fn as_raw_handle(&self) -> RawHandle {
+            1_usize as RawHandle
+        }
+    }
 
     #[test]
     fn pipe_stdin_handles_are_detached_on_attach_close() {
@@ -421,6 +566,22 @@ mod tests {
         assert_eq!(
             input_join_policy(console_like),
             InputJoinPolicy::DetachOnClose
+        );
+    }
+
+    #[test]
+    fn input_worker_publishes_wait_failure_before_exiting() {
+        let (input_tx, _input_rx) = mpsc::channel(1);
+        let lock_state = Arc::new(AttachLockState::default());
+        let (worker, completion_rx) = spawn_input_worker(InvalidHandleInput, input_tx, lock_state);
+
+        let completion = completion_rx
+            .blocking_recv()
+            .expect("input worker must publish its result");
+        join_attach_thread(worker).expect("input worker must not panic");
+        assert!(
+            matches!(completion, Err(ClientError::Io(_))),
+            "invalid wait handle must surface as an input I/O error: {completion:?}"
         );
     }
 
