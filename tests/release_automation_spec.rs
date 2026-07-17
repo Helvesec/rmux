@@ -390,9 +390,13 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
         .take(12)
         .any(|line| line.contains("continue-on-error")));
     assert!(release.contains("if-no-files-found: error"));
-    assert!(release.contains("rmux-windows-interactive"));
+    assert!(release.contains("- os: windows-latest"));
+    assert!(!release.contains("self-hosted"));
+    assert!(!release.contains("rmux-windows-interactive"));
+    assert!(!release.contains("-PortableSmokeOnly"));
+    assert!(!release.contains("portable-smoke.evidence.json"));
     assert!(!release.contains("RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON"));
-    assert!(release.contains("\"-Rmux\", $releaseBin"));
+    assert!(release.contains("Run \"./scripts/windows_ctrl_matrix.ps1\" @(\"-StaticMatrixSpec\")"));
     assert!(
         release.contains("$packageHelper = \"target/$env:TARGET/$env:PROFILE_DIR/rmux-full.exe\"")
     );
@@ -493,7 +497,9 @@ fn release_publication_waits_for_native_and_package_validations() {
         .split("\n  platform-gates:\n")
         .next()
         .expect("bounded release build job");
-    assert!(build.contains("rmux-windows-interactive"));
+    assert!(build.contains("- os: windows-latest"));
+    assert!(!build.contains("self-hosted"));
+    assert!(!build.contains("rmux-windows-interactive"));
 
     let platform_gates = release
         .split("\n  platform-gates:\n")
@@ -745,7 +751,7 @@ fn every_ci_and_release_job_has_a_bounded_runtime() {
 }
 
 #[test]
-fn windows_package_reuses_the_exact_ctrl_tested_release_binaries() {
+fn windows_package_reuses_the_exact_release_tested_binaries() {
     let release = include_str!("../.github/workflows/release.yml");
     let package = include_str!("../scripts/package-windows.ps1");
 
@@ -776,7 +782,7 @@ fn windows_package_reuses_the_exact_ctrl_tested_release_binaries() {
         .next()
         .expect("bounded Windows archive step");
     assert!(package_step.contains("-ReuseReleaseBinaries"));
-    assert!(package_step.contains("target/windows-ctrl-matrix/release-binaries.json"));
+    assert!(package_step.contains("target/windows-release-evidence/release-binaries.json"));
 }
 
 #[test]

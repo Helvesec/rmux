@@ -111,7 +111,7 @@ fn platform_runtime_installs_clippy_before_running_the_windows_msvc_gate() {
 }
 
 #[test]
-fn windows_release_gate_runs_ctrl_matrix_and_nonempty_cargo_filters() {
+fn windows_release_gate_uses_hosted_checks_and_nonempty_cargo_filters() {
     let workflow = include_str!("../.github/workflows/release.yml");
     let gate = include_str!("../scripts/gate-windows-fast.ps1");
     let assert_filter = include_str!("../scripts/assert-cargo-filter-nonempty.ps1");
@@ -121,16 +121,13 @@ fn windows_release_gate_runs_ctrl_matrix_and_nonempty_cargo_filters() {
         r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes")"#,
         r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_attach_exit")"#,
         r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")"#,
-        r#"Run "./scripts/windows_ctrl_matrix.ps1" $ctrlArgs"#,
-        r#""-ExpectedGitSha", $env:RMUX_EXPECTED_GIT_SHA"#,
-        "rmux-windows-interactive",
-        "portable-smoke.evidence.json",
+        r#"Run "./scripts/windows_ctrl_matrix.ps1" @("-StaticMatrixSpec")"#,
+        "- os: windows-latest",
         "rmux-windows-release-binaries",
         "-ReuseReleaseBinaries",
         "-ReleaseBinaryManifest",
         r#"if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"#,
-        "rmux-${{ env.RELEASE_REF }}-${{ matrix.target }}-windows-ctrl-matrix",
-        "-RunCtrlMatrixSmoke",
+        "rmux-${{ env.RELEASE_REF }}-${{ matrix.target }}-windows-release-evidence",
     ] {
         assert!(
             workflow.contains(required),
@@ -138,6 +135,19 @@ fn windows_release_gate_runs_ctrl_matrix_and_nonempty_cargo_filters() {
         );
     }
     assert!(!workflow.contains("RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON"));
+    for forbidden in [
+        "self-hosted",
+        "rmux-windows-interactive",
+        "-PortableSmokeOnly",
+        "portable-smoke.evidence.json",
+        "-RunCtrlMatrixSmoke",
+        "-CtrlMatrixEvidence",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "release workflow must not depend on an external interactive runner: {forbidden:?}"
+        );
+    }
 
     assert!(
         gate.contains("assert-cargo-filter-nonempty.ps1")
@@ -158,12 +168,7 @@ fn windows_release_gate_runs_ctrl_matrix_and_nonempty_cargo_filters() {
             && package_verify.contains("ExpectedGitSha")
             && package_verify.contains("CtrlMatrixEvidence")
             && package_verify.contains("produced no passing evidence"),
-        "Windows package verification must keep the packaged Ctrl matrix smoke"
+        "manual Windows package verification must keep the optional interactive Ctrl matrix smoke"
     );
-    assert!(
-        !workflow.contains(
-            r#""-PortableSmokeOnly", "-OutDir", "target/windows-ctrl-matrix", "-AllowPortableSmokeSkip""#
-        ) && workflow.contains("if-no-files-found: error"),
-        "release workflow must not accept a session-0 Ctrl smoke skip as passing evidence"
-    );
+    assert!(workflow.contains("if-no-files-found: error"));
 }

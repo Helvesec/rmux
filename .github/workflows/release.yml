@@ -169,7 +169,7 @@ jobs:
             platform-label: macos-aarch64
             binary: rmux
             archive: tar.gz
-          - os: [self-hosted, Windows, X64, rmux-windows-interactive]
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
             platform-label: windows-x86_64
             binary: rmux.exe
@@ -350,7 +350,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $actualGitSha -ne $env:RMUX_EXPECTED_GIT_SHA) {
             throw "release binary manifest Git SHA does not match the checked-out release"
           }
-          $releaseManifestPath = "target/windows-ctrl-matrix/release-binaries.json"
+          $releaseManifestPath = "target/windows-release-evidence/release-binaries.json"
           New-Item -ItemType Directory -Force -Path (Split-Path -Parent $releaseManifestPath) | Out-Null
           $releaseManifest = [ordered]@{
             schema = 1
@@ -367,16 +367,6 @@ jobs:
             ($releaseManifest | ConvertTo-Json -Depth 3),
             [System.Text.UTF8Encoding]::new($false)
           )
-          $ctrlArgs = @(
-            "-Rmux", $releaseBin,
-            "-PortableSmokeOnly",
-            "-OutDir", "target/windows-ctrl-matrix",
-            "-ExpectedGitSha", $env:RMUX_EXPECTED_GIT_SHA
-          )
-          Run "./scripts/windows_ctrl_matrix.ps1" $ctrlArgs
-          if (-not (Test-Path -LiteralPath target/windows-ctrl-matrix/portable-smoke.evidence.json -PathType Leaf)) {
-            throw "Windows Ctrl matrix produced no passing SHA-bound evidence"
-          }
           Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_ctrl_matrix_spec")
           Run "cargo" @("test", "-p", "rmux", "--locked", "--test", "windows_ctrl_matrix_spec", "--", "--test-threads=1")
           Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")
@@ -388,12 +378,12 @@ jobs:
           Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "internal_daemon_windows")
           Run "cargo" @("test", "-p", "rmux", "--locked", "--test", "internal_daemon_windows", "--", "--nocapture", "--test-threads=1")
 
-      - name: Upload Windows Ctrl matrix smoke artifacts
+      - name: Upload Windows release evidence
         if: runner.os == 'Windows' && always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: rmux-${{ env.RELEASE_REF }}-${{ matrix.target }}-windows-ctrl-matrix
-          path: target/windows-ctrl-matrix
+          name: rmux-${{ env.RELEASE_REF }}-${{ matrix.target }}-windows-release-evidence
+          path: target/windows-release-evidence
           if-no-files-found: error
 
       - name: Create Unix archive
@@ -443,7 +433,7 @@ jobs:
             -OutputDir dist `
             -PlatformLabel "$env:PLATFORM_LABEL" `
             -ReuseReleaseBinaries `
-            -ReleaseBinaryManifest "target/windows-ctrl-matrix/release-binaries.json"
+            -ReleaseBinaryManifest "target/windows-release-evidence/release-binaries.json"
           $archive = Get-ChildItem -Path dist -Filter "rmux-*.zip" | Select-Object -First 1
           if ($null -eq $archive) {
             throw "Windows package archive was not generated"
@@ -455,9 +445,6 @@ jobs:
             -RunDaemonSmoke `
             -RunSdkSmoke `
             -RunMouseBorderSmoke `
-            -RunCtrlMatrixSmoke `
-            -ExpectedGitSha "$env:GITHUB_SHA" `
-            -CtrlMatrixEvidence "target/windows-ctrl-matrix/portable-smoke.evidence.json" `
             -RequireReleaseArtifact
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
