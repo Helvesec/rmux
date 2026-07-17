@@ -396,7 +396,8 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
     assert!(!release.contains("-PortableSmokeOnly"));
     assert!(!release.contains("portable-smoke.evidence.json"));
     assert!(!release.contains("RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON"));
-    assert!(release.contains("Run \"./scripts/windows_ctrl_matrix.ps1\" @(\"-StaticMatrixSpec\")"));
+    assert!(release.contains("& \"./scripts/windows_ctrl_matrix.ps1\" -StaticMatrixSpec"));
+    assert!(!release.contains("Run \"./scripts/windows_ctrl_matrix.ps1\" @(\"-StaticMatrixSpec\")"));
     assert!(
         release.contains("$packageHelper = \"target/$env:TARGET/$env:PROFILE_DIR/rmux-full.exe\"")
     );

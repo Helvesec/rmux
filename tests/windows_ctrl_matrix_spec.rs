@@ -121,7 +121,7 @@ fn windows_release_gate_uses_hosted_checks_and_nonempty_cargo_filters() {
         r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes")"#,
         r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_attach_exit")"#,
         r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")"#,
-        r#"Run "./scripts/windows_ctrl_matrix.ps1" @("-StaticMatrixSpec")"#,
+        r#"& "./scripts/windows_ctrl_matrix.ps1" -StaticMatrixSpec"#,
         "- os: windows-latest",
         "rmux-windows-release-binaries",
         "-ReuseReleaseBinaries",
@@ -135,6 +135,10 @@ fn windows_release_gate_uses_hosted_checks_and_nonempty_cargo_filters() {
         );
     }
     assert!(!workflow.contains("RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON"));
+    assert!(
+        !workflow.contains(r#"Run "./scripts/windows_ctrl_matrix.ps1" @("-StaticMatrixSpec")"#),
+        "PowerShell switch parameters must not be passed through positional array splatting"
+    );
     for forbidden in [
         "self-hosted",
         "rmux-windows-interactive",

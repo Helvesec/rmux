@@ -314,7 +314,8 @@ jobs:
           Run "cargo" @("test", "-p", "rmux-client", "--locked", "blocked_console_output_does_not_block_input_forwarding", "--", "--test-threads=1")
           Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live")
           Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live", "--", "--test-threads=1")
-          Run "./scripts/windows_ctrl_matrix.ps1" @("-StaticMatrixSpec")
+          & "./scripts/windows_ctrl_matrix.ps1" -StaticMatrixSpec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $releaseBin = "target/$env:TARGET/$env:PROFILE_DIR/$env:BINARY"
           $packageHelper = "target/$env:TARGET/$env:PROFILE_DIR/rmux-full.exe"
           $runtimeHelper = "target/$env:TARGET/$env:PROFILE_DIR/libexec/rmux/rmux.exe"
