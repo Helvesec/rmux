@@ -483,8 +483,8 @@ fn github_windows_tests_keep_debug_daemons_inside_the_runner_job() {
     );
     assert_eq!(
         release.matches(opt_in).count(),
-        1,
-        "only the GitHub-hosted Windows release gate may opt into the runner-owned job"
+        2,
+        "both GitHub-hosted Windows release test surfaces must opt into the runner-owned job"
     );
 }
 

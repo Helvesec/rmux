@@ -291,6 +291,7 @@ jobs:
         shell: pwsh
         env:
           RMUX_EXPECTED_GIT_SHA: ${{ github.sha }}
+          RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: "1"
         run: |
           $ErrorActionPreference = "Stop"
           $env:CARGO_INCREMENTAL = "0"
