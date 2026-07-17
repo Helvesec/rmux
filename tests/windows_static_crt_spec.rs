@@ -10,8 +10,12 @@ fn windows_release_builds_and_reuses_only_static_crt_binaries() {
     assert!(workflow
         .contains("$env:RUSTFLAGS = \"-C target-feature=+crt-static -Clink-arg=/DEBUG:NONE\""));
     let workflow_gate = workflow
-        .find("Run \"./scripts/assert-windows-static-crt.ps1\"")
+        .find("& \"./scripts/assert-windows-static-crt.ps1\" `")
         .expect("release workflow static CRT gate");
+    assert!(
+        !workflow.contains("Run \"./scripts/assert-windows-static-crt.ps1\" @("),
+        "PowerShell named parameters must not use positional array splatting"
+    );
     let manifest = workflow
         .find("kind = \"rmux-windows-release-binaries\"")
         .expect("release binary manifest");
@@ -19,12 +23,16 @@ fn windows_release_builds_and_reuses_only_static_crt_binaries() {
         workflow_gate < manifest,
         "unverified binaries reached the manifest"
     );
+    let workflow_gate_block = &workflow[workflow_gate..manifest];
     for required in [
-        "\"-Binary\", $releaseBin",
-        "\"-HelperBinary\", $packageHelper",
-        "\"-DaemonBinary\", $releaseDaemon",
+        "-Binary $releaseBin",
+        "-HelperBinary $packageHelper",
+        "-DaemonBinary $releaseDaemon",
     ] {
-        assert!(workflow.contains(required), "workflow gate lost {required}");
+        assert!(
+            workflow_gate_block.contains(required),
+            "workflow gate lost {required}"
+        );
     }
 
     let static_flag = package

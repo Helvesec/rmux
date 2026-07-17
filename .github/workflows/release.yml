@@ -342,11 +342,11 @@ jobs:
           } finally {
             $env:RUSTFLAGS = $testRustFlags
           }
-          Run "./scripts/assert-windows-static-crt.ps1" @(
-            "-Binary", $releaseBin,
-            "-HelperBinary", $packageHelper,
-            "-DaemonBinary", $releaseDaemon
-          )
+          & "./scripts/assert-windows-static-crt.ps1" `
+            -Binary $releaseBin `
+            -HelperBinary $packageHelper `
+            -DaemonBinary $releaseDaemon
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $actualGitSha = (& git rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or $actualGitSha -ne $env:RMUX_EXPECTED_GIT_SHA) {
             throw "release binary manifest Git SHA does not match the checked-out release"
