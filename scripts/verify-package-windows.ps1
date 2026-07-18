@@ -365,16 +365,35 @@ function InvokeSdkWindowsSmoke([string]$Binary, [string]$DaemonBinary) {
 function InvokeMouseBorderSmoke([string]$Binary, [string]$DaemonBinary) {
     $previousBinary = $env:RMUX_MOUSE_BORDER_RMUX_BIN
     $previousDaemon = $env:RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN
+    $mouseTest = "mouse_drag_on_vertical_border_resizes_horizontal_split_through_attach_binding"
     try {
         $env:RMUX_MOUSE_BORDER_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
         $env:RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN = [System.IO.Path]::GetFullPath($DaemonBinary)
+        & "$PSScriptRoot/assert-cargo-filter-nonempty.ps1" @(
+            "1",
+            "--",
+            "test",
+            "--locked",
+            "-p",
+            "rmux",
+            "--test",
+            "windows_mouse_border_resize",
+            $mouseTest
+        )
+        if ($LASTEXITCODE -ne 0) {
+            Fail "Windows mouse border package smoke filter failed with exit code $LASTEXITCODE"
+        }
         & cargo @(
             "test",
             "--locked",
             "-p",
             "rmux",
             "--test",
-            "windows_mouse_border_resize"
+            "windows_mouse_border_resize",
+            $mouseTest,
+            "--",
+            "--exact",
+            "--test-threads=1"
         )
         if ($LASTEXITCODE -ne 0) {
             Fail "Windows mouse border package smoke failed with exit code $LASTEXITCODE"

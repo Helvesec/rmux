@@ -723,6 +723,12 @@ fn windows_package_smokes_own_release_daemons_inside_the_runner_job() {
     assert!(verifier.contains("NewPackagePipeName([string]$Binary, [string]$Label)"));
     assert!(verifier.contains("@(\"-L\", $Label, \"diagnose\", \"--json\")"));
     assert!(verifier.contains("$diagnostics.socket_path"));
+    assert!(verifier.contains(
+        "$mouseTest = \"mouse_drag_on_vertical_border_resizes_horizontal_split_through_attach_binding\""
+    ));
+    assert!(verifier.contains("& \"$PSScriptRoot/assert-cargo-filter-nonempty.ps1\""));
+    assert!(verifier.contains("\"--exact\""));
+    assert!(verifier.contains("\"--test-threads=1\""));
     assert!(
         !verifier.contains(r#"\\.\pipe\rmux-package-$component"#),
         "package verification must use the identity-bound endpoint resolved by RMUX"
