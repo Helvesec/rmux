@@ -802,6 +802,25 @@ fn release_publication_waits_for_native_and_package_validations() {
     assert!(chocolatey_publish.contains("- publish"));
     assert!(chocolatey_publish.contains("- validate-chocolatey"));
     assert!(chocolatey_publish.contains("choco push"));
+    assert!(chocolatey_publish.contains("-SkipDaemon"));
+}
+
+#[test]
+fn chocolatey_retry_is_bounded_to_a_verified_public_release() {
+    let workflow = include_str!("../.github/workflows/publish-chocolatey.yml");
+
+    assert!(workflow.contains("environment: release"));
+    assert!(workflow.contains("ref: ${{ env.RELEASE_REF }}"));
+    assert!(workflow.contains("release tag signature is not verified by GitHub"));
+    assert!(workflow.contains("public release target does not match the signed tag"));
+    assert!(workflow.contains("gh release download"));
+    assert!(workflow.contains("Get-FileHash -Algorithm SHA256"));
+    assert!(workflow.contains("scripts/generate-chocolatey-package.sh"));
+    assert!(workflow.contains("choco install rmux"));
+    assert!(workflow.contains("-SkipDaemon"));
+    assert!(workflow.contains("choco push"));
+    assert!(!workflow.contains("snapcraft"));
+    assert!(!workflow.contains("cargo build"));
 }
 
 #[test]

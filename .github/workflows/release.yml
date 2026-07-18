@@ -1499,7 +1499,13 @@ jobs:
             throw "Unexpected rmux version from Chocolatey install: $versionOutput"
           }
 
-          .\scripts\smoke-installed-rmux.ps1 -Rmux rmux -RequireDaemonCommand
+          # The signed Windows archive has already passed the runner-owned
+          # daemon smoke. GitHub's job object forbids detached daemon startup,
+          # so this channel gate checks the installed CLI and helper layout.
+          .\scripts\smoke-installed-rmux.ps1 `
+            -Rmux rmux `
+            -SkipDaemon `
+            -RequireDaemonCommand
           choco uninstall rmux --yes --no-progress
           "CHOCOLATEY_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append
 
