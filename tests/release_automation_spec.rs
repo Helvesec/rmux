@@ -531,7 +531,7 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         .split("\n  windows-test-archive-cache:\n")
         .nth(1)
         .expect("Windows test archive cache job")
-        .split("\n  windows-package-preflight:\n")
+        .split("\n  windows-package-build:\n")
         .next()
         .expect("bounded Windows test archive cache job");
 
@@ -734,7 +734,7 @@ fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
     for (job, next_job) in [
         ("snap-package", "nix-flake"),
         ("nix-flake", "linux-sdk-smoke"),
-        ("windows-package-preflight", "windows-cross"),
+        ("windows-package-build", "windows-package-runtime-smoke"),
     ] {
         let block = ci
             .split(&format!("\n  {job}:\n"))
@@ -829,31 +829,113 @@ fn windows_package_smokes_own_release_daemons_inside_the_runner_job() {
 #[test]
 fn ci_runs_the_windows_release_package_preflight_before_tagging() {
     let ci = include_str!("../.github/workflows/ci.yml");
-    let preflight = ci
+    let build = ci
+        .split("\n  windows-package-build:\n")
+        .nth(1)
+        .expect("Windows package build job")
+        .split("\n  windows-package-runtime-smoke:\n")
+        .next()
+        .expect("bounded Windows package build job");
+    let runtime = ci
+        .split("\n  windows-package-runtime-smoke:\n")
+        .nth(1)
+        .expect("Windows package runtime smoke job")
+        .split("\n  windows-package-harness-smoke:\n")
+        .next()
+        .expect("bounded Windows package runtime smoke job");
+    let harness = ci
+        .split("\n  windows-package-harness-smoke:\n")
+        .nth(1)
+        .expect("Windows package harness smoke job")
+        .split("\n  windows-package-preflight:\n")
+        .next()
+        .expect("bounded Windows package harness smoke job");
+    let gate = ci
         .split("\n  windows-package-preflight:\n")
         .nth(1)
-        .expect("Windows package preflight job")
+        .expect("Windows package preflight gate")
         .split("\n  windows-cross:\n")
         .next()
-        .expect("bounded Windows package preflight job");
+        .expect("bounded Windows package preflight gate");
 
-    assert!(preflight.contains("runs-on: windows-latest"));
-    assert!(preflight.contains("needs: windows-tests-gate"));
-    assert!(!preflight.contains("self-hosted"));
-    assert!(preflight.contains("./scripts/package-windows.ps1"));
-    assert!(preflight.contains("./scripts/verify-package-windows.ps1"));
     for required in [
-        "-RunBinary",
-        "-RunDaemonSmoke",
-        "-RunSdkSmoke",
-        "-RunMouseBorderSmoke",
+        "name: Windows release package build",
+        "runs-on: windows-latest",
+        "needs: windows-tests-gate",
+        "startsWith(github.ref, 'refs/tags/v')",
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: \"-C target-feature=+crt-static\"",
+        "windows-package-${{ runner.os }}-${{ runner.arch }}-rust-1.96.1-${{ hashFiles('Cargo.lock', 'scripts/package-windows.ps1', 'scripts/verify-package-windows.ps1') }}",
+        "./scripts/package-windows.ps1",
+        "./scripts/verify-package-windows.ps1",
         "-RequireReleaseArtifact",
+        "-ExpectedGitSha \"${{ github.sha }}\"",
+        "name: rmux-windows-package-${{ github.sha }}",
     ] {
         assert!(
-            preflight.contains(required),
-            "Windows package preflight lost {required}"
+            build.contains(required),
+            "Windows package build lost {required}"
         );
     }
+    assert!(!build.contains("self-hosted"));
+    assert!(!build.contains("-RunBinary"));
+    assert!(!build.contains("-RunDaemonSmoke"));
+    assert!(!build.contains("-RunSdkSmoke"));
+    assert!(!build.contains("-RunMouseBorderSmoke"));
+
+    for required in [
+        "name: Windows package runtime smoke",
+        "needs: windows-package-build",
+        "runs-on: windows-latest",
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: \"-C target-feature=+crt-static\"",
+        "name: rmux-windows-package-${{ github.sha }}",
+        "-RunBinary",
+        "-RunDaemonSmoke",
+        "-RequireReleaseArtifact",
+        "-ExpectedGitSha \"${{ github.sha }}\"",
+    ] {
+        assert!(
+            runtime.contains(required),
+            "Windows package runtime smoke lost {required}"
+        );
+    }
+
+    for required in [
+        "name: Windows package harness smoke (${{ matrix.smoke }})",
+        "needs: [windows-package-build, windows-test-archive]",
+        "runs-on: windows-latest",
+        "max-parallel: 2",
+        "smoke: [sdk, mouse]",
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: \"-C target-feature=+crt-static\"",
+        "name: rmux-windows-nextest-${{ github.sha }}",
+        "NextestArchive = \"target/windows-nextest.tar.zst\"",
+        "$arguments.RunSdkSmoke = $true",
+        "$arguments.RunMouseBorderSmoke = $true",
+        "RequireReleaseArtifact = $true",
+        "ExpectedGitSha = \"${{ github.sha }}\"",
+    ] {
+        assert!(
+            harness.contains(required),
+            "Windows package harness smoke lost {required}"
+        );
+    }
+
+    for required in [
+        "name: Windows release package preflight",
+        "always() &&",
+        "startsWith(github.ref, 'refs/tags/v')",
+        "needs: [windows-package-build, windows-package-runtime-smoke, windows-package-harness-smoke]",
+        "WINDOWS_PACKAGE_BUILD_RESULT: ${{ needs.windows-package-build.result }}",
+        "WINDOWS_PACKAGE_RUNTIME_RESULT: ${{ needs.windows-package-runtime-smoke.result }}",
+        "WINDOWS_PACKAGE_HARNESS_RESULT: ${{ needs.windows-package-harness-smoke.result }}",
+    ] {
+        assert!(
+            gate.contains(required),
+            "Windows package preflight gate lost {required}"
+        );
+    }
+    assert!(!runtime.contains("self-hosted"));
+    assert!(!harness.contains("self-hosted"));
+    assert!(!gate.contains("self-hosted"));
 }
 
 #[test]
