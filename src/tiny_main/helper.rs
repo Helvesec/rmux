@@ -234,6 +234,7 @@ fn full_helper_candidates(current_exe: &Path) -> Vec<PathBuf> {
             .join("libexec")
             .join("rmux")
             .join(helper_file_name()),
+        Path::new("/usr/lib/rmux/libexec").join(helper_file_name()),
     ]
 }
 
