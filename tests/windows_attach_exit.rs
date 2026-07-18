@@ -26,6 +26,7 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const CONPTY_STRESS_OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
 const CTRL_C_SYNTHETIC_ATTEMPTS: usize = 3;
 const CTRL_C_SYNTHETIC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+const CTRL_C_PROMPT_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const CTRL_D_SYNTHETIC_ATTEMPTS: usize = 3;
 const EXIT_LATENCY_TIMEOUT: Duration = Duration::from_secs(2);
 const EXIT_LATENCY_BUDGET: Duration = Duration::from_millis(250);
@@ -1480,7 +1481,9 @@ fn windows_send_keys_ctrl_c_multi_token_stops_ping_when_available() -> Result<()
         ],
     )?;
     run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
-    wait_for_capture_contains(&binary, &label, "sendping:0.0", b"PS ", SETUP_TIMEOUT)?;
+    let initial_capture =
+        wait_for_capture_contains(&binary, &label, "sendping:0.0", b"PS ", SETUP_TIMEOUT)?;
+    let initial_prompt_occurrences = count_occurrences(&initial_capture, b"PS ");
 
     run_rmux(
         &binary,
@@ -1499,7 +1502,19 @@ fn windows_send_keys_ctrl_c_multi_token_stops_ping_when_available() -> Result<()
         &label,
         ["send-keys", "-t", "sendping:0.0", "C-c", "Enter"],
     )?;
-    thread::sleep(Duration::from_millis(500));
+    let (prompt_returned, output) = capture_until_occurrences(
+        &binary,
+        &label,
+        "sendping:0.0",
+        b"PS ",
+        initial_prompt_occurrences + 1,
+        CTRL_C_PROMPT_READY_TIMEOUT,
+    )?;
+    assert!(
+        prompt_returned,
+        "send-keys Ctrl-C did not return to a fresh PowerShell prompt\n{}",
+        String::from_utf8_lossy(&output)
+    );
     run_rmux(
         &binary,
         &label,
