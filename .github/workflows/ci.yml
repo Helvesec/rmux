@@ -19,7 +19,7 @@ on:
       windows_package_smoke:
         description: Run the Windows release package preflight
         required: false
-        default: true
+        default: false
         type: boolean
       release_qualification:
         description: Run the deferred release qualification jobs
@@ -326,7 +326,7 @@ jobs:
 
   release-review-perf:
     name: Release review (perf)
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
     needs: windows-tests-gate
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -371,7 +371,7 @@ jobs:
 
   release-review-sections:
     name: Release review (${{ matrix.section }})
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
     needs: [linux-source-gates, windows-tests-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -444,7 +444,7 @@ jobs:
     name: Release review gate (no package)
     if: >-
       always() &&
-      (github.event_name == 'push' ||
+      (startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.release_qualification))
     needs: [release-review-perf, release-review-sections]
     runs-on: ubuntu-latest
@@ -460,7 +460,7 @@ jobs:
 
   snap-package:
     name: Snap package smoke
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
     needs: windows-tests-gate
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -484,7 +484,7 @@ jobs:
 
   nix-flake:
     name: Nix flake gate
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
     needs: windows-tests-gate
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -883,7 +883,10 @@ jobs:
 
   windows-package-preflight:
     name: Windows release package preflight
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.windows_package_smoke)
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+      (inputs.windows_package_smoke || inputs.release_qualification))
     needs: windows-tests-gate
     runs-on: windows-latest
     timeout-minutes: 90

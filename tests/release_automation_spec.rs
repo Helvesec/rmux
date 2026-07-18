@@ -675,6 +675,7 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
     for required in [
         "name: Release review (perf)",
         "needs: windows-tests-gate",
+        "startsWith(github.ref, 'refs/tags/v')",
         "inputs.release_qualification",
         "CARGO_BUILD_JOBS: \"4\"",
         "--section perf",
@@ -690,6 +691,7 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
     for required in [
         "name: Release review (${{ matrix.section }})",
         "needs: [linux-source-gates, windows-tests-gate]",
+        "startsWith(github.ref, 'refs/tags/v')",
         "inputs.release_qualification",
         "max-parallel: 6",
         "section: [static, lint, server, cli, tmux, runtime-sdk]",
@@ -708,6 +710,7 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
     for required in [
         "name: Release review gate (no package)",
         "always() &&",
+        "startsWith(github.ref, 'refs/tags/v')",
         "inputs.release_qualification",
         "needs: [release-review-perf, release-review-sections]",
         "RELEASE_REVIEW_PERF_RESULT: ${{ needs.release-review-perf.result }}",
@@ -743,6 +746,14 @@ fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
         assert!(
             block.contains("needs: windows-tests-gate"),
             "{job} must not contend with protected fast-lane jobs"
+        );
+        assert!(
+            block.contains("startsWith(github.ref, 'refs/tags/v')"),
+            "{job} must run for release tags"
+        );
+        assert!(
+            !block.contains("github.event_name == 'push'"),
+            "{job} must not extend ordinary main pushes"
         );
     }
 }
