@@ -509,6 +509,13 @@ fn windows_package_smokes_own_release_daemons_inside_the_runner_job() {
             "Windows package verification lost {required}"
         );
     }
+    assert!(verifier.contains("NewPackagePipeName([string]$Binary, [string]$Label)"));
+    assert!(verifier.contains("@(\"-L\", $Label, \"diagnose\", \"--json\")"));
+    assert!(verifier.contains("$diagnostics.socket_path"));
+    assert!(
+        !verifier.contains(r#"\\.\pipe\rmux-package-$component"#),
+        "package verification must use the identity-bound endpoint resolved by RMUX"
+    );
     assert!(sdk_harness.contains("RMUX_SDK_WINDOWS_SMOKE_PIPE"));
     assert!(sdk_harness.contains("builder(&pipe_name).connect().await?"));
     assert!(mouse_harness.contains("RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN"));

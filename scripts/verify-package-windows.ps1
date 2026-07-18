@@ -105,9 +105,24 @@ function AssertDaemonBinary([string]$Binary) {
     }
 }
 
-function NewPackagePipeName([string]$Label) {
-    $component = $Label -replace '[^A-Za-z0-9._-]', '-'
-    return "\\.\pipe\rmux-package-$component"
+function NewPackagePipeName([string]$Binary, [string]$Label) {
+    $result = Invoke-NativeCapture $Binary @("-L", $Label, "diagnose", "--json")
+    if ($result.Status -ne 0) {
+        Fail "failed to resolve package pipe for label '$Label': $Binary diagnose --json; $($result.Output)"
+    }
+
+    try {
+        $diagnostics = ($result.Output -join [Environment]::NewLine) | ConvertFrom-Json
+    } catch {
+        Fail "package binary returned invalid diagnose JSON for label '$Label': $($result.Output)"
+    }
+
+    $pipePath = [string]$diagnostics.socket_path
+    if ([string]::IsNullOrWhiteSpace($pipePath) -or
+        $pipePath -notmatch '^\\\\\.\\pipe\\rmux-.+-il-(untrusted|low|medium|high|system)-.+$') {
+        Fail "package binary returned a non-canonical Windows pipe for label '$Label': $pipePath"
+    }
+    return $pipePath
 }
 
 function Remove-PackageDaemon([object]$Daemon) {
@@ -306,7 +321,7 @@ function AssertOutputContains([object[]]$Output, [string]$Needle, [string]$Conte
 function InvokeSdkWindowsSmoke([string]$Binary, [string]$DaemonBinary) {
     $previousBinary = $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN
     $previousPipe = $env:RMUX_SDK_WINDOWS_SMOKE_PIPE
-    $pipePath = NewPackagePipeName "sdk-smoke-$PID-$([guid]::NewGuid().ToString('N'))"
+    $pipePath = NewPackagePipeName $Binary "sdk-smoke-$PID-$([guid]::NewGuid().ToString('N'))"
     $daemon = Start-PackageDaemon $DaemonBinary $pipePath
     try {
         $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
@@ -472,7 +487,7 @@ function AssertArchiveInstallerTransaction([string]$InstallScript, [string]$Pack
     $helperBackup = Join-Path $Root "package-helper-backup.exe"
     $readmeBackup = Join-Path $Root "package-readme-backup.md"
     $label = "package-installer-transaction-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    $pipePath = NewPackagePipeName $label
+    $pipePath = NewPackagePipeName $installedBinary $label
     $daemon = $null
 
     Copy-Item -LiteralPath $packageHelper -Destination $helperBackup
@@ -918,7 +933,7 @@ try {
 
     if ($RunDaemonSmoke) {
         $label = "package-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-        $pipePath = NewPackagePipeName $label
+        $pipePath = NewPackagePipeName $binary $label
         $daemon = $null
         try {
             $webPort = Get-FreeTcpPort
@@ -945,7 +960,7 @@ try {
         }
 
         $fallbackLabel = "package-fallback-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-        $fallbackPipePath = NewPackagePipeName $fallbackLabel
+        $fallbackPipePath = NewPackagePipeName $binary $fallbackLabel
         $previousDisableTiny = $env:RMUX_DISABLE_TINY_CLI
         $fallbackDaemon = $null
         try {
@@ -969,7 +984,7 @@ try {
 
         if ($portableAlias.Available) {
             $portableAliasLabel = "package-alias-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-            $portableAliasPipePath = NewPackagePipeName $portableAliasLabel
+            $portableAliasPipePath = NewPackagePipeName $binary $portableAliasLabel
             $portableAliasDaemon = $null
             try {
                 $portableAliasDaemon = Start-PackageDaemon $daemonBinary $portableAliasPipePath
