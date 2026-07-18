@@ -789,6 +789,7 @@ jobs:
     env:
       RUST_MIN_STACK: "8388608"
       RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: "1"
+      RMUX_WINDOWS_SMOKE_RMUX_BIN: ${{ github.workspace }}/target/debug/rmux.exe
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 

@@ -572,6 +572,7 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         "--extract-overwrite",
         "--partition \"slice:${{ matrix.shard }}/18\"",
         "--test-threads num-cpus",
+        "RMUX_WINDOWS_SMOKE_RMUX_BIN: ${{ github.workspace }}/target/debug/rmux.exe",
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
     ] {
         assert!(
@@ -622,6 +623,28 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         !ci.contains("cargo test workspace on Windows"),
         "the serial Windows workspace test must not return"
     );
+}
+
+#[test]
+fn windows_smokes_can_reuse_the_binary_from_the_nextest_archive() {
+    let build_support = include_str!("support/windows_cargo_build.rs");
+    assert!(build_support.contains(
+        "pub(crate) const PREBUILT_RMUX_BINARY_ENV: &str = \"RMUX_WINDOWS_SMOKE_RMUX_BIN\""
+    ));
+    assert!(build_support.contains("pub(crate) fn prebuilt_rmux_binary()"));
+    assert!(build_support.contains("points to a missing rmux binary"));
+
+    for source in [
+        include_str!("../crates/rmux-sdk/tests/common/windows_smoke.rs"),
+        include_str!("../crates/ratatui-rmux/tests/ratatui_real_daemon_render_smoke_windows.rs"),
+        include_str!("../crates/rmux-server/tests/status_windows.rs"),
+        include_str!("../crates/rmux-server/tests/send_keys_windows.rs"),
+    ] {
+        assert!(
+            source.contains("windows_cargo_build::prebuilt_rmux_binary()?"),
+            "Windows smoke lost the shared prebuilt rmux fast path"
+        );
+    }
 }
 
 #[test]
