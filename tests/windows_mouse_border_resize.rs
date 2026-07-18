@@ -637,7 +637,7 @@ impl ServerGuard {
                 let ready = rmux_os::daemon::StartupReadyEvent::new()?;
                 let mut child = Command::new(binary)
                     .arg("--__internal-daemon")
-                    .arg(package_pipe_name(&label))
+                    .arg(package_pipe_name(&label)?)
                     .arg("--startup-ready-event")
                     .arg(ready.name())
                     .stdin(Stdio::null())
@@ -695,15 +695,26 @@ fn rmux_command(label: &str) -> Command {
 }
 
 fn rmux_endpoint_args(label: &str) -> Vec<String> {
-    if std::env::var_os(RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN_ENV).is_some() {
-        vec!["-S".to_owned(), package_pipe_name(label)]
-    } else {
-        vec!["-L".to_owned(), label.to_owned()]
-    }
+    vec!["-L".to_owned(), label.to_owned()]
 }
 
-fn package_pipe_name(label: &str) -> String {
-    format!(r"\\.\pipe\rmux-package-mouse-{label}")
+fn package_pipe_name(label: &str) -> Result<String, Box<dyn Error>> {
+    let output = assert_success(
+        Command::new(rmux_binary())
+            .args(["-L", label, "diagnose", "--json"])
+            .stdin(Stdio::null())
+            .output()?,
+        "resolve packaged mouse smoke endpoint",
+    )?;
+    let diagnostics: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let pipe_name = diagnostics
+        .get("socket_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("diagnose output omitted socket_path")?;
+    if !pipe_name.starts_with(r"\\.\pipe\rmux-") || !pipe_name.contains("-il-") {
+        return Err(format!("diagnose returned a non-canonical Windows pipe: {pipe_name}").into());
+    }
+    Ok(pipe_name.to_owned())
 }
 
 fn rmux_binary() -> std::path::PathBuf {

@@ -519,7 +519,13 @@ fn windows_package_smokes_own_release_daemons_inside_the_runner_job() {
     assert!(sdk_harness.contains("RMUX_SDK_WINDOWS_SMOKE_PIPE"));
     assert!(sdk_harness.contains("builder(&pipe_name).connect().await?"));
     assert!(mouse_harness.contains("RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN"));
-    assert!(mouse_harness.contains("rmux-package-mouse-{label}"));
+    assert!(mouse_harness.contains(".args([\"-L\", label, \"diagnose\", \"--json\"])"));
+    assert!(mouse_harness.contains(".get(\"socket_path\")"));
+    assert!(mouse_harness.contains("vec![\"-L\".to_owned(), label.to_owned()]"));
+    assert!(
+        !mouse_harness.contains(r"\\.\pipe\rmux-package-mouse"),
+        "mouse package smoke must not handcraft a Windows pipe name"
+    );
     assert!(mouse_harness.contains("rmux_os::daemon::StartupReadyEvent::new()?"));
     assert!(daemon_policy.contains(
         "#[cfg(all(windows, not(debug_assertions)))]\nconst fn internal_caller_job_test_opt_in_enabled() -> bool {\n    false"
