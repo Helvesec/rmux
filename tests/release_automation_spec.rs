@@ -726,7 +726,8 @@ fn windows_package_smokes_own_release_daemons_inside_the_runner_job() {
     assert!(verifier.contains(
         "$mouseTest = \"mouse_drag_on_vertical_border_resizes_horizontal_split_through_attach_binding\""
     ));
-    assert!(verifier.contains("& \"$PSScriptRoot/assert-cargo-filter-nonempty.ps1\""));
+    assert!(verifier.contains("$filterArgs = @("));
+    assert!(verifier.contains("& \"$PSScriptRoot/assert-cargo-filter-nonempty.ps1\" @filterArgs"));
     assert!(verifier.contains("\"--exact\""));
     assert!(verifier.contains("\"--test-threads=1\""));
     assert!(

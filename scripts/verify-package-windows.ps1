@@ -369,7 +369,7 @@ function InvokeMouseBorderSmoke([string]$Binary, [string]$DaemonBinary) {
     try {
         $env:RMUX_MOUSE_BORDER_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
         $env:RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN = [System.IO.Path]::GetFullPath($DaemonBinary)
-        & "$PSScriptRoot/assert-cargo-filter-nonempty.ps1" @(
+        $filterArgs = @(
             "1",
             "--",
             "test",
@@ -380,6 +380,7 @@ function InvokeMouseBorderSmoke([string]$Binary, [string]$DaemonBinary) {
             "windows_mouse_border_resize",
             $mouseTest
         )
+        & "$PSScriptRoot/assert-cargo-filter-nonempty.ps1" @filterArgs
         if ($LASTEXITCODE -ne 0) {
             Fail "Windows mouse border package smoke filter failed with exit code $LASTEXITCODE"
         }
