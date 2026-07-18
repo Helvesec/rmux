@@ -1361,30 +1361,17 @@ fn windows_send_keys_ctrl_c_targets_only_selected_pane_and_preserves_sibling_and
         wait_for_capture_contains(&binary, &label, target, b"TTL=", SETUP_TIMEOUT)?;
     }
 
-    run_rmux(
-        &binary,
-        &label,
-        ["send-keys", "-t", "targetonly:0.0", "C-c"],
-    )?;
-    thread::sleep(Duration::from_millis(500));
-    run_rmux(
-        &binary,
-        &label,
-        [
-            "send-keys",
-            "-t",
-            "targetonly:0.0",
-            "Write-Output RMUX_TARGET_CTRL_C_DONE",
-            "Enter",
-        ],
-    )?;
-    wait_for_capture_contains(
+    let target = send_rmux_ctrl_c_and_wait_for_marker(
         &binary,
         &label,
         "targetonly:0.0",
-        b"RMUX_TARGET_CTRL_C_DONE",
-        EXIT_TIMEOUT,
+        "RMUX_TARGET_CTRL_C_DONE",
     )?;
+    assert!(
+        target.returned_to_prompt,
+        "send-keys Ctrl-C did not stop ping in the selected pane\n{}",
+        String::from_utf8_lossy(&target.output)
+    );
 
     run_rmux(
         &binary,

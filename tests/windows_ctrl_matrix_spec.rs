@@ -91,22 +91,23 @@ fn windows_ctrl_matrix_implementation(script: &str) -> String {
 }
 
 #[test]
-fn platform_runtime_installs_clippy_before_running_the_windows_msvc_gate() {
+fn windows_test_build_installs_clippy_before_running_the_windows_msvc_gate() {
     let workflow = include_str!("../.github/workflows/ci.yml");
-    let platform_runtime = workflow
-        .split_once("\n  platform-runtime:\n")
+    let windows_test_build = workflow
+        .split_once("\n  windows-test-build:\n")
         .map(|(_, suffix)| suffix)
-        .and_then(|suffix| suffix.split_once("\n  windows-cross:\n"))
+        .and_then(|suffix| suffix.split_once("\n  windows-tests:\n"))
         .map(|(section, _)| section)
-        .expect("platform-runtime workflow section");
+        .expect("windows-test-build workflow section");
 
     assert!(
-        platform_runtime.contains("toolchain: \"1.96.1\"\n          components: clippy"),
-        "platform-runtime must install cargo-clippy for windows-latest"
+        windows_test_build.contains("toolchain: \"1.96.1\"\n          components: clippy"),
+        "windows-test-build must install cargo-clippy for windows-latest"
     );
     assert!(
-        platform_runtime.contains("cargo clippy --workspace --all-targets --locked -- -D warnings"),
-        "platform-runtime must keep the Windows MSVC clippy gate"
+        windows_test_build
+            .contains("cargo clippy --workspace --all-targets --locked -- -D warnings"),
+        "windows-test-build must keep the Windows MSVC clippy gate"
     );
 }
 

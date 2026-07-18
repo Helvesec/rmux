@@ -319,19 +319,19 @@ jobs:
           RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
         run: cargo test --locked --test tmux_compat_harness -- --test-threads=1
 
-  release-review-gate:
-    name: Release review gate (no package)
+  release-review-perf:
+    name: Release review (perf)
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 90
     env:
       RUST_MIN_STACK: "8388608"
+      CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: "1.96.1"
-          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -348,7 +348,58 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
+      - name: Release review performance section
+        env:
+          RMUX_PERF_AUTO_CURRENT: "1"
+          RMUX_PERF_GATE_MODE: portable-budget
+          RMUX_PERF_EXPECTED_GIT_SHA: ${{ github.sha }}
+          RMUX_PERF_EXPECTED_PLATFORM: linux
+          RMUX_PERF_EXPECTED_PROVENANCE: github-actions:${{ github.repository }}:${{ github.workflow }}:${{ github.job }}:perf:${{ github.run_id }}:${{ github.run_attempt }}
+          RMUX_PERF_MAX_CURRENT_AGE_SECONDS: "21600"
+        run: >-
+          scripts/release-review-gate.sh
+          --skip-package
+          --section perf
+          --target-dir target/release-review-ci-perf
+
+  release-review-sections:
+    name: Release review (${{ matrix.section }})
+    needs: linux-source-gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        section: [static, lint, server, cli, tmux, runtime-sdk]
+    env:
+      RUST_MIN_STACK: "8388608"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.96.1"
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ matrix.section }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ matrix.section }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
       - name: Install tmux oracle build dependencies
+        if: matrix.section == 'tmux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -362,9 +413,10 @@ jobs:
             pkg-config
 
       - name: Build pinned tmux 3.7b oracle
+        if: matrix.section == 'tmux'
         run: scripts/oracle/build-tmux37.sh --prefix "$RUNNER_TEMP/rmux-oracle"
 
-      - name: Release review gate
+      - name: Release review section
         env:
           RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
           RMUX_REQUIRE_TMUX: "1"
@@ -372,9 +424,28 @@ jobs:
           RMUX_PERF_GATE_MODE: portable-budget
           RMUX_PERF_EXPECTED_GIT_SHA: ${{ github.sha }}
           RMUX_PERF_EXPECTED_PLATFORM: linux
-          RMUX_PERF_EXPECTED_PROVENANCE: github-actions:${{ github.repository }}:${{ github.workflow }}:${{ github.job }}:${{ github.run_id }}:${{ github.run_attempt }}
+          RMUX_PERF_EXPECTED_PROVENANCE: github-actions:${{ github.repository }}:${{ github.workflow }}:${{ github.job }}:${{ matrix.section }}:${{ github.run_id }}:${{ github.run_attempt }}
           RMUX_PERF_MAX_CURRENT_AGE_SECONDS: "21600"
-        run: scripts/release-review-gate.sh --skip-package --target-dir target/release-review-ci
+        run: >-
+          scripts/release-review-gate.sh
+          --skip-package
+          --section ${{ matrix.section }}
+          --target-dir target/release-review-ci-${{ matrix.section }}
+
+  release-review-gate:
+    name: Release review gate (no package)
+    if: always()
+    needs: [release-review-perf, release-review-sections]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every release review section
+        env:
+          RELEASE_REVIEW_PERF_RESULT: ${{ needs.release-review-perf.result }}
+          RELEASE_REVIEW_RESULT: ${{ needs.release-review-sections.result }}
+        run: |
+          test "$RELEASE_REVIEW_PERF_RESULT" = success
+          test "$RELEASE_REVIEW_RESULT" = success
 
   snap-package:
     name: Snap package smoke
@@ -546,7 +617,6 @@ jobs:
         os:
           - macos-15-intel
           - macos-15
-          - windows-latest
     env:
       RUST_MIN_STACK: "8388608"
       RUST_TEST_THREADS: "1"
@@ -556,7 +626,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: "1.96.1"
-          components: clippy
 
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
@@ -581,26 +650,221 @@ jobs:
       - name: cargo build
         run: cargo build --workspace --locked
 
-      - name: cargo clippy on Windows MSVC
-        if: runner.os == 'Windows'
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
       - name: cargo test portable crates
-        if: runner.os != 'Windows'
         run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core -p rmux-client
 
       - name: cargo test macOS direct /tmp socket path
         if: runner.os == 'macOS'
         run: cargo test --locked -p rmux --test cli_surface socket_path_flag_can_start_directly_under_tmp -- --exact --test-threads=1
 
-      - name: cargo test workspace on Windows
-        if: runner.os == 'Windows'
-        env:
-          RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: "1"
-        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
+      - name: rmux binary smoke
+        run: cargo run --package rmux --bin rmux --locked -- -V
+
+  windows-test-archive:
+    name: Windows workspace test archive
+    runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      cache_hit: ${{ steps.archive-cache.outputs.cache-hit }}
+    env:
+      RUST_MIN_STACK: "8388608"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Restore reusable Windows test archive
+        id: archive-cache
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target/windows-nextest.tar.zst
+          key: windows-nextest-${{ runner.os }}-${{ github.sha }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        with:
+          toolchain: "1.96.1"
+
+      - name: Install cargo-nextest
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
+        with:
+          tool: nextest@0.9.138
+          fallback: none
+
+      - name: Restore cargo cache
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-windows-latest-nextest-archive-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-windows-latest-nextest-archive-
+            cargo-windows-latest-platform-runtime-
+
+      - name: Configure temporary paths
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "RMUX_TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Fetch locked dependencies
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        run: cargo fetch --locked
+
+      - name: Build Windows test archive
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        run: cargo nextest archive --workspace --locked --archive-file target/windows-nextest.tar.zst
+
+      - name: Upload Windows test archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rmux-windows-nextest-${{ github.sha }}
+          path: target/windows-nextest.tar.zst
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  windows-test-build:
+    name: Windows build, lint, docs, and smoke
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      RUST_MIN_STACK: "8388608"
+      RUST_TEST_THREADS: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.96.1"
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-windows-latest-platform-runtime-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-windows-latest-platform-runtime-${{ hashFiles('Cargo.lock') }}-
+            cargo-windows-latest-platform-runtime-
+
+      - name: Configure temporary paths
+        shell: bash
+        run: |
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "RMUX_TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: cargo build
+        run: cargo build --workspace --locked
+
+      - name: cargo clippy on Windows MSVC
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test Windows doctests
+        run: cargo test --workspace --doc --locked -- --test-threads=1
 
       - name: rmux binary smoke
         run: cargo run --package rmux --bin rmux --locked -- -V
+
+  windows-tests:
+    name: Windows workspace tests (${{ matrix.shard }}/18)
+    needs: windows-test-archive
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+    env:
+      RUST_MIN_STACK: "8388608"
+      RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.96.1"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
+        with:
+          tool: nextest@0.9.138
+          fallback: none
+
+      - name: Configure temporary paths
+        shell: bash
+        run: |
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "RMUX_TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Download Windows test archive
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rmux-windows-nextest-${{ github.sha }}
+          path: target
+
+      - name: Run Windows test shard
+        shell: pwsh
+        run: |
+          cargo nextest run `
+            --archive-file target/windows-nextest.tar.zst `
+            --extract-to "$env:GITHUB_WORKSPACE" `
+            --extract-overwrite `
+            --workspace-remap "$env:GITHUB_WORKSPACE" `
+            --partition "slice:${{ matrix.shard }}/18" `
+            --no-fail-fast `
+            --test-threads num-cpus
+
+  windows-tests-gate:
+    name: Platform build and smoke on windows-latest
+    if: always()
+    needs: [windows-test-build, windows-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every Windows test shard
+        env:
+          WINDOWS_BUILD_RESULT: ${{ needs.windows-test-build.result }}
+          WINDOWS_TESTS_RESULT: ${{ needs.windows-tests.result }}
+        run: |
+          test "$WINDOWS_BUILD_RESULT" = success
+          test "$WINDOWS_TESTS_RESULT" = success
+
+  windows-test-archive-cache:
+    name: Cache reusable Windows test archive
+    if: >-
+      always() &&
+      needs.windows-test-archive.result == 'success' &&
+      needs.windows-tests-gate.result == 'success' &&
+      needs.windows-test-archive.outputs.cache_hit != 'true'
+    needs: [windows-test-archive, windows-tests-gate]
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download Windows test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: rmux-windows-nextest-${{ github.sha }}
+          path: target
+
+      - name: Cache Windows test archive
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: target/windows-nextest.tar.zst
+          key: windows-nextest-${{ runner.os }}-${{ github.sha }}
 
   windows-package-preflight:
     name: Windows release package preflight

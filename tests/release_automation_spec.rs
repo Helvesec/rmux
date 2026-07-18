@@ -489,6 +489,217 @@ fn github_windows_tests_keep_debug_daemons_inside_the_runner_job() {
 }
 
 #[test]
+fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let nextest = include_str!("../.config/nextest.toml");
+    let macos = ci
+        .split("\n  platform-runtime:\n")
+        .nth(1)
+        .expect("macOS platform runtime job")
+        .split("\n  windows-test-archive:\n")
+        .next()
+        .expect("bounded macOS platform runtime job");
+    let archive = ci
+        .split("\n  windows-test-archive:\n")
+        .nth(1)
+        .expect("Windows test archive job")
+        .split("\n  windows-test-build:\n")
+        .next()
+        .expect("bounded Windows test archive job");
+    let build = ci
+        .split("\n  windows-test-build:\n")
+        .nth(1)
+        .expect("Windows test build job")
+        .split("\n  windows-tests:\n")
+        .next()
+        .expect("bounded Windows test build job");
+    let shards = ci
+        .split("\n  windows-tests:\n")
+        .nth(1)
+        .expect("Windows test shard job")
+        .split("\n  windows-tests-gate:\n")
+        .next()
+        .expect("bounded Windows test shard job");
+    let gate = ci
+        .split("\n  windows-tests-gate:\n")
+        .nth(1)
+        .expect("Windows test aggregate gate")
+        .split("\n  windows-test-archive-cache:\n")
+        .next()
+        .expect("bounded Windows test aggregate gate");
+    let archive_cache = ci
+        .split("\n  windows-test-archive-cache:\n")
+        .nth(1)
+        .expect("Windows test archive cache job")
+        .split("\n  windows-package-preflight:\n")
+        .next()
+        .expect("bounded Windows test archive cache job");
+
+    assert!(!macos.contains("windows-latest"));
+    for required in [
+        "name: Windows workspace test archive",
+        "runs-on: windows-latest",
+        "id: archive-cache",
+        "key: windows-nextest-${{ runner.os }}-${{ github.sha }}",
+        "actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830",
+        "cargo nextest archive --workspace --locked",
+        "target/windows-nextest.tar.zst",
+        "compression-level: 0",
+    ] {
+        assert!(
+            archive.contains(required),
+            "Windows test archive lost required snippet {required:?}"
+        );
+    }
+    for required in [
+        "name: Windows build, lint, docs, and smoke",
+        "runs-on: windows-latest",
+        "cargo test --workspace --doc --locked",
+        "cargo clippy --workspace --all-targets --locked -- -D warnings",
+        "key: cargo-windows-latest-platform-runtime-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}",
+    ] {
+        assert!(
+            build.contains(required),
+            "Windows test build lost required snippet {required:?}"
+        );
+    }
+    for required in [
+        "needs: windows-test-archive",
+        "name: Windows workspace tests (${{ matrix.shard }}/18)",
+        "max-parallel: 18",
+        "shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]",
+        "--extract-to \"$env:GITHUB_WORKSPACE\"",
+        "--extract-overwrite",
+        "--partition \"slice:${{ matrix.shard }}/18\"",
+        "--test-threads num-cpus",
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    ] {
+        assert!(
+            shards.contains(required),
+            "Windows test sharding lost required snippet {required:?}"
+        );
+    }
+    assert!(!archive.contains("needs:"));
+    assert!(!build.contains("needs:"));
+    assert!(!archive.contains("self-hosted"));
+    assert!(!build.contains("self-hosted"));
+    assert!(!shards.contains("self-hosted"));
+    assert_eq!(
+        nextest
+            .matches("threads-required = \"num-test-threads\"")
+            .count(),
+        2,
+        "Windows console tests must be exclusive while other shard tests stay parallel"
+    );
+    for required in [
+        "name: Platform build and smoke on windows-latest",
+        "if: always()",
+        "needs: [windows-test-build, windows-tests]",
+        "WINDOWS_BUILD_RESULT: ${{ needs.windows-test-build.result }}",
+        "WINDOWS_TESTS_RESULT: ${{ needs.windows-tests.result }}",
+        "test \"$WINDOWS_BUILD_RESULT\" = success",
+        "test \"$WINDOWS_TESTS_RESULT\" = success",
+    ] {
+        assert!(
+            gate.contains(required),
+            "Windows test aggregate gate lost required snippet {required:?}"
+        );
+    }
+    for required in [
+        "name: Cache reusable Windows test archive",
+        "needs: [windows-test-archive, windows-tests-gate]",
+        "needs.windows-tests-gate.result == 'success'",
+        "needs.windows-test-archive.outputs.cache_hit != 'true'",
+        "actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830",
+        "key: windows-nextest-${{ runner.os }}-${{ github.sha }}",
+    ] {
+        assert!(
+            archive_cache.contains(required),
+            "Windows test archive caching lost required snippet {required:?}"
+        );
+    }
+    assert!(
+        !ci.contains("cargo test workspace on Windows"),
+        "the serial Windows workspace test must not return"
+    );
+}
+
+#[test]
+fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let perf = ci
+        .split("\n  release-review-perf:\n")
+        .nth(1)
+        .expect("release review performance job")
+        .split("\n  release-review-sections:\n")
+        .next()
+        .expect("bounded release review performance job");
+    let sections = ci
+        .split("\n  release-review-sections:\n")
+        .nth(1)
+        .expect("release review sections job")
+        .split("\n  release-review-gate:\n")
+        .next()
+        .expect("bounded release review sections job");
+    let gate = ci
+        .split("\n  release-review-gate:\n")
+        .nth(1)
+        .expect("release review aggregate gate")
+        .split("\n  snap-package:\n")
+        .next()
+        .expect("bounded release review aggregate gate");
+
+    for required in [
+        "name: Release review (perf)",
+        "CARGO_BUILD_JOBS: \"4\"",
+        "--section perf",
+        "target/release-review-ci-perf",
+        "${{ github.job }}-${{ hashFiles('Cargo.lock') }}",
+    ] {
+        assert!(
+            perf.contains(required),
+            "early performance review lost required snippet {required:?}"
+        );
+    }
+    assert!(
+        !perf.contains("needs:"),
+        "performance review must be eligible at workflow start"
+    );
+
+    for required in [
+        "name: Release review (${{ matrix.section }})",
+        "needs: linux-source-gates",
+        "max-parallel: 6",
+        "section: [static, lint, server, cli, tmux, runtime-sdk]",
+        "CARGO_BUILD_JOBS: \"4\"",
+        "if: matrix.section == 'tmux'",
+        "--section ${{ matrix.section }}",
+        "target/release-review-ci-${{ matrix.section }}",
+        "${{ matrix.section }}-${{ hashFiles('Cargo.lock') }}",
+    ] {
+        assert!(
+            sections.contains(required),
+            "release review sharding lost required snippet {required:?}"
+        );
+    }
+
+    for required in [
+        "name: Release review gate (no package)",
+        "if: always()",
+        "needs: [release-review-perf, release-review-sections]",
+        "RELEASE_REVIEW_PERF_RESULT: ${{ needs.release-review-perf.result }}",
+        "RELEASE_REVIEW_RESULT: ${{ needs.release-review-sections.result }}",
+        "test \"$RELEASE_REVIEW_PERF_RESULT\" = success",
+        "test \"$RELEASE_REVIEW_RESULT\" = success",
+    ] {
+        assert!(
+            gate.contains(required),
+            "release review aggregate gate lost required snippet {required:?}"
+        );
+    }
+}
+
+#[test]
 fn windows_package_smokes_own_release_daemons_inside_the_runner_job() {
     let verifier = include_str!("../scripts/verify-package-windows.ps1");
     let sdk_harness = include_str!("../crates/rmux-sdk/tests/common/windows_smoke.rs");
