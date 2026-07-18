@@ -234,9 +234,12 @@ if ($buildsReleaseMsvc -and $originalRustFlags -notlike "*+crt-static*") {
 }
 try {
     if (-not $SkipBuild -and -not $ReuseReleaseBinaries) {
-        & cargo @cargoArgs --bin rmux
+        # Build the daemon with the full helper before enabling tiny-cli. The
+        # packaged daemon must retain web support even though the public binary
+        # is relinked with the tiny command surface below.
+        & cargo @cargoArgs --bin rmux --bin rmux-daemon
         if ($LASTEXITCODE -ne 0) {
-            Fail "cargo build full rmux helper failed"
+            Fail "cargo build full rmux helper and daemon failed"
         }
         Copy-Item -LiteralPath $binary -Destination $helperBinary -Force
 
@@ -245,14 +248,6 @@ try {
         & cargo @tinyCargoArgs --bin rmux
         if ($LASTEXITCODE -ne 0) {
             Fail "cargo build tiny rmux failed"
-        }
-        # Keep the packaged hidden daemon web-capable. The public binary can still
-        # use the tiny CLI fast path, but sessions it starts must remain shareable
-        # later from a fresh `rmux web-share` invocation.
-        $daemonCargoArgs = @($cargoArgs)
-        & cargo @daemonCargoArgs --bin rmux-daemon
-        if ($LASTEXITCODE -ne 0) {
-            Fail "cargo build rmux-daemon failed"
         }
     }
 } finally {
