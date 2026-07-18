@@ -533,6 +533,35 @@ fn windows_package_smokes_own_release_daemons_inside_the_runner_job() {
 }
 
 #[test]
+fn ci_runs_the_windows_release_package_preflight_before_tagging() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let preflight = ci
+        .split("\n  windows-package-preflight:\n")
+        .nth(1)
+        .expect("Windows package preflight job")
+        .split("\n  windows-cross:\n")
+        .next()
+        .expect("bounded Windows package preflight job");
+
+    assert!(preflight.contains("runs-on: windows-latest"));
+    assert!(!preflight.contains("self-hosted"));
+    assert!(preflight.contains("./scripts/package-windows.ps1"));
+    assert!(preflight.contains("./scripts/verify-package-windows.ps1"));
+    for required in [
+        "-RunBinary",
+        "-RunDaemonSmoke",
+        "-RunSdkSmoke",
+        "-RunMouseBorderSmoke",
+        "-RequireReleaseArtifact",
+    ] {
+        assert!(
+            preflight.contains(required),
+            "Windows package preflight lost {required}"
+        );
+    }
+}
+
+#[test]
 fn release_publication_waits_for_native_and_package_validations() {
     let release = include_str!("../.github/workflows/release.yml");
     assert!(release.contains("concurrency:\n  group: rmux-release\n  cancel-in-progress: false"));
