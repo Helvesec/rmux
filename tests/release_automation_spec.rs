@@ -592,6 +592,31 @@ fn release_publication_waits_for_native_and_package_validations() {
     assert!(platform_gates.contains("name: macOS native runtime smoke"));
     assert!(platform_gates.contains("run: scripts/smoke-macos.sh"));
 
+    let external_validation = release
+        .split("\n  validate-external-configuration:\n")
+        .nth(1)
+        .expect("external rollout validation job")
+        .split("\n  package-repository-snapshot:\n")
+        .next()
+        .expect("bounded external rollout validation job");
+    assert!(external_validation.contains("gh api \"repos/$RMUX_PACKAGE_REPO\""));
+    assert!(external_validation.contains(".permissions.push // false"));
+    assert!(external_validation.contains("case \"${RELEASE_REF#v}\" in"));
+    assert!(!external_validation.contains("needs:\n      - source-gates"));
+
+    let package_snapshot = release
+        .split("\n  package-repository-snapshot:\n")
+        .nth(1)
+        .expect("package repository snapshot job")
+        .split("\n  prepare-release:\n")
+        .next()
+        .expect("bounded package repository snapshot job");
+    assert!(package_snapshot.contains("name: Snapshot retained Linux package history"));
+    assert!(package_snapshot.contains("GH_TOKEN: ${{ secrets.RMUX_PACKAGE_REPO_TOKEN }}"));
+    assert!(package_snapshot.contains("gh repo clone \"$RMUX_PACKAGE_REPO\""));
+    assert!(package_snapshot.contains("package-repository-history.tar.gz"));
+    assert!(!package_snapshot.contains("git push"));
+
     let prepare = release
         .split("\n  prepare-release:\n")
         .nth(1)
@@ -600,9 +625,17 @@ fn release_publication_waits_for_native_and_package_validations() {
         .next()
         .expect("bounded release preparation job");
     assert!(prepare.contains("name: Prepare signed release draft"));
-    assert!(prepare.contains("- source-gates\n      - build\n      - platform-gates\n      - snap"));
+    assert!(prepare.contains(
+        "- source-gates\n      - build\n      - platform-gates\n      - snap\n      - package-repository-snapshot"
+    ));
     assert!(prepare.contains("--draft"));
     assert!(prepare.contains("gh release upload"));
+    assert!(prepare.contains("pattern: rmux-${{ env.RELEASE_REF }}-*"));
+    assert!(prepare.contains("name: package-repository-history-${{ env.RELEASE_REF }}"));
+    assert!(
+        prepare.contains("target/package-repository-snapshot/package-repository-history.tar.gz")
+    );
+    assert!(!prepare.contains("git clone"));
     let current_assets = prepare
         .find("sha256sum --check --strict SHA256SUMS")
         .expect("current release asset validation");

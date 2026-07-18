@@ -579,10 +579,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: release
-    needs:
-      - source-gates
     env:
-      IS_PRERELEASE: ${{ needs.source-gates.outputs.is_prerelease }}
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      RMUX_PACKAGE_REPO: Helvesec/rmux-packages
     steps:
       - name: Require configured external publishers
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
@@ -593,19 +592,73 @@ jobs:
           CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
         run: |
           missing=0
+          is_prerelease=false
+          case "${RELEASE_REF#v}" in
+            *-*) is_prerelease=true ;;
+          esac
           if [ -z "${SNAPCRAFT_STORE_CREDENTIALS:-}" ]; then
             echo "Missing required secret: SNAPCRAFT_STORE_CREDENTIALS" >&2
             missing=1
           fi
-          if [ "$IS_PRERELEASE" != "true" ]; then
+          if [ "$is_prerelease" != "true" ]; then
             for name in RMUX_PACKAGE_REPO_TOKEN CHOCOLATEY_API_KEY; do
               if [ -z "${!name:-}" ]; then
                 echo "Missing required secret: $name" >&2
                 missing=1
               fi
             done
+            if [ "$missing" -eq 0 ]; then
+              permission="$(
+                GH_TOKEN="$RMUX_PACKAGE_REPO_TOKEN" \
+                  gh api "repos/$RMUX_PACKAGE_REPO" --jq '.permissions.push // false'
+              )"
+              if [ "$permission" != "true" ]; then
+                echo "RMUX_PACKAGE_REPO_TOKEN cannot write $RMUX_PACKAGE_REPO" >&2
+                missing=1
+              fi
+            fi
           fi
           [ "$missing" -eq 0 ]
+
+  package-repository-snapshot:
+    name: Snapshot retained Linux package history
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    needs:
+      - source-gates
+      - validate-external-configuration
+    env:
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      IS_PRERELEASE: ${{ needs.source-gates.outputs.is_prerelease }}
+      RMUX_PACKAGE_REPO: Helvesec/rmux-packages
+      RMUX_PACKAGE_REPO_BRANCH: main
+    steps:
+      - name: Clone retained package history
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RMUX_PACKAGE_REPO_TOKEN }}
+        run: |
+          : "${GH_TOKEN:?missing RMUX_PACKAGE_REPO_TOKEN}"
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          gh repo clone "$RMUX_PACKAGE_REPO" "$work/package-repository-history" -- \
+            --depth 1 \
+            --branch "$RMUX_PACKAGE_REPO_BRANCH"
+          git -C "$work/package-repository-history" remote set-url origin \
+            "https://github.com/${RMUX_PACKAGE_REPO}.git"
+          git -C "$work/package-repository-history" rev-parse --verify 'HEAD^{commit}'
+          tar -C "$work" -czf package-repository-history.tar.gz \
+            package-repository-history
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+        with:
+          name: package-repository-history-${{ env.RELEASE_REF }}
+          path: package-repository-history.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
   prepare-release:
     name: Prepare signed release draft
@@ -621,6 +674,7 @@ jobs:
       - build
       - platform-gates
       - snap
+      - package-repository-snapshot
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
       PACKAGE_VERSION: ${{ needs.source-gates.outputs.package_version }}
@@ -642,8 +696,15 @@ jobs:
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
+          pattern: rmux-${{ env.RELEASE_REF }}-*
           path: release-assets
           merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+        with:
+          name: package-repository-history-${{ env.RELEASE_REF }}
+          path: target/package-repository-snapshot
 
       - name: Generate checksums
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
@@ -837,9 +898,8 @@ jobs:
           fi
           cp -- "${current_packages[@]}" target/package-repository-inputs/
           rm -rf target/package-repository-history
-          git clone --depth 1 --branch "$RMUX_PACKAGE_REPO_BRANCH" \
-            "https://github.com/${RMUX_PACKAGE_REPO}.git" \
-            target/package-repository-history
+          tar -C target -xzf \
+            target/package-repository-snapshot/package-repository-history.tar.gz
           git -C target/package-repository-history rev-parse --verify 'HEAD^{commit}' \
             > target/PACKAGE_REPOSITORY_BASE
           scripts/retain-linux-package-history.py \
