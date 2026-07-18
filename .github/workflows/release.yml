@@ -626,16 +626,28 @@ jobs:
     timeout-minutes: 10
     environment: release
     needs:
-      - source-gates
       - validate-external-configuration
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
-      IS_PRERELEASE: ${{ needs.source-gates.outputs.is_prerelease }}
+      SKIP_EXTERNAL_PACKAGE_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish }}
       RMUX_PACKAGE_REPO: Helvesec/rmux-packages
       RMUX_PACKAGE_REPO_BRANCH: main
     steps:
+      - name: Resolve package history requirement
+        id: requirement
+        shell: bash
+        run: |
+          required=true
+          if [ "$SKIP_EXTERNAL_PACKAGE_PUBLISH" = "true" ]; then
+            required=false
+          fi
+          case "${RELEASE_REF#v}" in
+            *-*) required=false ;;
+          esac
+          echo "required=$required" >> "$GITHUB_OUTPUT"
+
       - name: Clone retained package history
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+        if: steps.requirement.outputs.required == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.RMUX_PACKAGE_REPO_TOKEN }}
@@ -653,7 +665,7 @@ jobs:
             package-repository-history
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
+        if: steps.requirement.outputs.required == 'true'
         with:
           name: package-repository-history-${{ env.RELEASE_REF }}
           path: package-repository-history.tar.gz

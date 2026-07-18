@@ -612,6 +612,9 @@ fn release_publication_waits_for_native_and_package_validations() {
         .next()
         .expect("bounded package repository snapshot job");
     assert!(package_snapshot.contains("name: Snapshot retained Linux package history"));
+    assert!(package_snapshot.contains("name: Resolve package history requirement"));
+    assert!(package_snapshot.contains("SKIP_EXTERNAL_PACKAGE_PUBLISH:"));
+    assert!(!package_snapshot.contains("- source-gates"));
     assert!(package_snapshot.contains("GH_TOKEN: ${{ secrets.RMUX_PACKAGE_REPO_TOKEN }}"));
     assert!(package_snapshot.contains("gh repo clone \"$RMUX_PACKAGE_REPO\""));
     assert!(package_snapshot.contains("package-repository-history.tar.gz"));
