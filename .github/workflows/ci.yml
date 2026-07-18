@@ -918,15 +918,19 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $outputDir = "target/windows-package-preflight"
+          if (Test-Path -LiteralPath $outputDir) {
+            Remove-Item -LiteralPath $outputDir -Recurse -Force
+          }
           ./scripts/package-windows.ps1 `
             -Configuration release `
             -Target x86_64-pc-windows-msvc `
             -OutputDir $outputDir `
             -PlatformLabel windows-x86_64
-          $archive = Get-ChildItem -Path $outputDir -Filter "rmux-*.zip" | Select-Object -First 1
-          if ($null -eq $archive) {
-            throw "Windows package archive was not generated"
+          $archives = @(Get-ChildItem -Path $outputDir -Filter "rmux-*.zip")
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one Windows package archive, found $($archives.Count)"
           }
+          $archive = $archives[0]
           ./scripts/verify-package-windows.ps1 `
             -Archive $archive.FullName `
             -Checksums "$outputDir/SHA256SUMS.txt" `
@@ -968,10 +972,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $outputDir = "target/windows-package-preflight"
-          $archive = Get-ChildItem -Path $outputDir -Filter "rmux-*.zip" | Select-Object -First 1
-          if ($null -eq $archive) {
-            throw "Windows package archive was not downloaded"
+          $archives = @(Get-ChildItem -Path $outputDir -Filter "rmux-*.zip")
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one downloaded Windows package archive, found $($archives.Count)"
           }
+          $archive = $archives[0]
           ./scripts/verify-package-windows.ps1 `
             -Archive $archive.FullName `
             -Checksums "$outputDir/SHA256SUMS.txt" `
@@ -1024,10 +1029,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $outputDir = "target/windows-package-preflight"
-          $archive = Get-ChildItem -Path $outputDir -Filter "rmux-*.zip" | Select-Object -First 1
-          if ($null -eq $archive) {
-            throw "Windows package archive was not downloaded"
+          $archives = @(Get-ChildItem -Path $outputDir -Filter "rmux-*.zip")
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one downloaded Windows package archive, found $($archives.Count)"
           }
+          $archive = $archives[0]
           $arguments = @{
             Archive = $archive.FullName
             Checksums = "$outputDir/SHA256SUMS.txt"
