@@ -489,6 +489,37 @@ fn github_windows_tests_keep_debug_daemons_inside_the_runner_job() {
 }
 
 #[test]
+fn windows_package_smokes_own_release_daemons_inside_the_runner_job() {
+    let verifier = include_str!("../scripts/verify-package-windows.ps1");
+    let sdk_harness = include_str!("../crates/rmux-sdk/tests/common/windows_smoke.rs");
+    let mouse_harness = include_str!("windows_mouse_border_resize.rs");
+    let daemon_policy = include_str!("../crates/rmux-os/src/daemon.rs");
+
+    for required in [
+        "Start-PackageDaemon",
+        "--__internal-daemon",
+        "--startup-ready-event",
+        "NewPackagePipeName",
+        "Stop-PackageDaemon",
+        "RMUX_SDK_WINDOWS_SMOKE_PIPE",
+        "RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN",
+    ] {
+        assert!(
+            verifier.contains(required),
+            "Windows package verification lost {required}"
+        );
+    }
+    assert!(sdk_harness.contains("RMUX_SDK_WINDOWS_SMOKE_PIPE"));
+    assert!(sdk_harness.contains("builder(&pipe_name).connect().await?"));
+    assert!(mouse_harness.contains("RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN"));
+    assert!(mouse_harness.contains("rmux-package-mouse-{label}"));
+    assert!(mouse_harness.contains("rmux_os::daemon::StartupReadyEvent::new()?"));
+    assert!(daemon_policy.contains(
+        "#[cfg(all(windows, not(debug_assertions)))]\nconst fn internal_caller_job_test_opt_in_enabled() -> bool {\n    false"
+    ));
+}
+
+#[test]
 fn release_publication_waits_for_native_and_package_validations() {
     let release = include_str!("../.github/workflows/release.yml");
     assert!(release.contains("concurrency:\n  group: rmux-release\n  cancel-in-progress: false"));

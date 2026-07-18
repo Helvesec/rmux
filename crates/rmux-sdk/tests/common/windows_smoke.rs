@@ -29,6 +29,7 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const OUTPUT_BUDGET: usize = 64 * 1024;
 const SNAPSHOT_STABLE_PERIOD: Duration = Duration::from_millis(500);
 const RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN_ENV: &str = "RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN";
+const RMUX_SDK_WINDOWS_SMOKE_PIPE_ENV: &str = "RMUX_SDK_WINDOWS_SMOKE_PIPE";
 
 pub static LIVE_DAEMON_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -42,10 +43,20 @@ pub struct Harness {
 
 impl Harness {
     pub async fn start(label: &str) -> TestResult<Self> {
-        let pipe_name = unique_pipe_name(label)?;
+        let package_pipe = std::env::var(RMUX_SDK_WINDOWS_SMOKE_PIPE_ENV)
+            .ok()
+            .filter(|pipe_name| !pipe_name.is_empty());
+        let pipe_name = match &package_pipe {
+            Some(pipe_name) => pipe_name.clone(),
+            None => unique_pipe_name(label)?,
+        };
         let daemon_binary = rmux_binary()?.to_path_buf();
         let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
-        let rmux = builder(&pipe_name).connect_or_start().await?;
+        let rmux = if package_pipe.is_some() {
+            builder(&pipe_name).connect().await?
+        } else {
+            builder(&pipe_name).connect_or_start().await?
+        };
         Ok(Self {
             pipe_name,
             rmux: Some(rmux),

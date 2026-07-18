@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use std::error::Error;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +15,7 @@ const MOUSE_SETTLE_DELAY: Duration = Duration::from_millis(900);
 const MOUSE_GEOMETRY_CHANGE_TIMEOUT: Duration = Duration::from_secs(6);
 const ATTACH_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const RMUX_MOUSE_BORDER_RMUX_BIN_ENV: &str = "RMUX_MOUSE_BORDER_RMUX_BIN";
+const RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN_ENV: &str = "RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PaneGeometry {
@@ -30,7 +31,7 @@ fn mouse_drag_on_vertical_border_resizes_horizontal_split_through_attach_binding
 ) -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-horizontal")?;
     let label = unique_label("mouse-border-resize-h")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70h";
 
     create_split_session(&label, session, "-h")?;
@@ -68,7 +69,7 @@ fn mouse_drag_on_vertical_border_shrinks_horizontal_split_through_attach_binding
 ) -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-horizontal-shrink")?;
     let label = unique_label("mouse-border-resize-h-shrink")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70hs";
 
     create_split_session(&label, session, "-h")?;
@@ -106,7 +107,7 @@ fn mouse_drag_on_horizontal_border_resizes_vertical_split_through_attach_binding
 ) -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-vertical")?;
     let label = unique_label("mouse-border-resize-v")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70v";
 
     create_split_session(&label, session, "-v")?;
@@ -144,7 +145,7 @@ fn mouse_drag_on_horizontal_border_shrinks_vertical_split_through_attach_binding
 ) -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-vertical-shrink")?;
     let label = unique_label("mouse-border-resize-v-shrink")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70vs";
 
     create_split_session(&label, session, "-v")?;
@@ -181,7 +182,7 @@ fn mouse_drag_on_horizontal_border_shrinks_vertical_split_through_attach_binding
 fn mouse_drag_border_does_not_resize_when_mouse_option_is_off() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-mouse-off")?;
     let label = unique_label("mouse-border-resize-off")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70off";
 
     create_split_session_with_mouse(&label, session, "-h", false)?;
@@ -207,7 +208,7 @@ fn mouse_drag_border_does_not_resize_when_mouse_option_is_off() -> Result<(), Bo
 fn mouse_drag_border_does_not_resize_when_binding_is_unbound() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-unbound")?;
     let label = unique_label("mouse-border-resize-unbound")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70unbound";
 
     create_split_session(&label, session, "-h")?;
@@ -240,7 +241,7 @@ fn mouse_drag_border_does_not_resize_when_binding_is_unbound() -> Result<(), Box
 fn mouse_drag_border_read_only_attach_does_not_resize() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-read-only")?;
     let label = unique_label("mouse-border-resize-readonly")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70readonly";
 
     create_split_session(&label, session, "-h")?;
@@ -266,7 +267,7 @@ fn mouse_drag_border_read_only_attach_does_not_resize() -> Result<(), Box<dyn Er
 fn mouse_drag_border_binding_pipeline_preserves_mouse_event() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-binding-pipeline")?;
     let label = unique_label("mouse-border-resize-pipeline")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70pipeline";
 
     create_split_session(&label, session, "-h")?;
@@ -307,7 +308,7 @@ fn mouse_drag_border_binding_pipeline_preserves_mouse_event() -> Result<(), Box<
 fn mouse_drag_border_resizes_inside_three_pane_layout() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-three-pane")?;
     let label = unique_label("mouse-border-resize-three")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70three";
 
     create_split_session(&label, session, "-h")?;
@@ -346,7 +347,7 @@ fn mouse_drag_border_resizes_inside_three_pane_layout() -> Result<(), Box<dyn Er
 fn malformed_mouse_sgr_does_not_resize_or_crash_attach() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("mouse-border-resize-malformed")?;
     let label = unique_label("mouse-border-resize-malformed")?;
-    let _server = ServerGuard::new(label.clone());
+    let _server = ServerGuard::new(label.clone())?;
     let session = "i70malformed";
 
     create_split_session(&label, session, "-h")?;
@@ -546,11 +547,8 @@ struct AttachGuard {
 
 impl AttachGuard {
     fn spawn(label: &str, session: &str, read_only: bool) -> Result<Self, Box<dyn Error>> {
-        let mut args = vec![
-            "-L".to_owned(),
-            label.to_owned(),
-            "attach-session".to_owned(),
-        ];
+        let mut args = rmux_endpoint_args(label);
+        args.push("attach-session".to_owned());
         if read_only {
             args.push("-r".to_owned());
         }
@@ -629,11 +627,41 @@ impl Drop for AttachGuard {
 
 struct ServerGuard {
     label: String,
+    daemon: Option<Child>,
 }
 
 impl ServerGuard {
-    fn new(label: String) -> Self {
-        Self { label }
+    fn new(label: String) -> Result<Self, Box<dyn Error>> {
+        let daemon = match std::env::var_os(RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN_ENV) {
+            Some(binary) => {
+                let ready = rmux_os::daemon::StartupReadyEvent::new()?;
+                let mut child = Command::new(binary)
+                    .arg("--__internal-daemon")
+                    .arg(package_pipe_name(&label))
+                    .arg("--startup-ready-event")
+                    .arg(ready.name())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                match ready.wait(Duration::from_secs(15)) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err("packaged mouse smoke daemon did not become ready".into());
+                    }
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error.into());
+                    }
+                }
+                Some(child)
+            }
+            None => None,
+        };
+        Ok(Self { label, daemon })
     }
 }
 
@@ -645,13 +673,37 @@ impl Drop for ServerGuard {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        if let Some(mut daemon) = self.daemon.take() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                match daemon.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(25)),
+                    Err(_) => break,
+                }
+            }
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
     }
 }
 
 fn rmux_command(label: &str) -> Command {
     let mut command = Command::new(rmux_binary());
-    command.args(["-L", label]);
+    command.args(rmux_endpoint_args(label));
     command
+}
+
+fn rmux_endpoint_args(label: &str) -> Vec<String> {
+    if std::env::var_os(RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN_ENV).is_some() {
+        vec!["-S".to_owned(), package_pipe_name(label)]
+    } else {
+        vec!["-L".to_owned(), label.to_owned()]
+    }
+}
+
+fn package_pipe_name(label: &str) -> String {
+    format!(r"\\.\pipe\rmux-package-mouse-{label}")
 }
 
 fn rmux_binary() -> std::path::PathBuf {
