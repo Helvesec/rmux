@@ -648,7 +648,7 @@ fn windows_smokes_can_reuse_the_binary_from_the_nextest_archive() {
 }
 
 #[test]
-fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
+fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
     let ci = include_str!("../.github/workflows/ci.yml");
     let perf = ci
         .split("\n  release-review-perf:\n")
@@ -674,6 +674,8 @@ fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
 
     for required in [
         "name: Release review (perf)",
+        "needs: windows-tests-gate",
+        "inputs.release_qualification",
         "CARGO_BUILD_JOBS: \"4\"",
         "--section perf",
         "target/release-review-ci-perf",
@@ -681,17 +683,14 @@ fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
     ] {
         assert!(
             perf.contains(required),
-            "early performance review lost required snippet {required:?}"
+            "deferred performance review lost required snippet {required:?}"
         );
     }
-    assert!(
-        !perf.contains("needs:"),
-        "performance review must be eligible at workflow start"
-    );
 
     for required in [
         "name: Release review (${{ matrix.section }})",
-        "needs: linux-source-gates",
+        "needs: [linux-source-gates, windows-tests-gate]",
+        "inputs.release_qualification",
         "max-parallel: 6",
         "section: [static, lint, server, cli, tmux, runtime-sdk]",
         "CARGO_BUILD_JOBS: \"4\"",
@@ -708,7 +707,8 @@ fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
 
     for required in [
         "name: Release review gate (no package)",
-        "if: always()",
+        "always() &&",
+        "inputs.release_qualification",
         "needs: [release-review-perf, release-review-sections]",
         "RELEASE_REVIEW_PERF_RESULT: ${{ needs.release-review-perf.result }}",
         "RELEASE_REVIEW_RESULT: ${{ needs.release-review-sections.result }}",
@@ -720,6 +720,48 @@ fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
             "release review aggregate gate lost required snippet {required:?}"
         );
     }
+}
+
+#[test]
+fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    assert!(ci.contains("release_qualification:"));
+    assert!(ci.contains("description: Run the deferred release qualification jobs"));
+
+    for (job, next_job) in [
+        ("snap-package", "nix-flake"),
+        ("nix-flake", "linux-sdk-smoke"),
+        ("windows-package-preflight", "windows-cross"),
+    ] {
+        let block = ci
+            .split(&format!("\n  {job}:\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing {job} job"))
+            .split(&format!("\n  {next_job}:\n"))
+            .next()
+            .unwrap_or_else(|| panic!("unbounded {job} job"));
+        assert!(
+            block.contains("needs: windows-tests-gate"),
+            "{job} must not contend with protected fast-lane jobs"
+        );
+    }
+}
+
+#[test]
+fn required_linux_perf_check_does_not_publish_a_cache_on_its_critical_path() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let perf = ci
+        .split("\n  linux-perf-smoke:\n")
+        .nth(1)
+        .expect("Linux performance smoke job")
+        .split("\n  linux-dependency-audit:\n")
+        .next()
+        .expect("bounded Linux performance smoke job");
+
+    assert!(perf.contains("name: Restore cargo cache"));
+    assert!(perf.contains("uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830"));
+    assert!(!perf.contains("uses: actions/cache@"));
+    assert!(!perf.contains("uses: actions/cache/save@"));
 }
 
 #[test]
@@ -785,6 +827,7 @@ fn ci_runs_the_windows_release_package_preflight_before_tagging() {
         .expect("bounded Windows package preflight job");
 
     assert!(preflight.contains("runs-on: windows-latest"));
+    assert!(preflight.contains("needs: windows-tests-gate"));
     assert!(!preflight.contains("self-hosted"));
     assert!(preflight.contains("./scripts/package-windows.ps1"));
     assert!(preflight.contains("./scripts/verify-package-windows.ps1"));
