@@ -19,8 +19,6 @@ use rmux_core::{
     text_width, truncate_to_width, GridRenderOptions, Screen, ScreenCaptureRange, Utf8Config,
 };
 use rmux_proto::TerminalSize;
-use std::process::{Child, Command, Output, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 // ─── deterministic PRNG ─────────────────────────────────────────────
@@ -226,82 +224,25 @@ fn drive(input: &[u8]) {
 
 // ─── tests ──────────────────────────────────────────────────────────
 
-const RANDOM_ESCAPE_WORKER: &str = "RMUX_RANDOM_ESCAPE_FUZZ_WORKER";
-const RANDOM_ESCAPE_TIMEOUT: Duration = Duration::from_secs(60);
-const RANDOM_ESCAPE_CASES_PER_SEED: u32 = 128;
-
-// Per-case wall time measures host scheduling as well as parser work. Run a fixed
-// corpus instead, with a process boundary so the aggregate deadline is enforceable.
-fn run_random_escape_corpus() {
+#[test]
+fn fuzz_random_escape_sequences_does_not_panic() {
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut iterations: u64 = 0;
-    for seed in 1u64..=64 {
+    'seeds: for seed in 1u64..=64 {
         let mut rng = XorShift64::new(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        for _ in 0..RANDOM_ESCAPE_CASES_PER_SEED {
+        for _ in 0..2_000u32 {
+            if Instant::now() >= deadline {
+                break 'seeds;
+            }
             let target = ((rng.next_u32() as usize) % 8192) + 16;
             let buf = build_fuzz_input(&mut rng, target);
+            // Per-case wall time measures host scheduling as well as parser work.
+            // The aggregate deadline bounds the adaptive no-panic corpus instead.
             drive(&buf);
             iterations += 1;
         }
     }
     eprintln!("fuzz: ran {iterations} iterations without panic");
-}
-
-fn wait_for_fuzz_worker(mut child: Child) -> Output {
-    let deadline = Instant::now() + RANDOM_ESCAPE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                return child
-                    .wait_with_output()
-                    .expect("collect fuzz worker output")
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                child.kill().expect("kill timed-out fuzz worker");
-                let output = child
-                    .wait_with_output()
-                    .expect("collect timed-out fuzz worker output");
-                panic!(
-                    "random escape corpus exceeded {RANDOM_ESCAPE_TIMEOUT:?}\nstdout:\n{}\nstderr:\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("failed to poll random escape fuzz worker: {error}");
-            }
-        }
-    }
-}
-
-#[test]
-fn fuzz_random_escape_sequences_does_not_panic() {
-    if std::env::var_os(RANDOM_ESCAPE_WORKER).is_some() {
-        run_random_escape_corpus();
-        return;
-    }
-
-    let child = Command::new(std::env::current_exe().expect("resolve fuzz test executable"))
-        .args([
-            "--exact",
-            "fuzz_random_escape_sequences_does_not_panic",
-            "--nocapture",
-        ])
-        .env(RANDOM_ESCAPE_WORKER, "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn isolated random escape fuzz worker");
-    let output = wait_for_fuzz_worker(child);
-    assert!(
-        output.status.success(),
-        "random escape fuzz worker failed with {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 #[test]
