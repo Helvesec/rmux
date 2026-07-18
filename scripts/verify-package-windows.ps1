@@ -9,7 +9,8 @@ param(
     [switch]$RunCtrlMatrixSmoke,
     [switch]$RequireReleaseArtifact,
     [string]$ExpectedGitSha = $env:RMUX_EXPECTED_GIT_SHA,
-    [string]$CtrlMatrixEvidence = ""
+    [string]$CtrlMatrixEvidence = "",
+    [string]$NextestArchive = ""
 )
 
 Set-StrictMode -Version Latest
@@ -318,7 +319,11 @@ function AssertOutputContains([object[]]$Output, [string]$Needle, [string]$Conte
     }
 }
 
-function InvokeSdkWindowsSmoke([string]$Binary, [string]$DaemonBinary) {
+function InvokeSdkWindowsSmoke(
+    [string]$Binary,
+    [string]$DaemonBinary,
+    [string]$NextestArchive
+) {
     $previousBinary = $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN
     $previousPipe = $env:RMUX_SDK_WINDOWS_SMOKE_PIPE
     $pipePath = NewPackagePipeName $Binary "sdk-smoke-$PID-$([guid]::NewGuid().ToString('N'))"
@@ -326,26 +331,35 @@ function InvokeSdkWindowsSmoke([string]$Binary, [string]$DaemonBinary) {
     try {
         $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
         $env:RMUX_SDK_WINDOWS_SMOKE_PIPE = $pipePath
-        Assert-CargoFilter 1 @(
-            "test",
-            "--locked",
-            "-p",
-            "rmux-sdk",
-            "--test",
-            "smoke_v1_windows",
-            "daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon"
-        )
-        & cargo @(
-            "test",
-            "--locked",
-            "-p",
-            "rmux-sdk",
-            "--test",
-            "smoke_v1_windows",
-            "daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon"
-        )
-        if ($LASTEXITCODE -ne 0) {
-            Fail "Windows SDK package smoke failed with exit code $LASTEXITCODE"
+        $sdkTest = "daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon"
+        if ([string]::IsNullOrWhiteSpace($NextestArchive)) {
+            Assert-CargoFilter 1 @(
+                "test",
+                "--locked",
+                "-p",
+                "rmux-sdk",
+                "--test",
+                "smoke_v1_windows",
+                $sdkTest
+            )
+            & cargo @(
+                "test",
+                "--locked",
+                "-p",
+                "rmux-sdk",
+                "--test",
+                "smoke_v1_windows",
+                $sdkTest
+            )
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Windows SDK package smoke failed with exit code $LASTEXITCODE"
+            }
+        } else {
+            & (Join-Path $PSScriptRoot "run-nextest-package-smoke.ps1") `
+                -Archive $NextestArchive `
+                -Package "rmux-sdk" `
+                -TestTarget "smoke_v1_windows" `
+                -TestName $sdkTest
         }
     } finally {
         if ($null -eq $previousBinary) {
@@ -362,42 +376,54 @@ function InvokeSdkWindowsSmoke([string]$Binary, [string]$DaemonBinary) {
     }
 }
 
-function InvokeMouseBorderSmoke([string]$Binary, [string]$DaemonBinary) {
+function InvokeMouseBorderSmoke(
+    [string]$Binary,
+    [string]$DaemonBinary,
+    [string]$NextestArchive
+) {
     $previousBinary = $env:RMUX_MOUSE_BORDER_RMUX_BIN
     $previousDaemon = $env:RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN
     $mouseTest = "mouse_drag_on_vertical_border_resizes_horizontal_split_through_attach_binding"
     try {
         $env:RMUX_MOUSE_BORDER_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
         $env:RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN = [System.IO.Path]::GetFullPath($DaemonBinary)
-        $filterArgs = @(
-            "1",
-            "--",
-            "test",
-            "--locked",
-            "-p",
-            "rmux",
-            "--test",
-            "windows_mouse_border_resize",
-            $mouseTest
-        )
-        & "$PSScriptRoot/assert-cargo-filter-nonempty.ps1" @filterArgs
-        if ($LASTEXITCODE -ne 0) {
-            Fail "Windows mouse border package smoke filter failed with exit code $LASTEXITCODE"
-        }
-        & cargo @(
-            "test",
-            "--locked",
-            "-p",
-            "rmux",
-            "--test",
-            "windows_mouse_border_resize",
-            $mouseTest,
-            "--",
-            "--exact",
-            "--test-threads=1"
-        )
-        if ($LASTEXITCODE -ne 0) {
-            Fail "Windows mouse border package smoke failed with exit code $LASTEXITCODE"
+        if ([string]::IsNullOrWhiteSpace($NextestArchive)) {
+            $filterArgs = @(
+                "1",
+                "--",
+                "test",
+                "--locked",
+                "-p",
+                "rmux",
+                "--test",
+                "windows_mouse_border_resize",
+                $mouseTest
+            )
+            & "$PSScriptRoot/assert-cargo-filter-nonempty.ps1" @filterArgs
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Windows mouse border package smoke filter failed with exit code $LASTEXITCODE"
+            }
+            & cargo @(
+                "test",
+                "--locked",
+                "-p",
+                "rmux",
+                "--test",
+                "windows_mouse_border_resize",
+                $mouseTest,
+                "--",
+                "--exact",
+                "--test-threads=1"
+            )
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Windows mouse border package smoke failed with exit code $LASTEXITCODE"
+            }
+        } else {
+            & (Join-Path $PSScriptRoot "run-nextest-package-smoke.ps1") `
+                -Archive $NextestArchive `
+                -Package "rmux" `
+                -TestTarget "windows_mouse_border_resize" `
+                -TestName $mouseTest
         }
     } finally {
         if ($null -eq $previousBinary) {
@@ -821,6 +847,12 @@ if (-not (Test-Path -LiteralPath $archiveFull -PathType Leaf)) {
 if (-not $archiveFull.EndsWith(".zip", [System.StringComparison]::OrdinalIgnoreCase)) {
     Fail "unsupported archive extension, expected .zip: $Archive"
 }
+if (-not [string]::IsNullOrWhiteSpace($NextestArchive)) {
+    $NextestArchive = [System.IO.Path]::GetFullPath($NextestArchive)
+    if (-not (Test-Path -LiteralPath $NextestArchive -PathType Leaf)) {
+        Fail "nextest archive not found: $NextestArchive"
+    }
+}
 
 $archiveDir = Split-Path -Parent $archiveFull
 $archiveName = [System.IO.Path]::GetFileName($archiveFull)
@@ -881,6 +913,19 @@ try {
         }
         if ($metadata.configuration -ne "release") {
             Fail "release artifact metadata configuration is not release"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedGitSha)) {
+            if ($ExpectedGitSha -notmatch '^[0-9a-f]{40}$') {
+                Fail "expected Git SHA must be a canonical full lowercase SHA"
+            }
+            if (-not ($metadata.PSObject.Properties.Name -contains "git_commit") -or
+                -not [string]::Equals(
+                    [string]$metadata.git_commit,
+                    $ExpectedGitSha,
+                    [System.StringComparison]::Ordinal
+                )) {
+                Fail "release artifact metadata git_commit does not match expected Git SHA"
+            }
         }
     }
     $packagedBinaryHash = Sha256File $binary
@@ -1024,11 +1069,11 @@ try {
     }
 
     if ($RunSdkSmoke) {
-        InvokeSdkWindowsSmoke $binary $daemonBinary
+        InvokeSdkWindowsSmoke $binary $daemonBinary $NextestArchive
     }
 
     if ($RunMouseBorderSmoke) {
-        InvokeMouseBorderSmoke $binary $daemonBinary
+        InvokeMouseBorderSmoke $binary $daemonBinary $NextestArchive
     }
 
     $ctrlMatrixStatus = "not-requested"
