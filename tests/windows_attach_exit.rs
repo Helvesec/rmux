@@ -1589,8 +1589,12 @@ fn windows_send_keys_ctrl_c_double_token_interrupts_synchronized_panes_when_avai
             "on",
         ],
     )?;
-    wait_for_capture_contains(&binary, &label, "syncping:0.0", b"PS ", SETUP_TIMEOUT)?;
-    wait_for_capture_contains(&binary, &label, "syncping:0.1", b"PS ", SETUP_TIMEOUT)?;
+    let first_initial_capture =
+        wait_for_capture_contains(&binary, &label, "syncping:0.0", b"PS ", SETUP_TIMEOUT)?;
+    let second_initial_capture =
+        wait_for_capture_contains(&binary, &label, "syncping:0.1", b"PS ", SETUP_TIMEOUT)?;
+    let first_initial_prompts = count_occurrences(&first_initial_capture, b"PS ");
+    let second_initial_prompts = count_occurrences(&second_initial_capture, b"PS ");
 
     run_rmux(
         &binary,
@@ -1611,7 +1615,24 @@ fn windows_send_keys_ctrl_c_double_token_interrupts_synchronized_panes_when_avai
         &label,
         ["send-keys", "-t", "syncping:0.0", "C-c", "C-c"],
     )?;
-    thread::sleep(Duration::from_millis(500));
+    for (target, initial_prompts) in [
+        ("syncping:0.0", first_initial_prompts),
+        ("syncping:0.1", second_initial_prompts),
+    ] {
+        let (prompt_returned, output) = capture_until_occurrences(
+            &binary,
+            &label,
+            target,
+            b"PS ",
+            initial_prompts + 1,
+            CTRL_C_PROMPT_READY_TIMEOUT,
+        )?;
+        assert!(
+            prompt_returned,
+            "synchronized Ctrl-C did not return {target} to a fresh PowerShell prompt\n{}",
+            String::from_utf8_lossy(&output)
+        );
+    }
     run_rmux(
         &binary,
         &label,
