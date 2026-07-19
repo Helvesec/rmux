@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "percentile_policy": {
+    "minimum_samples_for_percentiles": 7,
+    "below_minimum_report": ["raw_values", "median", "maximum"]
+  },
+  "initial_ceilings_seconds": {
+    "fast_required_checks": 600,
+    "windows_archive_cold_build": 600,
+    "windows_archive_download": 30,
+    "runner_setup": 60,
+    "runner_queue_target": 180,
+    "runner_queue_maximum": 300,
+    "canonical_build_linux_x86_64": 600,
+    "canonical_build_linux_aarch64": 720,
+    "canonical_build_macos_aarch64": 720,
+    "canonical_build_macos_x86_64": 900,
+    "canonical_build_windows_x86_64": 900
+  },
+  "observed_anchor_aggregation": "individual-observations-not-percentiles",
+  "observed_anchors": [
+    {"metric": "windows_archive_cold_build", "measurement": "step_wallclock", "run_id": 29662134732, "run_attempt": 2, "source_git_sha": "1a0cc9072aae30478674ec8422dd4f200aa12ddc", "job_id": 88128231383, "job_name": "Windows workspace test archive", "step_name": "Build Windows test archive", "job_conclusion": "success", "run_conclusion": "success", "cache_state": "archive_restore_miss", "seconds": 312},
+    {"metric": "windows_archive_cold_build", "measurement": "step_wallclock", "run_id": 29659473119, "run_attempt": 1, "source_git_sha": "281033e73374eb265c33be19a2bb25a37ab7651f", "job_id": 88119494148, "job_name": "Windows workspace test archive", "step_name": "Build Windows test archive", "job_conclusion": "success", "run_conclusion": "success", "cache_state": "archive_restore_miss", "seconds": 338},
+    {"metric": "windows_archive_download", "measurement": "range_across_18_shard_steps", "run_id": 29679333252, "run_attempt": 1, "source_git_sha": "4f3e938b3bc3bb67502cdf5def4679ef1c4e928e", "run_conclusion": "success", "range_seconds": [1, 6]},
+    {"metric": "windows_runner_queue", "measurement": "maximum_across_18_shard_jobs", "run_id": 29679333252, "run_attempt": 1, "source_git_sha": "4f3e938b3bc3bb67502cdf5def4679ef1c4e928e", "run_conclusion": "success", "maximum_seconds": 169},
+    {"metric": "build_linux_x86_64", "measurement": "step_wallclock", "run_id": 29647419533, "run_attempt": 1, "source_git_sha": "b2f80522bae2927e22d81e5c902b727623f934d0", "job_id": 88091039041, "job_name": "Build x86_64-unknown-linux-gnu", "step_name": "Build rmux", "job_conclusion": "success", "run_conclusion": "failure", "cache_state": "cold_no_target_restore", "seconds": 225},
+    {"metric": "build_linux_aarch64", "measurement": "step_wallclock", "run_id": 29647419533, "run_attempt": 1, "source_git_sha": "b2f80522bae2927e22d81e5c902b727623f934d0", "job_id": 88091038966, "job_name": "Build aarch64-unknown-linux-gnu", "step_name": "Build rmux", "job_conclusion": "success", "run_conclusion": "failure", "cache_state": "cold_no_target_restore", "seconds": 288},
+    {"metric": "build_macos_aarch64", "measurement": "step_wallclock", "run_id": 29647419533, "run_attempt": 1, "source_git_sha": "b2f80522bae2927e22d81e5c902b727623f934d0", "job_id": 88091038957, "job_name": "Build aarch64-apple-darwin", "step_name": "Build rmux", "job_conclusion": "success", "run_conclusion": "failure", "cache_state": "cold_no_target_restore", "seconds": 299},
+    {"metric": "build_macos_x86_64", "measurement": "step_wallclock", "run_id": 29647419533, "run_attempt": 1, "source_git_sha": "b2f80522bae2927e22d81e5c902b727623f934d0", "job_id": 88091038997, "job_name": "Build x86_64-apple-darwin", "step_name": "Build rmux", "job_conclusion": "success", "run_conclusion": "failure", "cache_state": "cold_no_target_restore", "seconds": 507},
+    {"metric": "build_windows_x86_64", "measurement": "step_wallclock", "run_id": 29647419533, "run_attempt": 1, "source_git_sha": "b2f80522bae2927e22d81e5c902b727623f934d0", "job_id": 88091039046, "job_name": "Build x86_64-pc-windows-msvc", "step_name": "Build rmux", "job_conclusion": "success", "run_conclusion": "failure", "cache_state": "cold_no_target_restore", "seconds": 552}
+  ]
+}

@@ -1,0 +1,13 @@
+/.github/CODEOWNERS @shideneyu
+/.github/actions/ @shideneyu
+/.github/workflows/ @shideneyu
+/.github/release/ @shideneyu
+/Cargo.lock @shideneyu
+/Cargo.toml @shideneyu
+/SECURITY.md @shideneyu
+/flake.lock @shideneyu
+/flake.nix @shideneyu
+/rust-toolchain.toml @shideneyu
+/scripts/ @shideneyu
+/snap/snapcraft.yaml @shideneyu
+/tests/ @shideneyu

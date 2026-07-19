@@ -1,0 +1,300 @@
+name: Release candidate shadow audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Exact CI release-qualification run ID to audit
+        required: true
+        type: string
+      expected_source_sha:
+        description: Exact main SHA shared by this audit and the candidate
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-shadow-${{ inputs.candidate_run_id }}
+  cancel-in-progress: false
+
+jobs:
+  audit-candidate:
+    name: Audit release candidate without authority
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      SHADOW_REF: ${{ github.ref }}
+      SHADOW_SHA: ${{ github.sha }}
+    steps:
+      - name: Verify the exact candidate with public GET requests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+          from collections import Counter
+          from datetime import datetime, timezone
+
+          API = "https://api.github.com"
+          RAW = "https://raw.githubusercontent.com"
+          REPOSITORY = "Helvesec/rmux"
+          API_VERSION = "2026-03-10"
+          MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+          MAX_GET_ATTEMPTS = 3
+          MAX_RETRY_DELAY_SECONDS = 10
+          STANDARD_RUNNER_LABELS = {
+              "macos-15",
+              "macos-15-intel",
+              "ubuntu-latest",
+              "windows-latest",
+          }
+
+
+          def get_json(url):
+              if not (url.startswith(f"{API}/repos/{REPOSITORY}/") or
+                      url.startswith(f"{RAW}/{REPOSITORY}/")):
+                  raise RuntimeError(f"GET host or path is not allowlisted: {url}")
+              request = urllib.request.Request(
+                  url,
+                  method="GET",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "rmux-release-shadow",
+                      "X-GitHub-Api-Version": API_VERSION,
+                  },
+              )
+              for attempt in range(1, MAX_GET_ATTEMPTS + 1):
+                  try:
+                      with urllib.request.urlopen(request, timeout=30) as response:
+                          payload = response.read(MAX_RESPONSE_BYTES + 1)
+                      break
+                  except urllib.error.HTTPError as error:
+                      rate_limited = (
+                          error.code == 429 or
+                          (error.code == 403 and error.headers.get("X-RateLimit-Remaining") == "0")
+                      )
+                      retryable = rate_limited or 500 <= error.code <= 599
+                      if not retryable or attempt == MAX_GET_ATTEMPTS:
+                          raise RuntimeError(
+                              f"GET failed closed for {url}: HTTP {error.code}"
+                          ) from error
+                      retry_after = error.headers.get("Retry-After", "")
+                      delay = int(retry_after) if retry_after.isdigit() else 2 ** (attempt - 1)
+                      time.sleep(min(delay, MAX_RETRY_DELAY_SECONDS))
+                  except (urllib.error.URLError, TimeoutError) as error:
+                      raise RuntimeError(f"GET failed closed for {url}: {error}") from error
+              if len(payload) > MAX_RESPONSE_BYTES:
+                  raise RuntimeError(f"GET response exceeds {MAX_RESPONSE_BYTES} bytes")
+              return json.loads(payload)
+
+
+          def require(actual, expected, label):
+              if actual != expected:
+                  raise RuntimeError(f"{label}: expected {expected!r}, got {actual!r}")
+
+
+          run_id_text = os.environ["CANDIDATE_RUN_ID"]
+          source_sha = os.environ["EXPECTED_SOURCE_SHA"]
+          shadow_sha = os.environ["SHADOW_SHA"]
+          if not re.fullmatch(r"[1-9][0-9]*", run_id_text):
+              raise RuntimeError("candidate_run_id must be a positive decimal integer")
+          if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
+              raise RuntimeError("expected_source_sha must be 40 lowercase hex characters")
+          require(os.environ["SHADOW_REF"], "refs/heads/main", "shadow ref")
+          require(shadow_sha, source_sha, "shadow workflow SHA")
+          run_id = int(run_id_text)
+
+          contract_url = (
+              f"{RAW}/{REPOSITORY}/{shadow_sha}/"
+              ".github/release/candidate-contract.json"
+          )
+          contract = get_json(contract_url)
+          qualification = contract["qualification_run"]
+
+          run_url = f"{API}/repos/{REPOSITORY}/actions/runs/{run_id}"
+          run_before = get_json(run_url)
+          expected_run = {
+              "id": run_id,
+              "workflow_id": qualification["workflow_id"],
+              "path": qualification["workflow_path"],
+              "name": "CI",
+              "event": qualification["event"],
+              "head_branch": qualification["branch"],
+              "head_sha": source_sha,
+              "run_attempt": qualification["required_run_attempt"],
+              "status": "completed",
+              "conclusion": "success",
+          }
+          for field, expected in expected_run.items():
+              require(run_before.get(field), expected, f"candidate run {field}")
+          for identity_field in ("repository", "head_repository"):
+              identity = run_before.get(identity_field)
+              if not isinstance(identity, dict):
+                  raise RuntimeError(f"candidate run {identity_field} is missing")
+              require(identity.get("id"), contract["repository"]["id"], f"{identity_field} ID")
+              require(identity.get("full_name"), REPOSITORY, f"{identity_field} name")
+
+          started = datetime.fromisoformat(run_before["run_started_at"].replace("Z", "+00:00"))
+          age_seconds = int((datetime.now(timezone.utc) - started).total_seconds())
+          if age_seconds < -300:
+              raise RuntimeError("candidate run_started_at is in the future")
+          if age_seconds > int(contract["fast_run"]["freshness_hours"]) * 3600:
+              raise RuntimeError("candidate is stale")
+
+          jobs = []
+          total_count = None
+          page = 1
+          while total_count is None or len(jobs) < total_count:
+              jobs_url = (
+                  f"{API}/repos/{REPOSITORY}/actions/runs/{run_id}/attempts/1/jobs"
+                  f"?per_page=100&page={page}"
+              )
+              response = get_json(jobs_url)
+              current_total = response.get("total_count")
+              current_jobs = response.get("jobs")
+              if not isinstance(current_total, int) or not isinstance(current_jobs, list):
+                  raise RuntimeError("jobs response has an invalid shape")
+              if total_count is None:
+                  total_count = current_total
+              require(current_total, total_count, "jobs total_count")
+              if not current_jobs and len(jobs) < total_count:
+                  raise RuntimeError("jobs pagination ended early")
+              jobs.extend(current_jobs)
+              page += 1
+          require(len(jobs), total_count, "paginated job count")
+
+          run_after = get_json(run_url)
+          for field, expected in expected_run.items():
+              require(run_after.get(field), expected, f"candidate run after pagination {field}")
+          require(run_after.get("updated_at"), run_before.get("updated_at"), "candidate run stability")
+
+          expected = {
+              **{name: ("success",) for name in qualification["success_jobs"]},
+              **{name: ("skipped",) for name in qualification["skipped_jobs"]},
+              **{name: tuple(values) for name, values in qualification["allowed_jobs"].items()},
+          }
+          names = [job.get("name") for job in jobs]
+          if not all(isinstance(name, str) and name for name in names):
+              raise RuntimeError("candidate job names must be non-empty strings")
+          duplicate_names = sorted(name for name, count in Counter(names).items() if count != 1)
+          if duplicate_names:
+              raise RuntimeError(f"duplicate candidate job names: {duplicate_names}")
+          if set(names) != set(expected):
+              raise RuntimeError(
+                  f"candidate job set mismatch; missing={sorted(set(expected) - set(names))}, "
+                  f"unexpected={sorted(set(names) - set(expected))}"
+              )
+          runner_policy = contract.get("runner_policy")
+          if not isinstance(runner_policy, dict):
+              raise RuntimeError("runner policy is missing")
+          require(runner_policy.get("provider"), "github_standard_hosted", "runner provider")
+          runner_group_id = runner_policy.get("runner_group_id")
+          if type(runner_group_id) is not int or runner_group_id != 0:
+              raise RuntimeError("runner group ID must be the integer zero")
+          require(runner_policy.get("runner_group_name"), "GitHub Actions", "runner group name")
+          jobs_by_label = runner_policy.get("jobs_by_label")
+          if not isinstance(jobs_by_label, dict):
+              raise RuntimeError("runner jobs_by_label must be an object")
+          require(set(jobs_by_label), STANDARD_RUNNER_LABELS, "standard runner label set")
+          job_labels = {}
+          for label, contracted_names in jobs_by_label.items():
+              if not isinstance(contracted_names, list):
+                  raise RuntimeError(f"runner jobs for {label} must be an array")
+              for name in contracted_names:
+                  if not isinstance(name, str) or not name:
+                      raise RuntimeError(f"runner jobs for {label} must be non-empty strings")
+                  if name in job_labels:
+                      raise RuntimeError(f"runner policy assigns {name!r} more than once")
+                  job_labels[name] = label
+          contracted_job_names = set()
+          for run_kind in ("fast_run", "qualification_run"):
+              run_contract = contract.get(run_kind)
+              if not isinstance(run_contract, dict):
+                  raise RuntimeError(f"{run_kind} contract is missing")
+              for field in ("success_jobs", "skipped_jobs"):
+                  contracted_names = run_contract.get(field)
+                  if not isinstance(contracted_names, list):
+                      raise RuntimeError(f"{run_kind}.{field} must be an array")
+                  contracted_job_names.update(contracted_names)
+              allowed_jobs = run_contract.get("allowed_jobs")
+              if not isinstance(allowed_jobs, dict):
+                  raise RuntimeError(f"{run_kind}.allowed_jobs must be an object")
+              contracted_job_names.update(allowed_jobs)
+          require(set(job_labels), contracted_job_names, "runner policy job set")
+          if not set(expected) <= set(job_labels):
+              raise RuntimeError("candidate job has no runner policy assignment")
+          ids = [job.get("id") for job in jobs]
+          if not all(type(job_id) is int and job_id > 0 for job_id in ids):
+              raise RuntimeError("candidate job IDs must be positive integers")
+          if len(ids) != len(set(ids)):
+              raise RuntimeError("candidate contains duplicate job IDs")
+          for job in jobs:
+              name = job["name"]
+              require(job.get("run_id"), run_id, f"{name} run_id")
+              require(job.get("run_attempt"), 1, f"{name} run_attempt")
+              require(job.get("head_sha"), source_sha, f"{name} head_sha")
+              require(job.get("workflow_name"), "CI", f"{name} workflow_name")
+              require(job.get("status"), "completed", f"{name} status")
+              if job.get("conclusion") not in expected[name]:
+                  raise RuntimeError(
+                      f"{name} conclusion must be one of {expected[name]}, "
+                      f"got {job.get('conclusion')!r}"
+                  )
+              require(job.get("labels"), [job_labels[name]], f"{name} runner labels")
+              if "self-hosted" in job["labels"]:
+                  raise RuntimeError(f"{name} used a self-hosted runner")
+              if job.get("conclusion") == "skipped":
+                  for field in (
+                      "runner_id",
+                      "runner_name",
+                      "runner_group_id",
+                      "runner_group_name",
+                  ):
+                      if field not in job:
+                          raise RuntimeError(f"skipped {name} is missing {field}")
+                      require(job[field], None, f"skipped {name} {field}")
+              else:
+                  runner_id = job.get("runner_id")
+                  if type(runner_id) is not int or runner_id <= 0:
+                      raise RuntimeError(f"{name} runner ID must be a positive integer")
+                  runner_group_id = job.get("runner_group_id")
+                  if type(runner_group_id) is not int or runner_group_id != 0:
+                      raise RuntimeError(f"{name} runner group ID must be the integer zero")
+                  require(
+                      job.get("runner_group_name"),
+                      "GitHub Actions",
+                      f"{name} runner group name",
+                  )
+                  require(
+                      job.get("runner_name"),
+                      f"GitHub Actions {runner_id}",
+                      f"{name} runner name",
+                  )
+              created = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
+              started_at = datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))
+              completed = datetime.fromisoformat(job["completed_at"].replace("Z", "+00:00"))
+              if job.get("conclusion") == "success" and not created <= started_at <= completed:
+                  raise RuntimeError(f"invalid timestamp ordering for {name}")
+
+          print(
+              json.dumps(
+                  {
+                      "candidate_run_id": run_id,
+                      "source_git_sha": source_sha,
+                      "run_attempt": 1,
+                      "job_count": len(jobs),
+                      "conclusion": "success",
+                      "mode": "read-only-shadow",
+                  },
+                  sort_keys=True,
+              )
+          )
+          PY

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "default_decision": "deny",
+  "release_kinds": {
+    "shadow": {
+      "apt_rpm": false,
+      "chocolatey": false,
+      "crates_io": false,
+      "github_public_release": false,
+      "homebrew_core": false,
+      "homebrew_tap": false,
+      "rmux_io": false,
+      "scoop": false,
+      "snap_candidate": false,
+      "snap_stable": false,
+      "web_share": false,
+      "winget": false
+    },
+    "rc": {
+      "apt_rpm": false,
+      "chocolatey": false,
+      "crates_io": false,
+      "github_public_release": true,
+      "homebrew_core": false,
+      "homebrew_tap": false,
+      "rmux_io": false,
+      "scoop": false,
+      "snap_candidate": "explicit_opt_in",
+      "snap_stable": false,
+      "web_share": false,
+      "winget": false
+    },
+    "stable": {
+      "apt_rpm": true,
+      "chocolatey": true,
+      "crates_io": true,
+      "github_public_release": true,
+      "homebrew_core": true,
+      "homebrew_tap": true,
+      "rmux_io": true,
+      "scoop": true,
+      "snap_candidate": true,
+      "snap_stable": false,
+      "web_share": true,
+      "winget": true
+    }
+  },
+  "downstream_gate": "publication_receipt_success",
+  "snap_stable_publication": "denied_until_support_decision"
+}
