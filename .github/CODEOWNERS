@@ -1,0 +1,11 @@
+/.github/workflows/ @shideneyu
+/.github/release/ @shideneyu
+/scripts/release/ @shideneyu
+/scripts/release-identity.sh @shideneyu
+/scripts/release-review-gate.sh @shideneyu
+/scripts/release-review-gate-windows.ps1 @shideneyu
+/scripts/verify-release-ref.sh @shideneyu
+/scripts/verify-release-tag-protection.sh @shideneyu
+/tests/release_automation_spec.rs @shideneyu
+/tests/release_shadow_spec.rs @shideneyu
+/SECURITY.md @shideneyu

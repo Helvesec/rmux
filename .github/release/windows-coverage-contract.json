@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "source": "scripts/release-review-gate-windows.ps1",
+  "steps": [
+    {"name": "release versions", "proof": "release_delta", "evidence": "release identity and version contract"},
+    {"name": "changelog release audit", "proof": "release_delta", "evidence": "release review static section"},
+    {"name": "tmux divergence ledger", "proof": "release_delta", "evidence": "release review tmux section"},
+    {"name": "feature inventory", "proof": "release_delta", "evidence": "release review static section"},
+    {"name": "formatting", "proof": "fast_exact", "evidence": "Linux format, lint, and docs"},
+    {"name": "platform cfg budget", "proof": "release_delta", "evidence": "release review static section"},
+    {"name": "worktree hygiene", "proof": "release_delta", "evidence": "release review static section"},
+    {"name": "workspace clippy", "proof": "fast_exact", "evidence": "Windows build, lint, docs, and smoke"},
+    {"name": "tiny parser and boundary tests", "proof": "release_delta", "evidence": "tiny-cli feature probe"},
+    {"name": "mutating target-action retry tests", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "server lib tests", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "SDK lib tests", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "CLI acceptance matrix", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "source/config acceptance matrix", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "target/format acceptance matrix", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "Windows attach stream queue regressions", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "Windows CLI queue formats", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "Windows Ctrl matrix spec", "proof": "release_delta", "evidence": "PowerShell StaticMatrixSpec plus Rust test"},
+    {"name": "Windows attach exit probes", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "Windows mouse border resize probes", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "Windows daemon integration", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "Windows ConPTY integration", "proof": "fast_exact", "evidence": "Windows workspace test archive and 18 slices"},
+    {"name": "Windows package", "proof": "canonical_build", "evidence": "Windows release package build under CRT-static"},
+    {"name": "Windows package verify", "proof": "canonical_smoke", "evidence": "runtime, SDK, and mouse smokes on canonical ZIP"},
+    {"name": "Windows Ctrl matrix portable smoke", "proof": "release_delta", "evidence": "portable smoke against canonical rmux.exe"}
+  ]
+}

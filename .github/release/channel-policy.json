@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "default_decision": "deny",
+  "release_kinds": {
+    "shadow": {
+      "apt_rpm": false,
+      "chocolatey": false,
+      "crates_io": false,
+      "github_public_release": false,
+      "homebrew_core": false,
+      "rmux_io": false,
+      "scoop": false,
+      "snap_candidate": false,
+      "web_share": false,
+      "winget": false
+    },
+    "rc": {
+      "apt_rpm": false,
+      "chocolatey": false,
+      "crates_io": false,
+      "github_public_release": true,
+      "homebrew_core": false,
+      "rmux_io": false,
+      "scoop": false,
+      "snap_candidate": "explicit_opt_in",
+      "web_share": false,
+      "winget": false
+    },
+    "stable": {
+      "apt_rpm": true,
+      "chocolatey": true,
+      "crates_io": true,
+      "github_public_release": true,
+      "homebrew_core": true,
+      "rmux_io": true,
+      "scoop": true,
+      "snap_candidate": false,
+      "web_share": true,
+      "winget": true
+    }
+  },
+  "downstream_gate": "publication_receipt_success"
+}

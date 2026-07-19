@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "percentile_policy": {
+    "minimum_samples_for_percentiles": 7,
+    "below_minimum_report": ["raw_values", "median", "maximum"]
+  },
+  "initial_ceilings_seconds": {
+    "fast_required_checks": 600,
+    "windows_archive_cold_build": 600,
+    "windows_archive_download": 30,
+    "runner_setup": 60,
+    "runner_queue_target": 180,
+    "runner_queue_maximum": 300,
+    "canonical_build_linux_x86_64": 600,
+    "canonical_build_linux_aarch64": 720,
+    "canonical_build_macos_aarch64": 720,
+    "canonical_build_macos_x86_64": 900,
+    "canonical_build_windows_x86_64": 900
+  },
+  "observed_anchors": [
+    {"metric": "windows_archive_cold_build", "run_id": 29662134732, "seconds": 312},
+    {"metric": "windows_archive_cold_build", "run_id": 29659473119, "seconds": 338},
+    {"metric": "windows_archive_download", "run_id": 29679333252, "range_seconds": [1, 6]},
+    {"metric": "windows_runner_queue", "run_id": 29679333252, "maximum_seconds": 169},
+    {"metric": "build_linux_x86_64", "run_id": 29647419533, "seconds": 225},
+    {"metric": "build_linux_aarch64", "run_id": 29647419533, "seconds": 288},
+    {"metric": "build_macos_aarch64", "run_id": 29647419533, "seconds": 299},
+    {"metric": "build_macos_x86_64", "run_id": 29647419533, "seconds": 507},
+    {"metric": "build_windows_x86_64", "run_id": 29647419533, "seconds": 552}
+  ]
+}
