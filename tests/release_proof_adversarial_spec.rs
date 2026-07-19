@@ -103,6 +103,7 @@ fn policy_root_binds_the_committed_contract_and_git_mode() {
 
     assert_eq!(first["algorithm"], "sha256-length-delimited-v2");
     assert_eq!(first["records"][1]["mode"], "100644");
+    assert_eq!(first["records"][1]["type"], "blob");
     assert_eq!(second["records"][1]["mode"], "100755");
     assert_ne!(
         first["release_policy_sha256"],

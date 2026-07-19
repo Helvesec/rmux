@@ -40,7 +40,7 @@ def validate_path(value: Any) -> str:
     return value
 
 
-def git_blob(root: Path, source_sha: str, path: str) -> tuple[str, str, bytes]:
+def git_blob(root: Path, source_sha: str, path: str) -> tuple[str, str, str, bytes]:
     entry = git(root, "ls-tree", "-z", source_sha, "--", path)
     if not entry.endswith(b"\x00") or entry.count(b"\x00") != 1:
         raise ValueError(
@@ -62,7 +62,7 @@ def git_blob(root: Path, source_sha: str, path: str) -> tuple[str, str, bytes]:
             f"policy path must be a regular Git blob: {path} ({mode} {object_type})"
         )
     content = git(root, "cat-file", "blob", blob_oid)
-    return mode, blob_oid, content
+    return mode, object_type, blob_oid, content
 
 
 def calculate(root: Path, source_sha: str) -> dict[str, Any]:
@@ -76,7 +76,7 @@ def calculate(root: Path, source_sha: str) -> dict[str, Any]:
     if resolved != source_sha:
         raise ValueError(f"source SHA did not resolve exactly: {resolved}")
     contract_path = CONTRACT_PATH
-    contract_mode, contract_blob_oid, contract_bytes = git_blob(
+    contract_mode, contract_type, contract_blob_oid, contract_bytes = git_blob(
         root, source_sha, contract_path
     )
     try:
@@ -98,15 +98,17 @@ def calculate(root: Path, source_sha: str) -> dict[str, Any]:
     root_hash.update(DOMAIN)
     records: list[dict[str, Any]] = []
     for path in paths:
-        mode, blob_oid, content = git_blob(root, source_sha, path)
+        mode, object_type, blob_oid, content = git_blob(root, source_sha, path)
         content_sha256 = hashlib.sha256(content).hexdigest()
         path_bytes = path.encode("utf-8")
         mode_bytes = mode.encode("ascii")
+        type_bytes = object_type.encode("ascii")
         oid_bytes = blob_oid.encode("ascii")
         hash_bytes = content_sha256.encode("ascii")
         size_bytes = len(content).to_bytes(8, "big")
         root_hash.update(encode_field(path_bytes))
         root_hash.update(encode_field(mode_bytes))
+        root_hash.update(encode_field(type_bytes))
         root_hash.update(encode_field(oid_bytes))
         root_hash.update(encode_field(size_bytes))
         root_hash.update(encode_field(hash_bytes))
@@ -114,6 +116,7 @@ def calculate(root: Path, source_sha: str) -> dict[str, Any]:
             {
                 "path": path,
                 "mode": mode,
+                "type": object_type,
                 "size": len(content),
                 "blob_oid": blob_oid,
                 "sha256": content_sha256,
@@ -125,6 +128,7 @@ def calculate(root: Path, source_sha: str) -> dict[str, Any]:
         "source_git_sha": source_sha,
         "contract_path": contract_path,
         "contract_mode": contract_mode,
+        "contract_type": contract_type,
         "contract_blob_oid": contract_blob_oid,
         "release_policy_sha256": root_hash.hexdigest(),
         "records": records,
