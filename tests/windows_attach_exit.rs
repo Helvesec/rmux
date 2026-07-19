@@ -307,11 +307,13 @@ fn windows_cmd_default_shell_script_runs_through_cmd_wrapper() -> Result<(), Box
         &binary,
         &label,
         "cmddefault:0.0",
-        b"RMUX_DEFAULT_CMD_READY",
+        b"custom default.cmd",
         SETUP_TIMEOUT,
     )?;
     assert!(
-        output_contains(&output, b"custom default.cmd"),
+        output_contains(&output, b"RMUX_DEFAULT_CMD_READY")
+            && output_contains(&output, b"RMUX_DEFAULT_CMD_PATH:")
+            && output_contains(&output, b"custom default.cmd"),
         ".cmd default-shell path with spaces was not executed through the wrapper; observed output: {}",
         escaped_output(&output)
     );
