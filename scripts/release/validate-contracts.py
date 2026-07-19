@@ -9,8 +9,17 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from local_action_policy import validate_local_action_policy
+
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DIR = ROOT / ".github" / "release"
+STANDARD_RUNNER_LABELS = {
+    "macos-15",
+    "macos-15-intel",
+    "ubuntu-latest",
+    "windows-latest",
+}
+DRAFT_SCHEMA_STATUS = "draft-non-authoritative"
 ALLOWED_WINDOWS_PROOFS = {
     "fast_exact",
     "release_delta",
@@ -151,6 +160,52 @@ def validate_candidate() -> None:
     }
     if qualification_shards != expected_shards:
         raise ValueError("qualification contract must cover every Windows slice 1..18")
+    runner_policy = contract.get("runner_policy")
+    if not isinstance(runner_policy, dict) or runner_policy.get("provider") != (
+        "github_standard_hosted"
+    ):
+        raise ValueError("runner policy must require standard GitHub-hosted runners")
+    runner_group_id = runner_policy.get("runner_group_id")
+    if (
+        type(runner_group_id) is not int
+        or runner_group_id != 0
+        or runner_policy.get("runner_group_name") != "GitHub Actions"
+    ):
+        raise ValueError("runner policy must require the standard GitHub Actions group")
+    jobs_by_label = runner_policy.get("jobs_by_label")
+    if not isinstance(jobs_by_label, dict) or set(jobs_by_label) != (
+        STANDARD_RUNNER_LABELS
+    ):
+        raise ValueError("runner policy must define exactly the standard runner labels")
+    contracted_jobs = (
+        set(success)
+        | set(skipped)
+        | set(allowed)
+        | set(qualification_success)
+        | set(qualification_skipped)
+        | set(qualification_allowed)
+    )
+    assigned_jobs: list[str] = []
+    for label in sorted(jobs_by_label):
+        names = require_unique_strings(
+            jobs_by_label[label], f"runner_policy.jobs_by_label.{label}"
+        )
+        if names != sorted(names):
+            raise ValueError(f"runner jobs for {label} must be bytewise sorted")
+        assigned_jobs.extend(names)
+    duplicate_runner_jobs = sorted(
+        name for name in set(assigned_jobs) if assigned_jobs.count(name) != 1
+    )
+    if duplicate_runner_jobs:
+        raise ValueError(
+            f"runner policy assigns jobs more than once: {duplicate_runner_jobs}"
+        )
+    if set(assigned_jobs) != contracted_jobs:
+        raise ValueError(
+            "runner policy job set mismatch; "
+            f"missing={sorted(contracted_jobs - set(assigned_jobs))}, "
+            f"unexpected={sorted(set(assigned_jobs) - contracted_jobs)}"
+        )
     paths = require_unique_strings(contract.get("policy_paths"), "policy_paths")
     if paths != sorted(paths):
         raise ValueError("policy_paths must be bytewise sorted")
@@ -189,6 +244,7 @@ def validate_candidate() -> None:
         )
     all_scripts = {path for path in tracked if path.startswith("scripts/")}
     local_actions = {path for path in tracked if path.startswith(".github/actions/")}
+    validate_local_action_policy(ROOT, tracked)
     release_gate_data = {
         "CHANGELOG.md",
         "benches/perf/baselines/release-0.7.0.json",
@@ -303,6 +359,10 @@ def validate_schemas() -> None:
     }
     for filename, required_fields in expected.items():
         schema = load(schema_dir / filename)
+        if schema.get("x-rmux-status") != DRAFT_SCHEMA_STATUS:
+            raise ValueError(f"{filename} must remain explicitly non-authoritative")
+        if "MUST NOT authorize publication" not in schema.get("description", ""):
+            raise ValueError(f"{filename} must state its publication prohibition")
         if schema.get("additionalProperties") is not False:
             raise ValueError(f"{filename} must fail closed on unknown fields")
         required = set(
@@ -311,6 +371,18 @@ def validate_schemas() -> None:
         missing = required_fields - required
         if missing:
             raise ValueError(f"{filename} is missing required fields {sorted(missing)}")
+    authority_schema_names = {
+        "promotion-authorization.schema.json",
+        "publication-receipt.schema.json",
+    }
+    for workflow in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+        text = workflow.read_text(encoding="utf-8")
+        referenced = sorted(name for name in authority_schema_names if name in text)
+        if referenced:
+            raise ValueError(
+                f"{workflow.relative_to(ROOT)} consumes draft authority schemas: "
+                f"{referenced}"
+            )
     receipt = load(schema_dir / "publication-receipt.schema.json")
     if receipt["properties"]["receipt_run_attempt"].get("const") != 1:
         raise ValueError("receipt-only runs must be attempt 1")
@@ -324,6 +396,13 @@ def validate_schemas() -> None:
     if not isinstance(candidate.get("allOf"), list) or len(candidate["allOf"]) < 3:
         raise ValueError(
             "candidate schema must bind stable/RC kind and prerelease state"
+        )
+    runner_images = candidate["properties"]["artifacts"]["items"]["properties"][
+        "runner_image"
+    ].get("enum")
+    if runner_images != sorted(STANDARD_RUNNER_LABELS):
+        raise ValueError(
+            "candidate runner_image must use the standard runner allowlist"
         )
 
 

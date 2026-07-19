@@ -37,6 +37,7 @@ jobs:
           import json
           import os
           import re
+          import time
           import urllib.error
           import urllib.request
           from collections import Counter
@@ -47,6 +48,14 @@ jobs:
           REPOSITORY = "Helvesec/rmux"
           API_VERSION = "2026-03-10"
           MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+          MAX_GET_ATTEMPTS = 3
+          MAX_RETRY_DELAY_SECONDS = 10
+          STANDARD_RUNNER_LABELS = {
+              "macos-15",
+              "macos-15-intel",
+              "ubuntu-latest",
+              "windows-latest",
+          }
 
 
           def get_json(url):
@@ -62,11 +71,26 @@ jobs:
                       "X-GitHub-Api-Version": API_VERSION,
                   },
               )
-              try:
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      payload = response.read(MAX_RESPONSE_BYTES + 1)
-              except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
-                  raise RuntimeError(f"GET failed closed for {url}: {error}") from error
+              for attempt in range(1, MAX_GET_ATTEMPTS + 1):
+                  try:
+                      with urllib.request.urlopen(request, timeout=30) as response:
+                          payload = response.read(MAX_RESPONSE_BYTES + 1)
+                      break
+                  except urllib.error.HTTPError as error:
+                      rate_limited = (
+                          error.code == 429 or
+                          (error.code == 403 and error.headers.get("X-RateLimit-Remaining") == "0")
+                      )
+                      retryable = rate_limited or 500 <= error.code <= 599
+                      if not retryable or attempt == MAX_GET_ATTEMPTS:
+                          raise RuntimeError(
+                              f"GET failed closed for {url}: HTTP {error.code}"
+                          ) from error
+                      retry_after = error.headers.get("Retry-After", "")
+                      delay = int(retry_after) if retry_after.isdigit() else 2 ** (attempt - 1)
+                      time.sleep(min(delay, MAX_RETRY_DELAY_SECONDS))
+                  except (urllib.error.URLError, TimeoutError) as error:
+                      raise RuntimeError(f"GET failed closed for {url}: {error}") from error
               if len(payload) > MAX_RESPONSE_BYTES:
                   raise RuntimeError(f"GET response exceeds {MAX_RESPONSE_BYTES} bytes")
               return json.loads(payload)
@@ -168,8 +192,47 @@ jobs:
                   f"candidate job set mismatch; missing={sorted(set(expected) - set(names))}, "
                   f"unexpected={sorted(set(names) - set(expected))}"
               )
+          runner_policy = contract.get("runner_policy")
+          if not isinstance(runner_policy, dict):
+              raise RuntimeError("runner policy is missing")
+          require(runner_policy.get("provider"), "github_standard_hosted", "runner provider")
+          runner_group_id = runner_policy.get("runner_group_id")
+          if type(runner_group_id) is not int or runner_group_id != 0:
+              raise RuntimeError("runner group ID must be the integer zero")
+          require(runner_policy.get("runner_group_name"), "GitHub Actions", "runner group name")
+          jobs_by_label = runner_policy.get("jobs_by_label")
+          if not isinstance(jobs_by_label, dict):
+              raise RuntimeError("runner jobs_by_label must be an object")
+          require(set(jobs_by_label), STANDARD_RUNNER_LABELS, "standard runner label set")
+          job_labels = {}
+          for label, contracted_names in jobs_by_label.items():
+              if not isinstance(contracted_names, list):
+                  raise RuntimeError(f"runner jobs for {label} must be an array")
+              for name in contracted_names:
+                  if not isinstance(name, str) or not name:
+                      raise RuntimeError(f"runner jobs for {label} must be non-empty strings")
+                  if name in job_labels:
+                      raise RuntimeError(f"runner policy assigns {name!r} more than once")
+                  job_labels[name] = label
+          contracted_job_names = set()
+          for run_kind in ("fast_run", "qualification_run"):
+              run_contract = contract.get(run_kind)
+              if not isinstance(run_contract, dict):
+                  raise RuntimeError(f"{run_kind} contract is missing")
+              for field in ("success_jobs", "skipped_jobs"):
+                  contracted_names = run_contract.get(field)
+                  if not isinstance(contracted_names, list):
+                      raise RuntimeError(f"{run_kind}.{field} must be an array")
+                  contracted_job_names.update(contracted_names)
+              allowed_jobs = run_contract.get("allowed_jobs")
+              if not isinstance(allowed_jobs, dict):
+                  raise RuntimeError(f"{run_kind}.allowed_jobs must be an object")
+              contracted_job_names.update(allowed_jobs)
+          require(set(job_labels), contracted_job_names, "runner policy job set")
+          if not set(expected) <= set(job_labels):
+              raise RuntimeError("candidate job has no runner policy assignment")
           ids = [job.get("id") for job in jobs]
-          if not all(isinstance(job_id, int) and job_id > 0 for job_id in ids):
+          if not all(type(job_id) is int and job_id > 0 for job_id in ids):
               raise RuntimeError("candidate job IDs must be positive integers")
           if len(ids) != len(set(ids)):
               raise RuntimeError("candidate contains duplicate job IDs")
@@ -184,6 +247,36 @@ jobs:
                   raise RuntimeError(
                       f"{name} conclusion must be one of {expected[name]}, "
                       f"got {job.get('conclusion')!r}"
+                  )
+              require(job.get("labels"), [job_labels[name]], f"{name} runner labels")
+              if "self-hosted" in job["labels"]:
+                  raise RuntimeError(f"{name} used a self-hosted runner")
+              if job.get("conclusion") == "skipped":
+                  for field in (
+                      "runner_id",
+                      "runner_name",
+                      "runner_group_id",
+                      "runner_group_name",
+                  ):
+                      if field not in job:
+                          raise RuntimeError(f"skipped {name} is missing {field}")
+                      require(job[field], None, f"skipped {name} {field}")
+              else:
+                  runner_id = job.get("runner_id")
+                  if type(runner_id) is not int or runner_id <= 0:
+                      raise RuntimeError(f"{name} runner ID must be a positive integer")
+                  runner_group_id = job.get("runner_group_id")
+                  if type(runner_group_id) is not int or runner_group_id != 0:
+                      raise RuntimeError(f"{name} runner group ID must be the integer zero")
+                  require(
+                      job.get("runner_group_name"),
+                      "GitHub Actions",
+                      f"{name} runner group name",
+                  )
+                  require(
+                      job.get("runner_name"),
+                      f"GitHub Actions {runner_id}",
+                      f"{name} runner name",
                   )
               created = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
               started_at = datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))

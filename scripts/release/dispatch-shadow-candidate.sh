@@ -27,6 +27,10 @@ while (($#)); do
 done
 
 [[ $repository =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]] || { echo "invalid repository" >&2; exit 2; }
+[[ $repository == Helvesec/rmux ]] || {
+  echo "repository must be exactly Helvesec/rmux" >&2
+  exit 2
+}
 [[ $expected_source_sha =~ ^[0-9a-f]{40}$ ]] || { echo "invalid expected source SHA" >&2; exit 2; }
 payload=$(jq -cn \
   --arg ref main \

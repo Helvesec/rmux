@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/release-candidate-manifest-v1.json",
   "title": "RMUX canonical release candidate manifest",
+  "description": "Preparatory draft only. It MUST NOT authorize publication before the PR6 validators and workflows replace this draft contract.",
+  "x-rmux-status": "draft-non-authoritative",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -94,7 +96,9 @@
           "name": {"type": "string", "minLength": 1},
           "archive_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
           "target_triple": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{2,63}$"},
-          "runner_image": {"type": "string", "minLength": 1, "maxLength": 128},
+          "runner_image": {
+            "enum": ["macos-15", "macos-15-intel", "ubuntu-latest", "windows-latest"]
+          },
           "rust_toolchain": {"type": "string", "minLength": 1, "maxLength": 128},
           "rustc_vv_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
           "files": {

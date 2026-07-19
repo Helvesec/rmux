@@ -1,7 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/release-promotion-authorization-v1.json",
-  "title": "RMUX release promotion authorization envelope",
+  "title": "RMUX draft release promotion authorization record",
+  "description": "Preparatory draft only. It MUST NOT authorize publication before PR6 separates the signed predicate from its post-upload envelope and binds a fresh policy audit.",
+  "x-rmux-status": "draft-non-authoritative",
   "type": "object",
   "additionalProperties": false,
   "required": [

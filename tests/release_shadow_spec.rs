@@ -49,6 +49,20 @@ fn release_shadow_has_no_write_authority_or_mutation_primitive() {
     assert!(workflow.contains("/attempts/1/jobs"));
     assert_eq!(workflow.matches("urllib.request.Request(").count(), 1);
     assert_eq!(workflow.matches("urllib.request.urlopen(").count(), 1);
+    assert!(workflow.contains("MAX_GET_ATTEMPTS = 3"));
+    assert!(workflow.contains("X-RateLimit-Remaining"));
+    for runner_proof in [
+        "github_standard_hosted",
+        "runner_group_id",
+        "runner_group_name",
+        "runner_name",
+        "self-hosted",
+    ] {
+        assert!(
+            workflow.contains(runner_proof),
+            "shadow does not bind runner proof field {runner_proof}"
+        );
+    }
 
     for trigger in [
         "\n  push:",
@@ -201,12 +215,14 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
     let mut next_id = 1_u64;
     for (field, conclusion) in [("success_jobs", "success"), ("skipped_jobs", "skipped")] {
         for name in fast[field].as_array().expect("job list") {
+            let name = name.as_str().expect("job name");
             jobs.push(job_fixture(
                 next_id,
                 run_id,
                 &sha,
-                name.as_str().expect("job name"),
+                name,
                 conclusion,
+                contracted_runner_label(&contract, name),
             ));
             next_id += 1;
         }
@@ -218,6 +234,7 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
             &sha,
             name,
             conclusions[0].as_str().expect("allowed conclusion"),
+            contracted_runner_label(&contract, name),
         ));
         next_id += 1;
     }
@@ -264,6 +281,94 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
         serde_json::from_slice(&accepted.stdout).expect("parse exact-run proof");
     assert_eq!(proof["run_id"], 42);
     assert_eq!(proof["run_attempt"], 1);
+    assert_eq!(proof["jobs"][0]["runner_group_id"], 0);
+    assert_eq!(proof["jobs"][0]["runner_group_name"], "GitHub Actions");
+
+    let original_jobs = fs::read_to_string(&jobs_path).expect("read accepted jobs fixture");
+    let mut self_hosted: serde_json::Value =
+        serde_json::from_str(&original_jobs).expect("parse accepted jobs fixture");
+    let executed = self_hosted["jobs"]
+        .as_array_mut()
+        .expect("jobs array")
+        .iter_mut()
+        .find(|job| job["conclusion"] == "success")
+        .expect("executed fixture job");
+    executed["runner_group_id"] = serde_json::json!(1);
+    executed["runner_group_name"] = serde_json::json!("Default");
+    executed["runner_name"] = serde_json::json!("GitHub Actions 1");
+    fs::write(&jobs_path, self_hosted.to_string()).expect("write self-hosted fixture");
+    let rejected_runner = run(&verifier, &common);
+    assert!(!rejected_runner.status.success());
+    assert!(String::from_utf8_lossy(&rejected_runner.stderr).contains("group ID"));
+
+    let mut boolean_group: serde_json::Value =
+        serde_json::from_str(&original_jobs).expect("parse accepted jobs fixture");
+    let boolean_group_job = boolean_group["jobs"]
+        .as_array_mut()
+        .expect("jobs array")
+        .iter_mut()
+        .find(|job| job["conclusion"] == "success")
+        .expect("executed fixture job");
+    boolean_group_job["runner_group_id"] = serde_json::json!(false);
+    fs::write(&jobs_path, boolean_group.to_string()).expect("write boolean group ID");
+    let rejected_boolean_group = run(&verifier, &common);
+    assert!(!rejected_boolean_group.status.success());
+    assert!(String::from_utf8_lossy(&rejected_boolean_group.stderr)
+        .contains("group ID must be the integer zero"));
+
+    let mut invalid_skip: serde_json::Value =
+        serde_json::from_str(&original_jobs).expect("parse accepted jobs fixture");
+    let skipped = invalid_skip["jobs"]
+        .as_array_mut()
+        .expect("jobs array")
+        .iter_mut()
+        .find(|job| job["conclusion"] == "skipped")
+        .expect("skipped fixture job");
+    skipped["runner_id"] = serde_json::json!(1234);
+    skipped["runner_name"] = serde_json::json!("GitHub Actions 1234");
+    skipped["runner_group_id"] = serde_json::json!(0);
+    skipped["runner_group_name"] = serde_json::json!("GitHub Actions");
+    fs::write(&jobs_path, invalid_skip.to_string()).expect("write invalid skipped job");
+    let rejected_skip = run(&verifier, &common);
+    assert!(!rejected_skip.status.success());
+    assert!(String::from_utf8_lossy(&rejected_skip.stderr).contains("skipped job"));
+
+    let mut missing_skip_field: serde_json::Value =
+        serde_json::from_str(&original_jobs).expect("parse accepted jobs fixture");
+    let skipped = missing_skip_field["jobs"]
+        .as_array_mut()
+        .expect("jobs array")
+        .iter_mut()
+        .find(|job| job["conclusion"] == "skipped")
+        .expect("skipped fixture job");
+    skipped
+        .as_object_mut()
+        .expect("skipped job object")
+        .remove("runner_id");
+    fs::write(&jobs_path, missing_skip_field.to_string()).expect("write missing runner ID");
+    let rejected_missing_skip_field = run(&verifier, &common);
+    assert!(!rejected_missing_skip_field.status.success());
+    assert!(String::from_utf8_lossy(&rejected_missing_skip_field.stderr)
+        .contains("is missing runner_id"));
+
+    let mut boolean_job_id: serde_json::Value =
+        serde_json::from_str(&original_jobs).expect("parse accepted jobs fixture");
+    boolean_job_id["jobs"][0]["id"] = serde_json::json!(true);
+    fs::write(&jobs_path, boolean_job_id.to_string()).expect("write boolean job ID");
+    let rejected_boolean_job_id = run(&verifier, &common);
+    assert!(!rejected_boolean_job_id.status.success());
+    assert!(String::from_utf8_lossy(&rejected_boolean_job_id.stderr)
+        .contains("every job must have a positive integer ID"));
+
+    let mut wrong_label: serde_json::Value =
+        serde_json::from_str(&original_jobs).expect("parse accepted jobs fixture");
+    wrong_label["jobs"][0]["labels"] = serde_json::json!(["self-hosted"]);
+    fs::write(&jobs_path, wrong_label.to_string()).expect("write wrong runner label");
+    let rejected_label = run(&verifier, &common);
+    assert!(!rejected_label.status.success());
+    assert!(String::from_utf8_lossy(&rejected_label.stderr).contains("runner labels"));
+
+    fs::write(&jobs_path, &original_jobs).expect("restore accepted jobs fixture");
 
     let mut corrupted: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&jobs_path).expect("read jobs fixture"))
@@ -278,7 +383,46 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
 }
 
 #[cfg(unix)]
-fn job_fixture(id: u64, run_id: u64, sha: &str, name: &str, conclusion: &str) -> serde_json::Value {
+fn contracted_runner_label<'a>(contract: &'a serde_json::Value, name: &str) -> &'a str {
+    contract["runner_policy"]["jobs_by_label"]
+        .as_object()
+        .expect("runner jobs by label")
+        .iter()
+        .find_map(|(label, names)| {
+            names
+                .as_array()
+                .expect("runner job list")
+                .iter()
+                .any(|value| value.as_str() == Some(name))
+                .then_some(label.as_str())
+        })
+        .unwrap_or_else(|| panic!("missing runner label for {name}"))
+}
+
+#[cfg(unix)]
+fn job_fixture(
+    id: u64,
+    run_id: u64,
+    sha: &str,
+    name: &str,
+    conclusion: &str,
+    runner_label: &str,
+) -> serde_json::Value {
+    let (runner_id, runner_name, runner_group_id, runner_group_name) = if conclusion == "skipped" {
+        (
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        )
+    } else {
+        (
+            serde_json::json!(id + 1000),
+            serde_json::json!(format!("GitHub Actions {}", id + 1000)),
+            serde_json::json!(0),
+            serde_json::json!("GitHub Actions"),
+        )
+    };
     serde_json::json!({
         "id": id,
         "run_id": run_id,
@@ -288,6 +432,11 @@ fn job_fixture(id: u64, run_id: u64, sha: &str, name: &str, conclusion: &str) ->
         "name": name,
         "status": "completed",
         "conclusion": conclusion,
+        "labels": [runner_label],
+        "runner_id": runner_id,
+        "runner_name": runner_name,
+        "runner_group_id": runner_group_id,
+        "runner_group_name": runner_group_name,
         "created_at": "2026-07-19T09:00:00Z",
         "started_at": "2026-07-19T09:00:01Z",
         "completed_at": "2026-07-19T09:00:02Z"
@@ -426,6 +575,178 @@ fn candidate_controller_is_dry_run_by_default_and_requests_the_returned_run_id()
     assert_eq!(request["payload"]["return_run_details"], true);
     assert_eq!(request["payload"]["inputs"]["release_qualification"], true);
     assert_eq!(request["binding"], "none-baseline-qualification-only");
+
+    let foreign = run(
+        &controller,
+        &[
+            "--repository",
+            "someone/else",
+            "--expected-source-sha",
+            "cccccccccccccccccccccccccccccccccccccccc",
+        ],
+    );
+    assert!(!foreign.status.success());
+    assert!(String::from_utf8_lossy(&foreign.stderr)
+        .contains("repository must be exactly Helvesec/rmux"));
+}
+
+#[test]
+#[cfg(unix)]
+fn local_actions_are_confined_to_the_policy_directory() {
+    let root = temp_dir("local-action-policy");
+    fs::create_dir_all(root.join(".github/workflows")).expect("create workflow directory");
+    fs::create_dir_all(root.join(".github/actions/example")).expect("create action directory");
+    fs::write(
+        root.join(".github/workflows/ci.yml"),
+        "jobs:\n  test:\n    steps:\n      - uses: ./.github/actions/example\n",
+    )
+    .expect("write workflow fixture");
+    fs::write(
+        root.join(".github/actions/example/action.yml"),
+        "name: example\nruns:\n  using: composite\n  steps:\n    - shell: bash\n      run: true\n",
+    )
+    .expect("write action fixture");
+    fs::write(root.join(".github/actions/example/helper.sh"), "true\n")
+        .expect("write action helper");
+    for arguments in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "RMUX test"],
+        vec!["config", "user.email", "rmux-test@example.invalid"],
+        vec!["add", "."],
+    ] {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(&root)
+            .output()
+            .expect("run local action fixture command");
+        assert!(output.status.success());
+    }
+    let policy = repo_root().join("scripts/release/local_action_policy.py");
+    let root_text = root.to_str().expect("fixture root");
+    let accepted = run(&policy, &["--repository-root", root_text]);
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    fs::create_dir_all(root.join("tools/release-action")).expect("create foreign action");
+    fs::write(
+        root.join("tools/release-action/action.yml"),
+        "name: foreign\nruns:\n  using: composite\n  steps: []\n",
+    )
+    .expect("write foreign action");
+    fs::write(
+        root.join(".github/workflows/ci.yml"),
+        "jobs:\n  test:\n    steps:\n      - uses : ./tools/release-action\n",
+    )
+    .expect("reference foreign action");
+    assert!(Command::new("git")
+        .args(["add", "."])
+        .current_dir(&root)
+        .status()
+        .expect("stage foreign action fixture")
+        .success());
+    let rejected_workflow = run(&policy, &["--repository-root", root_text]);
+    assert!(!rejected_workflow.status.success());
+    assert!(String::from_utf8_lossy(&rejected_workflow.stderr)
+        .contains("manifests must live below .github/actions"));
+
+    fs::write(
+        root.join(".github/workflows/ci.yml"),
+        "jobs:\n  test:\n    steps:\n      - uses: ./.github/actions/example\n",
+    )
+    .expect("restore workflow fixture");
+    fs::write(
+        root.join(".github/actions/example/action.yml"),
+        "name: example\nruns:\n  using: composite\n  steps:\n    - {uses: ./tools/release-action}\n",
+    )
+    .expect("reference foreign action from composite");
+    assert!(Command::new("git")
+        .args(["add", "."])
+        .current_dir(&root)
+        .status()
+        .expect("stage composite fixture")
+        .success());
+    let rejected_composite = run(&policy, &["--repository-root", root_text]);
+    assert!(!rejected_composite.status.success());
+    assert!(String::from_utf8_lossy(&rejected_composite.stderr)
+        .contains("manifests must live below .github/actions"));
+
+    fs::remove_file(root.join("tools/release-action/action.yml"))
+        .expect("remove foreign action manifest");
+    fs::write(
+        root.join("tools/release-action/Action.yml"),
+        "name: wrong-case\nruns:\n  using: composite\n  steps: []\n",
+    )
+    .expect("write wrong-case action manifest");
+    assert!(Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(&root)
+        .status()
+        .expect("stage wrong-case action fixture")
+        .success());
+    let rejected_wrong_case = run(&policy, &["--repository-root", root_text]);
+    assert!(!rejected_wrong_case.status.success());
+    assert!(String::from_utf8_lossy(&rejected_wrong_case.stderr)
+        .contains("must use the exact lowercase name"));
+    fs::remove_dir_all(root).expect("remove local action fixtures");
+}
+
+#[test]
+fn candidate_artifacts_allow_only_standard_github_runner_labels() {
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../.github/release/schemas/candidate-manifest.schema.json"
+    ))
+    .expect("parse candidate manifest schema");
+    assert_eq!(
+        schema["properties"]["artifacts"]["items"]["properties"]["runner_image"]["enum"],
+        serde_json::json!([
+            "macos-15",
+            "macos-15-intel",
+            "ubuntu-latest",
+            "windows-latest"
+        ])
+    );
+}
+
+#[test]
+fn draft_authority_schemas_cannot_drive_a_workflow() {
+    for schema in [
+        include_str!("../.github/release/schemas/candidate-manifest.schema.json"),
+        include_str!("../.github/release/schemas/promotion-authorization.schema.json"),
+        include_str!("../.github/release/schemas/publication-receipt.schema.json"),
+    ] {
+        let schema: serde_json::Value = serde_json::from_str(schema).expect("parse draft schema");
+        assert_eq!(schema["x-rmux-status"], "draft-non-authoritative");
+        assert!(schema["description"]
+            .as_str()
+            .expect("schema description")
+            .contains("MUST NOT authorize publication"));
+    }
+
+    for entry in
+        fs::read_dir(repo_root().join(".github/workflows")).expect("read workflow directory")
+    {
+        let path = entry.expect("workflow entry").path();
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let workflow = fs::read_to_string(&path).expect("read workflow");
+        for authority_schema in [
+            "promotion-authorization.schema.json",
+            "publication-receipt.schema.json",
+        ] {
+            assert!(
+                !workflow.contains(authority_schema),
+                "{} consumes draft authority schema {authority_schema}",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]

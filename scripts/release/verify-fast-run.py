@@ -22,6 +22,12 @@ from github_actions import (
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = ".github/release/candidate-contract.json"
+STANDARD_RUNNER_LABELS = {
+    "macos-15",
+    "macos-15-intel",
+    "ubuntu-latest",
+    "windows-latest",
+}
 
 
 def timestamp(value: Any, label: str) -> datetime:
@@ -107,6 +113,92 @@ def require_equal(actual: Any, expected: Any, label: str) -> None:
         raise ValueError(f"{label} mismatch: expected {expected!r}, got {actual!r}")
 
 
+def contracted_runner_labels(
+    contract: dict[str, Any], expected_job_names: set[str]
+) -> tuple[dict[str, Any], dict[str, str]]:
+    policy = contract.get("runner_policy")
+    if not isinstance(policy, dict):
+        raise ValueError("runner policy is missing")
+    require_equal(policy.get("provider"), "github_standard_hosted", "runner provider")
+    runner_group_id = policy.get("runner_group_id")
+    if type(runner_group_id) is not int or runner_group_id != 0:
+        raise ValueError("runner group ID must be the integer zero")
+    require_equal(
+        policy.get("runner_group_name"), "GitHub Actions", "runner group name"
+    )
+    jobs_by_label = policy.get("jobs_by_label")
+    if not isinstance(jobs_by_label, dict):
+        raise ValueError("runner jobs_by_label must be an object")
+    require_equal(
+        set(jobs_by_label), STANDARD_RUNNER_LABELS, "standard runner label set"
+    )
+    job_labels: dict[str, str] = {}
+    for label, names in jobs_by_label.items():
+        if not isinstance(names, list) or not all(
+            isinstance(name, str) and name for name in names
+        ):
+            raise ValueError(f"runner jobs for {label} must be non-empty strings")
+        for name in names:
+            if name in job_labels:
+                raise ValueError(f"runner policy assigns {name!r} more than once")
+            job_labels[name] = label
+    contracted_job_names: set[str] = set()
+    for run_kind in ("fast_run", "qualification_run"):
+        run_contract = contract.get(run_kind)
+        if not isinstance(run_contract, dict):
+            raise ValueError(f"{run_kind} contract is missing")
+        for field in ("success_jobs", "skipped_jobs"):
+            names = run_contract.get(field)
+            if not isinstance(names, list) or not all(
+                isinstance(name, str) and name for name in names
+            ):
+                raise ValueError(f"{run_kind}.{field} must contain job names")
+            contracted_job_names.update(names)
+        allowed_jobs = run_contract.get("allowed_jobs")
+        if not isinstance(allowed_jobs, dict):
+            raise ValueError(f"{run_kind}.allowed_jobs must be an object")
+        contracted_job_names.update(allowed_jobs)
+    require_equal(set(job_labels), contracted_job_names, "runner policy job set")
+    if not expected_job_names <= set(job_labels):
+        raise ValueError("current run has a job without a runner policy assignment")
+    return policy, job_labels
+
+
+def verify_job_runner(
+    job: dict[str, Any], policy: dict[str, Any], expected_label: str
+) -> None:
+    name = job["name"]
+    labels = job.get("labels")
+    require_equal(labels, [expected_label], f"job {name} runner labels")
+    if "self-hosted" in labels:
+        raise ValueError(f"job {name} used a self-hosted runner")
+    if job.get("conclusion") == "skipped":
+        for field in (
+            "runner_id",
+            "runner_name",
+            "runner_group_id",
+            "runner_group_name",
+        ):
+            if field not in job:
+                raise ValueError(f"skipped job {name} is missing {field}")
+            require_equal(job[field], None, f"skipped job {name} {field}")
+        return
+    runner_id = job.get("runner_id")
+    if type(runner_id) is not int or runner_id <= 0:
+        raise ValueError(f"job {name} runner ID must be a positive integer")
+    runner_group_id = job.get("runner_group_id")
+    if type(runner_group_id) is not int or runner_group_id != policy["runner_group_id"]:
+        raise ValueError(f"job {name} group ID must be the integer zero")
+    require_equal(
+        job.get("runner_group_name"),
+        policy["runner_group_name"],
+        f"job {name} group name",
+    )
+    require_equal(
+        job.get("runner_name"), f"GitHub Actions {runner_id}", f"job {name} runner name"
+    )
+
+
 def verify(
     args: argparse.Namespace,
     contract_bytes: bytes,
@@ -184,7 +276,7 @@ def verify(
     if duplicate_names:
         raise ValueError(f"run contains duplicate job names: {duplicate_names}")
     job_ids = [job.get("id") for job in jobs]
-    if not all(isinstance(job_id, int) and job_id > 0 for job_id in job_ids):
+    if not all(type(job_id) is int and job_id > 0 for job_id in job_ids):
         raise ValueError("every job must have a positive integer ID")
     if len(job_ids) != len(set(job_ids)):
         raise ValueError("run contains duplicate job IDs")
@@ -196,6 +288,7 @@ def verify(
         raise ValueError(
             f"job set mismatch; missing={missing}, unexpected={unexpected}"
         )
+    runner_policy, job_labels = contracted_runner_labels(contract, expected_names)
     for job in jobs:
         require_equal(job.get("status"), "completed", f"job {job['name']} status")
         require_equal(job.get("run_id"), args.run_id, f"job {job['name']} run ID")
@@ -217,6 +310,7 @@ def verify(
                 f"job {job['name']} conclusion must be one of {expected[job['name']]!r}, "
                 f"got {job.get('conclusion')!r}"
             )
+        verify_job_runner(job, runner_policy, job_labels[job["name"]])
         created = timestamp(job.get("created_at"), f"job {job['name']} created_at")
         job_started = timestamp(job.get("started_at"), f"job {job['name']} started_at")
         completed = timestamp(
@@ -230,7 +324,16 @@ def verify(
 
     job_proof = sorted(
         (
-            {"id": job["id"], "name": job["name"], "conclusion": job["conclusion"]}
+            {
+                "id": job["id"],
+                "name": job["name"],
+                "conclusion": job["conclusion"],
+                "labels": job["labels"],
+                "runner_id": job.get("runner_id"),
+                "runner_name": job.get("runner_name"),
+                "runner_group_id": job.get("runner_group_id"),
+                "runner_group_name": job.get("runner_group_name"),
+            }
             for job in jobs
         ),
         key=lambda item: item["name"],

@@ -2,6 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/release-publication-receipt-v1.json",
   "title": "RMUX immutable release publication receipt",
+  "description": "Preparatory draft only. It MUST NOT authorize publication or downstream channels before the PR6 and PR7 validators and workflows replace this draft contract.",
+  "x-rmux-status": "draft-non-authoritative",
   "type": "object",
   "additionalProperties": false,
   "required": [
