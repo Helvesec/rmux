@@ -84,7 +84,9 @@ jq -e \
     .head_branch == "main" and
     .head_sha == $expected_source_sha and
     .run_attempt == 1 and
+    .repository.id == 1239918790 and
     .repository.full_name == $repository and
+    .head_repository.id == 1239918790 and
     .head_repository.full_name == $repository
   ' <<<"$run" >/dev/null || {
   echo "dispatched qualification run identity is not exact" >&2

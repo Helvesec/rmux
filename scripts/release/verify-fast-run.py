@@ -47,10 +47,22 @@ def load_committed_contract(root: Path, source_sha: str) -> tuple[bytes, str]:
     resolved = git(root, "rev-parse", f"{source_sha}^{{commit}}").decode().strip()
     if resolved != source_sha:
         raise ValueError(f"source SHA did not resolve exactly: {resolved}")
-    blob_oid = git(root, "rev-parse", f"{source_sha}:{CONTRACT_PATH}").decode().strip()
-    object_type = git(root, "cat-file", "-t", blob_oid).decode().strip()
-    if object_type != "blob":
-        raise ValueError(f"committed candidate contract is not a blob: {object_type}")
+    entry = git(root, "ls-tree", "-z", source_sha, "--", CONTRACT_PATH)
+    if not entry.endswith(b"\x00") or entry.count(b"\x00") != 1:
+        raise ValueError("committed candidate contract did not resolve exactly once")
+    try:
+        metadata, encoded_path = entry[:-1].split(b"\t", 1)
+        encoded_mode, encoded_type, encoded_oid = metadata.split(b" ")
+        mode = encoded_mode.decode("ascii")
+        object_type = encoded_type.decode("ascii")
+        blob_oid = encoded_oid.decode("ascii")
+        path = encoded_path.decode("utf-8")
+    except (UnicodeDecodeError, ValueError) as error:
+        raise ValueError("invalid committed candidate contract tree entry") from error
+    if path != CONTRACT_PATH or mode != "100644" or object_type != "blob":
+        raise ValueError(
+            "committed candidate contract must be one regular non-executable blob"
+        )
     return git(root, "cat-file", "blob", blob_oid), blob_oid
 
 

@@ -175,7 +175,8 @@ def validate_candidate() -> None:
         raise ValueError("candidate contract must include itself in policy_paths")
     workflow_paths = {
         path.relative_to(ROOT).as_posix()
-        for path in (ROOT / ".github" / "workflows").glob("*.yml")
+        for suffix in ("*.yml", "*.yaml")
+        for path in (ROOT / ".github" / "workflows").glob(suffix)
     }
     referenced_scripts: set[str] = set()
     for workflow_path in workflow_paths:
@@ -186,7 +187,21 @@ def validate_candidate() -> None:
                 workflow,
             )
         )
-    uncovered = sorted((workflow_paths | referenced_scripts) - set(paths))
+    all_scripts = {path for path in tracked if path.startswith("scripts/")}
+    release_gate_data = {
+        "CHANGELOG.md",
+        "benches/perf/baselines/release-0.7.0.json",
+        "benches/perf/baselines/release-0.9.0-linux.json",
+        "benches/perf/baselines/release-0.9.0.json",
+        "deny.toml",
+        "tests/reference/tmux_compat/divergences.toml",
+        "tests/reference/tmux_compat/error_exit_matrix.yaml",
+        "tests/reference/tmux_compat/frozen_reference.yaml",
+    }
+    uncovered = sorted(
+        (workflow_paths | referenced_scripts | all_scripts | release_gate_data)
+        - set(paths)
+    )
     if uncovered:
         raise ValueError(
             f"release policy does not cover workflow-reachable files: {uncovered}"
