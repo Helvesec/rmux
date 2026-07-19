@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "status": "review-only-not-authoritative",
+  "repository_id": 1239918790,
+  "workflow": {
+    "id": 277622540,
+    "name": "CI",
+    "path": ".github/workflows/ci.yml",
+    "event": "workflow_dispatch",
+    "branch": "main",
+    "required_run_attempt": 1
+  },
+  "scheduler": {
+    "concurrency_group": "rmux-release-candidate",
+    "cancel_in_progress": false,
+    "maximum_parallel_jobs": 14,
+    "maximum_parallel_macos_jobs": 2,
+    "dispatch_after_fast_success": true
+  },
+  "fast_proof": {
+    "kind": "fast",
+    "selected_by_run_id": true,
+    "required_workflow_id": 277622540,
+    "required_job_contract": ".github/release/candidate-contract.json"
+  },
+  "delta": {
+    "replays_fast_jobs": false,
+    "tmux_oracle_builds": 1,
+    "review_sections": ["cli", "perf", "static", "tmux"],
+    "proof_jobs": [
+      "nix",
+      "release-review-cli",
+      "release-review-perf",
+      "release-review-static",
+      "release-review-tmux",
+      "snap",
+      "windows-ctrl-matrix"
+    ]
+  },
+  "publication": {
+    "enabled": false,
+    "public_triggers": false,
+    "publication_permissions": false,
+    "publication_secrets": false
+  }
+}

@@ -177,6 +177,11 @@ def validate_candidate() -> None:
         STANDARD_RUNNER_LABELS
     ):
         raise ValueError("runner policy must define exactly the standard runner labels")
+    non_runner_jobs = require_unique_strings(
+        runner_policy.get("non_runner_jobs"), "runner_policy.non_runner_jobs"
+    )
+    if non_runner_jobs != ["Run release-only candidate delta"]:
+        raise ValueError("runner policy must identify the reusable workflow call job")
     contracted_jobs = (
         set(success)
         | set(skipped)
@@ -200,11 +205,14 @@ def validate_candidate() -> None:
         raise ValueError(
             f"runner policy assigns jobs more than once: {duplicate_runner_jobs}"
         )
-    if set(assigned_jobs) != contracted_jobs:
+    assigned_or_virtual = set(assigned_jobs) | set(non_runner_jobs)
+    if set(assigned_jobs) & set(non_runner_jobs):
+        raise ValueError("a virtual workflow call cannot also have a runner label")
+    if assigned_or_virtual != contracted_jobs:
         raise ValueError(
             "runner policy job set mismatch; "
-            f"missing={sorted(contracted_jobs - set(assigned_jobs))}, "
-            f"unexpected={sorted(set(assigned_jobs) - contracted_jobs)}"
+            f"missing={sorted(contracted_jobs - assigned_or_virtual)}, "
+            f"unexpected={sorted(assigned_or_virtual - contracted_jobs)}"
         )
     paths = require_unique_strings(contract.get("policy_paths"), "policy_paths")
     if paths != sorted(paths):
@@ -293,6 +301,81 @@ def validate_windows_coverage() -> None:
             raise ValueError(f"invalid proof for Windows step {entry.get('name')}")
         if not isinstance(entry.get("evidence"), str) or not entry["evidence"].strip():
             raise ValueError(f"Windows step {entry.get('name')} has no evidence")
+
+
+def validate_candidate_workflow() -> None:
+    contract = load(CONTRACT_DIR / "candidate-workflow-contract.json")
+    if contract.get("schema_version") != 1:
+        raise ValueError("candidate workflow contract schema_version must be 1")
+    if contract.get("status") != "review-only-not-authoritative":
+        raise ValueError("candidate workflow must remain review-only before cut-over")
+    workflow = contract.get("workflow")
+    if workflow != {
+        "id": 277622540,
+        "name": "CI",
+        "path": ".github/workflows/ci.yml",
+        "event": "workflow_dispatch",
+        "branch": "main",
+        "required_run_attempt": 1,
+    }:
+        raise ValueError("candidate workflow identity drifted")
+    scheduler = contract.get("scheduler")
+    if not isinstance(scheduler, dict):
+        raise ValueError("candidate scheduler policy is missing")
+    if (
+        scheduler.get("concurrency_group") != "rmux-release-candidate"
+        or scheduler.get("cancel_in_progress") is not False
+        or scheduler.get("dispatch_after_fast_success") is not True
+        or scheduler.get("maximum_parallel_jobs") != 14
+        or scheduler.get("maximum_parallel_macos_jobs") != 2
+    ):
+        raise ValueError("candidate scheduler invariants drifted")
+    delta = contract.get("delta")
+    if not isinstance(delta, dict) or delta.get("replays_fast_jobs") is not False:
+        raise ValueError("candidate delta must not replay fast jobs")
+    sections = require_unique_strings(
+        delta.get("review_sections"), "candidate delta review_sections"
+    )
+    if sections != sorted(sections) or sections != ["cli", "perf", "static", "tmux"]:
+        raise ValueError("candidate delta contains a fast-covered review section")
+    if delta.get("tmux_oracle_builds") != 1:
+        raise ValueError("the fast and candidate path must build tmux exactly once")
+    publication = contract.get("publication")
+    if not isinstance(publication, dict) or any(
+        publication.get(field) is not False
+        for field in (
+            "enabled",
+            "public_triggers",
+            "publication_permissions",
+            "publication_secrets",
+        )
+    ):
+        raise ValueError("candidate delta acquired publication authority")
+
+    ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    delta_workflow = (
+        ROOT / ".github/workflows/release-candidate-delta.yml"
+    ).read_text(encoding="utf-8")
+    for required_input in (
+        "fast_run_id:",
+        "expected_source_sha:",
+        "release_intent_id:",
+        "planned_release_ref:",
+        "release_kind:",
+    ):
+        if required_input not in ci:
+            raise ValueError(f"CI candidate route is missing {required_input}")
+    if "uses: ./.github/workflows/release-candidate-delta.yml" not in ci:
+        raise ValueError("CI does not call the release-only delta workflow")
+    if "--retries 0" not in ci:
+        raise ValueError("Windows fast proof must disable Nextest retries")
+    if "workflow_call:" not in delta_workflow or "workflow_dispatch:" in delta_workflow:
+        raise ValueError("release delta must only be reachable through workflow_call")
+    forbidden = ("contents: write", "packages: write", "id-token: write", "secrets:")
+    if any(value in delta_workflow for value in forbidden):
+        raise ValueError("release delta contains a publication capability")
+    if "--evidence-mode candidate-delta" not in delta_workflow:
+        raise ValueError("release delta does not request deduplicated evidence")
 
 
 def validate_channels() -> None:
@@ -444,6 +527,7 @@ def validate_measurement_budget() -> None:
 
 def main() -> int:
     validate_candidate()
+    validate_candidate_workflow()
     validate_windows_coverage()
     validate_channels()
     validate_schemas()

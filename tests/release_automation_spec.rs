@@ -590,6 +590,7 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         "--extract-to \"$env:GITHUB_WORKSPACE\"",
         "--extract-overwrite",
         "--partition \"slice:${{ matrix.shard }}/18\"",
+        "--retries 0",
         "--test-threads num-cpus",
         "RMUX_WINDOWS_SMOKE_RMUX_BIN: ${{ github.workspace }}/target/debug/rmux.exe",
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
@@ -618,7 +619,7 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
     );
     for required in [
         "name: Platform build and smoke on windows-latest",
-        "if: always()",
+        "always() &&",
         "needs: [windows-test-build, windows-tests]",
         "WINDOWS_BUILD_RESULT: ${{ needs.windows-test-build.result }}",
         "WINDOWS_TESTS_RESULT: ${{ needs.windows-tests.result }}",
@@ -674,6 +675,7 @@ fn windows_smokes_can_reuse_the_binary_from_the_nextest_archive() {
 #[test]
 fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
     let ci = include_str!("../.github/workflows/ci.yml");
+    let delta = include_str!("../.github/workflows/release-candidate-delta.yml");
     let perf = ci
         .split("\n  release-review-perf:\n")
         .nth(1)
@@ -700,7 +702,6 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
         "name: Release review (perf)",
         "needs: windows-tests-gate",
         "startsWith(github.ref, 'refs/tags/v')",
-        "inputs.release_qualification",
         "CARGO_BUILD_JOBS: \"4\"",
         "--section perf",
         "target/release-review-ci-perf",
@@ -716,7 +717,6 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
         "name: Release review (${{ matrix.section }})",
         "needs: [linux-source-gates, windows-tests-gate]",
         "startsWith(github.ref, 'refs/tags/v')",
-        "inputs.release_qualification",
         "max-parallel: 6",
         "section: [static, lint, server, cli, tmux, runtime-sdk]",
         "CARGO_BUILD_JOBS: \"4\"",
@@ -735,7 +735,6 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
         "name: Release review gate (no package)",
         "always() &&",
         "startsWith(github.ref, 'refs/tags/v')",
-        "inputs.release_qualification",
         "needs: [release-review-perf, release-review-sections]",
         "RELEASE_REVIEW_PERF_RESULT: ${{ needs.release-review-perf.result }}",
         "RELEASE_REVIEW_RESULT: ${{ needs.release-review-sections.result }}",
@@ -747,14 +746,31 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
             "release review aggregate gate lost required snippet {required:?}"
         );
     }
+
+    for required in [
+        "workflow_call:",
+        "Candidate release delta gate",
+        "--evidence-mode candidate-delta",
+        "section: [static, cli, tmux]",
+        "run-id: ${{ inputs.fast_run_id }}",
+    ] {
+        assert!(
+            delta.contains(required),
+            "candidate delta lost deduplication invariant {required:?}"
+        );
+    }
 }
 
 #[test]
 fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
     let ci = include_str!("../.github/workflows/ci.yml");
     assert!(ci.contains("release_qualification:"));
-    assert!(ci.contains("description: Run all deferred release qualification jobs"));
-    assert!(ci.contains("including native Windows smoke"));
+    assert!(
+        ci.contains("description: Run the release-only delta after proving an exact fast main run")
+    );
+    assert!(ci.contains("name: Verify exhaustive fast evidence"));
+    assert!(ci.contains("--kind fast"));
+    assert!(ci.contains("uses: ./.github/workflows/release-candidate-delta.yml"));
 
     for (job, next_job) in [
         ("snap-package", "nix-flake"),
@@ -784,8 +800,9 @@ fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
 }
 
 #[test]
-fn release_qualification_includes_the_native_windows_runtime_smoke() {
+fn release_qualification_replaces_replayed_runtime_with_release_delta() {
     let ci = include_str!("../.github/workflows/ci.yml");
+    let delta = include_str!("../.github/workflows/release-candidate-delta.yml");
     let runtime = ci
         .split("\n  windows-runtime-smoke:\n")
         .nth(1)
@@ -796,7 +813,6 @@ fn release_qualification_includes_the_native_windows_runtime_smoke() {
         "startsWith(github.ref, 'refs/tags/v')",
         "github.event_name == 'workflow_dispatch'",
         "inputs.windows_runtime_smoke",
-        "inputs.release_qualification",
     ] {
         assert!(
             runtime.contains(required),
@@ -807,6 +823,9 @@ fn release_qualification_includes_the_native_windows_runtime_smoke() {
         !runtime.contains("github.event_name == 'push'"),
         "native Windows runtime smoke must remain tag- or dispatch-only"
     );
+    assert!(delta.contains("name: Candidate delta Windows Ctrl policy"));
+    assert!(delta.contains("windows_ctrl_matrix.ps1 -StaticMatrixSpec"));
+    assert!(!delta.contains("cargo test -p rmux --locked --test windows_ctrl_matrix_spec"));
 
     for (job, next_job) in [
         ("release-review-perf", "release-review-sections"),
@@ -884,7 +903,6 @@ fn ordinary_main_pushes_skip_the_windows_release_package_chain() {
             "startsWith(github.ref, 'refs/tags/v')",
             "github.event_name == 'workflow_dispatch'",
             "inputs.windows_package_smoke",
-            "inputs.release_qualification",
         ] {
             assert!(
                 block.contains(required),
@@ -1422,6 +1440,10 @@ fn workflows_install_the_workspace_toolchain_instead_of_floating_stable() {
 fn every_ci_and_release_job_has_a_bounded_runtime() {
     for (workflow_name, workflow) in [
         ("ci", include_str!("../.github/workflows/ci.yml")),
+        (
+            "release-candidate-delta",
+            include_str!("../.github/workflows/release-candidate-delta.yml"),
+        ),
         ("release", include_str!("../.github/workflows/release.yml")),
         (
             "scorecard",
@@ -1434,6 +1456,7 @@ fn every_ci_and_release_job_has_a_bounded_runtime() {
             .expect("workflow jobs section");
         let mut current_job: Option<&str> = None;
         let mut current_has_timeout = false;
+        let mut current_is_reusable_call = false;
 
         for line in jobs.lines().chain(std::iter::once("  end:")) {
             let is_job_header =
@@ -1441,14 +1464,17 @@ fn every_ci_and_release_job_has_a_bounded_runtime() {
             if is_job_header {
                 if let Some(job) = current_job {
                     assert!(
-                        current_has_timeout,
+                        current_has_timeout || current_is_reusable_call,
                         "{workflow_name} job {job} must set timeout-minutes"
                     );
                 }
                 current_job = Some(line.trim_end_matches(':').trim());
                 current_has_timeout = false;
+                current_is_reusable_call = false;
             } else if line.trim_start().starts_with("timeout-minutes:") {
                 current_has_timeout = true;
+            } else if line.trim_start().starts_with("uses: ./.github/workflows/") {
+                current_is_reusable_call = true;
             }
         }
     }

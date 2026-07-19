@@ -1,0 +1,202 @@
+name: Release candidate delta
+
+on:
+  workflow_call:
+    inputs:
+      expected_source_sha:
+        required: true
+        type: string
+      fast_run_id:
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  release-review-perf:
+    name: Candidate delta release review (perf)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: "4"
+      RUST_MIN_STACK: "8388608"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.96.1"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Run release-only performance evidence
+        env:
+          RMUX_PERF_AUTO_CURRENT: "1"
+          RMUX_PERF_GATE_MODE: portable-budget
+          RMUX_PERF_EXPECTED_GIT_SHA: ${{ inputs.expected_source_sha }}
+          RMUX_PERF_EXPECTED_PLATFORM: linux
+          RMUX_PERF_EXPECTED_PROVENANCE: github-actions:${{ github.repository }}:${{ github.workflow }}:${{ github.job }}:${{ github.run_id }}:${{ github.run_attempt }}
+          RMUX_PERF_MAX_CURRENT_AGE_SECONDS: "21600"
+        run: >-
+          scripts/release-review-gate.sh
+          --evidence-mode candidate-delta
+          --skip-package
+          --section perf
+          --target-dir target/release-candidate-perf
+
+  release-review-sections:
+    name: Candidate delta release review (${{ matrix.section }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        section: [static, cli, tmux]
+    env:
+      CARGO_BUILD_JOBS: "4"
+      RUST_MIN_STACK: "8388608"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: "1.96.1"
+
+      - name: Install tmux oracle runtime dependencies
+        if: matrix.section == 'tmux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libevent-2.1-7t64 libncursesw6 libutf8proc3
+
+      - name: Download the exact fast-run tmux oracle
+        if: matrix.section == 'tmux'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: rmux-tmux-oracle-${{ inputs.expected_source_sha }}
+          path: ${{ runner.temp }}/rmux-oracle
+          github-token: ${{ github.token }}
+          repository: Helvesec/rmux
+          run-id: ${{ inputs.fast_run_id }}
+
+      - name: Verify downloaded tmux oracle metadata
+        if: matrix.section == 'tmux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 755 "$RUNNER_TEMP/rmux-oracle/tmux"
+          test "$("$RUNNER_TEMP/rmux-oracle/tmux" -V)" = "tmux 3.7b"
+          grep -F 'source_sha: "e802909de06012a4df6209d55e86487c56223163"' \
+            "$RUNNER_TEMP/rmux-oracle/tmux.reference"
+          grep -F 'source_tarball_sha256: "87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96"' \
+            "$RUNNER_TEMP/rmux-oracle/tmux.reference"
+          recorded="$(sed -n 's/^binary_sha256: "\([0-9a-f]\{64\}\)"$/\1/p' \
+            "$RUNNER_TEMP/rmux-oracle/tmux.reference")"
+          test -n "$recorded"
+          test "$(sha256sum "$RUNNER_TEMP/rmux-oracle/tmux" | cut -d' ' -f1)" = "$recorded"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Run release-only section
+        env:
+          RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
+          RMUX_REQUIRE_TMUX: "1"
+        run: >-
+          scripts/release-review-gate.sh
+          --evidence-mode candidate-delta
+          --skip-package
+          --section ${{ matrix.section }}
+          --target-dir target/release-candidate-${{ matrix.section }}
+
+  snap:
+    name: Candidate delta Snap smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Build Snap without publishing
+        id: snapcraft
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79
+        with:
+          path: .
+
+      - name: Smoke Snap package
+        run: scripts/smoke-snap-package.sh "${{ steps.snapcraft.outputs.snap }}"
+
+  nix:
+    name: Candidate delta Nix gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+
+      - name: Check and build Nix flake
+        run: |
+          nix flake check
+          nix build .#packages.x86_64-linux.default --no-link
+
+      - name: Verify Nix binary version
+        run: |
+          set -euo pipefail
+          expected="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+          test "$(nix run . -- -V)" = "rmux $expected"
+
+  windows-ctrl-matrix:
+    name: Candidate delta Windows Ctrl policy
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify the release-only static Ctrl policy
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          ./scripts/windows_ctrl_matrix.ps1 -StaticMatrixSpec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  gate:
+    name: Candidate release delta gate
+    if: always()
+    needs: [release-review-perf, release-review-sections, snap, nix, windows-ctrl-matrix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every release-only delta
+        env:
+          NIX_RESULT: ${{ needs.nix.result }}
+          PERF_RESULT: ${{ needs.release-review-perf.result }}
+          REVIEW_RESULT: ${{ needs.release-review-sections.result }}
+          SNAP_RESULT: ${{ needs.snap.result }}
+          WINDOWS_RESULT: ${{ needs.windows-ctrl-matrix.result }}
+        run: |
+          test "$NIX_RESULT" = success
+          test "$PERF_RESULT" = success
+          test "$REVIEW_RESULT" = success
+          test "$SNAP_RESULT" = success
+          test "$WINDOWS_RESULT" = success

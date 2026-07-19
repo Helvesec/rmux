@@ -396,7 +396,15 @@ fn contracted_runner_label<'a>(contract: &'a serde_json::Value, name: &str) -> &
                 .any(|value| value.as_str() == Some(name))
                 .then_some(label.as_str())
         })
-        .unwrap_or_else(|| panic!("missing runner label for {name}"))
+        .or_else(|| {
+            contract["runner_policy"]["non_runner_jobs"]
+                .as_array()
+                .expect("non-runner job list")
+                .iter()
+                .any(|value| value.as_str() == Some(name))
+                .then_some("")
+        })
+        .unwrap_or_else(|| panic!("missing runner policy for {name}"))
 }
 
 #[cfg(unix)]
@@ -408,21 +416,27 @@ fn job_fixture(
     conclusion: &str,
     runner_label: &str,
 ) -> serde_json::Value {
-    let (runner_id, runner_name, runner_group_id, runner_group_name) = if conclusion == "skipped" {
-        (
-            serde_json::Value::Null,
-            serde_json::Value::Null,
-            serde_json::Value::Null,
-            serde_json::Value::Null,
-        )
+    let labels = if runner_label.is_empty() {
+        serde_json::json!([])
     } else {
-        (
-            serde_json::json!(id + 1000),
-            serde_json::json!(format!("GitHub Actions {}", id + 1000)),
-            serde_json::json!(0),
-            serde_json::json!("GitHub Actions"),
-        )
+        serde_json::json!([runner_label])
     };
+    let (runner_id, runner_name, runner_group_id, runner_group_name) =
+        if conclusion == "skipped" || runner_label.is_empty() {
+            (
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+            )
+        } else {
+            (
+                serde_json::json!(id + 1000),
+                serde_json::json!(format!("GitHub Actions {}", id + 1000)),
+                serde_json::json!(0),
+                serde_json::json!("GitHub Actions"),
+            )
+        };
     serde_json::json!({
         "id": id,
         "run_id": run_id,
@@ -432,7 +446,7 @@ fn job_fixture(
         "name": name,
         "status": "completed",
         "conclusion": conclusion,
-        "labels": [runner_label],
+        "labels": labels,
         "runner_id": runner_id,
         "runner_name": runner_name,
         "runner_group_id": runner_group_id,
@@ -541,26 +555,27 @@ fn timing_job(id: u64, name: &str, completed_at: &str, label: &str) -> serde_jso
 
 #[test]
 #[cfg(unix)]
-fn candidate_controller_is_dry_run_by_default_and_requests_the_returned_run_id() {
+fn shadow_candidate_controller_enforces_the_exact_candidate_contract() {
     let controller = repo_root().join("scripts/release/dispatch-shadow-candidate.sh");
     let source = fs::read_to_string(&controller).expect("read candidate controller");
-    assert!(source.contains("X-GitHub-Api-Version: 2026-03-10"));
-    assert!(source.contains("return_run_details"));
-    assert!(source.contains("workflow_run_id"));
-    assert!(!source.contains("gh run list"));
+    assert!(source.contains("dispatch-release-candidate.sh"));
+    assert!(source.contains("--release-kind shadow"));
     assert!(!source.contains("git tag"));
     assert!(!source.contains("git push"));
-    assert!(!source.contains("--fast-run-id"));
-    assert!(!source.contains("--release-intent-id"));
-    assert!(!source.contains("--planned-release-ref"));
 
     let output = run(
         &controller,
         &[
             "--repository",
             "Helvesec/rmux",
+            "--fast-run-id",
+            "29689101595",
             "--expected-source-sha",
             "cccccccccccccccccccccccccccccccccccccccc",
+            "--release-intent-id",
+            "shadow-20260719-001",
+            "--planned-release-ref",
+            "v0.10.0-rc.1",
         ],
     );
     assert!(
@@ -571,18 +586,25 @@ fn candidate_controller_is_dry_run_by_default_and_requests_the_returned_run_id()
     let request: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse dry-run request");
     assert_eq!(request["mode"], "dry-run");
-    assert_eq!(request["api_version"], "2026-03-10");
     assert_eq!(request["payload"]["return_run_details"], true);
     assert_eq!(request["payload"]["inputs"]["release_qualification"], true);
-    assert_eq!(request["binding"], "none-baseline-qualification-only");
+    assert_eq!(request["payload"]["inputs"]["fast_run_id"], "29689101595");
+    assert_eq!(request["payload"]["inputs"]["release_kind"], "shadow");
+    assert_eq!(request["publication_authority"], false);
 
     let foreign = run(
         &controller,
         &[
             "--repository",
             "someone/else",
+            "--fast-run-id",
+            "29689101595",
             "--expected-source-sha",
             "cccccccccccccccccccccccccccccccccccccccc",
+            "--release-intent-id",
+            "shadow-20260719-001",
+            "--planned-release-ref",
+            "v0.10.0-rc.1",
         ],
     );
     assert!(!foreign.status.success());
