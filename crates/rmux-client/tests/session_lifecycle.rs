@@ -120,7 +120,7 @@ fn kill_session_destroys_existing_session() -> Result<(), Box<dyn Error>> {
         kill_response,
         Response::KillSession(KillSessionResponse { existed: true })
     );
-    wait_for_absent_server(harness.socket_path(), Duration::from_secs(2))?;
+    wait_for_socket_removal(harness.socket_path(), Duration::from_secs(2))?;
 
     server.shutdown()?;
     Ok(())
@@ -328,18 +328,19 @@ fn send_roundtrip(socket_path: &Path, request: &Request) -> Result<Response, Box
     Ok(connection.roundtrip(request)?)
 }
 
-fn wait_for_absent_server(socket_path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
+fn wait_for_socket_removal(socket_path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + timeout;
 
     loop {
-        match connect_or_absent(socket_path)? {
-            ConnectResult::Absent => return Ok(()),
-            ConnectResult::Connected(_) => {}
+        match fs::symlink_metadata(socket_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
         }
 
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for server '{}' to become absent",
+                "timed out waiting for server socket '{}' to be removed",
                 socket_path.display()
             )
             .into());
