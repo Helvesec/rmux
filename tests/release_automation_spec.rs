@@ -536,6 +536,24 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         .expect("bounded Windows test archive cache job");
 
     assert!(!macos.contains("windows-latest"));
+    assert!(!macos.contains("RUST_TEST_THREADS"));
+    for required in [
+        "name: cargo test parallel-safe portable crates",
+        "run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core",
+        "name: cargo test rmux-client serially",
+        "run: cargo test --locked --no-fail-fast -p rmux-client -- --test-threads=1",
+        "run: cargo test --locked -p rmux --test cli_surface socket_path_flag_can_start_directly_under_tmp -- --exact --test-threads=1",
+    ] {
+        assert!(
+            macos.contains(required),
+            "macOS platform runtime lost test scheduling invariant {required:?}"
+        );
+    }
+    assert_eq!(
+        macos.matches("-p rmux-client").count(),
+        1,
+        "rmux-client must only run in its explicitly serialized step"
+    );
     for required in [
         "name: Windows workspace test archive",
         "runs-on: windows-latest",

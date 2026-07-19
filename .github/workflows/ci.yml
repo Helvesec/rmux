@@ -633,7 +633,6 @@ jobs:
           - macos-15
     env:
       RUST_MIN_STACK: "8388608"
-      RUST_TEST_THREADS: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -664,8 +663,11 @@ jobs:
       - name: cargo build
         run: cargo build --workspace --locked
 
-      - name: cargo test portable crates
-        run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core -p rmux-client
+      - name: cargo test parallel-safe portable crates
+        run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core
+
+      - name: cargo test rmux-client serially
+        run: cargo test --locked --no-fail-fast -p rmux-client -- --test-threads=1
 
       - name: cargo test macOS direct /tmp socket path
         if: runner.os == 'macOS'
