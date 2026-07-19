@@ -188,6 +188,7 @@ def validate_candidate() -> None:
             )
         )
     all_scripts = {path for path in tracked if path.startswith("scripts/")}
+    local_actions = {path for path in tracked if path.startswith(".github/actions/")}
     release_gate_data = {
         "CHANGELOG.md",
         "benches/perf/baselines/release-0.7.0.json",
@@ -199,7 +200,13 @@ def validate_candidate() -> None:
         "tests/reference/tmux_compat/frozen_reference.yaml",
     }
     uncovered = sorted(
-        (workflow_paths | referenced_scripts | all_scripts | release_gate_data)
+        (
+            workflow_paths
+            | referenced_scripts
+            | all_scripts
+            | local_actions
+            | release_gate_data
+        )
         - set(paths)
     )
     if uncovered:

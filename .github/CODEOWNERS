@@ -1,4 +1,5 @@
 /.github/CODEOWNERS @shideneyu
+/.github/actions/ @shideneyu
 /.github/workflows/ @shideneyu
 /.github/release/ @shideneyu
 /Cargo.lock @shideneyu
