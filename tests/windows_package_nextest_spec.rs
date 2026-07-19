@@ -78,6 +78,8 @@ fn package_verifier_preserves_cargo_fallback_and_zip_binary_environment() {
         "run-nextest-package-smoke.ps1",
         "-Package \"rmux-sdk\"",
         "-TestTarget \"smoke_v1_windows\"",
+        "$nextestSdkTest = \"windows::$sdkTest\"",
+        "-TestName $nextestSdkTest",
     ] {
         assert!(
             sdk.contains(required),

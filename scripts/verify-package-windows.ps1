@@ -355,11 +355,12 @@ function InvokeSdkWindowsSmoke(
                 Fail "Windows SDK package smoke failed with exit code $LASTEXITCODE"
             }
         } else {
+            $nextestSdkTest = "windows::$sdkTest"
             & (Join-Path $PSScriptRoot "run-nextest-package-smoke.ps1") `
                 -Archive $NextestArchive `
                 -Package "rmux-sdk" `
                 -TestTarget "smoke_v1_windows" `
-                -TestName $sdkTest
+                -TestName $nextestSdkTest
         }
     } finally {
         if ($null -eq $previousBinary) {
