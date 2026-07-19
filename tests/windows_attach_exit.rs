@@ -1441,17 +1441,29 @@ fn windows_attach_ctrl_c_stops_ping_when_available() -> Result<(), Box<dyn Error
     wait_for_needle_or_error(&mut attach, b"PS ", SETUP_TIMEOUT)?;
     io.write_all(b"ping -t 127.0.0.1\r\n")?;
     wait_for_needle_or_error(&mut attach, b"TTL=", SETUP_TIMEOUT)?;
-    write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_c())?;
-    thread::sleep(Duration::from_millis(500));
-    io.write_all(b"\r\nWrite-Output RMUX_PING_CTRL_C_DONE\r\n")?;
-
-    let (returned, output) =
-        wait_for_needle_or_terminate(&mut attach, b"RMUX_PING_CTRL_C_DONE", EXIT_TIMEOUT)?;
+    let outcome = send_attach_ctrl_c_and_wait_for_marker(
+        &binary,
+        &label,
+        "pingattach:0.0",
+        &attach,
+        &io,
+        "RMUX_PING_CTRL_C_DONE",
+    )?;
+    let (displayed, attach_output) = if outcome.returned_to_prompt {
+        wait_for_needle_or_terminate(&mut attach, b"RMUX_PING_CTRL_C_DONE", EXIT_TIMEOUT)?
+    } else {
+        (false, Vec::new())
+    };
     terminate_spawned(&mut attach);
     assert!(
-        returned,
+        outcome.returned_to_prompt,
         "attached Ctrl-C did not stop ping and return to PowerShell\n{}",
-        String::from_utf8_lossy(&output)
+        String::from_utf8_lossy(&outcome.output)
+    );
+    assert!(
+        displayed,
+        "attached client did not display the post-Ctrl-C marker\n{}",
+        String::from_utf8_lossy(&attach_output)
     );
 
     Ok(())
@@ -2165,7 +2177,8 @@ fn send_attach_ctrl_c_and_wait_for_marker(
 ) -> Result<ControlKeyOutcome, Box<dyn Error>> {
     let marker_command = format!("\r\nWrite-Output {marker}\r\n");
     let marker_bytes = marker.as_bytes();
-    let mut last_capture = Vec::new();
+    let initial_capture = wait_for_capture_contains(binary, label, target, b"PS ", SETUP_TIMEOUT)?;
+    let mut last_capture = initial_capture;
 
     for _ in 0..CTRL_C_SYNTHETIC_ATTEMPTS {
         // WriteConsoleInput-based Ctrl-C injection is the host-dependent part of
@@ -2174,8 +2187,20 @@ fn send_attach_ctrl_c_and_wait_for_marker(
         // is healthy. Keep the oracle strict by requiring the pane to execute the
         // marker and to show KeyboardInterrupt/^C, but allow a small number of
         // synthetic injection attempts before declaring the attach path broken.
+        let prompt_baseline = count_occurrences(&last_capture, b"PS ");
         write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_c())?;
-        thread::sleep(Duration::from_millis(500));
+        let (prompt_returned, capture) = capture_until_occurrences(
+            binary,
+            label,
+            target,
+            b"PS ",
+            prompt_baseline + 1,
+            CTRL_C_PROMPT_READY_TIMEOUT,
+        )?;
+        last_capture = capture;
+        if !prompt_returned {
+            continue;
+        }
         io.write_all(marker_command.as_bytes())?;
 
         let (found, capture) = capture_until_contains(
@@ -2202,11 +2227,24 @@ fn send_rmux_ctrl_c_and_wait_for_marker(
 ) -> Result<ControlKeyOutcome, Box<dyn Error>> {
     let marker_command = format!("Write-Output {marker}");
     let marker_bytes = marker.as_bytes();
-    let mut last_capture = Vec::new();
+    let initial_capture = wait_for_capture_contains(binary, label, target, b"PS ", SETUP_TIMEOUT)?;
+    let mut last_capture = initial_capture;
 
     for _ in 0..CTRL_C_SYNTHETIC_ATTEMPTS {
+        let prompt_baseline = count_occurrences(&last_capture, b"PS ");
         run_rmux(binary, label, ["send-keys", "-t", target, "C-c"])?;
-        thread::sleep(Duration::from_millis(500));
+        let (prompt_returned, capture) = capture_until_occurrences(
+            binary,
+            label,
+            target,
+            b"PS ",
+            prompt_baseline + 1,
+            CTRL_C_PROMPT_READY_TIMEOUT,
+        )?;
+        last_capture = capture;
+        if !prompt_returned {
+            continue;
+        }
         run_rmux(
             binary,
             label,
