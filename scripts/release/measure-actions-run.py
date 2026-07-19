@@ -345,6 +345,8 @@ def main() -> int:
     if len(ids) != len(set(ids)):
         raise ValueError("measured jobs contain duplicate IDs")
     for job in jobs:
+        if job.get("status") != "completed" or not job.get("completed_at"):
+            raise ValueError(f"job {job.get('name')} is not completed")
         if job.get("run_id") != args.run_id:
             raise ValueError(f"job {job.get('name')} belongs to another run")
         if job.get("run_attempt") != args.attempt:

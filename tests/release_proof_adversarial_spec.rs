@@ -201,6 +201,16 @@ fn timing_collector_rejects_fractional_inversion_and_rerun_race() {
     assert!(!inverted.status.success());
     assert!(String::from_utf8_lossy(&inverted.stderr).contains("timestamps are not ordered"));
 
+    let mut incomplete: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&jobs_path).expect("read jobs fixture"))
+            .expect("parse jobs fixture");
+    incomplete["jobs"][0]["status"] = serde_json::json!("in_progress");
+    incomplete["jobs"][0]["completed_at"] = serde_json::Value::Null;
+    fs::write(&jobs_path, incomplete.to_string()).expect("write incomplete job");
+    let unfinished = run(&collector, &timing_args(&run_path, &jobs_path));
+    assert!(!unfinished.status.success());
+    assert!(String::from_utf8_lossy(&unfinished.stderr).contains("is not completed"));
+
     fs::write(&run_after_path, timing_run(2).to_string()).expect("write changed run");
     let mut race_args = timing_args(&run_path, &jobs_path);
     race_args.extend([
