@@ -531,17 +531,36 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         .split("\n  windows-test-archive-cache:\n")
         .nth(1)
         .expect("Windows test archive cache job")
-        .split("\n  windows-package-preflight:\n")
+        .split("\n  windows-package-build:\n")
         .next()
         .expect("bounded Windows test archive cache job");
 
     assert!(!macos.contains("windows-latest"));
+    assert!(!macos.contains("RUST_TEST_THREADS"));
+    for required in [
+        "name: cargo test parallel-safe portable crates",
+        "run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core",
+        "name: cargo test rmux-client serially",
+        "run: cargo test --locked --no-fail-fast -p rmux-client -- --test-threads=1",
+        "run: cargo test --locked -p rmux --test cli_surface socket_path_flag_can_start_directly_under_tmp -- --exact --test-threads=1",
+    ] {
+        assert!(
+            macos.contains(required),
+            "macOS platform runtime lost test scheduling invariant {required:?}"
+        );
+    }
+    assert_eq!(
+        macos.matches("-p rmux-client").count(),
+        1,
+        "rmux-client must only run in its explicitly serialized step"
+    );
     for required in [
         "name: Windows workspace test archive",
         "runs-on: windows-latest",
         "id: archive-cache",
         "key: windows-nextest-${{ runner.os }}-${{ github.sha }}",
         "actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830",
+        "CARGO_PROFILE_TEST_DEBUG: \"0\"",
         "cargo nextest archive --workspace --locked",
         "target/windows-nextest.tar.zst",
         "compression-level: 0",
@@ -572,6 +591,7 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         "--extract-overwrite",
         "--partition \"slice:${{ matrix.shard }}/18\"",
         "--test-threads num-cpus",
+        "RMUX_WINDOWS_SMOKE_RMUX_BIN: ${{ github.workspace }}/target/debug/rmux.exe",
         "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
     ] {
         assert!(
@@ -584,6 +604,11 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
     assert!(!archive.contains("self-hosted"));
     assert!(!build.contains("self-hosted"));
     assert!(!shards.contains("self-hosted"));
+    assert_eq!(
+        ci.matches("CARGO_PROFILE_TEST_DEBUG: \"0\"").count(),
+        1,
+        "test debug metadata must only be disabled for the Windows test archive"
+    );
     assert_eq!(
         nextest
             .matches("threads-required = \"num-test-threads\"")
@@ -625,7 +650,29 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
 }
 
 #[test]
-fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
+fn windows_smokes_can_reuse_the_binary_from_the_nextest_archive() {
+    let build_support = include_str!("support/windows_cargo_build.rs");
+    assert!(build_support.contains(
+        "pub(crate) const PREBUILT_RMUX_BINARY_ENV: &str = \"RMUX_WINDOWS_SMOKE_RMUX_BIN\""
+    ));
+    assert!(build_support.contains("pub(crate) fn prebuilt_rmux_binary()"));
+    assert!(build_support.contains("points to a missing rmux binary"));
+
+    for source in [
+        include_str!("../crates/rmux-sdk/tests/common/windows_smoke.rs"),
+        include_str!("../crates/ratatui-rmux/tests/ratatui_real_daemon_render_smoke_windows.rs"),
+        include_str!("../crates/rmux-server/tests/status_windows.rs"),
+        include_str!("../crates/rmux-server/tests/send_keys_windows.rs"),
+    ] {
+        assert!(
+            source.contains("windows_cargo_build::prebuilt_rmux_binary()?"),
+            "Windows smoke lost the shared prebuilt rmux fast path"
+        );
+    }
+}
+
+#[test]
+fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
     let ci = include_str!("../.github/workflows/ci.yml");
     let perf = ci
         .split("\n  release-review-perf:\n")
@@ -651,6 +698,9 @@ fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
 
     for required in [
         "name: Release review (perf)",
+        "needs: windows-tests-gate",
+        "startsWith(github.ref, 'refs/tags/v')",
+        "inputs.release_qualification",
         "CARGO_BUILD_JOBS: \"4\"",
         "--section perf",
         "target/release-review-ci-perf",
@@ -658,17 +708,15 @@ fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
     ] {
         assert!(
             perf.contains(required),
-            "early performance review lost required snippet {required:?}"
+            "deferred performance review lost required snippet {required:?}"
         );
     }
-    assert!(
-        !perf.contains("needs:"),
-        "performance review must be eligible at workflow start"
-    );
 
     for required in [
         "name: Release review (${{ matrix.section }})",
-        "needs: linux-source-gates",
+        "needs: [linux-source-gates, windows-tests-gate]",
+        "startsWith(github.ref, 'refs/tags/v')",
+        "inputs.release_qualification",
         "max-parallel: 6",
         "section: [static, lint, server, cli, tmux, runtime-sdk]",
         "CARGO_BUILD_JOBS: \"4\"",
@@ -685,7 +733,9 @@ fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
 
     for required in [
         "name: Release review gate (no package)",
-        "if: always()",
+        "always() &&",
+        "startsWith(github.ref, 'refs/tags/v')",
+        "inputs.release_qualification",
         "needs: [release-review-perf, release-review-sections]",
         "RELEASE_REVIEW_PERF_RESULT: ${{ needs.release-review-perf.result }}",
         "RELEASE_REVIEW_RESULT: ${{ needs.release-review-sections.result }}",
@@ -697,6 +747,56 @@ fn ci_starts_perf_review_immediately_and_shards_the_remaining_sections() {
             "release review aggregate gate lost required snippet {required:?}"
         );
     }
+}
+
+#[test]
+fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    assert!(ci.contains("release_qualification:"));
+    assert!(ci.contains("description: Run the deferred release qualification jobs"));
+
+    for (job, next_job) in [
+        ("snap-package", "nix-flake"),
+        ("nix-flake", "linux-sdk-smoke"),
+        ("windows-package-build", "windows-package-runtime-smoke"),
+    ] {
+        let block = ci
+            .split(&format!("\n  {job}:\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing {job} job"))
+            .split(&format!("\n  {next_job}:\n"))
+            .next()
+            .unwrap_or_else(|| panic!("unbounded {job} job"));
+        assert!(
+            block.contains("needs: windows-tests-gate"),
+            "{job} must not contend with protected fast-lane jobs"
+        );
+        assert!(
+            block.contains("startsWith(github.ref, 'refs/tags/v')"),
+            "{job} must run for release tags"
+        );
+        assert!(
+            !block.contains("github.event_name == 'push'"),
+            "{job} must not extend ordinary main pushes"
+        );
+    }
+}
+
+#[test]
+fn required_linux_perf_check_does_not_publish_a_cache_on_its_critical_path() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let perf = ci
+        .split("\n  linux-perf-smoke:\n")
+        .nth(1)
+        .expect("Linux performance smoke job")
+        .split("\n  linux-dependency-audit:\n")
+        .next()
+        .expect("bounded Linux performance smoke job");
+
+    assert!(perf.contains("name: Restore cargo cache"));
+    assert!(perf.contains("uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830"));
+    assert!(!perf.contains("uses: actions/cache@"));
+    assert!(!perf.contains("uses: actions/cache/save@"));
 }
 
 #[test]
@@ -753,30 +853,117 @@ fn windows_package_smokes_own_release_daemons_inside_the_runner_job() {
 #[test]
 fn ci_runs_the_windows_release_package_preflight_before_tagging() {
     let ci = include_str!("../.github/workflows/ci.yml");
-    let preflight = ci
+    let build = ci
+        .split("\n  windows-package-build:\n")
+        .nth(1)
+        .expect("Windows package build job")
+        .split("\n  windows-package-runtime-smoke:\n")
+        .next()
+        .expect("bounded Windows package build job");
+    let runtime = ci
+        .split("\n  windows-package-runtime-smoke:\n")
+        .nth(1)
+        .expect("Windows package runtime smoke job")
+        .split("\n  windows-package-harness-smoke:\n")
+        .next()
+        .expect("bounded Windows package runtime smoke job");
+    let harness = ci
+        .split("\n  windows-package-harness-smoke:\n")
+        .nth(1)
+        .expect("Windows package harness smoke job")
+        .split("\n  windows-package-preflight:\n")
+        .next()
+        .expect("bounded Windows package harness smoke job");
+    let gate = ci
         .split("\n  windows-package-preflight:\n")
         .nth(1)
-        .expect("Windows package preflight job")
+        .expect("Windows package preflight gate")
         .split("\n  windows-cross:\n")
         .next()
-        .expect("bounded Windows package preflight job");
+        .expect("bounded Windows package preflight gate");
 
-    assert!(preflight.contains("runs-on: windows-latest"));
-    assert!(!preflight.contains("self-hosted"));
-    assert!(preflight.contains("./scripts/package-windows.ps1"));
-    assert!(preflight.contains("./scripts/verify-package-windows.ps1"));
     for required in [
-        "-RunBinary",
-        "-RunDaemonSmoke",
-        "-RunSdkSmoke",
-        "-RunMouseBorderSmoke",
+        "name: Windows release package build",
+        "runs-on: windows-latest",
+        "needs: windows-tests-gate",
+        "startsWith(github.ref, 'refs/tags/v')",
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: \"-C target-feature=+crt-static\"",
+        "windows-package-${{ runner.os }}-${{ runner.arch }}-rust-1.96.1-${{ hashFiles('Cargo.lock', 'scripts/package-windows.ps1', 'scripts/verify-package-windows.ps1') }}",
+        "./scripts/package-windows.ps1",
+        "./scripts/verify-package-windows.ps1",
+        "Remove-Item -LiteralPath $outputDir -Recurse -Force",
+        "$archives.Count -ne 1",
         "-RequireReleaseArtifact",
+        "-ExpectedGitSha \"${{ github.sha }}\"",
+        "name: rmux-windows-package-${{ github.sha }}",
     ] {
         assert!(
-            preflight.contains(required),
-            "Windows package preflight lost {required}"
+            build.contains(required),
+            "Windows package build lost {required}"
         );
     }
+    assert!(!build.contains("self-hosted"));
+    assert!(!build.contains("-RunBinary"));
+    assert!(!build.contains("-RunDaemonSmoke"));
+    assert!(!build.contains("-RunSdkSmoke"));
+    assert!(!build.contains("-RunMouseBorderSmoke"));
+
+    for required in [
+        "name: Windows package runtime smoke",
+        "needs: windows-package-build",
+        "runs-on: windows-latest",
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: \"-C target-feature=+crt-static\"",
+        "name: rmux-windows-package-${{ github.sha }}",
+        "$archives.Count -ne 1",
+        "-RunBinary",
+        "-RunDaemonSmoke",
+        "-RequireReleaseArtifact",
+        "-ExpectedGitSha \"${{ github.sha }}\"",
+    ] {
+        assert!(
+            runtime.contains(required),
+            "Windows package runtime smoke lost {required}"
+        );
+    }
+
+    for required in [
+        "name: Windows package harness smoke (${{ matrix.smoke }})",
+        "needs: [windows-package-build, windows-test-archive]",
+        "runs-on: windows-latest",
+        "max-parallel: 2",
+        "smoke: [sdk, mouse]",
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: \"-C target-feature=+crt-static\"",
+        "name: rmux-windows-nextest-${{ github.sha }}",
+        "$archives.Count -ne 1",
+        "NextestArchive = \"target/windows-nextest.tar.zst\"",
+        "$arguments.RunSdkSmoke = $true",
+        "$arguments.RunMouseBorderSmoke = $true",
+        "RequireReleaseArtifact = $true",
+        "ExpectedGitSha = \"${{ github.sha }}\"",
+    ] {
+        assert!(
+            harness.contains(required),
+            "Windows package harness smoke lost {required}"
+        );
+    }
+
+    for required in [
+        "name: Windows release package preflight",
+        "always() &&",
+        "startsWith(github.ref, 'refs/tags/v')",
+        "needs: [windows-package-build, windows-package-runtime-smoke, windows-package-harness-smoke]",
+        "WINDOWS_PACKAGE_BUILD_RESULT: ${{ needs.windows-package-build.result }}",
+        "WINDOWS_PACKAGE_RUNTIME_RESULT: ${{ needs.windows-package-runtime-smoke.result }}",
+        "WINDOWS_PACKAGE_HARNESS_RESULT: ${{ needs.windows-package-harness-smoke.result }}",
+    ] {
+        assert!(
+            gate.contains(required),
+            "Windows package preflight gate lost {required}"
+        );
+    }
+    assert!(!runtime.contains("self-hosted"));
+    assert!(!harness.contains("self-hosted"));
+    assert!(!gate.contains("self-hosted"));
 }
 
 #[test]
