@@ -47,6 +47,8 @@ fn release_shadow_has_no_write_authority_or_mutation_primitive() {
     assert!(workflow.contains("https://raw.githubusercontent.com"));
     assert!(workflow.contains("refs/heads/main"));
     assert!(workflow.contains("/attempts/1/jobs"));
+    assert_eq!(workflow.matches("urllib.request.Request(").count(), 1);
+    assert_eq!(workflow.matches("urllib.request.urlopen(").count(), 1);
 
     for trigger in [
         "\n  push:",
@@ -99,6 +101,11 @@ fn release_shadow_has_no_write_authority_or_mutation_primitive() {
         "snapcraft release",
         "--data",
         "--form",
+        "data=",
+        "import subprocess",
+        "import requests",
+        "http.client",
+        "socket.",
         "GITHUB_OUTPUT",
         "GITHUB_ENV",
         "GITHUB_STEP_SUMMARY",
@@ -138,7 +145,35 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
         serde_json::from_str(include_str!("../.github/release/candidate-contract.json"))
             .expect("parse candidate contract");
     let fast = contract.get("fast_run").expect("fast run contract");
-    let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    fs::create_dir_all(root.join(".github/release")).expect("create contract directory");
+    fs::write(
+        root.join(".github/release/candidate-contract.json"),
+        include_str!("../.github/release/candidate-contract.json"),
+    )
+    .expect("write candidate contract fixture");
+    for arguments in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "RMUX test"],
+        vec!["config", "user.email", "rmux-test@example.invalid"],
+        vec!["add", ".github/release/candidate-contract.json"],
+        vec!["commit", "-q", "-m", "candidate contract fixture"],
+    ] {
+        let output = Command::new("git")
+            .args(arguments)
+            .current_dir(&root)
+            .output()
+            .expect("run git fixture command");
+        assert!(output.status.success());
+    }
+    let sha_output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .expect("resolve contract fixture SHA");
+    let sha = String::from_utf8(sha_output.stdout)
+        .expect("UTF-8 contract fixture SHA")
+        .trim()
+        .to_owned();
     let run_id = 42_u64;
     let repository = serde_json::json!({
         "id": 1239918790,
@@ -150,9 +185,10 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
         "id": run_id,
         "workflow_id": 277622540,
         "path": ".github/workflows/ci.yml",
+        "name": "CI",
         "event": "push",
         "head_branch": "main",
-        "head_sha": sha,
+        "head_sha": &sha,
         "run_attempt": 1,
         "status": "completed",
         "conclusion": "success",
@@ -168,7 +204,7 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
             jobs.push(job_fixture(
                 next_id,
                 run_id,
-                sha,
+                &sha,
                 name.as_str().expect("job name"),
                 conclusion,
             ));
@@ -179,7 +215,7 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
         jobs.push(job_fixture(
             next_id,
             run_id,
-            sha,
+            &sha,
             name,
             conclusions[0].as_str().expect("allowed conclusion"),
         ));
@@ -204,9 +240,11 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
         "--run-id",
         "42",
         "--expected-source-sha",
-        sha,
+        &sha,
         "--kind",
         "fast",
+        "--repository-root",
+        root.to_str().expect("fixture repository root"),
         "--now",
         "2026-07-19T10:00:00Z",
         "--repository-json",
@@ -268,13 +306,15 @@ fn timing_collector_separates_required_and_all_job_end_times() {
             "id": 77,
             "workflow_id": 277622540,
             "path": ".github/workflows/ci.yml",
+            "name": "CI",
             "event": "push",
             "head_branch": "main",
             "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "run_attempt": 1,
             "status": "completed",
             "conclusion": "success",
-            "run_started_at": "2026-07-19T09:00:00Z"
+            "run_started_at": "2026-07-19T09:00:00Z",
+            "updated_at": "2026-07-19T09:03:00Z"
         })
         .to_string(),
     )
@@ -336,6 +376,9 @@ fn timing_collector_separates_required_and_all_job_end_times() {
 fn timing_job(id: u64, name: &str, completed_at: &str, label: &str) -> serde_json::Value {
     serde_json::json!({
         "id": id,
+        "run_id": 77,
+        "run_attempt": 1,
+        "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "name": name,
         "status": "completed",
         "conclusion": "success",
@@ -358,6 +401,9 @@ fn candidate_controller_is_dry_run_by_default_and_requests_the_returned_run_id()
     assert!(!source.contains("gh run list"));
     assert!(!source.contains("git tag"));
     assert!(!source.contains("git push"));
+    assert!(!source.contains("--fast-run-id"));
+    assert!(!source.contains("--release-intent-id"));
+    assert!(!source.contains("--planned-release-ref"));
 
     let output = run(
         &controller,
@@ -366,12 +412,6 @@ fn candidate_controller_is_dry_run_by_default_and_requests_the_returned_run_id()
             "Helvesec/rmux",
             "--expected-source-sha",
             "cccccccccccccccccccccccccccccccccccccccc",
-            "--fast-run-id",
-            "123",
-            "--release-intent-id",
-            "intent-1234",
-            "--planned-release-ref",
-            "v1.0.0-rc.1",
         ],
     );
     assert!(
@@ -385,6 +425,7 @@ fn candidate_controller_is_dry_run_by_default_and_requests_the_returned_run_id()
     assert_eq!(request["api_version"], "2026-03-10");
     assert_eq!(request["payload"]["return_run_details"], true);
     assert_eq!(request["payload"]["inputs"]["release_qualification"], true);
+    assert_eq!(request["binding"], "none-baseline-qualification-only");
 }
 
 #[test]
@@ -400,11 +441,14 @@ fn release_verification_cli_is_pinned_and_capability_checked() {
 fn release_policy_surfaces_have_explicit_code_owners() {
     let owners = include_str!("../.github/CODEOWNERS");
     for protected_path in [
+        "/.github/CODEOWNERS",
         "/.github/workflows/",
         "/.github/release/",
-        "/scripts/release/",
-        "/scripts/verify-release-tag-protection.sh",
-        "/tests/release_shadow_spec.rs",
+        "/Cargo.lock",
+        "/rust-toolchain.toml",
+        "/scripts/",
+        "/snap/snapcraft.yaml",
+        "/tests/",
     ] {
         assert!(
             owners.lines().any(|line| line.starts_with(protected_path)),
@@ -421,7 +465,7 @@ fn policy_root_reads_committed_blob_bytes_not_the_worktree() {
     fs::write(root.join("a.txt"), "first\n").expect("write first policy blob");
     fs::write(
         root.join(".github/release/candidate-contract.json"),
-        r#"{"policy_paths":["a.txt"]}"#,
+        r#"{"policy_paths":[".github/release/candidate-contract.json","a.txt"]}"#,
     )
     .expect("write policy contract");
     for args in [
@@ -454,14 +498,24 @@ fn policy_root_reads_committed_blob_bytes_not_the_worktree() {
     let first = run_policy_root(&root, &first_sha);
 
     fs::write(root.join("a.txt"), "uncommitted drift\n").expect("write worktree drift");
+    fs::write(
+        root.join(".github/release/candidate-contract.json"),
+        r#"{"policy_paths":[".github/release/candidate-contract.json"]}"#,
+    )
+    .expect("write uncommitted contract drift");
     let same_commit = run_policy_root(&root, &first_sha);
     assert_eq!(
         first["release_policy_sha256"], same_commit["release_policy_sha256"],
         "uncommitted bytes must not influence a Git-rooted policy hash"
     );
 
+    fs::write(
+        root.join(".github/release/candidate-contract.json"),
+        r#"{"policy_paths":[".github/release/candidate-contract.json","a.txt"]}"#,
+    )
+    .expect("restore policy contract");
     let add = Command::new("git")
-        .args(["add", "a.txt"])
+        .args(["add", "a.txt", ".github/release/candidate-contract.json"])
         .current_dir(&root)
         .output()
         .expect("stage second fixture");
@@ -491,14 +545,11 @@ fn policy_root_reads_committed_blob_bytes_not_the_worktree() {
 
 #[cfg(unix)]
 fn run_policy_root(repository_root: &Path, source_sha: &str) -> serde_json::Value {
-    let contract_path = repository_root.join(".github/release/candidate-contract.json");
     let output = run(
         &repo_root().join("scripts/release/policy-root.py"),
         &[
             "--repository-root",
             repository_root.to_str().expect("fixture root path"),
-            "--contract",
-            contract_path.to_str().expect("fixture contract path"),
             "--source-sha",
             source_sha,
         ],

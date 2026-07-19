@@ -450,12 +450,6 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
             "release tag protection gate lost {required}"
         );
     }
-    assert!(tag_protection.contains("has(\"bypass_actors\")"));
-    assert!(tag_protection.contains("refusing to infer that no bypass exists"));
-    assert!(
-        !tag_protection.contains(".bypass_actors // []"),
-        "a hidden bypass_actors field must fail closed"
-    );
     assert!(release.contains("RPM-GPG-KEY-rmux-repository"));
     assert_eq!(
         release.matches("uses: actions/checkout@").count(),

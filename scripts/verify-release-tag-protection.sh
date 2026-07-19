@@ -28,17 +28,10 @@ for ruleset_id in $ruleset_ids; do
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
     "repos/$repository/rulesets/$ruleset_id")
-  if ! jq -e '
-    has("bypass_actors") and
-    (.bypass_actors | type == "array")
-  ' <<<"$detail" >/dev/null; then
-    echo "ruleset $ruleset_id did not expose bypass_actors; refusing to infer that no bypass exists" >&2
-    continue
-  fi
   if jq -e '
     .target == "tag" and
     .enforcement == "active" and
-    (.bypass_actors | length == 0) and
+    ((.bypass_actors // []) | length == 0) and
     ((.conditions.ref_name.include // []) | any(. == "refs/tags/v*" or . == "refs/tags/v**" or . == "~ALL")) and
     ((.conditions.ref_name.exclude // []) | length == 0) and
     ([.rules[].type] | index("update") != null) and

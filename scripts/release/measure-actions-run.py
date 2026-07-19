@@ -22,12 +22,11 @@ def parse_timestamp(value: Any, label: str) -> datetime:
 
 
 def seconds(start: datetime, end: datetime) -> int:
-    delta = int((end - start).total_seconds())
-    if delta < 0:
+    if end < start:
         raise ValueError(
             f"timestamp order is negative: {start.isoformat()} > {end.isoformat()}"
         )
-    return delta
+    return int((end - start).total_seconds())
 
 
 def load_inputs(
@@ -36,13 +35,35 @@ def load_inputs(
     if bool(args.run_json) != bool(args.jobs_json):
         raise ValueError("--run-json and --jobs-json must be provided together")
     if args.run_json:
-        run = read_json(args.run_json)
+        run_before = read_json(args.run_json)
+        run_after = (
+            read_json(args.run_after_json) if args.run_after_json else run_before
+        )
         jobs = jobs_from_json(read_json(args.jobs_json))
-        if not isinstance(run, dict):
-            raise ValueError("run fixture must be an object")
-        return run, jobs
-    run = get_run(args.repository, args.run_id)
-    return run, get_jobs(args.repository, args.run_id, args.attempt)
+        if not isinstance(run_before, dict) or not isinstance(run_after, dict):
+            raise ValueError("run fixtures must be objects")
+    else:
+        if args.run_after_json:
+            raise ValueError("--run-after-json is only valid with both fixtures")
+        run_before = get_run(args.repository, args.run_id)
+        jobs = get_jobs(args.repository, args.run_id, args.attempt)
+        run_after = get_run(args.repository, args.run_id)
+    for field in (
+        "id",
+        "workflow_id",
+        "path",
+        "name",
+        "event",
+        "head_branch",
+        "head_sha",
+        "run_attempt",
+        "status",
+        "conclusion",
+        "updated_at",
+    ):
+        if run_before.get(field) != run_after.get(field):
+            raise ValueError(f"run changed while jobs were paginated: {field}")
+    return run_after, jobs
 
 
 def step_record(step: dict[str, Any]) -> dict[str, Any]:
@@ -128,7 +149,22 @@ def build_report(
             and job_end
             and not job_created <= job_start <= job_end
         )
-        if not timestamps_ordered and job.get("conclusion") != "skipped":
+        skipped_api_anomaly = bool(
+            not timestamps_ordered
+            and job.get("status") == "completed"
+            and job.get("conclusion") == "skipped"
+            and job_created
+            and job_start
+            and job_end
+            and not job.get("steps")
+            and max(
+                abs((job_start - job_created).total_seconds()),
+                abs((job_end - job_created).total_seconds()),
+                abs((job_end - job_start).total_seconds()),
+            )
+            <= 5
+        )
+        if not timestamps_ordered and not skipped_api_anomaly:
             raise ValueError(f"job {job.get('name')} timestamps are not ordered")
         labels = job.get("labels", [])
         is_macos = isinstance(labels, list) and any(
@@ -167,6 +203,9 @@ def build_report(
                 "labels": labels,
                 "created_at": job.get("created_at"),
                 "timestamp_anomaly": not timestamps_ordered,
+                "timestamp_anomaly_kind": (
+                    "github_skipped_job_clock" if skipped_api_anomaly else None
+                ),
                 "runner_wait_from_run_start_sec": (
                     seconds(run_start, job_start)
                     if job_start and timestamps_ordered
@@ -280,6 +319,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-conclusion")
     parser.add_argument("--required-check", action="append", default=[])
     parser.add_argument("--run-json", type=Path)
+    parser.add_argument("--run-after-json", type=Path)
     parser.add_argument("--jobs-json", type=Path)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
@@ -292,6 +332,25 @@ def main() -> int:
         raise ValueError("selected run ID does not match the run response")
     if int(run.get("run_attempt", -1)) != args.attempt:
         raise ValueError("selected attempt does not match the run response")
+    if run.get("status") != "completed":
+        raise ValueError("selected run is not completed")
+    names = [job.get("name") for job in jobs]
+    ids = [job.get("id") for job in jobs]
+    if not all(isinstance(name, str) and name for name in names):
+        raise ValueError("every measured job must have a non-empty name")
+    if len(names) != len(set(names)):
+        raise ValueError("measured jobs contain duplicate names")
+    if not all(isinstance(job_id, int) and job_id > 0 for job_id in ids):
+        raise ValueError("every measured job must have a positive ID")
+    if len(ids) != len(set(ids)):
+        raise ValueError("measured jobs contain duplicate IDs")
+    for job in jobs:
+        if job.get("run_id") != args.run_id:
+            raise ValueError(f"job {job.get('name')} belongs to another run")
+        if job.get("run_attempt") != args.attempt:
+            raise ValueError(f"job {job.get('name')} belongs to another attempt")
+        if job.get("head_sha") != run.get("head_sha"):
+            raise ValueError(f"job {job.get('name')} belongs to another SHA")
     expectations = {
         "head_sha": args.expected_sha,
         "event": args.expected_event,

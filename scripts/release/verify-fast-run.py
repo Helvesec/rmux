@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +21,7 @@ from github_actions import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_CONTRACT = ROOT / ".github" / "release" / "candidate-contract.json"
+CONTRACT_PATH = ".github/release/candidate-contract.json"
 
 
 def timestamp(value: Any, label: str) -> datetime:
@@ -30,6 +31,27 @@ def timestamp(value: Any, label: str) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as error:
         raise ValueError(f"invalid {label}: {value}") from error
+
+
+def git(root: Path, *arguments: str) -> bytes:
+    completed = subprocess.run(
+        ["git", *arguments], cwd=root, check=False, capture_output=True
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise ValueError(f"git {' '.join(arguments)} failed: {detail}")
+    return completed.stdout
+
+
+def load_committed_contract(root: Path, source_sha: str) -> tuple[bytes, str]:
+    resolved = git(root, "rev-parse", f"{source_sha}^{{commit}}").decode().strip()
+    if resolved != source_sha:
+        raise ValueError(f"source SHA did not resolve exactly: {resolved}")
+    blob_oid = git(root, "rev-parse", f"{source_sha}:{CONTRACT_PATH}").decode().strip()
+    object_type = git(root, "cat-file", "-t", blob_oid).decode().strip()
+    if object_type != "blob":
+        raise ValueError(f"committed candidate contract is not a blob: {object_type}")
+    return git(root, "cat-file", "blob", blob_oid), blob_oid
 
 
 def load_inputs(
@@ -53,6 +75,7 @@ def load_inputs(
         "id",
         "workflow_id",
         "path",
+        "name",
         "event",
         "head_branch",
         "head_sha",
@@ -101,6 +124,7 @@ def verify(
     require_equal(run.get("id"), args.run_id, "run ID")
     require_equal(run.get("workflow_id"), run_contract["workflow_id"], "workflow ID")
     require_equal(run.get("path"), run_contract["workflow_path"], "workflow path")
+    require_equal(run.get("name"), run_contract["workflow_name"], "workflow name")
     require_equal(run.get("event"), run_contract["event"], "run event")
     require_equal(run.get("head_branch"), run_contract["branch"], "head branch")
     require_equal(run.get("head_sha"), args.expected_source_sha, "source SHA")
@@ -163,11 +187,19 @@ def verify(
     for job in jobs:
         require_equal(job.get("status"), "completed", f"job {job['name']} status")
         require_equal(job.get("run_id"), args.run_id, f"job {job['name']} run ID")
-        require_equal(job.get("run_attempt"), 1, f"job {job['name']} run attempt")
+        require_equal(
+            job.get("run_attempt"),
+            run_contract["required_run_attempt"],
+            f"job {job['name']} run attempt",
+        )
         require_equal(
             job.get("head_sha"), args.expected_source_sha, f"job {job['name']} SHA"
         )
-        require_equal(job.get("workflow_name"), "CI", f"job {job['name']} workflow")
+        require_equal(
+            job.get("workflow_name"),
+            run_contract["workflow_name"],
+            f"job {job['name']} workflow",
+        )
         if job.get("conclusion") not in expected[job["name"]]:
             raise ValueError(
                 f"job {job['name']} conclusion must be one of {expected[job['name']]!r}, "
@@ -201,6 +233,8 @@ def verify(
         "run_started_at": run["run_started_at"],
         "verified_at": now.isoformat().replace("+00:00", "Z"),
         "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
+        "contract_blob_oid": args.contract_blob_oid,
+        "test_fixture": args.fixture_mode,
         "jobs": job_proof,
     }
     canonical = json.dumps(proof, sort_keys=True, separators=(",", ":")).encode()
@@ -214,7 +248,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--expected-source-sha", required=True)
     parser.add_argument("--kind", choices=("fast", "qualification"), required=True)
-    parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
+    parser.add_argument("--repository-root", type=Path, default=ROOT)
     parser.add_argument("--now")
     parser.add_argument("--repository-json", type=Path)
     parser.add_argument("--run-json", type=Path)
@@ -228,7 +262,13 @@ def main() -> int:
         raise ValueError(
             "--expected-source-sha must be exactly 40 lowercase hex characters"
         )
-    contract_bytes = args.contract.read_bytes()
+    fixture_paths = [args.repository_json, args.run_json, args.jobs_json]
+    args.fixture_mode = all(fixture_paths)
+    if args.now and not args.fixture_mode:
+        raise ValueError("--now is restricted to complete offline test fixtures")
+    contract_bytes, args.contract_blob_oid = load_committed_contract(
+        args.repository_root.resolve(), args.expected_source_sha
+    )
     contract = json.loads(contract_bytes)
     repository, run, jobs = load_inputs(args)
     proof = verify(args, contract_bytes, contract, repository, run, jobs)

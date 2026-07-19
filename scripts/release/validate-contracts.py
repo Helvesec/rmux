@@ -21,10 +21,12 @@ IRREVERSIBLE_RC_CHANNELS = {
     "chocolatey",
     "crates_io",
     "homebrew_core",
+    "homebrew_tap",
     "rmux_io",
     "scoop",
     "web_share",
     "winget",
+    "snap_stable",
 }
 
 
@@ -64,6 +66,7 @@ def validate_candidate() -> None:
         "event": "push",
         "required_run_attempt": 1,
         "workflow_id": 277622540,
+        "workflow_name": "CI",
         "workflow_path": ".github/workflows/ci.yml",
         "freshness_hours": 48,
         "maximum_signed_extension_hours": 72,
@@ -107,6 +110,7 @@ def validate_candidate() -> None:
         "event": "workflow_dispatch",
         "required_run_attempt": 1,
         "workflow_id": 277622540,
+        "workflow_name": "CI",
         "workflow_path": ".github/workflows/ci.yml",
     }.items():
         if qualification.get(key) != value:
@@ -152,6 +156,26 @@ def validate_candidate() -> None:
     missing = [path for path in paths if not (ROOT / path).is_file()]
     if missing:
         raise ValueError(f"policy paths do not exist: {missing}")
+    if ".github/release/candidate-contract.json" not in paths:
+        raise ValueError("candidate contract must include itself in policy_paths")
+    workflow_paths = {
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / ".github" / "workflows").glob("*.yml")
+    }
+    referenced_scripts: set[str] = set()
+    for workflow_path in workflow_paths:
+        workflow = (ROOT / workflow_path).read_text(encoding="utf-8")
+        referenced_scripts.update(
+            re.findall(
+                r"(?:\./)?(scripts/[A-Za-z0-9_./-]+\.(?:sh|ps1|py))",
+                workflow,
+            )
+        )
+    uncovered = sorted((workflow_paths | referenced_scripts) - set(paths))
+    if uncovered:
+        raise ValueError(
+            f"release policy does not cover workflow-reachable files: {uncovered}"
+        )
 
 
 def validate_windows_coverage() -> None:
@@ -200,6 +224,12 @@ def validate_channels() -> None:
             raise ValueError(f"RC must deny irreversible channel {channel}")
     if kinds["rc"].get("snap_candidate") != "explicit_opt_in":
         raise ValueError("RC Snap candidate must require explicit opt-in")
+    if kinds["stable"].get("snap_candidate") is not True:
+        raise ValueError("stable releases currently stage Snap in latest/candidate")
+    if kinds["stable"].get("snap_stable") is not False:
+        raise ValueError("Snap stable must remain denied pending a support decision")
+    if policy.get("snap_stable_publication") != "denied_until_support_decision":
+        raise ValueError("Snap stable denial must be explicit")
     if policy.get("downstream_gate") != "publication_receipt_success":
         raise ValueError(
             "every downstream channel must gate on the publication receipt"
@@ -211,17 +241,25 @@ def validate_schemas() -> None:
     expected = {
         "candidate-manifest.schema.json": {
             "candidate_run_attempt",
+            "fast_run_proof_sha256",
+            "producer",
+            "canonical_build_policy",
             "release_policy_sha256",
             "artifacts",
         },
         "promotion-authorization.schema.json": {
             "authorization_attestation_id",
+            "candidate_manifest_artifact_digest",
             "authorization_bundle_artifact_id",
             "authorization_bundle_artifact_digest",
         },
         "publication-receipt.schema.json": {
             "release_id",
             "authorization_attestation_id",
+            "candidate_manifest_artifact_id",
+            "candidate_manifest_artifact_digest",
+            "authorization_bundle_artifact_id",
+            "authorization_bundle_artifact_digest",
             "receipt_run_attempt",
             "immutable",
         },
@@ -242,6 +280,14 @@ def validate_schemas() -> None:
     authorization = load(schema_dir / "promotion-authorization.schema.json")
     if authorization["properties"]["authorization_run_attempt"].get("const") != 1:
         raise ValueError("promotion authorization runs must be attempt 1")
+    candidate = load(schema_dir / "candidate-manifest.schema.json")
+    intent_pattern = candidate["properties"]["release_intent_id"].get("pattern")
+    if intent_pattern != "^[A-Za-z0-9._:-]{8,128}$":
+        raise ValueError("release intent IDs must use the canonical ASCII allowlist")
+    if not isinstance(candidate.get("allOf"), list) or len(candidate["allOf"]) < 3:
+        raise ValueError(
+            "candidate schema must bind stable/RC kind and prerelease state"
+        )
 
 
 def validate_measurement_budget() -> None:
@@ -261,6 +307,23 @@ def validate_measurement_budget() -> None:
         raise ValueError("fast required checks ceiling must remain ten minutes")
     if any(not isinstance(value, int) or value <= 0 for value in ceilings.values()):
         raise ValueError("measurement ceilings must be positive integer seconds")
+    if budget.get("observed_anchor_aggregation") != (
+        "individual-observations-not-percentiles"
+    ):
+        raise ValueError("observed anchors must not be presented as percentiles")
+    pathological = [
+        anchor
+        for anchor in budget.get("observed_anchors", [])
+        if anchor.get("run_id") == 29647419533
+    ]
+    if len(pathological) != 5 or any(
+        anchor.get("run_conclusion") != "failure"
+        or anchor.get("job_conclusion") != "success"
+        or anchor.get("step_name") != "Build rmux"
+        or anchor.get("measurement") != "step_wallclock"
+        for anchor in pathological
+    ):
+        raise ValueError("failed release baseline anchors must disclose their scope")
 
 
 def main() -> int:
