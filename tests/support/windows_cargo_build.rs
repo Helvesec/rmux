@@ -14,6 +14,7 @@ const ACCESS_DENIED_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LNK1104_RETRY_LIMIT: usize = 3;
 const PROCESS_BINARY_STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+pub(crate) const PREBUILT_RMUX_BINARY_ENV: &str = "RMUX_WINDOWS_SMOKE_RMUX_BIN";
 #[allow(dead_code)]
 const PRIVATE_TARGET_DIR: &str = "rmux-windows-smoke-build";
 #[allow(dead_code)]
@@ -81,6 +82,24 @@ pub(crate) fn acquire(parent_target_dir: &Path) -> io::Result<WindowsCargoBuildG
 #[allow(dead_code)]
 pub(crate) fn private_target_dir(parent_target_dir: &Path) -> PathBuf {
     parent_target_dir.join(PRIVATE_TARGET_DIR)
+}
+
+#[allow(dead_code)]
+pub(crate) fn prebuilt_rmux_binary() -> io::Result<Option<PathBuf>> {
+    let Some(value) = std::env::var_os(PREBUILT_RMUX_BINARY_ENV) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if path.is_file() {
+        return Ok(Some(path));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{PREBUILT_RMUX_BINARY_ENV} points to a missing rmux binary: {}",
+            path.display()
+        ),
+    ))
 }
 
 #[allow(dead_code)]
