@@ -711,6 +711,7 @@ fn candidate_artifacts_allow_only_standard_github_runner_labels() {
 }
 
 #[test]
+#[cfg(unix)]
 fn draft_authority_schemas_cannot_drive_a_workflow() {
     for schema in [
         include_str!("../.github/release/schemas/candidate-manifest.schema.json"),
