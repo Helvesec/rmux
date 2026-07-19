@@ -19,7 +19,14 @@ on:
       windows_package_smoke:
         description: Run the Windows release package preflight
         required: false
-        default: true
+        # Ordinary main pushes intentionally skip Windows package qualification;
+        # release qualification and v* tags enable it.
+        default: false
+        type: boolean
+      release_qualification:
+        description: Run all deferred release qualification jobs, including native Windows smoke
+        required: false
+        default: false
         type: boolean
 
 permissions:
@@ -321,6 +328,8 @@ jobs:
 
   release-review-perf:
     name: Release review (perf)
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    needs: windows-tests-gate
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -364,7 +373,8 @@ jobs:
 
   release-review-sections:
     name: Release review (${{ matrix.section }})
-    needs: linux-source-gates
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    needs: [linux-source-gates, windows-tests-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -434,7 +444,10 @@ jobs:
 
   release-review-gate:
     name: Release review gate (no package)
-    if: always()
+    if: >-
+      always() &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_qualification))
     needs: [release-review-perf, release-review-sections]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -449,6 +462,8 @@ jobs:
 
   snap-package:
     name: Snap package smoke
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    needs: windows-tests-gate
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -471,6 +486,8 @@ jobs:
 
   nix-flake:
     name: Nix flake gate
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    needs: windows-tests-gate
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -549,18 +566,8 @@ jobs:
         with:
           toolchain: "1.96.1"
 
-      - name: Cache cargo
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
-        with:
-          path: |
-            ~/.cargo/git
-            ~/.cargo/registry
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-            cargo-${{ runner.os }}-${{ runner.arch }}-
-
+      # Intentionally uncached: historical multi-gigabyte restore/save costs
+      # exceeded the compile-time benefit, so this required budget stays cold.
       - name: Non-final local performance budget smoke
         run: scripts/perf-bench.sh --iterations 3 --line-count 10000 --output-dir target/perf/non-final-ci --fail-on-budget
 
@@ -619,7 +626,6 @@ jobs:
           - macos-15
     env:
       RUST_MIN_STACK: "8388608"
-      RUST_TEST_THREADS: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -650,8 +656,13 @@ jobs:
       - name: cargo build
         run: cargo build --workspace --locked
 
-      - name: cargo test portable crates
-        run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core -p rmux-client
+      # These crates passed repeated parallel-safe runs; keep rmux-client and
+      # suites with shared socket or process state serial below.
+      - name: cargo test parallel-safe portable crates
+        run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core
+
+      - name: cargo test rmux-client serially
+        run: cargo test --locked --no-fail-fast -p rmux-client -- --test-threads=1
 
       - name: cargo test macOS direct /tmp socket path
         if: runner.os == 'macOS'
@@ -667,6 +678,7 @@ jobs:
     outputs:
       cache_hit: ${{ steps.archive-cache.outputs.cache-hit }}
     env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
       RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -789,6 +801,7 @@ jobs:
     env:
       RUST_MIN_STACK: "8388608"
       RMUX_ALLOW_INTERNAL_DAEMON_IN_CALLER_JOB: "1"
+      RMUX_WINDOWS_SMOKE_RMUX_BIN: ${{ github.workspace }}/target/debug/rmux.exe
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -866,11 +879,17 @@ jobs:
           path: target/windows-nextest.tar.zst
           key: windows-nextest-${{ runner.os }}-${{ github.sha }}
 
-  windows-package-preflight:
-    name: Windows release package preflight
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.windows_package_smoke)
+  windows-package-build:
+    name: Windows release package build
+    # Ordinary main pushes stay on the protected fast lane; release
+    # qualification, targeted dispatches, and v* tags run this package chain.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+      (inputs.windows_package_smoke || inputs.release_qualification))
+    needs: windows-tests-gate
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
     steps:
@@ -887,45 +906,170 @@ jobs:
             ~/.cargo/git
             ~/.cargo/registry
             target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          key: windows-package-${{ runner.os }}-${{ runner.arch }}-rust-1.96.1-${{ hashFiles('Cargo.lock', 'scripts/package-windows.ps1', 'scripts/verify-package-windows.ps1') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-            cargo-${{ runner.os }}-${{ runner.arch }}-
+            windows-package-${{ runner.os }}-${{ runner.arch }}-rust-1.96.1-
 
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
-      - name: Build and verify Windows release package
+      - name: Build Windows release package
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $outputDir = "target/windows-package-preflight"
+          if (Test-Path -LiteralPath $outputDir) {
+            Remove-Item -LiteralPath $outputDir -Recurse -Force
+          }
           ./scripts/package-windows.ps1 `
             -Configuration release `
             -Target x86_64-pc-windows-msvc `
             -OutputDir $outputDir `
             -PlatformLabel windows-x86_64
-          $archive = Get-ChildItem -Path $outputDir -Filter "rmux-*.zip" | Select-Object -First 1
-          if ($null -eq $archive) {
-            throw "Windows package archive was not generated"
+          $archives = @(Get-ChildItem -Path $outputDir -Filter "rmux-*.zip")
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one Windows package archive, found $($archives.Count)"
           }
+          $archive = $archives[0]
+          ./scripts/verify-package-windows.ps1 `
+            -Archive $archive.FullName `
+            -Checksums "$outputDir/SHA256SUMS.txt" `
+            -RequireReleaseArtifact `
+            -ExpectedGitSha "${{ github.sha }}"
+
+      - name: Upload Windows release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-windows-package-${{ github.sha }}
+          path: target/windows-package-preflight
+          if-no-files-found: error
+          retention-days: 3
+
+  windows-package-runtime-smoke:
+    name: Windows package runtime smoke
+    needs: windows-package-build
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Configure temporary paths
+        shell: pwsh
+        run: |
+          "TMPDIR=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RMUX_TMPDIR=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Download Windows release package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: rmux-windows-package-${{ github.sha }}
+          path: target/windows-package-preflight
+
+      - name: Run packaged binary and daemon smokes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $outputDir = "target/windows-package-preflight"
+          $archives = @(Get-ChildItem -Path $outputDir -Filter "rmux-*.zip")
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one downloaded Windows package archive, found $($archives.Count)"
+          }
+          $archive = $archives[0]
           ./scripts/verify-package-windows.ps1 `
             -Archive $archive.FullName `
             -Checksums "$outputDir/SHA256SUMS.txt" `
             -RunBinary `
             -RunDaemonSmoke `
-            -RunSdkSmoke `
-            -RunMouseBorderSmoke `
-            -RequireReleaseArtifact
+            -RequireReleaseArtifact `
+            -ExpectedGitSha "${{ github.sha }}"
 
-      - name: Upload Windows package preflight
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+  windows-package-harness-smoke:
+    name: Windows package harness smoke (${{ matrix.smoke }})
+    needs: [windows-package-build, windows-test-archive]
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        smoke: [sdk, mouse]
+    # The downloaded test harness uses the default dynamic CRT; packaged
+    # binaries are independently verified CRT-static before it runs.
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
         with:
-          name: rmux-windows-package-preflight-${{ github.sha }}
+          tool: nextest@0.9.138
+          fallback: none
+
+      - name: Configure temporary paths
+        shell: pwsh
+        run: |
+          "TMPDIR=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RMUX_TMPDIR=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Download Windows release package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: rmux-windows-package-${{ github.sha }}
           path: target/windows-package-preflight
-          if-no-files-found: error
-          retention-days: 3
+
+      - name: Download Windows test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: rmux-windows-nextest-${{ github.sha }}
+          path: target
+
+      - name: Run package harness smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $outputDir = "target/windows-package-preflight"
+          $archives = @(Get-ChildItem -Path $outputDir -Filter "rmux-*.zip")
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one downloaded Windows package archive, found $($archives.Count)"
+          }
+          $archive = $archives[0]
+          $arguments = @{
+            Archive = $archive.FullName
+            Checksums = "$outputDir/SHA256SUMS.txt"
+            NextestArchive = "target/windows-nextest.tar.zst"
+            RequireReleaseArtifact = $true
+            ExpectedGitSha = "${{ github.sha }}"
+          }
+          if ("${{ matrix.smoke }}" -eq "sdk") {
+            $arguments.RunSdkSmoke = $true
+          } else {
+            $arguments.RunMouseBorderSmoke = $true
+          }
+          ./scripts/verify-package-windows.ps1 @arguments
+
+  windows-package-preflight:
+    name: Windows release package preflight
+    if: >-
+      always() &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+      (inputs.windows_package_smoke || inputs.release_qualification)))
+    needs: [windows-package-build, windows-package-runtime-smoke, windows-package-harness-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every Windows package smoke
+        env:
+          WINDOWS_PACKAGE_BUILD_RESULT: ${{ needs.windows-package-build.result }}
+          WINDOWS_PACKAGE_RUNTIME_RESULT: ${{ needs.windows-package-runtime-smoke.result }}
+          WINDOWS_PACKAGE_HARNESS_RESULT: ${{ needs.windows-package-harness-smoke.result }}
+        run: |
+          test "$WINDOWS_PACKAGE_BUILD_RESULT" = success
+          test "$WINDOWS_PACKAGE_RUNTIME_RESULT" = success
+          test "$WINDOWS_PACKAGE_HARNESS_RESULT" = success
 
   windows-cross:
     name: Cross-target Windows build check
@@ -961,7 +1105,10 @@ jobs:
 
   windows-runtime-smoke:
     name: Native Windows runtime smoke
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.windows_runtime_smoke)
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+      (inputs.windows_runtime_smoke || inputs.release_qualification))
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
