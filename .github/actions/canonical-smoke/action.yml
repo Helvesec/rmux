@@ -1,0 +1,244 @@
+name: Smoke one persisted canonical RMUX bundle
+description: Download by numeric artifact ID, verify every byte, then run a native smoke
+
+inputs:
+  expected-source-sha:
+    description: Exact protected main commit represented by the artifacts
+    required: true
+  fast-run-id:
+    description: Numeric Actions run ID containing the accepted fast archive
+    required: true
+  fast-nextest-artifact-id:
+    description: Numeric artifact ID of the exact Windows Nextest archive
+    required: true
+  fast-nextest-artifact-digest:
+    description: Actions archive digest of the Windows Nextest artifact
+    required: true
+  release-intent-id:
+    description: Unique allowlisted identifier for this release intent
+    required: true
+  planned-release-ref:
+    description: Planned stable or release-candidate tag name
+    required: true
+  release-kind:
+    description: Shadow, release-candidate, or stable intent kind
+    required: true
+  platform-key:
+    description: Contracted canonical platform key
+    required: true
+  assets-artifact-id:
+    description: Numeric ID of the persisted canonical asset artifact
+    required: true
+  assets-artifact-name:
+    description: SHA-scoped name of the persisted canonical asset artifact
+    required: true
+  assets-artifact-digest:
+    description: Actions archive digest of the canonical asset artifact
+    required: true
+  expected-build-record-sha256:
+    description: SHA-256 emitted by the canonical build job for its build record
+    required: true
+  smoke-kind:
+    description: Contracted package, runtime, SDK, or mouse smoke kind
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Verify the literal GitHub-hosted smoke allocation
+      shell: bash
+      env:
+        RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
+      run: |
+        set -euo pipefail
+        test "$RUNNER_ENVIRONMENT" = github-hosted
+        python3 - "$RMUX_PLATFORM_KEY" "$RUNNER_OS" "$RUNNER_ARCH" <<'PY'
+        import json
+        import pathlib
+        import sys
+
+        contract = json.loads(pathlib.Path(".github/release/canonical-build-contract.json").read_text())
+        matches = [entry for entry in contract["platforms"] if entry["key"] == sys.argv[1]]
+        if len(matches) != 1:
+            raise SystemExit("canonical smoke platform key is not unique")
+        observed = (sys.argv[2], sys.argv[3])
+        expected = (matches[0]["runner_os"], matches[0]["runner_arch"])
+        if observed != expected:
+            raise SystemExit(f"canonical smoke runner differs: {observed!r} != {expected!r}")
+        PY
+
+    - name: Verify the current-run artifact identity
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RMUX_ASSETS_ARTIFACT_DIGEST: ${{ inputs.assets-artifact-digest }}
+        RMUX_ASSETS_ARTIFACT_ID: ${{ inputs.assets-artifact-id }}
+        RMUX_ASSETS_ARTIFACT_NAME: ${{ inputs.assets-artifact-name }}
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+      run: |
+        set -euo pipefail
+        scripts/release/actions-artifact.py verify \
+          --repository "$GITHUB_REPOSITORY" \
+          --run-id "$GITHUB_RUN_ID" \
+          --artifact-id "$RMUX_ASSETS_ARTIFACT_ID" \
+          --name "$RMUX_ASSETS_ARTIFACT_NAME" \
+          --expected-digest "$RMUX_ASSETS_ARTIFACT_DIGEST" \
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA"
+
+    - name: Download only the persisted asset artifact ID
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.assets-artifact-id }}
+        path: ${{ runner.temp }}/rmux-canonical-download
+
+    - name: Verify the build record and all downloaded bytes
+      shell: bash
+      env:
+        RMUX_EXPECTED_BUILD_RECORD_SHA256: ${{ inputs.expected-build-record-sha256 }}
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+        RMUX_FAST_RUN_ID: ${{ inputs.fast-run-id }}
+        RMUX_RELEASE_INTENT_ID: ${{ inputs.release-intent-id }}
+        RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned-release-ref }}
+        RMUX_RELEASE_KIND: ${{ inputs.release-kind }}
+        RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
+      run: |
+        set -euo pipefail
+        scripts/release/canonical-build-record.py verify \
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --fast-run-id "$RMUX_FAST_RUN_ID" \
+          --candidate-run-id "$GITHUB_RUN_ID" \
+          --release-intent-id "$RMUX_RELEASE_INTENT_ID" \
+          --planned-release-ref "$RMUX_PLANNED_RELEASE_REF" \
+          --release-kind "$RMUX_RELEASE_KIND" \
+          --platform-key "$RMUX_PLATFORM_KEY" \
+          --assets-dir "$RUNNER_TEMP/rmux-canonical-download/assets" \
+          --record "$RUNNER_TEMP/rmux-canonical-download/canonical-build-record.json" \
+          --expected-record-sha256 "$RMUX_EXPECTED_BUILD_RECORD_SHA256"
+
+    - name: Install Linux verification tools
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y rpm
+
+    - name: Smoke persisted Unix packages
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        set -euo pipefail
+        assets="$RUNNER_TEMP/rmux-canonical-download/assets"
+        set -- "$assets"/rmux-*.tar.gz
+        test "$#" = 1
+        test -f "$1"
+        scripts/verify-package.sh "$1" \
+          --checksums "$assets/SHA256SUMS.txt" \
+          --run-binary \
+          --require-release-artifact
+        if [[ "$RUNNER_OS" == Linux ]]; then
+          set -- "$assets"/rmux_*.deb
+          test "$#" = 1
+          test -f "$1"
+          scripts/verify-debian-package.sh "$1" \
+            --checksums "$assets/SHA256SUMS.txt" \
+            --run-binary \
+            --require-release-artifact
+          set -- "$assets"/rmux-*.rpm
+          test "$#" = 1
+          test -f "$1"
+          scripts/verify-rpm-package.sh "$1" \
+            --checksums "$assets/SHA256SUMS.txt" \
+            --run-binary \
+            --require-release-artifact
+        fi
+
+    - name: Verify the exact fast Windows driver artifact
+      if: runner.os == 'Windows' && inputs.smoke-kind != 'runtime'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+        RMUX_FAST_NEXTEST_DIGEST: ${{ inputs.fast-nextest-artifact-digest }}
+        RMUX_FAST_NEXTEST_ID: ${{ inputs.fast-nextest-artifact-id }}
+        RMUX_FAST_RUN_ID: ${{ inputs.fast-run-id }}
+      run: |
+        set -euo pipefail
+        scripts/release/actions-artifact.py verify \
+          --repository "$GITHUB_REPOSITORY" \
+          --run-id "$RMUX_FAST_RUN_ID" \
+          --artifact-id "$RMUX_FAST_NEXTEST_ID" \
+          --name "rmux-windows-nextest-$RMUX_EXPECTED_SOURCE_SHA" \
+          --expected-digest "$RMUX_FAST_NEXTEST_DIGEST" \
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA"
+
+    - name: Download exact fast Windows test drivers
+      if: runner.os == 'Windows' && inputs.smoke-kind != 'runtime'
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.fast-nextest-artifact-id }}
+        path: ${{ runner.temp }}/rmux-fast-nextest
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ inputs.fast-run-id }}
+
+    - name: Verify exact fast Windows test driver bytes
+      if: runner.os == 'Windows' && inputs.smoke-kind != 'runtime'
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP/rmux-fast-nextest"
+        test -f windows-nextest.tar.zst
+        test -f windows-nextest.tar.zst.sha256
+        sha256sum --check windows-nextest.tar.zst.sha256
+
+    - name: Smoke persisted Windows runtime bytes
+      if: runner.os == 'Windows' && inputs.smoke-kind == 'runtime'
+      shell: pwsh
+      env:
+        RMUX_EXPECTED_GIT_SHA: ${{ inputs.expected-source-sha }}
+      run: |
+        $assets = "$env:RUNNER_TEMP/rmux-canonical-download/assets"
+        $archives = @(Get-ChildItem -LiteralPath $assets -Filter "rmux-*.zip")
+        if ($archives.Count -ne 1) { throw "expected one canonical Windows ZIP" }
+        ./scripts/verify-package-windows.ps1 `
+          -Archive $archives[0].FullName `
+          -Checksums "$assets/SHA256SUMS.txt" `
+          -RunBinary `
+          -RunDaemonSmoke `
+          -RunCtrlMatrixSmoke `
+          -RequireReleaseArtifact `
+          -ExpectedGitSha $env:RMUX_EXPECTED_GIT_SHA
+
+    - name: Smoke persisted Windows SDK bytes
+      if: runner.os == 'Windows' && inputs.smoke-kind == 'sdk'
+      shell: pwsh
+      env:
+        RMUX_EXPECTED_GIT_SHA: ${{ inputs.expected-source-sha }}
+      run: |
+        $assets = "$env:RUNNER_TEMP/rmux-canonical-download/assets"
+        $archives = @(Get-ChildItem -LiteralPath $assets -Filter "rmux-*.zip")
+        if ($archives.Count -ne 1) { throw "expected one canonical Windows ZIP" }
+        ./scripts/verify-package-windows.ps1 `
+          -Archive $archives[0].FullName `
+          -Checksums "$assets/SHA256SUMS.txt" `
+          -RunSdkSmoke `
+          -RequireReleaseArtifact `
+          -ExpectedGitSha $env:RMUX_EXPECTED_GIT_SHA `
+          -NextestArchive "$env:RUNNER_TEMP/rmux-fast-nextest/windows-nextest.tar.zst"
+
+    - name: Smoke persisted Windows mouse bytes
+      if: runner.os == 'Windows' && inputs.smoke-kind == 'mouse'
+      shell: pwsh
+      env:
+        RMUX_EXPECTED_GIT_SHA: ${{ inputs.expected-source-sha }}
+      run: |
+        $assets = "$env:RUNNER_TEMP/rmux-canonical-download/assets"
+        $archives = @(Get-ChildItem -LiteralPath $assets -Filter "rmux-*.zip")
+        if ($archives.Count -ne 1) { throw "expected one canonical Windows ZIP" }
+        ./scripts/verify-package-windows.ps1 `
+          -Archive $archives[0].FullName `
+          -Checksums "$assets/SHA256SUMS.txt" `
+          -RunMouseBorderSmoke `
+          -RequireReleaseArtifact `
+          -ExpectedGitSha $env:RMUX_EXPECTED_GIT_SHA `
+          -NextestArchive "$env:RUNNER_TEMP/rmux-fast-nextest/windows-nextest.tar.zst"

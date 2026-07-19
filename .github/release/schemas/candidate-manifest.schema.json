@@ -95,9 +95,17 @@
           "artifact_id": {"type": "integer", "minimum": 1},
           "name": {"type": "string", "minLength": 1},
           "archive_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
-          "target_triple": {"type": "string", "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]{2,63}$"},
+          "target_triple": {
+            "enum": [
+              "aarch64-apple-darwin",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-apple-darwin",
+              "x86_64-pc-windows-msvc",
+              "x86_64-unknown-linux-gnu"
+            ]
+          },
           "runner_image": {
-            "enum": ["macos-15", "macos-15-intel", "ubuntu-latest", "windows-latest"]
+            "enum": ["macos-15", "macos-15-intel", "ubuntu-22.04", "ubuntu-22.04-arm", "windows-latest"]
           },
           "rust_toolchain": {"type": "string", "minLength": 1, "maxLength": 128},
           "rustc_vv_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -116,7 +124,29 @@
               }
             }
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"target_triple": {"const": "x86_64-unknown-linux-gnu"}}, "required": ["target_triple"]},
+            "then": {"properties": {"runner_image": {"const": "ubuntu-22.04"}}}
+          },
+          {
+            "if": {"properties": {"target_triple": {"const": "aarch64-unknown-linux-gnu"}}, "required": ["target_triple"]},
+            "then": {"properties": {"runner_image": {"const": "ubuntu-22.04-arm"}}}
+          },
+          {
+            "if": {"properties": {"target_triple": {"const": "x86_64-apple-darwin"}}, "required": ["target_triple"]},
+            "then": {"properties": {"runner_image": {"const": "macos-15-intel"}}}
+          },
+          {
+            "if": {"properties": {"target_triple": {"const": "aarch64-apple-darwin"}}, "required": ["target_triple"]},
+            "then": {"properties": {"runner_image": {"const": "macos-15"}}}
+          },
+          {
+            "if": {"properties": {"target_triple": {"const": "x86_64-pc-windows-msvc"}}, "required": ["target_triple"]},
+            "then": {"properties": {"runner_image": {"const": "windows-latest"}}}
+          }
+        ]
       }
     }
   },

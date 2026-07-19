@@ -11,6 +11,7 @@
     "runner_group_id": 0,
     "runner_group_name": "GitHub Actions",
     "non_runner_jobs": [
+      "Build canonical native artifacts",
       "Run release-only candidate delta"
     ],
     "jobs_by_label": {
@@ -36,6 +37,7 @@
         "Nix flake gate",
         "Platform build and smoke on windows-latest",
         "Release candidate delta gate",
+        "Release candidate gate",
         "Release review (${{ matrix.section }})",
         "Release review (cli)",
         "Release review (lint)",
@@ -129,9 +131,11 @@
       "Windows workspace tests (18/18)"
     ],
     "skipped_jobs": [
+      "Build canonical native artifacts",
       "Native Windows runtime smoke",
       "Nix flake gate",
       "Release candidate delta gate",
+      "Release candidate gate",
       "Release review (${{ matrix.section }})",
       "Release review (perf)",
       "Release review gate (no package)",
@@ -216,14 +220,20 @@
   "policy_paths": [
     ".config/nextest.toml",
     ".github/CODEOWNERS",
+    ".github/actions/canonical-build/action.yml",
+    ".github/actions/canonical-smoke/action.yml",
     ".github/release/candidate-contract.json",
     ".github/release/candidate-workflow-contract.json",
+    ".github/release/canonical-build-contract.json",
     ".github/release/channel-policy.json",
     ".github/release/measurement-budget.json",
     ".github/release/schemas/candidate-manifest.schema.json",
+    ".github/release/schemas/canonical-artifact-binding.schema.json",
+    ".github/release/schemas/canonical-build-record.schema.json",
     ".github/release/schemas/promotion-authorization.schema.json",
     ".github/release/schemas/publication-receipt.schema.json",
     ".github/release/windows-coverage-contract.json",
+    ".github/workflows/canonical-native-build.yml",
     ".github/workflows/ci.yml",
     ".github/workflows/publish-chocolatey.yml",
     ".github/workflows/release-candidate-delta.yml",
@@ -293,6 +303,10 @@
     "scripts/release-local.sh",
     "scripts/release-review-gate-windows.ps1",
     "scripts/release-review-gate.sh",
+    "scripts/release/actions-artifact.py",
+    "scripts/release/canonical-artifact-binding.py",
+    "scripts/release/canonical-build-record.py",
+    "scripts/release/canonical_contract.py",
     "scripts/release/dispatch-release-candidate.sh",
     "scripts/release/dispatch-shadow-candidate.sh",
     "scripts/release/github_actions.py",
@@ -335,6 +349,7 @@
     "tests/reference/tmux_compat/frozen_reference.yaml",
     "tests/release_automation_spec.rs",
     "tests/release_candidate_spec.rs",
+    "tests/release_canonical_build_spec.rs",
     "tests/release_proof_adversarial_spec.rs",
     "tests/release_shadow_spec.rs"
   ]

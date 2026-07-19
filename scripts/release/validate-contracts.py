@@ -9,6 +9,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from canonical_contract import (
+    validate_build as validate_canonical_build,
+    validate_candidate_policy as validate_canonical_candidate_policy,
+    validate_schemas as validate_canonical_schemas,
+)
 from local_action_policy import validate_local_action_policy
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -180,8 +185,11 @@ def validate_candidate() -> None:
     non_runner_jobs = require_unique_strings(
         runner_policy.get("non_runner_jobs"), "runner_policy.non_runner_jobs"
     )
-    if non_runner_jobs != ["Run release-only candidate delta"]:
-        raise ValueError("runner policy must identify the reusable workflow call job")
+    if non_runner_jobs != [
+        "Build canonical native artifacts",
+        "Run release-only candidate delta",
+    ]:
+        raise ValueError("runner policy must identify both reusable workflow call jobs")
     contracted_jobs = (
         set(success)
         | set(skipped)
@@ -340,6 +348,7 @@ def validate_candidate_workflow() -> None:
         raise ValueError("candidate delta contains a fast-covered review section")
     if delta.get("tmux_oracle_builds") != 1:
         raise ValueError("the fast and candidate path must build tmux exactly once")
+    validate_canonical_candidate_policy(contract.get("canonical_builds"))
     publication = contract.get("publication")
     if not isinstance(publication, dict) or any(
         publication.get(field) is not False
@@ -480,13 +489,7 @@ def validate_schemas() -> None:
         raise ValueError(
             "candidate schema must bind stable/RC kind and prerelease state"
         )
-    runner_images = candidate["properties"]["artifacts"]["items"]["properties"][
-        "runner_image"
-    ].get("enum")
-    if runner_images != sorted(STANDARD_RUNNER_LABELS):
-        raise ValueError(
-            "candidate runner_image must use the standard runner allowlist"
-        )
+    validate_canonical_schemas(candidate, schema_dir)
 
 
 def validate_measurement_budget() -> None:
@@ -528,6 +531,7 @@ def validate_measurement_budget() -> None:
 def main() -> int:
     validate_candidate()
     validate_candidate_workflow()
+    validate_canonical_build()
     validate_windows_coverage()
     validate_channels()
     validate_schemas()

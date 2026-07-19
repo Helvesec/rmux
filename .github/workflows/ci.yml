@@ -85,6 +85,9 @@ jobs:
       CANDIDATE_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
       CANDIDATE_PLANNED_RELEASE_REF: ${{ inputs.planned_release_ref }}
       CANDIDATE_RELEASE_KIND: ${{ inputs.release_kind }}
+    outputs:
+      fast_nextest_artifact_digest: ${{ steps.fast-nextest.outputs.artifact_digest }}
+      fast_nextest_artifact_id: ${{ steps.fast-nextest.outputs.artifact_id }}
     steps:
       - name: Reject untrusted candidate inputs before checkout
         shell: bash
@@ -128,12 +131,26 @@ jobs:
           --kind fast
           > fast-proof.json
 
+      - id: fast-nextest
+        name: Resolve the exact fast Windows test archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/release/actions-artifact.py resolve
+          --repository "$GITHUB_REPOSITORY"
+          --run-id "$CANDIDATE_FAST_RUN_ID"
+          --name "rmux-windows-nextest-$CANDIDATE_EXPECTED_SOURCE_SHA"
+          --expected-source-sha "$CANDIDATE_EXPECTED_SOURCE_SHA"
+          --github-output "$GITHUB_OUTPUT"
+          > fast-nextest-artifact.json
+
       - name: Upload immutable input proofs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: rmux-fast-proof-${{ inputs.expected_source_sha }}
           path: |
             candidate-intent.json
+            fast-nextest-artifact.json
             fast-proof.json
           if-no-files-found: error
           retention-days: 7
@@ -166,6 +183,43 @@ jobs:
         run: |
           test "$FAST_PROOF_RESULT" = success
           test "$DELTA_RESULT" = success
+
+  release-canonical-native:
+    name: Build canonical native artifacts
+    if: github.event_name == 'workflow_dispatch' && inputs.release_qualification
+    needs: verify-fast-evidence
+    uses: ./.github/workflows/canonical-native-build.yml
+    with:
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      fast_run_id: ${{ inputs.fast_run_id }}
+      fast_nextest_artifact_id: ${{ needs.verify-fast-evidence.outputs.fast_nextest_artifact_id }}
+      fast_nextest_artifact_digest: ${{ needs.verify-fast-evidence.outputs.fast_nextest_artifact_digest }}
+      release_intent_id: ${{ inputs.release_intent_id }}
+      planned_release_ref: ${{ inputs.planned_release_ref }}
+      release_kind: ${{ inputs.release_kind }}
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+
+  release-candidate-gate:
+    name: Release candidate gate
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' &&
+      inputs.release_qualification
+    needs: [release-candidate-delta-gate, release-canonical-native]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require release delta and every canonical byte
+        env:
+          CANONICAL_RESULT: ${{ needs.release-canonical-native.result }}
+          DELTA_RESULT: ${{ needs.release-candidate-delta-gate.result }}
+        run: |
+          test "$DELTA_RESULT" = success
+          test "$CANONICAL_RESULT" = success
 
   linux-quality:
     name: Linux format, lint, and docs
@@ -878,11 +932,27 @@ jobs:
         if: steps.archive-cache.outputs.cache-hit != 'true'
         run: cargo nextest archive --workspace --locked --archive-file target/windows-nextest.tar.zst
 
+      - name: Bind the Windows test archive bytes
+        shell: pwsh
+        run: |
+          $archive = "target/windows-nextest.tar.zst"
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "Windows Nextest archive is missing"
+          }
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          [System.IO.File]::WriteAllText(
+            "$archive.sha256",
+            "$digest  windows-nextest.tar.zst`n",
+            [System.Text.Encoding]::ASCII
+          )
+
       - name: Upload Windows test archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: rmux-windows-nextest-${{ github.sha }}
-          path: target/windows-nextest.tar.zst
+          path: |
+            target/windows-nextest.tar.zst
+            target/windows-nextest.tar.zst.sha256
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
