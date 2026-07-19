@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +157,20 @@ def validate_candidate() -> None:
     missing = [path for path in paths if not (ROOT / path).is_file()]
     if missing:
         raise ValueError(f"policy paths do not exist: {missing}")
+    tracked_result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+    )
+    if tracked_result.returncode != 0:
+        raise ValueError("cannot enumerate tracked files for the release policy")
+    tracked = {
+        value.decode("utf-8") for value in tracked_result.stdout.split(b"\x00") if value
+    }
+    untracked = sorted(set(paths) - tracked)
+    if untracked:
+        raise ValueError(f"policy paths are not tracked by Git: {untracked}")
     if ".github/release/candidate-contract.json" not in paths:
         raise ValueError("candidate contract must include itself in policy_paths")
     workflow_paths = {

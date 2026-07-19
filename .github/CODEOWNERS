@@ -1,7 +1,6 @@
 /.github/CODEOWNERS @shideneyu
 /.github/workflows/ @shideneyu
 /.github/release/ @shideneyu
-/.release-deployment/release-runbook.md @shideneyu
 /Cargo.lock @shideneyu
 /Cargo.toml @shideneyu
 /SECURITY.md @shideneyu

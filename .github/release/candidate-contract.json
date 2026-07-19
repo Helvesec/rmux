@@ -150,7 +150,6 @@
     ".github/workflows/release-shadow.yml",
     ".github/workflows/release.yml",
     ".github/workflows/scorecard.yml",
-    ".release-deployment/release-runbook.md",
     "Cargo.lock",
     "Cargo.toml",
     "SECURITY.md",
