@@ -753,7 +753,8 @@ fn ci_defers_release_review_until_the_protected_fast_lane_finishes() {
 fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
     let ci = include_str!("../.github/workflows/ci.yml");
     assert!(ci.contains("release_qualification:"));
-    assert!(ci.contains("description: Run the deferred release qualification jobs"));
+    assert!(ci.contains("description: Run all deferred release qualification jobs"));
+    assert!(ci.contains("including native Windows smoke"));
 
     for (job, next_job) in [
         ("snap-package", "nix-flake"),
@@ -780,6 +781,173 @@ fn ci_keeps_release_only_work_behind_the_protected_fast_lane() {
             "{job} must not extend ordinary main pushes"
         );
     }
+}
+
+#[test]
+fn release_qualification_includes_the_native_windows_runtime_smoke() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let runtime = ci
+        .split("\n  windows-runtime-smoke:\n")
+        .nth(1)
+        .expect("native Windows runtime smoke job");
+
+    for required in [
+        "name: Native Windows runtime smoke",
+        "startsWith(github.ref, 'refs/tags/v')",
+        "github.event_name == 'workflow_dispatch'",
+        "inputs.windows_runtime_smoke",
+        "inputs.release_qualification",
+    ] {
+        assert!(
+            runtime.contains(required),
+            "native Windows runtime smoke lost dispatch condition {required:?}"
+        );
+    }
+    assert!(
+        !runtime.contains("github.event_name == 'push'"),
+        "native Windows runtime smoke must remain tag- or dispatch-only"
+    );
+
+    for (job, next_job) in [
+        ("release-review-perf", "release-review-sections"),
+        ("snap-package", "nix-flake"),
+        ("nix-flake", "linux-sdk-smoke"),
+        ("windows-package-build", "windows-package-runtime-smoke"),
+    ] {
+        let block = ci
+            .split(&format!("\n  {job}:\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing {job} job"))
+            .split(&format!("\n  {next_job}:\n"))
+            .next()
+            .unwrap_or_else(|| panic!("unbounded {job} job"));
+        assert!(
+            !block.contains("inputs.windows_runtime_smoke"),
+            "the targeted native runtime input must not enable {job}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_main_pushes_skip_the_windows_release_package_chain() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let package_input = ci
+        .split("\n      windows_package_smoke:\n")
+        .nth(1)
+        .expect("Windows package workflow-dispatch input")
+        .split("\n      release_qualification:\n")
+        .next()
+        .expect("bounded Windows package workflow-dispatch input");
+    assert!(package_input.contains("default: false"));
+
+    let build = ci
+        .split("\n  windows-package-build:\n")
+        .nth(1)
+        .expect("Windows package build job")
+        .split("\n  windows-package-runtime-smoke:\n")
+        .next()
+        .expect("bounded Windows package build job");
+    let runtime = ci
+        .split("\n  windows-package-runtime-smoke:\n")
+        .nth(1)
+        .expect("Windows package runtime smoke job")
+        .split("\n  windows-package-harness-smoke:\n")
+        .next()
+        .expect("bounded Windows package runtime smoke job");
+    let harness = ci
+        .split("\n  windows-package-harness-smoke:\n")
+        .nth(1)
+        .expect("Windows package harness smoke job")
+        .split("\n  windows-package-preflight:\n")
+        .next()
+        .expect("bounded Windows package harness smoke job");
+    let gate = ci
+        .split("\n  windows-package-preflight:\n")
+        .nth(1)
+        .expect("Windows package preflight gate")
+        .split("\n  windows-cross:\n")
+        .next()
+        .expect("bounded Windows package preflight gate");
+
+    let build_comments = build
+        .lines()
+        .filter(|line| line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        build_comments.contains("Ordinary main pushes"),
+        "the package entry point must document why ordinary main pushes skip it"
+    );
+
+    for block in [build, gate] {
+        for required in [
+            "startsWith(github.ref, 'refs/tags/v')",
+            "github.event_name == 'workflow_dispatch'",
+            "inputs.windows_package_smoke",
+            "inputs.release_qualification",
+        ] {
+            assert!(
+                block.contains(required),
+                "Windows package entry point lost condition {required:?}"
+            );
+        }
+        assert!(
+            !block.contains("github.event_name == 'push'"),
+            "ordinary main pushes must not enable the Windows package chain"
+        );
+    }
+
+    assert!(runtime.contains("needs: windows-package-build"));
+    assert!(harness.contains("needs: [windows-package-build, windows-test-archive]"));
+    assert!(gate.contains(
+        "needs: [windows-package-build, windows-package-runtime-smoke, windows-package-harness-smoke]"
+    ));
+}
+
+#[test]
+fn ci_documents_the_parallel_test_and_crt_boundaries() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let platform = ci
+        .split("\n  platform-runtime:\n")
+        .nth(1)
+        .expect("portable platform runtime job")
+        .split("\n  windows-test-archive:\n")
+        .next()
+        .expect("bounded portable platform runtime job");
+    let platform_comments = platform
+        .lines()
+        .filter(|line| line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        platform_comments.contains("parallel-safe"),
+        "the macOS job must document the proven parallel-safe test boundary"
+    );
+    assert!(
+        platform_comments.contains("serial"),
+        "the macOS job must document which tests retain serial scheduling"
+    );
+
+    let harness = ci
+        .split("\n  windows-package-harness-smoke:\n")
+        .nth(1)
+        .expect("Windows package harness smoke job")
+        .split("\n  windows-package-preflight:\n")
+        .next()
+        .expect("bounded Windows package harness smoke job");
+    let harness_comments = harness
+        .lines()
+        .filter(|line| line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        harness_comments.contains("dynamic CRT"),
+        "the package harness must disclose the archived test driver's CRT mode"
+    );
+    assert!(
+        harness_comments.contains("CRT-static"),
+        "the package harness must distinguish the CRT-static binaries under test"
+    );
 }
 
 #[test]
