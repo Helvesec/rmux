@@ -542,6 +542,7 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
         "id: archive-cache",
         "key: windows-nextest-${{ runner.os }}-${{ github.sha }}",
         "actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830",
+        "CARGO_PROFILE_TEST_DEBUG: \"0\"",
         "cargo nextest archive --workspace --locked",
         "target/windows-nextest.tar.zst",
         "compression-level: 0",
@@ -585,6 +586,11 @@ fn ci_builds_windows_tests_once_and_runs_eighteen_hosted_shards() {
     assert!(!archive.contains("self-hosted"));
     assert!(!build.contains("self-hosted"));
     assert!(!shards.contains("self-hosted"));
+    assert_eq!(
+        ci.matches("CARGO_PROFILE_TEST_DEBUG: \"0\"").count(),
+        1,
+        "test debug metadata must only be disabled for the Windows test archive"
+    );
     assert_eq!(
         nextest
             .matches("threads-required = \"num-test-threads\"")

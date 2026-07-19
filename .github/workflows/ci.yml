@@ -681,6 +681,7 @@ jobs:
     outputs:
       cache_hit: ${{ steps.archive-cache.outputs.cache-hit }}
     env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
       RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
