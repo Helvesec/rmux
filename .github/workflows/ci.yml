@@ -566,17 +566,8 @@ jobs:
         with:
           toolchain: "1.96.1"
 
-      - name: Restore cargo cache
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
-        with:
-          path: |
-            ~/.cargo/git
-            ~/.cargo/registry
-            target
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-
+      # Intentionally uncached: historical multi-gigabyte restore/save costs
+      # exceeded the compile-time benefit, so this required budget stays cold.
       - name: Non-final local performance budget smoke
         run: scripts/perf-bench.sh --iterations 3 --line-count 10000 --output-dir target/perf/non-final-ci --fail-on-budget
 

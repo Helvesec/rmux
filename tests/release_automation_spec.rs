@@ -951,7 +951,7 @@ fn ci_documents_the_parallel_test_and_crt_boundaries() {
 }
 
 #[test]
-fn required_linux_perf_check_does_not_publish_a_cache_on_its_critical_path() {
+fn required_linux_perf_check_is_intentionally_uncached() {
     let ci = include_str!("../.github/workflows/ci.yml");
     let perf = ci
         .split("\n  linux-perf-smoke:\n")
@@ -961,9 +961,9 @@ fn required_linux_perf_check_does_not_publish_a_cache_on_its_critical_path() {
         .next()
         .expect("bounded Linux performance smoke job");
 
-    assert!(perf.contains("name: Restore cargo cache"));
-    assert!(perf.contains("uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830"));
+    assert!(perf.contains("Intentionally uncached"));
     assert!(!perf.contains("uses: actions/cache@"));
+    assert!(!perf.contains("uses: actions/cache/restore@"));
     assert!(!perf.contains("uses: actions/cache/save@"));
 }
 
