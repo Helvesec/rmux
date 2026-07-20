@@ -61,6 +61,8 @@ jobs:
       actions: read
       contents: read
     uses: ./.github/workflows/release-policy-audit.yml
+    secrets:
+      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY: ${{ github.token }}
     with:
       simulation: true
       candidate_run_id: ${{ inputs.candidate_run_id }}

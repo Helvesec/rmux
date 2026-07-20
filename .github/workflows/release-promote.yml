@@ -308,6 +308,8 @@ jobs:
     needs: verify-candidate
     if: ${{ false }}
     uses: ./.github/workflows/release-policy-audit.yml
+    secrets:
+      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY: ${{ github.token }}
     with:
       candidate_run_id: ${{ inputs.candidate_run_id }}
       candidate_manifest_run_id: ${{ inputs.candidate_manifest_run_id }}

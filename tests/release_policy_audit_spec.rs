@@ -22,7 +22,7 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
 
     assert!(workflow.contains("on:\n  workflow_call:"));
     assert!(workflow.contains(
-        "    secrets:\n      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:\n        required: false\n"
+        "    secrets:\n      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:\n        required: true\n"
     ));
     assert_eq!(
         workflow
@@ -123,6 +123,17 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
     assert_eq!(callers.len(), 2, "policy audit must have two exact callers");
     assert!(callers[0].ends_with("release-promote.yml"));
     assert!(callers[1].ends_with("release-promotion-simulation.yml"));
+    for caller in &callers {
+        let text = fs::read_to_string(caller).expect("read policy audit caller");
+        assert_eq!(
+            text.matches(
+                "    secrets:\n      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY: ${{ github.token }}\n"
+            )
+            .count(),
+            1
+        );
+        assert!(!text.contains("secrets: inherit"));
+    }
     let caller = fs::read_to_string(&callers[0]).expect("read promote workflow");
     let audit_job = caller
         .split("\n  policy-audit:\n")
