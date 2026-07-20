@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/release-policy-audit-predicate-v1.json",
+  "title": "RMUX live release policy audit predicate",
+  "description": "Disarmed review-only predicate. It MUST NOT authorize publication; a separate post-upload reference and PR6 authorization are required.",
+  "x-rmux-status": "disarmed-non-authoritative",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "predicate_type", "status", "repository_id", "source_git_sha", "candidate", "release", "release_policy", "audit_identity", "emitted_at", "expires_at", "observed_state"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "predicate_type": {"const": "https://rmux.io/attestations/release-policy-audit/v1"},
+    "status": {"const": "shadow-non-authoritative"},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"$ref": "#/$defs/sha40"},
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "manifest_run_id", "manifest_run_attempt", "manifest_artifact_id", "manifest_artifact_digest", "manifest_sha256", "manifest_created_at", "manifest_expires_at"],
+      "properties": {
+        "run_id": {"type": "integer", "minimum": 1},
+        "run_attempt": {"const": 1},
+        "manifest_run_id": {"type": "integer", "minimum": 1},
+        "manifest_run_attempt": {"const": 1},
+        "manifest_artifact_id": {"type": "integer", "minimum": 1},
+        "manifest_artifact_digest": {"$ref": "#/$defs/digest"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "manifest_created_at": {"type": "string", "format": "date-time"},
+        "manifest_expires_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intent_id", "planned_ref", "kind"],
+      "properties": {
+        "intent_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+        "planned_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+        "kind": {"enum": ["rc", "stable"]}
+      }
+    },
+    "release_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root_sha256", "contract_blob_oid"],
+      "properties": {
+        "root_sha256": {"$ref": "#/$defs/sha256"},
+        "contract_blob_oid": {"$ref": "#/$defs/sha40"}
+      }
+    },
+    "audit_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "workflow_id", "workflow_path", "app_id", "installation_id", "app_slug", "repository_selection", "permissions"],
+      "properties": {
+        "run_id": {"type": "integer", "minimum": 1},
+        "run_attempt": {"const": 1},
+        "workflow_id": {"type": "integer", "minimum": 1},
+        "workflow_path": {"const": ".github/workflows/release-policy-audit.yml"},
+        "app_id": {"type": "integer", "minimum": 1},
+        "installation_id": {"type": "integer", "minimum": 1},
+        "app_slug": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+        "repository_selection": {"const": "selected"},
+        "permissions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["actions", "administration", "metadata"],
+          "properties": {
+            "actions": {"const": "read"},
+            "administration": {"const": "write"},
+            "metadata": {"const": "read"}
+          }
+        }
+      }
+    },
+    "emitted_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "observed_state": {"type": "object", "minProperties": 7}
+  },
+  "$defs": {
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

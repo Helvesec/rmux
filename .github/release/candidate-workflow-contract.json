@@ -62,6 +62,17 @@
     "manifest_retention_days": 7,
     "manifest_self_reference": false
   },
+  "policy_audit": {
+    "activation_ledger": ".github/release/release-activation.json",
+    "capability_enabled": false,
+    "contract": ".github/release/policy-audit-contract.json",
+    "audit_app_configured": false,
+    "workflow": ".github/workflows/release-policy-audit.yml",
+    "workflow_callers": 0,
+    "privileged_job_condition": "false",
+    "pat_fallback": false,
+    "authorizes_publication": false
+  },
   "publication": {
     "enabled": false,
     "public_triggers": false,
