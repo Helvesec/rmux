@@ -169,11 +169,18 @@ fn windows_release_gate_uses_hosted_checks_and_nonempty_cargo_filters() {
     assert!(
         package_verify.contains("RunCtrlMatrixSmoke")
             && package_verify.contains("windows_ctrl_matrix.ps1")
-            && package_verify.contains("-PortableSmokeOnly")
+            && package_verify.contains("PortableSmokeOnly = $true")
             && package_verify.contains("ExpectedGitSha")
             && package_verify.contains("CtrlMatrixEvidence")
             && package_verify.contains("produced no passing evidence"),
         "manual Windows package verification must keep the optional interactive Ctrl matrix smoke"
+    );
+    assert!(
+        package_verify.contains("$arguments = @{\n            Rmux =")
+            && package_verify.contains("PortableSmokeOnly = $true")
+            && package_verify.contains("$arguments.EvidencePath =")
+            && !package_verify.contains("\"-Rmux\", [System.IO.Path]::GetFullPath($Binary)"),
+        "PowerShell script parameters must use named hashtable splatting"
     );
     assert!(workflow.contains("if-no-files-found: error"));
 }

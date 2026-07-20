@@ -193,6 +193,13 @@ runs:
         test -f windows-nextest.tar.zst.sha256
         sha256sum --check windows-nextest.tar.zst.sha256
 
+    - name: Install cargo-nextest for persisted Windows test drivers
+      if: runner.os == 'Windows' && inputs.smoke-kind != 'runtime'
+      uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
+      with:
+        tool: nextest@0.9.138
+        fallback: none
+
     - name: Smoke persisted Windows runtime bytes
       if: runner.os == 'Windows' && inputs.smoke-kind == 'runtime'
       shell: pwsh
