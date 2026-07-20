@@ -2,6 +2,9 @@ name: Disarmed reusable release policy audit
 
 on:
   workflow_call:
+    secrets:
+      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:
+        required: false
     inputs:
       simulation:
         required: false
