@@ -309,6 +309,25 @@ fn canonical_record_rejects_mutated_record_or_downloaded_bytes() {
         "{}",
         String::from_utf8_lossy(&created.stderr)
     );
+    let created_record: serde_json::Value =
+        serde_json::from_slice(&fs::read(&record).expect("read created record"))
+            .expect("parse created record");
+    let created_paths = created_record["files"]
+        .as_array()
+        .expect("created record files")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("created record file path"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        created_paths,
+        [
+            "SHA256SUMS.txt",
+            "rmux-0.9.0-1.x86_64.rpm",
+            "rmux-0.9.0-linux-x86_64.tar.gz",
+            "rmux_0.9.0_amd64.deb",
+        ],
+        "canonical asset order must not depend on host path semantics"
+    );
     let record_sha = String::from_utf8(created.stdout).expect("record digest is UTF-8");
     let record_sha = record_sha.trim();
     let mut verify = vec!["verify"];
