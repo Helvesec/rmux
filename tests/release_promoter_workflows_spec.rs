@@ -90,13 +90,13 @@ fn assert_workflow_dispatch_only(workflow: &str) {
 }
 
 #[test]
-fn promoter_workflows_have_exact_triggers_and_remain_triple_disarmed() {
+fn promoter_workflows_have_exact_triggers_and_remain_disarmed() {
     for workflow in [TAG, PROMOTE] {
         assert_workflow_call_only(workflow);
     }
     assert_workflow_dispatch_only(RECEIPT);
     assert_eq!(TAG.matches("if: ${{ false }}").count(), 1);
-    assert_eq!(PROMOTE.matches("if: ${{ false }}").count(), 3);
+    assert_eq!(PROMOTE.matches("if: ${{ false }}").count(), 4);
     assert_eq!(RECEIPT.matches("if: ${{ false }}").count(), 1);
 
     let activation: serde_json::Value =
@@ -152,7 +152,8 @@ fn signed_tag_gate_preserves_dedicated_ssh_signature_and_app_boundary() {
 
 #[test]
 fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
-    let verify = job(PROMOTE, "verify-candidate", Some("policy-audit"));
+    let verify = job(PROMOTE, "verify-candidate", Some("prepare-policy-audit"));
+    let prepare = job(PROMOTE, "prepare-policy-audit", Some("policy-audit"));
     let audit = job(PROMOTE, "policy-audit", Some("authorize-promotion"));
     let authorize = job(PROMOTE, "authorize-promotion", Some("publish"));
     let publish = job(PROMOTE, "publish", None);
@@ -168,8 +169,13 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
     assert_eq!(PROMOTE.matches("merge-multiple: true").count(), 4);
     assert!(authorize.contains("rmux-authorization/verified"));
     assert!(authorize.contains("rmux-authorization/policy"));
+    assert!(prepare.contains("if: ${{ false }}"));
+    assert!(prepare.contains("uses: ./.github/workflows/release-policy-audit.yml"));
     assert!(audit.contains("if: ${{ false }}"));
-    assert!(audit.contains("uses: ./.github/workflows/release-policy-audit.yml"));
+    assert!(audit.contains("environment: release-policy-audit"));
+    assert!(audit.contains("uses: ./.github/actions/release-policy-audit"));
+    assert!(audit.contains("audit-workflow-id: 316435346"));
+    assert!(audit.contains("audit-workflow-path: .github/workflows/release-promote.yml"));
     assert!(authorize.contains("needs: [verify-candidate, policy-audit]"));
     assert!(authorize.contains("id-token: write"));
     assert!(authorize.contains("attestations: write"));

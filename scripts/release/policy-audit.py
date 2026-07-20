@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 from policy_audit_contract import API_GETS, validate_contract
 from policy_audit_model import (
+    AUDIT_WORKFLOW_STATE_KEYS,
     DIGEST,
     INTENT,
     RELEASE_REF,
@@ -148,6 +149,8 @@ def collect(args: argparse.Namespace) -> None:
         policy=policy,
         audit_run_id=args.audit_run_id,
         audit_run_attempt=args.audit_run_attempt,
+        audit_workflow_id=args.audit_workflow_id,
+        audit_workflow_path=args.audit_workflow_path,
         observed_state=state,
         now=parse_now(args.now, args.api_fixture_dir),
     )
@@ -206,6 +209,8 @@ def add_identity_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--release-kind", choices=("rc", "stable"), required=True)
     parser.add_argument("--audit-run-id", required=True, type=int)
     parser.add_argument("--audit-run-attempt", required=True, type=int)
+    parser.add_argument("--audit-workflow-id", required=True, type=int)
+    parser.add_argument("--audit-workflow-path", required=True)
     parser.add_argument("--audit-app-id", required=True, type=int)
     parser.add_argument("--audit-installation-id", required=True, type=int)
     parser.add_argument("--audit-app-slug", required=True)
@@ -249,6 +254,8 @@ def validate_argument_shapes(args: argparse.Namespace) -> None:
         raise ValueError("release intent ID is invalid")
     if RELEASE_REF.fullmatch(args.planned_release_ref) is None:
         raise ValueError("planned release ref is invalid")
+    if args.audit_workflow_path not in AUDIT_WORKFLOW_STATE_KEYS:
+        raise ValueError("policy audit workflow path is not allowed")
 
 
 def main() -> int:

@@ -313,6 +313,7 @@
     ".github/CODEOWNERS",
     ".github/actions/canonical-build/action.yml",
     ".github/actions/canonical-smoke/action.yml",
+    ".github/actions/release-policy-audit/action.yml",
     ".github/actions/release-publication-inputs/action.yml",
     ".github/release/candidate-contract.json",
     ".github/release/candidate-workflow-contract.json",

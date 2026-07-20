@@ -375,8 +375,8 @@ fn fixture() -> Fixture {
             "predicate_artifact_digest": format!("sha256:{}", hex(22)),
             "predicate_sha256": hex(23), "emitted_at": "2026-07-19T00:30:00Z",
             "expires_at": "2026-07-19T00:45:00Z", "app_id": 1001,
-            "installation_id": 1002, "workflow_id": 1003,
-            "workflow_path": ".github/workflows/release-policy-audit.yml",
+            "installation_id": 1002, "workflow_id": 316435346,
+            "workflow_path": ".github/workflows/release-promote.yml",
             "release_policy_sha256": hex(20)
         }),
     );

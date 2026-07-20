@@ -398,7 +398,8 @@ def validate_policy_audit(
         or reference["candidate_run_id"] != manifest["candidate_run_id"]
         or reference["release_intent_id"] != manifest["release_intent_id"]
         or reference["policy_audit_run_attempt"] != 1
-        or reference["workflow_path"] != ".github/workflows/release-policy-audit.yml"
+        or reference["workflow_id"] != 316435346
+        or reference["workflow_path"] != ".github/workflows/release-promote.yml"
         or reference["release_policy_sha256"] != manifest["release_policy"]["sha256"]
     ):
         raise ValueError("policy audit reference does not bind the exact candidate")
