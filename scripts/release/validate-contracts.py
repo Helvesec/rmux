@@ -15,6 +15,7 @@ from canonical_contract import (
     validate_schemas as validate_canonical_schemas,
 )
 from local_action_policy import validate_local_action_policy
+from policy_audit_contract import validate_repository_contracts
 from shadow_contract import (
     validate_candidate_policy as validate_shadow_candidate_policy,
 )
@@ -578,6 +579,7 @@ def main() -> int:
     validate_channels()
     validate_schemas()
     validate_measurement_budget()
+    validate_repository_contracts(ROOT)
     print("release-contracts-ok")
     return 0
 

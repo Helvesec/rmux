@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/release-policy-audit-reference-v1.json",
+  "title": "RMUX post-upload policy audit reference",
+  "description": "Disarmed review-only post-upload reference. It MUST NOT authorize publication without an exact PR6 promotion authorization.",
+  "x-rmux-status": "disarmed-non-authoritative",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "repository_id", "source_git_sha", "candidate_run_id", "release_intent_id", "policy_audit_run_id", "policy_audit_run_attempt", "predicate_artifact_id", "predicate_artifact_digest", "predicate_sha256", "emitted_at", "expires_at", "app_id", "installation_id", "workflow_id", "workflow_path", "release_policy_sha256"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"const": "shadow-non-authoritative"},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "candidate_run_id": {"type": "integer", "minimum": 1},
+    "release_intent_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+    "policy_audit_run_id": {"type": "integer", "minimum": 1},
+    "policy_audit_run_attempt": {"const": 1},
+    "predicate_artifact_id": {"type": "integer", "minimum": 1},
+    "predicate_artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "predicate_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "emitted_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "app_id": {"type": "integer", "minimum": 1},
+    "installation_id": {"type": "integer", "minimum": 1},
+    "workflow_id": {"type": "integer", "minimum": 1},
+    "workflow_path": {"const": ".github/workflows/release-policy-audit.yml"},
+    "release_policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
