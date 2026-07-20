@@ -166,6 +166,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.receipt_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-snap-retry/receipt
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -174,6 +175,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.receipt_envelope_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-snap-retry/receipt-envelope
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -182,6 +184,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.prior_result_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-snap-retry/result
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -190,6 +193,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.prior_result_envelope_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-snap-retry/result-envelope
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}

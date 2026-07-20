@@ -165,7 +165,7 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
     assert!(verify.contains("stage-candidate-release.py"));
     assert!(CANDIDATE_STAGING.contains("item.get(\"role\") == \"checksums\""));
     assert!(CANDIDATE_STAGING.contains("args.output / \"SHA256SUMS\""));
-    assert!(!PROMOTE.contains("merge-multiple:"));
+    assert_eq!(PROMOTE.matches("merge-multiple: true").count(), 4);
     assert!(authorize.contains("rmux-authorization/verified"));
     assert!(authorize.contains("rmux-authorization/policy"));
     assert!(audit.contains("if: ${{ false }}"));
@@ -219,7 +219,7 @@ fn receipt_is_separate_receipt_only_and_never_writes_contents() {
     assert!(!receipt.contains("contents: write"));
     assert!(!RECEIPT.contains("gh release"));
     assert!(!RECEIPT.contains("git push"));
-    assert!(!RECEIPT.contains("merge-multiple:"));
+    assert_eq!(RECEIPT.matches("merge-multiple: true").count(), 2);
     assert!(RECEIPT.contains("rmux-receipt/authorization"));
     assert!(RECEIPT.contains("rmux-receipt/envelope"));
     assert!(RECEIPT.contains("actions/runs/$RMUX_AUTHORIZATION_RUN_ID"));

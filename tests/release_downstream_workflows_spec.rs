@@ -174,7 +174,7 @@ fn exact_receipt_ids_digests_origin_and_documents_are_bound() {
         2
     );
     assert!(!prepare.contains("pattern:"));
-    assert!(!prepare.contains("merge-multiple:"));
+    assert_eq!(prepare.matches("merge-multiple: true").count(), 2);
     assert!(prepare.contains("receipt predicate acquired downstream authority"));
     assert!(prepare.contains("receipt envelope acquired downstream authority"));
     assert!(prepare.contains("receipt artifact contains a symlink"));

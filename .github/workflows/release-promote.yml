@@ -112,6 +112,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.candidate_manifest_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-promotion/evidence
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -121,6 +122,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.signed_tag_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-promotion/tag
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -368,6 +370,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ needs.verify-candidate.outputs.bundle_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-authorization/verified
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -377,6 +380,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ needs.policy-audit.outputs.policy_audit_reference_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-authorization/policy
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
