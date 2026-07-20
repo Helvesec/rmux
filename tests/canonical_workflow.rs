@@ -20,6 +20,7 @@ const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const NONBLOCKING_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
 const CHURN_ITERATIONS: usize = 8;
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const LAST_SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(7);
 
 #[test]
 fn workflow_fixture_is_separately_verified() {
@@ -148,6 +149,10 @@ fn canonical_session_workflow_runs_end_to_end() -> Result<(), Box<dyn Error>> {
                 attach.assert_restored()?;
                 wait_for_path(&hook_path, ATTACH_TIMEOUT)?;
             }
+            "kill-session" => {
+                assert_success(&harness.run(step.argv)?);
+                wait_for_path_absent(harness.socket_path(), LAST_SESSION_SHUTDOWN_TIMEOUT)?;
+            }
             "has-session-after-kill" => {
                 let output = harness.run(step.argv)?;
                 assert_absent_session(&output);
@@ -263,6 +268,19 @@ fn run_success_with_transient_retry(
     assert!(stdout(output).is_empty(), "stdout should be empty");
     assert!(stderr(output).is_empty(), "stderr should be empty");
     Ok(())
+}
+
+fn wait_for_path_absent(path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !path.try_exists()? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for '{}' to disappear", path.display()).into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn assert_absent_session(output: &Output) {
