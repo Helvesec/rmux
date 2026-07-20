@@ -338,6 +338,19 @@ def _validate_repositories(release: Path) -> None:
             not in record.get("blockers", [])
         ):
             raise ValueError(f"private Free-plan blocker disappeared: {key}")
+    for key in ("homebrew-rmux", "rmux-web-share", "scoop-rmux"):
+        record = records[key]
+        blockers = set(record.get("blockers", []))
+        if (
+            record.get("protection_api_supported") is not True
+            or record.get("branch_protected") is not True
+            or record.get("ruleset_count") != 1
+            or record.get("environment_count") != 1
+            or "repository_protection_missing" in blockers
+            or "environment_admin_bypass_enabled" not in blockers
+            or "downstream_writer_app_missing" not in blockers
+        ):
+            raise ValueError(f"public downstream protection snapshot drifted: {key}")
     web_blockers = set(records["rmux-web-share"].get("blockers", []))
     if (
         not {

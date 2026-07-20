@@ -2,7 +2,7 @@
   "schema_version": 1,
   "status": "review-only-disarmed",
   "description": "Observed downstream repository identities and fail-closed activation blockers. This file grants no write authority.",
-  "observed_at": "2026-07-19T00:00:00Z",
+  "observed_at": "2026-07-20T21:47:46Z",
   "writer_app": {
     "configured": false,
     "app_id": null,
@@ -55,12 +55,12 @@
       "environment": "release-homebrew-tap",
       "archived": false,
       "protection_api_supported": true,
-      "branch_protected": false,
-      "ruleset_count": 0,
-      "environment_count": 0,
+      "branch_protected": true,
+      "ruleset_count": 1,
+      "environment_count": 1,
       "activation_ready": false,
       "blockers": [
-        "repository_protection_missing",
+        "environment_admin_bypass_enabled",
         "downstream_writer_app_missing"
       ]
     },
@@ -95,12 +95,12 @@
       "environment": "release-web-share",
       "archived": false,
       "protection_api_supported": true,
-      "branch_protected": false,
-      "ruleset_count": 0,
-      "environment_count": 0,
+      "branch_protected": true,
+      "ruleset_count": 1,
+      "environment_count": 1,
       "activation_ready": false,
       "blockers": [
-        "repository_protection_missing",
+        "environment_admin_bypass_enabled",
         "downstream_writer_app_missing",
         "floating_actions_present",
         "unprotected_secret_deployment_workflow"
@@ -137,12 +137,12 @@
       "environment": "release-scoop",
       "archived": false,
       "protection_api_supported": true,
-      "branch_protected": false,
-      "ruleset_count": 0,
-      "environment_count": 0,
+      "branch_protected": true,
+      "ruleset_count": 1,
+      "environment_count": 1,
       "activation_ready": false,
       "blockers": [
-        "repository_protection_missing",
+        "environment_admin_bypass_enabled",
         "downstream_writer_app_missing"
       ]
     },

@@ -203,7 +203,7 @@
       ],
       "retryable": true,
       "blockers": [
-        "repository_protection_missing",
+        "environment_admin_bypass_enabled",
         "downstream_writer_app_missing"
       ]
     },
@@ -238,7 +238,7 @@
       ],
       "retryable": true,
       "blockers": [
-        "repository_protection_missing",
+        "environment_admin_bypass_enabled",
         "downstream_writer_app_missing"
       ]
     },
@@ -285,7 +285,7 @@
       ],
       "retryable": true,
       "blockers": [
-        "repository_protection_missing",
+        "environment_admin_bypass_enabled",
         "downstream_writer_app_missing",
         "floating_actions_present",
         "unprotected_secret_deployment_workflow"

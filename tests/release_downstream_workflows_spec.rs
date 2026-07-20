@@ -309,7 +309,7 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
     assert_eq!(
         web_share["blockers"],
         serde_json::json!([
-            "repository_protection_missing",
+            "environment_admin_bypass_enabled",
             "downstream_writer_app_missing",
             "floating_actions_present",
             "unprotected_secret_deployment_workflow"
@@ -382,6 +382,45 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
     assert_eq!(DOWNSTREAM.matches("channel-summary.py create").count(), 0);
     for writer in [linux, chocolatey, rmux_io] {
         assert!(writer.contains("assert-release-capability.py downstream_channels"));
+    }
+}
+
+#[test]
+fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
+    let registry: serde_json::Value = serde_json::from_str(include_str!(
+        "../.github/release/downstream-repositories.json"
+    ))
+    .expect("downstream repository registry");
+    let repositories = registry["repositories"].as_array().expect("repositories");
+
+    for key in ["homebrew-rmux", "rmux-web-share", "scoop-rmux"] {
+        let repository = repositories
+            .iter()
+            .find(|repository| repository["key"] == key)
+            .unwrap_or_else(|| panic!("missing downstream repository {key}"));
+        assert_eq!(repository["branch_protected"], true, "{key}");
+        assert_eq!(repository["ruleset_count"], 1, "{key}");
+        assert_eq!(repository["environment_count"], 1, "{key}");
+        assert_eq!(repository["activation_ready"], false, "{key}");
+        let blockers = repository["blockers"].as_array().expect("blockers");
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker == "environment_admin_bypass_enabled"),
+            "{key} lost its environment bypass blocker"
+        );
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker == "downstream_writer_app_missing"),
+            "{key} lost its writer App blocker"
+        );
+        assert!(
+            blockers
+                .iter()
+                .all(|blocker| blocker != "repository_protection_missing"),
+            "{key} still reports missing repository protection"
+        );
     }
 }
 
