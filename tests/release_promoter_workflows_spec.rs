@@ -4,6 +4,9 @@ use std::path::PathBuf;
 const TAG: &str = include_str!("../.github/workflows/release-tag-authoring.yml");
 const PROMOTE: &str = include_str!("../.github/workflows/release-promote.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
+const SIMULATION: &str = include_str!("../.github/workflows/release-promotion-simulation.yml");
+const SCHEMA_VALIDATOR_REQUIREMENTS: &str =
+    include_str!("../.github/release/schema-validator-requirements.txt");
 const PUBLICATION_INPUTS: &str =
     include_str!("../.github/actions/release-publication-inputs/action.yml");
 const CANDIDATE_STAGING: &str = include_str!("../scripts/release/stage-candidate-release.py");
@@ -279,4 +282,41 @@ fn only_promoter_and_nonpublishing_simulation_call_policy_audit() {
     );
     let audit = job(PROMOTE, "policy-audit", Some("authorize-promotion"));
     assert!(audit.contains("if: ${{ false }}"));
+}
+
+#[test]
+fn promotion_simulation_pins_a_draft_2020_schema_validator() {
+    let verify = job(SIMULATION, "verify-simulation", None);
+    assert!(verify.contains("sys.version_info.minor"));
+    assert!(verify.contains(")')\" = 3.10"));
+    assert!(verify.contains("python3 -m venv \"$validator\""));
+    assert!(verify.contains("--no-deps"));
+    assert!(verify.contains("--only-binary=:all:"));
+    assert!(verify.contains("--require-hashes"));
+    assert!(verify.contains("schema-validator-requirements.txt"));
+    assert!(verify.contains("Draft202012Validator"));
+    assert!(verify.contains(">> \"$GITHUB_PATH\""));
+
+    let requirements = SCHEMA_VALIDATOR_REQUIREMENTS
+        .lines()
+        .map(|line| {
+            let (requirement, hash) = line
+                .split_once(" --hash=sha256:")
+                .expect("requirement hash");
+            assert_eq!(hash.len(), 64);
+            assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            requirement
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        requirements,
+        [
+            "attrs==26.1.0",
+            "jsonschema==4.26.0",
+            "jsonschema-specifications==2025.9.1",
+            "referencing==0.37.0",
+            "rpds-py==0.30.0",
+            "typing-extensions==4.16.0",
+        ]
+    );
 }

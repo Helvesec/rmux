@@ -325,6 +325,7 @@
     ".github/release/policy-audit-contract.json",
     ".github/release/release-activation.json",
     ".github/release/release-signers.json",
+    ".github/release/schema-validator-requirements.txt",
     ".github/release/schemas/candidate-manifest.schema.json",
     ".github/release/schemas/canonical-artifact-binding.schema.json",
     ".github/release/schemas/canonical-build-record.schema.json",
