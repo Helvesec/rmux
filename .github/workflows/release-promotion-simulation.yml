@@ -159,6 +159,27 @@ jobs:
           ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
+      - name: Install pinned Draft 2020-12 schema validator
+        shell: bash
+        run: |
+          set -euo pipefail
+          validator="$RUNNER_TEMP/rmux-jsonschema"
+          test "$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = 3.10
+          python3 -m venv "$validator"
+          "$validator/bin/python" -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            --only-binary=:all: \
+            --require-hashes \
+            --requirement .github/release/schema-validator-requirements.txt
+          "$validator/bin/python" - <<'PY'
+          import jsonschema
+
+          if not hasattr(jsonschema, "Draft202012Validator"):
+              raise SystemExit("jsonschema lacks Draft 2020-12 support")
+          PY
+          printf '%s\n' "$validator/bin" >> "$GITHUB_PATH"
+
       - name: Verify disarmed policy and exact audit reference artifact
         env:
           GH_TOKEN: ${{ github.token }}
