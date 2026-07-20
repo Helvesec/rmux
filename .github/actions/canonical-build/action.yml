@@ -118,6 +118,37 @@ runs:
         toolchain: "1.96.1"
         targets: ${{ inputs.target-triple }}
 
+    - name: Resolve the exact workspace version
+      shell: bash
+      env:
+        RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned-release-ref }}
+      run: |
+        set -euo pipefail
+        metadata="$RUNNER_TEMP/rmux-canonical-cargo-metadata.json"
+        cargo metadata --locked --no-deps --format-version 1 > "$metadata"
+        version="$(python3 - "$metadata" "$GITHUB_WORKSPACE/Cargo.toml" <<'PY'
+        import json
+        import pathlib
+        import sys
+
+        metadata = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+        root_manifest = pathlib.Path(sys.argv[2]).resolve()
+        versions = [
+            package["version"]
+            for package in metadata["packages"]
+            if pathlib.Path(package["manifest_path"]).resolve() == root_manifest
+        ]
+        if len(versions) != 1:
+            raise SystemExit("cargo metadata did not identify one root package")
+        print(versions[0])
+        PY
+        )"
+        [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+        planned_version="${RMUX_PLANNED_RELEASE_REF#v}"
+        planned_version="${planned_version%%-rc.*}"
+        test "$planned_version" = "$version"
+        echo "RMUX_PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+
     - name: Capture toolchain and fetch locked dependencies
       shell: bash
       run: |
@@ -184,7 +215,7 @@ runs:
         set -euo pipefail
         test -f "$RMUX_SNAP_PACKAGE"
         test ! -L "$RMUX_SNAP_PACKAGE"
-        version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+        version="$RMUX_PACKAGE_VERSION"
         case "$RMUX_PLATFORM_KEY" in
           linux-x86_64) snap_arch=amd64 ;;
           linux-aarch64) snap_arch=arm64 ;;
@@ -199,7 +230,7 @@ runs:
         RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
       run: |
         set -euo pipefail
-        version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+        version="$RMUX_PACKAGE_VERSION"
         tools="$RUNNER_TEMP/rmux-canonical-tools"
         wasm_target="$RUNNER_TEMP/rmux-canonical-wasm-target"
         crate_target="$RUNNER_TEMP/rmux-canonical-crate-target"
@@ -235,7 +266,7 @@ runs:
         RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned-release-ref }}
       run: |
         set -euo pipefail
-        version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+        version="$RMUX_PACKAGE_VERSION"
         package_root="$RUNNER_TEMP/rmux-canonical-chocolatey"
         test ! -e "$package_root"
         scripts/generate-chocolatey-package.sh \

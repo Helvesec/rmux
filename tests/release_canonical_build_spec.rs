@@ -189,6 +189,26 @@ fn canonical_producers_are_object_cold_and_non_publishing() {
     assert_eq!(smoke.matches("required: true").count(), 13);
 }
 
+#[test]
+fn canonical_version_resolution_is_structured_and_python_310_compatible() {
+    let build = include_str!("../.github/actions/canonical-build/action.yml");
+
+    assert_eq!(
+        build
+            .matches("cargo metadata --locked --no-deps --format-version 1")
+            .count(),
+        1
+    );
+    assert!(build.contains("RMUX_PACKAGE_VERSION=$version"));
+    assert_eq!(
+        build.matches("version=\"$RMUX_PACKAGE_VERSION\"").count(),
+        3
+    );
+    assert!(build.contains("package[\"manifest_path\"]"));
+    assert!(build.contains("planned_version=\"${planned_version%%-rc.*}\""));
+    assert!(!build.contains("tomllib"));
+}
+
 #[cfg(unix)]
 #[test]
 fn canonical_checksums_reject_a_symbolic_manifest() {
