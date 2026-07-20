@@ -21,6 +21,9 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
     .expect("parse policy audit contract");
 
     assert!(workflow.contains("on:\n  workflow_call:"));
+    assert!(workflow.contains(
+        "    secrets:\n      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:\n        required: false\n"
+    ));
     assert_eq!(
         workflow
             .matches("\n    if: ${{ inputs.simulation }}")

@@ -244,6 +244,12 @@ def validate_repository_contracts(root: Path) -> None:
             raise ValueError(f"policy audit gained public trigger {trigger.strip()}")
     if workflow.count("\n    if: ${{ inputs.simulation }}") != 1:
         raise ValueError("privileged policy audit must be simulation-only before PR8")
+    if (
+        "    secrets:\n"
+        "      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:\n"
+        "        required: false\n"
+    ) not in workflow:
+        raise ValueError("policy audit App key must be declared for workflow_call")
     required_markers = (
         "assert-release-capability.py policy_audit",
         "environment: release-policy-audit",
