@@ -256,7 +256,8 @@ def validate_authorization(
             audit.get("source_git_sha") != source,
             audit.get("release_intent_id") != release.get("intent_id"),
             audit.get("policy_audit_run_attempt") != 1,
-            audit.get("workflow_path") != ".github/workflows/release-policy-audit.yml",
+            audit.get("workflow_id") != 316435346,
+            audit.get("workflow_path") != ".github/workflows/release-promote.yml",
             audit.get("release_policy_sha256")
             != predicate.get("release_policy_sha256"),
         )

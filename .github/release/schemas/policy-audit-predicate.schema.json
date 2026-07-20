@@ -56,7 +56,7 @@
         "run_id": {"type": "integer", "minimum": 1},
         "run_attempt": {"const": 1},
         "workflow_id": {"type": "integer", "minimum": 1},
-        "workflow_path": {"const": ".github/workflows/release-policy-audit.yml"},
+        "workflow_path": {"enum": [".github/workflows/release-promote.yml", ".github/workflows/release-promotion-simulation.yml"]},
         "app_id": {"type": "integer", "minimum": 1},
         "installation_id": {"type": "integer", "minimum": 1},
         "app_slug": {"type": "string", "pattern": "^[a-z0-9-]+$"},

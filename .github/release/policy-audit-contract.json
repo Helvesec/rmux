@@ -18,11 +18,17 @@
     "only_trigger": "workflow_call",
     "caller_count": 2,
     "required_run_attempt": 1,
+    "preparer_job": "prepare-policy-audit",
+    "privileged_action": ".github/actions/release-policy-audit/action.yml",
     "privileged_job": "policy-audit",
-    "privileged_job_condition": "inputs.simulation",
+    "privileged_job_condition": "disabled-in-promoter",
     "environment": "release-policy-audit",
     "runner_image": "ubuntu-22.04",
-    "workflow_id": 316425885
+    "workflow_id": 316425885,
+    "audit_workflows": [
+      {"id": 316435346, "path": ".github/workflows/release-promote.yml"},
+      {"id": 316591947, "path": ".github/workflows/release-promotion-simulation.yml"}
+    ]
   },
   "candidate_binding": {
     "candidate_run_attempt": 1,
@@ -68,7 +74,9 @@
     {"key": "branch_protection", "path": "/repos/Helvesec/rmux/branches/main/protection"},
     {"key": "immutable_releases", "path": "/repos/Helvesec/rmux/immutable-releases"},
     {"key": "installation_repositories", "path": "/installation/repositories?per_page=100&page=1"},
-    {"key": "policy_workflow", "path": "/repos/Helvesec/rmux/actions/workflows/release-policy-audit.yml"},
+    {"key": "policy_preparer_workflow", "path": "/repos/Helvesec/rmux/actions/workflows/release-policy-audit.yml"},
+    {"key": "policy_promoter_workflow", "path": "/repos/Helvesec/rmux/actions/workflows/release-promote.yml"},
+    {"key": "policy_simulation_workflow", "path": "/repos/Helvesec/rmux/actions/workflows/release-promotion-simulation.yml"},
     {"key": "release_environment", "path": "/repos/Helvesec/rmux/environments/release"},
     {"key": "release_policy_audit", "path": "/repos/Helvesec/rmux/environments/release-policy-audit"},
     {"key": "release_publication", "path": "/repos/Helvesec/rmux/environments/release-publication"},
@@ -178,6 +186,21 @@
     "immutable_releases": {
       "enabled": true,
       "enforced_by_owner": true
+    },
+    "policy_preparer_workflow": {
+      "id": 316425885,
+      "path": ".github/workflows/release-policy-audit.yml",
+      "state": "active"
+    },
+    "policy_promoter_workflow": {
+      "id": 316435346,
+      "path": ".github/workflows/release-promote.yml",
+      "state": "active"
+    },
+    "policy_simulation_workflow": {
+      "id": 316591947,
+      "path": ".github/workflows/release-promotion-simulation.yml",
+      "state": "active"
     },
     "self_hosted_runners": {
       "total_count": 0

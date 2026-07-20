@@ -4,6 +4,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../.github/actions/canonical-smoke/action.yml"),
     ),
     (
+        ".github/actions/release-policy-audit/action.yml",
+        include_str!("../.github/actions/release-policy-audit/action.yml"),
+    ),
+    (
         ".github/actions/release-publication-inputs/action.yml",
         include_str!("../.github/actions/release-publication-inputs/action.yml"),
     ),

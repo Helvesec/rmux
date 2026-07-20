@@ -32,3 +32,14 @@ def normalize_environment(value: dict[str, Any], label: str) -> dict[str, Any]:
         "reviewer_id": actor.get("id"),
         "reviewer_login": actor.get("login"),
     }
+
+
+def normalize_workflow(value: dict[str, Any], label: str) -> dict[str, Any]:
+    workflow_id = value.get("id")
+    if type(workflow_id) is not int or workflow_id <= 0:
+        raise ValueError(f"{label} ID must be a positive integer")
+    return {
+        "id": workflow_id,
+        "path": value.get("path"),
+        "state": value.get("state"),
+    }

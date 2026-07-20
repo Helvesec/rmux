@@ -10,7 +10,19 @@ from typing import Any
 
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
-WORKFLOW_PATH = ".github/workflows/release-policy-audit.yml"
+PREPARER_WORKFLOW_PATH = ".github/workflows/release-policy-audit.yml"
+PRIVILEGED_ACTION_PATH = ".github/actions/release-policy-audit/action.yml"
+AUDIT_WORKFLOWS = (
+    {"id": 316435346, "path": ".github/workflows/release-promote.yml"},
+    {
+        "id": 316591947,
+        "path": ".github/workflows/release-promotion-simulation.yml",
+    },
+)
+AUDIT_WORKFLOW_STATE_KEYS = {
+    ".github/workflows/release-promote.yml": "policy_promoter_workflow",
+    ".github/workflows/release-promotion-simulation.yml": "policy_simulation_workflow",
+}
 GITHUB_ACTIONS_APP_ID = 15368
 REQUIRED_CHECK_CONTEXTS = (
     "Cross-target Windows build check",
@@ -38,8 +50,16 @@ API_GETS = (
         "/installation/repositories?per_page=100&page=1",
     ),
     (
-        "policy_workflow",
+        "policy_preparer_workflow",
         "/repos/Helvesec/rmux/actions/workflows/release-policy-audit.yml",
+    ),
+    (
+        "policy_promoter_workflow",
+        "/repos/Helvesec/rmux/actions/workflows/release-promote.yml",
+    ),
+    (
+        "policy_simulation_workflow",
+        "/repos/Helvesec/rmux/actions/workflows/release-promotion-simulation.yml",
     ),
     ("release_environment", "/repos/Helvesec/rmux/environments/release"),
     (
@@ -136,21 +156,21 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
         raise ValueError("policy audit activation binding changed")
     workflow = value.get("workflow")
     expected_workflow = {
-        "path": WORKFLOW_PATH,
+        "path": PREPARER_WORKFLOW_PATH,
         "only_trigger": "workflow_call",
         "caller_count": 2,
         "required_run_attempt": 1,
+        "preparer_job": "prepare-policy-audit",
+        "privileged_action": PRIVILEGED_ACTION_PATH,
         "privileged_job": "policy-audit",
-        "privileged_job_condition": "inputs.simulation",
+        "privileged_job_condition": "disabled-in-promoter",
         "environment": "release-policy-audit",
         "runner_image": "ubuntu-22.04",
+        "workflow_id": 316425885,
+        "audit_workflows": list(AUDIT_WORKFLOWS),
     }
-    if not isinstance(workflow, dict) or any(
-        workflow.get(key) != expected for key, expected in expected_workflow.items()
-    ):
+    if workflow != expected_workflow:
         raise ValueError("policy audit workflow call boundary changed")
-    if workflow.get("workflow_id") is not None:
-        _positive(workflow["workflow_id"], "policy workflow ID")
     app = value.get("audit_app")
     if not isinstance(app, dict) or app.get("pat_fallback") is not False:
         raise ValueError("policy audit must never fall back to a PAT")
@@ -198,6 +218,28 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
     ]
     if not isinstance(main, dict) or main.get("required_checks") != expected_checks:
         raise ValueError("required checks lost their exact GitHub Actions binding")
+    expected_workflow_states = {
+        "policy_preparer_workflow": {
+            "id": 316425885,
+            "path": PREPARER_WORKFLOW_PATH,
+            "state": "active",
+        },
+        "policy_promoter_workflow": {
+            "id": 316435346,
+            "path": ".github/workflows/release-promote.yml",
+            "state": "active",
+        },
+        "policy_simulation_workflow": {
+            "id": 316591947,
+            "path": ".github/workflows/release-promotion-simulation.yml",
+            "state": "active",
+        },
+    }
+    if any(
+        expected_state.get(key) != expected
+        for key, expected in expected_workflow_states.items()
+    ):
+        raise ValueError("policy audit workflow identities changed")
     proof = value.get("proof")
     if not isinstance(proof, dict) or proof.get("freshness_seconds") != 900:
         raise ValueError("policy audit proof must expire after fifteen minutes")
@@ -205,6 +247,14 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
         raise ValueError("policy audit proof cannot authorize publication")
     if value.get("external_blockers") != []:
         raise ValueError("policy audit external blockers changed")
+
+
+def _job_block(workflow: str, name: str, next_name: str) -> str:
+    marker = f"\n  {name}:\n"
+    next_marker = f"\n  {next_name}:\n"
+    if workflow.count(marker) != 1 or workflow.count(next_marker) != 1:
+        raise ValueError(f"workflow job boundary changed for {name}")
+    return workflow.split(marker, 1)[1].split(next_marker, 1)[0]
 
 
 def validate_repository_contracts(root: Path) -> None:
@@ -221,14 +271,15 @@ def validate_repository_contracts(root: Path) -> None:
         "capability_enabled": False,
         "contract": ".github/release/policy-audit-contract.json",
         "audit_app_configured": True,
-        "workflow": WORKFLOW_PATH,
-        "workflow_callers": 2,
-        "privileged_job_condition": "inputs.simulation",
+        "preparer_workflow": PREPARER_WORKFLOW_PATH,
+        "preparer_callers": 2,
+        "privileged_action": PRIVILEGED_ACTION_PATH,
+        "privileged_job_condition": "disabled-in-promoter",
         "pat_fallback": False,
         "authorizes_publication": False,
     }:
         raise ValueError("candidate workflow policy audit binding changed")
-    workflow_path = root / WORKFLOW_PATH
+    workflow_path = root / PREPARER_WORKFLOW_PATH
     workflow = workflow_path.read_text(encoding="utf-8")
     if "on:\n  workflow_call:" not in workflow:
         raise ValueError("policy audit must remain workflow_call-only")
@@ -242,33 +293,18 @@ def validate_repository_contracts(root: Path) -> None:
     ):
         if trigger in workflow:
             raise ValueError(f"policy audit gained public trigger {trigger.strip()}")
-    if workflow.count("\n    if: ${{ inputs.simulation }}") != 1:
-        raise ValueError("privileged policy audit must be simulation-only before PR8")
-    if (
-        "    secrets:\n"
-        "      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:\n"
-        "        required: true\n"
-    ) not in workflow:
-        raise ValueError("policy audit App key must be declared for workflow_call")
     required_markers = (
         "assert-release-capability.py policy_audit",
-        "environment: release-policy-audit",
-        "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
-        "permission-administration: write",
-        "permission-actions: read",
-        "permission-metadata: read",
-        "RMUX_POLICY_AUDIT_APP_PRIVATE_KEY",
         "scripts/release/policy-root.py",
         "--expected-workflow-id 316223904",
-        "--audit-app-id",
-        "--audit-installation-id",
-        "--audit-app-slug",
-        "--predicate-artifact-id",
-        "--predicate-artifact-digest",
+        "Upload the unprivileged exact policy bundle",
     )
     if any(marker not in workflow for marker in required_markers):
-        raise ValueError("policy audit workflow lost a disarm or identity binding")
+        raise ValueError("policy audit preparer lost a disarm or input binding")
     for authority in (
+        "environment:",
+        "RMUX_POLICY_AUDIT_APP_PRIVATE_KEY",
+        "actions/create-github-app-token@",
         "contents: write",
         "id-token: write",
         "packages: write",
@@ -276,7 +312,7 @@ def validate_repository_contracts(root: Path) -> None:
         "PAT_TOKEN",
     ):
         if authority in workflow:
-            raise ValueError(f"policy audit gained forbidden authority {authority}")
+            raise ValueError(f"policy audit preparer gained forbidden authority {authority}")
     caller_paths: list[str] = []
     for candidate in sorted((root / ".github" / "workflows").glob("*.y*ml")):
         if candidate == workflow_path:
@@ -287,31 +323,79 @@ def validate_repository_contracts(root: Path) -> None:
         caller_paths.extend([candidate.name] * count)
     if caller_paths != ["release-promote.yml", "release-promotion-simulation.yml"]:
         raise ValueError("policy audit callers differ from the exact allowlist")
-    secret_forwarding = (
-        "    secrets:\n"
-        "      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY: ${{ github.token }}\n"
+    action_path = root / PRIVILEGED_ACTION_PATH
+    action = action_path.read_text(encoding="utf-8")
+    action_markers = (
+        "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
+        "private-key: ${{ inputs.audit-app-private-key }}",
+        "permission-actions: read",
+        "permission-administration: write",
+        "permission-metadata: read",
+        "--audit-workflow-id",
+        "--audit-workflow-path",
+        "scripts/release/policy-audit.py collect",
+        "--predicate-artifact-id",
+        "--predicate-artifact-digest",
     )
-    for caller_name in caller_paths:
-        caller = (root / ".github" / "workflows" / caller_name).read_text(
-            encoding="utf-8"
-        )
-        if caller.count(secret_forwarding) != 1 or "secrets: inherit" in caller:
-            raise ValueError(f"policy audit secret forwarding changed in {caller_name}")
+    if any(marker not in action for marker in action_markers):
+        raise ValueError("privileged policy audit action lost an identity binding")
+    for authority in (
+        "contents: write",
+        "id-token: write",
+        "packages: write",
+        "attestations: write",
+        "PAT_TOKEN",
+    ):
+        if authority in action:
+            raise ValueError(f"privileged policy audit action gained {authority}")
     promote = (root / ".github/workflows/release-promote.yml").read_text(
         encoding="utf-8"
     )
-    audit_block = promote.split("\n  policy-audit:\n", 1)[-1].split(
-        "\n  authorize-promotion:\n", 1
-    )[0]
-    if "if: ${{ false }}" not in audit_block:
-        raise ValueError("release promoter policy audit caller must remain disabled")
     simulation = (root / ".github/workflows/release-promotion-simulation.yml").read_text(
         encoding="utf-8"
     )
+    promote_prepare = _job_block(promote, "prepare-policy-audit", "policy-audit")
+    promote_audit = _job_block(promote, "policy-audit", "authorize-promotion")
+    simulation_prepare = _job_block(simulation, "prepare-policy-audit", "policy-audit")
+    simulation_audit = _job_block(simulation, "policy-audit", "verify-simulation")
+    caller_contracts = (
+        (
+            "release-promote.yml",
+            promote_prepare,
+            promote_audit,
+            316435346,
+            ".github/workflows/release-promote.yml",
+        ),
+        (
+            "release-promotion-simulation.yml",
+            simulation_prepare,
+            simulation_audit,
+            316591947,
+            ".github/workflows/release-promotion-simulation.yml",
+        ),
+    )
+    for caller_name, prepare, audit, workflow_id, caller_path in caller_contracts:
+        if prepare.count("uses: ./.github/workflows/release-policy-audit.yml") != 1:
+            raise ValueError(f"policy preparer call changed in {caller_name}")
+        required_audit = (
+            "environment: release-policy-audit",
+            "runs-on: ubuntu-22.04",
+            "uses: ./.github/actions/release-policy-audit",
+            "audit-app-id: ${{ vars.RMUX_POLICY_AUDIT_APP_ID }}",
+            "audit-app-private-key: ${{ secrets.RMUX_POLICY_AUDIT_APP_PRIVATE_KEY }}",
+            f"audit-workflow-id: {workflow_id}",
+            f"audit-workflow-path: {caller_path}",
+        )
+        if any(marker not in audit for marker in required_audit):
+            raise ValueError(f"privileged audit boundary changed in {caller_name}")
+        if "secrets: inherit" in prepare or "secrets: inherit" in audit:
+            raise ValueError(f"policy audit secret inheritance appeared in {caller_name}")
+    if "if: ${{ false }}" not in promote_prepare or "if: ${{ false }}" not in promote_audit:
+        raise ValueError("release promoter policy audit must remain disabled")
     if (
         "on:\n  workflow_dispatch:" not in simulation
         or "\n  workflow_call:" in simulation
-        or "simulation: true" not in simulation
+        or "simulation: true" not in simulation_prepare
         or "permissions: {}" not in simulation
     ):
         raise ValueError("release promotion simulation entrypoint changed")

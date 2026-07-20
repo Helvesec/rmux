@@ -302,14 +302,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
-
-  policy-audit:
-    name: Disabled exact live policy audit
+  prepare-policy-audit:
+    name: Disabled exact policy audit preparation
     needs: verify-candidate
     if: ${{ false }}
     uses: ./.github/workflows/release-policy-audit.yml
-    secrets:
-      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY: ${{ github.token }}
     with:
       candidate_run_id: ${{ inputs.candidate_run_id }}
       candidate_manifest_run_id: ${{ inputs.candidate_manifest_run_id }}
@@ -324,7 +321,47 @@ jobs:
       release_kind: ${{ inputs.release_kind }}
       release_policy_sha256: ${{ inputs.release_policy_sha256 }}
       release_policy_contract_blob_oid: ${{ inputs.release_policy_contract_blob_oid }}
-
+  policy-audit:
+    name: Disabled exact live policy audit
+    needs: prepare-policy-audit
+    if: ${{ false }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    environment: release-policy-audit
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      policy_audit_reference_artifact_id: ${{ steps.audit.outputs.reference-artifact-id }}
+      policy_audit_reference_artifact_digest: ${{ steps.audit.outputs.reference-artifact-digest }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/actions/release-policy-audit
+      - id: audit
+        uses: ./.github/actions/release-policy-audit
+        with:
+          bundle-artifact-id: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_id }}
+          bundle-artifact-digest: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_digest }}
+          bundle-artifact-name: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_name }}
+          candidate-run-id: ${{ inputs.candidate_run_id }}
+          candidate-manifest-run-id: ${{ inputs.candidate_manifest_run_id }}
+          candidate-manifest-artifact-id: ${{ inputs.candidate_manifest_artifact_id }}
+          candidate-manifest-artifact-digest: ${{ inputs.candidate_manifest_artifact_digest }}
+          candidate-manifest-sha256: ${{ inputs.candidate_manifest_sha256 }}
+          candidate-manifest-created-at: ${{ inputs.candidate_manifest_created_at }}
+          candidate-manifest-expires-at: ${{ inputs.candidate_manifest_expires_at }}
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          audit-workflow-id: 316435346
+          audit-workflow-path: .github/workflows/release-promote.yml
+          audit-app-id: ${{ vars.RMUX_POLICY_AUDIT_APP_ID }}
+          audit-app-private-key: ${{ secrets.RMUX_POLICY_AUDIT_APP_PRIVATE_KEY }}
+          github-token: ${{ github.token }}
   authorize-promotion:
     name: Disabled short-lived promotion authorization
     needs: [verify-candidate, policy-audit]
@@ -346,10 +383,8 @@ jobs:
         with:
           ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
-
       - name: Fail closed before OIDC authorization
         run: scripts/release/assert-release-capability.py promotion_authorization
-
       - name: Verify exact candidate and policy evidence artifact identities
         env:
           GH_TOKEN: ${{ github.token }}
@@ -367,7 +402,6 @@ jobs:
             --name "rmux-policy-audit-reference-$GITHUB_RUN_ID" \
             --expected-source-sha "${{ inputs.expected_source_sha }}" \
             --expected-digest "${{ needs.policy-audit.outputs.policy_audit_reference_artifact_digest }}" --max-attempts 1
-
       - name: Download only the exact verified candidate bundle ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:

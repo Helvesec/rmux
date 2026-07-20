@@ -10,12 +10,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from policy_audit_contract import API_GETS
-from policy_audit_live_state import normalize_environment
+from policy_audit_contract import API_GETS, AUDIT_WORKFLOW_STATE_KEYS
+from policy_audit_live_state import normalize_environment, normalize_workflow
 
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
-WORKFLOW_PATH = ".github/workflows/release-policy-audit.yml"
 PREDICATE_TYPE = "https://rmux.io/attestations/release-policy-audit/v1"
 SHA40 = re.compile(r"[0-9a-f]{40}")
 SHA64 = re.compile(r"[0-9a-f]{64}")
@@ -222,11 +221,13 @@ def normalize_state(
         "app_slug": normalized_installation["app_slug"],
     }:
         raise ValueError("audit App action identity differs from the live App")
-    workflow = responses["policy_workflow"]
-    normalized_workflow = {
-        "id": workflow.get("id"),
-        "path": workflow.get("path"),
-        "state": workflow.get("state"),
+    normalized_workflows = {
+        key: normalize_workflow(responses[key], key)
+        for key in (
+            "policy_preparer_workflow",
+            "policy_promoter_workflow",
+            "policy_simulation_workflow",
+        )
     }
     installation_repositories = responses["installation_repositories"]
     accessible = installation_repositories.get("repositories")
@@ -266,7 +267,7 @@ def normalize_state(
             "total_count": installation_repositories.get("total_count"),
             "repository_ids": accessible_ids,
         },
-        "policy_workflow": normalized_workflow,
+        **normalized_workflows,
     }
     expected = contract["expected_state"]
     for key, wanted in expected.items():
@@ -281,12 +282,6 @@ def normalize_state(
         "permissions": app["permissions"],
     }:
         raise ValueError("live audit App identity or permissions changed")
-    if (
-        normalized_workflow["path"] != WORKFLOW_PATH
-        or normalized_workflow["state"] != "active"
-    ):
-        raise ValueError("policy audit reusable workflow is not active")
-    positive_integer(normalized_workflow["id"], "policy audit workflow ID")
     return state
 
 
@@ -311,12 +306,23 @@ def build_predicate(
     policy: dict[str, str],
     audit_run_id: int,
     audit_run_attempt: int,
+    audit_workflow_id: int,
+    audit_workflow_path: str,
     observed_state: dict[str, Any],
     now: datetime,
 ) -> dict[str, Any]:
     if not contract["audit_app"]["configured"]:
         raise ValueError("policy audit App is not configured; audit remains disarmed")
-    workflow_id = observed_state["policy_workflow"]["id"]
+    positive_integer(audit_workflow_id, "policy audit workflow ID")
+    workflow_state_key = AUDIT_WORKFLOW_STATE_KEYS.get(audit_workflow_path)
+    if workflow_state_key is None:
+        raise ValueError("policy audit workflow path is not allowed")
+    if observed_state.get(workflow_state_key) != {
+        "id": audit_workflow_id,
+        "path": audit_workflow_path,
+        "state": "active",
+    }:
+        raise ValueError("policy audit workflow identity differs from live state")
     value = {
         "schema_version": 1,
         "predicate_type": PREDICATE_TYPE,
@@ -329,8 +335,8 @@ def build_predicate(
         "audit_identity": {
             "run_id": audit_run_id,
             "run_attempt": audit_run_attempt,
-            "workflow_id": workflow_id,
-            "workflow_path": WORKFLOW_PATH,
+            "workflow_id": audit_workflow_id,
+            "workflow_path": audit_workflow_path,
             "app_id": contract["audit_app"]["app_id"],
             "installation_id": contract["audit_app"]["installation_id"],
             "app_slug": contract["audit_app"]["app_slug"],
@@ -449,7 +455,7 @@ def validate_predicate(value: dict[str, Any]) -> None:
         positive_integer(identity[field], f"audit {field}")
     if (
         identity["run_attempt"] != 1
-        or identity["workflow_path"] != WORKFLOW_PATH
+        or identity["workflow_path"] not in AUDIT_WORKFLOW_STATE_KEYS
         or identity["repository_selection"] != "selected"
         or identity["permissions"]
         != {"actions": "read", "administration": "write", "metadata": "read"}
@@ -475,10 +481,7 @@ def validate_predicate_against_contract(
 ) -> None:
     validate_predicate(value)
     state = value["observed_state"]
-    expected_state_keys = set(contract["expected_state"]) | {
-        "audit_app",
-        "policy_workflow",
-    }
+    expected_state_keys = set(contract["expected_state"]) | {"audit_app"}
     if set(state) != expected_state_keys:
         raise ValueError(
             "predicate live state keys differ from the exhaustive contract"
@@ -508,10 +511,15 @@ def validate_predicate_against_contract(
         )
     ):
         raise ValueError("predicate audit identity differs from the live App")
-    workflow = state.get("policy_workflow")
+    allowed_workflows = contract["workflow"]["audit_workflows"]
+    workflow_binding = dict(id=identity["workflow_id"], path=identity["workflow_path"])
+    if workflow_binding not in allowed_workflows:
+        raise ValueError("predicate workflow identity is not allowed by the contract")
+    state_key = AUDIT_WORKFLOW_STATE_KEYS[identity["workflow_path"]]
+    workflow = state.get(state_key)
     if not isinstance(workflow, dict) or workflow != {
         "id": identity["workflow_id"],
-        "path": WORKFLOW_PATH,
+        "path": identity["workflow_path"],
         "state": "active",
     }:
         raise ValueError("predicate workflow identity differs from live state")

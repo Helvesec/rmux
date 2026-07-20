@@ -12,6 +12,7 @@ fn repo_root() -> PathBuf {
 #[test]
 fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
     let workflow = include_str!("../.github/workflows/release-policy-audit.yml");
+    let action = include_str!("../.github/actions/release-policy-audit/action.yml");
     let activation: serde_json::Value =
         serde_json::from_str(include_str!("../.github/release/release-activation.json"))
             .expect("parse activation ledger");
@@ -21,20 +22,15 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
     .expect("parse policy audit contract");
 
     assert!(workflow.contains("on:\n  workflow_call:"));
-    assert!(workflow.contains(
-        "    secrets:\n      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:\n        required: true\n"
-    ));
-    assert_eq!(
-        workflow
-            .matches("\n    if: ${{ inputs.simulation }}")
-            .count(),
-        1
-    );
+    assert_eq!(workflow.matches("if: ${{ inputs.simulation }}").count(), 1);
     assert_eq!(workflow.matches("permissions: {}").count(), 1);
     assert!(workflow.contains("assert-release-capability.py policy_audit"));
-    assert!(workflow.contains("environment: release-policy-audit"));
-    assert!(workflow
-        .contains("actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349"));
+    assert!(!workflow.contains("environment: release-policy-audit"));
+    assert!(!workflow.contains("RMUX_POLICY_AUDIT_APP_PRIVATE_KEY"));
+    assert!(!workflow.contains("actions/create-github-app-token@"));
+    assert!(
+        action.contains("actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349")
+    );
     assert!(workflow.contains("scripts/release/policy-root.py"));
     assert!(workflow.contains("--expected-workflow-id 316223904"));
     assert!(workflow.contains("candidate manifest SHA-256 differs"));
@@ -43,8 +39,10 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
         "permission-administration: write",
         "permission-metadata: read",
     ] {
-        assert!(workflow.contains(permission), "missing {permission}");
+        assert!(action.contains(permission), "missing {permission}");
     }
+    assert!(action.contains("--audit-workflow-id"));
+    assert!(action.contains("--audit-workflow-path"));
     let guard = workflow
         .find("assert-release-capability.py policy_audit")
         .expect("capability guard");
@@ -69,6 +67,9 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
         );
     }
     for authority in [
+        "environment:",
+        "RMUX_POLICY_AUDIT_APP_PRIVATE_KEY",
+        "actions/create-github-app-token@",
         "contents: write",
         "id-token: write",
         "attestations: write",
@@ -93,7 +94,7 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
     assert_eq!(contract["workflow"]["caller_count"], 2);
     assert_eq!(
         contract["workflow"]["privileged_job_condition"],
-        "inputs.simulation"
+        "disabled-in-promoter"
     );
     assert_eq!(contract["token_lifecycle"]["collector_methods"][0], "GET");
     let required_checks = contract["expected_state"]["main"]["required_checks"]
@@ -126,12 +127,13 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
     for caller in &callers {
         let text = fs::read_to_string(caller).expect("read policy audit caller");
         assert_eq!(
-            text.matches(
-                "    secrets:\n      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY: ${{ github.token }}\n"
-            )
-            .count(),
+            text.matches("uses: ./.github/actions/release-policy-audit")
+                .count(),
             1
         );
+        assert!(text.contains("environment: release-policy-audit"));
+        assert!(text
+            .contains("audit-app-private-key: ${{ secrets.RMUX_POLICY_AUDIT_APP_PRIVATE_KEY }}"));
         assert!(!text.contains("secrets: inherit"));
     }
     let caller = fs::read_to_string(&callers[0]).expect("read promote workflow");
@@ -244,7 +246,6 @@ contract["audit_app"].update({
     "installation_id": 9002,
     "app_slug": "rmux-policy-audit-test",
 })
-contract["workflow"]["workflow_id"] = 7001
 contract_path = root / "contract.json"
 write(contract_path, contract)
 
@@ -307,9 +308,9 @@ responses = {
     "installation_repositories": {
         "total_count": 1, "repositories": [{"id": 1239918790, "full_name": "Helvesec/rmux"}],
     },
-    "policy_workflow": {
-        "id": 7001, "path": ".github/workflows/release-policy-audit.yml", "state": "active",
-    },
+    "policy_preparer_workflow": copy.deepcopy(expected["policy_preparer_workflow"]),
+    "policy_promoter_workflow": copy.deepcopy(expected["policy_promoter_workflow"]),
+    "policy_simulation_workflow": copy.deepcopy(expected["policy_simulation_workflow"]),
 }
 for key, value in responses.items():
     write(fixture / f"{key}.json", value)
@@ -331,6 +332,8 @@ common = [
     "--candidate-manifest-expires-at", "2026-07-20T11:00:00Z",
     "--release-intent-id", "stable:policy:test", "--planned-release-ref", "v0.9.1",
     "--release-kind", "stable", "--audit-run-id", "111", "--audit-run-attempt", "1",
+    "--audit-workflow-id", "316591947",
+    "--audit-workflow-path", ".github/workflows/release-promotion-simulation.yml",
     "--audit-app-id", "9001", "--audit-installation-id", "9002",
     "--audit-app-slug", "rmux-policy-audit-test",
     "--contract", contract_path, "--policy-root", policy,
@@ -431,6 +434,8 @@ wrong_repo[wrong_repo.index("Helvesec/rmux")] = "attacker/fork"
 assert invoke(wrong_repo).returncode != 0
 
 for flag, replacement in [
+    ("--audit-workflow-id", "1"),
+    ("--audit-workflow-path", ".github/workflows/release-promote.yml"),
     ("--audit-app-id", "1"),
     ("--audit-installation-id", "2"),
     ("--audit-app-slug", "attacker-app"),
@@ -472,7 +477,9 @@ reject_response("audit_app", lambda v: v.update(id=1), "action identity differs"
 reject_response("audit_app", lambda v: v["owner"].update(login="attacker"), "owner changed")
 reject_response("audit_app", lambda v: v.update(events=["push"]), "webhook events changed")
 reject_response("installation_repositories", lambda v: v.update(total_count=2, repositories=[{"id": 1}, {"id": 1239918790}]), "audit_app_repositories differs")
-reject_response("policy_workflow", lambda v: v.update(state="disabled_manually"), "not active")
+reject_response("policy_preparer_workflow", lambda v: v.update(state="disabled_manually"), "policy_preparer_workflow differs")
+reject_response("policy_promoter_workflow", lambda v: v.update(state="disabled_manually"), "policy_promoter_workflow differs")
+reject_response("policy_simulation_workflow", lambda v: v.update(state="disabled_manually"), "policy_simulation_workflow differs")
 
 document = json.loads(predicate.read_text())
 mutated = copy.deepcopy(document)

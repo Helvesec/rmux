@@ -67,9 +67,10 @@
     "capability_enabled": false,
     "contract": ".github/release/policy-audit-contract.json",
     "audit_app_configured": true,
-    "workflow": ".github/workflows/release-policy-audit.yml",
-    "workflow_callers": 2,
-    "privileged_job_condition": "inputs.simulation",
+    "preparer_workflow": ".github/workflows/release-policy-audit.yml",
+    "preparer_callers": 2,
+    "privileged_action": ".github/actions/release-policy-audit/action.yml",
+    "privileged_job_condition": "disabled-in-promoter",
     "pat_fallback": false,
     "authorizes_publication": false
   },

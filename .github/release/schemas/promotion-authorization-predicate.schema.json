@@ -178,7 +178,7 @@
         "app_id": {"$ref": "#/$defs/positive"},
         "installation_id": {"$ref": "#/$defs/positive"},
         "workflow_id": {"$ref": "#/$defs/positive"},
-        "workflow_path": {"const": ".github/workflows/release-policy-audit.yml"},
+        "workflow_path": {"const": ".github/workflows/release-promote.yml"},
         "release_policy_sha256": {"$ref": "#/$defs/sha256"},
         "reference_sha256": {"$ref": "#/$defs/sha256"}
       }

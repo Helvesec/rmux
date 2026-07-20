@@ -24,7 +24,7 @@
     "app_id": {"type": "integer", "minimum": 1},
     "installation_id": {"type": "integer", "minimum": 1},
     "workflow_id": {"type": "integer", "minimum": 1},
-    "workflow_path": {"const": ".github/workflows/release-policy-audit.yml"},
+    "workflow_path": {"enum": [".github/workflows/release-promote.yml", ".github/workflows/release-promotion-simulation.yml"]},
     "release_policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
   }
 }

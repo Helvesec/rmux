@@ -1,10 +1,7 @@
-name: Disarmed reusable release policy audit
+name: Disarmed release policy input preparer
 
 on:
   workflow_call:
-    secrets:
-      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:
-        required: true
     inputs:
       simulation:
         required: false
@@ -50,12 +47,15 @@ on:
         required: true
         type: string
     outputs:
-      policy_audit_reference_artifact_id:
-        description: Exact nonpublishing simulation reference artifact ID
-        value: ${{ jobs.policy-audit.outputs.reference_artifact_id }}
-      policy_audit_reference_artifact_digest:
-        description: Exact nonpublishing simulation reference artifact digest
-        value: ${{ jobs.policy-audit.outputs.reference_artifact_digest }}
+      bundle_artifact_id:
+        description: Exact prepared policy bundle artifact ID
+        value: ${{ jobs.prepare-policy-audit.outputs.bundle_artifact_id }}
+      bundle_artifact_digest:
+        description: Exact prepared policy bundle artifact digest
+        value: ${{ jobs.prepare-policy-audit.outputs.bundle_artifact_digest }}
+      bundle_artifact_name:
+        description: Exact prepared policy bundle artifact name
+        value: ${{ jobs.prepare-policy-audit.outputs.bundle_artifact_name }}
 
 permissions: {}
 
@@ -247,171 +247,3 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
-
-  policy-audit:
-    name: Nonpublishing live policy audit simulation
-    needs: prepare-policy-audit
-    if: ${{ inputs.simulation }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
-    environment: release-policy-audit
-    permissions:
-      actions: read
-    outputs:
-      reference_artifact_id: ${{ steps.reference-api.outputs.artifact_id }}
-      reference_artifact_digest: ${{ steps.reference-api.outputs.artifact_digest }}
-    env:
-      RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
-      RMUX_CANDIDATE_MANIFEST_RUN_ID: ${{ inputs.candidate_manifest_run_id }}
-      RMUX_CANDIDATE_MANIFEST_ARTIFACT_ID: ${{ inputs.candidate_manifest_artifact_id }}
-      RMUX_CANDIDATE_MANIFEST_ARTIFACT_DIGEST: ${{ inputs.candidate_manifest_artifact_digest }}
-      RMUX_CANDIDATE_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
-      RMUX_CANDIDATE_MANIFEST_CREATED_AT: ${{ inputs.candidate_manifest_created_at }}
-      RMUX_CANDIDATE_MANIFEST_EXPIRES_AT: ${{ inputs.candidate_manifest_expires_at }}
-      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
-      RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
-      RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned_release_ref }}
-      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
-    steps:
-      - name: Download only the prepared policy bundle ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/rmux-policy-audit
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ github.run_id }}
-
-      - name: Verify the policy bundle API digest
-        working-directory: ${{ runner.temp }}/rmux-policy-audit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          python3 scripts/release/actions-artifact.py verify
-          --repository "$GITHUB_REPOSITORY"
-          --run-id "$GITHUB_RUN_ID"
-          --artifact-id "${{ needs.prepare-policy-audit.outputs.bundle_artifact_id }}"
-          --name "${{ needs.prepare-policy-audit.outputs.bundle_artifact_name }}"
-          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA"
-          --expected-digest "${{ needs.prepare-policy-audit.outputs.bundle_artifact_digest }}"
-          --max-attempts 1
-
-      # The pinned Action alone may POST one installation token and DELETE that
-      # same token during its post step. The RMUX collector below remains GET-only.
-      - id: audit-app
-        name: Create the repository-scoped audit App token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
-        with:
-          app-id: ${{ vars.RMUX_POLICY_AUDIT_APP_ID }}
-          private-key: ${{ secrets.RMUX_POLICY_AUDIT_APP_PRIVATE_KEY }}
-          owner: Helvesec
-          repositories: rmux
-          permission-actions: read
-          permission-administration: write
-          permission-metadata: read
-
-      - name: Collect the exact live GET-only policy state
-        working-directory: ${{ runner.temp }}/rmux-policy-audit
-        env:
-          RMUX_POLICY_AUDIT_TOKEN: ${{ steps.audit-app.outputs.token }}
-        run: >-
-          python3 scripts/release/policy-audit.py collect
-          --repository "$GITHUB_REPOSITORY"
-          --source-sha "$RMUX_EXPECTED_SOURCE_SHA"
-          --candidate-run-id "$RMUX_CANDIDATE_RUN_ID"
-          --candidate-run-attempt 1
-          --candidate-manifest-run-id "$RMUX_CANDIDATE_MANIFEST_RUN_ID"
-          --candidate-manifest-run-attempt 1
-          --candidate-manifest-artifact-id "$RMUX_CANDIDATE_MANIFEST_ARTIFACT_ID"
-          --candidate-manifest-artifact-digest "$RMUX_CANDIDATE_MANIFEST_ARTIFACT_DIGEST"
-          --candidate-manifest-sha256 "$RMUX_CANDIDATE_MANIFEST_SHA256"
-          --candidate-manifest-created-at "$RMUX_CANDIDATE_MANIFEST_CREATED_AT"
-          --candidate-manifest-expires-at "$RMUX_CANDIDATE_MANIFEST_EXPIRES_AT"
-          --release-intent-id "$RMUX_RELEASE_INTENT_ID"
-          --planned-release-ref "$RMUX_PLANNED_RELEASE_REF"
-          --release-kind "$RMUX_RELEASE_KIND"
-          --audit-run-id "$GITHUB_RUN_ID"
-          --audit-run-attempt "$GITHUB_RUN_ATTEMPT"
-          --audit-app-id "${{ vars.RMUX_POLICY_AUDIT_APP_ID }}"
-          --audit-installation-id "${{ steps.audit-app.outputs.installation-id }}"
-          --audit-app-slug "${{ steps.audit-app.outputs.app-slug }}"
-          --contract .github/release/policy-audit-contract.json
-          --policy-root .rmux-policy-audit/release-policy-root.json
-          --output policy-audit-predicate.json
-
-      - name: Verify the predicate before upload
-        working-directory: ${{ runner.temp }}/rmux-policy-audit
-        run: >-
-          python3 scripts/release/policy-audit.py verify
-          --predicate policy-audit-predicate.json
-          --contract .github/release/policy-audit-contract.json
-
-      - id: predicate-upload
-        name: Upload only the short-lived policy predicate
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: rmux-policy-audit-predicate-${{ github.run_id }}
-          path: ${{ runner.temp }}/rmux-policy-audit/policy-audit-predicate.json
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-
-      - id: predicate-api
-        name: Resolve the predicate by exact API artifact ID
-        working-directory: ${{ runner.temp }}/rmux-policy-audit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          python3 scripts/release/actions-artifact.py resolve-id
-          --repository "$GITHUB_REPOSITORY"
-          --run-id "$GITHUB_RUN_ID"
-          --artifact-id "${{ steps.predicate-upload.outputs.artifact-id }}"
-          --name "rmux-policy-audit-predicate-$GITHUB_RUN_ID"
-          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA"
-          --max-attempts 6
-          --retry-delay-seconds 2
-          --github-output "$GITHUB_OUTPUT"
-
-      - name: Create the non-circular post-upload reference
-        working-directory: ${{ runner.temp }}/rmux-policy-audit
-        run: >-
-          python3 scripts/release/policy-audit.py reference
-          --predicate policy-audit-predicate.json
-          --predicate-artifact-id "${{ steps.predicate-api.outputs.artifact_id }}"
-          --predicate-artifact-digest "${{ steps.predicate-api.outputs.artifact_digest }}"
-          --output policy-audit-reference.json
-
-      - name: Verify the predicate/reference binding
-        working-directory: ${{ runner.temp }}/rmux-policy-audit
-        run: >-
-          python3 scripts/release/policy-audit.py verify-reference
-          --predicate policy-audit-predicate.json
-          --reference policy-audit-reference.json
-          --contract .github/release/policy-audit-contract.json
-
-      - id: reference-upload
-        name: Upload the post-upload reference separately
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: rmux-policy-audit-reference-${{ github.run_id }}
-          path: ${{ runner.temp }}/rmux-policy-audit/policy-audit-reference.json
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-
-      - id: reference-api
-        name: Resolve the reference by exact API artifact ID
-        working-directory: ${{ runner.temp }}/rmux-policy-audit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: >-
-          python3 scripts/release/actions-artifact.py resolve-id
-          --repository "$GITHUB_REPOSITORY"
-          --run-id "$GITHUB_RUN_ID"
-          --artifact-id "${{ steps.reference-upload.outputs.artifact-id }}"
-          --name "rmux-policy-audit-reference-$GITHUB_RUN_ID"
-          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA"
-          --max-attempts 6
-          --retry-delay-seconds 2
-          --github-output "$GITHUB_OUTPUT"

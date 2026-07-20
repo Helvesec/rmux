@@ -55,14 +55,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  policy-audit:
-    name: Audit exact live policy without publication authority
+  prepare-policy-audit:
+    name: Prepare exact policy audit inputs
     permissions:
       actions: read
       contents: read
     uses: ./.github/workflows/release-policy-audit.yml
-    secrets:
-      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY: ${{ github.token }}
     with:
       simulation: true
       candidate_run_id: ${{ inputs.candidate_run_id }}
@@ -78,6 +76,48 @@ jobs:
       release_kind: ${{ inputs.release_kind }}
       release_policy_sha256: ${{ inputs.release_policy_sha256 }}
       release_policy_contract_blob_oid: ${{ inputs.release_policy_contract_blob_oid }}
+
+  policy-audit:
+    name: Audit exact live policy without publication authority
+    needs: prepare-policy-audit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    environment: release-policy-audit
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      policy_audit_reference_artifact_id: ${{ steps.audit.outputs.reference-artifact-id }}
+      policy_audit_reference_artifact_digest: ${{ steps.audit.outputs.reference-artifact-digest }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/actions/release-policy-audit
+
+      - id: audit
+        uses: ./.github/actions/release-policy-audit
+        with:
+          bundle-artifact-id: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_id }}
+          bundle-artifact-digest: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_digest }}
+          bundle-artifact-name: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_name }}
+          candidate-run-id: ${{ inputs.candidate_run_id }}
+          candidate-manifest-run-id: ${{ inputs.candidate_manifest_run_id }}
+          candidate-manifest-artifact-id: ${{ inputs.candidate_manifest_artifact_id }}
+          candidate-manifest-artifact-digest: ${{ inputs.candidate_manifest_artifact_digest }}
+          candidate-manifest-sha256: ${{ inputs.candidate_manifest_sha256 }}
+          candidate-manifest-created-at: ${{ inputs.candidate_manifest_created_at }}
+          candidate-manifest-expires-at: ${{ inputs.candidate_manifest_expires_at }}
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          audit-workflow-id: 316591947
+          audit-workflow-path: .github/workflows/release-promotion-simulation.yml
+          audit-app-id: ${{ vars.RMUX_POLICY_AUDIT_APP_ID }}
+          audit-app-private-key: ${{ secrets.RMUX_POLICY_AUDIT_APP_PRIVATE_KEY }}
+          github-token: ${{ github.token }}
 
   verify-simulation:
     name: Verify nonpublishing promotion and receipt contracts
@@ -165,8 +205,8 @@ jobs:
               "policy_audit_run_attempt": 1,
               "app_id": 4344532,
               "installation_id": 147749910,
-              "workflow_id": 316425885,
-              "workflow_path": ".github/workflows/release-policy-audit.yml",
+              "workflow_id": 316591947,
+              "workflow_path": ".github/workflows/release-promotion-simulation.yml",
           }
           for field, wanted in expected.items():
               if value.get(field) != wanted:
