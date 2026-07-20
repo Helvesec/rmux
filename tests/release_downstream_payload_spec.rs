@@ -36,7 +36,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, 'scripts/release')
-from downstream_payload import validate_payload_document
+from downstream_payload import collect_files, validate_payload_document
 
 SOURCE = 'a' * 40
 RELEASE = {
@@ -260,6 +260,45 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
     rejected = run_cli(['create', *value['common'], '--output', str(value['document']), '--subject-output', str(value['subject'])])
     if rejected.returncode == 0 or 'regular files' not in rejected.stderr:
         raise SystemExit(f'symlink payload was not rejected: {rejected.stderr}')
+"#
+    ));
+}
+
+#[test]
+fn payload_collection_supports_multiarch_roles_and_rejects_duplicate_names() {
+    assert_fixture(&format!(
+        "{PRELUDE}\n{}",
+        r#"
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
+    root = pathlib.Path(directory)
+    names = [
+        'rmux_0.9.0_amd64.deb',
+        'rmux_0.9.0_arm64.deb',
+        'rmux-0.9.0-1.x86_64.rpm',
+        'rmux-0.9.0-1.aarch64.rpm',
+    ]
+    for name in names:
+        (root / name).write_bytes(name.encode('ascii'))
+    files = collect_files(root, [
+        'debian=rmux_0.9.0_amd64.deb',
+        'debian=rmux_0.9.0_arm64.deb',
+        'rpm=rmux-0.9.0-1.x86_64.rpm',
+        'rpm=rmux-0.9.0-1.aarch64.rpm',
+    ])
+    if [item['name'] for item in files] != sorted(names):
+        raise SystemExit('multiarch payload files are not sorted')
+    roles = [item['role'] for item in files]
+    if roles.count('debian') != 2 or roles.count('rpm') != 2:
+        raise SystemExit('multiarch payload roles were collapsed')
+    try:
+        collect_files(root, [
+            'debian=rmux_0.9.0_amd64.deb',
+            'rpm=rmux_0.9.0_amd64.deb',
+        ])
+    except ValueError:
+        pass
+    else:
+        raise SystemExit('duplicate payload filename was accepted')
 "#
     ));
 }

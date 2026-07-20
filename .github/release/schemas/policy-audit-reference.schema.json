@@ -21,8 +21,8 @@
     "predicate_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "emitted_at": {"type": "string", "format": "date-time"},
     "expires_at": {"type": "string", "format": "date-time"},
-    "app_id": {"type": "integer", "minimum": 1},
-    "installation_id": {"type": "integer", "minimum": 1},
+    "app_id": {"const": 4344532},
+    "installation_id": {"const": 147749910},
     "workflow_id": {"type": "integer", "minimum": 1},
     "workflow_path": {"enum": [".github/workflows/release-promote.yml", ".github/workflows/release-promotion-simulation.yml"]},
     "release_policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}

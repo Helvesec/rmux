@@ -20,6 +20,10 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
         "../.github/release/policy-audit-contract.json"
     ))
     .expect("parse policy audit contract");
+    let reference_schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../.github/release/schemas/policy-audit-reference.schema.json"
+    ))
+    .expect("parse policy audit reference schema");
 
     assert!(workflow.contains("on:\n  workflow_call:"));
     assert_eq!(workflow.matches("if: ${{ inputs.simulation }}").count(), 1);
@@ -90,6 +94,11 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
     assert_eq!(contract["audit_app"]["configured"], true);
     assert_eq!(contract["audit_app"]["app_id"], 4344532);
     assert_eq!(contract["audit_app"]["installation_id"], 147749910);
+    assert_eq!(reference_schema["properties"]["app_id"]["const"], 4344532);
+    assert_eq!(
+        reference_schema["properties"]["installation_id"]["const"],
+        147749910
+    );
     assert_eq!(contract["audit_app"]["pat_fallback"], false);
     assert_eq!(contract["workflow"]["caller_count"], 2);
     assert_eq!(
@@ -240,12 +249,6 @@ def write(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 contract = copy.deepcopy(base_contract)
-contract["audit_app"].update({
-    "configured": True,
-    "app_id": 9001,
-    "installation_id": 9002,
-    "app_slug": "rmux-policy-audit-test",
-})
 contract_path = root / "contract.json"
 write(contract_path, contract)
 
@@ -301,7 +304,7 @@ responses = {
     "immutable_releases": {"enabled": True, "enforced_by_owner": True},
     "self_hosted_runners": {"total_count": 0, "runners": []},
     "audit_app": {
-        "id": 9001, "slug": "rmux-policy-audit-test",
+        "id": 4344532, "slug": "helvesec-rmux-policy-audit",
         "owner": {"login": "Helvesec"}, "events": [],
         "permissions": {"actions": "read", "administration": "write", "metadata": "read"},
     },
@@ -334,8 +337,8 @@ common = [
     "--release-kind", "stable", "--audit-run-id", "111", "--audit-run-attempt", "1",
     "--audit-workflow-id", "316591947",
     "--audit-workflow-path", ".github/workflows/release-promotion-simulation.yml",
-    "--audit-app-id", "9001", "--audit-installation-id", "9002",
-    "--audit-app-slug", "rmux-policy-audit-test",
+    "--audit-app-id", "4344532", "--audit-installation-id", "147749910",
+    "--audit-app-slug", "helvesec-rmux-policy-audit",
     "--contract", contract_path, "--policy-root", policy,
     "--api-fixture-dir", fixture, "--now", "2026-07-19T12:00:00Z", "--output", predicate,
 ]
