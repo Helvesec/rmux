@@ -214,7 +214,6 @@ runs:
           -Checksums "$assets/SHA256SUMS.txt" `
           -RunBinary `
           -RunDaemonSmoke `
-          -RunCtrlMatrixSmoke `
           -RequireReleaseArtifact `
           -ExpectedGitSha $env:RMUX_EXPECTED_GIT_SHA
 

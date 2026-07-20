@@ -117,6 +117,7 @@ fn windows_release_gate_uses_hosted_checks_and_nonempty_cargo_filters() {
     let gate = include_str!("../scripts/gate-windows-fast.ps1");
     let assert_filter = include_str!("../scripts/assert-cargo-filter-nonempty.ps1");
     let package_verify = include_str!("../scripts/verify-package-windows.ps1");
+    let canonical_smoke = include_str!("../.github/actions/canonical-smoke/action.yml");
 
     for required in [
         r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes")"#,
@@ -181,6 +182,12 @@ fn windows_release_gate_uses_hosted_checks_and_nonempty_cargo_filters() {
             && package_verify.contains("$arguments.EvidencePath =")
             && !package_verify.contains("\"-Rmux\", [System.IO.Path]::GetFullPath($Binary)"),
         "PowerShell script parameters must use named hashtable splatting"
+    );
+    assert!(
+        canonical_smoke.contains("-RunBinary")
+            && canonical_smoke.contains("-RunDaemonSmoke")
+            && !canonical_smoke.contains("-RunCtrlMatrixSmoke"),
+        "GitHub-hosted package smokes must not require an interactive Windows session"
     );
     assert!(workflow.contains("if-no-files-found: error"));
 }
