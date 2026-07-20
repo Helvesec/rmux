@@ -247,7 +247,7 @@ def validate_repository_contracts(root: Path) -> None:
     if (
         "    secrets:\n"
         "      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:\n"
-        "        required: false\n"
+        "        required: true\n"
     ) not in workflow:
         raise ValueError("policy audit App key must be declared for workflow_call")
     required_markers = (
@@ -287,6 +287,16 @@ def validate_repository_contracts(root: Path) -> None:
         caller_paths.extend([candidate.name] * count)
     if caller_paths != ["release-promote.yml", "release-promotion-simulation.yml"]:
         raise ValueError("policy audit callers differ from the exact allowlist")
+    secret_forwarding = (
+        "    secrets:\n"
+        "      RMUX_POLICY_AUDIT_APP_PRIVATE_KEY: ${{ github.token }}\n"
+    )
+    for caller_name in caller_paths:
+        caller = (root / ".github" / "workflows" / caller_name).read_text(
+            encoding="utf-8"
+        )
+        if caller.count(secret_forwarding) != 1 or "secrets: inherit" in caller:
+            raise ValueError(f"policy audit secret forwarding changed in {caller_name}")
     promote = (root / ".github/workflows/release-promote.yml").read_text(
         encoding="utf-8"
     )

@@ -4,7 +4,7 @@ on:
   workflow_call:
     secrets:
       RMUX_POLICY_AUDIT_APP_PRIVATE_KEY:
-        required: false
+        required: true
     inputs:
       simulation:
         required: false
