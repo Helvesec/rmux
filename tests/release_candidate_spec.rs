@@ -63,6 +63,26 @@ fn candidate_route_proves_fast_before_release_only_work() {
 }
 
 #[test]
+fn release_candidate_gate_runner_contract_matches_workflow() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let gate = job_block(ci, "release-candidate-gate", "linux-quality");
+    assert!(gate.contains("runs-on: ubuntu-22.04"));
+
+    let contract: serde_json::Value =
+        serde_json::from_str(include_str!("../.github/release/candidate-contract.json"))
+            .expect("parse candidate contract");
+    let jobs = &contract["runner_policy"]["jobs_by_label"];
+    let pinned = jobs["ubuntu-22.04"]
+        .as_array()
+        .expect("ubuntu-22.04 runner inventory");
+    let floating = jobs["ubuntu-latest"]
+        .as_array()
+        .expect("ubuntu-latest runner inventory");
+    assert!(pinned.iter().any(|job| job == "Release candidate gate"));
+    assert!(!floating.iter().any(|job| job == "Release candidate gate"));
+}
+
+#[test]
 fn candidate_mode_does_not_replay_fast_jobs() {
     let ci = include_str!("../.github/workflows/ci.yml");
     let fast_jobs = [
