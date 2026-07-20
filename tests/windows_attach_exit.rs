@@ -2339,38 +2339,7 @@ fn write_python_descendant_sleep_script(label: &str) -> Result<PathBuf, Box<dyn 
 }
 
 const RAW_CONSOLE_PROBE_SCRIPT: &str = r#"
-Add-Type @"
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-
-public static class RmuxRawConsoleProbe {
-    private const int STD_INPUT_HANDLE = -10;
-    private const uint ENABLE_PROCESSED_INPUT = 0x0001;
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr GetStdHandle(int nStdHandle);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
-
-    public static void DisableProcessedInput() {
-        IntPtr handle = GetStdHandle(STD_INPUT_HANDLE);
-        uint mode;
-        if (!GetConsoleMode(handle, out mode)) {
-            throw new Win32Exception(Marshal.GetLastWin32Error());
-        }
-        if (!SetConsoleMode(handle, mode & ~ENABLE_PROCESSED_INPUT)) {
-            throw new Win32Exception(Marshal.GetLastWin32Error());
-        }
-    }
-}
-"@
-
-[RmuxRawConsoleProbe]::DisableProcessedInput()
+[Console]::TreatControlCAsInput = $true
 [Console]::Out.WriteLine("RAW_READY")
 [Console]::Out.Flush()
 while ($true) {
