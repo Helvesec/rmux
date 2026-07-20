@@ -447,14 +447,14 @@ function InvokeCtrlMatrixSmoke([string]$Binary, [string]$GitSha, [string]$Eviden
     $outDir = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-package-ctrl-matrix-$PID-$([guid]::NewGuid().ToString('N'))"
     try {
         $global:LASTEXITCODE = 0
-        $arguments = @(
-            "-Rmux", [System.IO.Path]::GetFullPath($Binary),
-            "-OutDir", $outDir,
-            "-PortableSmokeOnly",
-            "-ExpectedGitSha", $GitSha
-        )
+        $arguments = @{
+            Rmux = [System.IO.Path]::GetFullPath($Binary)
+            OutDir = $outDir
+            PortableSmokeOnly = $true
+            ExpectedGitSha = $GitSha
+        }
         if (-not [string]::IsNullOrWhiteSpace($Evidence)) {
-            $arguments += @("-EvidencePath", [System.IO.Path]::GetFullPath($Evidence))
+            $arguments.EvidencePath = [System.IO.Path]::GetFullPath($Evidence)
         }
         & (Join-Path $PSScriptRoot "windows_ctrl_matrix.ps1") @arguments
         if ($LASTEXITCODE -ne 0) {

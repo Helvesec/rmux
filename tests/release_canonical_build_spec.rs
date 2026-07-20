@@ -195,6 +195,10 @@ fn canonical_smokes_consume_numeric_ids_and_exact_fast_drivers() {
         "artifact-ids: ${{ inputs.fast-nextest-artifact-id }}",
         "windows-nextest.tar.zst.sha256",
         "sha256sum --check",
+        "Install cargo-nextest for persisted Windows test drivers",
+        "uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb",
+        "tool: nextest@0.9.138",
+        "fallback: none",
         "inputs.smoke-kind == 'runtime'",
         "inputs.smoke-kind == 'sdk'",
         "inputs.smoke-kind == 'mouse'",
@@ -204,6 +208,7 @@ fn canonical_smokes_consume_numeric_ids_and_exact_fast_drivers() {
     ] {
         assert!(smoke.contains(required), "canonical smoke lost {required}");
     }
+    assert_eq!(smoke.matches("tool: nextest@0.9.138").count(), 1);
     let record_step = smoke
         .split("    - name: Verify the build record and all downloaded bytes\n")
         .nth(1)
