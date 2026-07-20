@@ -202,13 +202,18 @@ fn canonical_smokes_consume_numeric_ids_and_exact_fast_drivers() {
         "inputs.smoke-kind == 'runtime'",
         "inputs.smoke-kind == 'sdk'",
         "inputs.smoke-kind == 'mouse'",
-        "-RunCtrlMatrixSmoke",
+        "-RunBinary",
+        "-RunDaemonSmoke",
         "-RunSdkSmoke",
         "-RunMouseBorderSmoke",
     ] {
         assert!(smoke.contains(required), "canonical smoke lost {required}");
     }
     assert_eq!(smoke.matches("tool: nextest@0.9.138").count(), 1);
+    assert!(
+        !smoke.contains("-RunCtrlMatrixSmoke"),
+        "GitHub-hosted canonical smokes cannot run the interactive Ctrl matrix"
+    );
     let record_step = smoke
         .split("    - name: Verify the build record and all downloaded bytes\n")
         .nth(1)
