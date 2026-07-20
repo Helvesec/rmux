@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/downstream-channel-plan-v1.json",
+  "title": "RMUX disarmed downstream channel plan",
+  "description": "Review-only downstream plan. It MUST NOT authorize publication before PR8.",
+  "x-rmux-status": "disarmed-non-authoritative",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "downstream_authority",
+    "execution_authority",
+    "execution_enabled",
+    "repository_id",
+    "source_git_sha",
+    "release",
+    "receipt",
+    "channel_policy",
+    "snap_candidate_opt_in",
+    "created_at",
+    "channel_count",
+    "channels"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"const": "disarmed-non-authoritative"},
+    "downstream_authority": {"const": false},
+    "execution_authority": {"const": false},
+    "execution_enabled": {"const": false},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"$ref": "#/$defs/sha40"},
+    "release": {"$ref": "#/$defs/release"},
+    "receipt": {"$ref": "#/$defs/receipt"},
+    "channel_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "schema_version", "sha256"],
+      "properties": {
+        "path": {"const": ".github/release/channel-policy.json"},
+        "schema_version": {"const": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "snap_candidate_opt_in": {"type": "boolean"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "channel_count": {"const": 11},
+    "channels": {
+      "type": "array",
+      "minItems": 11,
+      "maxItems": 11,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "phase",
+          "policy_decision",
+          "explicit_opt_in",
+          "execution_decision",
+          "execution_enabled",
+          "payload_ready",
+          "payload_roles",
+          "depends_on",
+          "blockers"
+        ],
+        "properties": {
+          "name": {"$ref": "#/$defs/channel"},
+          "phase": {"type": "integer", "minimum": 1, "maximum": 3},
+          "policy_decision": {"enum": ["allow", "deny", "explicit-opt-in"]},
+          "explicit_opt_in": {"type": "boolean"},
+          "execution_decision": {"enum": ["blocked", "denied", "disarmed"]},
+          "execution_enabled": {"const": false},
+          "payload_ready": {"type": "boolean"},
+          "payload_roles": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string", "pattern": "^[a-z0-9-]+$"}
+          },
+          "depends_on": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"$ref": "#/$defs/channel"}
+          },
+          "blockers": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {"type": "string", "pattern": "^[a-z0-9_]+$"}
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "positive": {"type": "integer", "minimum": 1},
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "intent": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+    "release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+    "channel": {
+      "enum": [
+        "apt_rpm",
+        "chocolatey",
+        "crates_io",
+        "homebrew_core",
+        "homebrew_tap",
+        "rmux_io",
+        "scoop",
+        "snap_candidate",
+        "snap_stable",
+        "web_share",
+        "winget"
+      ]
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ref", "intent_id", "kind", "tag_object_sha", "immutable"],
+      "properties": {
+        "id": {"$ref": "#/$defs/positive"},
+        "ref": {"$ref": "#/$defs/release_ref"},
+        "intent_id": {"$ref": "#/$defs/intent"},
+        "kind": {"enum": ["rc", "stable"]},
+        "tag_object_sha": {"$ref": "#/$defs/sha40"},
+        "immutable": {"const": true}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "name", "archive_digest", "size_in_bytes"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/positive"},
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9._+@=-]+$"},
+        "archive_digest": {"$ref": "#/$defs/digest"},
+        "size_in_bytes": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "receipt_predicate_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {"name": {"pattern": "^rmux-publication-receipt-[0-9a-f]{40}-[1-9][0-9]*$"}}}
+      ]
+    },
+    "receipt_envelope_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {"name": {"pattern": "^rmux-publication-receipt-envelope-[0-9a-f]{40}-[1-9][0-9]*$"}}}
+      ]
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "run_attempt",
+        "workflow_id",
+        "workflow_path",
+        "predicate_bundle",
+        "predicate_sha256",
+        "envelope_bundle",
+        "envelope_sha256",
+        "attestation",
+        "verified_at"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/positive"},
+        "run_attempt": {"const": 1},
+        "workflow_id": {"$ref": "#/$defs/positive"},
+        "workflow_path": {"const": ".github/workflows/release-receipt.yml"},
+        "predicate_bundle": {"$ref": "#/$defs/receipt_predicate_artifact"},
+        "predicate_sha256": {"$ref": "#/$defs/sha256"},
+        "envelope_bundle": {"$ref": "#/$defs/receipt_envelope_artifact"},
+        "envelope_sha256": {"$ref": "#/$defs/sha256"},
+        "attestation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attestation_id", "bundle_file", "bundle_sha256"],
+          "properties": {
+            "attestation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "bundle_file": {"const": "publication-receipt.sigstore.json"},
+            "bundle_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "verified_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}
