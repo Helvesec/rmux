@@ -1,0 +1,325 @@
+name: Disarmed signed release tag authoring
+
+on:
+  workflow_call:
+    inputs:
+      candidate_run_id:
+        required: true
+        type: string
+      candidate_manifest_run_id:
+        required: true
+        type: string
+      candidate_manifest_artifact_id:
+        required: true
+        type: string
+      candidate_manifest_artifact_digest:
+        required: true
+        type: string
+      candidate_manifest_sha256:
+        required: true
+        type: string
+      expected_source_sha:
+        required: true
+        type: string
+      release_intent_id:
+        required: true
+        type: string
+      release_ref:
+        required: true
+        type: string
+      release_kind:
+        required: true
+        type: string
+      release_policy_sha256:
+        required: true
+        type: string
+    outputs:
+      signed_tag_artifact_id:
+        description: Exact signed-tag evidence artifact ID, unavailable while disarmed
+        value: ${{ jobs.create-signed-tag.outputs.artifact_id }}
+      signed_tag_artifact_digest:
+        description: Exact signed-tag evidence artifact digest, unavailable while disarmed
+        value: ${{ jobs.create-signed-tag.outputs.artifact_digest }}
+      tag_object_sha:
+        description: Exact annotated tag object SHA, unavailable while disarmed
+        value: ${{ jobs.create-signed-tag.outputs.tag_object_sha }}
+
+concurrency:
+  group: rmux-release-tag-authoring-${{ inputs.release_ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  verify-tag-inputs:
+    name: Verify exact candidate before tag approval
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      bundle_artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+      bundle_artifact_digest: sha256:${{ steps.bundle.outputs.artifact-digest }}
+      bundle_artifact_name: rmux-tag-input-${{ inputs.expected_source_sha }}
+    env:
+      RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      RMUX_MANIFEST_RUN_ID: ${{ inputs.candidate_manifest_run_id }}
+      RMUX_MANIFEST_ARTIFACT_ID: ${{ inputs.candidate_manifest_artifact_id }}
+      RMUX_MANIFEST_ARTIFACT_DIGEST: ${{ inputs.candidate_manifest_artifact_digest }}
+      RMUX_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
+      RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
+      RMUX_RELEASE_POLICY_SHA256: ${{ inputs.release_policy_sha256 }}
+    steps:
+      - name: Reject malformed tag inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RMUX_CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RMUX_MANIFEST_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RMUX_MANIFEST_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RMUX_MANIFEST_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RMUX_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_INTENT_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]
+          [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$RMUX_RELEASE_KIND" =~ ^(rc|stable)$ ]]
+          [[ "$RMUX_RELEASE_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$GITHUB_RUN_ATTEMPT" = 1
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Verify exact candidate manifest artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/release/actions-artifact.py verify
+          --repository "$GITHUB_REPOSITORY"
+          --run-id "$RMUX_MANIFEST_RUN_ID"
+          --artifact-id "$RMUX_MANIFEST_ARTIFACT_ID"
+          --name "rmux-candidate-manifest-$RMUX_CANDIDATE_RUN_ID"
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA"
+          --expected-digest "$RMUX_MANIFEST_ARTIFACT_DIGEST"
+          --expected-workflow-id 316223904
+          --expected-workflow-path .github/workflows/release-shadow.yml
+          --expected-event workflow_dispatch
+          --expected-head-branch main
+          --max-attempts 1
+
+      - name: Download only the exact candidate manifest artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.candidate_manifest_artifact_id }}
+          path: ${{ runner.temp }}/rmux-tag-input
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_manifest_run_id }}
+
+      - name: Bind release identity to the candidate manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/rmux-tag-input/candidate-manifest.json"
+          python3 - "$manifest" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          raw = path.read_bytes()
+          value = json.loads(raw)
+          expected = {
+              "candidate_run_id": int(os.environ["RMUX_CANDIDATE_RUN_ID"]),
+              "candidate_run_attempt": 1,
+              "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
+              "planned_release_ref": os.environ["RMUX_RELEASE_REF"],
+              "release_kind": os.environ["RMUX_RELEASE_KIND"],
+          }
+          for field, wanted in expected.items():
+              if value.get(field) != wanted:
+                  raise SystemExit(f"candidate manifest {field} differs")
+          if value.get("release_policy", {}).get("sha256") != os.environ["RMUX_RELEASE_POLICY_SHA256"]:
+              raise SystemExit("candidate release policy root differs")
+          if hashlib.sha256(raw).hexdigest() != os.environ["RMUX_MANIFEST_SHA256"]:
+              raise SystemExit("candidate manifest file hash differs")
+          PY
+          python3 scripts/release/candidate-reference.py create \
+            --manifest "$manifest" \
+            --manifest-run-id "$RMUX_MANIFEST_RUN_ID" \
+            --manifest-run-attempt 1 \
+            --manifest-workflow-id 316223904 \
+            --manifest-artifact-id "$RMUX_MANIFEST_ARTIFACT_ID" \
+            --manifest-artifact-digest "$RMUX_MANIFEST_ARTIFACT_DIGEST" \
+            --output "$RUNNER_TEMP/rmux-tag-input/candidate-reference.json"
+          python3 scripts/release/candidate-reference.py verify \
+            --manifest "$manifest" \
+            --manifest-run-id "$RMUX_MANIFEST_RUN_ID" \
+            --manifest-run-attempt 1 \
+            --manifest-workflow-id 316223904 \
+            --manifest-artifact-id "$RMUX_MANIFEST_ARTIFACT_ID" \
+            --manifest-artifact-digest "$RMUX_MANIFEST_ARTIFACT_DIGEST" \
+            --document "$RUNNER_TEMP/rmux-tag-input/candidate-reference.json"
+
+      - id: bundle
+        name: Upload immutable verified tag inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-tag-input-${{ inputs.expected_source_sha }}
+          path: |
+            ${{ runner.temp }}/rmux-tag-input/candidate-manifest.json
+            ${{ runner.temp }}/rmux-tag-input/candidate-reference.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  create-signed-tag:
+    name: Disabled exact signed annotated tag creation
+    needs: verify-tag-inputs
+    if: ${{ false }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    environment: release-tagging
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.tag-proof.outputs.artifact-id }}
+      artifact_digest: sha256:${{ steps.tag-proof.outputs.artifact-digest }}
+      tag_object_sha: ${{ steps.identity.outputs.tag_object_sha }}
+    env:
+      RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
+      RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
+      RMUX_MANIFEST_ARTIFACT_ID: ${{ inputs.candidate_manifest_artifact_id }}
+      RMUX_MANIFEST_ARTIFACT_DIGEST: ${{ inputs.candidate_manifest_artifact_digest }}
+      RMUX_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+      RMUX_RELEASE_POLICY_SHA256: ${{ inputs.release_policy_sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Fail closed before reading release credentials
+        run: scripts/release/assert-release-capability.py signed_tag_creation
+
+      - name: Download only the verified tag input bundle ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.verify-tag-inputs.outputs.bundle_artifact_id }}
+          path: ${{ runner.temp }}/rmux-tag-input
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Verify tag input bundle API identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/release/actions-artifact.py verify
+          --repository "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID"
+          --artifact-id "${{ needs.verify-tag-inputs.outputs.bundle_artifact_id }}"
+          --name "${{ needs.verify-tag-inputs.outputs.bundle_artifact_name }}"
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA"
+          --expected-digest "${{ needs.verify-tag-inputs.outputs.bundle_artifact_digest }}"
+          --max-attempts 1
+
+      - id: release-app
+        name: Create the repository-scoped release App token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ vars.RMUX_RELEASE_APP_ID }}
+          private-key: ${{ secrets.RMUX_RELEASE_APP_PRIVATE_KEY }}
+          owner: Helvesec
+          repositories: rmux
+          permission-contents: write
+
+      - id: gh
+        name: Install the pinned GitHub CLI
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/rmux-gh-2.93.0"
+          scripts/release/install-gh-2.93.0.sh "$install_root"
+          echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+      - id: identity
+        name: Sign locally and push only the exact annotated tag object
+        shell: bash
+        env:
+          GH: ${{ steps.gh.outputs.binary }}
+          RMUX_RELEASE_APP_ID: ${{ vars.RMUX_RELEASE_APP_ID }}
+          RMUX_RELEASE_APP_TOKEN: ${{ steps.release-app.outputs.token }}
+          RMUX_RELEASE_SSH_SIGNING_KEY: ${{ secrets.RMUX_RELEASE_SSH_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/rmux-release-signing-key"
+          umask 077
+          printf '%s\n' "$RMUX_RELEASE_SSH_SIGNING_KEY" > "$key"
+          export PATH="$(dirname "$GH"):$PATH"
+          scripts/release/sign-and-push-release-tag.sh \
+            --repository "$GITHUB_REPOSITORY" \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --release-ref "$RMUX_RELEASE_REF" \
+            --release-intent-id "$RMUX_RELEASE_INTENT_ID" \
+            --release-kind "$RMUX_RELEASE_KIND" \
+            --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --candidate-manifest-artifact-id "$RMUX_MANIFEST_ARTIFACT_ID" \
+            --candidate-manifest-artifact-digest "$RMUX_MANIFEST_ARTIFACT_DIGEST" \
+            --candidate-manifest-sha256 "$RMUX_MANIFEST_SHA256" \
+            --release-policy-root-sha256 "$RMUX_RELEASE_POLICY_SHA256" \
+            --signing-key "$key" > "$RUNNER_TEMP/tag-result.json"
+          python3 - "$RUNNER_TEMP/tag-result.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          result = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          verification = result.get("github_verification", result.get("verification"))
+          if not isinstance(verification, dict) or verification.get("mode") != "github-json-verified":
+              raise SystemExit("tag result has no GitHub-verified signed tag proof")
+          pathlib.Path(sys.argv[1]).with_name("tag-verification.json").write_text(
+              json.dumps(verification, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"tag_object_sha={verification['tag_object_sha']}\n")
+          PY
+
+      - name: Create and verify typed signed-tag evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          python3 scripts/release/signed-tag-proof.py create \
+            --verification "$RUNNER_TEMP/tag-verification.json" \
+            --verified-at "$verified_at" \
+            --output "$RUNNER_TEMP/signed-tag-proof.json"
+          python3 scripts/release/signed-tag-proof.py verify \
+            --verification "$RUNNER_TEMP/tag-verification.json" \
+            --verified-at "$verified_at" \
+            --document "$RUNNER_TEMP/signed-tag-proof.json"
+
+      - id: tag-proof
+        name: Upload only exact signed-tag evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-signed-tag-${{ inputs.expected_source_sha }}
+          path: |
+            ${{ runner.temp }}/rmux-tag-input/candidate-reference.json
+            ${{ runner.temp }}/signed-tag-proof.json
+            ${{ runner.temp }}/tag-verification.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

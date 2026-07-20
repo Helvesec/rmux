@@ -10,7 +10,7 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn policy_audit_is_triple_disarmed_and_uncalled() {
+fn policy_audit_is_triple_disarmed_with_one_disabled_caller() {
     let workflow = include_str!("../.github/workflows/release-policy-audit.yml");
     let activation: serde_json::Value =
         serde_json::from_str(include_str!("../.github/release/release-activation.json"))
@@ -79,7 +79,7 @@ fn policy_audit_is_triple_disarmed_and_uncalled() {
     assert!(contract["audit_app"]["app_id"].is_null());
     assert!(contract["audit_app"]["installation_id"].is_null());
     assert_eq!(contract["audit_app"]["pat_fallback"], false);
-    assert_eq!(contract["workflow"]["caller_count"], 0);
+    assert_eq!(contract["workflow"]["caller_count"], 1);
     assert_eq!(contract["workflow"]["privileged_job_condition"], "false");
     assert_eq!(contract["token_lifecycle"]["collector_methods"][0], "GET");
     let required_checks = contract["expected_state"]["main"]["required_checks"]
@@ -94,18 +94,26 @@ fn policy_audit_is_triple_disarmed_and_uncalled() {
     }));
 
     let workflows = repo_root().join(".github/workflows");
+    let mut callers = Vec::new();
     for entry in fs::read_dir(workflows).expect("list workflows") {
         let path = entry.expect("workflow entry").path();
         if path.ends_with("release-policy-audit.yml") {
             continue;
         }
         let text = fs::read_to_string(&path).expect("read workflow");
-        assert!(
-            !text.contains("uses: ./.github/workflows/release-policy-audit.yml"),
-            "{} calls the disabled audit",
-            path.display()
-        );
+        if text.contains("uses: ./.github/workflows/release-policy-audit.yml") {
+            callers.push(path);
+        }
     }
+    assert_eq!(callers.len(), 1, "policy audit must have one exact caller");
+    assert!(callers[0].ends_with("release-promote.yml"));
+    let caller = fs::read_to_string(&callers[0]).expect("read promote workflow");
+    let audit_job = caller
+        .split("\n  policy-audit:\n")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  authorize-promotion:\n").next())
+        .expect("isolated policy audit caller job");
+    assert!(audit_job.contains("if: ${{ false }}"));
 
     let collector = include_str!("../scripts/release/policy-audit.py");
     assert!(collector.contains("method=\"GET\""));

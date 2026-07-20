@@ -129,7 +129,7 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
     expected_workflow = {
         "path": WORKFLOW_PATH,
         "only_trigger": "workflow_call",
-        "caller_count": 0,
+        "caller_count": 1,
         "required_run_attempt": 1,
         "privileged_job": "policy-audit",
         "privileged_job_condition": "false",
@@ -139,7 +139,7 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
     if not isinstance(workflow, dict) or any(
         workflow.get(key) != expected for key, expected in expected_workflow.items()
     ):
-        raise ValueError("policy audit workflow must remain uncalled and disabled")
+        raise ValueError("policy audit workflow must remain singly called and disabled")
     if workflow.get("workflow_id") is not None:
         _positive(workflow["workflow_id"], "policy workflow ID")
     app = value.get("audit_app")
@@ -217,7 +217,7 @@ def validate_repository_contracts(root: Path) -> None:
         "contract": ".github/release/policy-audit-contract.json",
         "audit_app_configured": False,
         "workflow": WORKFLOW_PATH,
-        "workflow_callers": 0,
+        "workflow_callers": 1,
         "privileged_job_condition": "false",
         "pat_fallback": False,
         "authorizes_publication": False,
@@ -261,15 +261,24 @@ def validate_repository_contracts(root: Path) -> None:
     ):
         if authority in workflow:
             raise ValueError(f"policy audit gained forbidden authority {authority}")
-    callers = 0
+    caller_paths: list[str] = []
     for candidate in sorted((root / ".github" / "workflows").glob("*.y*ml")):
         if candidate == workflow_path:
             continue
-        callers += candidate.read_text(encoding="utf-8").count(
+        count = candidate.read_text(encoding="utf-8").count(
             "uses: ./.github/workflows/release-policy-audit.yml"
         )
-    if callers != 0:
-        raise ValueError("policy audit reusable workflow acquired a caller")
+        caller_paths.extend([candidate.name] * count)
+    if caller_paths != ["release-promote.yml"]:
+        raise ValueError("policy audit caller must be exactly release-promote.yml")
+    promote = (root / ".github/workflows/release-promote.yml").read_text(
+        encoding="utf-8"
+    )
+    audit_block = promote.split("\n  policy-audit:\n", 1)[-1].split(
+        "\n  authorize-promotion:\n", 1
+    )[0]
+    if "if: ${{ false }}" not in audit_block:
+        raise ValueError("release promoter policy audit caller must remain disabled")
     schema_names = (
         "release-activation.schema.json",
         "policy-audit-predicate.schema.json",

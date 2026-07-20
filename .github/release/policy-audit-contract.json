@@ -16,7 +16,7 @@
   "workflow": {
     "path": ".github/workflows/release-policy-audit.yml",
     "only_trigger": "workflow_call",
-    "caller_count": 0,
+    "caller_count": 1,
     "required_run_attempt": 1,
     "privileged_job": "policy-audit",
     "privileged_job_condition": "false",
