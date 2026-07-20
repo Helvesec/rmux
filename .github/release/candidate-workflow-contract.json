@@ -46,6 +46,22 @@
     "download_by_artifact_id": true,
     "object_cache_restored": false
   },
+  "shadow_sealer": {
+    "workflow_id": 316223904,
+    "workflow": ".github/workflows/release-shadow.yml",
+    "selected_by_candidate_run_id": true,
+    "candidate_artifact_count": 11,
+    "canonical_platforms": [
+      "linux-aarch64",
+      "linux-x86_64",
+      "macos-aarch64",
+      "macos-x86_64",
+      "windows-x86_64"
+    ],
+    "manifest_status": "shadow-non-authoritative",
+    "manifest_retention_days": 7,
+    "manifest_self_reference": false
+  },
   "publication": {
     "enabled": false,
     "public_triggers": false,

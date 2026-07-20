@@ -38,31 +38,23 @@ fn run(program: &Path, args: &[&str]) -> Output {
 #[test]
 fn release_shadow_has_no_write_authority_or_mutation_primitive() {
     let workflow = include_str!("../.github/workflows/release-shadow.yml");
+    let candidate_contract = include_str!("../.github/release/candidate-contract.json");
     assert!(workflow.contains("on:\n  workflow_dispatch:"));
     assert_eq!(workflow.matches("permissions: {}").count(), 1);
-    assert_eq!(workflow.matches("permissions:").count(), 1);
-    assert!(!workflow.contains("uses:"));
-    assert!(workflow.contains("method=\"GET\""));
-    assert!(workflow.contains("https://api.github.com"));
-    assert!(workflow.contains("https://raw.githubusercontent.com"));
+    assert_eq!(workflow.matches("permissions:").count(), 2);
+    assert!(workflow.contains("actions: read"));
+    assert!(workflow.contains("contents: read"));
+    assert!(workflow.contains("candidate_run_id:"));
+    assert!(workflow.contains("--kind candidate"));
+    assert!(workflow.contains("artifact-ids: ${{ steps.artifacts.outputs.artifact_ids }}"));
+    assert!(workflow.contains("verify-candidate-attestations.sh"));
+    assert!(workflow.contains("GH_TOKEN: ${{ github.token }}"));
+    assert!(workflow.contains("candidate-manifest.py create"));
+    assert!(workflow.contains("candidate-manifest.py verify"));
+    assert!(workflow.contains("rmux-candidate-manifest-${{ inputs.candidate_run_id }}"));
     assert!(workflow.contains("refs/heads/main"));
-    assert!(workflow.contains("/attempts/1/jobs"));
-    assert_eq!(workflow.matches("urllib.request.Request(").count(), 1);
-    assert_eq!(workflow.matches("urllib.request.urlopen(").count(), 1);
-    assert!(workflow.contains("MAX_GET_ATTEMPTS = 3"));
-    assert!(workflow.contains("X-RateLimit-Remaining"));
-    for runner_proof in [
-        "github_standard_hosted",
-        "runner_group_id",
-        "runner_group_name",
-        "runner_name",
-        "self-hosted",
-    ] {
-        assert!(
-            workflow.contains(runner_proof),
-            "shadow does not bind runner proof field {runner_proof}"
-        );
-    }
+    assert!(workflow.contains("test \"$GITHUB_RUN_ATTEMPT\" = 1"));
+    assert!(!candidate_contract.contains("maximum_signed_extension_hours"));
 
     for trigger in [
         "\n  push:",
@@ -80,9 +72,6 @@ fn release_shadow_has_no_write_authority_or_mutation_primitive() {
         );
     }
     for authority in [
-        "github.token",
-        "GITHUB_TOKEN",
-        "GH_TOKEN",
         "secrets.",
         "environment:",
         "id-token:",
@@ -96,11 +85,6 @@ fn release_shadow_has_no_write_authority_or_mutation_primitive() {
         );
     }
     for mutation in [
-        "method=\"POST\"",
-        "method=\"PUT\"",
-        "method=\"PATCH\"",
-        "method=\"DELETE\"",
-        "upload-artifact",
         "actions/cache",
         "actions/attest",
         "github-script",
@@ -116,11 +100,9 @@ fn release_shadow_has_no_write_authority_or_mutation_primitive() {
         "--data",
         "--form",
         "data=",
-        "import subprocess",
         "import requests",
         "http.client",
         "socket.",
-        "GITHUB_OUTPUT",
         "GITHUB_ENV",
         "GITHUB_STEP_SUMMARY",
         "continue-on-error",
@@ -131,6 +113,22 @@ fn release_shadow_has_no_write_authority_or_mutation_primitive() {
             "shadow gained mutation primitive {mutation}"
         );
     }
+    for required_action in [
+        "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    ] {
+        assert!(workflow.contains(required_action));
+    }
+}
+
+#[test]
+fn release_contract_validator_stays_bounded() {
+    let validator = include_str!("../scripts/release/validate-contracts.py");
+    assert!(
+        validator.lines().count() < 600,
+        "release contract orchestrator became a God File"
+    );
 }
 
 #[test]
@@ -751,8 +749,17 @@ fn candidate_artifacts_allow_only_standard_github_runner_labels() {
 #[test]
 #[cfg(unix)]
 fn draft_authority_schemas_cannot_drive_a_workflow() {
+    let candidate: serde_json::Value = serde_json::from_str(include_str!(
+        "../.github/release/schemas/candidate-manifest.schema.json"
+    ))
+    .expect("parse shadow candidate schema");
+    assert_eq!(candidate["x-rmux-status"], "shadow-non-authoritative");
+    assert!(candidate["description"]
+        .as_str()
+        .expect("candidate schema description")
+        .contains("MUST NOT authorize publication"));
+
     for schema in [
-        include_str!("../.github/release/schemas/candidate-manifest.schema.json"),
         include_str!("../.github/release/schemas/promotion-authorization.schema.json"),
         include_str!("../.github/release/schemas/publication-receipt.schema.json"),
     ] {
@@ -795,6 +802,7 @@ fn release_verification_cli_is_pinned_and_capability_checked() {
     assert!(installer.contains("02d1290eba130e0b896f3709ffff22e1c75a51475ddb70476a85abc6b5807af0"));
     assert!(installer.contains("release verify --help"));
     assert!(installer.contains("release verify-asset --help"));
+    assert!(installer.contains("attestation verify --help"));
 }
 
 #[test]

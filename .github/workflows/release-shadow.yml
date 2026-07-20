@@ -1,300 +1,228 @@
-name: Release candidate shadow audit
+name: Release candidate shadow sealer
 
 on:
   workflow_dispatch:
     inputs:
       candidate_run_id:
-        description: Exact CI release-qualification run ID to audit
+        description: Exact completed canonical candidate run ID to seal
         required: true
         type: string
       expected_source_sha:
-        description: Exact main SHA shared by this audit and the candidate
+        description: Exact protected main SHA shared with the candidate
         required: true
         type: string
+      release_intent_id:
+        description: Exact release intent bound by the candidate
+        required: true
+        type: string
+      planned_release_ref:
+        description: Planned stable or release-candidate tag name
+        required: true
+        type: string
+      release_kind:
+        description: Non-publishing shadow, RC, or stable intent
+        required: true
+        type: choice
+        options: [shadow, rc, stable]
 
 permissions: {}
 
 concurrency:
-  group: release-shadow-${{ inputs.candidate_run_id }}
+  group: rmux-release-shadow-${{ inputs.release_intent_id }}
   cancel-in-progress: false
 
 jobs:
-  audit-candidate:
-    name: Audit release candidate without authority
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  seal-candidate:
+    name: Seal exact candidate without publication authority
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
     env:
-      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
-      EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
-      SHADOW_REF: ${{ github.ref }}
-      SHADOW_SHA: ${{ github.sha }}
+      RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
+      RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned_release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
     steps:
-      - name: Verify the exact candidate with public GET requests
+      - name: Reject untrusted inputs before checkout or API access
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          [[ "$RMUX_CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_INTENT_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]
+          [[ "$RMUX_PLANNED_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$RMUX_RELEASE_KIND" =~ ^(shadow|rc|stable)$ ]]
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify the exact completed candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RMUX_EXPECTED_SOURCE_SHA"
+          scripts/release/verify-fast-run.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --kind candidate \
+            > "$RUNNER_TEMP/candidate-run-proof.json"
+
+      - id: artifacts
+        name: Resolve the exact eleven candidate artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          resolution="$RUNNER_TEMP/candidate-artifact-resolution.json"
+          scripts/release/verify-candidate-artifacts.py resolve \
+            --repository "$GITHUB_REPOSITORY" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --output "$resolution"
+          artifact_ids=$(python3 - "$resolution" <<'PY'
           import json
-          import os
-          import re
-          import time
-          import urllib.error
-          import urllib.request
-          from collections import Counter
-          from datetime import datetime, timezone
+          import pathlib
+          import sys
 
-          API = "https://api.github.com"
-          RAW = "https://raw.githubusercontent.com"
-          REPOSITORY = "Helvesec/rmux"
-          API_VERSION = "2026-03-10"
-          MAX_RESPONSE_BYTES = 2 * 1024 * 1024
-          MAX_GET_ATTEMPTS = 3
-          MAX_RETRY_DELAY_SECONDS = 10
-          STANDARD_RUNNER_LABELS = {
-              "macos-15",
-              "macos-15-intel",
-              "ubuntu-latest",
-              "windows-latest",
-          }
-
-
-          def get_json(url):
-              if not (url.startswith(f"{API}/repos/{REPOSITORY}/") or
-                      url.startswith(f"{RAW}/{REPOSITORY}/")):
-                  raise RuntimeError(f"GET host or path is not allowlisted: {url}")
-              request = urllib.request.Request(
-                  url,
-                  method="GET",
-                  headers={
-                      "Accept": "application/vnd.github+json",
-                      "User-Agent": "rmux-release-shadow",
-                      "X-GitHub-Api-Version": API_VERSION,
-                  },
-              )
-              for attempt in range(1, MAX_GET_ATTEMPTS + 1):
-                  try:
-                      with urllib.request.urlopen(request, timeout=30) as response:
-                          payload = response.read(MAX_RESPONSE_BYTES + 1)
-                      break
-                  except urllib.error.HTTPError as error:
-                      rate_limited = (
-                          error.code == 429 or
-                          (error.code == 403 and error.headers.get("X-RateLimit-Remaining") == "0")
-                      )
-                      retryable = rate_limited or 500 <= error.code <= 599
-                      if not retryable or attempt == MAX_GET_ATTEMPTS:
-                          raise RuntimeError(
-                              f"GET failed closed for {url}: HTTP {error.code}"
-                          ) from error
-                      retry_after = error.headers.get("Retry-After", "")
-                      delay = int(retry_after) if retry_after.isdigit() else 2 ** (attempt - 1)
-                      time.sleep(min(delay, MAX_RETRY_DELAY_SECONDS))
-                  except (urllib.error.URLError, TimeoutError) as error:
-                      raise RuntimeError(f"GET failed closed for {url}: {error}") from error
-              if len(payload) > MAX_RESPONSE_BYTES:
-                  raise RuntimeError(f"GET response exceeds {MAX_RESPONSE_BYTES} bytes")
-              return json.loads(payload)
-
-
-          def require(actual, expected, label):
-              if actual != expected:
-                  raise RuntimeError(f"{label}: expected {expected!r}, got {actual!r}")
-
-
-          run_id_text = os.environ["CANDIDATE_RUN_ID"]
-          source_sha = os.environ["EXPECTED_SOURCE_SHA"]
-          shadow_sha = os.environ["SHADOW_SHA"]
-          if not re.fullmatch(r"[1-9][0-9]*", run_id_text):
-              raise RuntimeError("candidate_run_id must be a positive decimal integer")
-          if not re.fullmatch(r"[0-9a-f]{40}", source_sha):
-              raise RuntimeError("expected_source_sha must be 40 lowercase hex characters")
-          require(os.environ["SHADOW_REF"], "refs/heads/main", "shadow ref")
-          require(shadow_sha, source_sha, "shadow workflow SHA")
-          run_id = int(run_id_text)
-
-          contract_url = (
-              f"{RAW}/{REPOSITORY}/{shadow_sha}/"
-              ".github/release/candidate-contract.json"
-          )
-          contract = get_json(contract_url)
-          qualification = contract["qualification_run"]
-
-          run_url = f"{API}/repos/{REPOSITORY}/actions/runs/{run_id}"
-          run_before = get_json(run_url)
-          expected_run = {
-              "id": run_id,
-              "workflow_id": qualification["workflow_id"],
-              "path": qualification["workflow_path"],
-              "name": "CI",
-              "event": qualification["event"],
-              "head_branch": qualification["branch"],
-              "head_sha": source_sha,
-              "run_attempt": qualification["required_run_attempt"],
-              "status": "completed",
-              "conclusion": "success",
-          }
-          for field, expected in expected_run.items():
-              require(run_before.get(field), expected, f"candidate run {field}")
-          for identity_field in ("repository", "head_repository"):
-              identity = run_before.get(identity_field)
-              if not isinstance(identity, dict):
-                  raise RuntimeError(f"candidate run {identity_field} is missing")
-              require(identity.get("id"), contract["repository"]["id"], f"{identity_field} ID")
-              require(identity.get("full_name"), REPOSITORY, f"{identity_field} name")
-
-          started = datetime.fromisoformat(run_before["run_started_at"].replace("Z", "+00:00"))
-          age_seconds = int((datetime.now(timezone.utc) - started).total_seconds())
-          if age_seconds < -300:
-              raise RuntimeError("candidate run_started_at is in the future")
-          if age_seconds > int(contract["fast_run"]["freshness_hours"]) * 3600:
-              raise RuntimeError("candidate is stale")
-
-          jobs = []
-          total_count = None
-          page = 1
-          while total_count is None or len(jobs) < total_count:
-              jobs_url = (
-                  f"{API}/repos/{REPOSITORY}/actions/runs/{run_id}/attempts/1/jobs"
-                  f"?per_page=100&page={page}"
-              )
-              response = get_json(jobs_url)
-              current_total = response.get("total_count")
-              current_jobs = response.get("jobs")
-              if not isinstance(current_total, int) or not isinstance(current_jobs, list):
-                  raise RuntimeError("jobs response has an invalid shape")
-              if total_count is None:
-                  total_count = current_total
-              require(current_total, total_count, "jobs total_count")
-              if not current_jobs and len(jobs) < total_count:
-                  raise RuntimeError("jobs pagination ended early")
-              jobs.extend(current_jobs)
-              page += 1
-          require(len(jobs), total_count, "paginated job count")
-
-          run_after = get_json(run_url)
-          for field, expected in expected_run.items():
-              require(run_after.get(field), expected, f"candidate run after pagination {field}")
-          require(run_after.get("updated_at"), run_before.get("updated_at"), "candidate run stability")
-
-          expected = {
-              **{name: ("success",) for name in qualification["success_jobs"]},
-              **{name: ("skipped",) for name in qualification["skipped_jobs"]},
-              **{name: tuple(values) for name, values in qualification["allowed_jobs"].items()},
-          }
-          names = [job.get("name") for job in jobs]
-          if not all(isinstance(name, str) and name for name in names):
-              raise RuntimeError("candidate job names must be non-empty strings")
-          duplicate_names = sorted(name for name, count in Counter(names).items() if count != 1)
-          if duplicate_names:
-              raise RuntimeError(f"duplicate candidate job names: {duplicate_names}")
-          if set(names) != set(expected):
-              raise RuntimeError(
-                  f"candidate job set mismatch; missing={sorted(set(expected) - set(names))}, "
-                  f"unexpected={sorted(set(names) - set(expected))}"
-              )
-          runner_policy = contract.get("runner_policy")
-          if not isinstance(runner_policy, dict):
-              raise RuntimeError("runner policy is missing")
-          require(runner_policy.get("provider"), "github_standard_hosted", "runner provider")
-          runner_group_id = runner_policy.get("runner_group_id")
-          if type(runner_group_id) is not int or runner_group_id != 0:
-              raise RuntimeError("runner group ID must be the integer zero")
-          require(runner_policy.get("runner_group_name"), "GitHub Actions", "runner group name")
-          jobs_by_label = runner_policy.get("jobs_by_label")
-          if not isinstance(jobs_by_label, dict):
-              raise RuntimeError("runner jobs_by_label must be an object")
-          require(set(jobs_by_label), STANDARD_RUNNER_LABELS, "standard runner label set")
-          job_labels = {}
-          for label, contracted_names in jobs_by_label.items():
-              if not isinstance(contracted_names, list):
-                  raise RuntimeError(f"runner jobs for {label} must be an array")
-              for name in contracted_names:
-                  if not isinstance(name, str) or not name:
-                      raise RuntimeError(f"runner jobs for {label} must be non-empty strings")
-                  if name in job_labels:
-                      raise RuntimeError(f"runner policy assigns {name!r} more than once")
-                  job_labels[name] = label
-          contracted_job_names = set()
-          for run_kind in ("fast_run", "qualification_run"):
-              run_contract = contract.get(run_kind)
-              if not isinstance(run_contract, dict):
-                  raise RuntimeError(f"{run_kind} contract is missing")
-              for field in ("success_jobs", "skipped_jobs"):
-                  contracted_names = run_contract.get(field)
-                  if not isinstance(contracted_names, list):
-                      raise RuntimeError(f"{run_kind}.{field} must be an array")
-                  contracted_job_names.update(contracted_names)
-              allowed_jobs = run_contract.get("allowed_jobs")
-              if not isinstance(allowed_jobs, dict):
-                  raise RuntimeError(f"{run_kind}.allowed_jobs must be an object")
-              contracted_job_names.update(allowed_jobs)
-          require(set(job_labels), contracted_job_names, "runner policy job set")
-          if not set(expected) <= set(job_labels):
-              raise RuntimeError("candidate job has no runner policy assignment")
-          ids = [job.get("id") for job in jobs]
-          if not all(type(job_id) is int and job_id > 0 for job_id in ids):
-              raise RuntimeError("candidate job IDs must be positive integers")
-          if len(ids) != len(set(ids)):
-              raise RuntimeError("candidate contains duplicate job IDs")
-          for job in jobs:
-              name = job["name"]
-              require(job.get("run_id"), run_id, f"{name} run_id")
-              require(job.get("run_attempt"), 1, f"{name} run_attempt")
-              require(job.get("head_sha"), source_sha, f"{name} head_sha")
-              require(job.get("workflow_name"), "CI", f"{name} workflow_name")
-              require(job.get("status"), "completed", f"{name} status")
-              if job.get("conclusion") not in expected[name]:
-                  raise RuntimeError(
-                      f"{name} conclusion must be one of {expected[name]}, "
-                      f"got {job.get('conclusion')!r}"
-                  )
-              require(job.get("labels"), [job_labels[name]], f"{name} runner labels")
-              if "self-hosted" in job["labels"]:
-                  raise RuntimeError(f"{name} used a self-hosted runner")
-              if job.get("conclusion") == "skipped":
-                  for field in (
-                      "runner_id",
-                      "runner_name",
-                      "runner_group_id",
-                      "runner_group_name",
-                  ):
-                      if field not in job:
-                          raise RuntimeError(f"skipped {name} is missing {field}")
-                      require(job[field], None, f"skipped {name} {field}")
-              else:
-                  runner_id = job.get("runner_id")
-                  if type(runner_id) is not int or runner_id <= 0:
-                      raise RuntimeError(f"{name} runner ID must be a positive integer")
-                  runner_group_id = job.get("runner_group_id")
-                  if type(runner_group_id) is not int or runner_group_id != 0:
-                      raise RuntimeError(f"{name} runner group ID must be the integer zero")
-                  require(
-                      job.get("runner_group_name"),
-                      "GitHub Actions",
-                      f"{name} runner group name",
-                  )
-                  require(
-                      job.get("runner_name"),
-                      f"GitHub Actions {runner_id}",
-                      f"{name} runner name",
-                  )
-              created = datetime.fromisoformat(job["created_at"].replace("Z", "+00:00"))
-              started_at = datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))
-              completed = datetime.fromisoformat(job["completed_at"].replace("Z", "+00:00"))
-              if job.get("conclusion") == "success" and not created <= started_at <= completed:
-                  raise RuntimeError(f"invalid timestamp ordering for {name}")
-
-          print(
-              json.dumps(
-                  {
-                      "candidate_run_id": run_id,
-                      "source_git_sha": source_sha,
-                      "run_attempt": 1,
-                      "job_count": len(jobs),
-                      "conclusion": "success",
-                      "mode": "read-only-shadow",
-                  },
-                  sort_keys=True,
-              )
-          )
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          artifacts = value.get("artifacts")
+          if not isinstance(artifacts, list) or len(artifacts) != 11:
+              raise SystemExit("candidate artifact resolution must contain eleven artifacts")
+          identifiers = [item.get("artifact_id") for item in artifacts]
+          if any(type(identifier) is not int or identifier <= 0 for identifier in identifiers):
+              raise SystemExit("candidate artifact IDs must be positive integers")
+          if len(identifiers) != len(set(identifiers)):
+              raise SystemExit("candidate artifact IDs must be unique")
+          print(",".join(str(identifier) for identifier in identifiers))
           PY
+          )
+          echo "artifact_ids=$artifact_ids" >> "$GITHUB_OUTPUT"
+
+      - name: Download only the resolved artifact IDs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ steps.artifacts.outputs.artifact_ids }}
+          path: ${{ runner.temp }}/rmux-candidate-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - id: identity
+        name: Recover and bind the selected fast run ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          intent="$RUNNER_TEMP/rmux-candidate-download/rmux-fast-proof-$RMUX_EXPECTED_SOURCE_SHA/candidate-intent.json"
+          fast_run_id=$(python3 - "$intent" "$RMUX_EXPECTED_SOURCE_SHA" "$RMUX_RELEASE_INTENT_ID" "$RMUX_PLANNED_RELEASE_REF" "$RMUX_RELEASE_KIND" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "source_git_sha": sys.argv[2],
+              "release_intent_id": sys.argv[3],
+              "planned_release_ref": sys.argv[4],
+              "release_kind": sys.argv[5],
+              "candidate_run_attempt": 1,
+          }
+          for field, wanted in expected.items():
+              if value.get(field) != wanted:
+                  raise SystemExit(f"candidate intent {field} differs")
+          run_id = value.get("fast_run_id")
+          if type(run_id) is not int or run_id <= 0:
+              raise SystemExit("candidate intent fast run ID is invalid")
+          print(run_id)
+          PY
+          )
+          echo "fast_run_id=$fast_run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Verify every downloaded record, binding, and byte
+        env:
+          RMUX_FAST_RUN_ID: ${{ steps.identity.outputs.fast_run_id }}
+        run: |
+          set -euo pipefail
+          scripts/release/verify-candidate-artifacts.py verify-downloaded \
+            --repository "$GITHUB_REPOSITORY" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --fast-run-id "$RMUX_FAST_RUN_ID" \
+            --release-intent-id "$RMUX_RELEASE_INTENT_ID" \
+            --planned-release-ref "$RMUX_PLANNED_RELEASE_REF" \
+            --release-kind "$RMUX_RELEASE_KIND" \
+            --resolution "$RUNNER_TEMP/candidate-artifact-resolution.json" \
+            --downloads-dir "$RUNNER_TEMP/rmux-candidate-download" \
+            --output "$RUNNER_TEMP/verified-candidate-artifacts.json"
+
+      - id: gh
+        name: Install the pinned attestation verifier
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/rmux-gh-2.93.0"
+          test ! -e "$install_root"
+          scripts/release/install-gh-2.93.0.sh "$install_root"
+          echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Verify every build-provenance signature offline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RMUX_GH_BINARY: ${{ steps.gh.outputs.binary }}
+        run: >-
+          scripts/release/verify-candidate-attestations.sh
+          "$RUNNER_TEMP/rmux-candidate-download"
+          "$RMUX_EXPECTED_SOURCE_SHA"
+          "$RMUX_GH_BINARY"
+
+      - name: Recompute the immutable policy root
+        run: |
+          set -euo pipefail
+          scripts/release/policy-root.py \
+            --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --output "$RUNNER_TEMP/release-policy-root.json"
+
+      - name: Seal and independently reproduce the candidate manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          download="$RUNNER_TEMP/rmux-candidate-download"
+          proof="$download/rmux-fast-proof-$RMUX_EXPECTED_SOURCE_SHA"
+          common=(
+            --candidate-proof "$RUNNER_TEMP/candidate-run-proof.json"
+            --fast-proof "$proof/fast-proof.json"
+            --candidate-intent "$proof/candidate-intent.json"
+            --policy-root "$RUNNER_TEMP/release-policy-root.json"
+            --canonical-artifacts "$RUNNER_TEMP/verified-candidate-artifacts.json"
+          )
+          for platform in linux-aarch64 linux-x86_64 macos-aarch64 macos-x86_64 windows-x86_64; do
+            common+=(
+              --build-record "$platform=$download/rmux-canonical-$platform-$RMUX_EXPECTED_SOURCE_SHA/canonical-build-record.json"
+              --artifact-binding "$platform=$download/rmux-canonical-provenance-$platform-$RMUX_EXPECTED_SOURCE_SHA/canonical-artifact-binding.json"
+            )
+          done
+          manifest="$RUNNER_TEMP/candidate-manifest.json"
+          scripts/release/candidate-manifest.py create "${common[@]}" --output "$manifest"
+          scripts/release/candidate-manifest.py verify "${common[@]}" --manifest "$manifest"
+
+      - name: Persist only the non-authoritative shadow evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-candidate-manifest-${{ inputs.candidate_run_id }}
+          path: |
+            ${{ runner.temp }}/candidate-manifest.json
+            ${{ runner.temp }}/candidate-run-proof.json
+            ${{ runner.temp }}/release-policy-root.json
+            ${{ runner.temp }}/verified-candidate-artifacts.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

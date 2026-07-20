@@ -25,6 +25,8 @@ CONTRACT_PATH = ".github/release/candidate-contract.json"
 STANDARD_RUNNER_LABELS = {
     "macos-15",
     "macos-15-intel",
+    "ubuntu-22.04",
+    "ubuntu-22.04-arm",
     "ubuntu-latest",
     "windows-latest",
 }
@@ -151,7 +153,7 @@ def contracted_runner_labels(
                 raise ValueError(f"runner policy assigns {name!r} more than once")
             job_labels[name] = label
     contracted_job_names: set[str] = set()
-    for run_kind in ("fast_run", "qualification_run"):
+    for run_kind in ("fast_run", "qualification_run", "candidate_run"):
         run_contract = contract.get(run_kind)
         if not isinstance(run_contract, dict):
             raise ValueError(f"{run_kind} contract is missing")
@@ -276,7 +278,9 @@ def verify(
     age_seconds = int((now - started).total_seconds())
     if age_seconds < -300:
         raise ValueError("run_started_at is more than five minutes in the future")
-    freshness_hours = int(contract["fast_run"]["freshness_hours"])
+    freshness_hours = int(
+        run_contract.get("freshness_hours", contract["fast_run"]["freshness_hours"])
+    )
     if age_seconds > freshness_hours * 3600:
         raise ValueError(
             f"run proof is stale: {age_seconds}s exceeds {freshness_hours}h policy"
@@ -390,7 +394,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--run-id", required=True, type=int)
     parser.add_argument("--expected-source-sha", required=True)
-    parser.add_argument("--kind", choices=("fast", "qualification"), required=True)
+    parser.add_argument(
+        "--kind", choices=("fast", "qualification", "candidate"), required=True
+    )
     parser.add_argument("--repository-root", type=Path, default=ROOT)
     parser.add_argument("--now")
     parser.add_argument("--repository-json", type=Path)
