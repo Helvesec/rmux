@@ -37,11 +37,9 @@ SHA40 = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 SAFE_NAME = re.compile(r"[A-Za-z0-9._+@=-]+")
-SAFE_ROLE = re.compile(r"[a-z0-9-]+")
 SAFE_EXTERNAL_ID = re.compile(r"[A-Za-z0-9._:/#@+-]+")
 INTENT = re.compile(r"[A-Za-z0-9._:-]{8,128}")
 RELEASE_REF = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?")
-WORKFLOW_PATH = re.compile(r"\.github/workflows/[a-z0-9-]+\.yml")
 RESULT_PREDICATE_TYPE = (
     "https://rmux.io/attestations/release-downstream-channel-result/v1"
 )
@@ -263,13 +261,21 @@ def load_contract() -> dict[str, Any]:
         or retry.get("native_rebuild_allowed") is not False
         or retry.get("maximum_retry_depth") != 1
         or retry.get("retryable_states") != ["failed-transient", "prepared"]
-        or result_evidence.get("result_aggregation_ready") is not False
-        or result_evidence.get("aggregation_blockers")
-        != [
-            "result_reference_contract_missing",
-            "result_attestation_verification_missing",
-            "rmux_io_two_phase_contract_missing",
-        ]
+        or result_evidence.get("result_reference_ready") is not True
+        or result_evidence.get("result_reference_schema")
+        != ".github/release/schemas/downstream-channel-result-reference.schema.json"
+        or result_evidence.get("attestation_verification_ready") is not True
+        or result_evidence.get("attestation_verifier")
+        != "scripts/release/verify-channel-result-attestation.py"
+        or result_evidence.get("result_aggregation_ready") is not True
+        or result_evidence.get("aggregation_blockers") != []
+        or result_evidence.get("summary_schema")
+        != ".github/release/schemas/downstream-channel-summary.schema.json"
+        or result_evidence.get("summary_phases") != ["pre-site", "final"]
+        or result_evidence.get("pre_site_result_count") != 10
+        or result_evidence.get("final_result_count") != 11
+        or result_evidence.get("rmux_io_pre_site_digest_field")
+        != "pre_site_summary_sha256"
     ):
         raise ValueError("downstream channel contract is not fail-closed")
     return contract
@@ -317,78 +323,9 @@ def target_for_channel(channel: str) -> dict[str, Any]:
 
 
 def validate_payload(value: dict[str, Any], channel: str, source_sha: str) -> None:
-    payload_contract = load_contract().get("payload_evidence", {})
-    if (
-        payload_contract.get("canonical_provenance_ready") is not False
-        or payload_contract.get("actions_expiry_bound") is not False
-        or payload_contract.get("producer_workflow_allowlist_ready") is not False
-        or not payload_contract.get("activation_blockers")
-    ):
-        raise ValueError("downstream payload evidence contract is not safely disarmed")
-    _validate_payload_shape(value, channel, source_sha)
-    raise ValueError(
-        "downstream payload provenance and Actions expiry are not implemented in PR7"
-    )
+    from downstream_payload import validate_payload_document
 
-
-def _validate_payload_shape(value: dict[str, Any], channel: str, source_sha: str) -> None:
-    exact_keys(
-        value,
-        {
-            "schema_version",
-            "status",
-            "repository_id",
-            "source_git_sha",
-            "channel",
-            "producer",
-            "artifact",
-            "file_count",
-            "files",
-            "retention_expires_at",
-        },
-        "channel payload",
-    )
-    if (
-        value["schema_version"] != 1
-        or value["status"] != STATUS
-        or value["repository_id"] != REPOSITORY_ID
-        or value["source_git_sha"] != source_sha
-        or value["channel"] != channel
-    ):
-        raise ValueError("channel payload identity changed")
-    producer = value["producer"]
-    if not isinstance(producer, dict):
-        raise ValueError("payload producer must be an object")
-    exact_keys(
-        producer,
-        {"run_id", "run_attempt", "workflow_id", "workflow_path"},
-        "payload producer",
-    )
-    positive(producer["run_id"], "payload run ID")
-    positive(producer["workflow_id"], "payload workflow ID")
-    if producer["run_attempt"] != 1:
-        raise ValueError("payload producer must be Actions attempt 1")
-    match(producer["workflow_path"], WORKFLOW_PATH, "payload workflow path")
-    validate_artifact(value["artifact"], "payload artifact")
-    files = value["files"]
-    if not isinstance(files, list) or not files or value["file_count"] != len(files):
-        raise ValueError("payload file cardinality changed")
-    names: list[str] = []
-    roles: list[str] = []
-    for item in files:
-        if not isinstance(item, dict):
-            raise ValueError("payload file must be an object")
-        exact_keys(item, {"name", "role", "size", "sha256"}, "payload file")
-        names.append(match(item["name"], SAFE_NAME, "payload file name"))
-        roles.append(match(item["role"], SAFE_ROLE, "payload file role"))
-        positive(item["size"], "payload file size")
-        match(item["sha256"], SHA256, "payload file digest")
-    if names != sorted(names) or len(names) != len(set(names)):
-        raise ValueError("payload files must be sorted and unique")
-    required_roles = contract_channels()[channel]["payload_roles"]
-    if sorted(roles) != sorted(required_roles) or len(roles) != len(set(roles)):
-        raise ValueError("payload roles differ from the channel contract")
-    timestamp(value["retention_expires_at"], "payload retention expiry")
+    validate_payload_document(value, channel=channel, source_sha=source_sha)
 
 
 def validate_request(value: dict[str, Any]) -> dict[str, Any]:
@@ -412,6 +349,7 @@ def validate_request(value: dict[str, Any]) -> dict[str, Any]:
             "retry_of_request_sha256",
             "payload_artifact",
             "payload_set_sha256",
+            "pre_site_summary_sha256",
             "target",
             "previous_result",
             "rebuild_native",
@@ -437,15 +375,37 @@ def validate_request(value: dict[str, Any]) -> dict[str, Any]:
     if channel not in CHANNELS:
         raise ValueError("channel request names an unknown channel")
     contracted = contract_channels()[channel]
-    if channel == "rmux_io":
-        raise ValueError("rmux_io requires the unimplemented two-phase summary contract")
     if contracted["payload_ready"] is not True or contracted["blockers"] != []:
         raise ValueError("channel request retains unresolved activation blockers")
-    validate_payload(value["payload_artifact"], channel, source_sha)
+    from downstream_payload import validate_payload_document
+
+    validate_payload_document(
+        value["payload_artifact"],
+        channel=channel,
+        source_sha=source_sha,
+        receipt_predicate_sha256=value["receipt"]["predicate_sha256"],
+        release=value["release"],
+    )
     if value["payload_set_sha256"] != canonical_hash(
         value["payload_artifact"]["files"]
     ):
         raise ValueError("payload set digest differs from its exact files")
+    pre_site_digest = value["pre_site_summary_sha256"]
+    if channel == "rmux_io":
+        match(pre_site_digest, SHA256, "pre-site summary digest")
+        summary_files = [
+            item
+            for item in value["payload_artifact"]["files"]
+            if item["role"] == "channel-truth-summary"
+        ]
+        if (
+            len(summary_files) != 1
+            or summary_files[0]["name"] != "pre-site-channel-summary.json"
+            or summary_files[0]["sha256"] != pre_site_digest
+        ):
+            raise ValueError("rmux.io payload does not bind the exact pre-site summary")
+    elif pre_site_digest is not None:
+        raise ValueError("non-site channel cannot bind a pre-site summary")
     expected_target = target_for_channel(channel)
     if value["target"] != expected_target:
         raise ValueError("channel target differs from the pinned contract")
@@ -524,6 +484,10 @@ def validate_request(value: dict[str, Any]) -> dict[str, Any]:
     )
     if expires <= requested or expires - requested > timedelta(hours=24):
         raise ValueError("channel request TTL must be in (0, 24h]")
+    if requested < timestamp(
+        value["payload_artifact"]["created_at"], "payload created_at"
+    ):
+        raise ValueError("channel request predates its exact payload evidence")
     if expires > retention:
         raise ValueError("channel request outlives its exact payload")
     return value

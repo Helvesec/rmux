@@ -9,8 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from release_evidence import (
+    PROMOTION_WORKFLOW_ID,
+    PROMOTION_WORKFLOW_PATH,
     REPOSITORY,
     REPOSITORY_ID,
+    SIMULATION_WORKFLOW_ID,
+    SIMULATION_WORKFLOW_PATH,
     STATUS,
     exact_keys,
     file_hash,
@@ -29,19 +33,24 @@ from release_evidence import (
 
 PREDICATE_TYPE = "https://rmux.io/attestations/release-promotion-authorization/v1"
 ENVELOPE_TYPE = "https://rmux.io/envelopes/release-promotion-authorization/v1"
-WORKFLOW_PATH = ".github/workflows/release-promote.yml"
 
 
 def authorization_identity(args: argparse.Namespace) -> dict[str, Any]:
     positive_integer(args.authorization_run_id, "authorization run ID")
     positive_integer(args.authorization_workflow_id, "authorization workflow ID")
+    expected_id = SIMULATION_WORKFLOW_ID if args.simulation else PROMOTION_WORKFLOW_ID
+    expected_path = (
+        SIMULATION_WORKFLOW_PATH if args.simulation else PROMOTION_WORKFLOW_PATH
+    )
     if args.authorization_run_attempt != 1:
         raise ValueError("promotion authorization requires Actions attempt 1")
+    if args.authorization_workflow_id != expected_id:
+        raise ValueError("promotion authorization workflow ID changed")
     return {
         "run_id": args.authorization_run_id,
         "run_attempt": 1,
         "workflow_id": args.authorization_workflow_id,
-        "workflow_path": WORKFLOW_PATH,
+        "workflow_path": expected_path,
     }
 
 
@@ -63,8 +72,17 @@ def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
         release_policy_sha256=manifest["release_policy"]["sha256"],
     )
     policy_path = validate_file(args.policy_audit_reference, "policy audit reference")
+    audit_workflow_id = (
+        SIMULATION_WORKFLOW_ID if args.simulation else PROMOTION_WORKFLOW_ID
+    )
+    audit_workflow_path = (
+        SIMULATION_WORKFLOW_PATH if args.simulation else PROMOTION_WORKFLOW_PATH
+    )
     policy_audit = validate_policy_audit(
-        read_object(policy_path, "policy audit reference"), manifest
+        read_object(policy_path, "policy audit reference"),
+        manifest,
+        workflow_id=audit_workflow_id,
+        workflow_path=audit_workflow_path,
     )
     authorization = authorization_identity(args)
     if policy_audit["policy_audit_run_id"] != authorization["run_id"]:
@@ -252,6 +270,7 @@ def validate_envelope_shape(envelope: dict[str, Any]) -> None:
 
 
 def predicate_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--candidate-manifest", type=Path, required=True)
     parser.add_argument("--candidate-reference", type=Path, required=True)
     parser.add_argument("--signed-tag", type=Path, required=True)

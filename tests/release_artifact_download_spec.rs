@@ -89,6 +89,6 @@ fn exact_single_artifact_downloads_extract_into_the_requested_directory() {
         }
     }
 
-    assert_eq!(single_downloads, 28);
-    assert_eq!(multi_downloads, 3);
+    assert_eq!(single_downloads, 29);
+    assert_eq!(multi_downloads, 4);
 }

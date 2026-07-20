@@ -49,8 +49,11 @@ for item in files:
     relative = item.get("path") if isinstance(item, dict) else None
     if not isinstance(relative, str):
         raise SystemExit("canonical subject path is invalid")
-    path = (root / "assets" / relative).resolve(strict=True)
-    if root not in path.parents or not path.is_file() or path.is_symlink():
+    candidate = root / "assets" / relative
+    if candidate.is_symlink():
+        raise SystemExit("canonical subject escaped its artifact root")
+    path = candidate.resolve(strict=True)
+    if root not in path.parents or not path.is_file():
         raise SystemExit("canonical subject escaped its artifact root")
     print(path)
 print(pathlib.Path(sys.argv[1]).resolve(strict=True))

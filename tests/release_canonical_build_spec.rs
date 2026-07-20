@@ -149,6 +149,12 @@ fn canonical_producers_are_object_cold_and_non_publishing() {
         "cargo fetch --locked",
         "scripts/package-unix.sh",
         "scripts/package-windows.ps1",
+        "canonical-wasm-bundle.py create",
+        "canonical-crate-set.py create",
+        "generate-chocolatey-package.sh",
+        "canonical-build-record.py checksums",
+        "RMUX_SNAP_PACKAGE: ${{ inputs.snap-package }}",
+        "test -n \"$RMUX_SNAP_PACKAGE\"",
         "subject-checksums:",
         "create-storage-record: false",
         "retention-days: 7",
@@ -157,6 +163,7 @@ fn canonical_producers_are_object_cold_and_non_publishing() {
         assert!(build.contains(required), "canonical build lost {required}");
     }
     assert_eq!(build.matches("scripts/package-windows.ps1").count(), 1);
+    assert!(!build.contains("test -n \"${{ inputs.snap-package }}\""));
     for api_bound in [
         "value: ${{ steps.assets-api.outputs.artifact_digest }}",
         "value: ${{ steps.provenance-api.outputs.artifact_digest }}",
@@ -175,11 +182,129 @@ fn canonical_producers_are_object_cold_and_non_publishing() {
     assert!(workflow.contains("attestations: write"));
     assert!(workflow.contains("id-token: write"));
     assert_eq!(workflow.matches("actions: read").count(), 10);
-    assert_eq!(build.matches("description:").count(), 16);
+    assert_eq!(build.matches("description:").count(), 17);
     assert_eq!(build.matches("required: true").count(), 8);
     let smoke = include_str!("../.github/actions/canonical-smoke/action.yml");
     assert_eq!(smoke.matches("description:").count(), 14);
     assert_eq!(smoke.matches("required: true").count(), 13);
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_checksums_reject_a_symbolic_manifest() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir("checksum-symlink");
+    let assets = root.join("assets");
+    fs::create_dir(&assets).expect("create asset directory");
+    fs::write(assets.join("rmux.tar.gz"), b"asset").expect("write asset");
+    let outside = root.join("outside.txt");
+    fs::write(&outside, b"outside").expect("write symlink target");
+    symlink(&outside, assets.join("SHA256SUMS.txt")).expect("create checksum symlink");
+
+    let script = repo_root().join("scripts/release/canonical-build-record.py");
+    let output = run(
+        &script,
+        &[
+            "checksums",
+            "--assets-dir",
+            assets.to_str().expect("asset path"),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("checksum manifest must be a regular file"));
+    assert_eq!(fs::read(&outside).expect("read symlink target"), b"outside");
+    fs::remove_dir_all(root).expect("remove checksum fixture");
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_binding_rejects_symbolic_evidence_inputs() {
+    let root = temp_dir("binding-symlink");
+    let fixture = r#"
+import hashlib
+import pathlib
+import subprocess
+import sys
+
+repo, root = map(pathlib.Path, sys.argv[1:])
+script = repo / "scripts/release/canonical-artifact-binding.py"
+record = root / "record.json"
+bundle = root / "bundle.json"
+record.write_bytes(b"record")
+bundle.write_bytes(b"bundle")
+common = [
+    sys.executable, script, "create",
+    "--source-sha", "a" * 40,
+    "--candidate-run-id", "1",
+    "--platform-key", "linux-x86_64",
+    "--assets-artifact-id", "2",
+    "--assets-artifact-name", f"rmux-canonical-linux-x86_64-{'a' * 40}",
+    "--assets-artifact-digest", "sha256:" + "b" * 64,
+    "--build-record-sha256", hashlib.sha256(record.read_bytes()).hexdigest(),
+    "--attestation-id", "attestation",
+    "--output", root / "binding.json",
+]
+
+record_link = root / "record-link.json"
+record_link.symlink_to(record)
+rejected = subprocess.run(
+    [*common, "--build-record", record_link, "--attestation-bundle", bundle],
+    cwd=repo, capture_output=True, text=True,
+)
+assert rejected.returncode != 0
+assert "build record must be one non-empty regular file" in rejected.stderr
+
+bundle_link = root / "bundle-link.json"
+bundle_link.symlink_to(bundle)
+rejected = subprocess.run(
+    [*common, "--build-record", record, "--attestation-bundle", bundle_link],
+    cwd=repo, capture_output=True, text=True,
+)
+assert rejected.returncode != 0
+assert "attestation bundle must be one non-empty regular file" in rejected.stderr
+"#;
+    let output = run_python(&[
+        "-c",
+        fixture,
+        repo_root().to_str().expect("repository path"),
+        root.to_str().expect("fixture path"),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(root).expect("remove binding fixture");
+}
+
+#[test]
+fn canonical_inputs_check_symlinks_before_resolution() {
+    let binding = include_str!("../scripts/release/canonical-artifact-binding.py");
+    let binding_check = binding
+        .find("if path.is_symlink():")
+        .expect("binding symlink check");
+    let binding_resolve = binding
+        .find("resolved = path.resolve(strict=True)")
+        .expect("binding path resolution");
+    assert!(binding_check < binding_resolve);
+
+    let record = include_str!("../scripts/release/canonical-build-record.py");
+    let assets_check = record
+        .find("if directory.is_symlink():")
+        .expect("asset directory symlink check");
+    let assets_resolve = record
+        .find("root = directory.resolve(strict=True)")
+        .expect("asset directory resolution");
+    assert!(assets_check < assets_resolve);
+    let rustc_check = record
+        .find("if args.rustc_verbose.is_symlink():")
+        .expect("rustc evidence symlink check");
+    let rustc_resolve = record
+        .find("rustc_path = args.rustc_verbose.resolve(strict=True)")
+        .expect("rustc evidence resolution");
+    assert!(rustc_check < rustc_resolve);
 }
 
 #[test]
@@ -248,16 +373,17 @@ fn canonical_record_rejects_mutated_record_or_downloaded_bytes() {
     fs::write(assets.join("rmux_0.9.0_amd64.deb"), b"canonical-deb").expect("write canonical deb");
     fs::write(assets.join("rmux-0.9.0-1.x86_64.rpm"), b"canonical-rpm")
         .expect("write canonical rpm");
-    let archive_sha = "77b08d303821794feed7d5c213090d47b4e46165dabb86f4cb9dbfc1d6d1d66a";
-    let deb_sha = "a73e52bfe4a4457942e464e620bbbfd47f05d776b03c4b45fa052c81179b6d78";
-    let rpm_sha = "e57fbfb31bdf4e80969d24be315835cb54498a9694a4175625d3b652f7e9808a";
-    fs::write(
-        assets.join("SHA256SUMS.txt"),
-        format!(
-            "{rpm_sha}  rmux-0.9.0-1.x86_64.rpm\n{archive_sha}  rmux-0.9.0-linux-x86_64.tar.gz\n{deb_sha}  rmux_0.9.0_amd64.deb\n"
+    for (name, bytes) in [
+        ("rmux-0.9.0-crate-package-set.tar", b"crate-set".as_slice()),
+        ("rmux-0.9.0-snap-amd64.snap", b"snap".as_slice()),
+        ("rmux-web-crypto-wasm-0.9.0.tar", b"wasm".as_slice()),
+        (
+            "rmux-web-crypto-wasm-0.9.0.provenance.json",
+            b"provenance".as_slice(),
         ),
-    )
-    .expect("write canonical checksums");
+    ] {
+        fs::write(assets.join(name), bytes).expect("write supplemental asset");
+    }
     let rustc = root.join("rustc-vV.txt");
     fs::write(
         &rustc,
@@ -266,6 +392,19 @@ fn canonical_record_rejects_mutated_record_or_downloaded_bytes() {
     .expect("write rustc evidence");
     let record = root.join("canonical-build-record.json");
     let script = repo_root().join("scripts/release/canonical-build-record.py");
+    let checksums = run(
+        &script,
+        &[
+            "checksums",
+            "--assets-dir",
+            assets.to_str().expect("asset path"),
+        ],
+    );
+    assert!(
+        checksums.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checksums.stderr)
+    );
     let source = "0123456789abcdef0123456789abcdef01234567";
     let common = [
         "--source-sha",
@@ -323,7 +462,11 @@ fn canonical_record_rejects_mutated_record_or_downloaded_bytes() {
         [
             "SHA256SUMS.txt",
             "rmux-0.9.0-1.x86_64.rpm",
+            "rmux-0.9.0-crate-package-set.tar",
             "rmux-0.9.0-linux-x86_64.tar.gz",
+            "rmux-0.9.0-snap-amd64.snap",
+            "rmux-web-crypto-wasm-0.9.0.provenance.json",
+            "rmux-web-crypto-wasm-0.9.0.tar",
             "rmux_0.9.0_amd64.deb",
         ],
         "canonical asset order must not depend on host path semantics"
@@ -364,13 +507,16 @@ fn canonical_record_rejects_mutated_record_or_downloaded_bytes() {
         b"mutated-bytes",
     )
     .expect("mutate asset");
-    fs::write(
-        assets.join("SHA256SUMS.txt"),
-        format!(
-            "{rpm_sha}  rmux-0.9.0-1.x86_64.rpm\nc5b6ec93d49dfee55a224f67fa567e3711f2ba30db20ac3d9c8ccd83e40a7e2c  rmux-0.9.0-linux-x86_64.tar.gz\n{deb_sha}  rmux_0.9.0_amd64.deb\n"
-        ),
+    assert!(run(
+        &script,
+        &[
+            "checksums",
+            "--assets-dir",
+            assets.to_str().expect("asset path"),
+        ],
     )
-    .expect("update mutated checksums");
+    .status
+    .success());
     let rejected = run(&script, &verify);
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("asset set or digest changed"));
@@ -392,6 +538,9 @@ fn actions_artifact_binding_rejects_digest_or_run_drift() {
             "digest": digest,
             "expired": false,
             "size_in_bytes": 123,
+            "created_at": "2026-07-20T00:00:00Z",
+            "updated_at": "2026-07-20T00:00:01Z",
+            "expires_at": "2026-07-27T00:00:00Z",
             "workflow_run": {
                 "id": 77,
                 "repository_id": 1239918790,
@@ -437,6 +586,33 @@ fn actions_artifact_binding_rejects_digest_or_run_drift() {
     for expected in expected_outputs {
         assert!(api_outputs.lines().any(|line| line == expected));
     }
+    let retained = run(
+        &script,
+        &[
+            "resolve-id",
+            "--run-id",
+            "77",
+            "--artifact-id",
+            "88",
+            "--name",
+            &name,
+            "--expected-source-sha",
+            source,
+            "--artifact-json",
+            artifact_path.to_str().expect("artifact fixture path"),
+            "--include-retention",
+        ],
+    );
+    assert!(
+        retained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retained.stderr)
+    );
+    let retained: serde_json::Value =
+        serde_json::from_slice(&retained.stdout).expect("parse retention metadata");
+    assert_eq!(retained["created_at"], "2026-07-20T00:00:00Z");
+    assert_eq!(retained["updated_at"], "2026-07-20T00:00:01Z");
+    assert_eq!(retained["expires_at"], "2026-07-27T00:00:00Z");
 
     let accepted = run(
         &script,
@@ -548,6 +724,9 @@ fn actions_artifact_binding_rejects_digest_or_run_drift() {
             "digest": "a".repeat(64),
             "expired": false,
             "size_in_bytes": 123,
+            "created_at": "2026-07-20T00:00:00Z",
+            "updated_at": "2026-07-20T00:00:01Z",
+            "expires_at": "2026-07-27T00:00:00Z",
             "workflow_run": {
                 "id": 77,
                 "repository_id": 1239918790,

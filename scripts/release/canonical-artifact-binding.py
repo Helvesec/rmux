@@ -59,8 +59,10 @@ def validate_inputs(args: argparse.Namespace) -> None:
         (args.build_record, "build record"),
         (args.attestation_bundle, "attestation bundle"),
     ):
+        if path.is_symlink():
+            raise ValueError(f"{label} must be one non-empty regular file")
         resolved = path.resolve(strict=True)
-        if not resolved.is_file() or resolved.is_symlink() or resolved.stat().st_size <= 0:
+        if not resolved.is_file() or resolved.stat().st_size <= 0:
             raise ValueError(f"{label} must be one non-empty regular file")
     if sha256_file(args.build_record) != args.build_record_sha256:
         raise ValueError("build record digest changed before binding")

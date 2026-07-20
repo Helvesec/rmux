@@ -284,6 +284,7 @@ struct Platform {
     target: &'static str,
     archive: &'static str,
     linux_packages: bool,
+    supplemental: &'static [(&'static str, &'static str)],
 }
 
 const PLATFORMS: [Platform; 5] = [
@@ -295,6 +296,15 @@ const PLATFORMS: [Platform; 5] = [
         target: "x86_64-unknown-linux-gnu",
         archive: "tar.gz",
         linux_packages: true,
+        supplemental: &[
+            ("rmux-0.9.0-crate-package-set.tar", "crate-package-set"),
+            ("rmux-0.9.0-snap-amd64.snap", "snap-amd64"),
+            ("rmux-web-crypto-wasm-0.9.0.tar", "wasm-byte-set"),
+            (
+                "rmux-web-crypto-wasm-0.9.0.provenance.json",
+                "wasm-provenance",
+            ),
+        ],
     },
     Platform {
         key: "linux-aarch64",
@@ -304,6 +314,7 @@ const PLATFORMS: [Platform; 5] = [
         target: "aarch64-unknown-linux-gnu",
         archive: "tar.gz",
         linux_packages: true,
+        supplemental: &[("rmux-0.9.0-snap-arm64.snap", "snap-arm64")],
     },
     Platform {
         key: "macos-x86_64",
@@ -313,6 +324,7 @@ const PLATFORMS: [Platform; 5] = [
         target: "x86_64-apple-darwin",
         archive: "tar.gz",
         linux_packages: false,
+        supplemental: &[],
     },
     Platform {
         key: "macos-aarch64",
@@ -322,6 +334,7 @@ const PLATFORMS: [Platform; 5] = [
         target: "aarch64-apple-darwin",
         archive: "tar.gz",
         linux_packages: false,
+        supplemental: &[],
     },
     Platform {
         key: "windows-x86_64",
@@ -331,6 +344,7 @@ const PLATFORMS: [Platform; 5] = [
         target: "x86_64-pc-windows-msvc",
         archive: "zip",
         linux_packages: false,
+        supplemental: &[("rmux.0.9.0.nupkg", "chocolatey-package")],
     },
 ];
 
@@ -349,6 +363,11 @@ fn create_asset_bytes(directory: &Path, platform: &Platform) {
         fs::write(directory.join(&deb), format!("deb-{}", platform.key)).expect("write deb");
         fs::write(directory.join(&rpm), format!("rpm-{}", platform.key)).expect("write rpm");
         names.extend([deb, rpm]);
+    }
+    for (name, _) in platform.supplemental {
+        fs::write(directory.join(name), format!("{name}:{}", platform.key))
+            .expect("write supplemental asset");
+        names.push((*name).to_owned());
     }
     let checksums = names
         .iter()

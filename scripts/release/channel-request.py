@@ -27,6 +27,7 @@ from downstream_channels import (
 )
 from downstream_plan import validate_plan
 from downstream_result import validate_retryable_previous
+from downstream_summary import validate_summary_for_plan
 
 
 def request_idempotency_key(
@@ -86,6 +87,35 @@ def previous_result(path: Path | None) -> dict[str, Any] | None:
     return value
 
 
+def pre_site_summary_digest(
+    path: Path | None,
+    *,
+    channel: str,
+    plan: dict[str, Any],
+    plan_path: Path,
+    requested_at: str,
+) -> str | None:
+    if channel != "rmux_io":
+        if path is not None:
+            raise ValueError("only rmux_io can consume a pre-site summary")
+        return None
+    if path is None or path.is_symlink():
+        raise ValueError("rmux_io requires one regular pre-site summary")
+    resolved = path.resolve(strict=True)
+    summary = read_object(resolved, "pre-site channel summary")
+    validate_summary_for_plan(
+        summary,
+        plan=plan,
+        plan_sha256=file_hash(plan_path),
+        expected_phase="pre-site",
+    )
+    if timestamp(requested_at, "request requested_at") < timestamp(
+        summary["created_at"], "pre-site summary created_at"
+    ):
+        raise ValueError("rmux.io request predates its pre-site summary")
+    return file_hash(resolved)
+
+
 def expected_request(args: argparse.Namespace) -> dict[str, Any]:
     plan_path = args.plan.resolve(strict=True)
     plan = read_object(plan_path, "downstream channel plan")
@@ -95,8 +125,6 @@ def expected_request(args: argparse.Namespace) -> dict[str, Any]:
     )
     if entry is None:
         raise ValueError("requested channel is absent from the exact plan")
-    if args.channel == "rmux_io":
-        raise ValueError("rmux_io requires the unimplemented two-phase summary contract")
     if (
         entry["execution_decision"] != "disarmed"
         or entry["execution_enabled"] is not False
@@ -110,6 +138,13 @@ def expected_request(args: argparse.Namespace) -> dict[str, Any]:
     if requested < timestamp(plan["created_at"], "plan created_at"):
         raise ValueError("channel request predates its exact plan")
     target = target_for_channel(args.channel)
+    pre_site_summary_sha256 = pre_site_summary_digest(
+        args.pre_site_summary,
+        channel=args.channel,
+        plan=plan,
+        plan_path=plan_path,
+        requested_at=args.requested_at,
+    )
     payload_set_sha256 = canonical_hash(payload["files"])
     idempotency_key = request_idempotency_key(
         plan["receipt"]["predicate_sha256"],
@@ -147,6 +182,7 @@ def expected_request(args: argparse.Namespace) -> dict[str, Any]:
             ("idempotency_key", idempotency_key),
             ("payload_artifact", payload),
             ("payload_set_sha256", payload_set_sha256),
+            ("pre_site_summary_sha256", pre_site_summary_sha256),
             ("target", target),
         ):
             if original[field] != expected:
@@ -169,6 +205,7 @@ def expected_request(args: argparse.Namespace) -> dict[str, Any]:
         "retry_of_request_sha256": retry_digest,
         "payload_artifact": payload,
         "payload_set_sha256": payload_set_sha256,
+        "pre_site_summary_sha256": pre_site_summary_sha256,
         "target": target,
         "previous_result": bound_previous,
         "rebuild_native": False,
@@ -184,6 +221,7 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--channel", required=True)
     parser.add_argument("--operation", choices=("initial", "retry"), required=True)
     parser.add_argument("--payload-artifact", type=Path, required=True)
+    parser.add_argument("--pre-site-summary", type=Path)
     parser.add_argument("--retry-of", type=Path)
     parser.add_argument("--previous-result", type=Path)
     parser.add_argument("--requested-at", required=True)

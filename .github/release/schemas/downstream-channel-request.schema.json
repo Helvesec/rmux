@@ -24,6 +24,7 @@
     "retry_of_request_sha256",
     "payload_artifact",
     "payload_set_sha256",
+    "pre_site_summary_sha256",
     "target",
     "previous_result",
     "rebuild_native",
@@ -50,6 +51,9 @@
     },
     "payload_artifact": {"$ref": "#/$defs/payload"},
     "payload_set_sha256": {"$ref": "#/$defs/sha256"},
+    "pre_site_summary_sha256": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]
+    },
     "target": {"$ref": "#/$defs/target"},
     "previous_result": {
       "oneOf": [
@@ -95,6 +99,19 @@
           "retry_depth": {"const": 1},
           "retry_of_request_sha256": {"$ref": "#/$defs/sha256"},
           "previous_result": {"type": "object"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"channel": {"const": "rmux_io"}}, "required": ["channel"]},
+      "then": {
+        "properties": {
+          "pre_site_summary_sha256": {"$ref": "#/$defs/sha256"}
+        }
+      },
+      "else": {
+        "properties": {
+          "pre_site_summary_sha256": {"type": "null"}
         }
       }
     }
@@ -184,36 +201,7 @@
       }
     },
     "payload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["schema_version", "status", "repository_id", "source_git_sha", "channel", "producer", "artifact", "file_count", "files", "retention_expires_at"],
-      "properties": {
-        "schema_version": {"const": 1},
-        "status": {"const": "disarmed-non-authoritative"},
-        "repository_id": {"const": 1239918790},
-        "source_git_sha": {"$ref": "#/$defs/sha40"},
-        "channel": {"$ref": "#/$defs/channel"},
-        "producer": {"$ref": "#/$defs/producer"},
-        "artifact": {"$ref": "#/$defs/artifact"},
-        "file_count": {"type": "integer", "minimum": 1},
-        "files": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["name", "role", "size", "sha256"],
-            "properties": {
-              "name": {"$ref": "#/$defs/safe_name"},
-              "role": {"type": "string", "pattern": "^[a-z0-9-]+$"},
-              "size": {"$ref": "#/$defs/positive"},
-              "sha256": {"$ref": "#/$defs/sha256"}
-            }
-          }
-        },
-        "retention_expires_at": {"type": "string", "format": "date-time"}
-      }
+      "$ref": "https://rmux.io/schemas/downstream-channel-payload-v1.json"
     },
     "target": {
       "type": "object",

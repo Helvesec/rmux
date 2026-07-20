@@ -100,6 +100,7 @@ def load_contract(path: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]
                 "target_triple",
                 "archive_format",
                 "linux_packages",
+                "supplemental_roles",
             },
             "canonical platform",
         )
@@ -120,6 +121,21 @@ def asset_role(relative: str, platform: dict[str, Any]) -> str:
         return "debian"
     if platform["linux_packages"] and relative.endswith(".rpm"):
         return "rpm"
+    if relative.endswith(".snap"):
+        return {
+            "linux-x86_64": "snap-amd64",
+            "linux-aarch64": "snap-arm64",
+        }.get(platform["key"], "invalid-snap-platform")
+    if relative.startswith("rmux-web-crypto-wasm-") and relative.endswith(".tar"):
+        return "wasm-byte-set"
+    if relative.startswith("rmux-web-crypto-wasm-") and relative.endswith(
+        ".provenance.json"
+    ):
+        return "wasm-provenance"
+    if relative.startswith("rmux-") and relative.endswith("-crate-package-set.tar"):
+        return "crate-package-set"
+    if relative.startswith("rmux.") and relative.endswith(".nupkg"):
+        return "chocolatey-package"
     raise ValueError(f"canonical asset has no contracted role: {relative}")
 
 
@@ -127,6 +143,12 @@ def verify_asset_roles(files: list[dict[str, Any]], platform: dict[str, Any]) ->
     expected = {"archive", "checksums"}
     if platform["linux_packages"]:
         expected.update({"debian", "rpm"})
+    supplemental = platform.get("supplemental_roles")
+    if not isinstance(supplemental, list) or any(
+        not isinstance(role, str) for role in supplemental
+    ):
+        raise ValueError("canonical supplemental role contract is invalid")
+    expected.update(supplemental)
     roles = [item["role"] for item in files]
     if set(roles) != expected or len(roles) != len(expected):
         raise ValueError(
@@ -142,9 +164,7 @@ def verify_checksums(directory: Path, files: list[dict[str, Any]]) -> None:
     except (OSError, UnicodeDecodeError) as error:
         raise ValueError("canonical checksum manifest is not ASCII") from error
     expected = {
-        item["path"]: item["sha256"]
-        for item in files
-        if item["role"] != "checksums"
+        item["path"]: item["sha256"] for item in files if item["role"] != "checksums"
     }
     actual: dict[str, str] = {}
     for line in lines:
@@ -156,13 +176,17 @@ def verify_checksums(directory: Path, files: list[dict[str, Any]]) -> None:
             raise ValueError(f"duplicate canonical checksum entry: {path}")
         actual[path] = match.group(1)
     if actual != expected:
-        raise ValueError("canonical checksum manifest does not cover the exact asset set")
+        raise ValueError(
+            "canonical checksum manifest does not cover the exact asset set"
+        )
 
 
 def asset_files(directory: Path, platform: dict[str, Any]) -> list[dict[str, Any]]:
+    if directory.is_symlink():
+        raise ValueError("assets path must be one real directory")
     root = directory.resolve(strict=True)
     if not root.is_dir():
-        raise ValueError("assets path must be a directory")
+        raise ValueError("assets path must be one real directory")
     files: list[dict[str, Any]] = []
     paths = sorted(
         root.rglob("*"),
@@ -214,7 +238,9 @@ def validate_identity(args: argparse.Namespace) -> None:
         raise ValueError("RC candidate requires an RC ref")
 
 
-def rustc_identity(path: Path, expected_host: str, expected_release: str) -> dict[str, str]:
+def rustc_identity(
+    path: Path, expected_host: str, expected_release: str
+) -> dict[str, str]:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError) as error:
@@ -259,8 +285,10 @@ def create(args: argparse.Namespace) -> str:
         raise ValueError(
             f"runner identity mismatch: expected {expected_runner}, got {actual_runner}"
         )
+    if args.rustc_verbose.is_symlink():
+        raise ValueError("rustc verbose evidence must be one regular file")
     rustc_path = args.rustc_verbose.resolve(strict=True)
-    if not rustc_path.is_file() or rustc_path.is_symlink():
+    if not rustc_path.is_file():
         raise ValueError("rustc verbose evidence must be one regular file")
     rustc = rustc_identity(
         rustc_path, platform["target_triple"], contract["rust_toolchain"]
@@ -426,11 +454,37 @@ def write_subjects(args: argparse.Namespace) -> None:
     actual_files = asset_files(args.assets_dir, platform)
     if recorded_files != actual_files:
         raise ValueError("canonical build subjects differ from the build record")
-    lines = [
-        f"{item['sha256']}  assets/{item['path']}" for item in actual_files
-    ]
+    lines = [f"{item['sha256']}  assets/{item['path']}" for item in actual_files]
     lines.append(f"{sha256_file(args.record)}  canonical-build-record.json")
     args.output.write_text("\n".join(sorted(lines)) + "\n", encoding="ascii")
+
+
+def write_checksums(args: argparse.Namespace) -> None:
+    root = args.assets_dir.resolve(strict=True)
+    if args.assets_dir.is_symlink() or not root.is_dir():
+        raise ValueError("assets path must be one real directory")
+    output = root / "SHA256SUMS.txt"
+    if output.is_symlink() or (output.exists() and not output.is_file()):
+        raise ValueError("canonical checksum manifest must be a regular file")
+    lines: list[str] = []
+    for path in sorted(
+        root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
+    ):
+        if path.is_symlink():
+            raise ValueError("canonical assets cannot contain symlinks")
+        if path.is_dir():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative == "SHA256SUMS.txt":
+            continue
+        if not path.is_file() or SAFE_PATH.fullmatch(relative) is None:
+            raise ValueError(f"canonical asset path is invalid: {relative}")
+        if path.stat().st_size <= 0:
+            raise ValueError(f"canonical asset is empty: {relative}")
+        lines.append(f"{sha256_file(path)}  {relative}")
+    if not lines:
+        raise ValueError("canonical bundle has no checksum subjects")
+    output.write_text("\n".join(lines) + "\n", encoding="ascii")
 
 
 def common_identity(parser: argparse.ArgumentParser) -> None:
@@ -439,7 +493,9 @@ def common_identity(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--candidate-run-id", type=int, required=True)
     parser.add_argument("--release-intent-id", required=True)
     parser.add_argument("--planned-release-ref", required=True)
-    parser.add_argument("--release-kind", choices=("shadow", "rc", "stable"), required=True)
+    parser.add_argument(
+        "--release-kind", choices=("shadow", "rc", "stable"), required=True
+    )
     parser.add_argument("--platform-key", required=True)
     parser.add_argument("--assets-dir", type=Path, required=True)
     parser.add_argument("--contract", type=Path, default=CONTRACT)
@@ -466,6 +522,8 @@ def parse_args() -> argparse.Namespace:
     subjects_parser.add_argument("--assets-dir", type=Path, required=True)
     subjects_parser.add_argument("--output", type=Path, required=True)
     subjects_parser.add_argument("--contract", type=Path, default=CONTRACT)
+    checksums_parser = commands.add_parser("checksums")
+    checksums_parser.add_argument("--assets-dir", type=Path, required=True)
     return parser.parse_args()
 
 
@@ -475,8 +533,10 @@ def main() -> int:
         create(args)
     elif args.command == "verify":
         verify(args)
-    else:
+    elif args.command == "subjects":
         write_subjects(args)
+    else:
+        write_checksums(args)
     return 0
 
 

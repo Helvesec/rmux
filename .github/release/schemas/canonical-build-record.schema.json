@@ -87,7 +87,7 @@
         "required": ["path", "role", "size", "sha256"],
         "properties": {
           "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._+@=-]+(?:/[A-Za-z0-9._+@=-]+)*$"},
-          "role": {"enum": ["archive", "checksums", "debian", "rpm"]},
+          "role": {"enum": ["archive", "checksums", "chocolatey-package", "crate-package-set", "debian", "rpm", "snap-amd64", "snap-arm64", "wasm-byte-set", "wasm-provenance"]},
           "size": {"type": "integer", "minimum": 1},
           "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
         }

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -244,7 +244,7 @@ fn fixture(active: bool) -> Fixture {
     let authorization = json!({
         "run_id": 501,
         "run_attempt": 1,
-        "workflow_id": 602,
+        "workflow_id": 316435346,
         "workflow_path": ".github/workflows/release-promote.yml",
     });
     let predicate_value = json!({
@@ -297,6 +297,8 @@ fn fixture(active: bool) -> Fixture {
             "predicate_artifact_digest": AUDIT_DIGEST,
             "predicate_sha256": "1".repeat(64),
             "reference_sha256": "2".repeat(64),
+            "app_id": 4344532,
+            "installation_id": 147749910,
             "workflow_id": 316435346,
             "workflow_path": ".github/workflows/release-promote.yml",
             "release_policy_sha256": "3".repeat(64),
@@ -582,7 +584,7 @@ fn handle_request(mut stream: TcpStream, shared: &Arc<Mutex<ServerState>>) {
         ),
         ("GET", "/repos/Helvesec/rmux/actions/runs/501") => (
             200,
-            json!({"id": 501, "run_attempt": 1, "workflow_id": 602, "path": ".github/workflows/release-promote.yml", "head_sha": SOURCE, "status": "in_progress", "conclusion": null, "repository": {"id": 1239918790}}),
+            json!({"id": 501, "run_attempt": 1, "workflow_id": 316435346, "path": ".github/workflows/release-promote.yml", "head_sha": SOURCE, "status": "in_progress", "conclusion": null, "repository": {"id": 1239918790}}),
         ),
         ("GET", "/repos/Helvesec/rmux/actions/artifacts/503") => (
             200,
@@ -610,6 +612,25 @@ fn disabled_activation_fails_before_any_http_request() {
     let fixture = fixture(false);
     let server = FakeServer::start(&fixture, InitialRelease::Absent);
     assert_rejected(invoke(&fixture, &server, true), "not activated");
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn simulation_can_never_enter_execute_mode() {
+    let fixture = fixture(true);
+    let server = FakeServer::start(&fixture, InitialRelease::Absent);
+    let mut arguments = base_arguments(&fixture, &server);
+    arguments.extend(["--simulation".into(), "--execute".into()]);
+    let output = Command::new("python3")
+        .arg(repo_root().join("scripts/release/publish-github-release.py"))
+        .args(arguments)
+        .current_dir(repo_root())
+        .output()
+        .expect("run simulation execute rejection");
+    assert_rejected(
+        output,
+        "simulation requires a read-only loopback publication plan",
+    );
     assert!(server.requests().is_empty());
 }
 
@@ -651,6 +672,42 @@ fn invalid_authorization_attestation_fails_before_any_http_request() {
     assert_rejected(
         invoke(&fixture, &server, true),
         "attestation verification failed closed",
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn wrong_policy_audit_app_identity_fails_before_any_http_request() {
+    let fixture = fixture(false);
+    let mut predicate: Value = serde_json::from_slice(
+        &fs::read(&fixture.predicate).expect("read authorization predicate"),
+    )
+    .expect("parse authorization predicate");
+    predicate["policy_audit"]["app_id"] = json!(4344533);
+    write_json(&fixture.predicate, &predicate);
+    let mut envelope: Value =
+        serde_json::from_slice(&fs::read(&fixture.envelope).expect("read authorization envelope"))
+            .expect("parse authorization envelope");
+    envelope["predicate_sha256"] = json!(sha256(&fixture.predicate));
+    write_json(&fixture.envelope, &envelope);
+    let server = FakeServer::start(&fixture, InitialRelease::Absent);
+    assert_rejected(
+        invoke(&fixture, &server, false),
+        "authorization policy audit binding changed",
+    );
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn symlinked_attestation_verifier_fails_before_any_http_request() {
+    let fixture = fixture(true);
+    let verifier_target = fixture.root.join("gh-verifier-target");
+    fs::rename(&fixture.gh_verifier, &verifier_target).expect("move verifier target");
+    symlink(&verifier_target, &fixture.gh_verifier).expect("symlink verifier");
+    let server = FakeServer::start(&fixture, InitialRelease::Absent);
+    assert_rejected(
+        invoke(&fixture, &server, true),
+        "attestation verifier must be one regular file",
     );
     assert!(server.requests().is_empty());
 }

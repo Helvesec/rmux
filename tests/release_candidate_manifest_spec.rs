@@ -83,11 +83,11 @@ intent_path = write("intent.json", {
 })
 
 platforms = [
-    ("linux-x86_64", "x86_64-unknown-linux-gnu", "ubuntu-22.04", "Linux", "X64", ["archive", "checksums", "debian", "rpm"]),
-    ("linux-aarch64", "aarch64-unknown-linux-gnu", "ubuntu-22.04-arm", "Linux", "ARM64", ["archive", "checksums", "debian", "rpm"]),
+    ("linux-x86_64", "x86_64-unknown-linux-gnu", "ubuntu-22.04", "Linux", "X64", ["archive", "checksums", "crate-package-set", "debian", "rpm", "snap-amd64", "wasm-byte-set", "wasm-provenance"]),
+    ("linux-aarch64", "aarch64-unknown-linux-gnu", "ubuntu-22.04-arm", "Linux", "ARM64", ["archive", "checksums", "debian", "rpm", "snap-arm64"]),
     ("macos-x86_64", "x86_64-apple-darwin", "macos-15-intel", "macOS", "X64", ["archive", "checksums"]),
     ("macos-aarch64", "aarch64-apple-darwin", "macos-15", "macOS", "ARM64", ["archive", "checksums"]),
-    ("windows-x86_64", "x86_64-pc-windows-msvc", "windows-latest", "Windows", "X64", ["archive", "checksums"]),
+    ("windows-x86_64", "x86_64-pc-windows-msvc", "windows-latest", "Windows", "X64", ["archive", "checksums", "chocolatey-package"]),
 ]
 records, bindings, assets, provenances, canonical = {}, {}, [], [], []
 for number, (key, target, image, os_name, arch, roles) in enumerate(platforms, 1):

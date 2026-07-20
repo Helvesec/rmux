@@ -30,6 +30,12 @@ from release_publish_security import (
 
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
+POLICY_AUDIT_APP_ID = 4344532
+POLICY_AUDIT_INSTALLATION_ID = 147749910
+PROMOTION_WORKFLOW_ID = 316435346
+PROMOTION_WORKFLOW_PATH = ".github/workflows/release-promote.yml"
+SIMULATION_WORKFLOW_ID = 316591947
+SIMULATION_WORKFLOW_PATH = ".github/workflows/release-promotion-simulation.yml"
 MAX_NOTES_BYTES = 1024 * 1024
 SHA40 = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -115,7 +121,11 @@ class Evidence:
 
 
 def validate_authorization(
-    predicate: dict[str, Any], envelope: dict[str, Any], predicate_sha256: str
+    predicate: dict[str, Any],
+    envelope: dict[str, Any],
+    predicate_sha256: str,
+    *,
+    simulation: bool = False,
 ) -> None:
     predicate_keys = {
         "schema_version",
@@ -222,7 +232,16 @@ def validate_authorization(
         raise ValueError("promotion authorization must come from attempt 1")
     for field in ("run_id", "workflow_id"):
         positive(authorization.get(field), f"authorization {field}")
-    if authorization.get("workflow_path") != ".github/workflows/release-promote.yml":
+    expected_workflow_id = (
+        SIMULATION_WORKFLOW_ID if simulation else PROMOTION_WORKFLOW_ID
+    )
+    expected_workflow_path = (
+        SIMULATION_WORKFLOW_PATH if simulation else PROMOTION_WORKFLOW_PATH
+    )
+    if (
+        authorization.get("workflow_id") != expected_workflow_id
+        or authorization.get("workflow_path") != expected_workflow_path
+    ):
         raise ValueError("authorization workflow path changed")
     tag = predicate.get("signed_tag")
     if not isinstance(tag, dict) or any(
@@ -256,8 +275,10 @@ def validate_authorization(
             audit.get("source_git_sha") != source,
             audit.get("release_intent_id") != release.get("intent_id"),
             audit.get("policy_audit_run_attempt") != 1,
-            audit.get("workflow_id") != 316435346,
-            audit.get("workflow_path") != ".github/workflows/release-promote.yml",
+            audit.get("app_id") != POLICY_AUDIT_APP_ID,
+            audit.get("installation_id") != POLICY_AUDIT_INSTALLATION_ID,
+            audit.get("workflow_id") != expected_workflow_id,
+            audit.get("workflow_path") != expected_workflow_path,
             audit.get("release_policy_sha256")
             != predicate.get("release_policy_sha256"),
         )
@@ -359,7 +380,9 @@ def load_evidence(args: argparse.Namespace) -> Evidence:
     envelope_path = args.envelope.resolve(strict=True)
     predicate = read_object(predicate_path, "promotion predicate")
     envelope = read_object(envelope_path, "promotion envelope")
-    validate_authorization(predicate, envelope, file_hash(predicate_path))
+    validate_authorization(
+        predicate, envelope, file_hash(predicate_path), simulation=args.simulation
+    )
     records = expected_asset_records(predicate, envelope)
     if args.assets_dir.is_symlink():
         raise ValueError("assets directory cannot be a symlink")
@@ -511,6 +534,11 @@ def parse_args() -> argparse.Namespace:
         help="Perform the otherwise read-only publication plan",
     )
     parser.add_argument(
+        "--simulation",
+        action="store_true",
+        help="Exercise a non-authoritative plan against a loopback API",
+    )
+    parser.add_argument(
         "--token", help="Explicit short-lived token; no environment fallback"
     )
     parser.add_argument(
@@ -528,6 +556,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.simulation and (args.execute or not args.test_only_loopback_api):
+        raise ValueError("simulation requires a read-only loopback publication plan")
     evidence = load_evidence(args)
     result = execute(args, evidence) if args.execute else plan(args, evidence)
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

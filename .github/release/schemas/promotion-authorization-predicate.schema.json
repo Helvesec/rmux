@@ -193,7 +193,7 @@
           "type": ["string", "null"],
           "enum": [null, "linux-aarch64", "linux-x86_64", "macos-aarch64", "macos-x86_64", "windows-x86_64"]
         },
-        "role": {"enum": ["archive", "checksums", "debian", "rpm"]},
+        "role": {"enum": ["archive", "checksums", "debian", "rpm", "snap-amd64", "snap-arm64"]},
         "size": {"$ref": "#/$defs/positive"},
         "sha256": {"$ref": "#/$defs/sha256"}
       }

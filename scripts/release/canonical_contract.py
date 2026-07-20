@@ -114,6 +114,24 @@ def validate_build() -> None:
     }
     if actual != PLATFORMS or len(platforms) != len(PLATFORMS):
         raise ValueError("canonical target-to-runner mapping changed")
+    expected_supplemental = {
+        "linux-x86_64": [
+            "crate-package-set",
+            "snap-amd64",
+            "wasm-byte-set",
+            "wasm-provenance",
+        ],
+        "linux-aarch64": ["snap-arm64"],
+        "macos-x86_64": [],
+        "macos-aarch64": [],
+        "windows-x86_64": ["chocolatey-package"],
+    }
+    if {
+        entry.get("key"): entry.get("supplemental_roles")
+        for entry in platforms
+        if isinstance(entry, dict)
+    } != expected_supplemental:
+        raise ValueError("canonical supplemental role mapping changed")
 
     workflow = (ROOT / ".github/workflows/canonical-native-build.yml").read_text(
         encoding="utf-8"
@@ -169,7 +187,9 @@ def validate_build() -> None:
 def validate_schemas(candidate: dict[str, Any], schema_dir: Path) -> None:
     strict_candidate = _load(schema_dir / "candidate-manifest.schema.json")
     if candidate != strict_candidate:
-        raise ValueError("candidate manifest schema changed during canonical validation")
+        raise ValueError(
+            "candidate manifest schema changed during canonical validation"
+        )
     candidate = strict_candidate
     runner_images = candidate["properties"]["artifacts"]["items"]["properties"][
         "runner_image"

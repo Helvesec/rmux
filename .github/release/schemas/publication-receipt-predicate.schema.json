@@ -73,7 +73,7 @@
         "properties": {
           "id": {"$ref": "#/$defs/positive"},
           "name": {"type": "string", "pattern": "^[A-Za-z0-9._+@=-]+$"},
-          "role": {"enum": ["archive", "authorization-attestation", "checksums", "debian", "rpm"]},
+          "role": {"enum": ["archive", "authorization-attestation", "checksums", "debian", "rpm", "snap-amd64", "snap-arm64"]},
           "size": {"$ref": "#/$defs/positive"},
           "digest": {"$ref": "#/$defs/digest"}
         }

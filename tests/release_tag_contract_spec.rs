@@ -1,5 +1,5 @@
 #[test]
-fn release_tag_surface_is_disarmed_and_create_only() {
+fn release_tag_surface_has_a_dedicated_signer_and_is_create_only() {
     let policy: serde_json::Value =
         serde_json::from_str(include_str!("../.github/release/release-signers.json"))
             .expect("parse signer policy");
@@ -15,18 +15,27 @@ fn release_tag_surface_is_disarmed_and_create_only() {
         policy["tag_policy"]["required_private_key_secret"],
         "RMUX_RELEASE_SSH_SIGNING_KEY"
     );
-    assert_eq!(policy["tag_policy"]["enabled"], false);
-    assert_eq!(
-        policy["tag_policy"]["blocker"],
-        "dedicated_release_ssh_signing_key_not_configured"
-    );
+    assert_eq!(policy["status"], "enabled");
+    assert_eq!(policy["tag_policy"]["enabled"], true);
+    assert_eq!(policy["tag_policy"]["blocker"], "");
     assert_eq!(
         policy["tag_policy"]["allowed_signers"]
             .as_array()
             .expect("signer array")
             .len(),
-        0
+        1
     );
+    let signer = &policy["tag_policy"]["allowed_signers"][0];
+    assert_eq!(signer["principal"], "rmux-release@rmux.io");
+    assert_eq!(
+        signer["fingerprint"],
+        "SHA256:b9YcU2ZntSfSXHhCjiUqUCT+WyUenxRqJM279E4LuB0"
+    );
+
+    let activation: serde_json::Value =
+        serde_json::from_str(include_str!("../.github/release/release-activation.json"))
+            .expect("parse activation ledger");
+    assert_eq!(activation["capabilities"]["signed_tag_creation"], false);
 
     let driver = include_str!("../scripts/release/sign-and-push-release-tag.sh");
     assert!(driver.contains("RMUX_RELEASE_APP_ID:-} == 4339867"));

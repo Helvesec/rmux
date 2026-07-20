@@ -11,7 +11,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from release_evidence import publishable_assets, validate_candidate_manifest
+from release_evidence import (
+    PUBLIC_ASSET_ROLES,
+    publishable_assets,
+    validate_candidate_manifest,
+)
 
 REPOSITORY_ID = 1239918790
 SHA40 = re.compile(r"[0-9a-f]{40}")
@@ -106,7 +110,9 @@ def exact_asset_files(root: Path, expected: set[str]) -> None:
             raise ValueError("canonical assets cannot contain symlinks")
         if entry.is_dir():
             continue
-        if not entry.is_file() or not entry.resolve(strict=True).is_relative_to(resolved_root):
+        if not entry.is_file() or not entry.resolve(strict=True).is_relative_to(
+            resolved_root
+        ):
             raise ValueError("canonical asset escaped its download root")
         actual.add(entry.relative_to(root).as_posix())
     if actual != expected:
@@ -129,8 +135,10 @@ def stage(args: argparse.Namespace) -> str:
         args.candidate_run_id,
         args.source_sha,
     )
+    if args.downloads_dir.is_symlink():
+        raise ValueError("candidate downloads must be one real directory")
     downloads = args.downloads_dir.resolve(strict=True)
-    if downloads.is_symlink() or not downloads.is_dir():
+    if not downloads.is_dir():
         raise ValueError("candidate downloads must be one real directory")
     if args.output.exists() or args.output.is_symlink():
         raise ValueError("refusing to overwrite staged release assets")
@@ -146,31 +154,28 @@ def stage(args: argparse.Namespace) -> str:
             ("canonical-provenance", "provenance"),
         ):
             if platform.get(field) != resolution.get((role, key)):
-                raise ValueError(f"{key} manifest does not bind the live {role} archive")
+                raise ValueError(
+                    f"{key} manifest does not bind the live {role} archive"
+                )
         source_root = downloads / platform["assets"]["name"] / "assets"
         files = platform.get("files")
         if not isinstance(files, list):
             raise ValueError(f"{key} manifest files are missing")
-        expected_paths = {
-            item.get("path") for item in files if isinstance(item, dict)
-        }
-        if (
-            len(expected_paths) != len(files)
-            or any(
-                not isinstance(path, str) or SAFE_PATH.fullmatch(path) is None
-                for path in expected_paths
-            )
+        expected_paths = {item.get("path") for item in files if isinstance(item, dict)}
+        if len(expected_paths) != len(files) or any(
+            not isinstance(path, str) or SAFE_PATH.fullmatch(path) is None
+            for path in expected_paths
         ):
             raise ValueError(f"{key} manifest file paths are invalid")
         exact_asset_files(source_root, expected_paths)
         for item in files:
             source = source_root / item["path"]
             raw = source.read_bytes()
-            if len(raw) != item.get("size") or hashlib.sha256(raw).hexdigest() != item.get(
-                "sha256"
-            ):
+            if len(raw) != item.get("size") or hashlib.sha256(
+                raw
+            ).hexdigest() != item.get("sha256"):
                 raise ValueError(f"{key} candidate asset bytes differ")
-            if item.get("role") == "checksums":
+            if item.get("role") not in PUBLIC_ASSET_ROLES:
                 continue
             name = Path(item["path"]).name
             if name != item["path"] or (args.output / name).exists():

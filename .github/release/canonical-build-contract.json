@@ -27,7 +27,13 @@
       "runner_arch": "X64",
       "target_triple": "x86_64-unknown-linux-gnu",
       "archive_format": "tar.gz",
-      "linux_packages": true
+      "linux_packages": true,
+      "supplemental_roles": [
+        "crate-package-set",
+        "snap-amd64",
+        "wasm-byte-set",
+        "wasm-provenance"
+      ]
     },
     {
       "key": "linux-aarch64",
@@ -36,7 +42,8 @@
       "runner_arch": "ARM64",
       "target_triple": "aarch64-unknown-linux-gnu",
       "archive_format": "tar.gz",
-      "linux_packages": true
+      "linux_packages": true,
+      "supplemental_roles": ["snap-arm64"]
     },
     {
       "key": "macos-x86_64",
@@ -45,7 +52,8 @@
       "runner_arch": "X64",
       "target_triple": "x86_64-apple-darwin",
       "archive_format": "tar.gz",
-      "linux_packages": false
+      "linux_packages": false,
+      "supplemental_roles": []
     },
     {
       "key": "macos-aarch64",
@@ -54,7 +62,8 @@
       "runner_arch": "ARM64",
       "target_triple": "aarch64-apple-darwin",
       "archive_format": "tar.gz",
-      "linux_packages": false
+      "linux_packages": false,
+      "supplemental_roles": []
     },
     {
       "key": "windows-x86_64",
@@ -63,7 +72,8 @@
       "runner_arch": "X64",
       "target_triple": "x86_64-pc-windows-msvc",
       "archive_format": "zip",
-      "linux_packages": false
+      "linux_packages": false,
+      "supplemental_roles": ["chocolatey-package"]
     }
   ]
 }

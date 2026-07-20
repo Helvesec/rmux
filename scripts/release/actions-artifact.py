@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,21 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 SHA = re.compile(r"[0-9a-f]{40}")
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
+
+
+def artifact_timestamp(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"artifact {label} is missing")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"artifact {label} is invalid") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timedelta(0):
+        raise ValueError(f"artifact {label} must use UTC")
+    rendered = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if rendered != value:
+        raise ValueError(f"artifact {label} is not canonical")
+    return rendered
 
 
 def get_artifact_by_id(args: argparse.Namespace) -> dict[str, Any]:
@@ -150,6 +166,13 @@ def verify_artifact(
     size = artifact.get("size_in_bytes")
     if type(size) is not int or size <= 0:
         raise ValueError("artifact size must be a positive integer")
+    created_at = artifact_timestamp(artifact.get("created_at"), "created_at")
+    updated_at = artifact_timestamp(artifact.get("updated_at"), "updated_at")
+    expires_at = artifact_timestamp(artifact.get("expires_at"), "expires_at")
+    if datetime.fromisoformat(
+        updated_at.replace("Z", "+00:00")
+    ) < datetime.fromisoformat(created_at.replace("Z", "+00:00")):
+        raise ValueError("artifact updated_at predates created_at")
     workflow = artifact.get("workflow_run")
     if not isinstance(workflow, dict):
         raise ValueError("artifact workflow identity is missing")
@@ -167,6 +190,9 @@ def verify_artifact(
         "name": artifact["name"],
         "digest": digest,
         "size_in_bytes": size,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "expires_at": expires_at,
         "run_id": args.run_id,
         "source_git_sha": args.expected_source_sha,
     }
@@ -190,6 +216,7 @@ def parse_args() -> argparse.Namespace:
             "--expected-event", choices=("workflow_call", "workflow_dispatch")
         )
         command.add_argument("--expected-head-branch")
+        command.add_argument("--include-retention", action="store_true")
         if name in {"resolve-id", "verify"}:
             command.add_argument("--artifact-id", type=int, required=True)
             command.add_argument("--max-attempts", type=int, default=1)
@@ -239,12 +266,25 @@ def main() -> int:
             raise ValueError("direct artifact resolution requires exactly one artifact")
         artifact = artifacts[0]
     result = verify_artifact(artifact, args)
+    rendered = (
+        result
+        if args.include_retention
+        else {
+            key: value
+            for key, value in result.items()
+            if key not in {"created_at", "updated_at", "expires_at"}
+        }
+    )
     if args.github_output:
         with args.github_output.open("a", encoding="utf-8") as output:
             output.write(f"artifact_id={result['artifact_id']}\n")
             output.write(f"artifact_digest={result['digest']}\n")
             output.write(f"artifact_name={result['name']}\n")
-    print(json.dumps(result, sort_keys=True))
+            if args.include_retention:
+                output.write(f"artifact_created_at={result['created_at']}\n")
+                output.write(f"artifact_updated_at={result['updated_at']}\n")
+                output.write(f"artifact_expires_at={result['expires_at']}\n")
+    print(json.dumps(rendered, sort_keys=True))
     return 0
 
 

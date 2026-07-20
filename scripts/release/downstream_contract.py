@@ -24,10 +24,12 @@ CHANNELS = (
     "winget",
 )
 SCHEMAS = (
+    "downstream-channel-payload.schema.json",
     "downstream-channel-plan.schema.json",
     "downstream-channel-request.schema.json",
     "downstream-channel-result-envelope.schema.json",
     "downstream-channel-result-predicate.schema.json",
+    "downstream-channel-result-reference.schema.json",
     "downstream-channel-summary.schema.json",
 )
 REPOSITORIES = {
@@ -88,12 +90,11 @@ REPOSITORIES = {
         "external",
     ),
 }
-BLOCKED_PAYLOADS = {
-    "chocolatey",
-    "crates_io",
-    "snap_candidate",
-    "snap_stable",
-    "web_share",
+SEALED_CANONICAL_CHANNEL_ROLES = {
+    "chocolatey": {"chocolatey-package"},
+    "crates_io": {"crate-package-set"},
+    "snap_candidate": {"snap-amd64", "snap-arm64"},
+    "web_share": {"wasm-byte-set", "wasm-provenance"},
 }
 RESULT_STATES = {
     "blocked",
@@ -163,14 +164,14 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
     receipt = contract.get("receipt_gate", {})
     if (
         receipt.get("workflow_path") != ".github/workflows/release-receipt.yml"
+        or receipt.get("workflow_id") != 316435347
         or receipt.get("required_run_attempt") != 1
         or receipt.get("download_by_artifact_id") is not True
         or receipt.get("exact_artifact_digest_required") is not True
         or receipt.get("attestation_required") is not True
         or receipt.get("attestation_subject_name") != "release-state.json"
         or receipt.get("attestation_subject_in_bundle") is not True
-        or receipt.get("activation_blockers")
-        != ["receipt_workflow_id_unset_until_merge"]
+        or receipt.get("activation_blockers") != []
         or receipt.get("required_downstream_authority") is not False
     ):
         raise ValueError("downstream receipt gate is not exact and disarmed")
@@ -204,15 +205,39 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         raise ValueError("downstream retries must be fresh and build-free")
     payload = contract.get("payload_evidence", {})
     if payload != {
-        "canonical_provenance_ready": False,
-        "actions_expiry_bound": False,
-        "producer_workflow_allowlist_ready": False,
-        "activation_blockers": [
-            "channel_payload_producer_contract_missing",
-            "actions_artifact_expiry_binding_missing",
-        ],
+        "schema": ".github/release/schemas/downstream-channel-payload.schema.json",
+        "predicate_type": "https://rmux.io/attestations/release-downstream-channel-payload/v1",
+        "subject_name": "downstream-channel-payload-subject.json",
+        "canonical_provenance_ready": True,
+        "actions_expiry_bound": True,
+        "producer_workflow_allowlist_ready": True,
+        "producer": {
+            "workflow_id": 316435347,
+            "workflow_path": ".github/workflows/release-receipt.yml",
+            "job_workflow_path": ".github/workflows/release-downstream.yml",
+            "required_run_attempt": 1,
+        },
+        "activation_blockers": [],
     }:
-        raise ValueError("downstream payload provenance must remain explicitly blocked")
+        raise ValueError("downstream payload provenance is not exact")
+    result = contract.get("result_evidence", {})
+    if (
+        result.get("result_reference_ready") is not True
+        or result.get("result_reference_schema")
+        != ".github/release/schemas/downstream-channel-result-reference.schema.json"
+        or result.get("attestation_verification_ready") is not True
+        or result.get("attestation_verifier")
+        != "scripts/release/verify-channel-result-attestation.py"
+        or result.get("result_aggregation_ready") is not True
+        or result.get("aggregation_blockers") != []
+        or result.get("summary_schema")
+        != ".github/release/schemas/downstream-channel-summary.schema.json"
+        or result.get("summary_phases") != ["pre-site", "final"]
+        or result.get("pre_site_result_count") != len(CHANNELS) - 1
+        or result.get("final_result_count") != len(CHANNELS)
+        or result.get("rmux_io_pre_site_digest_field") != "pre_site_summary_sha256"
+    ):
+        raise ValueError("downstream result evidence readiness changed")
     channels = contract.get("channels")
     if not isinstance(channels, list):
         raise ValueError("downstream channel inventory is missing")
@@ -221,20 +246,44 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         != CHANNELS
     ):
         raise ValueError("downstream channels must be sorted, unique, and exhaustive")
+    canonical = _read(release / "canonical-build-contract.json")
+    canonical_roles = {
+        role
+        for platform in canonical.get("platforms", [])
+        if isinstance(platform, dict)
+        for role in platform.get("supplemental_roles", [])
+        if isinstance(role, str)
+    }
     for entry in channels:
         name = entry["name"]
         for kind in ("rc", "stable"):
             expected = _policy_decision(policy["release_kinds"][kind][name])
             if entry.get(f"{kind}_policy") != expected:
                 raise ValueError(f"{name} {kind} policy differs from channel policy")
-        if name in BLOCKED_PAYLOADS:
-            if entry.get("payload_ready") is not False or not entry.get("blockers"):
-                raise ValueError(f"{name} must retain its exact-payload blocker")
+        if name in SEALED_CANONICAL_CHANNEL_ROLES:
+            expected_roles = SEALED_CANONICAL_CHANNEL_ROLES[name]
+            if (
+                entry.get("payload_ready") is not True
+                or set(entry.get("payload_roles", [])) != expected_roles
+                or not expected_roles <= canonical_roles
+            ):
+                raise ValueError(f"{name} must consume its sealed canonical payload")
+    snap_stable = next(item for item in channels if item["name"] == "snap_stable")
+    if (
+        snap_stable.get("payload_ready") is not False
+        or snap_stable.get("payload_roles") != []
+        or snap_stable.get("blockers") != ["denied_until_support_decision"]
+    ):
+        raise ValueError("Snap stable must remain explicitly unsupported")
     rmux_io = next(item for item in channels if item["name"] == "rmux_io")
     if (
         rmux_io.get("phase") != 3
         or rmux_io.get("target_repository_key") != "rmux.io"
-        or "channel_truth_summary_not_available" not in rmux_io.get("blockers", [])
+        or rmux_io.get("blockers")
+        != [
+            "private_repository_protection_unavailable_on_current_plan",
+            "downstream_writer_app_missing",
+        ]
     ):
         raise ValueError("rmux.io must remain the blocked final channel")
 
@@ -321,6 +370,30 @@ def _validate_schemas(release: Path) -> None:
             ):
                 raise ValueError(f"{filename} lost false {field}")
     request = _read(schemas / "downstream-channel-request.schema.json")
+    if "pre_site_summary_sha256" not in request[
+        "required"
+    ] or "pre_site_summary_sha256" not in json.dumps(
+        request.get("allOf", []), sort_keys=True
+    ):
+        raise ValueError("rmux.io request lost its pre-site summary binding")
+    if request["$defs"]["payload"].get("$ref") != (
+        "https://rmux.io/schemas/downstream-channel-payload-v1.json"
+    ):
+        raise ValueError("downstream request lost its exact payload schema")
+    payload = _read(schemas / "downstream-channel-payload.schema.json")
+    producer = payload["$defs"]["producer"]["properties"]
+    if (
+        payload["properties"]["predicate_type"].get("const")
+        != "https://rmux.io/attestations/release-downstream-channel-payload/v1"
+        or producer["workflow_id"].get("const") != 316435347
+        or producer["workflow_path"].get("const")
+        != ".github/workflows/release-receipt.yml"
+        or producer["job_workflow_path"].get("const")
+        != ".github/workflows/release-downstream.yml"
+        or producer["runner_group_id"].get("const") != 0
+        or payload["properties"]["retention_expires_at"].get("format") != "date-time"
+    ):
+        raise ValueError("downstream payload schema lost provenance or retention")
     previous = request["properties"]["previous_result"]
     encoded = json.dumps(previous, sort_keys=True)
     for field in (
@@ -345,8 +418,12 @@ def _validate_schemas(release: Path) -> None:
     ):
         raise ValueError("downstream result producer is not GitHub-hosted attempt 1")
     summary = _read(schemas / "downstream-channel-summary.schema.json")
-    if summary["properties"]["result_count"].get("const") != len(CHANNELS):
-        raise ValueError("downstream summary must remain exhaustive")
+    if (
+        summary["properties"]["result_aggregation_ready"].get("const") is not True
+        or summary["properties"]["rmux_io_two_phase_ready"].get("const") is not True
+        or summary["properties"]["aggregation_blockers"].get("maxItems") != 0
+    ):
+        raise ValueError("downstream two-phase summary contract is incomplete")
     if summary["properties"]["rmux_io_last"].get("const") is not True:
         raise ValueError("downstream summary no longer keeps rmux.io last")
 
@@ -410,15 +487,15 @@ def _validate_workflows(root: Path) -> None:
     if "max-parallel: 3" not in main:
         raise ValueError("downstream Linux fanout must leave one slot for Chocolatey")
     for required in (
-        "Disabled pre-site result aggregation",
-        "Disabled post-aggregation rmux.io deployment",
-        "Disabled final result aggregation",
+        "Disabled pre-site aggregation wiring",
+        "Disabled rmux.io writer",
+        "Disabled final aggregation wiring",
     ):
         if required not in main:
             raise ValueError(
                 "downstream unavailable phase acquired an authoritative name"
             )
-    for overstated in ("Require ten exact", "Require eleven exact"):
+    for overstated in ("Consume ten exact", "Consume eleven exact"):
         if overstated in main:
             raise ValueError(
                 "downstream unavailable aggregation overstates its evidence"
@@ -445,6 +522,7 @@ def _validate_workflows(root: Path) -> None:
             or retry.count(workflow_identity_binding) != 1
             or retry.count("--deny-self-hosted-runners") != 1
             or retry.count("live payload artifact identity differs") != 1
+            or retry.count("--include-retention") != 1
             or retry.count(".github/workflows/release-downstream.yml") != 1
             or retry.count("prior result is not safe for one exact retry") != 1
             or retry.count("prior result started outside the original request TTL") != 1
@@ -468,9 +546,14 @@ def _validate_workflows(root: Path) -> None:
             "channel-policy.py",
             "channel-request.py",
             "channel-result.py",
+            "channel-result-reference.py",
             "channel-summary.py",
             "downstream_channels.py",
+            "downstream_result_document.py",
+            "downstream_result_reference.py",
+            "downstream_summary.py",
             "verify-downstream-repository.py",
+            "verify-channel-result-attestation.py",
         ):
             script_path = root / "scripts/release" / script
             if len(script_path.read_text(encoding="utf-8").splitlines()) >= 600:
