@@ -3,6 +3,10 @@ name: Disarmed reusable release policy audit
 on:
   workflow_call:
     inputs:
+      simulation:
+        required: false
+        type: boolean
+        default: false
       candidate_run_id:
         required: true
         type: string
@@ -44,10 +48,10 @@ on:
         type: string
     outputs:
       policy_audit_reference_artifact_id:
-        description: Exact post-upload reference artifact ID, unavailable while disarmed
+        description: Exact nonpublishing simulation reference artifact ID
         value: ${{ jobs.policy-audit.outputs.reference_artifact_id }}
       policy_audit_reference_artifact_digest:
-        description: Exact post-upload reference artifact digest, unavailable while disarmed
+        description: Exact nonpublishing simulation reference artifact digest
         value: ${{ jobs.policy-audit.outputs.reference_artifact_digest }}
 
 permissions: {}
@@ -69,6 +73,8 @@ jobs:
       RMUX_CANDIDATE_MANIFEST_ARTIFACT_ID: ${{ inputs.candidate_manifest_artifact_id }}
       RMUX_CANDIDATE_MANIFEST_ARTIFACT_DIGEST: ${{ inputs.candidate_manifest_artifact_digest }}
       RMUX_CANDIDATE_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+      RMUX_CANDIDATE_MANIFEST_CREATED_AT: ${{ inputs.candidate_manifest_created_at }}
+      RMUX_CANDIDATE_MANIFEST_EXPIRES_AT: ${{ inputs.candidate_manifest_expires_at }}
       RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
       RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
       RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned_release_ref }}
@@ -82,7 +88,30 @@ jobs:
           persist-credentials: false
 
       - name: Fail closed before packaging or privileged work
+        if: ${{ !inputs.simulation }}
         run: scripts/release/assert-release-capability.py policy_audit
+
+      - name: Validate the disarmed simulation entrypoint
+        if: ${{ inputs.simulation }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_WORKFLOW" = "Release promotion simulation"
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          path = pathlib.Path(".github/release/release-activation.json")
+          value = json.loads(path.read_text(encoding="utf-8"))
+          capabilities = value.get("capabilities")
+          if value.get("status") != "disarmed" or not isinstance(capabilities, dict):
+              raise SystemExit("release activation ledger is not disarmed")
+          if not capabilities or any(setting is not False for setting in capabilities.values()):
+              raise SystemExit("release simulation requires every capability to be false")
+          PY
 
       - name: Validate exact audit inputs
         shell: bash
@@ -102,21 +131,94 @@ jobs:
           test "$GITHUB_RUN_ATTEMPT" = 1
           test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
 
-      - name: Materialize the exact policy root binding
+      - name: Verify the exact candidate manifest artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/release/actions-artifact.py verify
+          --repository "$GITHUB_REPOSITORY"
+          --run-id "$RMUX_CANDIDATE_MANIFEST_RUN_ID"
+          --artifact-id "$RMUX_CANDIDATE_MANIFEST_ARTIFACT_ID"
+          --name "rmux-candidate-manifest-$RMUX_CANDIDATE_RUN_ID"
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA"
+          --expected-digest "$RMUX_CANDIDATE_MANIFEST_ARTIFACT_DIGEST"
+          --expected-workflow-id 316223904
+          --expected-workflow-path .github/workflows/release-shadow.yml
+          --expected-event workflow_dispatch
+          --expected-head-branch main
+          --max-attempts 1
+
+      - name: Download only the exact candidate manifest artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.candidate_manifest_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-policy-audit-candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_manifest_run_id }}
+
+      - name: Verify the exact candidate manifest binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/rmux-policy-audit-candidate/candidate-manifest.json" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          raw = path.read_bytes()
+          if hashlib.sha256(raw).hexdigest() != os.environ["RMUX_CANDIDATE_MANIFEST_SHA256"]:
+              raise SystemExit("candidate manifest SHA-256 differs")
+          value = json.loads(raw)
+          expected = {
+              "schema_version": 1,
+              "repository_id": 1239918790,
+              "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "candidate_run_id": int(os.environ["RMUX_CANDIDATE_RUN_ID"]),
+              "candidate_run_attempt": 1,
+              "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
+              "planned_release_ref": os.environ["RMUX_PLANNED_RELEASE_REF"],
+              "release_kind": os.environ["RMUX_RELEASE_KIND"],
+              "created_at": os.environ["RMUX_CANDIDATE_MANIFEST_CREATED_AT"],
+              "expires_at": os.environ["RMUX_CANDIDATE_MANIFEST_EXPIRES_AT"],
+          }
+          for field, wanted in expected.items():
+              if value.get(field) != wanted:
+                  raise SystemExit(f"candidate manifest {field} differs")
+          policy = value.get("release_policy", {})
+          if policy.get("sha256") != os.environ["RMUX_RELEASE_POLICY_SHA256"]:
+              raise SystemExit("candidate manifest policy SHA-256 differs")
+          if policy.get("contract_blob_oid") != os.environ["RMUX_RELEASE_POLICY_CONTRACT_BLOB_OID"]:
+              raise SystemExit("candidate manifest policy contract blob differs")
+          PY
+
+      - name: Recompute and materialize the exact policy root binding
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p .rmux-policy-audit
-          python3 - "$RMUX_EXPECTED_SOURCE_SHA" "$RMUX_RELEASE_POLICY_SHA256" "$RMUX_RELEASE_POLICY_CONTRACT_BLOB_OID" <<'PY'
+          scripts/release/policy-root.py \
+            --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --output .rmux-policy-audit/computed-release-policy-root.json
+          python3 - .rmux-policy-audit/computed-release-policy-root.json <<'PY'
           import json
+          import os
           import pathlib
           import sys
 
+          computed = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
           value = {
-              "source_git_sha": sys.argv[1],
-              "release_policy_sha256": sys.argv[2],
-              "contract_blob_oid": sys.argv[3],
+              "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "release_policy_sha256": os.environ["RMUX_RELEASE_POLICY_SHA256"],
+              "contract_blob_oid": os.environ["RMUX_RELEASE_POLICY_CONTRACT_BLOB_OID"],
           }
+          for field, wanted in value.items():
+              if computed.get(field) != wanted:
+                  raise SystemExit(f"computed release policy {field} differs")
           pathlib.Path(".rmux-policy-audit/release-policy-root.json").write_text(
               json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
@@ -137,15 +239,16 @@ jobs:
             scripts/release/github_actions.py
             scripts/release/policy-audit.py
             scripts/release/policy_audit_contract.py
+            scripts/release/policy_audit_live_state.py
             scripts/release/policy_audit_model.py
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
 
   policy-audit:
-    name: Disabled privileged live policy audit
+    name: Nonpublishing live policy audit simulation
     needs: prepare-policy-audit
-    if: ${{ false }}
+    if: ${{ inputs.simulation }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     environment: release-policy-audit
@@ -227,6 +330,9 @@ jobs:
           --release-kind "$RMUX_RELEASE_KIND"
           --audit-run-id "$GITHUB_RUN_ID"
           --audit-run-attempt "$GITHUB_RUN_ATTEMPT"
+          --audit-app-id "${{ vars.RMUX_POLICY_AUDIT_APP_ID }}"
+          --audit-installation-id "${{ steps.audit-app.outputs.installation-id }}"
+          --audit-app-slug "${{ steps.audit-app.outputs.app-slug }}"
           --contract .github/release/policy-audit-contract.json
           --policy-root .rmux-policy-audit/release-policy-root.json
           --output policy-audit-predicate.json

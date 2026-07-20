@@ -253,7 +253,7 @@ fn every_release_stage_serializes_each_tag_without_cancellation() {
 }
 
 #[test]
-fn only_promoter_calls_policy_audit_and_the_call_remains_disabled() {
+fn only_promoter_and_nonpublishing_simulation_call_policy_audit() {
     let workflows = repo_root().join(".github/workflows");
     let mut callers = Vec::new();
     for entry in fs::read_dir(workflows).expect("list workflows") {
@@ -263,9 +263,13 @@ fn only_promoter_calls_policy_audit_and_the_call_remains_disabled() {
             callers.push(path);
         }
     }
+    callers.sort();
     assert_eq!(
         callers,
-        vec![repo_root().join(".github/workflows/release-promote.yml")]
+        vec![
+            repo_root().join(".github/workflows/release-promote.yml"),
+            repo_root().join(".github/workflows/release-promotion-simulation.yml"),
+        ]
     );
     let audit = job(PROMOTE, "policy-audit", Some("authorize-promotion"));
     assert!(audit.contains("if: ${{ false }}"));

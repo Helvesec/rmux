@@ -104,6 +104,14 @@ def candidate_binding(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def audit_app_binding(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "app_id": args.audit_app_id,
+        "installation_id": args.audit_installation_id,
+        "app_slug": args.audit_app_slug,
+    }
+
+
 def collect(args: argparse.Namespace) -> None:
     if args.repository != REPOSITORY:
         raise ValueError(f"repository must be exactly {REPOSITORY}")
@@ -115,8 +123,16 @@ def collect(args: argparse.Namespace) -> None:
         raise ValueError(
             "policy audit App is unconfigured; live audit remains disarmed"
         )
+    app_binding = audit_app_binding(args)
+    expected_app = {
+        "app_id": contract["audit_app"]["app_id"],
+        "installation_id": contract["audit_app"]["installation_id"],
+        "app_slug": contract["audit_app"]["app_slug"],
+    }
+    if app_binding != expected_app:
+        raise ValueError("audit App action identity differs from its contract")
     responses = load_responses(args.api_fixture_dir)
-    state = normalize_state(responses, contract)
+    state = normalize_state(responses, contract, app_binding)
     policy = validate_policy_root(
         read_object(args.policy_root, "release policy root"), args.source_sha
     )
@@ -190,6 +206,9 @@ def add_identity_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--release-kind", choices=("rc", "stable"), required=True)
     parser.add_argument("--audit-run-id", required=True, type=int)
     parser.add_argument("--audit-run-attempt", required=True, type=int)
+    parser.add_argument("--audit-app-id", required=True, type=int)
+    parser.add_argument("--audit-installation-id", required=True, type=int)
+    parser.add_argument("--audit-app-slug", required=True)
 
 
 def parse_args() -> argparse.Namespace:

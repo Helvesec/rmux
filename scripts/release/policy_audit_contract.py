@@ -30,9 +30,9 @@ REQUIRED_CHECK_CONTEXTS = (
     "WASM crypto build and supply-chain gate",
 )
 API_GETS = (
+    ("audit_app", "/apps/helvesec-rmux-policy-audit"),
     ("branch_protection", "/repos/Helvesec/rmux/branches/main/protection"),
     ("immutable_releases", "/repos/Helvesec/rmux/immutable-releases"),
-    ("installation", "/installation"),
     (
         "installation_repositories",
         "/installation/repositories?per_page=100&page=1",
@@ -40,6 +40,15 @@ API_GETS = (
     (
         "policy_workflow",
         "/repos/Helvesec/rmux/actions/workflows/release-policy-audit.yml",
+    ),
+    ("release_environment", "/repos/Helvesec/rmux/environments/release"),
+    (
+        "release_policy_audit",
+        "/repos/Helvesec/rmux/environments/release-policy-audit",
+    ),
+    (
+        "release_publication",
+        "/repos/Helvesec/rmux/environments/release-publication",
     ),
     ("release_tagging", "/repos/Helvesec/rmux/environments/release-tagging"),
     ("repository", "/repositories/1239918790"),
@@ -129,17 +138,17 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
     expected_workflow = {
         "path": WORKFLOW_PATH,
         "only_trigger": "workflow_call",
-        "caller_count": 1,
+        "caller_count": 2,
         "required_run_attempt": 1,
         "privileged_job": "policy-audit",
-        "privileged_job_condition": "false",
+        "privileged_job_condition": "inputs.simulation",
         "environment": "release-policy-audit",
         "runner_image": "ubuntu-22.04",
     }
     if not isinstance(workflow, dict) or any(
         workflow.get(key) != expected for key, expected in expected_workflow.items()
     ):
-        raise ValueError("policy audit workflow must remain singly called and disabled")
+        raise ValueError("policy audit workflow call boundary changed")
     if workflow.get("workflow_id") is not None:
         _positive(workflow["workflow_id"], "policy workflow ID")
     app = value.get("audit_app")
@@ -164,8 +173,8 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
             raise ValueError("policy audit App slug is invalid")
     elif identity != (None, None, None):
         raise ValueError("unconfigured policy audit App cannot carry an identity")
-    if require_disarmed and configured is not False:
-        raise ValueError("repository contract must keep the audit App unconfigured")
+    if require_disarmed and configured is not True:
+        raise ValueError("repository contract must bind the installed audit App")
     lifecycle = value.get("token_lifecycle")
     if not isinstance(lifecycle, dict) or lifecycle.get("collector_methods") != ["GET"]:
         raise ValueError("policy collector must be GET-only")
@@ -194,11 +203,7 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
         raise ValueError("policy audit proof must expire after fifteen minutes")
     if proof.get("authorizes_publication") is not False:
         raise ValueError("policy audit proof cannot authorize publication")
-    if value.get("external_blockers") != [
-        "audit_app_not_installed",
-        "release_policy_audit_environment_missing",
-        "release_publication_environment_missing",
-    ]:
+    if value.get("external_blockers") != []:
         raise ValueError("policy audit external blockers changed")
 
 
@@ -215,10 +220,10 @@ def validate_repository_contracts(root: Path) -> None:
         "activation_ledger": ".github/release/release-activation.json",
         "capability_enabled": False,
         "contract": ".github/release/policy-audit-contract.json",
-        "audit_app_configured": False,
+        "audit_app_configured": True,
         "workflow": WORKFLOW_PATH,
-        "workflow_callers": 1,
-        "privileged_job_condition": "false",
+        "workflow_callers": 2,
+        "privileged_job_condition": "inputs.simulation",
         "pat_fallback": False,
         "authorizes_publication": False,
     }:
@@ -237,8 +242,8 @@ def validate_repository_contracts(root: Path) -> None:
     ):
         if trigger in workflow:
             raise ValueError(f"policy audit gained public trigger {trigger.strip()}")
-    if workflow.count("if: ${{ false }}") != 1:
-        raise ValueError("privileged policy audit job must be literally disabled")
+    if workflow.count("\n    if: ${{ inputs.simulation }}") != 1:
+        raise ValueError("privileged policy audit must be simulation-only before PR8")
     required_markers = (
         "assert-release-capability.py policy_audit",
         "environment: release-policy-audit",
@@ -247,6 +252,11 @@ def validate_repository_contracts(root: Path) -> None:
         "permission-actions: read",
         "permission-metadata: read",
         "RMUX_POLICY_AUDIT_APP_PRIVATE_KEY",
+        "scripts/release/policy-root.py",
+        "--expected-workflow-id 316223904",
+        "--audit-app-id",
+        "--audit-installation-id",
+        "--audit-app-slug",
         "--predicate-artifact-id",
         "--predicate-artifact-digest",
     )
@@ -269,8 +279,8 @@ def validate_repository_contracts(root: Path) -> None:
             "uses: ./.github/workflows/release-policy-audit.yml"
         )
         caller_paths.extend([candidate.name] * count)
-    if caller_paths != ["release-promote.yml"]:
-        raise ValueError("policy audit caller must be exactly release-promote.yml")
+    if caller_paths != ["release-promote.yml", "release-promotion-simulation.yml"]:
+        raise ValueError("policy audit callers differ from the exact allowlist")
     promote = (root / ".github/workflows/release-promote.yml").read_text(
         encoding="utf-8"
     )
@@ -279,6 +289,24 @@ def validate_repository_contracts(root: Path) -> None:
     )[0]
     if "if: ${{ false }}" not in audit_block:
         raise ValueError("release promoter policy audit caller must remain disabled")
+    simulation = (root / ".github/workflows/release-promotion-simulation.yml").read_text(
+        encoding="utf-8"
+    )
+    if (
+        "on:\n  workflow_dispatch:" not in simulation
+        or "\n  workflow_call:" in simulation
+        or "simulation: true" not in simulation
+        or "permissions: {}" not in simulation
+    ):
+        raise ValueError("release promotion simulation entrypoint changed")
+    for authority in (
+        "contents: write",
+        "id-token: write",
+        "packages: write",
+        "attestations: write",
+    ):
+        if authority in simulation:
+            raise ValueError(f"release simulation gained forbidden authority {authority}")
     schema_names = (
         "release-activation.schema.json",
         "policy-audit-predicate.schema.json",

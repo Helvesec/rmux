@@ -10,7 +10,7 @@ fn repo_root() -> PathBuf {
 }
 
 #[test]
-fn policy_audit_is_triple_disarmed_with_one_disabled_caller() {
+fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
     let workflow = include_str!("../.github/workflows/release-policy-audit.yml");
     let activation: serde_json::Value =
         serde_json::from_str(include_str!("../.github/release/release-activation.json"))
@@ -21,12 +21,20 @@ fn policy_audit_is_triple_disarmed_with_one_disabled_caller() {
     .expect("parse policy audit contract");
 
     assert!(workflow.contains("on:\n  workflow_call:"));
-    assert_eq!(workflow.matches("if: ${{ false }}").count(), 1);
+    assert_eq!(
+        workflow
+            .matches("\n    if: ${{ inputs.simulation }}")
+            .count(),
+        1
+    );
     assert_eq!(workflow.matches("permissions: {}").count(), 1);
     assert!(workflow.contains("assert-release-capability.py policy_audit"));
     assert!(workflow.contains("environment: release-policy-audit"));
     assert!(workflow
         .contains("actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349"));
+    assert!(workflow.contains("scripts/release/policy-root.py"));
+    assert!(workflow.contains("--expected-workflow-id 316223904"));
+    assert!(workflow.contains("candidate manifest SHA-256 differs"));
     for permission in [
         "permission-actions: read",
         "permission-administration: write",
@@ -75,12 +83,15 @@ fn policy_audit_is_triple_disarmed_with_one_disabled_caller() {
     assert!(capabilities.values().all(|value| value == false));
     assert_eq!(activation["runtime_override_allowed"], false);
     assert_eq!(activation["status"], "disarmed");
-    assert_eq!(contract["audit_app"]["configured"], false);
-    assert!(contract["audit_app"]["app_id"].is_null());
-    assert!(contract["audit_app"]["installation_id"].is_null());
+    assert_eq!(contract["audit_app"]["configured"], true);
+    assert_eq!(contract["audit_app"]["app_id"], 4344532);
+    assert_eq!(contract["audit_app"]["installation_id"], 147749910);
     assert_eq!(contract["audit_app"]["pat_fallback"], false);
-    assert_eq!(contract["workflow"]["caller_count"], 1);
-    assert_eq!(contract["workflow"]["privileged_job_condition"], "false");
+    assert_eq!(contract["workflow"]["caller_count"], 2);
+    assert_eq!(
+        contract["workflow"]["privileged_job_condition"],
+        "inputs.simulation"
+    );
     assert_eq!(contract["token_lifecycle"]["collector_methods"][0], "GET");
     let required_checks = contract["expected_state"]["main"]["required_checks"]
         .as_array()
@@ -105,8 +116,10 @@ fn policy_audit_is_triple_disarmed_with_one_disabled_caller() {
             callers.push(path);
         }
     }
-    assert_eq!(callers.len(), 1, "policy audit must have one exact caller");
+    callers.sort();
+    assert_eq!(callers.len(), 2, "policy audit must have two exact callers");
     assert!(callers[0].ends_with("release-promote.yml"));
+    assert!(callers[1].ends_with("release-promotion-simulation.yml"));
     let caller = fs::read_to_string(&callers[0]).expect("read promote workflow");
     let audit_job = caller
         .split("\n  policy-audit:\n")
@@ -114,6 +127,22 @@ fn policy_audit_is_triple_disarmed_with_one_disabled_caller() {
         .and_then(|tail| tail.split("\n  authorize-promotion:\n").next())
         .expect("isolated policy audit caller job");
     assert!(audit_job.contains("if: ${{ false }}"));
+    let simulation = fs::read_to_string(&callers[1]).expect("read simulation workflow");
+    assert!(simulation.contains("on:\n  workflow_dispatch:"));
+    assert!(simulation.contains("simulation: true"));
+    assert!(simulation.contains("publication_authority\": False"));
+    assert!(simulation.contains("repository_mutations\": False"));
+    for authority in [
+        "contents: write",
+        "id-token: write",
+        "attestations: write",
+        "packages: write",
+    ] {
+        assert!(
+            !simulation.contains(authority),
+            "simulation gained {authority}"
+        );
+    }
 
     let collector = include_str!("../scripts/release/policy-audit.py");
     assert!(collector.contains("method=\"GET\""));
@@ -208,6 +237,18 @@ write(contract_path, contract)
 expected = contract["expected_state"]
 expected_checks = expected["main"]["required_checks"]
 expected_contexts = [check["context"] for check in expected_checks]
+
+def environment(environment_id):
+    return {
+        "id": environment_id, "can_admins_bypass": False,
+        "deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False},
+        "protection_rules": [
+            {"type": "required_reviewers", "prevent_self_review": False,
+             "reviewers": [{"type": "User", "reviewer": {"id": 876824, "login": "shideneyu"}}]},
+            {"type": "branch_policy"},
+        ],
+    }
+
 responses = {
     "repository": {
         "id": 1239918790, "full_name": "Helvesec/rmux", "default_branch": "main",
@@ -238,20 +279,15 @@ responses = {
         "enforcement": "active", "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
         "rules": [{"type": "update"}, {"type": "deletion"}], "bypass_actors": [],
     },
-    "release_tagging": {
-        "id": 18400330964, "can_admins_bypass": False,
-        "deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False},
-        "protection_rules": [
-            {"type": "required_reviewers", "prevent_self_review": False,
-             "reviewers": [{"type": "User", "reviewer": {"id": 876824, "login": "shideneyu"}}]},
-            {"type": "branch_policy"},
-        ],
-    },
+    "release_environment": environment(16229050415),
+    "release_policy_audit": environment(18412850020),
+    "release_publication": environment(18412849790),
+    "release_tagging": environment(18400330964),
     "immutable_releases": {"enabled": True, "enforced_by_owner": True},
     "self_hosted_runners": {"total_count": 0, "runners": []},
-    "installation": {
-        "id": 9002, "app_id": 9001, "app_slug": "rmux-policy-audit-test",
-        "repository_selection": "selected",
+    "audit_app": {
+        "id": 9001, "slug": "rmux-policy-audit-test",
+        "owner": {"login": "Helvesec"}, "events": [],
         "permissions": {"actions": "read", "administration": "write", "metadata": "read"},
     },
     "installation_repositories": {
@@ -281,6 +317,8 @@ common = [
     "--candidate-manifest-expires-at", "2026-07-20T11:00:00Z",
     "--release-intent-id", "stable:policy:test", "--planned-release-ref", "v0.9.1",
     "--release-kind", "stable", "--audit-run-id", "111", "--audit-run-attempt", "1",
+    "--audit-app-id", "9001", "--audit-installation-id", "9002",
+    "--audit-app-slug", "rmux-policy-audit-test",
     "--contract", contract_path, "--policy-root", policy,
     "--api-fixture-dir", fixture, "--now", "2026-07-19T12:00:00Z", "--output", predicate,
 ]
@@ -363,6 +401,9 @@ if importlib.util.find_spec("jsonschema"):
         jsonschema.Draft202012Validator(schema).validate(json.loads(document.read_text()))
 
 disabled = copy.deepcopy(base_contract)
+disabled["audit_app"].update({
+    "configured": False, "app_id": None, "installation_id": None, "app_slug": None,
+})
 disabled_path = root / "disabled-contract.json"
 write(disabled_path, disabled)
 disabled_args = list(common)
@@ -374,6 +415,17 @@ assert "unconfigured" in rejected_disabled.stderr
 wrong_repo = list(common)
 wrong_repo[wrong_repo.index("Helvesec/rmux")] = "attacker/fork"
 assert invoke(wrong_repo).returncode != 0
+
+for flag, replacement in [
+    ("--audit-app-id", "1"),
+    ("--audit-installation-id", "2"),
+    ("--audit-app-slug", "attacker-app"),
+]:
+    changed = list(common)
+    changed[changed.index(flag) + 1] = replacement
+    rejected = invoke(changed)
+    assert rejected.returncode != 0, f"{flag} identity drift accepted"
+    assert "identity" in rejected.stderr, rejected.stderr
 
 def reject_response(key, mutate, expected_message):
     original = copy.deepcopy(responses[key])
@@ -397,9 +449,14 @@ reject_response("branch_protection", lambda v: v["required_status_checks"]["cont
 reject_response("tag_creation_ruleset", lambda v: v["bypass_actors"][0].update(actor_id=1), "tag_creation_ruleset differs")
 reject_response("tag_creation_ruleset", lambda v: v.pop("bypass_actors"), "bypass actors must be an array")
 reject_response("tag_immutability_ruleset", lambda v: v["bypass_actors"].append({"actor_id": 1}), "tag_immutability_ruleset differs")
+reject_response("release_environment", lambda v: v.update(can_admins_bypass=True), "release differs")
+reject_response("release_policy_audit", lambda v: v.update(can_admins_bypass=True), "release_policy_audit differs")
+reject_response("release_publication", lambda v: v.update(can_admins_bypass=True), "release_publication differs")
 reject_response("release_tagging", lambda v: v.update(can_admins_bypass=True), "release_tagging differs")
 reject_response("self_hosted_runners", lambda v: v.update(total_count=1, runners=[{"id": 1}]), "inventory must be empty")
-reject_response("installation", lambda v: v.update(app_id=1), "audit App identity")
+reject_response("audit_app", lambda v: v.update(id=1), "action identity differs")
+reject_response("audit_app", lambda v: v["owner"].update(login="attacker"), "owner changed")
+reject_response("audit_app", lambda v: v.update(events=["push"]), "webhook events changed")
 reject_response("installation_repositories", lambda v: v.update(total_count=2, repositories=[{"id": 1}, {"id": 1239918790}]), "audit_app_repositories differs")
 reject_response("policy_workflow", lambda v: v.update(state="disabled_manually"), "not active")
 

@@ -16,13 +16,13 @@
   "workflow": {
     "path": ".github/workflows/release-policy-audit.yml",
     "only_trigger": "workflow_call",
-    "caller_count": 1,
+    "caller_count": 2,
     "required_run_attempt": 1,
     "privileged_job": "policy-audit",
-    "privileged_job_condition": "false",
+    "privileged_job_condition": "inputs.simulation",
     "environment": "release-policy-audit",
     "runner_image": "ubuntu-22.04",
-    "workflow_id": null
+    "workflow_id": 316425885
   },
   "candidate_binding": {
     "candidate_run_attempt": 1,
@@ -32,10 +32,10 @@
     "release_kinds": ["rc", "stable"]
   },
   "audit_app": {
-    "configured": false,
-    "app_id": null,
-    "installation_id": null,
-    "app_slug": null,
+    "configured": true,
+    "app_id": 4344532,
+    "installation_id": 147749910,
+    "app_slug": "helvesec-rmux-policy-audit",
     "repository_selection": "selected",
     "repository_ids": [1239918790],
     "permissions": {
@@ -64,11 +64,14 @@
     "repository_state_mutations": false
   },
   "api_gets": [
+    {"key": "audit_app", "path": "/apps/helvesec-rmux-policy-audit"},
     {"key": "branch_protection", "path": "/repos/Helvesec/rmux/branches/main/protection"},
     {"key": "immutable_releases", "path": "/repos/Helvesec/rmux/immutable-releases"},
-    {"key": "installation", "path": "/installation"},
     {"key": "installation_repositories", "path": "/installation/repositories?per_page=100&page=1"},
     {"key": "policy_workflow", "path": "/repos/Helvesec/rmux/actions/workflows/release-policy-audit.yml"},
+    {"key": "release_environment", "path": "/repos/Helvesec/rmux/environments/release"},
+    {"key": "release_policy_audit", "path": "/repos/Helvesec/rmux/environments/release-policy-audit"},
+    {"key": "release_publication", "path": "/repos/Helvesec/rmux/environments/release-publication"},
     {"key": "release_tagging", "path": "/repos/Helvesec/rmux/environments/release-tagging"},
     {"key": "repository", "path": "/repositories/1239918790"},
     {"key": "self_hosted_runners", "path": "/repos/Helvesec/rmux/actions/runners?per_page=100&page=1"},
@@ -132,6 +135,36 @@
       "rules": ["deletion", "update"],
       "target": "tag"
     },
+    "release": {
+      "can_admins_bypass": false,
+      "custom_branch_policies": false,
+      "environment_id": 16229050415,
+      "prevent_self_review": false,
+      "protected_branches": true,
+      "reviewer_id": 876824,
+      "reviewer_login": "shideneyu",
+      "reviewer_type": "User"
+    },
+    "release_policy_audit": {
+      "can_admins_bypass": false,
+      "custom_branch_policies": false,
+      "environment_id": 18412850020,
+      "prevent_self_review": false,
+      "protected_branches": true,
+      "reviewer_id": 876824,
+      "reviewer_login": "shideneyu",
+      "reviewer_type": "User"
+    },
+    "release_publication": {
+      "can_admins_bypass": false,
+      "custom_branch_policies": false,
+      "environment_id": 18412849790,
+      "prevent_self_review": false,
+      "protected_branches": true,
+      "reviewer_id": 876824,
+      "reviewer_login": "shideneyu",
+      "reviewer_type": "User"
+    },
     "release_tagging": {
       "can_admins_bypass": false,
       "custom_branch_policies": false,
@@ -154,11 +187,7 @@
       "total_count": 1
     }
   },
-  "external_blockers": [
-    "audit_app_not_installed",
-    "release_policy_audit_environment_missing",
-    "release_publication_environment_missing"
-  ],
+  "external_blockers": [],
   "proof": {
     "predicate_schema": ".github/release/schemas/policy-audit-predicate.schema.json",
     "reference_schema": ".github/release/schemas/policy-audit-reference.schema.json",
