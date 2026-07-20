@@ -153,6 +153,7 @@ use std::time::Duration;
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let create_mate = std::env::var_os("RMUX_CLAUDE_TEST_CREATE_SWARM_FALLBACK").is_some();
     let tmux_env = std::env::var("TMUX").unwrap_or_default();
     let tmux_pane_env = std::env::var("TMUX_PANE").unwrap_or_default();
     let shell_env = std::env::var("SHELL").unwrap_or_default();
@@ -195,7 +196,7 @@ fn main() {
         writeln!(file, "tmux_version_stdout={}", version.trim()).expect("append version");
     }
     let _ = io::stdout().flush();
-    if std::env::var_os("RMUX_CLAUDE_TEST_CREATE_SWARM_FALLBACK").is_some() {
+    if create_mate {
         let default_shell = Command::new("tmux")
             .arg("show-options")
             .arg("-gqv")
@@ -265,7 +266,14 @@ fn main() {
         }
         let _ = io::stdout().flush();
     }
-    thread::sleep(Duration::from_secs(30));
+    // A detached mate becomes visible only after the lead exits. Keep both
+    // panes alive concurrently without racing their equal-duration sleeps.
+    let lead_hold = if create_mate {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(30)
+    };
+    thread::sleep(lead_hold);
 }
 "##,
     )?;
