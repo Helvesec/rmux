@@ -164,7 +164,11 @@ def asset_files(directory: Path, platform: dict[str, Any]) -> list[dict[str, Any
     if not root.is_dir():
         raise ValueError("assets path must be a directory")
     files: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
+    paths = sorted(
+        root.rglob("*"),
+        key=lambda path: path.relative_to(root).as_posix().encode("utf-8"),
+    )
+    for path in paths:
         if path.is_symlink():
             raise ValueError(f"canonical assets cannot contain symlinks: {path}")
         if path.is_dir():
