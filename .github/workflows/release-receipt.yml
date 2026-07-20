@@ -91,6 +91,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.authorization_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-receipt/authorization
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -100,6 +101,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.authorization_envelope_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-receipt/envelope
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}

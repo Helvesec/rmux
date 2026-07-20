@@ -171,6 +171,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-policy-audit
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}

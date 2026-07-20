@@ -191,7 +191,7 @@ fn retries_bind_exact_receipt_result_origin_and_closed_bundle() {
         );
         assert_eq!(prepare.matches("--max-attempts 1").count(), 5);
         assert!(!prepare.contains("pattern:"));
-        assert!(!prepare.contains("merge-multiple:"));
+        assert_eq!(prepare.matches("merge-multiple: true").count(), 4);
         for exact_file in [
             "channel-payload.json",
             "downstream-channel-plan.json",

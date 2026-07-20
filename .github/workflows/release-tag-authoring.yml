@@ -116,6 +116,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.candidate_manifest_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-tag-input
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -218,6 +219,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ needs.verify-tag-inputs.outputs.bundle_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-tag-input
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}

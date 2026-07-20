@@ -113,6 +113,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.receipt_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-downstream/receipt
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -122,6 +123,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ inputs.receipt_envelope_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-downstream/envelope
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
@@ -375,6 +377,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-downstream-summary
 
       - name: Fail closed before consuming incomplete channel results
@@ -439,6 +442,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           artifact-ids: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+          merge-multiple: true
           path: ${{ runner.temp }}/rmux-downstream-summary
 
       - name: Fail closed before consuming incomplete channel results

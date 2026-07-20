@@ -498,6 +498,7 @@
     "tests/reference/tmux_compat/divergences.toml",
     "tests/reference/tmux_compat/error_exit_matrix.yaml",
     "tests/reference/tmux_compat/frozen_reference.yaml",
+    "tests/release_artifact_download_spec.rs",
     "tests/release_automation_spec.rs",
     "tests/release_candidate_artifacts_spec.rs",
     "tests/release_candidate_manifest_spec.rs",

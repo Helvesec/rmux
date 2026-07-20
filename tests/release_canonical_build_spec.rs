@@ -185,6 +185,7 @@ fn canonical_producers_are_object_cold_and_non_publishing() {
 #[test]
 fn canonical_smokes_consume_numeric_ids_and_exact_fast_drivers() {
     let smoke = include_str!("../.github/actions/canonical-smoke/action.yml");
+    assert_eq!(smoke.matches("merge-multiple: true").count(), 2);
     for required in [
         "artifact-ids: ${{ inputs.assets-artifact-id }}",
         "test \"$RUNNER_ENVIRONMENT\" = github-hosted",
