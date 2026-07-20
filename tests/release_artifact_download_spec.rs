@@ -24,6 +24,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../.github/workflows/release-promote.yml"),
     ),
     (
+        ".github/workflows/release-promotion-simulation.yml",
+        include_str!("../.github/workflows/release-promotion-simulation.yml"),
+    ),
+    (
         ".github/workflows/release-receipt.yml",
         include_str!("../.github/workflows/release-receipt.yml"),
     ),
@@ -81,6 +85,6 @@ fn exact_single_artifact_downloads_extract_into_the_requested_directory() {
         }
     }
 
-    assert_eq!(single_downloads, 26);
+    assert_eq!(single_downloads, 28);
     assert_eq!(multi_downloads, 3);
 }

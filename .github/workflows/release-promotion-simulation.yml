@@ -1,0 +1,217 @@
+name: Release promotion simulation
+
+on:
+  workflow_dispatch:
+    inputs:
+      simulation_id:
+        description: Unique nonpublishing simulation identifier
+        required: true
+        type: string
+      candidate_run_id:
+        required: true
+        type: string
+      candidate_manifest_run_id:
+        required: true
+        type: string
+      candidate_manifest_artifact_id:
+        required: true
+        type: string
+      candidate_manifest_artifact_digest:
+        required: true
+        type: string
+      candidate_manifest_sha256:
+        required: true
+        type: string
+      candidate_manifest_created_at:
+        required: true
+        type: string
+      candidate_manifest_expires_at:
+        required: true
+        type: string
+      expected_source_sha:
+        required: true
+        type: string
+      release_intent_id:
+        required: true
+        type: string
+      planned_release_ref:
+        required: true
+        type: string
+      release_kind:
+        required: true
+        type: choice
+        options: [rc, stable]
+      release_policy_sha256:
+        required: true
+        type: string
+      release_policy_contract_blob_oid:
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: rmux-release-promotion-simulation-${{ inputs.expected_source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  policy-audit:
+    name: Audit exact live policy without publication authority
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/release-policy-audit.yml
+    with:
+      simulation: true
+      candidate_run_id: ${{ inputs.candidate_run_id }}
+      candidate_manifest_run_id: ${{ inputs.candidate_manifest_run_id }}
+      candidate_manifest_artifact_id: ${{ inputs.candidate_manifest_artifact_id }}
+      candidate_manifest_artifact_digest: ${{ inputs.candidate_manifest_artifact_digest }}
+      candidate_manifest_sha256: ${{ inputs.candidate_manifest_sha256 }}
+      candidate_manifest_created_at: ${{ inputs.candidate_manifest_created_at }}
+      candidate_manifest_expires_at: ${{ inputs.candidate_manifest_expires_at }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_intent_id: ${{ inputs.release_intent_id }}
+      planned_release_ref: ${{ inputs.planned_release_ref }}
+      release_kind: ${{ inputs.release_kind }}
+      release_policy_sha256: ${{ inputs.release_policy_sha256 }}
+      release_policy_contract_blob_oid: ${{ inputs.release_policy_contract_blob_oid }}
+
+  verify-simulation:
+    name: Verify nonpublishing promotion and receipt contracts
+    needs: policy-audit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    env:
+      RMUX_SIMULATION_ID: ${{ inputs.simulation_id }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
+      RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned_release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
+      RMUX_AUDIT_REFERENCE_ID: ${{ needs.policy-audit.outputs.policy_audit_reference_artifact_id }}
+      RMUX_AUDIT_REFERENCE_DIGEST: ${{ needs.policy-audit.outputs.policy_audit_reference_artifact_digest }}
+    steps:
+      - name: Reject malformed or authoritative execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RMUX_SIMULATION_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RMUX_RELEASE_INTENT_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]
+          [[ "$RMUX_PLANNED_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$RMUX_RELEASE_KIND" =~ ^(rc|stable)$ ]]
+          [[ "$RMUX_AUDIT_REFERENCE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RMUX_AUDIT_REFERENCE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Verify disarmed policy and exact audit reference artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/release/assert-release-capability.py policy_audit 2> "$RUNNER_TEMP/capability-error.txt" && exit 1
+          grep -F "disabled until reviewed PR8" "$RUNNER_TEMP/capability-error.txt"
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --artifact-id "$RMUX_AUDIT_REFERENCE_ID" \
+            --name "rmux-policy-audit-reference-$GITHUB_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_AUDIT_REFERENCE_DIGEST" \
+            --max-attempts 1
+
+      - name: Download only the exact audit reference
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.policy-audit.outputs.policy_audit_reference_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-promotion-simulation
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Verify audit binding and nonpublishing release contracts
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/rmux-promotion-simulation/policy-audit-reference.json" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "status": "shadow-non-authoritative",
+              "repository_id": 1239918790,
+              "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "candidate_run_id": int(os.environ["RMUX_CANDIDATE_RUN_ID"]),
+              "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
+              "policy_audit_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "policy_audit_run_attempt": 1,
+              "app_id": 4344532,
+              "installation_id": 147749910,
+              "workflow_id": 316425885,
+              "workflow_path": ".github/workflows/release-policy-audit.yml",
+          }
+          for field, wanted in expected.items():
+              if value.get(field) != wanted:
+                  raise SystemExit(f"audit reference {field} differs")
+          PY
+          cargo test --locked \
+            --test release_promotion_evidence_spec \
+            --test release_github_publisher_spec \
+            --test release_receipt_attestation_spec \
+            --test release_promoter_workflows_spec
+
+      - name: Write the nonauthoritative simulation record
+        run: |
+          set -euo pipefail
+          python3 - "$RUNNER_TEMP/rmux-promotion-simulation-record.json" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          value = {
+              "schema_version": 1,
+              "status": "nonpublishing-simulation",
+              "simulation_id": os.environ["RMUX_SIMULATION_ID"],
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "candidate_run_id": int(os.environ["RMUX_CANDIDATE_RUN_ID"]),
+              "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
+              "planned_release_ref": os.environ["RMUX_PLANNED_RELEASE_REF"],
+              "release_kind": os.environ["RMUX_RELEASE_KIND"],
+              "policy_audit_reference_artifact_id": int(os.environ["RMUX_AUDIT_REFERENCE_ID"]),
+              "policy_audit_reference_artifact_digest": os.environ["RMUX_AUDIT_REFERENCE_DIGEST"],
+              "publication_authority": False,
+              "repository_mutations": False,
+              "receipt_recovery_contracts_exercised": True,
+          }
+          pathlib.Path(sys.argv[1]).write_text(
+              json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload the nonauthoritative simulation record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-promotion-simulation-${{ inputs.simulation_id }}
+          path: ${{ runner.temp }}/rmux-promotion-simulation-record.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

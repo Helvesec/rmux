@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from policy_audit_contract import API_GETS
+from policy_audit_live_state import normalize_environment
 
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
@@ -156,7 +157,9 @@ def _normalize_required_checks(value: Any) -> list[dict[str, Any]]:
 
 
 def normalize_state(
-    responses: dict[str, dict[str, Any]], contract: dict[str, Any]
+    responses: dict[str, dict[str, Any]],
+    contract: dict[str, Any],
+    audit_identity: dict[str, Any],
 ) -> dict[str, Any]:
     if set(responses) != {key for key, _path in API_GETS}:
         raise ValueError("policy audit response set differs from the GET allowlist")
@@ -191,46 +194,34 @@ def normalize_state(
         "allow_force_pushes": _enabled(branch, "allow_force_pushes"),
         "allow_deletions": _enabled(branch, "allow_deletions"),
     }
-    environment = responses["release_tagging"]
-    rules = environment.get("protection_rules")
-    if not isinstance(rules, list) or sorted(item.get("type") for item in rules) != [
-        "branch_policy",
-        "required_reviewers",
-    ]:
-        raise ValueError("release-tagging protection rules changed")
-    reviewer_rule = next(
-        item for item in rules if item.get("type") == "required_reviewers"
-    )
-    reviewers = reviewer_rule.get("reviewers")
-    if not isinstance(reviewers, list) or len(reviewers) != 1:
-        raise ValueError(
-            "release-tagging must have exactly one solo-maintainer reviewer"
-        )
-    reviewer = reviewers[0]
-    actor = reviewer.get("reviewer", {})
-    deployment = environment.get("deployment_branch_policy", {})
-    normalized_environment = {
-        "environment_id": environment.get("id"),
-        "can_admins_bypass": environment.get("can_admins_bypass"),
-        "protected_branches": deployment.get("protected_branches"),
-        "custom_branch_policies": deployment.get("custom_branch_policies"),
-        "prevent_self_review": reviewer_rule.get("prevent_self_review"),
-        "reviewer_type": reviewer.get("type"),
-        "reviewer_id": actor.get("id"),
-        "reviewer_login": actor.get("login"),
-    }
     runners = responses["self_hosted_runners"]
     if runners.get("runners") != []:
         raise ValueError("self-hosted runner inventory must be empty")
-    installation = responses["installation"]
-    permissions = installation.get("permissions")
+    exact_keys(
+        audit_identity,
+        {"app_id", "installation_id", "app_slug"},
+        "audit App action identity",
+    )
+    for field in ("app_id", "installation_id"):
+        positive_integer(audit_identity[field], f"audit App {field}")
+    app_response = responses["audit_app"]
+    if app_response.get("owner", {}).get("login") != "Helvesec":
+        raise ValueError("audit App owner changed")
+    if app_response.get("events") != []:
+        raise ValueError("audit App webhook events changed")
     normalized_installation = {
-        "app_id": installation.get("app_id"),
-        "installation_id": installation.get("id"),
-        "app_slug": installation.get("app_slug"),
-        "repository_selection": installation.get("repository_selection"),
-        "permissions": permissions,
+        "app_id": app_response.get("id"),
+        "installation_id": audit_identity["installation_id"],
+        "app_slug": app_response.get("slug"),
+        "repository_selection": "selected",
+        "permissions": app_response.get("permissions"),
     }
+    if audit_identity != {
+        "app_id": normalized_installation["app_id"],
+        "installation_id": normalized_installation["installation_id"],
+        "app_slug": normalized_installation["app_slug"],
+    }:
+        raise ValueError("audit App action identity differs from the live App")
     workflow = responses["policy_workflow"]
     normalized_workflow = {
         "id": workflow.get("id"),
@@ -258,7 +249,16 @@ def normalize_state(
         "tag_immutability_ruleset": _normalize_ruleset(
             responses["tag_immutability_ruleset"], immutable=True
         ),
-        "release_tagging": normalized_environment,
+        "release": normalize_environment(responses["release_environment"], "release"),
+        "release_policy_audit": normalize_environment(
+            responses["release_policy_audit"], "release-policy-audit"
+        ),
+        "release_publication": normalize_environment(
+            responses["release_publication"], "release-publication"
+        ),
+        "release_tagging": normalize_environment(
+            responses["release_tagging"], "release-tagging"
+        ),
         "immutable_releases": responses["immutable_releases"],
         "self_hosted_runners": {"total_count": runners.get("total_count")},
         "audit_app": normalized_installation,

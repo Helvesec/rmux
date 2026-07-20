@@ -66,10 +66,10 @@
     "activation_ledger": ".github/release/release-activation.json",
     "capability_enabled": false,
     "contract": ".github/release/policy-audit-contract.json",
-    "audit_app_configured": false,
+    "audit_app_configured": true,
     "workflow": ".github/workflows/release-policy-audit.yml",
-    "workflow_callers": 1,
-    "privileged_job_condition": "false",
+    "workflow_callers": 2,
+    "privileged_job_condition": "inputs.simulation",
     "pat_fallback": false,
     "authorizes_publication": false
   },
