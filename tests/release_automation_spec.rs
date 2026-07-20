@@ -1437,6 +1437,23 @@ fn workflows_install_the_workspace_toolchain_instead_of_floating_stable() {
 }
 
 #[test]
+fn rustup_downloads_retry_transient_network_failures() {
+    for (name, workflow) in [
+        ("CI", include_str!("../.github/workflows/ci.yml")),
+        (
+            "release candidate delta",
+            include_str!("../.github/workflows/release-candidate-delta.yml"),
+        ),
+        ("release", include_str!("../.github/workflows/release.yml")),
+    ] {
+        assert!(
+            workflow.contains("RUSTUP_MAX_RETRIES: \"10\""),
+            "{name} does not retry transient rustup downloads"
+        );
+    }
+}
+
+#[test]
 fn every_ci_and_release_job_has_a_bounded_runtime() {
     for (workflow_name, workflow) in [
         ("ci", include_str!("../.github/workflows/ci.yml")),

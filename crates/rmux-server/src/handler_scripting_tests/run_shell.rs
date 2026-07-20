@@ -848,6 +848,8 @@ async fn background_run_shell_preserves_hook_formats_after_hook_scope_exits() {
 
     assert_eq!(response, Response::RunShell(RunShellResponse::background()));
     wait_for_file_text(&output_path, "%1").await;
+    wait_for_detached_request_count(&handler, 0).await;
+    std::fs::remove_dir_all(root).expect("remove background hook format output root");
 }
 
 #[tokio::test]
@@ -909,18 +911,22 @@ async fn execute_test_command(handler: &RequestHandler, command: &str) {
 }
 
 async fn wait_for_file_text(path: &std::path::Path, expected: &str) {
-    tokio::time::timeout(background_shell_test_timeout(), async {
+    let mut last_observed = None;
+    let result = tokio::time::timeout(background_shell_test_timeout(), async {
         loop {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if text == expected {
                     return;
                 }
+                last_observed = Some(text);
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("file {path:?} did not become {expected:?}"));
+    .await;
+    if result.is_err() {
+        panic!("file {path:?} did not become {expected:?}; last observed text: {last_observed:?}");
+    }
 }
 
 fn write_literal_format_command(path: &std::path::Path, text: &str) -> String {
