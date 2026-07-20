@@ -1876,11 +1876,15 @@ fn windows_send_keys_ctrl_c_preserves_raw_console_character_when_processed_input
         RAW_CONSOLE_PROBE_READY_TIMEOUT,
     )?;
 
-    run_rmux(
+    run_rmux(&binary, &label, ["send-keys", "-t", "rawsend:0.0", "C-c"])?;
+    wait_for_capture_contains(
         &binary,
         &label,
-        ["send-keys", "-t", "rawsend:0.0", "C-c", "x"],
+        "rawsend:0.0",
+        b"CHAR_0003",
+        EXIT_LATENCY_TIMEOUT,
     )?;
+    run_rmux(&binary, &label, ["send-keys", "-t", "rawsend:0.0", "x"])?;
 
     let (returned, output) = capture_until_contains(
         &binary,
