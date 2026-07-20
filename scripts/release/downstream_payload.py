@@ -334,18 +334,20 @@ def collect_files(root: Path, values: list[str] | None) -> list[dict[str, Any]]:
         raise ValueError("at least one ROLE=NAME payload file is required")
     if root.is_symlink() or not root.is_dir():
         raise ValueError("payload root must be one real directory")
-    mapped: dict[str, str] = {}
+    mapped: list[tuple[str, str]] = []
+    names: set[str] = set()
     for value in values:
         if "=" not in value:
             raise ValueError("payload file must use ROLE=NAME")
         role, name = value.split("=", 1)
-        if not role or role in mapped or SAFE_NAME.fullmatch(name) is None:
+        if not role or name in names or SAFE_NAME.fullmatch(name) is None:
             raise ValueError("payload file role or name is invalid")
-        mapped[role] = name
+        mapped.append((role, name))
+        names.add(name)
     paths = list(root.iterdir())
     if any(path.is_symlink() or not path.is_file() for path in paths):
         raise ValueError("payload root can contain only regular files")
-    if {path.name for path in paths} != set(mapped.values()):
+    if {path.name for path in paths} != names:
         raise ValueError("payload root file set differs from its role mapping")
     files = [
         {
@@ -354,7 +356,7 @@ def collect_files(root: Path, values: list[str] | None) -> list[dict[str, Any]]:
             "size": (root / name).stat().st_size,
             "sha256": file_hash(root / name),
         }
-        for role, name in mapped.items()
+        for role, name in mapped
     ]
     files.sort(key=lambda item: item["name"])
     return files
