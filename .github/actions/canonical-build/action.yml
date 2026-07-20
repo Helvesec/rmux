@@ -26,6 +26,10 @@ inputs:
   target-triple:
     description: Native Rust target triple contracted for the platform
     required: true
+  snap-package:
+    description: Exact native Snap already smoke-tested on Linux
+    required: false
+    default: ""
 
 outputs:
   assets-artifact-id:
@@ -60,6 +64,7 @@ runs:
         RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
         RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
         RMUX_RUNNER_IMAGE: ${{ inputs.runner-image }}
+        RMUX_SNAP_PACKAGE: ${{ inputs.snap-package }}
         RMUX_TARGET_TRIPLE: ${{ inputs.target-triple }}
       run: |
         set -euo pipefail
@@ -73,6 +78,11 @@ runs:
         test -z "${RUSTC_WRAPPER:-}"
         test -z "${RUSTC_WORKSPACE_WRAPPER:-}"
         test "$CARGO_INCREMENTAL" = 0
+        if [[ "$RMUX_PLATFORM_KEY" == linux-* ]]; then
+          test -n "$RMUX_SNAP_PACKAGE"
+        else
+          test -z "$RMUX_SNAP_PACKAGE"
+        fi
         canonical_target="$RUNNER_TEMP/rmux-canonical-target"
         canonical_bundle="$RUNNER_TEMP/rmux-canonical-bundle"
         canonical_assets="$canonical_bundle/assets"
@@ -163,6 +173,101 @@ runs:
           -Target $env:RMUX_TARGET_TRIPLE `
           -PlatformLabel $env:RMUX_PLATFORM_KEY `
           -OutputDir $env:CANONICAL_ASSETS
+
+    - name: Stage the native Snap bytes
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
+        RMUX_SNAP_PACKAGE: ${{ inputs.snap-package }}
+      run: |
+        set -euo pipefail
+        test -f "$RMUX_SNAP_PACKAGE"
+        test ! -L "$RMUX_SNAP_PACKAGE"
+        version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+        case "$RMUX_PLATFORM_KEY" in
+          linux-x86_64) snap_arch=amd64 ;;
+          linux-aarch64) snap_arch=arm64 ;;
+          *) echo "unexpected Snap platform: $RMUX_PLATFORM_KEY" >&2; exit 1 ;;
+        esac
+        cp -- "$RMUX_SNAP_PACKAGE" "$CANONICAL_ASSETS/rmux-$version-snap-$snap_arch.snap"
+
+    - name: Build the canonical crates.io and browser WASM payloads
+      if: inputs.platform-key == 'linux-x86_64'
+      shell: bash
+      env:
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+      run: |
+        set -euo pipefail
+        version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+        tools="$RUNNER_TEMP/rmux-canonical-tools"
+        wasm_target="$RUNNER_TEMP/rmux-canonical-wasm-target"
+        crate_target="$RUNNER_TEMP/rmux-canonical-crate-target"
+        test ! -e "$tools"
+        test ! -e "$wasm_target"
+        test ! -e "$crate_target"
+        rustup toolchain install 1.94.1 --profile minimal --target wasm32-unknown-unknown
+        CARGO_TARGET_DIR="$RUNNER_TEMP/rmux-wasm-pack-target" \
+          cargo install wasm-pack --version 0.13.1 --locked --root "$tools"
+        cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+        rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+        remap="--remap-path-prefix=$GITHUB_WORKSPACE=/rmux-source --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$rustup_home=/rustup"
+        PATH="$tools/bin:$PATH" \
+          CARGO_TARGET_DIR="$wasm_target" \
+          RUSTFLAGS="$remap" \
+          RUSTUP_TOOLCHAIN=1.94.1 \
+          scripts/build-web-crypto-wasm.sh wasm
+        scripts/release/canonical-wasm-bundle.py create \
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --version "$version" \
+          --package-dir crates/rmux-web-crypto/pkg \
+          --output-dir "$CANONICAL_ASSETS"
+        scripts/release/canonical-crate-set.py create \
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --version "$version" \
+          --target-dir "$crate_target" \
+          --output-dir "$CANONICAL_ASSETS"
+
+    - name: Generate the canonical Chocolatey package source
+      if: runner.os == 'Windows'
+      shell: bash
+      env:
+        RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned-release-ref }}
+      run: |
+        set -euo pipefail
+        version="$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+        package_root="$RUNNER_TEMP/rmux-canonical-chocolatey"
+        test ! -e "$package_root"
+        scripts/generate-chocolatey-package.sh \
+          --version "$version" \
+          --release-tag "$RMUX_PLANNED_RELEASE_REF" \
+          --checksums "$CANONICAL_ASSETS/SHA256SUMS.txt" \
+          --output-dir "$package_root"
+        echo "RMUX_CHOCOLATEY_ROOT=$package_root" >> "$GITHUB_ENV"
+        echo "RMUX_PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+
+    - name: Pack the canonical Chocolatey payload
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        Push-Location $env:RMUX_CHOCOLATEY_ROOT
+        try {
+          choco pack .\rmux.nuspec --outputdirectory .
+        } finally {
+          Pop-Location
+        }
+        $package = Join-Path $env:RMUX_CHOCOLATEY_ROOT "rmux.$env:RMUX_PACKAGE_VERSION.nupkg"
+        if (-not (Test-Path -LiteralPath $package -PathType Leaf)) {
+          throw "canonical Chocolatey package was not generated"
+        }
+        Copy-Item -LiteralPath $package -Destination $env:CANONICAL_ASSETS
+
+    - name: Regenerate checksums over native and supplemental bytes
+      shell: bash
+      run: >-
+        scripts/release/canonical-build-record.py checksums
+        --assets-dir "$CANONICAL_ASSETS"
 
     - id: record
       name: Record and enumerate every subject

@@ -359,7 +359,7 @@ jobs:
             --name "$(jq -er .artifact.name "$payload")" \
             --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
             --expected-digest "$(jq -er .artifact.archive_digest "$payload")" \
-            --max-attempts 1 > "$root/payload-artifact-live.json"
+            --include-retention --max-attempts 1 > "$root/payload-artifact-live.json"
           python3 - "$payload" "$root/payload-artifact-live.json" <<'PY'
           import json
           import pathlib
@@ -373,6 +373,9 @@ jobs:
               "name": artifact["name"],
               "digest": artifact["archive_digest"],
               "size_in_bytes": artifact["size_in_bytes"],
+              "created_at": artifact["created_at"],
+              "updated_at": artifact["updated_at"],
+              "expires_at": artifact["expires_at"],
               "run_id": payload["producer"]["run_id"],
               "source_git_sha": payload["source_git_sha"],
           }

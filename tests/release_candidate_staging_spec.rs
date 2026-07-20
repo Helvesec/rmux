@@ -23,6 +23,7 @@ fn temp_dir() -> PathBuf {
 const FIXTURE: &str = r#"
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -68,11 +69,22 @@ for platform in platforms:
     root_assets = downloads / assets["name"] / "assets"
     root_assets.mkdir(parents=True)
     roles = ["archive", "checksums"]
-    if platform.startswith("linux-"):
-        roles.extend(["debian", "rpm"])
+    if platform == "linux-x86_64":
+        roles.extend(["crate-package-set", "debian", "rpm", "snap-amd64", "wasm-byte-set", "wasm-provenance"])
+    elif platform == "linux-aarch64":
+        roles.extend(["debian", "rpm", "snap-arm64"])
+    elif platform == "windows-x86_64":
+        roles.append("chocolatey-package")
+    suffixes = {
+        "archive": ".tar.gz", "checksums": ".txt", "chocolatey-package": ".nupkg",
+        "crate-package-set": ".tar", "debian": ".deb", "rpm": ".rpm",
+        "snap-amd64": ".snap", "snap-arm64": ".snap", "wasm-byte-set": ".tar",
+        "wasm-provenance": ".json",
+    }
+    public_roles = {"archive", "debian", "rpm", "snap-amd64", "snap-arm64"}
     files = []
     for role in roles:
-        suffix = {"archive": ".tar.gz", "checksums": ".txt", "debian": ".deb", "rpm": ".rpm"}[role]
+        suffix = suffixes[role]
         name = "SHA256SUMS.txt" if role == "checksums" else f"rmux-{platform}-{role}{suffix}"
         raw = f"{platform}:{role}\n".encode()
         (root_assets / name).write_bytes(raw)
@@ -99,10 +111,10 @@ resolution_path = root / "resolution.json"
 manifest_path.write_text(json.dumps(manifest))
 resolution_path.write_text(json.dumps(resolution))
 
-def invoke(output):
+def invoke(output, downloads_dir=downloads):
     return subprocess.run([
         sys.executable, script, "--manifest", manifest_path,
-        "--resolution", resolution_path, "--downloads-dir", downloads,
+        "--resolution", resolution_path, "--downloads-dir", downloads_dir,
         "--candidate-run-id", str(run_id), "--source-sha", source,
         "--output", output,
     ], cwd=repo, capture_output=True, text=True)
@@ -111,8 +123,16 @@ staged = root / "staged"
 accepted = invoke(staged)
 assert accepted.returncode == 0, accepted.stderr
 sums = (staged / "SHA256SUMS").read_text().splitlines()
-assert len(sums) == 9
+assert len(sums) == 11
 assert all("SHA256SUMS.txt" not in line for line in sums)
+assert not any("crate-package-set" in line or "wasm" in line or ".nupkg" in line for line in sums)
+
+if os.name != "nt":
+    downloads_link = root / "downloads-link"
+    downloads_link.symlink_to(downloads, target_is_directory=True)
+    rejected = invoke(root / "symlink-downloads", downloads_link)
+    assert rejected.returncode != 0
+    assert "candidate downloads must be one real directory" in rejected.stderr
 
 original = resolution["artifacts"][1]["archive_digest"]
 resolution["artifacts"][1]["archive_digest"] = "sha256:" + "f" * 64

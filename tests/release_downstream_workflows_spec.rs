@@ -214,19 +214,46 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
     assert_eq!(contract["execution"]["rmux_io_last"], true);
     assert_eq!(
         contract["payload_evidence"]["canonical_provenance_ready"],
-        false
+        true
     );
-    assert_eq!(contract["payload_evidence"]["actions_expiry_bound"], false);
+    assert_eq!(contract["payload_evidence"]["actions_expiry_bound"], true);
     assert_eq!(
         contract["payload_evidence"]["producer_workflow_allowlist_ready"],
-        false
+        true
+    );
+    assert_eq!(
+        contract["payload_evidence"]["producer"],
+        serde_json::json!({
+            "workflow_id": 316435347,
+            "workflow_path": ".github/workflows/release-receipt.yml",
+            "job_workflow_path": ".github/workflows/release-downstream.yml",
+            "required_run_attempt": 1
+        })
     );
     assert_eq!(
         contract["payload_evidence"]["activation_blockers"],
-        serde_json::json!([
-            "channel_payload_producer_contract_missing",
-            "actions_artifact_expiry_binding_missing"
-        ])
+        serde_json::json!([])
+    );
+    assert_eq!(contract["result_evidence"]["result_reference_ready"], true);
+    assert_eq!(
+        contract["result_evidence"]["result_reference_schema"],
+        ".github/release/schemas/downstream-channel-result-reference.schema.json"
+    );
+    assert_eq!(
+        contract["result_evidence"]["attestation_verification_ready"],
+        true
+    );
+    assert_eq!(
+        contract["result_evidence"]["result_aggregation_ready"],
+        true
+    );
+    assert_eq!(
+        contract["result_evidence"]["aggregation_blockers"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        contract["result_evidence"]["summary_phases"],
+        serde_json::json!(["pre-site", "final"])
     );
     assert_eq!(contract["receipt_gate"]["attestation_required"], true);
     assert_eq!(
@@ -238,8 +265,12 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
         true
     );
     assert_eq!(
+        contract["receipt_gate"]["workflow_id"],
+        serde_json::json!(316435347)
+    );
+    assert_eq!(
         contract["receipt_gate"]["activation_blockers"],
-        serde_json::json!(["receipt_workflow_id_unset_until_merge"])
+        serde_json::json!([])
     );
 
     let channels = contract["channels"].as_array().expect("channels");
@@ -264,21 +295,63 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
             "winget",
         ])
     );
-    for blocked in [
-        "chocolatey",
-        "crates_io",
-        "snap_candidate",
-        "snap_stable",
-        "web_share",
-    ] {
+    for ready in ["chocolatey", "crates_io", "snap_candidate", "web_share"] {
         let channel = channels
             .iter()
-            .find(|channel| channel["name"] == blocked)
-            .expect("blocked channel");
-        assert_eq!(channel["payload_ready"], false, "{blocked} became ready");
+            .find(|channel| channel["name"] == ready)
+            .expect("canonical payload channel");
+        assert_eq!(channel["payload_ready"], true, "{ready} lost its payload");
+    }
+    let web_share = channels
+        .iter()
+        .find(|channel| channel["name"] == "web_share")
+        .expect("web-share channel");
+    assert_eq!(
+        web_share["blockers"],
+        serde_json::json!([
+            "repository_protection_missing",
+            "downstream_writer_app_missing",
+            "floating_actions_present",
+            "unprotected_secret_deployment_workflow"
+        ])
+    );
+    let snap_stable = channels
+        .iter()
+        .find(|channel| channel["name"] == "snap_stable")
+        .expect("Snap stable channel");
+    assert_eq!(snap_stable["payload_ready"], false);
+    assert_eq!(snap_stable["payload_roles"], serde_json::json!([]));
+    assert_eq!(
+        snap_stable["blockers"],
+        serde_json::json!(["denied_until_support_decision"])
+    );
+
+    let canonical: serde_json::Value = serde_json::from_str(include_str!(
+        "../.github/release/canonical-build-contract.json"
+    ))
+    .expect("canonical build contract");
+    let supplemental_roles: BTreeSet<_> = canonical["platforms"]
+        .as_array()
+        .expect("canonical platforms")
+        .iter()
+        .flat_map(|platform| {
+            platform["supplemental_roles"]
+                .as_array()
+                .expect("supplemental roles")
+        })
+        .map(|role| role.as_str().expect("supplemental role"))
+        .collect();
+    for role in [
+        "chocolatey-package",
+        "crate-package-set",
+        "snap-amd64",
+        "snap-arm64",
+        "wasm-byte-set",
+        "wasm-provenance",
+    ] {
         assert!(
-            !channel["blockers"].as_array().expect("blockers").is_empty(),
-            "{blocked} lost its activation blocker"
+            supplemental_roles.contains(role),
+            "downstream payload role {role} is not sealed canonically"
         );
     }
 
@@ -296,17 +369,17 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
     assert!(summary.contains("needs: [prepare-plan, stage-linux-channels, stage-chocolatey]"));
     assert!(rmux_io.contains("needs: [prepare-plan, channel-summary]"));
     assert!(final_summary.contains("needs: [prepare-plan, channel-summary, deploy-rmux-io]"));
-    assert!(summary.contains("Disabled pre-site result aggregation"));
-    assert!(summary.contains("Result aggregation is unavailable in PR7"));
-    assert!(rmux_io.contains("Disabled post-aggregation rmux.io deployment"));
-    assert!(rmux_io.contains("rmux.io remains unavailable and disabled"));
-    assert!(final_summary.contains("Disabled final result aggregation"));
-    assert!(final_summary.contains("Final result aggregation is unavailable in PR7"));
-    assert!(!DOWNSTREAM.contains("Require eleven exact"));
-    assert!(!DOWNSTREAM.contains("Require ten exact"));
+    assert!(summary.contains("Disabled pre-site aggregation wiring"));
+    assert!(summary.contains("writers expose ten exact result references"));
+    assert!(rmux_io.contains("Disabled rmux.io writer"));
+    assert!(rmux_io.contains("consumes the exact pre-site summary"));
+    assert!(final_summary.contains("Disabled final aggregation wiring"));
+    assert!(final_summary.contains("exact rmux.io result reference"));
+    assert!(!DOWNSTREAM.contains("Consume eleven exact"));
+    assert!(!DOWNSTREAM.contains("Consume ten exact"));
     assert!(DOWNSTREAM.contains("test \"$GITHUB_REPOSITORY\" = \"Helvesec/rmux\""));
     assert!(DOWNSTREAM.contains("test \"$GITHUB_REPOSITORY_ID\" = \"1239918790\""));
-    assert_eq!(DOWNSTREAM.matches("channel-summary.py create").count(), 2);
+    assert_eq!(DOWNSTREAM.matches("channel-summary.py create").count(), 0);
     for writer in [linux, chocolatey, rmux_io] {
         assert!(writer.contains("assert-release-capability.py downstream_channels"));
     }

@@ -359,7 +359,7 @@ jobs:
         run: throw "PR7 does not implement an active Chocolatey writer"
 
   channel-summary:
-    name: Disabled pre-site result aggregation
+    name: Disabled pre-site aggregation wiring
     needs: [prepare-plan, stage-linux-channels, stage-chocolatey]
     if: ${{ false }}
     runs-on: ubuntu-22.04
@@ -380,24 +380,17 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/rmux-downstream-summary
 
-      - name: Fail closed before consuming incomplete channel results
+      - name: Fail closed before consuming unwired channel results
         run: scripts/release/assert-release-capability.py downstream_channels
 
-      - name: Reject unavailable pre-site result aggregation
+      - name: Refuse missing exact result references
         shell: bash
         run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/rmux-downstream-summary"
-          mkdir -p "$root"
-          # Result aggregation is unavailable in PR7 because no writer emits
-          # result pairs. The canonical validator therefore fails closed.
-          python3 scripts/release/channel-summary.py create \
-            --plan "$root/downstream-channel-plan.json" \
-            --created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --output "$root/pre-site-channel-summary.json"
+          echo "pre-site aggregation remains disabled until writers expose ten exact result references" >&2
+          exit 1
 
   deploy-rmux-io:
-    name: Disabled post-aggregation rmux.io deployment
+    name: Disabled rmux.io writer
     needs: [prepare-plan, channel-summary]
     if: ${{ false }}
     runs-on: ubuntu-22.04
@@ -420,11 +413,11 @@ jobs:
       - name: Refuse the unimplemented final site writer
         shell: bash
         run: |
-          echo "rmux.io remains unavailable and disabled until reviewed cut-over" >&2
+          echo "rmux.io writer remains disabled until it consumes the exact pre-site summary" >&2
           exit 1
 
   final-channel-summary:
-    name: Disabled final result aggregation
+    name: Disabled final aggregation wiring
     needs: [prepare-plan, channel-summary, deploy-rmux-io]
     if: ${{ false }}
     runs-on: ubuntu-22.04
@@ -445,18 +438,11 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/rmux-downstream-summary
 
-      - name: Fail closed before consuming incomplete channel results
+      - name: Fail closed before consuming the unwired rmux.io result
         run: scripts/release/assert-release-capability.py downstream_channels
 
-      - name: Reject unavailable final result aggregation
+      - name: Refuse missing exact rmux.io result reference
         shell: bash
         run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/rmux-downstream-summary"
-          mkdir -p "$root"
-          # Final result aggregation is unavailable in PR7. With no exact result
-          # pairs, the canonical validator intentionally rejects this path.
-          python3 scripts/release/channel-summary.py create \
-            --plan "$root/downstream-channel-plan.json" \
-            --created-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --output "$root/final-channel-summary.json"
+          echo "final aggregation remains disabled until rmux.io exposes its exact result reference" >&2
+          exit 1

@@ -16,7 +16,7 @@
     "predicate_type": "https://rmux.io/attestations/release-publication-receipt/v1",
     "envelope_type": "https://rmux.io/envelopes/release-publication-receipt/v1",
     "workflow_path": ".github/workflows/release-receipt.yml",
-    "workflow_id": null,
+    "workflow_id": 316435347,
     "required_run_attempt": 1,
     "download_by_artifact_id": true,
     "exact_artifact_digest_required": true,
@@ -24,9 +24,7 @@
     "attestation_subject_name": "release-state.json",
     "attestation_subject_in_bundle": true,
     "required_downstream_authority": false,
-    "activation_blockers": [
-      "receipt_workflow_id_unset_until_merge"
-    ]
+    "activation_blockers": []
   },
   "execution": {
     "only_trigger": "workflow_call",
@@ -57,13 +55,19 @@
     "retry_requires_remote_request_id": null
   },
   "payload_evidence": {
-    "canonical_provenance_ready": false,
-    "actions_expiry_bound": false,
-    "producer_workflow_allowlist_ready": false,
-    "activation_blockers": [
-      "channel_payload_producer_contract_missing",
-      "actions_artifact_expiry_binding_missing"
-    ]
+    "schema": ".github/release/schemas/downstream-channel-payload.schema.json",
+    "predicate_type": "https://rmux.io/attestations/release-downstream-channel-payload/v1",
+    "subject_name": "downstream-channel-payload-subject.json",
+    "canonical_provenance_ready": true,
+    "actions_expiry_bound": true,
+    "producer_workflow_allowlist_ready": true,
+    "producer": {
+      "workflow_id": 316435347,
+      "workflow_path": ".github/workflows/release-receipt.yml",
+      "job_workflow_path": ".github/workflows/release-downstream.yml",
+      "required_run_attempt": 1
+    },
+    "activation_blockers": []
   },
   "result_evidence": {
     "predicate_type": "https://rmux.io/attestations/release-downstream-channel-result/v1",
@@ -79,12 +83,17 @@
       "receipt-reference.json"
     ],
     "envelope_separate": true,
-    "result_aggregation_ready": false,
-    "aggregation_blockers": [
-      "result_reference_contract_missing",
-      "result_attestation_verification_missing",
-      "rmux_io_two_phase_contract_missing"
-    ],
+    "result_reference_ready": true,
+    "result_reference_schema": ".github/release/schemas/downstream-channel-result-reference.schema.json",
+    "attestation_verification_ready": true,
+    "attestation_verifier": "scripts/release/verify-channel-result-attestation.py",
+    "result_aggregation_ready": true,
+    "aggregation_blockers": [],
+    "summary_schema": ".github/release/schemas/downstream-channel-summary.schema.json",
+    "summary_phases": ["pre-site", "final"],
+    "pre_site_result_count": 10,
+    "final_result_count": 11,
+    "rmux_io_pre_site_digest_field": "pre_site_summary_sha256",
     "producer_workflows": {
       "apt_rpm": [".github/workflows/release-downstream.yml"],
       "chocolatey": [
@@ -144,14 +153,12 @@
       "target_repository_key": null,
       "rc_policy": "deny",
       "stable_policy": "allow",
-      "payload_ready": false,
+      "payload_ready": true,
       "payload_roles": [
         "chocolatey-package"
       ],
       "retryable": true,
-      "blockers": [
-        "canonical_nupkg_not_persisted"
-      ]
+      "blockers": []
     },
     {
       "name": "crates_io",
@@ -160,14 +167,12 @@
       "target_repository_key": null,
       "rc_policy": "deny",
       "stable_policy": "allow",
-      "payload_ready": false,
+      "payload_ready": true,
       "payload_roles": [
         "crate-package-set"
       ],
       "retryable": true,
-      "blockers": [
-        "canonical_crate_packages_not_sealed"
-      ]
+      "blockers": []
     },
     {
       "name": "homebrew_core",
@@ -216,7 +221,6 @@
       ],
       "retryable": true,
       "blockers": [
-        "channel_truth_summary_not_available",
         "private_repository_protection_unavailable_on_current_plan",
         "downstream_writer_app_missing"
       ]
@@ -245,16 +249,13 @@
       "target_repository_key": null,
       "rc_policy": "explicit-opt-in",
       "stable_policy": "explicit-opt-in",
-      "payload_ready": false,
+      "payload_ready": true,
       "payload_roles": [
         "snap-amd64",
         "snap-arm64"
       ],
       "retryable": true,
-      "blockers": [
-        "canonical_snap_amd64_not_persisted",
-        "canonical_snap_arm64_missing"
-      ]
+      "blockers": []
     },
     {
       "name": "snap_stable",
@@ -277,14 +278,13 @@
       "target_repository_key": "rmux-web-share",
       "rc_policy": "deny",
       "stable_policy": "allow",
-      "payload_ready": false,
+      "payload_ready": true,
       "payload_roles": [
         "wasm-byte-set",
         "wasm-provenance"
       ],
       "retryable": true,
       "blockers": [
-        "canonical_wasm_payload_not_bound_to_candidate",
         "repository_protection_missing",
         "downstream_writer_app_missing",
         "floating_actions_present",

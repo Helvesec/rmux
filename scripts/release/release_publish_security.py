@@ -75,8 +75,10 @@ def verify_promotion_attestation(
     source_git_sha: str,
     release_ref: str,
 ) -> None:
+    if gh.is_symlink():
+        raise ValueError("GitHub attestation verifier must be one regular file")
     verifier = gh.resolve(strict=True)
-    if verifier.is_symlink() or not verifier.is_file():
+    if not verifier.is_file():
         raise ValueError("GitHub attestation verifier must be one regular file")
     if bundle.is_symlink() or not bundle.is_file():
         raise ValueError("attestation bundle must be one regular file")

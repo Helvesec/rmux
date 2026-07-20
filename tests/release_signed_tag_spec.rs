@@ -10,8 +10,6 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-const SOURCE_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-#[cfg(unix)]
 const MANIFEST_DIGEST: &str =
     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 #[cfg(unix)]
@@ -691,21 +689,22 @@ exec "$REAL_GIT" "$@"
 
 #[test]
 #[cfg(unix)]
-fn repository_policy_blocks_even_a_local_dry_run_until_key_is_configured() {
+fn repository_policy_blocks_a_local_dry_run_with_a_non_allowlisted_key() {
+    let fixture = activated_fixture("non-allowlisted-key");
     let key_root = temp_dir("disabled-key");
     let key = key_root.join("key");
     let generated = run(Command::new("ssh-keygen")
         .args(["-q", "-t", "ed25519", "-N", "", "-f"])
         .arg(&key));
     assert!(generated.status.success());
-    let script = repo_root().join("scripts/release/sign-and-push-release-tag.sh");
+    let script = fixture.scripts.join("sign-and-push-release-tag.sh");
     let mut args = vec![
         "--repository".to_owned(),
         "Helvesec/rmux".to_owned(),
         "--repository-root".to_owned(),
-        repo_root().display().to_string(),
+        fixture.repository.display().to_string(),
     ];
-    args.extend(identity_arguments(SOURCE_SHA));
+    args.extend(identity_arguments(&fixture.source_sha));
     args.extend([
         "--signing-key".to_owned(),
         key.display().to_string(),
@@ -713,6 +712,6 @@ fn repository_policy_blocks_even_a_local_dry_run_until_key_is_configured() {
     ]);
     let blocked = run(Command::new(script).args(args));
     assert!(!blocked.status.success());
-    assert!(stderr(&blocked).contains("dedicated_release_ssh_signing_key_not_configured"));
+    assert!(stderr(&blocked).contains("tag signature must match exactly one allowlisted signer"));
     fs::remove_dir_all(key_root).expect("remove key fixture");
 }

@@ -120,10 +120,10 @@ jobs:
           github-token: ${{ github.token }}
 
   verify-simulation:
-    name: Verify nonpublishing promotion and receipt contracts
+    name: Exercise exact candidate promotion without publication
     needs: policy-audit
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       actions: read
       contents: read
@@ -206,7 +206,146 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ github.run_id }}
 
-      - name: Verify audit binding and nonpublishing release contracts
+      - name: Verify and download the exact candidate manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "${{ inputs.candidate_manifest_run_id }}" \
+            --artifact-id "${{ inputs.candidate_manifest_artifact_id }}" \
+            --name "rmux-candidate-manifest-${{ inputs.candidate_run_id }}" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "${{ inputs.candidate_manifest_artifact_digest }}" \
+            --expected-workflow-id 316223904 \
+            --expected-workflow-path .github/workflows/release-shadow.yml \
+            --expected-event workflow_dispatch \
+            --expected-head-branch main \
+            --max-attempts 1
+
+      - name: Download only the exact candidate manifest ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.candidate_manifest_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-promotion-simulation/manifest
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_manifest_run_id }}
+
+      - id: artifacts
+        name: Resolve the eleven original candidate artifact IDs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          resolution="$RUNNER_TEMP/rmux-promotion-simulation/candidate-artifacts.json"
+          scripts/release/verify-candidate-artifacts.py resolve \
+            --repository "$GITHUB_REPOSITORY" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --output "$resolution"
+          ids=$(python3 - "$resolution" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          artifacts = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")).get("artifacts")
+          if not isinstance(artifacts, list) or len(artifacts) != 11:
+              raise SystemExit("simulation requires exactly eleven candidate artifacts")
+          identifiers = [item.get("artifact_id") for item in artifacts]
+          if any(type(value) is not int or value <= 0 for value in identifiers):
+              raise SystemExit("candidate artifact ID is invalid")
+          if len(set(identifiers)) != 11:
+              raise SystemExit("candidate artifact IDs are not unique")
+          print(",".join(str(value) for value in identifiers))
+          PY
+          )
+          echo "artifact_ids=$ids" >> "$GITHUB_OUTPUT"
+
+      - name: Download the eleven original candidate artifacts by exact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ steps.artifacts.outputs.artifact_ids }}
+          path: ${{ runner.temp }}/rmux-promotion-simulation/candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - id: candidate
+        name: Revalidate the original manifest and every candidate byte
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-promotion-simulation"
+          manifest="$root/manifest/candidate-manifest.json"
+          fast_run_id=$(python3 - "$manifest" <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          path = pathlib.Path(sys.argv[1])
+          raw = path.read_bytes()
+          if hashlib.sha256(raw).hexdigest() != "${{ inputs.candidate_manifest_sha256 }}":
+              raise SystemExit("candidate manifest digest differs")
+          value = json.loads(raw)
+          expected = {
+              "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "candidate_run_id": int(os.environ["RMUX_CANDIDATE_RUN_ID"]),
+              "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
+              "planned_release_ref": os.environ["RMUX_PLANNED_RELEASE_REF"],
+              "release_kind": os.environ["RMUX_RELEASE_KIND"],
+          }
+          for field, wanted in expected.items():
+              if value.get(field) != wanted:
+                  raise SystemExit(f"candidate manifest {field} differs")
+          run_id = value.get("fast_run_id")
+          if type(run_id) is not int or run_id <= 0:
+              raise SystemExit("candidate manifest fast run ID is invalid")
+          print(run_id)
+          PY
+          )
+          scripts/release/verify-candidate-artifacts.py verify-downloaded \
+            --repository "$GITHUB_REPOSITORY" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --fast-run-id "$fast_run_id" \
+            --release-intent-id "$RMUX_RELEASE_INTENT_ID" \
+            --planned-release-ref "$RMUX_PLANNED_RELEASE_REF" \
+            --release-kind "$RMUX_RELEASE_KIND" \
+            --resolution "$root/candidate-artifacts.json" \
+            --downloads-dir "$root/candidate" \
+            --output "$root/verified-candidate-artifacts.json"
+          echo "fast_run_id=$fast_run_id" >> "$GITHUB_OUTPUT"
+
+      - id: gh
+        name: Install the pinned attestation verifier
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/rmux-promotion-simulation-gh"
+          test ! -e "$install_root"
+          scripts/release/install-gh-2.93.0.sh "$install_root"
+          echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Verify build provenance and stage the exact release bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-promotion-simulation"
+          scripts/release/verify-candidate-attestations.sh \
+            "$root/candidate" "$RMUX_EXPECTED_SOURCE_SHA" "${{ steps.gh.outputs.binary }}"
+          scripts/release/stage-candidate-release.py \
+            --manifest "$root/manifest/candidate-manifest.json" \
+            --resolution "$root/candidate-artifacts.json" \
+            --downloads-dir "$root/candidate" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --output "$root/release-assets"
+
+      - name: Verify the exact audit binding
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP/rmux-promotion-simulation/policy-audit-reference.json" <<'PY'
@@ -233,48 +372,69 @@ jobs:
               if value.get(field) != wanted:
                   raise SystemExit(f"audit reference {field} differs")
           PY
+
+      - name: Exercise authorization, publisher plan, receipt recovery, and drills
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-promotion-simulation"
+          scripts/release/promotion-simulation.py \
+            --candidate-manifest "$root/manifest/candidate-manifest.json" \
+            --candidate-resolution "$root/candidate-artifacts.json" \
+            --verified-candidate-artifacts "$root/verified-candidate-artifacts.json" \
+            --manifest-run-id "${{ inputs.candidate_manifest_run_id }}" \
+            --manifest-artifact-id "${{ inputs.candidate_manifest_artifact_id }}" \
+            --manifest-artifact-digest "${{ inputs.candidate_manifest_artifact_digest }}" \
+            --manifest-sha256 "${{ inputs.candidate_manifest_sha256 }}" \
+            --policy-audit-reference "$root/policy-audit-reference.json" \
+            --staged-assets "$root/release-assets" \
+            --simulation-id "$RMUX_SIMULATION_ID" \
+            --simulation-run-id "$GITHUB_RUN_ID" \
+            --output-dir "$root/e2e"
+          python3 - "$root/e2e/promotion-simulation-record.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "status": "nonpublishing-e2e-simulation",
+              "publication_authority": False,
+              "downstream_authority": False,
+              "repository_mutations": False,
+              "exact_candidate_bytes_exercised": True,
+              "policy_audit_exercised": True,
+              "promotion_authorization_exercised": True,
+              "promotion_workflow_exercised": False,
+              "github_publication_plan_exercised": True,
+              "receipt_failure_exercised": True,
+              "receipt_recovery_exercised": True,
+              "receipt_workflow_exercised": False,
+              "expired_audit_drill_exercised": True,
+              "corrupt_asset_drill_exercised": True,
+              "synthetic_tag_boundary": True,
+              "synthetic_release_state": True,
+              "cryptographic_tag_signature_exercised": False,
+              "oidc_attestations_exercised": False,
+          }
+          for field, wanted in expected.items():
+              if value.get(field) != wanted:
+                  raise SystemExit(f"promotion simulation record {field} differs")
+          PY
+
+      - name: Run the static release contract regression suites
+        run: |
+          set -euo pipefail
           cargo test --locked \
             --test release_promotion_evidence_spec \
             --test release_github_publisher_spec \
             --test release_receipt_attestation_spec \
             --test release_promoter_workflows_spec
 
-      - name: Write the nonauthoritative simulation record
-        run: |
-          set -euo pipefail
-          python3 - "$RUNNER_TEMP/rmux-promotion-simulation-record.json" <<'PY'
-          import json
-          import os
-          import pathlib
-          import sys
-
-          value = {
-              "schema_version": 1,
-              "status": "nonpublishing-simulation",
-              "simulation_id": os.environ["RMUX_SIMULATION_ID"],
-              "run_id": int(os.environ["GITHUB_RUN_ID"]),
-              "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
-              "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
-              "candidate_run_id": int(os.environ["RMUX_CANDIDATE_RUN_ID"]),
-              "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
-              "planned_release_ref": os.environ["RMUX_PLANNED_RELEASE_REF"],
-              "release_kind": os.environ["RMUX_RELEASE_KIND"],
-              "policy_audit_reference_artifact_id": int(os.environ["RMUX_AUDIT_REFERENCE_ID"]),
-              "policy_audit_reference_artifact_digest": os.environ["RMUX_AUDIT_REFERENCE_DIGEST"],
-              "publication_authority": False,
-              "repository_mutations": False,
-              "receipt_recovery_contracts_exercised": True,
-          }
-          pathlib.Path(sys.argv[1]).write_text(
-              json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-          )
-          PY
-
       - name: Upload the nonauthoritative simulation record
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: rmux-promotion-simulation-${{ inputs.simulation_id }}
-          path: ${{ runner.temp }}/rmux-promotion-simulation-record.json
+          path: ${{ runner.temp }}/rmux-promotion-simulation/e2e/promotion-simulation-record.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 0

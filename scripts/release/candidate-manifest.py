@@ -41,7 +41,16 @@ PLATFORMS: dict[str, dict[str, Any]] = {
     "linux-x86_64": {
         "target": "x86_64-unknown-linux-gnu",
         "runner": {"image": "ubuntu-22.04", "os": "Linux", "arch": "X64"},
-        "roles": {"archive", "checksums", "debian", "rpm"},
+        "roles": {
+            "archive",
+            "checksums",
+            "crate-package-set",
+            "debian",
+            "rpm",
+            "snap-amd64",
+            "wasm-byte-set",
+            "wasm-provenance",
+        },
     },
     "linux-aarch64": {
         "target": "aarch64-unknown-linux-gnu",
@@ -50,7 +59,7 @@ PLATFORMS: dict[str, dict[str, Any]] = {
             "os": "Linux",
             "arch": "ARM64",
         },
-        "roles": {"archive", "checksums", "debian", "rpm"},
+        "roles": {"archive", "checksums", "debian", "rpm", "snap-arm64"},
     },
     "macos-x86_64": {
         "target": "x86_64-apple-darwin",
@@ -65,7 +74,7 @@ PLATFORMS: dict[str, dict[str, Any]] = {
     "windows-x86_64": {
         "target": "x86_64-pc-windows-msvc",
         "runner": {"image": "windows-latest", "os": "Windows", "arch": "X64"},
-        "roles": {"archive", "checksums"},
+        "roles": {"archive", "checksums", "chocolatey-package"},
     },
 }
 BUILD_POLICY = {

@@ -31,7 +31,7 @@ parts:
     build-packages:
       - curl
     override-pull: |
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.96.1
       . "$HOME/.cargo/env"
       ln -sf "$HOME/.cargo/bin/cargo" /usr/local/bin/cargo
       ln -sf "$HOME/.cargo/bin/rustc" /usr/local/bin/rustc

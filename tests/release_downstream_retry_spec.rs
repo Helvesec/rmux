@@ -245,6 +245,10 @@ fn retries_bind_exact_receipt_result_origin_and_closed_bundle() {
         assert!(prepare.contains("Revalidate the exact payload artifact is still available"));
         assert!(prepare.contains(".artifact.artifact_id"));
         assert!(prepare.contains(".artifact.archive_digest"));
+        assert!(prepare.contains("--include-retention"));
+        assert!(prepare.contains("artifact[\"created_at\"]"));
+        assert!(prepare.contains("artifact[\"updated_at\"]"));
+        assert!(prepare.contains("artifact[\"expires_at\"]"));
         assert!(prepare.contains("live payload artifact identity differs"));
         assert!(prepare.contains("request[\"retry_depth\"] != 0"));
         assert!(prepare.contains("result[\"state\"] not in {\"prepared\", \"failed-transient\"}"));
@@ -319,9 +323,9 @@ fn retries_share_channel_concurrency_and_never_rebuild() {
 }
 
 #[test]
-fn snap_retry_remains_candidate_only_and_payload_blocked() {
+fn snap_retry_remains_candidate_only_and_writer_disabled() {
     assert!(SNAP.contains("rmux-channel-snap-candidate-"));
-    assert!(SNAP.contains("no exact .snap is sealed"));
+    assert!(SNAP.contains("the downstream writer is disabled"));
     assert!(!SNAP.contains("snap-stable"));
 
     let policy: serde_json::Value =

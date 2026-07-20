@@ -12,6 +12,12 @@ from typing import Any
 
 REPOSITORY_ID = 1239918790
 REPOSITORY = "Helvesec/rmux"
+POLICY_AUDIT_APP_ID = 4344532
+POLICY_AUDIT_INSTALLATION_ID = 147749910
+PROMOTION_WORKFLOW_ID = 316435346
+PROMOTION_WORKFLOW_PATH = ".github/workflows/release-promote.yml"
+SIMULATION_WORKFLOW_ID = 316591947
+SIMULATION_WORKFLOW_PATH = ".github/workflows/release-promotion-simulation.yml"
 STATUS = "disarmed-non-authoritative"
 SHA40 = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -27,6 +33,23 @@ PLATFORMS = {
     "macos-x86_64",
     "windows-x86_64",
 }
+PLATFORM_ROLES = {
+    "linux-x86_64": {
+        "archive",
+        "checksums",
+        "crate-package-set",
+        "debian",
+        "rpm",
+        "snap-amd64",
+        "wasm-byte-set",
+        "wasm-provenance",
+    },
+    "linux-aarch64": {"archive", "checksums", "debian", "rpm", "snap-arm64"},
+    "macos-x86_64": {"archive", "checksums"},
+    "macos-aarch64": {"archive", "checksums"},
+    "windows-x86_64": {"archive", "checksums", "chocolatey-package"},
+}
+PUBLIC_ASSET_ROLES = {"archive", "debian", "rpm", "snap-amd64", "snap-arm64"}
 
 
 def read_object(path: Path, label: str) -> dict[str, Any]:
@@ -94,8 +117,10 @@ def render_timestamp(value: datetime) -> str:
 
 
 def validate_file(path: Path, label: str) -> Path:
+    if path.is_symlink():
+        raise ValueError(f"{label} must be one non-empty regular file")
     resolved = path.resolve(strict=True)
-    if resolved.is_symlink() or not resolved.is_file() or resolved.stat().st_size <= 0:
+    if not resolved.is_file() or resolved.stat().st_size <= 0:
         raise ValueError(f"{label} must be one non-empty regular file")
     return resolved
 
@@ -230,9 +255,7 @@ def publishable_assets(
         files = artifact.get("files")
         if not isinstance(files, list) or not files:
             raise ValueError(f"candidate {platform} files are missing")
-        expected_roles = {"archive", "checksums"}
-        if platform.startswith("linux-"):
-            expected_roles.update({"debian", "rpm"})
+        expected_roles = PLATFORM_ROLES[platform]
         actual_roles = [item.get("role") for item in files if isinstance(item, dict)]
         if set(actual_roles) != expected_roles or len(actual_roles) != len(
             expected_roles
@@ -242,7 +265,7 @@ def publishable_assets(
             if not isinstance(item, dict):
                 raise ValueError("candidate asset must be an object")
             exact_keys(item, {"path", "role", "size", "sha256"}, "candidate asset")
-            if item["role"] == "checksums":
+            if item["role"] not in PUBLIC_ASSET_ROLES:
                 continue
             name = require_match(item["path"], SAFE_NAME, "candidate public asset name")
             if name in names:
@@ -367,7 +390,11 @@ def validate_signed_tag(
 
 
 def validate_policy_audit(
-    reference: dict[str, Any], manifest: dict[str, Any]
+    reference: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    workflow_id: int = PROMOTION_WORKFLOW_ID,
+    workflow_path: str = PROMOTION_WORKFLOW_PATH,
 ) -> dict[str, Any]:
     keys = {
         "schema_version",
@@ -398,8 +425,10 @@ def validate_policy_audit(
         or reference["candidate_run_id"] != manifest["candidate_run_id"]
         or reference["release_intent_id"] != manifest["release_intent_id"]
         or reference["policy_audit_run_attempt"] != 1
-        or reference["workflow_id"] != 316435346
-        or reference["workflow_path"] != ".github/workflows/release-promote.yml"
+        or reference["app_id"] != POLICY_AUDIT_APP_ID
+        or reference["installation_id"] != POLICY_AUDIT_INSTALLATION_ID
+        or reference["workflow_id"] != workflow_id
+        or reference["workflow_path"] != workflow_path
         or reference["release_policy_sha256"] != manifest["release_policy"]["sha256"]
     ):
         raise ValueError("policy audit reference does not bind the exact candidate")

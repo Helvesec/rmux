@@ -81,7 +81,7 @@ for opted_in in (False, True):
     snap = next(entry for entry in entries if entry['name'] == 'snap_candidate')
     if snap['explicit_opt_in'] is not opted_in:
         raise SystemExit(f'Snap candidate opt-in was not preserved: {opted_in!r}')
-    expected = 'blocked' if opted_in else 'denied'
+    expected = 'disarmed' if opted_in else 'denied'
     if snap['execution_decision'] != expected:
         raise SystemExit(f'Snap candidate decision differs: {snap!r}')
 "#
@@ -236,7 +236,6 @@ fn forged_summary_results_fail_closed() {
     assert_fixture(&format!(
         "{PRELUDE}\n{}",
         r#"
-import argparse
 import importlib.util
 from downstream_channels import CHANNEL_POLICY, file_hash
 from downstream_plan import expected_channel_entries
@@ -267,16 +266,16 @@ with tempfile.TemporaryDirectory() as root:
         'channels': expected_channel_entries('stable', False),
     }
     plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-    args = argparse.Namespace(
-        plan=plan_path,
-        result_predicate=['apt_rpm=/tmp/forged-predicate.json'],
-        result_envelope=['apt_rpm=/tmp/forged-envelope.json'],
-        created_at='2026-07-19T00:00:01Z',
-    )
     try:
-        module.expected_summary(args)
+        module.create_summary(
+            plan_path=plan_path,
+            phase='pre-site',
+            result_paths={'apt_rpm': pathlib.Path('/tmp/forged-reference.json')},
+            pre_site_summary_path=None,
+            created_at='2026-07-19T00:00:01Z',
+        )
     except ValueError as error:
-        if 'result aggregation is blocked' not in str(error):
+        if 'reference set changed' not in str(error):
             raise
     else:
         raise SystemExit('forged summary result was accepted')

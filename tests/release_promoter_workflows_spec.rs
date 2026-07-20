@@ -10,6 +10,7 @@ const SCHEMA_VALIDATOR_REQUIREMENTS: &str =
 const PUBLICATION_INPUTS: &str =
     include_str!("../.github/actions/release-publication-inputs/action.yml");
 const CANDIDATE_STAGING: &str = include_str!("../scripts/release/stage-candidate-release.py");
+const PROMOTION_SIMULATION: &str = include_str!("../scripts/release/promotion-simulation.py");
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -167,7 +168,7 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
     assert!(verify.contains("verify-release-tag.py github-json"));
     assert!(verify.contains("differs byte-for-byte from live tag"));
     assert!(verify.contains("stage-candidate-release.py"));
-    assert!(CANDIDATE_STAGING.contains("item.get(\"role\") == \"checksums\""));
+    assert!(CANDIDATE_STAGING.contains("item.get(\"role\") not in PUBLIC_ASSET_ROLES"));
     assert!(CANDIDATE_STAGING.contains("args.output / \"SHA256SUMS\""));
     assert_eq!(PROMOTE.matches("merge-multiple: true").count(), 4);
     assert!(authorize.contains("rmux-authorization/verified"));
@@ -319,4 +320,40 @@ fn promotion_simulation_pins_a_draft_2020_schema_validator() {
             "typing-extensions==4.16.0",
         ]
     );
+}
+
+#[test]
+fn promotion_simulation_reports_only_the_work_it_executes() {
+    assert!(SIMULATION.contains("promotion-simulation.py"));
+    assert!(SIMULATION.contains("Resolve the eleven original candidate artifact IDs"));
+    assert!(SIMULATION.contains("verify-candidate-attestations.sh"));
+    assert!(SIMULATION.contains("\"exact_candidate_bytes_exercised\": True"));
+    assert!(SIMULATION.contains("\"policy_audit_exercised\": True"));
+    assert!(SIMULATION.contains("\"promotion_authorization_exercised\": True"));
+    assert!(SIMULATION.contains("\"promotion_workflow_exercised\": False"));
+    assert!(SIMULATION.contains("\"github_publication_plan_exercised\": True"));
+    assert!(SIMULATION.contains("\"receipt_recovery_exercised\": True"));
+    assert!(SIMULATION.contains("\"receipt_workflow_exercised\": False"));
+    assert!(SIMULATION.contains("\"cryptographic_tag_signature_exercised\": False"));
+    assert!(SIMULATION.contains("\"oidc_attestations_exercised\": False"));
+    assert!(!SIMULATION.contains("--execute"));
+}
+
+#[test]
+fn promotion_simulation_and_publisher_stay_below_the_release_file_budget() {
+    assert!(PROMOTION_SIMULATION.lines().count() < 600);
+    let publisher = include_str!("../scripts/release/publish-github-release.py");
+    assert!(publisher.lines().count() < 600);
+}
+
+#[test]
+fn candidate_attestation_gate_checks_symlinks_before_resolution() {
+    let verifier = include_str!("../scripts/release/verify-candidate-attestations.sh");
+    let symlink_check = verifier
+        .find("if candidate.is_symlink():")
+        .expect("symlink check");
+    let resolution = verifier
+        .find("path = candidate.resolve(strict=True)")
+        .expect("candidate resolution");
+    assert!(symlink_check < resolution);
 }

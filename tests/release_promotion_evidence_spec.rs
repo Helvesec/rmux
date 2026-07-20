@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -150,7 +151,7 @@ fn auth_predicate_args(fixture: &Fixture, output_flag: &str, output: &Path) -> V
         "--authorization-run-id".into(),
         "700".into(),
         "--authorization-workflow-id".into(),
-        "701".into(),
+        "316435346".into(),
         "--issued-at".into(),
         "2026-07-19T00:31:00Z".into(),
         "--expires-at".into(),
@@ -209,7 +210,7 @@ fn receipt_predicate_args(fixture: &Fixture, output_flag: &str, output: &Path) -
         "--receipt-run-id".into(),
         "900".into(),
         "--receipt-workflow-id".into(),
-        "901".into(),
+        "316435347".into(),
         "--verified-at".into(),
         "2026-07-19T00:34:00Z".into(),
         output_flag.into(),
@@ -283,6 +284,7 @@ fn fixture() -> Fixture {
                 asset("rmux-v1-linux-aarch64.tar.gz", "archive", 101, 1),
                 asset("rmux-v1-linux-aarch64.deb", "debian", 102, 2),
                 asset("rmux-v1-linux-aarch64.rpm", "rpm", 103, 3),
+                asset("rmux-1.0.0-snap-arm64.snap", "snap-arm64", 115, 15),
                 asset("SHA256SUMS.txt", "checksums", 104, 4),
             ],
         ),
@@ -292,6 +294,20 @@ fn fixture() -> Fixture {
                 asset("rmux-v1-linux-x86_64.tar.gz", "archive", 105, 5),
                 asset("rmux-v1-linux-x86_64.deb", "debian", 106, 6),
                 asset("rmux-v1-linux-x86_64.rpm", "rpm", 107, 7),
+                asset(
+                    "rmux-1.0.0-crate-package-set.tar",
+                    "crate-package-set",
+                    116,
+                    16,
+                ),
+                asset("rmux-1.0.0-snap-amd64.snap", "snap-amd64", 117, 17),
+                asset("rmux-web-crypto-wasm-1.0.0.tar", "wasm-byte-set", 118, 18),
+                asset(
+                    "rmux-web-crypto-wasm-1.0.0.provenance.json",
+                    "wasm-provenance",
+                    119,
+                    19,
+                ),
                 asset("SHA256SUMS.txt", "checksums", 108, 8),
             ],
         ),
@@ -313,6 +329,7 @@ fn fixture() -> Fixture {
             "windows-x86_64",
             vec![
                 asset("rmux-v1-windows-x86_64.zip", "archive", 113, 13),
+                asset("rmux.1.0.0.nupkg", "chocolatey-package", 120, 20),
                 asset("SHA256SUMS.txt", "checksums", 114, 14),
             ],
         ),
@@ -374,8 +391,8 @@ fn fixture() -> Fixture {
             "predicate_artifact_id": 601,
             "predicate_artifact_digest": format!("sha256:{}", hex(22)),
             "predicate_sha256": hex(23), "emitted_at": "2026-07-19T00:30:00Z",
-            "expires_at": "2026-07-19T00:45:00Z", "app_id": 1001,
-            "installation_id": 1002, "workflow_id": 316435346,
+            "expires_at": "2026-07-19T00:45:00Z", "app_id": 4344532,
+            "installation_id": 147749910, "workflow_id": 316435346,
             "workflow_path": ".github/workflows/release-promote.yml",
             "release_policy_sha256": hex(20)
         }),
@@ -386,7 +403,9 @@ fn fixture() -> Fixture {
         .expect("artifacts")
     {
         for item in artifact["files"].as_array().expect("files") {
-            if item["role"] != "checksums" {
+            if ["archive", "debian", "rpm", "snap-amd64", "snap-arm64"]
+                .contains(&item["role"].as_str().expect("asset role"))
+            {
                 sum_entries.push((
                     item["path"].as_str().unwrap().to_owned(),
                     item["sha256"].as_str().unwrap().to_owned(),
@@ -601,6 +620,38 @@ fn promotion_authorization_round_trip_rejects_forged_evidence() {
             &auth_verify_args(&fixture, &fixture.authorization),
         ),
         "predicate changed",
+    );
+}
+
+#[test]
+fn promotion_authorization_rejects_wrong_audit_app_identity_and_symlinks() {
+    let fixture = fixture();
+    let output = fixture.root.join("forged-authorization.json");
+    let original_audit = read_json(&fixture.audit);
+
+    for (field, value) in [("app_id", 4344533), ("installation_id", 147749911)] {
+        let mut forged = original_audit.clone();
+        forged[field] = json!(value);
+        write_json(&fixture.audit, &forged);
+        assert_rejected(
+            invoke(
+                "promotion-authorization.py",
+                &auth_predicate_args(&fixture, "--output", &output),
+            ),
+            "policy audit reference does not bind the exact candidate",
+        );
+    }
+
+    let audit_target = fixture.root.join("policy-audit-reference-target.json");
+    write_json(&audit_target, &original_audit);
+    fs::remove_file(&fixture.audit).expect("remove audit reference");
+    symlink(&audit_target, &fixture.audit).expect("symlink audit reference");
+    assert_rejected(
+        invoke(
+            "promotion-authorization.py",
+            &auth_predicate_args(&fixture, "--output", &output),
+        ),
+        "policy audit reference must be one non-empty regular file",
     );
 }
 

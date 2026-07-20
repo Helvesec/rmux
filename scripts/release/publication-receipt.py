@@ -9,10 +9,14 @@ from typing import Any
 
 from release_evidence import (
     DIGEST,
+    PROMOTION_WORKFLOW_ID,
+    PROMOTION_WORKFLOW_PATH,
     REPOSITORY_ID,
     RELEASE_REF,
     SHA40,
     SHA256,
+    SIMULATION_WORKFLOW_ID,
+    SIMULATION_WORKFLOW_PATH,
     STATUS,
     exact_keys,
     file_hash,
@@ -32,9 +36,13 @@ PREDICATE_TYPE = "https://rmux.io/attestations/release-publication-receipt/v1"
 ENVELOPE_TYPE = "https://rmux.io/envelopes/release-publication-receipt/v1"
 AUTHORIZATION_TYPE = "https://rmux.io/attestations/release-promotion-authorization/v1"
 AUTHORIZATION_ENVELOPE_TYPE = AUTHORIZATION_TYPE.replace("attestations", "envelopes")
+RECEIPT_WORKFLOW_ID = 316435347
+RECEIPT_WORKFLOW_PATH = ".github/workflows/release-receipt.yml"
 
 
-def validate_authorization_predicate(value: dict[str, Any]) -> None:
+def validate_authorization_predicate(
+    value: dict[str, Any], *, simulation: bool = False
+) -> None:
     exact_keys(
         value,
         {
@@ -143,6 +151,12 @@ def validate_authorization_predicate(value: dict[str, Any]) -> None:
     if not isinstance(policy, dict) or "reference_sha256" not in policy:
         raise ValueError("authorization policy audit reference is incomplete")
     require_match(policy["reference_sha256"], SHA256, "policy reference digest")
+    expected_workflow_id = (
+        SIMULATION_WORKFLOW_ID if simulation else PROMOTION_WORKFLOW_ID
+    )
+    expected_workflow_path = (
+        SIMULATION_WORKFLOW_PATH if simulation else PROMOTION_WORKFLOW_PATH
+    )
     validate_policy_audit(
         {key: item for key, item in policy.items() if key != "reference_sha256"},
         {
@@ -151,6 +165,8 @@ def validate_authorization_predicate(value: dict[str, Any]) -> None:
             "release_intent_id": release["intent_id"],
             "release_policy": {"sha256": value["release_policy_sha256"]},
         },
+        workflow_id=expected_workflow_id,
+        workflow_path=expected_workflow_path,
     )
     identity = value["authorization"]
     if not isinstance(identity, dict):
@@ -160,8 +176,10 @@ def validate_authorization_predicate(value: dict[str, Any]) -> None:
         {"run_id", "run_attempt", "workflow_id", "workflow_path"},
         "authorization run identity",
     )
-    if identity["run_attempt"] != 1 or identity["workflow_path"] != (
-        ".github/workflows/release-promote.yml"
+    if (
+        identity["run_attempt"] != 1
+        or identity["workflow_id"] != expected_workflow_id
+        or identity["workflow_path"] != expected_workflow_path
     ):
         raise ValueError("authorization run identity changed")
     positive_integer(identity["run_id"], "authorization run ID")
@@ -273,18 +291,24 @@ def receipt_identity(args: argparse.Namespace) -> dict[str, Any]:
     positive_integer(args.receipt_workflow_id, "receipt workflow ID")
     if args.receipt_run_attempt != 1:
         raise ValueError("publication receipt requires Actions attempt 1")
+    expected_id = SIMULATION_WORKFLOW_ID if args.simulation else RECEIPT_WORKFLOW_ID
+    expected_path = (
+        SIMULATION_WORKFLOW_PATH if args.simulation else RECEIPT_WORKFLOW_PATH
+    )
+    if args.receipt_workflow_id != expected_id:
+        raise ValueError("publication receipt workflow ID changed")
     return {
         "run_id": args.receipt_run_id,
         "run_attempt": 1,
         "workflow_id": args.receipt_workflow_id,
-        "workflow_path": ".github/workflows/release-receipt.yml",
+        "workflow_path": expected_path,
     }
 
 
 def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
     auth_path = validate_file(args.authorization_predicate, "authorization predicate")
     authorization = read_object(auth_path, "authorization predicate")
-    validate_authorization_predicate(authorization)
+    validate_authorization_predicate(authorization, simulation=args.simulation)
     envelope_path = validate_file(args.authorization_envelope, "authorization envelope")
     envelope = read_object(envelope_path, "authorization envelope")
     validate_authorization_envelope(envelope, auth_path, authorization)
@@ -441,6 +465,7 @@ def validate_envelope_shape(value: dict[str, Any]) -> None:
 
 
 def predicate_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--simulation", action="store_true")
     parser.add_argument("--authorization-predicate", type=Path, required=True)
     parser.add_argument("--authorization-envelope", type=Path, required=True)
     parser.add_argument("--release-state", type=Path, required=True)

@@ -53,6 +53,14 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Build the canonical amd64 Snap
+        id: snapcraft
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79
+        with:
+          path: .
+          snapcraft-args: --platform amd64
+      - name: Smoke the canonical amd64 Snap
+        run: scripts/smoke-snap-package.sh "${{ steps.snapcraft.outputs.snap }}"
       - id: build
         uses: ./.github/actions/canonical-build
         with:
@@ -64,6 +72,7 @@ jobs:
           platform-key: linux-x86_64
           runner-image: ubuntu-22.04
           target-triple: x86_64-unknown-linux-gnu
+          snap-package: ${{ steps.snapcraft.outputs.snap }}
 
   build-linux-aarch64:
     name: Canonical build linux-aarch64
@@ -90,6 +99,14 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Build the canonical arm64 Snap
+        id: snapcraft
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79
+        with:
+          path: .
+          snapcraft-args: --platform arm64
+      - name: Smoke the canonical arm64 Snap
+        run: scripts/smoke-snap-package.sh "${{ steps.snapcraft.outputs.snap }}"
       - id: build
         uses: ./.github/actions/canonical-build
         with:
@@ -101,6 +118,7 @@ jobs:
           platform-key: linux-aarch64
           runner-image: ubuntu-22.04-arm
           target-triple: aarch64-unknown-linux-gnu
+          snap-package: ${{ steps.snapcraft.outputs.snap }}
 
   build-macos-x86-64:
     name: Canonical build macos-x86_64
