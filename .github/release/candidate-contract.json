@@ -29,7 +29,8 @@
       "ubuntu-22.04": [
         "Build canonical native artifacts / Canonical build linux-x86_64",
         "Build canonical native artifacts / Canonical native build gate",
-        "Build canonical native artifacts / Canonical smoke linux-x86_64"
+        "Build canonical native artifacts / Canonical smoke linux-x86_64",
+        "Release candidate gate"
       ],
       "ubuntu-22.04-arm": [
         "Build canonical native artifacts / Canonical build linux-aarch64",
@@ -52,7 +53,6 @@
         "Nix flake gate",
         "Platform build and smoke on windows-latest",
         "Release candidate delta gate",
-        "Release candidate gate",
         "Release review (${{ matrix.section }})",
         "Release review (cli)",
         "Release review (lint)",
