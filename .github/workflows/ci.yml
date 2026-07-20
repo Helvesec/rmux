@@ -24,13 +24,43 @@ on:
         default: false
         type: boolean
       release_qualification:
-        description: Run all deferred release qualification jobs, including native Windows smoke
+        description: Run the release-only delta after proving an exact fast main run
         required: false
         default: false
         type: boolean
+      fast_run_id:
+        description: Exact successful main push CI run consumed by release qualification
+        required: false
+        default: ""
+        type: string
+      expected_source_sha:
+        description: Exact lowercase main SHA shared by the fast run and candidate
+        required: false
+        default: ""
+        type: string
+      release_intent_id:
+        description: Unique non-secret identifier for this candidate decision
+        required: false
+        default: ""
+        type: string
+      planned_release_ref:
+        description: Planned signed annotated tag, without creating it
+        required: false
+        default: ""
+        type: string
+      release_kind:
+        description: Non-authoritative candidate channel
+        required: false
+        default: shadow
+        type: choice
+        options: [shadow, rc, stable]
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && inputs.release_qualification && 'rmux-release-candidate' || format('rmux-ci-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -41,8 +71,105 @@ env:
   RMUX_TMPDIR: /tmp
 
 jobs:
+  verify-fast-evidence:
+    name: Verify exhaustive fast evidence
+    if: github.event_name == 'workflow_dispatch' && inputs.release_qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    env:
+      CANDIDATE_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      CANDIDATE_FAST_RUN_ID: ${{ inputs.fast_run_id }}
+      CANDIDATE_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
+      CANDIDATE_PLANNED_RELEASE_REF: ${{ inputs.planned_release_ref }}
+      CANDIDATE_RELEASE_KIND: ${{ inputs.release_kind }}
+    steps:
+      - name: Reject untrusted candidate inputs before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_FAST_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_RELEASE_INTENT_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]
+          [[ "$CANDIDATE_PLANNED_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$CANDIDATE_RELEASE_KIND" =~ ^(shadow|rc|stable)$ ]]
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_SHA" = "$CANDIDATE_EXPECTED_SOURCE_SHA"
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate immutable candidate intent
+        run: >-
+          scripts/release/validate-candidate-intent.py
+          --expected-source-sha "$CANDIDATE_EXPECTED_SOURCE_SHA"
+          --actual-source-sha "$(git rev-parse HEAD)"
+          --fast-run-id "$CANDIDATE_FAST_RUN_ID"
+          --release-intent-id "$CANDIDATE_RELEASE_INTENT_ID"
+          --planned-release-ref "$CANDIDATE_PLANNED_RELEASE_REF"
+          --release-kind "$CANDIDATE_RELEASE_KIND"
+          --github-ref "$GITHUB_REF"
+          --github-run-attempt "$GITHUB_RUN_ATTEMPT"
+          --output candidate-intent.json
+
+      - name: Verify the selected fast run and all of its jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/release/verify-fast-run.py
+          --repository "${{ github.repository }}"
+          --run-id "$CANDIDATE_FAST_RUN_ID"
+          --expected-source-sha "$CANDIDATE_EXPECTED_SOURCE_SHA"
+          --kind fast
+          > fast-proof.json
+
+      - name: Upload immutable input proofs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-fast-proof-${{ inputs.expected_source_sha }}
+          path: |
+            candidate-intent.json
+            fast-proof.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release-candidate-delta:
+    name: Run release-only candidate delta
+    if: github.event_name == 'workflow_dispatch' && inputs.release_qualification
+    needs: verify-fast-evidence
+    uses: ./.github/workflows/release-candidate-delta.yml
+    with:
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      fast_run_id: ${{ inputs.fast_run_id }}
+    permissions:
+      actions: read
+      contents: read
+
+  release-candidate-delta-gate:
+    name: Release candidate delta gate
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' &&
+      inputs.release_qualification
+    needs: [verify-fast-evidence, release-candidate-delta]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require proof and every delta
+        env:
+          DELTA_RESULT: ${{ needs.release-candidate-delta.result }}
+          FAST_PROOF_RESULT: ${{ needs.verify-fast-evidence.result }}
+        run: |
+          test "$FAST_PROOF_RESULT" = success
+          test "$DELTA_RESULT" = success
+
   linux-quality:
     name: Linux format, lint, and docs
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -87,6 +214,7 @@ jobs:
 
   linux-build:
     name: Linux workspace build
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -118,6 +246,7 @@ jobs:
 
   wasm-crypto:
     name: WASM crypto build and supply-chain gate
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -203,6 +332,7 @@ jobs:
 
   linux-tests:
     name: Linux tests (${{ matrix.group }})
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -248,6 +378,7 @@ jobs:
 
   linux-source-gates:
     name: Linux source boundary gates
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -267,6 +398,7 @@ jobs:
 
   tmux-oracle-linux:
     name: Linux tmux 3.7b oracle harness
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -326,9 +458,20 @@ jobs:
           RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
         run: cargo test --locked --test tmux_compat_harness -- --test-threads=1
 
+      - name: Upload exact tmux oracle for release delta
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-tmux-oracle-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/rmux-oracle/tmux
+            ${{ runner.temp }}/rmux-oracle/tmux.reference
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
   release-review-perf:
     name: Release review (perf)
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: windows-tests-gate
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -373,7 +516,7 @@ jobs:
 
   release-review-sections:
     name: Release review (${{ matrix.section }})
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux-source-gates, windows-tests-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -446,8 +589,7 @@ jobs:
     name: Release review gate (no package)
     if: >-
       always() &&
-      (startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.release_qualification))
+      startsWith(github.ref, 'refs/tags/v')
     needs: [release-review-perf, release-review-sections]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -462,7 +604,7 @@ jobs:
 
   snap-package:
     name: Snap package smoke
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: windows-tests-gate
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -486,7 +628,7 @@ jobs:
 
   nix-flake:
     name: Nix flake gate
-    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_qualification)
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: windows-tests-gate
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -524,6 +666,7 @@ jobs:
 
   linux-sdk-smoke:
     name: Linux SDK v1 daemon smoke
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -552,6 +695,7 @@ jobs:
 
   linux-perf-smoke:
     name: Linux non-final performance smoke
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -583,6 +727,7 @@ jobs:
 
   linux-dependency-audit:
     name: Linux dependency audit
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -616,6 +761,7 @@ jobs:
 
   platform-runtime:
     name: Platform build and smoke on ${{ matrix.os }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -673,6 +819,7 @@ jobs:
 
   windows-test-archive:
     name: Windows workspace test archive
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: windows-latest
     timeout-minutes: 30
     outputs:
@@ -737,11 +884,12 @@ jobs:
           name: rmux-windows-nextest-${{ github.sha }}
           path: target/windows-nextest.tar.zst
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 7
           compression-level: 0
 
   windows-test-build:
     name: Windows build, lint, docs, and smoke
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: windows-latest
     timeout-minutes: 60
     env:
@@ -790,6 +938,7 @@ jobs:
 
   windows-tests:
     name: Windows workspace tests (${{ matrix.shard }}/18)
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     needs: windows-test-archive
     runs-on: windows-latest
     timeout-minutes: 30
@@ -838,11 +987,14 @@ jobs:
             --workspace-remap "$env:GITHUB_WORKSPACE" `
             --partition "slice:${{ matrix.shard }}/18" `
             --no-fail-fast `
+            --retries 0 `
             --test-threads num-cpus
 
   windows-tests-gate:
     name: Platform build and smoke on windows-latest
-    if: always()
+    if: >-
+      always() &&
+      !(github.event_name == 'workflow_dispatch' && inputs.release_qualification)
     needs: [windows-test-build, windows-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -859,6 +1011,7 @@ jobs:
     name: Cache reusable Windows test archive
     if: >-
       always() &&
+      !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) &&
       needs.windows-test-archive.result == 'success' &&
       needs.windows-tests-gate.result == 'success' &&
       needs.windows-test-archive.outputs.cache_hit != 'true'
@@ -886,7 +1039,7 @@ jobs:
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' &&
-      (inputs.windows_package_smoke || inputs.release_qualification))
+      inputs.windows_package_smoke)
     needs: windows-tests-gate
     runs-on: windows-latest
     timeout-minutes: 60
@@ -1056,7 +1209,7 @@ jobs:
       always() &&
       (startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' &&
-      (inputs.windows_package_smoke || inputs.release_qualification)))
+      inputs.windows_package_smoke))
     needs: [windows-package-build, windows-package-runtime-smoke, windows-package-harness-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1073,6 +1226,7 @@ jobs:
 
   windows-cross:
     name: Cross-target Windows build check
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.release_qualification) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -1108,7 +1262,7 @@ jobs:
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' &&
-      (inputs.windows_runtime_smoke || inputs.release_qualification))
+      inputs.windows_runtime_smoke)
     runs-on: windows-latest
     timeout-minutes: 90
     steps:

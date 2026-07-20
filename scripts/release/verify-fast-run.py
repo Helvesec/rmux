@@ -115,7 +115,7 @@ def require_equal(actual: Any, expected: Any, label: str) -> None:
 
 def contracted_runner_labels(
     contract: dict[str, Any], expected_job_names: set[str]
-) -> tuple[dict[str, Any], dict[str, str]]:
+) -> tuple[dict[str, Any], dict[str, str], set[str]]:
     policy = contract.get("runner_policy")
     if not isinstance(policy, dict):
         raise ValueError("runner policy is missing")
@@ -132,6 +132,14 @@ def contracted_runner_labels(
     require_equal(
         set(jobs_by_label), STANDARD_RUNNER_LABELS, "standard runner label set"
     )
+    non_runner_jobs_value = policy.get("non_runner_jobs")
+    if not isinstance(non_runner_jobs_value, list) or not all(
+        isinstance(name, str) and name for name in non_runner_jobs_value
+    ):
+        raise ValueError("runner non_runner_jobs must contain job names")
+    non_runner_jobs = set(non_runner_jobs_value)
+    if len(non_runner_jobs) != len(non_runner_jobs_value):
+        raise ValueError("runner non_runner_jobs contains duplicates")
     job_labels: dict[str, str] = {}
     for label, names in jobs_by_label.items():
         if not isinstance(names, list) or not all(
@@ -158,10 +166,25 @@ def contracted_runner_labels(
         if not isinstance(allowed_jobs, dict):
             raise ValueError(f"{run_kind}.allowed_jobs must be an object")
         contracted_job_names.update(allowed_jobs)
-    require_equal(set(job_labels), contracted_job_names, "runner policy job set")
-    if not expected_job_names <= set(job_labels):
+    if set(job_labels) & non_runner_jobs:
+        raise ValueError("a non-runner job also has a runner label")
+    require_equal(
+        set(job_labels) | non_runner_jobs,
+        contracted_job_names,
+        "runner policy job set",
+    )
+    if not expected_job_names <= (set(job_labels) | non_runner_jobs):
         raise ValueError("current run has a job without a runner policy assignment")
-    return policy, job_labels
+    return policy, job_labels, non_runner_jobs
+
+
+def verify_non_runner_job(job: dict[str, Any]) -> None:
+    name = job["name"]
+    require_equal(job.get("labels"), [], f"job {name} runner labels")
+    for field in ("runner_id", "runner_name", "runner_group_id", "runner_group_name"):
+        if field not in job:
+            raise ValueError(f"non-runner job {name} is missing {field}")
+        require_equal(job[field], None, f"non-runner job {name} {field}")
 
 
 def verify_job_runner(
@@ -288,7 +311,9 @@ def verify(
         raise ValueError(
             f"job set mismatch; missing={missing}, unexpected={unexpected}"
         )
-    runner_policy, job_labels = contracted_runner_labels(contract, expected_names)
+    runner_policy, job_labels, non_runner_jobs = contracted_runner_labels(
+        contract, expected_names
+    )
     for job in jobs:
         require_equal(job.get("status"), "completed", f"job {job['name']} status")
         require_equal(job.get("run_id"), args.run_id, f"job {job['name']} run ID")
@@ -310,7 +335,10 @@ def verify(
                 f"job {job['name']} conclusion must be one of {expected[job['name']]!r}, "
                 f"got {job.get('conclusion')!r}"
             )
-        verify_job_runner(job, runner_policy, job_labels[job["name"]])
+        if job["name"] in non_runner_jobs:
+            verify_non_runner_job(job)
+        else:
+            verify_job_runner(job, runner_policy, job_labels[job["name"]])
         created = timestamp(job.get("created_at"), f"job {job['name']} created_at")
         job_started = timestamp(job.get("started_at"), f"job {job['name']} started_at")
         completed = timestamp(

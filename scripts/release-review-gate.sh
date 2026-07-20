@@ -18,6 +18,8 @@ Options:
   --layout DIR         Reuse or populate a release layout directory.
   --section NAME       Run one section: static, perf, lint, server, cli, tmux,
                        runtime-sdk, or package. Defaults to all sections.
+  --evidence-mode MODE full (default) or candidate-delta. Candidate delta
+                       omits checks already proven by the exact fast run.
   --skip-package       Skip release layout build and tiny package smoke.
   --skip-package-build Reuse --layout without rebuilding it.
   --no-tmux            Skip tmux authority checks inside the package smoke.
@@ -78,6 +80,7 @@ skip_package=0
 skip_package_build=0
 no_tmux=0
 section=all
+evidence_mode=full
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -94,6 +97,11 @@ while [ "$#" -gt 0 ]; do
     --section)
       [ "$#" -ge 2 ] || die "--section requires a name"
       section="$2"
+      shift 2
+      ;;
+    --evidence-mode)
+      [ "$#" -ge 2 ] || die "--evidence-mode requires a value"
+      evidence_mode="$2"
       shift 2
       ;;
     --skip-package)
@@ -122,6 +130,16 @@ case "$section" in
   all|static|perf|lint|server|cli|tmux|runtime-sdk|package) ;;
   *) die "unknown release review section: $section" ;;
 esac
+case "$evidence_mode" in
+  full|candidate-delta) ;;
+  *) die "unknown evidence mode: $evidence_mode" ;;
+esac
+if [ "$evidence_mode" = candidate-delta ]; then
+  case "$section" in
+    static|perf|cli|tmux) ;;
+    *) die "section $section is already covered by the exact fast proof" ;;
+  esac
+fi
 
 cd "$repo_root"
 gate_platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -175,7 +193,9 @@ if section_enabled static; then
   run_step "tmux divergence ledger" python3 scripts/check-tmux-release-ledger.py
   run_step "feature inventory" \
     cargo run --locked --package xtask -- feature-inventory --check
-  run_step "formatting" cargo fmt --all -- --check
+  if [ "$evidence_mode" = full ]; then
+    run_step "formatting" cargo fmt --all -- --check
+  fi
 fi
 
 if section_enabled perf; then
@@ -261,7 +281,9 @@ fi
 
 if section_enabled static; then
   run_step "worktree hygiene" scripts/check-worktree-hygiene.sh
-  run_step "platform neutrality" scripts/check-platform-neutrality.sh
+  if [ "$evidence_mode" = full ]; then
+    run_step "platform neutrality" scripts/check-platform-neutrality.sh
+  fi
 fi
 
 if section_enabled lint; then
@@ -279,33 +301,37 @@ if section_enabled cli; then
     scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux --features tiny-cli tiny_main --locked
   run_step "tiny parser and boundary tests" \
     cargo test -p rmux --features tiny-cli tiny_main --locked
-  run_step "mutating target-action retry filter selects tests" \
-    scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux --bin rmux --locked target_action_retry_is_limited
-  run_step "mutating target-action retry tests" \
-    cargo test -p rmux --bin rmux --locked target_action_retry_is_limited
-  run_step "acceptance CLI matrix filter selects tests" \
-    scripts/assert-cargo-filter-nonempty.sh 1 -- test --locked --test acceptance_cli_matrix
-  run_step "acceptance CLI matrix" \
-    cargo test --locked --test acceptance_cli_matrix -- --test-threads=1
-  run_step "source/config acceptance matrix filter selects tests" \
-    scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test acceptance_source_config_matrix
-  run_step "source/config acceptance matrix" \
-    cargo test --locked --test acceptance_source_config_matrix -- --test-threads=1
-  run_step "target/format acceptance matrix filter selects tests" \
-    scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test acceptance_target_format_matrix
-  run_step "target/format acceptance matrix" \
-    cargo test --locked --test acceptance_target_format_matrix -- --test-threads=1
-  run_step "config corpus smoke filter selects tests" \
-    scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test config_corpus_script
-  run_step "config corpus parse-only smoke" \
-    cargo test --locked --test config_corpus_script -- --test-threads=1
+  if [ "$evidence_mode" = full ]; then
+    run_step "mutating target-action retry filter selects tests" \
+      scripts/assert-cargo-filter-nonempty.sh 1 -- test -p rmux --bin rmux --locked target_action_retry_is_limited
+    run_step "mutating target-action retry tests" \
+      cargo test -p rmux --bin rmux --locked target_action_retry_is_limited
+    run_step "acceptance CLI matrix filter selects tests" \
+      scripts/assert-cargo-filter-nonempty.sh 1 -- test --locked --test acceptance_cli_matrix
+    run_step "acceptance CLI matrix" \
+      cargo test --locked --test acceptance_cli_matrix -- --test-threads=1
+    run_step "source/config acceptance matrix filter selects tests" \
+      scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test acceptance_source_config_matrix
+    run_step "source/config acceptance matrix" \
+      cargo test --locked --test acceptance_source_config_matrix -- --test-threads=1
+    run_step "target/format acceptance matrix filter selects tests" \
+      scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test acceptance_target_format_matrix
+    run_step "target/format acceptance matrix" \
+      cargo test --locked --test acceptance_target_format_matrix -- --test-threads=1
+    run_step "config corpus smoke filter selects tests" \
+      scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test config_corpus_script
+    run_step "config corpus parse-only smoke" \
+      cargo test --locked --test config_corpus_script -- --test-threads=1
+  fi
 fi
 
 if section_enabled tmux; then
-  run_step "source-file tmux oracle filter selects tests" \
-    scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test unix_source_file_tmux_oracle
-  run_step "source-file tmux oracle" \
-    cargo test --locked --test unix_source_file_tmux_oracle -- --test-threads=1
+  if [ "$evidence_mode" = full ]; then
+    run_step "source-file tmux oracle filter selects tests" \
+      scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test unix_source_file_tmux_oracle
+    run_step "source-file tmux oracle" \
+      cargo test --locked --test unix_source_file_tmux_oracle -- --test-threads=1
+  fi
   run_step "tmux surface matrix oracle filter selects tests" \
     scripts/assert-cargo-filter-nonempty.sh 45 -- test --locked --test tmux_compat_surface_matrix
   run_step "tmux surface matrix oracle" \
