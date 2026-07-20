@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/release-promotion-authorization-envelope-v1.json",
+  "title": "RMUX disarmed promotion authorization post-upload envelope",
+  "description": "Review-only post-upload binding. It MUST NOT authorize or publish anything before PR8 and never identifies its own upload.",
+  "x-rmux-status": "disarmed-non-authoritative",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "envelope_type",
+    "status",
+    "publication_authority",
+    "repository_id",
+    "source_git_sha",
+    "release_ref",
+    "release_intent_id",
+    "authorization",
+    "predicate_sha256",
+    "sha256sums_sha256",
+    "attestation",
+    "authorization_bundle",
+    "public_metadata_assets",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "envelope_type": {"const": "https://rmux.io/envelopes/release-promotion-authorization/v1"},
+    "status": {"const": "disarmed-non-authoritative"},
+    "publication_authority": {"const": false},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"$ref": "#/$defs/sha40"},
+    "release_ref": {"$ref": "#/$defs/release_ref"},
+    "release_intent_id": {"$ref": "#/$defs/intent"},
+    "authorization": {"$ref": "#/$defs/identity"},
+    "predicate_sha256": {"$ref": "#/$defs/sha256"},
+    "sha256sums_sha256": {"$ref": "#/$defs/sha256"},
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attestation_id", "bundle_file", "bundle_sha256"],
+      "properties": {
+        "attestation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "bundle_file": {"const": "SHA256SUMS.sigstore.json"},
+        "bundle_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "authorization_bundle": {"$ref": "#/$defs/artifact"},
+    "public_metadata_assets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "role", "size", "sha256"],
+        "properties": {
+          "name": {"const": "SHA256SUMS.sigstore.json"},
+          "role": {"const": "authorization-attestation"},
+          "size": {"type": "integer", "minimum": 1},
+          "sha256": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "intent": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+    "release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "workflow_id", "workflow_path"],
+      "properties": {
+        "run_id": {"type": "integer", "minimum": 1},
+        "run_attempt": {"const": 1},
+        "workflow_id": {"type": "integer", "minimum": 1},
+        "workflow_path": {"const": ".github/workflows/release-promote.yml"}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "name", "archive_digest", "size_in_bytes"],
+      "properties": {
+        "artifact_id": {"type": "integer", "minimum": 1},
+        "name": {"type": "string", "pattern": "^rmux-promotion-authorization-[0-9a-f]{40}$"},
+        "archive_digest": {"$ref": "#/$defs/digest"},
+        "size_in_bytes": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

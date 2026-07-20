@@ -68,15 +68,25 @@
     "contract": ".github/release/policy-audit-contract.json",
     "audit_app_configured": false,
     "workflow": ".github/workflows/release-policy-audit.yml",
-    "workflow_callers": 0,
+    "workflow_callers": 1,
     "privileged_job_condition": "false",
     "pat_fallback": false,
     "authorizes_publication": false
   },
   "publication": {
     "enabled": false,
+    "promoter_concurrency": "rmux-release-promote-${release_ref}",
+    "promoter_trigger": "workflow_call",
+    "promoter_workflow": ".github/workflows/release-promote.yml",
     "public_triggers": false,
     "publication_permissions": false,
-    "publication_secrets": false
+    "publication_secrets": false,
+    "receipt_concurrency": "rmux-release-receipt-${release_ref}",
+    "receipt_required_run_attempt": 1,
+    "receipt_trigger": "workflow_dispatch",
+    "receipt_workflow": ".github/workflows/release-receipt.yml",
+    "tag_authoring_concurrency": "rmux-release-tag-authoring-${release_ref}",
+    "tag_authoring_trigger": "workflow_call",
+    "tag_authoring_workflow": ".github/workflows/release-tag-authoring.yml"
   }
 }

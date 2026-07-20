@@ -16,6 +16,10 @@ from canonical_contract import (
 )
 from local_action_policy import validate_local_action_policy
 from policy_audit_contract import validate_repository_contracts
+from promotion_contract import (
+    validate_candidate_policy as validate_promotion_candidate_policy,
+    validate_schemas as validate_promotion_schemas,
+)
 from shadow_contract import (
     validate_candidate_policy as validate_shadow_candidate_policy,
 )
@@ -30,7 +34,6 @@ STANDARD_RUNNER_LABELS = {
     "ubuntu-latest",
     "windows-latest",
 }
-DRAFT_SCHEMA_STATUS = "draft-non-authoritative"
 SHADOW_SCHEMA_STATUS = "shadow-non-authoritative"
 ALLOWED_WINDOWS_PROOFS = {
     "fast_exact",
@@ -387,17 +390,7 @@ def validate_candidate_workflow() -> None:
         raise ValueError("the fast and candidate path must build tmux exactly once")
     validate_canonical_candidate_policy(contract.get("canonical_builds"))
     validate_shadow_candidate_policy(contract.get("shadow_sealer"))
-    publication = contract.get("publication")
-    if not isinstance(publication, dict) or any(
-        publication.get(field) is not False
-        for field in (
-            "enabled",
-            "public_triggers",
-            "publication_permissions",
-            "publication_secrets",
-        )
-    ):
-        raise ValueError("candidate delta acquired publication authority")
+    validate_promotion_candidate_policy(contract.get("publication"))
 
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     delta_workflow = (ROOT / ".github/workflows/release-candidate-delta.yml").read_text(
@@ -470,33 +463,12 @@ def validate_schemas() -> None:
             "release_policy",
             "artifacts",
         },
-        "promotion-authorization.schema.json": {
-            "authorization_attestation_id",
-            "candidate_manifest_artifact_digest",
-            "authorization_bundle_artifact_id",
-            "authorization_bundle_artifact_digest",
-        },
-        "publication-receipt.schema.json": {
-            "release_id",
-            "authorization_attestation_id",
-            "candidate_manifest_artifact_id",
-            "candidate_manifest_artifact_digest",
-            "authorization_bundle_artifact_id",
-            "authorization_bundle_artifact_digest",
-            "receipt_run_attempt",
-            "immutable",
-        },
     }
     for filename, required_fields in expected.items():
         schema = load(schema_dir / filename)
-        expected_status = (
-            SHADOW_SCHEMA_STATUS
-            if filename == "candidate-manifest.schema.json"
-            else DRAFT_SCHEMA_STATUS
-        )
-        if schema.get("x-rmux-status") != expected_status:
+        if schema.get("x-rmux-status") != SHADOW_SCHEMA_STATUS:
             raise ValueError(f"{filename} must remain explicitly non-authoritative")
-        if "MUST NOT authorize publication" not in schema.get("description", ""):
+        if "MUST NOT authorize" not in schema.get("description", ""):
             raise ValueError(f"{filename} must state its publication prohibition")
         if schema.get("additionalProperties") is not False:
             raise ValueError(f"{filename} must fail closed on unknown fields")
@@ -506,24 +478,7 @@ def validate_schemas() -> None:
         missing = required_fields - required
         if missing:
             raise ValueError(f"{filename} is missing required fields {sorted(missing)}")
-    authority_schema_names = {
-        "promotion-authorization.schema.json",
-        "publication-receipt.schema.json",
-    }
-    for workflow in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
-        text = workflow.read_text(encoding="utf-8")
-        referenced = sorted(name for name in authority_schema_names if name in text)
-        if referenced:
-            raise ValueError(
-                f"{workflow.relative_to(ROOT)} consumes draft authority schemas: "
-                f"{referenced}"
-            )
-    receipt = load(schema_dir / "publication-receipt.schema.json")
-    if receipt["properties"]["receipt_run_attempt"].get("const") != 1:
-        raise ValueError("receipt-only runs must be attempt 1")
-    authorization = load(schema_dir / "promotion-authorization.schema.json")
-    if authorization["properties"]["authorization_run_attempt"].get("const") != 1:
-        raise ValueError("promotion authorization runs must be attempt 1")
+    validate_promotion_schemas(schema_dir)
     candidate = load(schema_dir / "candidate-manifest.schema.json")
     intent_pattern = candidate["properties"]["release_intent_id"].get("pattern")
     if intent_pattern != "^[A-Za-z0-9._:-]{8,128}$":

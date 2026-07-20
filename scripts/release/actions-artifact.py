@@ -50,6 +50,45 @@ def get_artifact_by_id(args: argparse.Namespace) -> dict[str, Any]:
     raise AssertionError("bounded artifact lookup exhausted without returning")
 
 
+def verify_run_identity(args: argparse.Namespace) -> None:
+    expected = (
+        args.expected_workflow_id,
+        args.expected_workflow_path,
+        args.expected_event,
+        args.expected_head_branch,
+    )
+    if all(value is None for value in expected):
+        return
+    if any(value is None for value in expected):
+        raise ValueError("exact run identity options must be supplied together")
+    run = (
+        read_json(args.run_json)
+        if args.run_json
+        else gh_api(f"repos/{args.repository}/actions/runs/{args.run_id}")
+    )
+    if not isinstance(run, dict):
+        raise ValueError("workflow run response must be an object")
+    wanted = {
+        "id": args.run_id,
+        "workflow_id": args.expected_workflow_id,
+        "path": args.expected_workflow_path,
+        "event": args.expected_event,
+        "run_attempt": 1,
+        "head_sha": args.expected_source_sha,
+        "head_branch": args.expected_head_branch,
+        "status": "completed",
+        "conclusion": "success",
+    }
+    for field, value in wanted.items():
+        if run.get(field) != value:
+            raise ValueError(f"workflow run {field} mismatch")
+    if (
+        run.get("repository", {}).get("id") != REPOSITORY_ID
+        or run.get("head_repository", {}).get("id") != REPOSITORY_ID
+    ):
+        raise ValueError("workflow run repository identity mismatch")
+
+
 def load_artifacts(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.command in {"resolve-id", "verify"}:
         return [get_artifact_by_id(args)]
@@ -144,6 +183,13 @@ def parse_args() -> argparse.Namespace:
         command.add_argument("--expected-source-sha", required=True)
         command.add_argument("--artifact-json", type=Path)
         command.add_argument("--github-output", type=Path)
+        command.add_argument("--run-json", type=Path)
+        command.add_argument("--expected-workflow-id", type=int)
+        command.add_argument("--expected-workflow-path")
+        command.add_argument(
+            "--expected-event", choices=("workflow_call", "workflow_dispatch")
+        )
+        command.add_argument("--expected-head-branch")
         if name in {"resolve-id", "verify"}:
             command.add_argument("--artifact-id", type=int, required=True)
             command.add_argument("--max-attempts", type=int, default=1)
@@ -174,6 +220,7 @@ def main() -> int:
         if not 0 <= args.retry_delay_seconds <= 10:
             raise ValueError("artifact retry delay must be between 0 and 10 seconds")
     artifacts = load_artifacts(args)
+    verify_run_identity(args)
     if args.command == "resolve":
         matches = [
             artifact for artifact in artifacts if artifact.get("name") == args.name

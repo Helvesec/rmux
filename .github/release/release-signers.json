@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "status": "disabled-missing-dedicated-signing-key",
+  "repository": {
+    "id": 1239918790,
+    "full_name": "Helvesec/rmux"
+  },
+  "release_app": {
+    "app_id": 4339867,
+    "may_create_only": "refs/tags/v*",
+    "force_updates_allowed": false
+  },
+  "tag_policy": {
+    "signature_format": "ssh",
+    "signature_namespace": "git",
+    "ref_pattern": "^refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$",
+    "required_private_key_secret": "RMUX_RELEASE_SSH_SIGNING_KEY",
+    "enabled": false,
+    "blocker": "dedicated_release_ssh_signing_key_not_configured",
+    "allowed_signers": []
+  }
+}

@@ -431,6 +431,65 @@ fn actions_artifact_binding_rejects_digest_or_run_drift() {
         "{}",
         String::from_utf8_lossy(&accepted.stderr)
     );
+    let run_path = root.join("run.json");
+    fs::write(
+        &run_path,
+        serde_json::json!({
+            "id": 77,
+            "workflow_id": 316223904,
+            "path": ".github/workflows/release-shadow.yml",
+            "event": "workflow_dispatch",
+            "run_attempt": 1,
+            "head_sha": source,
+            "head_branch": "main",
+            "status": "completed",
+            "conclusion": "success",
+            "repository": {"id": 1239918790},
+            "head_repository": {"id": 1239918790}
+        })
+        .to_string(),
+    )
+    .expect("write run fixture");
+    let strict_args = [
+        "verify",
+        "--run-id",
+        "77",
+        "--artifact-id",
+        "88",
+        "--name",
+        &name,
+        "--expected-digest",
+        &digest,
+        "--expected-source-sha",
+        source,
+        "--artifact-json",
+        artifact_path.to_str().expect("artifact fixture path"),
+        "--run-json",
+        run_path.to_str().expect("run fixture path"),
+        "--expected-workflow-id",
+        "316223904",
+        "--expected-workflow-path",
+        ".github/workflows/release-shadow.yml",
+        "--expected-event",
+        "workflow_dispatch",
+        "--expected-head-branch",
+        "main",
+    ];
+    let strict = run(&script, &strict_args);
+    assert!(
+        strict.status.success(),
+        "{}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+    let mut forged_run: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&run_path).expect("read run fixture"))
+            .expect("parse run fixture");
+    forged_run["workflow_id"] = serde_json::json!(999);
+    fs::write(&run_path, forged_run.to_string()).expect("forge run fixture");
+    let forged_origin = run(&script, &strict_args);
+    assert!(!forged_origin.status.success());
+    assert!(String::from_utf8_lossy(&forged_origin.stderr)
+        .contains("workflow run workflow_id mismatch"));
     let rejected = run(
         &script,
         &[

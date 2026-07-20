@@ -1,0 +1,360 @@
+name: Disarmed immutable GitHub Release receipt
+
+on:
+  workflow_dispatch:
+    inputs:
+      authorization_run_id: {required: true, type: string}
+      authorization_artifact_id: {required: true, type: string}
+      authorization_artifact_digest: {required: true, type: string}
+      authorization_envelope_artifact_id: {required: true, type: string}
+      authorization_envelope_artifact_digest: {required: true, type: string}
+      authorization_workflow_id: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+      receipt_workflow_id: {required: true, type: string}
+
+concurrency:
+  group: rmux-release-receipt-${{ inputs.release_ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  receipt-only:
+    name: Disabled receipt-only immutable Release verification
+    if: ${{ false }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      receipt_artifact_id: ${{ steps.receipt-upload.outputs.artifact-id }}
+      receipt_artifact_digest: sha256:${{ steps.receipt-upload.outputs.artifact-digest }}
+      envelope_artifact_id: ${{ steps.envelope-upload.outputs.artifact-id }}
+      envelope_artifact_digest: sha256:${{ steps.envelope-upload.outputs.artifact-digest }}
+    env:
+      RMUX_AUTHORIZATION_RUN_ID: ${{ inputs.authorization_run_id }}
+      RMUX_AUTHORIZATION_ARTIFACT_ID: ${{ inputs.authorization_artifact_id }}
+      RMUX_AUTHORIZATION_ARTIFACT_DIGEST: ${{ inputs.authorization_artifact_digest }}
+      RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_ID: ${{ inputs.authorization_envelope_artifact_id }}
+      RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.authorization_envelope_artifact_digest }}
+      RMUX_AUTHORIZATION_WORKFLOW_ID: ${{ inputs.authorization_workflow_id }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_ID: ${{ inputs.release_id }}
+      RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+      RMUX_RECEIPT_WORKFLOW_ID: ${{ inputs.receipt_workflow_id }}
+    steps:
+      - name: Reject malformed receipt inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for value in "$RMUX_AUTHORIZATION_RUN_ID" "$RMUX_AUTHORIZATION_ARTIFACT_ID" "$RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_ID" "$RMUX_AUTHORIZATION_WORKFLOW_ID" "$RMUX_RELEASE_ID" "$RMUX_RECEIPT_WORKFLOW_ID"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          [[ "$RMUX_AUTHORIZATION_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          test "$GITHUB_RUN_ATTEMPT" = 1
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Fail closed before receipt attestation
+        run: scripts/release/assert-release-capability.py publication_receipt
+
+      - name: Verify exact receipt input artifacts through the Actions API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_AUTHORIZATION_RUN_ID" \
+            --artifact-id "$RMUX_AUTHORIZATION_ARTIFACT_ID" \
+            --name "rmux-promotion-authorization-$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_AUTHORIZATION_ARTIFACT_DIGEST" --max-attempts 1
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_AUTHORIZATION_RUN_ID" \
+            --artifact-id "$RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_ID" \
+            --name "rmux-promotion-envelope-$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_DIGEST" --max-attempts 1
+
+      - name: Download only the exact authorization predicate bundle ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.authorization_artifact_id }}
+          path: ${{ runner.temp }}/rmux-receipt/authorization
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.authorization_run_id }}
+
+      - name: Download only the exact authorization envelope ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.authorization_envelope_artifact_id }}
+          path: ${{ runner.temp }}/rmux-receipt/envelope
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.authorization_run_id }}
+
+      - id: gh
+        name: Install the pinned read-only GitHub CLI
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/rmux-gh-2.93.0"
+          scripts/release/install-gh-2.93.0.sh "$install_root"
+          echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+      - id: identity
+        name: Re-fetch live immutable Release, tag, and public assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RMUX_GH: ${{ steps.gh.outputs.binary }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-receipt"
+          "$RMUX_GH" api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RMUX_AUTHORIZATION_RUN_ID" > "$root/live-run.json"
+          "$RMUX_GH" api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$RMUX_RELEASE_ID" > "$root/live-release.json"
+          "$RMUX_GH" api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$RMUX_RELEASE_ID/assets?per_page=100&page=1" > "$root/live-assets.json"
+          "$RMUX_GH" api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/git/ref/tags/$RMUX_RELEASE_REF" > "$root/live-ref.json"
+          tag_object_sha=$(python3 - "$root/live-ref.json" <<'PY'
+          import json, pathlib, sys
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          tag = value.get("object", {}).get("sha")
+          if not isinstance(tag, str) or len(tag) != 40: raise SystemExit("live tag object SHA is invalid")
+          print(tag)
+          PY
+          )
+          "$RMUX_GH" api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" > "$root/live-tag.json"
+          python3 - "$root/authorization/promotion-authorization-predicate.json" "$root/live-run.json" "$root/live-release.json" "$root/live-assets.json" "$root/live-ref.json" "$root/live-tag.json" "$root/release-state.json" "$GITHUB_OUTPUT" <<'PY'
+          from datetime import datetime, timezone
+          import hashlib, json, os, pathlib, sys
+          predicate, run, release, assets, ref, tag = [json.loads(pathlib.Path(path).read_text(encoding="utf-8")) for path in sys.argv[1:7]]
+          run_expected = {
+              "id": int(os.environ["RMUX_AUTHORIZATION_RUN_ID"]),
+              "workflow_id": int(os.environ["RMUX_AUTHORIZATION_WORKFLOW_ID"]),
+              "run_attempt": 1,
+              "path": ".github/workflows/release-promote.yml",
+              "head_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "status": "completed",
+              "conclusion": "success",
+          }
+          if any(run.get(field) != wanted for field, wanted in run_expected.items()) or run.get("repository", {}).get("id") != 1239918790:
+              raise SystemExit("authorization producer run identity differs")
+          if predicate.get("authorization", {}).get("run_id") != run_expected["id"] or predicate.get("authorization", {}).get("workflow_id") != run_expected["workflow_id"]:
+              raise SystemExit("authorization predicate run identity differs from live run")
+          release_expected = {
+              "id": int(os.environ["RMUX_RELEASE_ID"]), "tag_name": os.environ["RMUX_RELEASE_REF"],
+              "target_commitish": os.environ["RMUX_EXPECTED_SOURCE_SHA"], "draft": False,
+              "prerelease": predicate.get("release", {}).get("is_prerelease"), "immutable": True,
+          }
+          if any(release.get(field) != wanted for field, wanted in release_expected.items()):
+              raise SystemExit("live immutable Release identity differs")
+          ref_object = ref.get("object", {})
+          if ref.get("ref") != f"refs/tags/{os.environ['RMUX_RELEASE_REF']}" or ref_object.get("type") != "tag" or ref_object.get("sha") != predicate.get("signed_tag", {}).get("tag_object_sha"):
+              raise SystemExit("live release ref differs from authorized tag object")
+          verification, target = tag.get("verification", {}), tag.get("object", {})
+          if tag.get("sha") != ref_object.get("sha") or tag.get("tag") != os.environ["RMUX_RELEASE_REF"] or target != {"type": "commit", "sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"]} or verification.get("verified") is not True or verification.get("reason") != "valid":
+              raise SystemExit("live annotated tag signature or target differs")
+          rendered_assets = sorted(
+              ({"id": item.get("id"), "name": item.get("name"), "size": item.get("size"), "digest": item.get("digest")} for item in assets),
+              key=lambda item: item["name"] if isinstance(item["name"], str) else "",
+          )
+          state = {
+              "schema_version": 1, "status": "verified-immutable-release", "repository_id": 1239918790,
+              "release_id": release["id"], "release_ref": release["tag_name"],
+              "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"], "tag_object_sha": ref_object["sha"],
+              "draft": release["draft"], "prerelease": release["prerelease"], "immutable": release["immutable"],
+              "created_at": release["created_at"], "published_at": release["published_at"], "assets": rendered_assets,
+          }
+          path = pathlib.Path(sys.argv[7])
+          path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          verified = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          with pathlib.Path(sys.argv[8]).open("a", encoding="utf-8") as output:
+              output.write(f"verified_at={verified}\n")
+              output.write(f"release_state_digest=sha256:{digest}\n")
+          PY
+
+      - name: Download and cryptographically verify every public asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RMUX_GH: ${{ steps.gh.outputs.binary }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-receipt"
+          mkdir "$root/public-assets"
+          python3 - "$root/release-state.json" "$root/public-assets.tsv" <<'PY'
+          import json, pathlib, re, sys
+          state = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          safe = re.compile(r"[A-Za-z0-9._+@=-]+")
+          lines = []
+          for item in state.get("assets", []):
+              if type(item.get("id")) is not int or item["id"] <= 0 or not isinstance(item.get("name"), str) or safe.fullmatch(item["name"]) is None:
+                  raise SystemExit("live public asset identity is unsafe")
+              if type(item.get("size")) is not int or item["size"] <= 0 or not isinstance(item.get("digest"), str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", item["digest"]):
+                  raise SystemExit("live public asset size or digest is invalid")
+              lines.append(f"{item['id']}\t{item['name']}\t{item['size']}\t{item['digest'][7:]}\n")
+          pathlib.Path(sys.argv[2]).write_text("".join(lines), encoding="ascii")
+          PY
+          while IFS=$'\t' read -r asset_id name size digest; do
+            destination="$root/public-assets/$name"
+            "$RMUX_GH" api -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$destination"
+            test "$(stat -c '%s' "$destination")" = "$size"
+            test "$(sha256sum "$destination" | cut -d' ' -f1)" = "$digest"
+          done < "$root/public-assets.tsv"
+          cmp -- "$root/authorization/SHA256SUMS.sigstore.json" \
+            "$root/public-assets/SHA256SUMS.sigstore.json"
+          expected_sums=$(python3 - "$root/authorization/promotion-authorization-predicate.json" <<'PY'
+          import json, pathlib, sys
+          print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["sha256sums_sha256"])
+          PY
+          )
+          test "$(sha256sum "$root/public-assets/SHA256SUMS" | cut -d' ' -f1)" = "$expected_sums"
+          first=true
+          while read -r digest name; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$name" =~ ^[A-Za-z0-9._+@=-]+$ ]]
+            output="$root/authorization-verification.json"
+            "$RMUX_GH" attestation verify "$root/public-assets/$name" \
+              --bundle "$root/public-assets/SHA256SUMS.sigstore.json" \
+              --repo Helvesec/rmux \
+              --signer-workflow Helvesec/rmux/.github/workflows/release-promote.yml \
+              --signer-digest "$RMUX_EXPECTED_SOURCE_SHA" \
+              --source-digest "$RMUX_EXPECTED_SOURCE_SHA" \
+              --source-ref "refs/tags/$RMUX_RELEASE_REF" \
+              --predicate-type https://rmux.io/attestations/release-promotion-authorization/v1 \
+              --deny-self-hosted-runners --format json > "$output"
+            python3 - "$output" "$root/authorization/promotion-authorization-predicate.json" "$root/public-assets/SHA256SUMS" <<'PY'
+          import json, pathlib, sys
+          results = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          predicate = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          expected = {}
+          for line in pathlib.Path(sys.argv[3]).read_text(encoding="ascii").splitlines():
+              digest, name = line.split("  ", 1)
+              expected[name] = digest
+          if not isinstance(results, list) or len(results) != 1:
+              raise SystemExit("authorization attestation cardinality differs")
+          statement = results[0].get("verificationResult", {}).get("statement", {})
+          subjects = statement.get("subject", [])
+          actual = {item.get("name"): item.get("digest", {}).get("sha256") for item in subjects if isinstance(item, dict)}
+          if len(actual) != len(subjects) or actual != expected:
+              raise SystemExit("authorization attestation subject set differs")
+          if statement.get("predicateType") != "https://rmux.io/attestations/release-promotion-authorization/v1" or statement.get("predicate") != predicate:
+              raise SystemExit("signed authorization predicate differs")
+          PY
+            first=false
+          done < "$root/public-assets/SHA256SUMS"
+          test "$first" = false
+
+      - name: Create and verify exact receipt predicate
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-receipt"
+          common=(
+            --authorization-predicate "$root/authorization/promotion-authorization-predicate.json"
+            --authorization-envelope "$root/envelope/promotion-authorization-envelope.json"
+            --release-state "$root/release-state.json"
+            --receipt-run-id "$GITHUB_RUN_ID" --receipt-run-attempt 1
+            --receipt-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID"
+            --verified-at "${{ steps.identity.outputs.verified_at }}"
+          )
+          python3 scripts/release/publication-receipt.py create-predicate \
+            "${common[@]}" --output "$root/publication-receipt-predicate.json"
+          python3 scripts/release/publication-receipt.py verify-predicate \
+            "${common[@]}" --document "$root/publication-receipt-predicate.json"
+
+      - id: attestation
+        name: Attest exact immutable Release state with the receipt predicate
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-name: release-state.json
+          subject-digest: ${{ steps.identity.outputs.release_state_digest }}
+          predicate-type: https://rmux.io/attestations/release-publication-receipt/v1
+          predicate-path: ${{ runner.temp }}/rmux-receipt/publication-receipt-predicate.json
+          show-summary: false
+
+      - name: Give the receipt attestation bundle its contracted name
+        shell: bash
+        run: cp -- "${{ steps.attestation.outputs.bundle-path }}" "$RUNNER_TEMP/rmux-receipt/publication-receipt.sigstore.json"
+
+      - id: receipt-upload
+        name: Upload receipt predicate and attestation by exact ID
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-publication-receipt-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}
+          path: |
+            ${{ runner.temp }}/rmux-receipt/publication-receipt-predicate.json
+            ${{ runner.temp }}/rmux-receipt/publication-receipt.sigstore.json
+            ${{ runner.temp }}/rmux-receipt/release-state.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - id: receipt-api
+        name: Resolve exact receipt bundle size and digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/actions-artifact.py resolve-id \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --artifact-id "${{ steps.receipt-upload.outputs.artifact-id }}" \
+            --name "rmux-publication-receipt-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" --max-attempts 6 \
+            --retry-delay-seconds 2 > "$RUNNER_TEMP/rmux-receipt/artifact.json"
+          python3 - "$RUNNER_TEMP/rmux-receipt/artifact.json" "$GITHUB_OUTPUT" <<'PY'
+          import json, pathlib, sys
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"artifact_digest={value['digest']}\n")
+              output.write(f"artifact_size={value['size_in_bytes']}\n")
+          PY
+
+      - name: Create and verify post-upload receipt envelope
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-receipt"
+          common=(
+            --predicate "$root/publication-receipt-predicate.json"
+            --attestation-id "${{ steps.attestation.outputs.attestation-id }}"
+            --attestation-bundle "$root/publication-receipt.sigstore.json"
+            --bundle-artifact-id "${{ steps.receipt-upload.outputs.artifact-id }}"
+            --bundle-artifact-name "rmux-publication-receipt-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}"
+            --bundle-artifact-digest "${{ steps.receipt-api.outputs.artifact_digest }}"
+            --bundle-artifact-size "${{ steps.receipt-api.outputs.artifact_size }}"
+            --created-at "${{ steps.identity.outputs.verified_at }}"
+          )
+          python3 scripts/release/publication-receipt.py create-envelope \
+            "${common[@]}" --output "$root/publication-receipt-envelope.json"
+          python3 scripts/release/publication-receipt.py verify-envelope \
+            "${common[@]}" --document "$root/publication-receipt-envelope.json"
+
+      - id: envelope-upload
+        name: Upload non-circular receipt envelope separately
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-publication-receipt-envelope-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}
+          path: ${{ runner.temp }}/rmux-receipt/publication-receipt-envelope.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

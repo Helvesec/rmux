@@ -748,7 +748,7 @@ fn candidate_artifacts_allow_only_standard_github_runner_labels() {
 
 #[test]
 #[cfg(unix)]
-fn draft_authority_schemas_cannot_drive_a_workflow() {
+fn disarmed_authority_schemas_cannot_drive_a_workflow() {
     let candidate: serde_json::Value = serde_json::from_str(include_str!(
         "../.github/release/schemas/candidate-manifest.schema.json"
     ))
@@ -760,15 +760,18 @@ fn draft_authority_schemas_cannot_drive_a_workflow() {
         .contains("MUST NOT authorize publication"));
 
     for schema in [
-        include_str!("../.github/release/schemas/promotion-authorization.schema.json"),
-        include_str!("../.github/release/schemas/publication-receipt.schema.json"),
+        include_str!("../.github/release/schemas/promotion-authorization-predicate.schema.json"),
+        include_str!("../.github/release/schemas/promotion-authorization-envelope.schema.json"),
+        include_str!("../.github/release/schemas/publication-receipt-predicate.schema.json"),
+        include_str!("../.github/release/schemas/publication-receipt-envelope.schema.json"),
     ] {
-        let schema: serde_json::Value = serde_json::from_str(schema).expect("parse draft schema");
-        assert_eq!(schema["x-rmux-status"], "draft-non-authoritative");
+        let schema: serde_json::Value =
+            serde_json::from_str(schema).expect("parse disarmed schema");
+        assert_eq!(schema["x-rmux-status"], "disarmed-non-authoritative");
         assert!(schema["description"]
             .as_str()
             .expect("schema description")
-            .contains("MUST NOT authorize publication"));
+            .contains("MUST NOT authorize"));
     }
 
     for entry in
@@ -783,8 +786,10 @@ fn draft_authority_schemas_cannot_drive_a_workflow() {
         }
         let workflow = fs::read_to_string(&path).expect("read workflow");
         for authority_schema in [
-            "promotion-authorization.schema.json",
-            "publication-receipt.schema.json",
+            "promotion-authorization-predicate.schema.json",
+            "promotion-authorization-envelope.schema.json",
+            "publication-receipt-predicate.schema.json",
+            "publication-receipt-envelope.schema.json",
         ] {
             assert!(
                 !workflow.contains(authority_schema),
