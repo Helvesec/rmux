@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/downstream-channel-result-envelope-v1.json",
+  "title": "RMUX disarmed downstream result envelope",
+  "description": "Review-only post-upload binding. It MUST NOT authorize publication before PR8 and never refers to its own upload.",
+  "x-rmux-status": "disarmed-non-authoritative",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "envelope_type",
+    "status",
+    "downstream_authority",
+    "execution_authority",
+    "repository_id",
+    "source_git_sha",
+    "release_ref",
+    "channel",
+    "request_sha256",
+    "predicate_sha256",
+    "attestation",
+    "result_bundle",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "envelope_type": {"const": "https://rmux.io/envelopes/release-downstream-channel-result/v1"},
+    "status": {"const": "disarmed-non-authoritative"},
+    "downstream_authority": {"const": false},
+    "execution_authority": {"const": false},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+    "channel": {
+      "enum": [
+        "apt_rpm",
+        "chocolatey",
+        "crates_io",
+        "homebrew_core",
+        "homebrew_tap",
+        "rmux_io",
+        "scoop",
+        "snap_candidate",
+        "snap_stable",
+        "web_share",
+        "winget"
+      ]
+    },
+    "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "predicate_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attestation_id", "bundle_file", "bundle_sha256"],
+      "properties": {
+        "attestation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "bundle_file": {"const": "downstream-channel-result.sigstore.json"},
+        "bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "result_bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "name", "archive_digest", "size_in_bytes"],
+      "properties": {
+        "artifact_id": {"type": "integer", "minimum": 1},
+        "name": {"type": "string", "pattern": "^rmux-downstream-[a-z0-9_]+-result-[0-9a-f]{40}-[1-9][0-9]*$"},
+        "archive_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "size_in_bytes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}

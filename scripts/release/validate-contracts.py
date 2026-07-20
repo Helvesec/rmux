@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 from pathlib import Path
@@ -14,6 +13,7 @@ from canonical_contract import (
     validate_candidate_policy as validate_canonical_candidate_policy,
     validate_schemas as validate_canonical_schemas,
 )
+from downstream_contract import validate_downstream_contracts
 from local_action_policy import validate_local_action_policy
 from policy_audit_contract import validate_repository_contracts
 from promotion_contract import (
@@ -23,6 +23,7 @@ from promotion_contract import (
 from shadow_contract import (
     validate_candidate_policy as validate_shadow_candidate_policy,
 )
+from strict_json import read_json_object
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DIR = ROOT / ".github" / "release"
@@ -56,13 +57,7 @@ IRREVERSIBLE_RC_CHANNELS = {
 
 
 def load(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"cannot read {path.relative_to(ROOT)}: {error}") from error
-    if not isinstance(value, dict):
-        raise ValueError(f"{path.relative_to(ROOT)} must contain an object")
-    return value
+    return read_json_object(path, str(path.relative_to(ROOT)))
 
 
 def require_unique_strings(values: Any, label: str) -> list[str]:
@@ -440,8 +435,8 @@ def validate_channels() -> None:
             raise ValueError(f"RC must deny irreversible channel {channel}")
     if kinds["rc"].get("snap_candidate") != "explicit_opt_in":
         raise ValueError("RC Snap candidate must require explicit opt-in")
-    if kinds["stable"].get("snap_candidate") is not True:
-        raise ValueError("stable releases currently stage Snap in latest/candidate")
+    if kinds["stable"].get("snap_candidate") != "explicit_opt_in":
+        raise ValueError("stable Snap candidate must require explicit opt-in")
     if kinds["stable"].get("snap_stable") is not False:
         raise ValueError("Snap stable must remain denied pending a support decision")
     if policy.get("snap_stable_publication") != "denied_until_support_decision":
@@ -533,6 +528,7 @@ def main() -> int:
     validate_windows_coverage()
     validate_channels()
     validate_schemas()
+    validate_downstream_contracts(ROOT)
     validate_measurement_budget()
     validate_repository_contracts(ROOT)
     print("release-contracts-ok")
