@@ -377,7 +377,7 @@ jobs:
         run: |
           set -euo pipefail
           root="$RUNNER_TEMP/rmux-promotion-simulation"
-          scripts/release/promotion-simulation.py \
+          python3 scripts/release/promotion-simulation.py \
             --candidate-manifest "$root/manifest/candidate-manifest.json" \
             --candidate-resolution "$root/candidate-artifacts.json" \
             --verified-candidate-artifacts "$root/verified-candidate-artifacts.json" \

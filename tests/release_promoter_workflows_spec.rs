@@ -324,7 +324,10 @@ fn promotion_simulation_pins_a_draft_2020_schema_validator() {
 
 #[test]
 fn promotion_simulation_reports_only_the_work_it_executes() {
-    assert!(SIMULATION.contains("promotion-simulation.py"));
+    assert!(SIMULATION.contains("python3 scripts/release/promotion-simulation.py"));
+    assert!(!SIMULATION.lines().any(|line| line
+        .trim_start()
+        .starts_with("scripts/release/promotion-simulation.py")));
     assert!(SIMULATION.contains("Resolve the eleven original candidate artifact IDs"));
     assert!(SIMULATION.contains("verify-candidate-attestations.sh"));
     assert!(SIMULATION.contains("\"exact_candidate_bytes_exercised\": True"));
