@@ -35,4 +35,5 @@ first_line=$("$install_root/gh" --version | head -n 1)
 }
 "$install_root/gh" release verify --help >/dev/null
 "$install_root/gh" release verify-asset --help >/dev/null
+"$install_root/gh" attestation verify --help >/dev/null
 printf 'gh-bin=%s\n' "$install_root/gh"

@@ -15,16 +15,22 @@ from canonical_contract import (
     validate_schemas as validate_canonical_schemas,
 )
 from local_action_policy import validate_local_action_policy
+from shadow_contract import (
+    validate_candidate_policy as validate_shadow_candidate_policy,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_DIR = ROOT / ".github" / "release"
 STANDARD_RUNNER_LABELS = {
     "macos-15",
     "macos-15-intel",
+    "ubuntu-22.04",
+    "ubuntu-22.04-arm",
     "ubuntu-latest",
     "windows-latest",
 }
 DRAFT_SCHEMA_STATUS = "draft-non-authoritative"
+SHADOW_SCHEMA_STATUS = "shadow-non-authoritative"
 ALLOWED_WINDOWS_PROOFS = {
     "fast_exact",
     "release_delta",
@@ -84,11 +90,12 @@ def validate_candidate() -> None:
         "workflow_name": "CI",
         "workflow_path": ".github/workflows/ci.yml",
         "freshness_hours": 48,
-        "maximum_signed_extension_hours": 72,
     }
     for key, value in expected.items():
         if fast.get(key) != value:
             raise ValueError(f"fast_run.{key} must equal {value!r}")
+    if "maximum_signed_extension_hours" in fast:
+        raise ValueError("unsigned fast evidence cannot claim a freshness extension")
     success = require_unique_strings(fast.get("success_jobs"), "fast_run.success_jobs")
     skipped = require_unique_strings(fast.get("skipped_jobs"), "fast_run.skipped_jobs")
     allowed = fast.get("allowed_jobs")
@@ -165,6 +172,32 @@ def validate_candidate() -> None:
     }
     if qualification_shards != expected_shards:
         raise ValueError("qualification contract must cover every Windows slice 1..18")
+    candidate = contract.get("candidate_run", {})
+    for key, value in {
+        "branch": "main",
+        "event": "workflow_dispatch",
+        "freshness_hours": 48,
+        "required_run_attempt": 1,
+        "workflow_id": 277622540,
+        "workflow_name": "CI",
+        "workflow_path": ".github/workflows/ci.yml",
+    }.items():
+        if candidate.get(key) != value:
+            raise ValueError(f"candidate_run.{key} must equal {value!r}")
+    candidate_success = require_unique_strings(
+        candidate.get("success_jobs"), "candidate_run.success_jobs"
+    )
+    candidate_skipped = require_unique_strings(
+        candidate.get("skipped_jobs"), "candidate_run.skipped_jobs"
+    )
+    if candidate.get("allowed_jobs") != {}:
+        raise ValueError("candidate run cannot have variable job conclusions")
+    if (
+        len(candidate_success) != 24
+        or len(candidate_skipped) != 26
+        or set(candidate_success) & set(candidate_skipped)
+    ):
+        raise ValueError("candidate contract must contain 24 successes and 26 skips")
     runner_policy = contract.get("runner_policy")
     if not isinstance(runner_policy, dict) or runner_policy.get("provider") != (
         "github_standard_hosted"
@@ -187,9 +220,10 @@ def validate_candidate() -> None:
     )
     if non_runner_jobs != [
         "Build canonical native artifacts",
+        "Platform build and smoke on ${{ matrix.os }}",
         "Run release-only candidate delta",
     ]:
-        raise ValueError("runner policy must identify both reusable workflow call jobs")
+        raise ValueError("runner policy virtual job inventory changed")
     contracted_jobs = (
         set(success)
         | set(skipped)
@@ -197,6 +231,8 @@ def validate_candidate() -> None:
         | set(qualification_success)
         | set(qualification_skipped)
         | set(qualification_allowed)
+        | set(candidate_success)
+        | set(candidate_skipped)
     )
     assigned_jobs: list[str] = []
     for label in sorted(jobs_by_label):
@@ -349,6 +385,7 @@ def validate_candidate_workflow() -> None:
     if delta.get("tmux_oracle_builds") != 1:
         raise ValueError("the fast and candidate path must build tmux exactly once")
     validate_canonical_candidate_policy(contract.get("canonical_builds"))
+    validate_shadow_candidate_policy(contract.get("shadow_sealer"))
     publication = contract.get("publication")
     if not isinstance(publication, dict) or any(
         publication.get(field) is not False
@@ -362,9 +399,9 @@ def validate_candidate_workflow() -> None:
         raise ValueError("candidate delta acquired publication authority")
 
     ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-    delta_workflow = (
-        ROOT / ".github/workflows/release-candidate-delta.yml"
-    ).read_text(encoding="utf-8")
+    delta_workflow = (ROOT / ".github/workflows/release-candidate-delta.yml").read_text(
+        encoding="utf-8"
+    )
     for required_input in (
         "fast_run_id:",
         "expected_source_sha:",
@@ -426,10 +463,10 @@ def validate_schemas() -> None:
     expected = {
         "candidate-manifest.schema.json": {
             "candidate_run_attempt",
-            "fast_run_proof_sha256",
             "producer",
+            "proofs",
             "canonical_build_policy",
-            "release_policy_sha256",
+            "release_policy",
             "artifacts",
         },
         "promotion-authorization.schema.json": {
@@ -451,7 +488,12 @@ def validate_schemas() -> None:
     }
     for filename, required_fields in expected.items():
         schema = load(schema_dir / filename)
-        if schema.get("x-rmux-status") != DRAFT_SCHEMA_STATUS:
+        expected_status = (
+            SHADOW_SCHEMA_STATUS
+            if filename == "candidate-manifest.schema.json"
+            else DRAFT_SCHEMA_STATUS
+        )
+        if schema.get("x-rmux-status") != expected_status:
             raise ValueError(f"{filename} must remain explicitly non-authoritative")
         if "MUST NOT authorize publication" not in schema.get("description", ""):
             raise ValueError(f"{filename} must state its publication prohibition")

@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/release-candidate-manifest-v1.json",
-  "title": "RMUX canonical release candidate manifest",
-  "description": "Preparatory draft only. It MUST NOT authorize publication before the PR6 validators and workflows replace this draft contract.",
-  "x-rmux-status": "draft-non-authoritative",
+  "title": "RMUX sealed shadow release candidate manifest",
+  "description": "Shadow evidence only. It MUST NOT authorize publication; PR8 cut-over remains a separate reviewed operation.",
+  "x-rmux-status": "shadow-non-authoritative",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -19,10 +19,10 @@
     "release_version",
     "package_version",
     "is_prerelease",
-    "fast_run_proof_sha256",
     "producer",
+    "proofs",
     "canonical_build_policy",
-    "release_policy_sha256",
+    "release_policy",
     "created_at",
     "expires_at",
     "jobs",
@@ -35,13 +35,24 @@
     "fast_run_id": {"type": "integer", "minimum": 1},
     "candidate_run_id": {"type": "integer", "minimum": 1},
     "candidate_run_attempt": {"const": 1},
-    "release_intent_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
-    "planned_release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+    "release_intent_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{8,128}$"
+    },
+    "planned_release_ref": {
+      "type": "string",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"
+    },
     "release_kind": {"enum": ["shadow", "rc", "stable"]},
-    "release_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
-    "package_version": {"type": "string", "pattern": "^[0-9A-Za-z][0-9A-Za-z.+~:-]{0,63}$"},
+    "release_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"
+    },
+    "package_version": {
+      "type": "string",
+      "pattern": "^[0-9A-Za-z][0-9A-Za-z.+~:-]{0,63}$"
+    },
     "is_prerelease": {"type": "boolean"},
-    "fast_run_proof_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "producer": {
       "type": "object",
       "additionalProperties": false,
@@ -54,23 +65,62 @@
         "branch": {"const": "main"}
       }
     },
+    "proofs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fast_semantic_sha256",
+        "fast_document_sha256",
+        "candidate_semantic_sha256",
+        "candidate_document_sha256",
+        "intent_document_sha256",
+        "policy_document_sha256",
+        "canonical_metadata_document_sha256"
+      ],
+      "properties": {
+        "fast_semantic_sha256": {"$ref": "#/$defs/sha256"},
+        "fast_document_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_semantic_sha256": {"$ref": "#/$defs/sha256"},
+        "candidate_document_sha256": {"$ref": "#/$defs/sha256"},
+        "intent_document_sha256": {"$ref": "#/$defs/sha256"},
+        "policy_document_sha256": {"$ref": "#/$defs/sha256"},
+        "canonical_metadata_document_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
     "canonical_build_policy": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["fresh_target", "cargo_incremental", "cargo_locked", "object_cache_restored"],
+      "required": [
+        "fresh_target",
+        "cargo_incremental",
+        "cargo_locked",
+        "object_cache_restored",
+        "publication_authority"
+      ],
       "properties": {
         "fresh_target": {"const": true},
         "cargo_incremental": {"const": false},
         "cargo_locked": {"const": true},
-        "object_cache_restored": {"const": false}
+        "object_cache_restored": {"const": false},
+        "publication_authority": {"const": false}
       }
     },
-    "release_policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "release_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "contract_blob_oid", "record_count"],
+      "properties": {
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "contract_blob_oid": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "record_count": {"type": "integer", "minimum": 1}
+      }
+    },
     "created_at": {"type": "string", "format": "date-time"},
     "expires_at": {"type": "string", "format": "date-time"},
     "jobs": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 50,
+      "maxItems": 50,
       "uniqueItems": true,
       "items": {
         "type": "object",
@@ -85,16 +135,26 @@
     },
     "artifacts": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 5,
+      "maxItems": 5,
       "uniqueItems": true,
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["artifact_id", "name", "archive_digest", "target_triple", "runner_image", "rust_toolchain", "rustc_vv_sha256", "files"],
+        "required": [
+          "platform_key",
+          "target_triple",
+          "runner_image",
+          "rust_toolchain",
+          "assets",
+          "provenance",
+          "build_record_sha256",
+          "binding_sha256",
+          "attestation",
+          "files"
+        ],
         "properties": {
-          "artifact_id": {"type": "integer", "minimum": 1},
-          "name": {"type": "string", "minLength": 1},
-          "archive_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "platform_key": {"$ref": "#/$defs/platform_key"},
           "target_triple": {
             "enum": [
               "aarch64-apple-darwin",
@@ -105,10 +165,39 @@
             ]
           },
           "runner_image": {
-            "enum": ["macos-15", "macos-15-intel", "ubuntu-22.04", "ubuntu-22.04-arm", "windows-latest"]
+            "enum": [
+              "macos-15",
+              "macos-15-intel",
+              "ubuntu-22.04",
+              "ubuntu-22.04-arm",
+              "windows-latest"
+            ]
           },
-          "rust_toolchain": {"type": "string", "minLength": 1, "maxLength": 128},
-          "rustc_vv_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "rust_toolchain": {"const": "1.96.1"},
+          "assets": {
+            "allOf": [
+              {"$ref": "#/$defs/artifact_reference"},
+              {"properties": {"role": {"const": "canonical-assets"}}}
+            ]
+          },
+          "provenance": {
+            "allOf": [
+              {"$ref": "#/$defs/artifact_reference"},
+              {"properties": {"role": {"const": "canonical-provenance"}}}
+            ]
+          },
+          "build_record_sha256": {"$ref": "#/$defs/sha256"},
+          "binding_sha256": {"$ref": "#/$defs/sha256"},
+          "attestation": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["attestation_id", "bundle_file", "bundle_sha256"],
+            "properties": {
+              "attestation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+              "bundle_file": {"const": "build-provenance.sigstore.json"},
+              "bundle_sha256": {"$ref": "#/$defs/sha256"}
+            }
+          },
           "files": {
             "type": "array",
             "minItems": 1,
@@ -116,11 +205,15 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["path", "size", "sha256"],
+              "required": ["path", "role", "size", "sha256"],
               "properties": {
-                "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._+@=-]+(?:/[A-Za-z0-9._+@=-]+)*$"},
+                "path": {
+                  "type": "string",
+                  "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._+@=-]+(?:/[A-Za-z0-9._+@=-]+)*$"
+                },
+                "role": {"enum": ["archive", "checksums", "debian", "rpm"]},
                 "size": {"type": "integer", "minimum": 1},
-                "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                "sha256": {"$ref": "#/$defs/sha256"}
               }
             }
           }
@@ -128,25 +221,63 @@
         "allOf": [
           {
             "if": {"properties": {"target_triple": {"const": "x86_64-unknown-linux-gnu"}}, "required": ["target_triple"]},
-            "then": {"properties": {"runner_image": {"const": "ubuntu-22.04"}}}
+            "then": {"properties": {"platform_key": {"const": "linux-x86_64"}, "runner_image": {"const": "ubuntu-22.04"}}}
           },
           {
             "if": {"properties": {"target_triple": {"const": "aarch64-unknown-linux-gnu"}}, "required": ["target_triple"]},
-            "then": {"properties": {"runner_image": {"const": "ubuntu-22.04-arm"}}}
+            "then": {"properties": {"platform_key": {"const": "linux-aarch64"}, "runner_image": {"const": "ubuntu-22.04-arm"}}}
           },
           {
             "if": {"properties": {"target_triple": {"const": "x86_64-apple-darwin"}}, "required": ["target_triple"]},
-            "then": {"properties": {"runner_image": {"const": "macos-15-intel"}}}
+            "then": {"properties": {"platform_key": {"const": "macos-x86_64"}, "runner_image": {"const": "macos-15-intel"}}}
           },
           {
             "if": {"properties": {"target_triple": {"const": "aarch64-apple-darwin"}}, "required": ["target_triple"]},
-            "then": {"properties": {"runner_image": {"const": "macos-15"}}}
+            "then": {"properties": {"platform_key": {"const": "macos-aarch64"}, "runner_image": {"const": "macos-15"}}}
           },
           {
             "if": {"properties": {"target_triple": {"const": "x86_64-pc-windows-msvc"}}, "required": ["target_triple"]},
-            "then": {"properties": {"runner_image": {"const": "windows-latest"}}}
+            "then": {"properties": {"platform_key": {"const": "windows-x86_64"}, "runner_image": {"const": "windows-latest"}}}
           }
         ]
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "platform_key": {
+      "enum": [
+        "linux-aarch64",
+        "linux-x86_64",
+        "macos-aarch64",
+        "macos-x86_64",
+        "windows-x86_64"
+      ]
+    },
+    "artifact_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role",
+        "platform_key",
+        "artifact_id",
+        "name",
+        "archive_digest",
+        "size_in_bytes"
+      ],
+      "properties": {
+        "role": {"enum": ["canonical-assets", "canonical-provenance"]},
+        "platform_key": {"$ref": "#/$defs/platform_key"},
+        "artifact_id": {"type": "integer", "minimum": 1},
+        "name": {
+          "type": "string",
+          "pattern": "^rmux-canonical-(?:provenance-)?[A-Za-z0-9._-]+-[0-9a-f]{40}$"
+        },
+        "archive_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "size_in_bytes": {"type": "integer", "minimum": 1}
       }
     }
   },
