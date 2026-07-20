@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "status": "review-only-non-publishing",
+  "repository_id": 1239918790,
+  "workflow": {
+    "id": 277622540,
+    "path": ".github/workflows/ci.yml",
+    "event": "workflow_dispatch",
+    "branch": "main",
+    "required_attempt": 1
+  },
+  "reusable_workflow": ".github/workflows/canonical-native-build.yml",
+  "rust_toolchain": "1.96.1",
+  "artifact_retention_days": 7,
+  "build_policy": {
+    "cargo_incremental": false,
+    "cargo_locked": true,
+    "fresh_target": true,
+    "object_cache_restored": false,
+    "publication_authority": false
+  },
+  "platforms": [
+    {
+      "key": "linux-x86_64",
+      "runner_image": "ubuntu-22.04",
+      "runner_os": "Linux",
+      "runner_arch": "X64",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "archive_format": "tar.gz",
+      "linux_packages": true
+    },
+    {
+      "key": "linux-aarch64",
+      "runner_image": "ubuntu-22.04-arm",
+      "runner_os": "Linux",
+      "runner_arch": "ARM64",
+      "target_triple": "aarch64-unknown-linux-gnu",
+      "archive_format": "tar.gz",
+      "linux_packages": true
+    },
+    {
+      "key": "macos-x86_64",
+      "runner_image": "macos-15-intel",
+      "runner_os": "macOS",
+      "runner_arch": "X64",
+      "target_triple": "x86_64-apple-darwin",
+      "archive_format": "tar.gz",
+      "linux_packages": false
+    },
+    {
+      "key": "macos-aarch64",
+      "runner_image": "macos-15",
+      "runner_os": "macOS",
+      "runner_arch": "ARM64",
+      "target_triple": "aarch64-apple-darwin",
+      "archive_format": "tar.gz",
+      "linux_packages": false
+    },
+    {
+      "key": "windows-x86_64",
+      "runner_image": "windows-latest",
+      "runner_os": "Windows",
+      "runner_arch": "X64",
+      "target_triple": "x86_64-pc-windows-msvc",
+      "archive_format": "zip",
+      "linux_packages": false
+    }
+  ]
+}

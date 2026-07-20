@@ -281,8 +281,13 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
         serde_json::from_slice(&accepted.stdout).expect("parse exact-run proof");
     assert_eq!(proof["run_id"], 42);
     assert_eq!(proof["run_attempt"], 1);
-    assert_eq!(proof["jobs"][0]["runner_group_id"], 0);
-    assert_eq!(proof["jobs"][0]["runner_group_name"], "GitHub Actions");
+    let hosted = proof["jobs"]
+        .as_array()
+        .expect("proof jobs")
+        .iter()
+        .find(|job| job["runner_group_id"] == 0)
+        .expect("hosted runner proof");
+    assert_eq!(hosted["runner_group_name"], "GitHub Actions");
 
     let original_jobs = fs::read_to_string(&jobs_path).expect("read accepted jobs fixture");
     let mut self_hosted: serde_json::Value =
@@ -322,7 +327,12 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
         .as_array_mut()
         .expect("jobs array")
         .iter_mut()
-        .find(|job| job["conclusion"] == "skipped")
+        .find(|job| {
+            job["conclusion"] == "skipped"
+                && job["labels"]
+                    .as_array()
+                    .is_some_and(|labels| !labels.is_empty())
+        })
         .expect("skipped fixture job");
     skipped["runner_id"] = serde_json::json!(1234);
     skipped["runner_name"] = serde_json::json!("GitHub Actions 1234");
@@ -339,7 +349,12 @@ fn exact_run_verifier_accepts_only_the_contracted_job_set() {
         .as_array_mut()
         .expect("jobs array")
         .iter_mut()
-        .find(|job| job["conclusion"] == "skipped")
+        .find(|job| {
+            job["conclusion"] == "skipped"
+                && job["labels"]
+                    .as_array()
+                    .is_some_and(|labels| !labels.is_empty())
+        })
         .expect("skipped fixture job");
     skipped
         .as_object_mut()
@@ -726,7 +741,8 @@ fn candidate_artifacts_allow_only_standard_github_runner_labels() {
         serde_json::json!([
             "macos-15",
             "macos-15-intel",
-            "ubuntu-latest",
+            "ubuntu-22.04",
+            "ubuntu-22.04-arm",
             "windows-latest"
         ])
     );

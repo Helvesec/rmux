@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/canonical-artifact-binding-v1.json",
+  "title": "RMUX post-upload canonical artifact binding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "repository_id",
+    "source_git_sha",
+    "candidate_run_id",
+    "platform_key",
+    "assets",
+    "build_record_sha256",
+    "attestation"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "candidate_run_id": {"type": "integer", "minimum": 1},
+    "platform_key": {"enum": ["linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64", "windows-x86_64"]},
+    "assets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "artifact_name", "artifact_digest"],
+      "properties": {
+        "artifact_id": {"type": "integer", "minimum": 1},
+        "artifact_name": {"type": "string", "pattern": "^rmux-canonical-[A-Za-z0-9._-]+-[0-9a-f]{40}$"},
+        "artifact_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "build_record_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attestation_id", "bundle_file", "bundle_sha256"],
+      "properties": {
+        "attestation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "bundle_file": {"const": "build-provenance.sigstore.json"},
+        "bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

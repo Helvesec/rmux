@@ -37,6 +37,15 @@
       "windows-ctrl-matrix"
     ]
   },
+  "canonical_builds": {
+    "contract": ".github/release/canonical-build-contract.json",
+    "workflow": ".github/workflows/canonical-native-build.yml",
+    "native_platforms": 5,
+    "windows_smokes": ["mouse", "runtime", "sdk"],
+    "artifact_retention_days": 7,
+    "download_by_artifact_id": true,
+    "object_cache_restored": false
+  },
   "publication": {
     "enabled": false,
     "public_triggers": false,
