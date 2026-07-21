@@ -546,6 +546,10 @@ impl RequestHandler {
                 self.handle_subscribe_pane_output_ref(connection_id, request)
                     .await,
             ),
+            Request::PaneOutputRecovery(request) => HandleOutcome::response(
+                self.handle_pane_output_recovery(connection_id, request)
+                    .await,
+            ),
             Request::UnsubscribePaneOutput(request) => HandleOutcome::response(
                 self.handle_unsubscribe_pane_output(connection_id, request)
                     .await,
@@ -829,6 +833,7 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::PaneSnapshot(_)
             | Request::SubscribePaneOutput(_)
             | Request::SubscribePaneOutputRef(_)
+            | Request::PaneOutputRecovery(_)
             | Request::UnsubscribePaneOutput(_)
             | Request::PaneOutputCursor(_)
             | Request::SubscribePaneState(_)

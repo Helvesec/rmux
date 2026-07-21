@@ -648,6 +648,23 @@ impl PaneOutputSender {
         (state.next_sequence(), captured)
     }
 
+    /// Captures daemon-owned renderer state and creates a cursor at the exact
+    /// next output sequence while holding the output-ring boundary lock.
+    pub(crate) fn capture_with_receiver<T>(
+        &self,
+        capture: impl FnOnce() -> T,
+    ) -> (u64, T, PaneOutputReceiver) {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("pane output state mutex must not be poisoned");
+        let captured = capture();
+        let sequence = state.next_sequence();
+        let receiver = self.receiver(OutputRing::cursor_from_sequence(sequence), sequence, None);
+        (sequence, captured, receiver)
+    }
+
     pub(crate) fn clear_retained(&self) {
         let mut state = self
             .inner
@@ -1275,6 +1292,58 @@ mod tests {
                 .expect("pane output fast receiver list must not be poisoned")
                 .is_empty(),
             "closed fast senders must not accumulate while panes are quiet"
+        );
+    }
+
+    #[test]
+    fn recovery_capture_and_receiver_share_one_atomic_output_boundary() {
+        let sender = pane_output_channel_with_limits(8, 1024);
+        assert_eq!(sender.send(b"before".to_vec()), 0);
+
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let capture_sender = sender.clone();
+        let capture_entered = Arc::clone(&entered);
+        let capture_release = Arc::clone(&release);
+        let capturing = std::thread::spawn(move || {
+            capture_sender.capture_with_receiver(|| {
+                capture_entered.wait();
+                capture_release.wait();
+                b"keyframe".to_vec()
+            })
+        });
+
+        entered.wait();
+        let publish_sender = sender.clone();
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publish_done = Arc::clone(&published);
+        let publishing = std::thread::spawn(move || {
+            let sequence = publish_sender.send(b"after".to_vec());
+            publish_done.store(true, Ordering::Release);
+            sequence
+        });
+        std::thread::yield_now();
+        assert!(
+            !published.load(Ordering::Acquire),
+            "publisher must not cross the held recovery boundary"
+        );
+        release.wait();
+
+        let (next_sequence, keyframe, mut receiver) =
+            capturing.join().expect("capture thread joins");
+        assert_eq!(next_sequence, 1);
+        assert_eq!(keyframe, b"keyframe");
+        assert_eq!(receiver.cursor().next_sequence(), next_sequence);
+        assert_eq!(publishing.join().expect("publisher thread joins"), 1);
+
+        let Some(OutputCursorItem::Event(event)) = receiver.try_recv() else {
+            panic!("post-keyframe output must be retained for the receiver");
+        };
+        assert_eq!(event.sequence(), next_sequence);
+        assert_eq!(event.bytes(), b"after");
+        assert!(
+            receiver.try_recv().is_none(),
+            "event must not be duplicated"
         );
     }
 

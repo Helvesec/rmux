@@ -1,15 +1,8 @@
-use rmux_core::input::mode;
-use rmux_core::{
-    render_dec_modes_for_snapshot, GridRenderOptions, PaneGeometry, PaneId, Screen,
-    ScreenCaptureRange,
-};
+use rmux_core::{render_dec_modes_for_snapshot, PaneGeometry, PaneId, Screen};
 use rmux_proto::TerminalSize;
 
 const SNAPSHOT_RESET_PREFIX: &[u8] =
     b"\x1b[?2026l\x1b[?1049l\x1b[?6l\x1b[r\x1b[0m\x1b[?25l\x1b[3J\x1b[2J\x1b[H";
-const SNAPSHOT_ALT_SCREEN_PREFIX: &[u8] =
-    b"\x1b[?1049h\x1b[?6l\x1b[r\x1b[0m\x1b[?25l\x1b[3J\x1b[2J\x1b[H";
-
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct WebPaneSnapshot {
     pub(crate) cols: u16,
@@ -26,9 +19,14 @@ pub(crate) struct WebPaneSnapshot {
     pub(crate) cursor_style: u32,
     /// Whether the pane is on the alternate screen at capture time.
     pub(crate) alternate: bool,
+    pub(crate) saved_ansi_lines: Option<Vec<Vec<u8>>>,
+    pub(crate) saved_cursor: Option<(u16, u16)>,
     /// DECSTBM scroll region (top, bottom), 0-based inclusive.
     pub(crate) scroll_top: u32,
     pub(crate) scroll_bottom: u32,
+    /// Undispatched parser prefix at `output_sequence`.
+    pub(crate) pending_bytes: Vec<u8>,
+    pub(crate) active_cell_state: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -87,51 +85,24 @@ impl WebPaneSnapshot {
     }
 
     pub(crate) fn append_ansi_bytes(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(SNAPSHOT_RESET_PREFIX);
-        // Match the inner program's alternate-screen state so the browser's
-        // emulator stays in sync with the later 1049h/l toggles in the live
-        // stream (otherwise a TUI exit restores a buffer we never painted).
-        if self.alternate {
-            out.extend_from_slice(SNAPSHOT_ALT_SCREEN_PREFIX);
+        crate::pane_recovery_keyframe::PaneRecoveryState {
+            cols: self.cols,
+            rows: self.rows,
+            ansi_lines: self.ansi_lines.clone(),
+            cursor_row: self.cursor_row,
+            cursor_col: self.cursor_col,
+            cursor_visible: self.cursor_visible,
+            mode_bits: self.mode_bits,
+            cursor_style: self.cursor_style,
+            alternate: self.alternate,
+            saved_ansi_lines: self.saved_ansi_lines.clone(),
+            saved_cursor: self.saved_cursor,
+            scroll_top: self.scroll_top,
+            scroll_bottom: self.scroll_bottom,
+            pending_bytes: self.pending_bytes.clone(),
+            active_cell_state: self.active_cell_state.clone(),
         }
-        // Emit a complete interactive mode state, not just the ON bits. Resyncs
-        // can arrive after lost live bytes, so the browser may still be in a
-        // stale mode such as synchronized output, alt-screen, bracketed paste,
-        // mouse reporting, or modifyOtherKeys.
-        render_dec_modes_for_snapshot(self.mode_bits, self.cursor_style, out);
-        for (index, line) in self.ansi_lines.iter().enumerate() {
-            if index > 0 {
-                out.extend_from_slice(b"\r\n");
-            }
-            out.extend_from_slice(b"\x1b[0m");
-            out.extend_from_slice(line);
-        }
-        // Scroll region (DECSTBM) goes *after* painting: it homes the cursor and
-        // would scroll the content if it were set before the line writes above.
-        let default_bottom = u32::from(self.rows.max(1)).saturating_sub(1);
-        if self.scroll_top != 0 || self.scroll_bottom != default_bottom {
-            out.extend_from_slice(
-                format!(
-                    "\x1b[{};{}r",
-                    self.scroll_top.saturating_add(1),
-                    self.scroll_bottom.saturating_add(1),
-                )
-                .as_bytes(),
-            );
-        }
-        let cursor_row = self.cursor_row.min(self.rows.saturating_sub(1)) + 1;
-        let cursor_col = self.cursor_col.min(self.cols.saturating_sub(1)) + 1;
-        out.extend_from_slice(format!("\x1b[0m\x1b[{cursor_row};{cursor_col}H").as_bytes());
-        // Origin mode (DECOM) last, so the absolute cursor positioning above is
-        // not reinterpreted relative to the scroll region.
-        if self.mode_bits & mode::MODE_ORIGIN != 0 {
-            out.extend_from_slice(b"\x1b[?6h");
-        }
-        out.extend_from_slice(if self.cursor_visible {
-            b"\x1b[?25h"
-        } else {
-            b"\x1b[?25l"
-        });
+        .append_ansi_bytes(out);
     }
 }
 
@@ -256,14 +227,7 @@ pub(crate) fn overlay_pane_lines(frame: &mut Vec<u8>, geometry: PaneGeometry, li
 }
 
 pub(crate) fn snapshot_ansi_lines(screen: &Screen) -> Vec<Vec<u8>> {
-    screen.capture_transcript_lines_independent(
-        ScreenCaptureRange::default(),
-        GridRenderOptions {
-            with_sequences: true,
-            trim_spaces: false,
-            ..GridRenderOptions::default()
-        },
-    )
+    crate::pane_recovery_keyframe::snapshot_ansi_lines(screen)
 }
 
 #[cfg(test)]
@@ -286,8 +250,12 @@ mod tests {
             mode_bits: mode::MODE_CURSOR | mode::MODE_WRAP,
             cursor_style: 0,
             alternate: false,
+            saved_ansi_lines: None,
+            saved_cursor: None,
             scroll_top: 0,
             scroll_bottom: 23,
+            pending_bytes: Vec::new(),
+            active_cell_state: Vec::new(),
         }
     }
 
@@ -333,6 +301,9 @@ mod tests {
                 expected_dec_modes.as_bytes(),
                 b"\x1b[0mgolden",
                 b"\x1b[0m\x1b[4;8H\x1b[?25h",
+                // Recovery also restores the parser's active rendition and
+                // hyperlink state before any raw post-keyframe bytes.
+                b"\x1b[0m\x1b]8;;\x1b\\",
             ]
             .concat()
         );
@@ -355,7 +326,9 @@ mod tests {
         // Interactive modes re-asserted right after the reset prefix.
         assert!(rendered.contains("\x1b[?2026l"), "{rendered:?}");
         assert!(rendered.contains("\x1b[?1049l"), "{rendered:?}");
-        assert!(rendered.contains("\x1b[?1049h"), "{rendered:?}");
+        // This fixture has no saved pre-alternate cursor, which represents a
+        // DEC 47 alternate screen rather than a DEC 1049 save/restore pair.
+        assert!(rendered.contains("\x1b[?47h"), "{rendered:?}");
         assert!(rendered.contains("\x1b[?1002h"), "{rendered:?}");
         assert!(rendered.contains("\x1b[?1006h"), "{rendered:?}");
         assert!(rendered.contains("\x1b[?2004h"), "{rendered:?}");

@@ -41,13 +41,13 @@ pub use pane::{
     MovePaneResponse, PaneBroadcastInputFailure, PaneBroadcastInputResponse,
     PaneBroadcastInputSuccess, PaneForegroundStateResponse, PaneOptionEntry, PaneOptionGetResponse,
     PaneOptionSetResponse, PaneOutputCursor, PaneOutputCursorResponse, PaneOutputEvent,
-    PaneOutputLagNotice, PaneOutputLagResponse, PaneRecentOutput, PaneSnapshotCell,
-    PaneSnapshotCursor, PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorResponse,
-    PaneStateEventDto, PaneStateLagResponse, PaneStateSnapshot, PipePaneResponse,
-    ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse, SendKeysResponse,
-    SplitWindowIdentityResponse, SplitWindowResponse, SubscribePaneOutputResponse,
-    SubscribePaneStateResponse, SwapPaneResponse, UnsubscribePaneOutputResponse,
-    UnsubscribePaneStateResponse,
+    PaneOutputKeyframe, PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputRecoveryResponse,
+    PaneRecentOutput, PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse,
+    PaneStateClosedReason, PaneStateCursorResponse, PaneStateEventDto, PaneStateLagResponse,
+    PaneStateSnapshot, PipePaneResponse, ResizePaneResponse, RespawnPaneResponse,
+    SelectPaneResponse, SendKeysResponse, SplitWindowIdentityResponse, SplitWindowResponse,
+    SubscribePaneOutputResponse, SubscribePaneStateResponse, SwapPaneResponse,
+    UnsubscribePaneOutputResponse, UnsubscribePaneStateResponse,
 };
 
 #[path = "response/client.rs"]
@@ -286,6 +286,8 @@ pub enum Response {
     PaneForegroundState(Box<PaneForegroundStateResponse>),
     /// Atomic visible and stable identity returned by an SDK split.
     SplitWindowIdentity(SplitWindowIdentityResponse),
+    /// Atomic renderer keyframe plus exact post-keyframe output subscription.
+    PaneOutputRecovery(Box<PaneOutputRecoveryResponse>),
 }
 
 impl Response {
@@ -311,6 +313,7 @@ impl Response {
             Self::SwapWindow(_) => "swap-window",
             Self::RotateWindow(_) => "rotate-window",
             Self::SplitWindow(_) | Self::SplitWindowIdentity(_) => "split-window",
+            Self::PaneOutputRecovery(_) => "pane-output-recovery",
             Self::SwapPane(_) => "swap-pane",
             Self::LastPane(_) => "last-pane",
             Self::JoinPane(_) => "join-pane",

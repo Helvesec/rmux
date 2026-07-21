@@ -314,6 +314,7 @@ fn read_only_request_allowed(request: &Request) -> bool {
                 | Request::ListBuffers(_)
                 | Request::SubscribePaneOutput(_)
                 | Request::SubscribePaneOutputRef(_)
+                | Request::PaneOutputRecovery(_)
                 | Request::UnsubscribePaneOutput(_)
                 | Request::PaneOutputCursor(_)
                 | Request::PaneSnapshot(_)

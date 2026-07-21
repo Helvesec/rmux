@@ -69,6 +69,7 @@ pub mod layout;
 pub mod load_state;
 pub mod locator;
 pub mod pane_set;
+mod recovery;
 pub mod snapshot;
 pub mod spec;
 pub mod trace;
@@ -123,6 +124,7 @@ pub use pane_set::{
     PaneSet, PaneSetAny, PaneSetBatch, PaneSetExpectation, PaneSetFailure, PaneSetSuccess,
     PaneSetVisibleTextOutcome, PaneSetVisibleTextWait,
 };
+pub use recovery::PaneOutputRecovery;
 pub use rmux_proto::LayoutName;
 #[cfg(feature = "web")]
 pub use rmux_proto::{WebTerminalPalette, WebTerminalTheme};

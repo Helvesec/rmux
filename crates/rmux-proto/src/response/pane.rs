@@ -449,6 +449,38 @@ pub struct SubscribePaneOutputResponse {
     pub cursor: PaneOutputCursor,
 }
 
+/// A complete ANSI renderer keyframe captured by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneOutputKeyframe {
+    /// Terminal width represented by `bytes`.
+    pub cols: u16,
+    /// Terminal height represented by `bytes`.
+    pub rows: u16,
+    /// Complete ANSI bytes that reset and reconstruct the pane emulator state.
+    pub bytes: Vec<u8>,
+    /// Whether the captured pane is using the alternate screen.
+    pub alternate: bool,
+    /// Exact first pane-output sequence not represented by `bytes`.
+    pub next_sequence: u64,
+}
+
+/// Atomic pane keyframe and already-registered post-keyframe subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneOutputRecoveryResponse {
+    /// Opaque daemon subscription identifier consumed by the SDK.
+    pub subscription_id: PaneOutputSubscriptionId,
+    /// Resolved target at capture time.
+    pub target: PaneTarget,
+    /// Stable pane identity captured by the daemon.
+    pub pane_id: PaneId,
+    /// Initial output cursor, equal to `keyframe.next_sequence`.
+    pub cursor: PaneOutputCursor,
+    /// Typed grid snapshot captured at the same boundary as `keyframe`.
+    pub snapshot: PaneSnapshotResponse,
+    /// Complete renderer state at the atomic output boundary.
+    pub keyframe: PaneOutputKeyframe,
+}
+
 /// Response payload for unsubscribing from live pane-output events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsubscribePaneOutputResponse {

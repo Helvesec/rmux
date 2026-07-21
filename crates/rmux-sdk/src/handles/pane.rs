@@ -29,6 +29,8 @@ mod options;
 mod output;
 #[path = "pane/queries.rs"]
 mod queries;
+#[path = "pane/recovery.rs"]
+mod recovery;
 #[path = "pane/snapshot.rs"]
 mod snapshot;
 #[path = "pane/spawn.rs"]
@@ -265,6 +267,7 @@ impl Pane {
         pane
     }
 
+    #[cfg(any(feature = "web", test))]
     pub(crate) fn proto_target_ref(&self) -> rmux_proto::PaneTargetRef {
         match self.stable_id {
             Some(pane_id) => {

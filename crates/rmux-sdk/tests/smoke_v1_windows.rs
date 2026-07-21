@@ -109,12 +109,25 @@ mod windows {
         assert!(session.is_listed().await?);
 
         let pane = session.pane(0, 0);
-        let mut output = pane.output_stream_starting_at(PaneOutputStart::Now).await?;
+        let recovery = pane.recover_output().await?;
+        assert!(recovery.cols > 0 && recovery.rows > 0);
+        assert_eq!(
+            (recovery.snapshot.cols, recovery.snapshot.rows),
+            (recovery.cols, recovery.rows)
+        );
+        recovery.snapshot.validate_shape()?;
+        assert!(recovery.keyframe.starts_with(b"\x1b[?2026l"));
+        let mut output = recovery.output;
         pane.send_text(cmd_echo_text(MARKER)).await?;
         wait_for_output_marker(&mut output, MARKER.as_bytes()).await?;
         drop(output);
         pane.wait_for_text(MARKER).await?;
         assert!(pane.snapshot().await?.visible_text().contains(MARKER));
+
+        let recovery_after_output = pane.recover_output().await?;
+        assert!(recovery_after_output.next_sequence > recovery.next_sequence);
+        drop(recovery_after_output.output);
+        exercise_atomic_recovery_after_lag(&pane).await?;
 
         harness.finish().await?;
         wait_for_daemon_unavailable(&pipe_name).await?;
@@ -269,6 +282,45 @@ mod windows {
             }
             sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    async fn exercise_atomic_recovery_after_lag(pane: &rmux_sdk::Pane) -> TestResult {
+        const FIRST: &str = "RMUX_SDK_LAG_BURST_ONE";
+        const SECOND: &str = "RMUX_SDK_LAG_BURST_TWO";
+        const AFTER: &str = "RMUX_SDK_POST_LAG_RECOVERY";
+
+        let initial = pane.recover_output().await?;
+        let initial_sequence = initial.next_sequence;
+        let mut stale = initial.output;
+        pane.send_text(windows_lag_burst_command("A", "BURST_ONE"))
+            .await?;
+        pane.wait_for_text(FIRST).await?;
+        pane.send_text(windows_lag_burst_command("B", "BURST_TWO"))
+            .await?;
+        pane.wait_for_text(SECOND).await?;
+
+        let Some(PaneOutputChunk::Lag(lag)) = timeout(DEFAULT_TIMEOUT, stale.next()).await?? else {
+            return Err("stale recovery stream did not report bounded lag".into());
+        };
+        assert!(lag.missed_events > 0);
+        drop(stale);
+
+        let recovered = pane.recover_output().await?;
+        assert!(recovered.next_sequence > initial_sequence);
+        assert!(recovered.snapshot.visible_text().contains(SECOND));
+        let mut output = recovered.output;
+        pane.send_text(
+            "powershell.exe -NoProfile -Command \"[Console]::Out.WriteLine(('RMUX_SDK_POST_' + 'LAG_RECOVERY'))\"\r",
+        )
+        .await?;
+        wait_for_output_marker(&mut output, AFTER.as_bytes()).await?;
+        Ok(())
+    }
+
+    fn windows_lag_burst_command(fill: &str, suffix: &str) -> String {
+        format!(
+            "powershell.exe -NoProfile -Command \"[Console]::Out.Write(('{fill}' * 180000)); [Console]::Out.WriteLine(); [Console]::Out.WriteLine(('RMUX_SDK_LAG_' + '{suffix}'))\"\r"
+        )
     }
 
     fn windows_marker_output_text(text: &str) -> String {

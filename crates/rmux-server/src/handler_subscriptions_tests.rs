@@ -5,16 +5,21 @@ use rmux_core::events::{
     OutputCursor, OutputCursorItem, OutputRing, PaneOutputSubscriptionKey, SubscriptionLimits,
 };
 use rmux_proto::{
-    NewSessionRequest, PaneId, PaneOutputCursorRequest, PaneOutputSubscriptionStart, PaneTarget,
-    PaneTargetRef, RenameSessionRequest, Request, Response, RmuxError, SessionId, SessionName,
-    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
+    NewSessionRequest, PaneId, PaneOutputCursor, PaneOutputCursorRequest, PaneOutputKeyframe,
+    PaneOutputRecoveryResponse, PaneOutputSubscriptionStart, PaneSnapshotCursor,
+    PaneSnapshotResponse, PaneTarget, PaneTargetRef, RenameSessionRequest, Request, Response,
+    RmuxError, SessionId, SessionName, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
+    DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
 use crate::daemon::ShutdownHandle;
 use crate::handler::exited_output_support::RetainedExitedPaneIdentities;
 use crate::pane_io::pane_output_channel_with_limits;
 
-use super::{lag_dto, OutputSubscriptionState, RequestHandler, MAX_LAG_RECENT_BYTES};
+use super::{
+    lag_dto, validate_recovery_response, OutputSubscriptionState, RequestHandler,
+    MAX_LAG_RECENT_BYTES,
+};
 use crate::handler::PendingShutdownReason;
 
 #[path = "handler_subscriptions_tests/destructive_mutations.rs"]
@@ -114,6 +119,74 @@ fn lag_dto_trims_recent_hint_under_detached_frame_limit() {
     assert_eq!(notice.recent.oldest_sequence, None);
     assert_eq!(notice.recent.newest_sequence, Some(1));
     assert_eq!(notice.resume_sequence, 1);
+}
+
+#[test]
+fn oversized_recovery_response_rolls_back_opaque_subscription() {
+    let handler = RequestHandler::new();
+    let connection_id = 76;
+    let session = SessionName::new("oversized-recovery").expect("valid session");
+    let pane_id = PaneId::new(7);
+    let sender = pane_output_channel_with_limits(1, 8);
+    let receiver = sender.subscribe();
+    let subscription_id = {
+        let mut subscriptions = handler
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned");
+        let record = subscriptions
+            .registry
+            .subscribe(
+                connection_id,
+                PaneOutputSubscriptionKey::new(session.clone(), pane_id),
+                Instant::now(),
+            )
+            .expect("subscription is within limits");
+        let subscription_id = record.id();
+        subscriptions.receivers.insert(subscription_id, receiver);
+        subscription_id
+    };
+    let response = Response::PaneOutputRecovery(Box::new(PaneOutputRecoveryResponse {
+        subscription_id,
+        target: PaneTarget::new(session, 0),
+        pane_id,
+        cursor: PaneOutputCursor {
+            next_sequence: 0,
+            missed_events: 0,
+        },
+        snapshot: PaneSnapshotResponse {
+            cols: 0,
+            rows: 0,
+            cells: Vec::new(),
+            cursor: PaneSnapshotCursor {
+                row: 0,
+                col: 0,
+                visible: true,
+                style: 0,
+            },
+            revision: 1,
+        },
+        keyframe: PaneOutputKeyframe {
+            cols: 0,
+            rows: 0,
+            bytes: vec![0; DEFAULT_MAX_DETACHED_FRAME_LENGTH],
+            alternate: false,
+            next_sequence: 0,
+        },
+    }));
+
+    assert!(matches!(
+        validate_recovery_response(&handler.subscriptions, subscription_id, response),
+        Response::Error(rmux_proto::ErrorResponse {
+            error: RmuxError::FrameTooLarge { .. },
+        })
+    ));
+    let subscriptions = handler
+        .subscriptions
+        .lock()
+        .expect("subscription registry mutex must not be poisoned");
+    assert!(subscriptions.registry.get(subscription_id).is_none());
+    assert!(!subscriptions.receivers.contains_key(&subscription_id));
 }
 
 #[tokio::test]

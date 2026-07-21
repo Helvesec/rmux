@@ -66,6 +66,20 @@ operations, normal pane removal, and panes retained by `remain-on-exit` close
 the stream. Retained panes use `PaneStateClosedReason::DiedKept`; the pane
 remains addressable for snapshots and captures after the state stream closes.
 
+## Renderer recovery
+
+Clients that render a pane as a terminal emulator should use
+`Pane::recover_output()`. The returned ANSI keyframe and `PaneOutputStream` are
+captured at one daemon-owned boundary: paint `keyframe` first, then feed raw
+`Bytes` chunks beginning at `next_sequence` without translating them. The
+keyframe also restores parser, alternate-screen, cursor, scroll-region, and
+interactive-mode state that a cell-only snapshot cannot represent.
+
+If the stream reports `PaneOutputChunk::Lag`, discard the old renderer stream
+and call `recover_output()` again. Do not combine a separately captured
+snapshot with a newly opened output stream; output can arrive between those
+operations and leave the emulator permanently out of sync.
+
 ## Examples
 
 Run the crate examples from the repository:

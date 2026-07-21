@@ -89,6 +89,13 @@ impl TerminalScreen {
         self.parser.pending_bytes()
     }
 
+    /// Returns ANSI bytes that restore the parser's active rendition,
+    /// character sets, and hyperlink after a renderer repaint.
+    #[must_use]
+    pub fn active_cell_state_ansi(&self) -> Vec<u8> {
+        self.parser.active_cell_state_ansi()
+    }
+
     /// Returns whether the parser ground timeout is currently armed.
     #[must_use]
     pub fn ground_timer_active(&self) -> bool {

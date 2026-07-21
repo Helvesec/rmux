@@ -20,7 +20,7 @@ use rmux_proto::{
 use tokio::time::sleep;
 
 const COMMAND_SURFACE_COUNT: usize = 79;
-const INTERNAL_REQUEST_COMMANDS: [&str; 50] = [
+const INTERNAL_REQUEST_COMMANDS: [&str; 51] = [
     "attach-session-ext",
     "attach-session-ext2",
     "attach-session-ext3",
@@ -38,6 +38,7 @@ const INTERNAL_REQUEST_COMMANDS: [&str; 50] = [
     "pane-kill",
     "pane-option-get",
     "pane-option-set",
+    "pane-output-recovery",
     "pane-foreground-state",
     "pane-resize",
     "pane-respawn",

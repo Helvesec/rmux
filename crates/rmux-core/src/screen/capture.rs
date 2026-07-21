@@ -97,6 +97,18 @@ impl Screen {
             .map(|saved| capture_grid_bytes(&saved.grid, &self.hyperlinks, range, options))
     }
 
+    /// Captures saved pre-alternate-screen rows from independent ANSI states.
+    #[must_use]
+    pub fn capture_saved_transcript_lines_independent(
+        &self,
+        range: ScreenCaptureRange,
+        options: GridRenderOptions,
+    ) -> Option<Vec<Vec<u8>>> {
+        self.saved_grid.as_ref().map(|saved| {
+            capture_grid_lines_independent(&saved.grid, &self.hyperlinks, range, options)
+        })
+    }
+
     /// Captures tmux-style per-line format flags from the saved alternate screen.
     #[must_use]
     pub fn capture_saved_line_format_flags(&self, range: ScreenCaptureRange) -> Option<Vec<u8>> {

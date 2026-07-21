@@ -68,6 +68,9 @@ pub struct Screen {
 }
 
 impl Screen {
+    pub(crate) fn render_cell_state_ansi(&self, state: &CellState) -> Vec<u8> {
+        crate::grid::render_cell_state_ansi(state, &self.hyperlinks)
+    }
     /// Creates a new screen with the given geometry and history limit.
     #[must_use]
     pub fn new(size: TerminalSize, history_limit: usize) -> Self {
@@ -184,6 +187,12 @@ impl Screen {
     #[must_use]
     pub fn is_alternate(&self) -> bool {
         self.saved_grid.is_some()
+    }
+
+    /// Returns the cursor saved by DEC alternate-screen entry, when present.
+    #[must_use]
+    pub fn alternate_saved_cursor_position(&self) -> Option<(u32, u32)> {
+        self.saved_cursor_x.zip(self.saved_cursor_y)
     }
 
     /// Returns the configured history limit.

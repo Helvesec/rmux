@@ -518,6 +518,13 @@ pub struct PaneSnapshotRefRequest {
     pub target: PaneTargetRef,
 }
 
+/// Atomically captures a renderer keyframe and subscribes at its exact output boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneOutputRecoveryRequest {
+    /// The exact pane target or stable pane id to recover.
+    pub target: PaneTargetRef,
+}
+
 /// SDK select/title request that can address a stable pane id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSelectRequest {

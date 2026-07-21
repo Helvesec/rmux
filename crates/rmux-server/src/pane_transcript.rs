@@ -356,6 +356,10 @@ impl PaneTranscript {
         self.terminal.pending_bytes()
     }
 
+    pub(crate) fn active_cell_state_ansi(&self) -> Vec<u8> {
+        self.terminal.active_cell_state_ansi()
+    }
+
     pub(crate) fn clear_history(&mut self, reset_hyperlinks: bool) {
         self.terminal
             .screen_mut()
