@@ -195,6 +195,7 @@ def validate_candidate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]
         "planned_release_ref",
         "release_kind",
         "release_version",
+        "package_version",
         "is_prerelease",
         "release_policy",
         "created_at",
@@ -221,6 +222,20 @@ def validate_candidate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]
     if manifest["release_version"] != release_ref[1:]:
         raise ValueError("candidate release version differs from its ref")
     is_rc = "-rc." in release_ref
+    package_version = manifest["package_version"]
+    if (
+        not isinstance(package_version, str)
+        or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", package_version) is None
+        or (
+            manifest["release_version"] != package_version
+            and re.fullmatch(
+                rf"{re.escape(package_version)}-rc\.([1-9][0-9]*)",
+                manifest["release_version"],
+            )
+            is None
+        )
+    ):
+        raise ValueError("candidate package version differs from its release")
     if manifest["is_prerelease"] is not is_rc:
         raise ValueError("candidate prerelease state differs from its ref")
     if (manifest["release_kind"] == "rc") is not is_rc:

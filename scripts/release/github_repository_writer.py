@@ -1,4 +1,4 @@
-"""Minimal GitHub Git Data API client for one atomic repository update."""
+"""Minimal GitHub API client for one signed atomic repository update."""
 
 from __future__ import annotations
 
@@ -9,6 +9,27 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+
+
+CREATE_COMMIT_MUTATION = """
+mutation CreateSignedCommit($input: CreateCommitOnBranchInput!) {
+  createCommitOnBranch(input: $input) {
+    commit {
+      oid
+      signature {
+        isValid
+        state
+        wasSignedByGitHub
+      }
+    }
+    ref {
+      target {
+        oid
+      }
+    }
+  }
+}
+"""
 
 
 @dataclass(frozen=True)
@@ -92,8 +113,13 @@ class GitHubApi:
     def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self.request("POST", path, payload)
 
-    def patch(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        return self.request("PATCH", path, payload)
+    def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        value = self.post("/graphql", {"query": query, "variables": variables})
+        errors = value.get("errors")
+        data = value.get("data")
+        if errors is not None or not isinstance(data, dict):
+            raise ValueError("GitHub GraphQL commit mutation failed")
+        return data
 
 
 def object_sha(value: dict[str, Any], label: str) -> str:
@@ -101,6 +127,83 @@ def object_sha(value: dict[str, Any], label: str) -> str:
     if not isinstance(sha, str) or len(sha) != 40:
         raise ValueError(f"GitHub {label} has no canonical SHA")
     return sha
+
+
+def object_oid(value: dict[str, Any], label: str) -> str:
+    oid = value.get("oid")
+    if (
+        not isinstance(oid, str)
+        or len(oid) != 40
+        or any(character not in "0123456789abcdef" for character in oid)
+    ):
+        raise ValueError(f"GitHub {label} has no canonical OID")
+    return oid
+
+
+def create_signed_commit(
+    api: GitHubApi,
+    *,
+    full_name: str,
+    branch: str,
+    base_commit: str,
+    additions: dict[str, bytes],
+    deletions: set[str],
+    message: str,
+) -> str:
+    data = api.graphql(
+        CREATE_COMMIT_MUTATION,
+        {
+            "input": {
+                "branch": {
+                    "repositoryNameWithOwner": full_name,
+                    "branchName": branch,
+                },
+                "expectedHeadOid": base_commit,
+                "message": {"headline": message},
+                "fileChanges": {
+                    "additions": [
+                        {
+                            "path": path,
+                            "contents": base64.b64encode(contents).decode("ascii"),
+                        }
+                        for path, contents in sorted(additions.items())
+                    ],
+                    "deletions": [{"path": path} for path in sorted(deletions)],
+                },
+            }
+        },
+    )
+    mutation = data.get("createCommitOnBranch")
+    if not isinstance(mutation, dict):
+        raise ValueError("GitHub signed commit mutation returned no result")
+    commit = mutation.get("commit")
+    reference = mutation.get("ref")
+    if not isinstance(commit, dict) or not isinstance(reference, dict):
+        raise ValueError("GitHub signed commit mutation returned incomplete objects")
+    commit_sha = object_oid(commit, "signed commit")
+    target = reference.get("target")
+    if not isinstance(target, dict) or object_oid(target, "updated ref") != commit_sha:
+        raise ValueError("GitHub signed commit mutation advanced an unexpected ref")
+    signature = commit.get("signature")
+    if (
+        not isinstance(signature, dict)
+        or signature.get("isValid") is not True
+        or signature.get("state") != "VALID"
+        or signature.get("wasSignedByGitHub") is not True
+    ):
+        raise ValueError("GitHub did not create a valid platform-signed commit")
+    verification = api.get(f"/repos/{full_name}/git/commits/{commit_sha}").get(
+        "verification"
+    )
+    if (
+        not isinstance(verification, dict)
+        or verification.get("verified") is not True
+        or verification.get("reason") != "valid"
+        or not isinstance(verification.get("signature"), str)
+        or not verification["signature"]
+    ):
+        raise ValueError("GitHub REST verification rejected the signed commit")
+    return commit_sha
 
 
 def repository_identity(
@@ -193,43 +296,14 @@ def publish(
         for path, data in updates.items()
     ):
         return PublishOutcome("no-op-exact", False, base_commit)
-    commit = api.get(f"/repos/{full_name}/git/commits/{base_commit}")
-    tree = commit.get("tree")
-    if not isinstance(tree, dict):
-        raise ValueError("downstream base commit has no tree")
-    base_tree = object_sha(tree, "base tree")
-    entries: list[dict[str, Any]] = [
-        {"path": path, "mode": "100644", "type": "blob", "sha": None}
-        for path in sorted(managed_existing - managed_expected)
-    ]
-    for path, data in sorted(updates.items()):
-        blob = api.post(
-            f"/repos/{full_name}/git/blobs",
-            {"content": base64.b64encode(data).decode("ascii"), "encoding": "base64"},
-        )
-        entries.append(
-            {
-                "path": path,
-                "mode": "100644",
-                "type": "blob",
-                "sha": object_sha(blob, "blob"),
-            }
-        )
-    created_tree = api.post(
-        f"/repos/{full_name}/git/trees", {"base_tree": base_tree, "tree": entries}
-    )
-    created_commit = api.post(
-        f"/repos/{full_name}/git/commits",
-        {
-            "message": message,
-            "tree": object_sha(created_tree, "created tree"),
-            "parents": [base_commit],
-        },
-    )
-    commit_sha = object_sha(created_commit, "created commit")
-    api.patch(
-        f"/repos/{full_name}/git/refs/heads/{branch}",
-        {"sha": commit_sha, "force": False},
+    commit_sha = create_signed_commit(
+        api,
+        full_name=full_name,
+        branch=branch,
+        base_commit=base_commit,
+        additions=updates,
+        deletions=managed_existing - managed_expected,
+        message=message,
     )
     if branch_head(api, full_name, branch) != commit_sha:
         raise ValueError("downstream branch did not advance to the exact commit")

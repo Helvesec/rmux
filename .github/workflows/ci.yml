@@ -439,6 +439,24 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
+      - name: Install the release writer Python baseline
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: "3.10"
+
+      - name: Validate release writers on Python 3.10
+        run: |
+          set -euo pipefail
+          for script in \
+            channel-execution.py \
+            prepare-channel-retry.py \
+            publish-crate-set.py \
+            publish-linux-repository.py \
+            publish-owned-repository.py \
+            snap-candidate-status.py; do
+            python "scripts/release/$script" --help >/dev/null
+          done
+
       - name: Unsafe policy gate
         run: scripts/unsafe-check.sh
 

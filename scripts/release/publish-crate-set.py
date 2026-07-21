@@ -13,7 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from crate_package_set import file_hash, unpack, validate
@@ -146,7 +146,10 @@ def execute(args: argparse.Namespace) -> None:
     for package in packages:
         wait_for_exact(package["name"], version, extracted / "crates" / package["file"])
     observed_at = (
-        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
     state = "public-live" if mutated else "no-op-exact"
     external_id = f"crates.io:rmux@{version}"

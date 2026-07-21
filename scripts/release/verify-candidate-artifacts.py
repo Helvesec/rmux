@@ -105,6 +105,8 @@ def verify_fast_directory(
         "fast proof artifact",
     )
     intent = read_object(directory / "candidate-intent.json", "candidate intent")
+    release_version = planned_release_ref.removeprefix("v")
+    package_version = release_version.split("-rc.", maxsplit=1)[0]
     expected_intent = {
         "schema_version": 1,
         "repository_id": REPOSITORY_ID,
@@ -113,8 +115,8 @@ def verify_fast_directory(
         "release_intent_id": release_intent_id,
         "planned_release_ref": planned_release_ref,
         "release_kind": release_kind,
-        "release_version": planned_release_ref.removeprefix("v"),
-        "package_version": planned_release_ref.removeprefix("v"),
+        "release_version": release_version,
+        "package_version": package_version,
         "is_prerelease": "-rc." in planned_release_ref,
         "candidate_run_attempt": 1,
     }

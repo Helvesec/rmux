@@ -345,7 +345,7 @@ fn fixture() -> Fixture {
             "source_git_sha": SOURCE, "candidate_run_id": 500,
             "candidate_run_attempt": 1, "release_intent_id": "release:v1.0.0:test",
             "planned_release_ref": "v1.0.0", "release_kind": "stable",
-            "release_version": "1.0.0", "is_prerelease": false,
+            "release_version": "1.0.0", "package_version": "1.0.0", "is_prerelease": false,
             "release_policy": {"sha256": hex(20), "contract_blob_oid": SOURCE, "record_count": 150},
             "created_at": "2026-07-19T00:00:00Z", "expires_at": "2026-07-21T00:00:00Z",
             "artifacts": artifacts
@@ -613,6 +613,17 @@ fn promotion_authorization_round_trip_rejects_forged_evidence() {
             &auth_predicate_args(&fixture, "--output", &duplicate),
         ),
         "at most fifteen minutes",
+    );
+    let mut expired_audit = original_audit.clone();
+    expired_audit["emitted_at"] = json!("2026-07-19T00:20:00Z");
+    expired_audit["expires_at"] = json!("2026-07-19T00:25:00Z");
+    write_json(&fixture.audit, &expired_audit);
+    assert_rejected(
+        invoke(
+            "promotion-authorization.py",
+            &auth_predicate_args(&fixture, "--output", &duplicate),
+        ),
+        "policy audit expired before authorization",
     );
     write_json(&fixture.audit, &original_audit);
     let mut forged = predicate;

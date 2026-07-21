@@ -177,11 +177,9 @@ def load_signer_policy(path: Path) -> SignerPolicy:
     if (
         tag_policy["signature_format"] != "ssh"
         or tag_policy["signature_namespace"] != SIGNATURE_NAMESPACE
-        or tag_policy["ref_pattern"] != (
-            r"^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?$"
-        )
-        or tag_policy["required_private_key_secret"]
-        != "RMUX_RELEASE_SSH_SIGNING_KEY"
+        or tag_policy["ref_pattern"]
+        != (r"^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?$")
+        or tag_policy["required_private_key_secret"] != "RMUX_RELEASE_SSH_SIGNING_KEY"
         or type(tag_policy["enabled"]) is not bool
         or not isinstance(tag_policy["blocker"], str)
     ):
@@ -196,11 +194,16 @@ def load_signer_policy(path: Path) -> SignerPolicy:
         principal = signer["principal"]
         public_key = signer["public_key"]
         fingerprint = signer["fingerprint"]
-        if not isinstance(principal, str) or PRINCIPAL_PATTERN.fullmatch(principal) is None:
+        if (
+            not isinstance(principal, str)
+            or PRINCIPAL_PATTERN.fullmatch(principal) is None
+        ):
             raise PolicyError("signer principal has an invalid format")
         if (
             not isinstance(public_key, str)
-            or not public_key.startswith(("ssh-ed25519 ", "sk-ssh-ed25519@openssh.com "))
+            or not public_key.startswith(
+                ("ssh-ed25519 ", "sk-ssh-ed25519@openssh.com ")
+            )
             or "\n" in public_key
         ):
             raise PolicyError("only one-line Ed25519 SSH public keys are allowed")
@@ -287,9 +290,7 @@ def parse_message(message: str) -> ReleaseTagIdentity:
     return identity
 
 
-def verify_ssh_signature(
-    policy: SignerPolicy, payload: bytes, signature: bytes
-) -> str:
+def verify_ssh_signature(policy: SignerPolicy, payload: bytes, signature: bytes) -> str:
     policy.require_enabled()
     if not payload or not signature.startswith(b"-----BEGIN SSH SIGNATURE-----\n"):
         raise PolicyError("tag has no canonical SSH signature")

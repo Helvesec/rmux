@@ -8,7 +8,7 @@ import hashlib
 import os
 import re
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from downstream_channels import target_for_channel, write_object
@@ -106,7 +106,10 @@ def execute(args: argparse.Namespace) -> None:
         expected_base=expected_base,
     )
     observed_at = (
-        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
     evidence = {
         "schema_version": 1,

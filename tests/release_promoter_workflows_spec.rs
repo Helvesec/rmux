@@ -362,6 +362,10 @@ fn promotion_simulation_reports_only_the_work_it_executes() {
     assert!(SIMULATION.contains("\"cryptographic_tag_signature_exercised\": False"));
     assert!(SIMULATION.contains("\"oidc_attestations_exercised\": False"));
     assert!(!SIMULATION.contains("--execute"));
+    assert!(PROMOTION_SIMULATION.contains("expired_at - timedelta(minutes=5)"));
+    assert!(PROMOTION_SIMULATION.contains("policy audit expired before authorization"));
+    assert!(!PROMOTION_SIMULATION
+        .contains("expired_audit[\"expires_at\"] = expired_audit[\"emitted_at\"]"));
 }
 
 #[test]

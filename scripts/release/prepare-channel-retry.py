@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -385,7 +385,7 @@ def prepare(args: argparse.Namespace) -> None:
             args.root / "payload" / item["name"], prepared / "payload" / item["name"]
         )
 
-    now = datetime.now(UTC).replace(microsecond=0)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
     retention = datetime.fromisoformat(
         payload["retention_expires_at"].replace("Z", "+00:00")
     )

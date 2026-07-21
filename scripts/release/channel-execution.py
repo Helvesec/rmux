@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from downstream_channels import (
@@ -50,7 +50,10 @@ def execute(args: argparse.Namespace) -> None:
     if execution_enabled is not (decision == "enabled"):
         raise ValueError("channel execution authority differs from its plan entry")
     started_at = (
-        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
     target = target_for_channel(args.channel)
     repository = target["repository_full_name"]
@@ -68,7 +71,10 @@ def execute(args: argparse.Namespace) -> None:
     else:
         raise ValueError("non-executable channel decision is unknown")
     observed_at = (
-        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
     evidence = {
         "schema_version": 1,

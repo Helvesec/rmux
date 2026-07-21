@@ -5,7 +5,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOWNSTREAM: &str = include_str!("../.github/workflows/release-downstream.yml");
+const DOWNSTREAM_AUDIT: &str = include_str!("../.github/workflows/release-downstream-audit.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
+const CI: &str = include_str!("../.github/workflows/ci.yml");
 const RECEIPT_REFERENCE_BUILDER: &str =
     include_str!("../scripts/release/build-downstream-receipt-reference.py");
 
@@ -88,7 +90,7 @@ fn downstream_workflow_is_uncalled_read_only_and_disarmed() {
     assert_workflow_call_only(DOWNSTREAM);
     assert_eq!(DOWNSTREAM.matches("if: ${{ false }}").count(), 0);
     assert!(!DOWNSTREAM.contains("contents: write"));
-    assert_eq!(DOWNSTREAM.matches("secrets: inherit").count(), 8);
+    assert!(!DOWNSTREAM.contains("secrets: inherit"));
     assert!(!DOWNSTREAM.contains("environment:"));
     assert!(!DOWNSTREAM.contains("self-hosted"));
     assert!(!DOWNSTREAM.contains("larger-runner"));
@@ -152,6 +154,7 @@ fn downstream_workflow_entry_points_are_executable() {
         "channel-request.py",
         "channel-summary.py",
         "channel-target-evidence.py",
+        "collect-downstream-repository.py",
         "downstream_payload.py",
         "prepare-channel-retry.py",
         "publish-crate-set.py",
@@ -170,6 +173,67 @@ fn downstream_workflow_entry_points_are_executable() {
             .mode();
         assert_ne!(mode & 0o111, 0, "{filename} is not executable");
     }
+}
+
+#[test]
+fn downstream_authority_is_rechecked_live_before_payload_staging() {
+    assert!(DOWNSTREAM_AUDIT.contains("on:\n  workflow_call:"));
+    assert!(DOWNSTREAM_AUDIT.contains("  workflow_dispatch:"));
+    assert!(DOWNSTREAM_AUDIT.contains("environment: release-publication"));
+    assert!(DOWNSTREAM_AUDIT.contains("permission-administration: read"));
+    assert!(DOWNSTREAM_AUDIT.contains("permission-contents: read"));
+    assert!(!DOWNSTREAM_AUDIT.contains("permission-administration: write"));
+    assert!(!DOWNSTREAM_AUDIT.contains("permission-contents: write"));
+    assert!(!DOWNSTREAM_AUDIT.contains("secrets: inherit"));
+    assert!(DOWNSTREAM_AUDIT.contains("collect-downstream-repository.py"));
+    assert!(DOWNSTREAM_AUDIT.contains("verify-downstream-repository.py fixtures"));
+    assert_eq!(
+        DOWNSTREAM_AUDIT
+            .matches("actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349")
+            .count(),
+        1
+    );
+    assert_eq!(
+        DOWNSTREAM
+            .matches("uses: ./.github/workflows/release-downstream-audit.yml")
+            .count(),
+        1
+    );
+    let payloads = job(
+        DOWNSTREAM,
+        "prepare-payloads",
+        Some("build-linux-repository"),
+    );
+    assert!(payloads.contains("needs: [prepare-plan, audit-downstream-authority]"));
+}
+
+#[test]
+fn downstream_writers_keep_the_python_310_runtime_contract() {
+    assert!(CI.contains("actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0"));
+    assert!(CI.contains("python-version: \"3.10\""));
+    assert!(CI.contains("Validate release writers on Python 3.10"));
+    for filename in [
+        "channel-execution.py",
+        "prepare-channel-retry.py",
+        "publish-crate-set.py",
+        "publish-linux-repository.py",
+        "publish-owned-repository.py",
+        "snap-candidate-status.py",
+    ] {
+        let source = fs::read_to_string(repo_root().join("scripts/release").join(filename))
+            .unwrap_or_else(|error| panic!("read {filename}: {error}"));
+        assert!(!source.contains("from datetime import UTC"));
+        assert!(!source.contains("datetime.now(UTC)"));
+    }
+}
+
+#[test]
+fn downstream_rc_payloads_keep_stable_package_names() {
+    let staging = include_str!("../scripts/release/stage-downstream-payloads.py");
+    let snap = include_str!("../scripts/release/snap-candidate-status.py");
+    assert!(staging.contains("version = manifest[\"package_version\"]"));
+    assert!(!staging.contains("version = release_ref.removeprefix(\"v\")"));
+    assert!(snap.contains("version = package_version(args.release_ref)"));
 }
 
 #[test]
@@ -453,6 +517,10 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
     assert_eq!(registry["writer_app"]["installation_id"], 147959477);
     assert_eq!(registry["writer_app"]["repository_selection"], "selected");
     assert_eq!(registry["writer_app"]["pat_fallback"], false);
+    assert_eq!(
+        registry["writer_app"]["required_permissions"]["administration"],
+        "read"
+    );
     let repositories = registry["repositories"].as_array().expect("repositories");
 
     for key in [
@@ -556,7 +624,12 @@ fn downstream_repository_verifier_accepts_github_ruleset_arrays() {
     );
     let rulesets = write(
         "rulesets.json",
-        serde_json::json!([{"enforcement": "active"}]),
+        serde_json::json!([{
+            "enforcement": "active",
+            "bypass_actors": [],
+            "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}]
+        }]),
     );
     let environments = write(
         "environments.json",
@@ -573,7 +646,7 @@ fn downstream_repository_verifier_accepts_github_ruleset_arrays() {
             "id": 147959477,
             "app_id": 4352876,
             "repository_selection": "selected",
-            "permissions": {"actions": "read", "contents": "write", "metadata": "read"},
+            "permissions": {"actions": "read", "administration": "read", "contents": "write", "metadata": "read"},
             "events": [],
             "repository_ids": [1249553407, 1258602064, 1259133629, 1259135161]
         }),

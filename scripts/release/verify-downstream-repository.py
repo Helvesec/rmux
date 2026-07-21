@@ -28,6 +28,7 @@ WRITER_APP = {
     "pat_fallback": False,
     "required_permissions": {
         "actions": "read",
+        "administration": "read",
         "contents": "write",
         "metadata": "read",
     },
@@ -131,12 +132,22 @@ def validate_owned_fixtures(expected: dict[str, Any], args: argparse.Namespace) 
     ):
         raise ValueError("owned downstream branch protection is incomplete")
     rulesets = require_array_fixture(args.rulesets, "repository rulesets")
-    if not any(
-        item.get("enforcement") == "active"
-        for item in rulesets
-        if isinstance(item, dict)
+    if len(rulesets) != 1 or not isinstance(rulesets[0], dict):
+        raise ValueError("owned downstream repository ruleset count changed")
+    ruleset = rulesets[0]
+    conditions = ruleset.get("conditions", {})
+    reference_names = conditions.get("ref_name", {})
+    rule_types = {
+        item.get("type") for item in ruleset.get("rules", []) if isinstance(item, dict)
+    }
+    if (
+        ruleset.get("enforcement") != "active"
+        or ruleset.get("bypass_actors") != []
+        or reference_names.get("include") != ["refs/heads/main"]
+        or reference_names.get("exclude") != []
+        or rule_types != {"deletion", "non_fast_forward"}
     ):
-        raise ValueError("owned downstream repository has no active ruleset")
+        raise ValueError("owned downstream repository ruleset changed")
     environments = require_object_fixture(args.environments, "repository environments")
     matches = [
         item
