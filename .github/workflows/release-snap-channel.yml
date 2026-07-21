@@ -56,49 +56,15 @@ jobs:
           --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
           --github-output "$GITHUB_OUTPUT"
 
-      - id: inspect
-        name: Compare candidate channel revisions with exact Snap bytes
-        if: steps.decision.outputs.execute == 'true'
-        shell: bash
-        run: >-
-          scripts/release/snap-candidate-status.py inspect
-          --payload-dir "${{ steps.prepare.outputs.payload-root }}"
-          --release-ref "${{ inputs.release_ref }}" --github-output "$GITHUB_OUTPUT"
-
-      - name: Publish exact amd64 Snap to candidate
-        if: steps.decision.outputs.execute == 'true' && steps.inspect.outputs.upload_amd64 == 'true'
-        uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40
-        env:
-          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
-        with:
-          snap: ${{ steps.inspect.outputs.amd64 }}
-          release: latest/candidate
-
-      - name: Publish exact arm64 Snap to candidate
-        if: steps.decision.outputs.execute == 'true' && steps.inspect.outputs.upload_arm64 == 'true'
-        uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40
-        env:
-          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
-        with:
-          snap: ${{ steps.inspect.outputs.arm64 }}
-          release: latest/candidate
-
       - id: writer
-        name: Reread and verify exact Snap candidate bytes
+        name: Publish or verify exact Snap candidate bytes
         if: steps.decision.outputs.execute == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          arguments=(
-            verify --payload-dir "${{ steps.prepare.outputs.payload-root }}"
-            --release-ref "${{ inputs.release_ref }}"
-            --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
-            --github-output "$GITHUB_OUTPUT"
-          )
-          if [ "${{ steps.inspect.outputs.all_exact }}" != true ]; then
-            arguments+=(--mutation-started)
-          fi
-          scripts/release/snap-candidate-status.py "${arguments[@]}"
+        uses: ./.github/actions/release-snap-candidate-write
+        with:
+          payload-dir: ${{ steps.prepare.outputs.payload-root }}
+          release-ref: ${{ inputs.release_ref }}
+          target-evidence: ${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json
+          store-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
       - id: outcome
         name: Normalize executable and policy-only outcomes

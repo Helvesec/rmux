@@ -1,0 +1,122 @@
+name: Publish or verify exact Snap candidate bytes
+description: Preserve a typed result even when a preflight or store operation fails.
+
+inputs:
+  payload-dir: {required: true}
+  release-ref: {required: true}
+  target-evidence: {required: true}
+  store-credentials: {required: true}
+
+outputs:
+  state:
+    value: ${{ steps.outcome.outputs.state }}
+  mutation_started:
+    value: ${{ steps.outcome.outputs.mutation_started }}
+  remote_request_id:
+    value: ${{ steps.outcome.outputs.remote_request_id }}
+  observed_at:
+    value: ${{ steps.outcome.outputs.observed_at }}
+
+runs:
+  using: composite
+  steps:
+    - id: inspect
+      name: Compare candidate revisions with exact Snap bytes
+      continue-on-error: true
+      shell: bash
+      run: >-
+        scripts/release/snap-candidate-status.py inspect
+        --payload-dir "${{ inputs.payload-dir }}"
+        --release-ref "${{ inputs.release-ref }}" --github-output "$GITHUB_OUTPUT"
+
+    - id: amd64
+      name: Publish exact amd64 Snap to candidate
+      if: steps.inspect.outcome == 'success' && steps.inspect.outputs.upload_amd64 == 'true'
+      continue-on-error: true
+      uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40
+      env:
+        SNAPCRAFT_STORE_CREDENTIALS: ${{ inputs.store-credentials }}
+      with:
+        snap: ${{ steps.inspect.outputs.amd64 }}
+        release: latest/candidate
+
+    - id: arm64
+      name: Publish exact arm64 Snap to candidate
+      if: steps.inspect.outcome == 'success' && steps.inspect.outputs.upload_arm64 == 'true'
+      continue-on-error: true
+      uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40
+      env:
+        SNAPCRAFT_STORE_CREDENTIALS: ${{ inputs.store-credentials }}
+      with:
+        snap: ${{ steps.inspect.outputs.arm64 }}
+        release: latest/candidate
+
+    - id: verify
+      name: Reread and verify exact Snap candidate bytes
+      if: steps.inspect.outcome == 'success' && steps.amd64.outcome != 'failure' && steps.arm64.outcome != 'failure'
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -euo pipefail
+        arguments=(
+          verify --payload-dir "${{ inputs.payload-dir }}"
+          --release-ref "${{ inputs.release-ref }}"
+          --target-evidence "${{ inputs.target-evidence }}"
+          --github-output "$GITHUB_OUTPUT"
+        )
+        if [ "${{ steps.inspect.outputs.all_exact }}" != true ]; then
+          arguments+=(--mutation-started)
+        fi
+        scripts/release/snap-candidate-status.py "${arguments[@]}"
+
+    - id: outcome
+      name: Preserve exact success or safely classified failure evidence
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        release_ref="${{ inputs.release-ref }}"
+        version="${release_ref#v}"
+        mutation=false
+        remote_id=
+        if [ "${{ steps.inspect.outcome }}" = failure ]; then
+          state=failed-transient
+        elif [ "${{ steps.amd64.outcome }}" = failure ] || [ "${{ steps.arm64.outcome }}" = failure ]; then
+          state=failed-terminal
+          mutation=true
+        elif [ "${{ steps.verify.outcome }}" = failure ]; then
+          if [ "${{ steps.inspect.outputs.all_exact }}" = true ]; then
+            state=failed-transient
+          else
+            state=failed-terminal
+            mutation=true
+          fi
+        else
+          state="${{ steps.verify.outputs.state }}"
+          mutation="${{ steps.verify.outputs.mutation_started }}"
+          remote_id="${{ steps.verify.outputs.remote_request_id }}"
+          observed_at="${{ steps.verify.outputs.observed_at }}"
+        fi
+        if [ "$mutation" = true ]; then
+          remote_id="snapcraft:rmux@$version:candidate"
+        fi
+        if [ -z "${observed_at:-}" ]; then
+          observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          arguments=(
+            create --channel snap_candidate --state "$state"
+            --version "$version"
+            --url https://snapcraft.io/rmux --observed-at "$observed_at"
+            --output "${{ inputs.target-evidence }}"
+          )
+          if [ -n "$remote_id" ]; then
+            arguments+=(--external-id "$remote_id")
+          fi
+          scripts/release/channel-target-evidence.py "${arguments[@]}"
+        fi
+        test -n "$state" && [[ "$mutation" =~ ^(true|false)$ ]]
+        {
+          echo "state=$state"
+          echo "mutation_started=$mutation"
+          echo "remote_request_id=$remote_id"
+          echo "observed_at=$observed_at"
+        } >> "$GITHUB_OUTPUT"

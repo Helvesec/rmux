@@ -108,6 +108,27 @@ RESULT_STATES = {
     "public-live",
     "submitted",
 }
+RESULT_PRODUCERS = {
+    "apt_rpm": {".github/workflows/release-linux-repository-publish.yml": 316435347},
+    "chocolatey": {
+        ".github/workflows/release-chocolatey-channel.yml": 316435347,
+        ".github/workflows/release-chocolatey-retry.yml": 316439352,
+    },
+    "crates_io": {".github/workflows/release-crates-channel.yml": 316435347},
+    "homebrew_core": {".github/workflows/release-policy-channel.yml": 316435347},
+    "homebrew_tap": {
+        ".github/workflows/release-owned-repository-channel.yml": 316435347
+    },
+    "rmux_io": {".github/workflows/release-rmux-io-channel.yml": 316435347},
+    "scoop": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+    "snap_candidate": {
+        ".github/workflows/release-snap-channel.yml": 316435347,
+        ".github/workflows/release-snap-retry.yml": 316439354,
+    },
+    "snap_stable": {".github/workflows/release-policy-channel.yml": 316435347},
+    "web_share": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+    "winget": {".github/workflows/release-policy-channel.yml": 316435347},
+}
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -199,7 +220,11 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         if retry.get(key) is not True:
             raise ValueError(f"downstream retry lost {key}")
     if (
-        retry.get("actions_run_attempt") != 1
+        retry.get("entry_workflow_path")
+        != ".github/workflows/release-channel-retry.yml"
+        or retry.get("entry_trigger") != "workflow_dispatch"
+        or retry.get("channels") != ["chocolatey", "snap_candidate"]
+        or retry.get("actions_run_attempt") != 1
         or retry.get("actions_rerun_allowed") is not False
         or retry.get("native_rebuild_allowed") is not False
     ):
@@ -240,6 +265,7 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         or result.get("pre_site_result_count") != len(CHANNELS) - 1
         or result.get("final_result_count") != len(CHANNELS)
         or result.get("rmux_io_pre_site_digest_field") != "pre_site_summary_sha256"
+        or result.get("producer_workflows") != RESULT_PRODUCERS
     ):
         raise ValueError("downstream result evidence readiness changed")
     channels = contract.get("channels")
@@ -272,6 +298,9 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
                 or not expected_roles <= canonical_roles
             ):
                 raise ValueError(f"{name} must consume its sealed canonical payload")
+    retryable = [entry["name"] for entry in channels if entry.get("retryable") is True]
+    if retryable != ["chocolatey", "snap_candidate"]:
+        raise ValueError("only implemented exact-byte channels may advertise retry")
     snap_stable = next(item for item in channels if item["name"] == "snap_stable")
     if (
         snap_stable.get("payload_ready") is not True

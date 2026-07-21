@@ -32,6 +32,14 @@ def _worker_paths(root: Path) -> tuple[Path, ...]:
     return tuple(workflows / name for name in names)
 
 
+def _retry_dispatch_path(root: Path) -> Path:
+    return root / ".github/workflows/release-channel-retry.yml"
+
+
+def _retry_prepare_path(root: Path) -> Path:
+    return root / ".github/actions/release-channel-retry-prepare/action.yml"
+
+
 def _validate_reusable_workflow(path: Path, *, require_repository_guard: bool) -> None:
     text = path.read_text(encoding="utf-8")
     if "on:\n  workflow_call:" not in text or "permissions: {}" not in text:
@@ -82,6 +90,13 @@ def _validate_callers(root: Path, downstream_paths: tuple[Path, Path, Path]) -> 
                     and caller.count("./.github/workflows/release-downstream.yml") == 1
                 ):
                     continue
+            if (
+                path.name == "release-channel-retry.yml"
+                and downstream.name
+                in {"release-chocolatey-retry.yml", "release-snap-retry.yml"}
+                and text.count(f"./.github/workflows/{downstream.name}") == 1
+            ):
+                continue
             raise ValueError(f"{path.name} calls disarmed {downstream.name}")
 
 
@@ -101,26 +116,68 @@ def _validate_receipt_origin(main: str) -> None:
 
 def _validate_retry(path: Path) -> None:
     retry = path.read_text(encoding="utf-8")
-    required_counts = {
-        "verify-receipt-attestation.py": 1,
-        "--expected-workflow-path .github/workflows/release-receipt.yml": 2,
-        "--expected-workflow-path .github/workflows/release-promote.yml": 2,
-        'test "$RMUX_RECEIPT_RUN_WORKFLOW_ID" = "$RMUX_RECEIPT_WORKFLOW_ID"': 1,
-        "--deny-self-hosted-runners": 1,
-        "live payload artifact identity differs": 1,
-        "--include-retention": 1,
-        ".github/workflows/release-downstream.yml": 1,
-        "prior result is not safe for one exact retry": 1,
-        "prior result started outside the original request TTL": 1,
-        'request["retry_depth"] != 0': 1,
-        '"request_sha256": result["request_sha256"]': 1,
-        '"mutation_started": result["mutation_started"]': 1,
-        '"remote_request_id": result["remote_request_id"]': 1,
-    }
-    if any(retry.count(needle) != count for needle, count in required_counts.items()):
-        raise ValueError(f"{path.name} lost exact retry evidence validation")
-    if f".github/workflows/{path.name}" in retry:
-        raise ValueError(f"{path.name} must allow at most one retry")
+    channel = "chocolatey" if "chocolatey" in path.name else "snap_candidate"
+    workflow_id = "316439352" if channel == "chocolatey" else "316439354"
+    required = (
+        "uses: ./.github/actions/release-channel-retry-prepare",
+        "scripts/release/prepare-channel-retry.py verify-prepared",
+        "scripts/release/assert-release-capability.py downstream_channels",
+        "uses: ./.github/actions/release-channel-result",
+        f'producer-workflow-id: "{workflow_id}"',
+        f"producer-workflow-path: .github/workflows/{path.name}",
+    )
+    if any(retry.count(needle) != 1 for needle in required):
+        raise ValueError(f"{path.name} lost its exact single-depth retry path")
+    if "if: ${{ false }}" in retry or "rebuild" in retry.lower():
+        raise ValueError(f"{path.name} regained a stub or rebuild path")
+
+
+def _validate_retry_dispatch(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    if (
+        "on:\n  workflow_dispatch:" not in text
+        or "permissions: {}" not in text
+        or "\n  push:" in text
+        or "\n  workflow_call:" in text
+    ):
+        raise ValueError("channel retry entry point must remain dispatch-only")
+    for channel, workflow in (
+        ("chocolatey", "release-chocolatey-retry.yml"),
+        ("snap_candidate", "release-snap-retry.yml"),
+    ):
+        if (
+            text.count(f"uses: ./.github/workflows/{workflow}") != 1
+            or text.count(f"inputs.channel == '{channel}'") != 1
+        ):
+            raise ValueError(f"channel retry dispatcher lost {channel}")
+    if text.count("secrets: inherit") != 2:
+        raise ValueError("channel retry dispatcher lost store secret forwarding")
+
+
+def _validate_retry_prepare(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    required = (
+        'test "$GITHUB_REPOSITORY" = "Helvesec/rmux"',
+        'test "$GITHUB_REPOSITORY_ID" = "1239918790"',
+        'test "$RMUX_RECEIPT_RUN_ID" = "$RMUX_PRIOR_RESULT_RUN_ID"',
+        "verify-receipt-attestation.py",
+        "verify-channel-result-attestation.py",
+        "prepare-channel-retry.py prepare",
+        "artifact-ids: ${{ steps.payload.outputs.artifact_id }}",
+    )
+    if any(text.count(value) != 1 for value in required):
+        raise ValueError("channel retry preparer lost exact evidence binding")
+    if (
+        text.count("--expected-workflow-path .github/workflows/release-receipt.yml")
+        != 2
+    ):
+        raise ValueError("channel retry preparer lost exact receipt run origins")
+    if (
+        "release-promote.yml" in text
+        or "cargo build" in text
+        or "cargo package" in text
+    ):
+        raise ValueError("channel retry preparer regained a wrong origin or rebuild")
 
 
 def _validate_helper_sizes(root: Path) -> None:
@@ -137,6 +194,7 @@ def _validate_helper_sizes(root: Path) -> None:
         "downstream_summary.py",
         "verify-downstream-repository.py",
         "verify-channel-result-attestation.py",
+        "prepare-channel-retry.py",
     )
     for name in names:
         path = root / "scripts/release" / name
@@ -190,7 +248,9 @@ def _validate_channel_orchestration(main: str) -> None:
 def validate_downstream_workflows(root: Path) -> None:
     paths = _workflow_paths(root)
     for path in paths:
-        _validate_reusable_workflow(path, require_repository_guard=True)
+        _validate_reusable_workflow(
+            path, require_repository_guard=path.name == "release-downstream.yml"
+        )
     for path in _worker_paths(root):
         _validate_reusable_workflow(path, require_repository_guard=False)
     _validate_callers(root, paths)
@@ -199,6 +259,8 @@ def validate_downstream_workflows(root: Path) -> None:
     _validate_channel_orchestration(main)
     for path in paths[1:]:
         _validate_retry(path)
+    _validate_retry_dispatch(_retry_dispatch_path(root))
+    _validate_retry_prepare(_retry_prepare_path(root))
     verifier = root / "scripts/release/verify-receipt-attestation.py"
     if "--deny-self-hosted-runners" not in verifier.read_text(encoding="utf-8"):
         raise ValueError("receipt verifier lost its GitHub-hosted runner gate")

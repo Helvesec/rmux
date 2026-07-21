@@ -1,38 +1,19 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
-const DOWNSTREAM: &str = include_str!("../.github/workflows/release-downstream.yml");
+const ACTIVATION: &str = include_str!("../.github/release/release-activation.json");
 const CHOCOLATEY: &str = include_str!("../.github/workflows/release-chocolatey-retry.yml");
+const CHOCOLATEY_WRITER: &str = include_str!("../scripts/release/publish-chocolatey-package.ps1");
+const DISPATCH: &str = include_str!("../.github/workflows/release-channel-retry.yml");
+const PREPARE: &str = include_str!("../.github/actions/release-channel-retry-prepare/action.yml");
+const RETRY_HELPER: &str = include_str!("../scripts/release/prepare-channel-retry.py");
 const SNAP: &str = include_str!("../.github/workflows/release-snap-retry.yml");
+const SNAP_WRITER: &str =
+    include_str!("../.github/actions/release-snap-candidate-write/action.yml");
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn job<'a>(workflow: &'a str, id: &str, next: Option<&str>) -> &'a str {
-    let marker = format!("\n  {id}:\n");
-    let tail = workflow
-        .split(&marker)
-        .nth(1)
-        .unwrap_or_else(|| panic!("missing job {id}"));
-    match next {
-        Some(next_id) => tail
-            .split(&format!("\n  {next_id}:\n"))
-            .next()
-            .expect("job boundary"),
-        None => tail,
-    }
-}
-
-fn artifact_verification<'a>(workflow: &'a str, artifact_name: &str) -> &'a str {
-    let marker = format!("--name \"{artifact_name}\"");
-    workflow
-        .split(&marker)
-        .nth(1)
-        .unwrap_or_else(|| panic!("missing artifact verification for {artifact_name}"))
-        .split("--max-attempts 1")
-        .next()
-        .expect("artifact verification boundary")
 }
 
 fn assert_reusable_only(workflow: &str) {
@@ -43,302 +24,222 @@ fn assert_reusable_only(workflow: &str) {
         "\n  repository_dispatch:",
         "\n  push:",
         "\n  schedule:",
+        "runs-on: self-hosted",
+        "- self-hosted",
+        "larger-runner",
     ] {
-        assert!(!workflow.contains(forbidden));
+        assert!(!workflow.contains(forbidden), "retry gained {forbidden}");
     }
-    assert!(!workflow.contains("contents: write"));
-    assert!(!workflow.contains("id-token: write"));
-    assert!(!workflow.contains("attestations: write"));
-    assert!(!workflow.contains("secrets:"));
-    assert!(!workflow.contains("environment:"));
-    assert!(!workflow.contains("runs-on: self-hosted"));
-    assert!(!workflow.contains("- self-hosted"));
 }
 
-fn calls_disarmed_workflow(line: &str, workflow_name: &str) -> bool {
-    let normalized = line.trim().strip_prefix("- ").unwrap_or(line.trim()).trim();
-    let Some(target) = normalized.strip_prefix("uses:") else {
-        return false;
-    };
-    let target = target
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .trim_matches(|character| character == '\'' || character == '"')
-        .to_ascii_lowercase();
-    target == format!("./.github/workflows/{workflow_name}")
-        || target.starts_with(&format!("helvesec/rmux/.github/workflows/{workflow_name}@"))
+fn workflow_calls(text: &str, name: &str) -> usize {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.strip_prefix("uses:")
+                .map(str::trim)
+                .is_some_and(|target| target == format!("./.github/workflows/{name}"))
+        })
+        .count()
 }
 
 #[test]
-fn retry_workflows_are_uncalled_with_read_only_prepare_and_false_writer() {
-    for (workflow, writer_id) in [
-        (CHOCOLATEY, "retry-chocolatey"),
-        (SNAP, "retry-snap-candidate"),
-    ] {
-        assert_reusable_only(workflow);
-        assert_eq!(workflow.matches("if: ${{ false }}").count(), 1);
-        let prepare = job(workflow, "prepare-retry", Some(writer_id));
-        let writer = job(workflow, writer_id, None);
-        assert!(!prepare.contains("if: ${{ false }}"));
-        assert!(prepare.contains("test \"$GITHUB_REPOSITORY\" = \"Helvesec/rmux\""));
-        assert!(prepare.contains("test \"$GITHUB_REPOSITORY_ID\" = \"1239918790\""));
-        assert!(writer.contains("if: ${{ false }}"));
-        assert!(prepare.contains("GITHUB_RUN_ATTEMPT"));
-        assert!(prepare.contains("actions: read"));
-        assert!(prepare.contains("contents: read"));
-        assert!(writer.contains("assert-release-capability.py downstream_channels"));
-        assert!(workflow.contains("cancel-in-progress: false"));
-    }
+fn retry_entry_point_is_dispatch_only_and_ledger_disarmed() {
+    assert!(DISPATCH.contains("on:\n  workflow_dispatch:"));
+    assert!(!DISPATCH.contains("\n  workflow_call:"));
+    assert!(!DISPATCH.contains("\n  push:"));
+    assert_eq!(DISPATCH.matches("permissions: {}").count(), 1);
+    assert_eq!(workflow_calls(DISPATCH, "release-chocolatey-retry.yml"), 1);
+    assert_eq!(workflow_calls(DISPATCH, "release-snap-retry.yml"), 1);
+    assert_eq!(DISPATCH.matches("secrets: inherit").count(), 2);
+    assert!(DISPATCH.contains("inputs.channel == 'chocolatey'"));
+    assert!(DISPATCH.contains("inputs.channel == 'snap_candidate'"));
+
+    let activation: serde_json::Value =
+        serde_json::from_str(ACTIVATION).expect("activation ledger");
+    assert_eq!(activation["status"], "disarmed");
+    assert_eq!(activation["capabilities"]["downstream_channels"], false);
+
+    let contract: serde_json::Value = serde_json::from_str(include_str!(
+        "../.github/release/downstream-channel-contract.json"
+    ))
+    .expect("downstream contract");
+    let retryable: Vec<_> = contract["channels"]
+        .as_array()
+        .expect("channels")
+        .iter()
+        .filter(|channel| channel["retryable"] == true)
+        .map(|channel| channel["name"].as_str().expect("channel name"))
+        .collect();
+    assert_eq!(retryable, ["chocolatey", "snap_candidate"]);
 
     let workflows = repo_root().join(".github/workflows");
     for entry in fs::read_dir(workflows).expect("list workflows") {
         let path = entry.expect("workflow entry").path();
         let text = fs::read_to_string(&path).expect("read workflow");
-        for workflow_name in ["release-chocolatey-retry.yml", "release-snap-retry.yml"] {
-            assert!(!text
-                .lines()
-                .any(|line| calls_disarmed_workflow(line, workflow_name)));
+        let calls = workflow_calls(&text, "release-chocolatey-retry.yml")
+            + workflow_calls(&text, "release-snap-retry.yml");
+        if path.ends_with("release-channel-retry.yml") {
+            assert_eq!(calls, 2);
+        } else {
+            assert_eq!(calls, 0, "unexpected retry caller {}", path.display());
         }
     }
 }
 
 #[test]
-fn retry_caller_guard_rejects_relative_and_absolute_targets() {
-    for workflow_name in ["release-chocolatey-retry.yml", "release-snap-retry.yml"] {
-        for target in [
-            format!("    uses: ./.github/workflows/{workflow_name}"),
-            format!(
-                "    uses: Helvesec/rmux/.github/workflows/{workflow_name}@0123456789012345678901234567890123456789"
-            ),
-        ] {
-            assert!(calls_disarmed_workflow(&target, workflow_name));
-        }
-    }
-}
-
-#[test]
-fn retries_bind_exact_receipt_result_origin_and_closed_bundle() {
-    for (workflow, writer_id, channel) in [
-        (CHOCOLATEY, "retry-chocolatey", "chocolatey"),
-        (SNAP, "retry-snap-candidate", "snap_candidate"),
-    ] {
-        for input in [
-            "receipt_run_id:",
-            "receipt_run_workflow_id:",
-            "receipt_workflow_id:",
-            "receipt_artifact_id:",
-            "receipt_artifact_digest:",
-            "receipt_envelope_artifact_id:",
-            "receipt_envelope_artifact_digest:",
-            "receipt_predicate_sha256:",
-            "receipt_envelope_sha256:",
-            "prior_result_run_id:",
-            "prior_result_run_workflow_id:",
-            "prior_result_producer_workflow_id:",
-            "prior_result_producer_workflow_path:",
-            "prior_result_artifact_id:",
-            "prior_result_artifact_digest:",
-            "prior_result_predicate_sha256:",
-            "prior_result_envelope_artifact_id:",
-            "prior_result_envelope_artifact_digest:",
-            "prior_result_envelope_sha256:",
-            "request_idempotency_key:",
-        ] {
-            assert!(workflow.contains(input), "missing retry input {input}");
-        }
-        let prepare = job(workflow, "prepare-retry", Some(writer_id));
-        assert_eq!(prepare.matches("actions-artifact.py verify").count(), 5);
-        assert_eq!(prepare.matches("artifact-ids:").count(), 4);
+fn retry_wrappers_use_one_common_exact_evidence_preparer() {
+    for (workflow, channel) in [(CHOCOLATEY, "chocolatey"), (SNAP, "snap_candidate")] {
+        assert_reusable_only(workflow);
         assert_eq!(
-            prepare
-                .matches("--expected-workflow-path .github/workflows/release-receipt.yml")
-                .count(),
-            2
-        );
-        assert_eq!(
-            prepare
-                .matches("--expected-workflow-path .github/workflows/release-promote.yml")
-                .count(),
-            2
-        );
-        for artifact_name in [
-            "rmux-publication-receipt-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID".to_owned(),
-            "rmux-publication-receipt-envelope-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID"
-                .to_owned(),
-        ] {
-            assert!(artifact_verification(prepare, &artifact_name)
-                .contains("--expected-workflow-path .github/workflows/release-receipt.yml"));
-        }
-        for artifact_name in [
-            format!(
-                "rmux-downstream-{channel}-result-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID"
-            ),
-            format!(
-                "rmux-downstream-{channel}-result-envelope-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID"
-            ),
-        ] {
-            assert!(artifact_verification(prepare, &artifact_name)
-                .contains("--expected-workflow-path .github/workflows/release-promote.yml"));
-        }
-        assert!(prepare
-            .contains("test \"$RMUX_RECEIPT_RUN_WORKFLOW_ID\" = \"$RMUX_RECEIPT_WORKFLOW_ID\""));
-        assert_eq!(
-            prepare
-                .matches("--expected-event workflow_dispatch")
-                .count(),
-            4
-        );
-        assert_eq!(prepare.matches("--max-attempts 1").count(), 5);
-        assert!(!prepare.contains("pattern:"));
-        assert_eq!(prepare.matches("merge-multiple: true").count(), 4);
-        for exact_file in [
-            "channel-payload.json",
-            "downstream-channel-plan.json",
-            "downstream-channel-request.json",
-            "downstream-channel-result-predicate.json",
-            "downstream-channel-result.sigstore.json",
-            "downstream-channel-target-evidence.json",
-            "release-state.json",
-            "receipt-reference.json",
-            "downstream-channel-result-envelope.json",
-        ] {
-            assert!(prepare.contains(exact_file), "bundle lost {exact_file}");
-        }
-        assert!(prepare.contains("names != wanted"));
-        assert!(prepare.contains("contains a symlink"));
-        assert!(prepare.contains("channel-policy.py verify-plan"));
-        assert!(prepare.contains("channel-request.py verify"));
-        assert!(prepare.contains("channel-request.py create"));
-        assert!(prepare.contains("channel-result.py verify-predicate"));
-        assert!(prepare.contains("result_started_at=\"$(jq -er .started_at"));
-        assert!(prepare.contains("--started-at \"$result_started_at\""));
-        assert!(prepare.contains("channel-result.py verify-envelope"));
-        assert_eq!(
-            prepare
-                .matches("--request \"$bundle/downstream-channel-request.json\"")
-                .count(),
-            2
-        );
-        assert!(prepare.contains("install-gh-2.93.0.sh"));
-        assert!(prepare.contains("verify-receipt-attestation.py"));
-        assert!(prepare.contains("attestation verify"));
-        assert!(prepare.contains("GH_TOKEN: ${{ github.token }}"));
-        assert!(prepare.contains("--deny-self-hosted-runners"));
-        assert!(prepare.contains("result attestation cardinality differs"));
-        assert!(prepare.contains("result attestation lacks signed verification evidence"));
-        assert!(prepare.contains("verifiedTimestamps"));
-        assert!(prepare.contains("signature.get(\"certificate\")"));
-        assert!(prepare.contains("signed result subject differs"));
-        assert!(!prepare.contains("predicate[\"subject\"]"));
-        assert!(prepare.contains("hashlib.sha256(target_path.read_bytes()).hexdigest()"));
-        assert!(prepare.contains("^rmux-downstream-v1:[0-9a-f]{64}$"));
-        assert!(prepare.contains("expected_receipt = {"));
-        assert!(prepare.contains("\"predicate_bundle\": reference[\"predicate_bundle\"]"));
-        assert!(prepare.contains("\"envelope_bundle\": reference[\"envelope_bundle\"]"));
-        assert!(prepare.contains("\"predicate_artifact_id\""));
-        assert!(prepare.contains("\"predicate_artifact_digest\""));
-        assert!(prepare.contains("\"envelope_artifact_id\""));
-        assert!(prepare.contains("\"envelope_artifact_digest\""));
-        assert!(prepare.contains("rebuild_native"));
-        assert!(prepare.contains("exact payload has expired"));
-        assert!(prepare.contains("Revalidate the exact payload artifact is still available"));
-        assert!(prepare.contains(".artifact.artifact_id"));
-        assert!(prepare.contains(".artifact.archive_digest"));
-        assert!(prepare.contains("--include-retention"));
-        assert!(prepare.contains("artifact[\"created_at\"]"));
-        assert!(prepare.contains("artifact[\"updated_at\"]"));
-        assert!(prepare.contains("artifact[\"expires_at\"]"));
-        assert!(prepare.contains("live payload artifact identity differs"));
-        assert!(prepare.contains("request[\"retry_depth\"] != 0"));
-        assert!(prepare.contains("result[\"state\"] not in {\"prepared\", \"failed-transient\"}"));
-        assert!(prepare.contains("result[\"mutation_started\"] is not False"));
-        assert!(prepare.contains("result[\"remote_request_id\"] is not None"));
-        assert!(prepare.contains("result[\"started_at\"]"));
-        assert!(prepare.contains("request[\"expires_at\"]"));
-        assert!(prepare.contains("prior result is not safe for one exact retry"));
-        assert!(prepare.contains("prior result started outside the original request TTL"));
-        for previous_field in [
-            "\"request_sha256\": result[\"request_sha256\"]",
-            "\"state\": result[\"state\"]",
-            "\"mutation_started\": result[\"mutation_started\"]",
-            "\"remote_request_id\": result[\"remote_request_id\"]",
-        ] {
-            assert!(prepare.contains(previous_field));
-        }
-        assert_eq!(
-            prepare
-                .matches(".github/workflows/release-downstream.yml")
+            workflow
+                .matches("uses: ./.github/actions/release-channel-retry-prepare")
                 .count(),
             1
         );
+        assert!(workflow.contains(&format!("channel: {channel}")));
+        assert!(workflow.contains("environment: release"));
+        assert!(workflow.contains("assert-release-capability.py downstream_channels"));
+        assert!(workflow.contains("prepare-channel-retry.py verify-prepared"));
+        assert!(workflow.contains("uses: ./.github/actions/release-channel-result"));
+        assert!(!workflow.contains("if: ${{ false }}"));
+        assert!(!workflow.contains("cargo build"));
+        assert!(!workflow.contains("cargo package"));
+        assert!(!workflow.contains("snapcore/action-build"));
     }
-    assert!(!CHOCOLATEY.contains(".github/workflows/release-chocolatey-retry.yml"));
-    assert!(!SNAP.contains(".github/workflows/release-snap-retry.yml"));
-    assert!(CHOCOLATEY.contains("snap_candidate_opt_in=\"$(jq -er"));
-    assert!(CHOCOLATEY.contains("plan_args+=(--snap-candidate-opt-in)"));
-    assert!(CHOCOLATEY.contains("if [[ \"$snap_candidate_opt_in\" == true ]]"));
+
+    assert!(CHOCOLATEY.contains("producer-workflow-id: \"316439352\""));
+    assert!(CHOCOLATEY
+        .contains("producer-workflow-path: .github/workflows/release-chocolatey-retry.yml"));
+    assert!(SNAP.contains("producer-workflow-id: \"316439354\""));
+    assert!(SNAP.contains("producer-workflow-path: .github/workflows/release-snap-retry.yml"));
+    assert!(SNAP.contains("uses: ./.github/actions/release-snap-candidate-write"));
+    assert!(SNAP_WRITER.contains("release: latest/candidate"));
+    assert!(!SNAP_WRITER.contains("latest/stable"));
 }
 
 #[test]
-fn retries_share_channel_concurrency_and_never_rebuild() {
-    assert!(DOWNSTREAM.contains("group: rmux-channel-chocolatey-${{ inputs.release_ref }}"));
-    assert!(CHOCOLATEY.contains("group: rmux-channel-chocolatey-${{ inputs.release_ref }}"));
-    assert!(
-        DOWNSTREAM.contains("group: rmux-channel-${{ matrix.channel }}-${{ inputs.release_ref }}")
+fn common_retry_preparer_binds_receipt_result_attestation_and_original_bytes() {
+    assert_eq!(PREPARE.matches("actions-artifact.py verify").count(), 5);
+    assert_eq!(PREPARE.matches("actions/download-artifact@").count(), 5);
+    assert_eq!(
+        PREPARE
+            .matches("--expected-workflow-path .github/workflows/release-receipt.yml")
+            .count(),
+        2
     );
-    assert!(SNAP.contains("group: rmux-channel-snap-candidate-${{ inputs.release_ref }}"));
+    assert!(!PREPARE.contains("release-promote.yml"));
+    assert!(PREPARE.contains("verify-receipt-attestation.py"));
+    assert!(PREPARE.contains("verify-channel-result-attestation.py"));
+    assert!(PREPARE.contains("install-gh-2.93.0.sh"));
+    assert!(PREPARE.contains("--include-retention"));
+    assert!(PREPARE.contains("artifact-ids: ${{ steps.payload.outputs.artifact_id }}"));
+    assert!(PREPARE.contains("prepare-channel-retry.py prepare"));
+    assert!(PREPARE.contains("test \"$RMUX_RECEIPT_RUN_ID\" = \"$RMUX_PRIOR_RESULT_RUN_ID\""));
+    assert!(PREPARE
+        .contains("test \"$RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID\" = \"$RMUX_RECEIPT_WORKFLOW_ID\""));
+    assert!(PREPARE.contains(
+        "test \"$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID\" = \"$RMUX_RECEIPT_WORKFLOW_ID\""
+    ));
+    assert!(!PREPARE.contains("cargo build"));
+    assert!(!PREPARE.contains("cargo package"));
+}
 
-    for (workflow, forbidden) in [
-        (
-            CHOCOLATEY,
-            [
-                "cargo build",
-                "cargo package",
-                "choco pack",
-                "choco push",
-                "generate-chocolatey-package.sh",
-                "latest/stable",
-            ],
-        ),
-        (
-            SNAP,
-            [
-                "cargo build",
-                "cargo package",
-                "snapcraft",
-                "snapcore/action-build",
-                "snapcore/action-publish",
-                "latest/stable",
-            ],
-        ),
+#[test]
+fn retry_helper_enforces_single_depth_no_mutation_and_exact_file_sets() {
+    for invariant in [
+        "validate_retryable_previous(result)",
+        "validate_retryable_previous(previous)",
+        "operation=\"retry\"",
+        "retry payload bytes differ",
+        "prepared retry bundle",
+        "original-request.json",
+        "previous-result.json",
+        "payload-artifact-live.json",
+        "exact retry payload has expired",
+        "expected_request(",
     ] {
-        for primitive in forbidden {
-            assert!(
-                !workflow.contains(primitive),
-                "retry gained forbidden rebuild or mutation primitive {primitive}"
-            );
-        }
+        assert!(
+            RETRY_HELPER.contains(invariant),
+            "retry helper lost {invariant}"
+        );
+    }
+    assert!(!RETRY_HELPER.contains("subprocess"));
+    assert!(!RETRY_HELPER.contains("cargo"));
+}
+
+#[test]
+fn retry_helper_imports_the_shared_request_model() {
+    let status = Command::new("python3")
+        .args(["scripts/release/prepare-channel-retry.py", "--help"])
+        .status()
+        .expect("run Python import probe");
+    assert!(
+        status.success(),
+        "retry helper must be importable at runtime"
+    );
+}
+
+#[test]
+fn retries_share_channel_concurrency_and_only_use_store_mutations() {
+    assert!(CHOCOLATEY.contains("group: rmux-channel-chocolatey-${{ inputs.release_ref }}"));
+    assert!(SNAP.contains("group: rmux-channel-snap-candidate-${{ inputs.release_ref }}"));
+    assert!(CHOCOLATEY.contains("publish-chocolatey-package.ps1"));
+    assert!(CHOCOLATEY_WRITER.contains("$state = \"failed-transient\""));
+    assert!(CHOCOLATEY_WRITER.contains("$state = \"failed-terminal\""));
+    assert!(CHOCOLATEY_WRITER.contains("ChocolateyPublicBytesMismatchException"));
+    assert!(
+        SNAP_WRITER.contains("snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40")
+    );
+    assert_eq!(SNAP_WRITER.matches("snapcore/action-publish@").count(), 2);
+    assert!(SNAP_WRITER.contains("state=failed-transient"));
+    assert!(SNAP_WRITER.contains("state=failed-terminal"));
+    for workflow in [CHOCOLATEY, SNAP] {
+        assert!(workflow.contains("cancel-in-progress: false"));
+        assert!(workflow.contains("persist-credentials: false"));
+        assert!(workflow.contains("attestations: write"));
+        assert!(workflow.contains("id-token: write"));
     }
 }
 
 #[test]
-fn snap_retry_remains_candidate_only_and_writer_disabled() {
-    assert!(SNAP.contains("rmux-channel-snap-candidate-"));
-    assert!(SNAP.contains("the downstream writer is disabled"));
-    assert!(!SNAP.contains("snap-stable"));
+fn retry_result_producer_requires_the_exact_workflow_id_path_pair() {
+    let script = r#"
+import sys
+sys.path.insert(0, 'scripts/release')
+from downstream_result import validate_producer
 
-    let policy: serde_json::Value =
-        serde_json::from_str(include_str!("../.github/release/channel-policy.json"))
-            .expect("channel policy");
-    assert_eq!(
-        policy["release_kinds"]["rc"]["snap_candidate"],
-        "explicit_opt_in"
+producer = {
+    'run_id': 9,
+    'run_attempt': 1,
+    'workflow_id': 316439352,
+    'workflow_path': '.github/workflows/release-chocolatey-retry.yml',
+    'runner_group_id': 0,
+    'runner_group_name': 'GitHub Actions',
+    'runner_image': 'windows-latest',
+}
+validate_producer(producer, 'chocolatey')
+for field, value in (
+    ('workflow_id', 316435347),
+    ('workflow_path', '.github/workflows/release-snap-retry.yml'),
+):
+    forged = dict(producer)
+    forged[field] = value
+    try:
+        validate_producer(forged, 'chocolatey')
+    except ValueError:
+        continue
+    raise SystemExit(f'forged retry producer accepted: {field}')
+"#;
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .current_dir(repo_root())
+        .output()
+        .expect("run retry producer fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        policy["release_kinds"]["stable"]["snap_candidate"],
-        "explicit_opt_in"
-    );
-    assert_eq!(policy["release_kinds"]["rc"]["snap_stable"], false);
-    assert_eq!(policy["release_kinds"]["stable"]["snap_stable"], false);
 }

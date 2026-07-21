@@ -33,7 +33,6 @@ REMOTE_MUTATION_STATES = {"submitted", "pending-moderation", "public-live"}
 NO_MUTATION_STATES = {"blocked", "denied-by-policy", "prepared"}
 OBSERVED_TARGET_STATES = REMOTE_MUTATION_STATES | {"no-op-exact"}
 RETRYABLE_STATES = {"prepared", "failed-transient"}
-RESULT_PRODUCER_WORKFLOW_ID = 316435347
 
 
 def result_state(value: Any) -> str:
@@ -66,13 +65,14 @@ def validate_producer(value: Any, channel: str) -> dict[str, Any]:
         "channel result producer",
     )
     positive(value["run_id"], "result run ID")
-    if (
-        positive(value["workflow_id"], "result workflow ID")
-        != RESULT_PRODUCER_WORKFLOW_ID
-    ):
-        raise ValueError("result producer workflow ID changed")
     workflows = _result_contract().get("producer_workflows", {}).get(channel)
-    if not isinstance(workflows, list) or value["workflow_path"] not in workflows:
+    if not isinstance(workflows, dict):
+        raise ValueError("result producer workflow allowlist is missing")
+    expected_workflow_id = workflows.get(value["workflow_path"])
+    if (
+        type(expected_workflow_id) is not int
+        or positive(value["workflow_id"], "result workflow ID") != expected_workflow_id
+    ):
         raise ValueError("result producer workflow is not allowlisted for its channel")
     expected_image = "windows-latest" if channel == "chocolatey" else "ubuntu-22.04"
     if (

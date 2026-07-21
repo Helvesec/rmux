@@ -64,7 +64,11 @@ fn read_json(path: &Path) -> Value {
 
 #[test]
 fn publication_receipt_modules_stay_below_the_release_file_budget() {
-    for filename in ["publication-receipt.py", "publication_release_state.py"] {
+    for filename in [
+        "publication-receipt.py",
+        "publication_authorization.py",
+        "publication_release_state.py",
+    ] {
         let path = repo_root().join("scripts/release").join(filename);
         let source = fs::read_to_string(&path).expect("read publication receipt module");
         assert!(

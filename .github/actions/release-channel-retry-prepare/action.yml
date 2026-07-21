@@ -1,0 +1,281 @@
+name: Prepare exact downstream channel retry
+description: Revalidate one retryable result and copy only its original payload bytes.
+
+inputs:
+  channel: {required: true}
+  receipt-run-id: {required: true}
+  receipt-run-workflow-id: {required: true}
+  receipt-workflow-id: {required: true}
+  receipt-artifact-id: {required: true}
+  receipt-artifact-digest: {required: true}
+  receipt-envelope-artifact-id: {required: true}
+  receipt-envelope-artifact-digest: {required: true}
+  receipt-predicate-sha256: {required: true}
+  receipt-envelope-sha256: {required: true}
+  prior-result-run-id: {required: true}
+  prior-result-run-workflow-id: {required: true}
+  prior-result-producer-workflow-id: {required: true}
+  prior-result-producer-workflow-path: {required: true}
+  prior-result-artifact-id: {required: true}
+  prior-result-artifact-digest: {required: true}
+  prior-result-predicate-sha256: {required: true}
+  prior-result-envelope-artifact-id: {required: true}
+  prior-result-envelope-artifact-digest: {required: true}
+  prior-result-envelope-sha256: {required: true}
+  request-idempotency-key: {required: true}
+  source-sha: {required: true}
+  release-id: {required: true}
+  release-ref: {required: true}
+
+outputs:
+  artifact-id:
+    value: ${{ steps.upload.outputs.artifact-id }}
+  artifact-digest:
+    value: sha256:${{ steps.upload.outputs.artifact-digest }}
+
+runs:
+  using: composite
+  steps:
+    - id: paths
+      name: Reject malformed or cross-run retry identities
+      shell: bash
+      env:
+        RMUX_CHANNEL: ${{ inputs.channel }}
+        RMUX_RECEIPT_RUN_ID: ${{ inputs.receipt-run-id }}
+        RMUX_RECEIPT_RUN_WORKFLOW_ID: ${{ inputs.receipt-run-workflow-id }}
+        RMUX_RECEIPT_WORKFLOW_ID: ${{ inputs.receipt-workflow-id }}
+        RMUX_PRIOR_RESULT_RUN_ID: ${{ inputs.prior-result-run-id }}
+        RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID: ${{ inputs.prior-result-run-workflow-id }}
+        RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID: ${{ inputs.prior-result-producer-workflow-id }}
+        RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH: ${{ inputs.prior-result-producer-workflow-path }}
+        RMUX_SOURCE_SHA: ${{ inputs.source-sha }}
+        RMUX_RELEASE_ID: ${{ inputs.release-id }}
+        RMUX_RELEASE_REF: ${{ inputs.release-ref }}
+      run: |
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
+        test "$GITHUB_REPOSITORY_ID" = "1239918790"
+        test "$GITHUB_RUN_ATTEMPT" = 1
+        [[ "$RMUX_CHANNEL" =~ ^(chocolatey|snap_candidate)$ ]]
+        for value in \
+          "$RMUX_RECEIPT_RUN_ID" "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
+          "$RMUX_RECEIPT_WORKFLOW_ID" "$RMUX_PRIOR_RESULT_RUN_ID" \
+          "$RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID" \
+          "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID" "$RMUX_RELEASE_ID"; do
+          [[ "$value" =~ ^[1-9][0-9]*$ ]]
+        done
+        test "$RMUX_RECEIPT_RUN_ID" = "$RMUX_PRIOR_RESULT_RUN_ID"
+        test "$RMUX_RECEIPT_RUN_WORKFLOW_ID" = "$RMUX_RECEIPT_WORKFLOW_ID"
+        test "$RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID" = "$RMUX_RECEIPT_WORKFLOW_ID"
+        test "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID" = "$RMUX_RECEIPT_WORKFLOW_ID"
+        [[ "$RMUX_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+        [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+        if [ "$RMUX_CHANNEL" = chocolatey ]; then
+          expected=.github/workflows/release-chocolatey-channel.yml
+        else
+          expected=.github/workflows/release-snap-channel.yml
+        fi
+        test "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH" = "$expected"
+        root="$RUNNER_TEMP/rmux-$RMUX_CHANNEL-retry"
+        test ! -e "$root"
+        mkdir -p "$root/receipt" "$root/receipt-envelope" \
+          "$root/result" "$root/result-envelope" "$root/payload"
+        echo "root=$root" >> "$GITHUB_OUTPUT"
+
+    - name: Fail closed before preparing a retry
+      shell: bash
+      run: scripts/release/assert-release-capability.py downstream_channels
+
+    - name: Verify receipt and prior result artifact origins
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        root="${{ steps.paths.outputs.root }}"
+        common=(
+          --repository "$GITHUB_REPOSITORY"
+          --expected-source-sha "${{ inputs.source-sha }}"
+          --expected-workflow-id "${{ inputs.receipt-workflow-id }}"
+          --expected-workflow-path .github/workflows/release-receipt.yml
+          --expected-event workflow_dispatch
+          --expected-head-branch "${{ inputs.release-ref }}"
+          --max-attempts 1
+        )
+        scripts/release/actions-artifact.py verify "${common[@]}" \
+          --run-id "${{ inputs.receipt-run-id }}" \
+          --artifact-id "${{ inputs.receipt-artifact-id }}" \
+          --name "rmux-publication-receipt-${{ inputs.source-sha }}-${{ inputs.release-id }}" \
+          --expected-digest "${{ inputs.receipt-artifact-digest }}" \
+          --include-retention > "$root/receipt-artifact.json"
+        scripts/release/actions-artifact.py verify "${common[@]}" \
+          --run-id "${{ inputs.receipt-run-id }}" \
+          --artifact-id "${{ inputs.receipt-envelope-artifact-id }}" \
+          --name "rmux-publication-receipt-envelope-${{ inputs.source-sha }}-${{ inputs.release-id }}" \
+          --expected-digest "${{ inputs.receipt-envelope-artifact-digest }}" \
+          --include-retention > "$root/receipt-envelope-artifact.json"
+        scripts/release/actions-artifact.py verify "${common[@]}" \
+          --run-id "${{ inputs.prior-result-run-id }}" \
+          --artifact-id "${{ inputs.prior-result-artifact-id }}" \
+          --name "rmux-downstream-${{ inputs.channel }}-result-${{ inputs.source-sha }}-${{ inputs.release-id }}" \
+          --expected-digest "${{ inputs.prior-result-artifact-digest }}" \
+          --include-retention > "$root/result-artifact.json"
+        scripts/release/actions-artifact.py verify "${common[@]}" \
+          --run-id "${{ inputs.prior-result-run-id }}" \
+          --artifact-id "${{ inputs.prior-result-envelope-artifact-id }}" \
+          --name "rmux-downstream-${{ inputs.channel }}-result-envelope-${{ inputs.source-sha }}-${{ inputs.release-id }}" \
+          --expected-digest "${{ inputs.prior-result-envelope-artifact-digest }}" \
+          --include-retention > "$root/result-envelope-artifact.json"
+
+    - name: Download the exact receipt predicate bundle
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.receipt-artifact-id }}
+        merge-multiple: true
+        path: ${{ steps.paths.outputs.root }}/receipt
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ inputs.receipt-run-id }}
+
+    - name: Download the exact receipt envelope
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.receipt-envelope-artifact-id }}
+        merge-multiple: true
+        path: ${{ steps.paths.outputs.root }}/receipt-envelope
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ inputs.receipt-run-id }}
+
+    - name: Download the exact prior result bundle
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.prior-result-artifact-id }}
+        merge-multiple: true
+        path: ${{ steps.paths.outputs.root }}/result
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ inputs.prior-result-run-id }}
+
+    - name: Download the exact prior result envelope
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.prior-result-envelope-artifact-id }}
+        merge-multiple: true
+        path: ${{ steps.paths.outputs.root }}/result-envelope
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ inputs.prior-result-run-id }}
+
+    - id: gh
+      name: Install the pinned attestation verifier
+      shell: bash
+      run: |
+        set -euo pipefail
+        install_root="$RUNNER_TEMP/rmux-gh-2.93.0-${{ inputs.channel }}-retry"
+        scripts/release/install-gh-2.93.0.sh "$install_root"
+        echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+    - name: Verify the exact signed receipt and prior result
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        root="${{ steps.paths.outputs.root }}"
+        scripts/release/verify-receipt-attestation.py \
+          --gh "${{ steps.gh.outputs.binary }}" \
+          --release-state "$root/receipt/release-state.json" \
+          --bundle "$root/receipt/publication-receipt.sigstore.json" \
+          --predicate "$root/receipt/publication-receipt-predicate.json" \
+          --source-sha "${{ inputs.source-sha }}" \
+          --release-ref "${{ inputs.release-ref }}"
+        scripts/release/verify-channel-result-attestation.py \
+          --gh "${{ steps.gh.outputs.binary }}" \
+          --request "$root/result/downstream-channel-request.json" \
+          --target-evidence "$root/result/downstream-channel-target-evidence.json" \
+          --bundle "$root/result/downstream-channel-result.sigstore.json" \
+          --predicate "$root/result/downstream-channel-result-predicate.json" \
+          --envelope "$root/result-envelope/downstream-channel-result-envelope.json" \
+          --source-sha "${{ inputs.source-sha }}" \
+          --release-ref "${{ inputs.release-ref }}" \
+          --channel "${{ inputs.channel }}"
+
+    - id: payload
+      name: Revalidate the original payload artifact identity
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        root="${{ steps.paths.outputs.root }}"
+        payload="$root/result/channel-payload.json"
+        run_id="$(jq -er .producer.run_id "$payload")"
+        artifact_id="$(jq -er .artifact.artifact_id "$payload")"
+        artifact_name="$(jq -er .artifact.name "$payload")"
+        artifact_digest="$(jq -er .artifact.archive_digest "$payload")"
+        [[ "$run_id" =~ ^[1-9][0-9]*$ && "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+        scripts/release/actions-artifact.py verify \
+          --repository "$GITHUB_REPOSITORY" --run-id "$run_id" \
+          --artifact-id "$artifact_id" --name "$artifact_name" \
+          --expected-source-sha "${{ inputs.source-sha }}" \
+          --expected-workflow-id 316435347 \
+          --expected-workflow-path .github/workflows/release-receipt.yml \
+          --expected-event workflow_dispatch \
+          --expected-head-branch "${{ inputs.release-ref }}" \
+          --expected-digest "$artifact_digest" --include-retention \
+          --max-attempts 1 > "$root/payload-artifact-live.json"
+        {
+          echo "run_id=$run_id"
+          echo "artifact_id=$artifact_id"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Download only the original payload artifact ID
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ steps.payload.outputs.artifact_id }}
+        merge-multiple: true
+        path: ${{ steps.paths.outputs.root }}/payload
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ steps.payload.outputs.run_id }}
+
+    - name: Prepare and revalidate the exact retry bundle
+      shell: bash
+      run: |
+        set -euo pipefail
+        scripts/release/prepare-channel-retry.py prepare \
+          --root "${{ steps.paths.outputs.root }}" \
+          --output "${{ steps.paths.outputs.root }}/prepared" \
+          --channel "${{ inputs.channel }}" \
+          --source-sha "${{ inputs.source-sha }}" \
+          --release-id "${{ inputs.release-id }}" \
+          --release-ref "${{ inputs.release-ref }}" \
+          --idempotency-key "${{ inputs.request-idempotency-key }}" \
+          --receipt-run-id "${{ inputs.receipt-run-id }}" \
+          --receipt-workflow-id "${{ inputs.receipt-workflow-id }}" \
+          --receipt-artifact-id "${{ inputs.receipt-artifact-id }}" \
+          --receipt-artifact-digest "${{ inputs.receipt-artifact-digest }}" \
+          --receipt-envelope-artifact-id "${{ inputs.receipt-envelope-artifact-id }}" \
+          --receipt-envelope-artifact-digest "${{ inputs.receipt-envelope-artifact-digest }}" \
+          --receipt-predicate-sha256 "${{ inputs.receipt-predicate-sha256 }}" \
+          --receipt-envelope-sha256 "${{ inputs.receipt-envelope-sha256 }}" \
+          --prior-result-run-id "${{ inputs.prior-result-run-id }}" \
+          --prior-result-producer-workflow-id "${{ inputs.prior-result-producer-workflow-id }}" \
+          --prior-result-producer-workflow-path "${{ inputs.prior-result-producer-workflow-path }}" \
+          --prior-result-artifact-id "${{ inputs.prior-result-artifact-id }}" \
+          --prior-result-artifact-digest "${{ inputs.prior-result-artifact-digest }}" \
+          --prior-result-predicate-sha256 "${{ inputs.prior-result-predicate-sha256 }}" \
+          --prior-result-envelope-artifact-id "${{ inputs.prior-result-envelope-artifact-id }}" \
+          --prior-result-envelope-artifact-digest "${{ inputs.prior-result-envelope-artifact-digest }}" \
+          --prior-result-envelope-sha256 "${{ inputs.prior-result-envelope-sha256 }}"
+
+    - id: upload
+      name: Upload only the exact prepared retry bundle
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rmux-downstream-${{ inputs.channel }}-retry-bundle-${{ inputs.source-sha }}-${{ inputs.release-id }}
+        path: ${{ steps.paths.outputs.root }}/prepared
+        if-no-files-found: error
+        retention-days: 1
+        compression-level: 0

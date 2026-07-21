@@ -159,9 +159,9 @@ def validate_schemas(schema_dir: Path) -> None:
     ]["properties"]
     if receipt_identity["run_attempt"].get("const") != 1:
         raise ValueError("receipt-only runs must be attempt 1")
-    authorization_identity = schemas[
-        "promotion-authorization-predicate.schema.json"
-    ]["$defs"]["authorization_identity"]["properties"]
+    authorization_identity = schemas["promotion-authorization-predicate.schema.json"][
+        "$defs"
+    ]["authorization_identity"]["properties"]
     if authorization_identity["run_attempt"].get("const") != 1:
         raise ValueError("promotion authorization runs must be attempt 1")
 

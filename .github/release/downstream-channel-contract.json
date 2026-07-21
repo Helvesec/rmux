@@ -39,6 +39,9 @@
     "rmux_io_last": true
   },
   "retry": {
+    "entry_workflow_path": ".github/workflows/release-channel-retry.yml",
+    "entry_trigger": "workflow_dispatch",
+    "channels": ["chocolatey", "snap_candidate"],
     "actions_run_attempt": 1,
     "actions_rerun_allowed": false,
     "same_receipt_required": true,
@@ -98,23 +101,23 @@
     "final_result_count": 11,
     "rmux_io_pre_site_digest_field": "pre_site_summary_sha256",
     "producer_workflows": {
-      "apt_rpm": [".github/workflows/release-linux-repository-publish.yml"],
-      "chocolatey": [
-        ".github/workflows/release-chocolatey-channel.yml",
-        ".github/workflows/release-chocolatey-retry.yml"
-      ],
-      "crates_io": [".github/workflows/release-crates-channel.yml"],
-      "homebrew_core": [".github/workflows/release-policy-channel.yml"],
-      "homebrew_tap": [".github/workflows/release-owned-repository-channel.yml"],
-      "rmux_io": [".github/workflows/release-rmux-io-channel.yml"],
-      "scoop": [".github/workflows/release-owned-repository-channel.yml"],
-      "snap_candidate": [
-        ".github/workflows/release-snap-channel.yml",
-        ".github/workflows/release-snap-retry.yml"
-      ],
-      "snap_stable": [".github/workflows/release-policy-channel.yml"],
-      "web_share": [".github/workflows/release-owned-repository-channel.yml"],
-      "winget": [".github/workflows/release-policy-channel.yml"]
+      "apt_rpm": {".github/workflows/release-linux-repository-publish.yml": 316435347},
+      "chocolatey": {
+        ".github/workflows/release-chocolatey-channel.yml": 316435347,
+        ".github/workflows/release-chocolatey-retry.yml": 316439352
+      },
+      "crates_io": {".github/workflows/release-crates-channel.yml": 316435347},
+      "homebrew_core": {".github/workflows/release-policy-channel.yml": 316435347},
+      "homebrew_tap": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+      "rmux_io": {".github/workflows/release-rmux-io-channel.yml": 316435347},
+      "scoop": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+      "snap_candidate": {
+        ".github/workflows/release-snap-channel.yml": 316435347,
+        ".github/workflows/release-snap-retry.yml": 316439354
+      },
+      "snap_stable": {".github/workflows/release-policy-channel.yml": 316435347},
+      "web_share": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+      "winget": {".github/workflows/release-policy-channel.yml": 316435347}
     },
     "target_policies": {
       "apt_rpm": {"allowed_hosts": ["github.com", "packages.rmux.io"], "commit_sha_required": true},
@@ -143,7 +146,7 @@
         "debian",
         "rpm"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": []
     },
     {
@@ -171,7 +174,7 @@
       "payload_roles": [
         "crate-package-set"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": []
     },
     {
@@ -185,7 +188,7 @@
       "payload_roles": [
         "homebrew-core-patch"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": [
         "manual_submission_identity_not_configured"
       ]
@@ -201,7 +204,7 @@
       "payload_roles": [
         "homebrew-formula"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": []
     },
     {
@@ -216,7 +219,7 @@
         "site-patch",
         "channel-truth-summary"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": [
         "private_repository_protection_unavailable_on_current_plan",
         "manual_site_update_required"
@@ -233,7 +236,7 @@
       "payload_roles": [
         "scoop-manifest"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": []
     },
     {
@@ -281,7 +284,7 @@
         "wasm-byte-set",
         "wasm-provenance"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": []
     },
     {
@@ -295,7 +298,7 @@
       "payload_roles": [
         "winget-manifest-set"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": [
         "manual_submission_identity_not_configured"
       ]

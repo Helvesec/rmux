@@ -141,6 +141,37 @@ fn downstream_caller_guard_rejects_relative_and_absolute_targets() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn downstream_workflow_entry_points_are_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for filename in [
+        "build-downstream-receipt-reference.py",
+        "channel-execution.py",
+        "channel-request.py",
+        "channel-summary.py",
+        "channel-target-evidence.py",
+        "downstream_payload.py",
+        "prepare-channel-retry.py",
+        "publish-crate-set.py",
+        "publish-linux-repository.py",
+        "publish-owned-repository.py",
+        "snap-candidate-status.py",
+        "stage-downstream-payloads.py",
+        "stage-rmux-io-payload.py",
+        "verify-exact-file-set.py",
+        "verify-receipt-attestation.py",
+    ] {
+        let path = repo_root().join("scripts/release").join(filename);
+        let mode = fs::metadata(&path)
+            .unwrap_or_else(|error| panic!("read {filename} metadata: {error}"))
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "{filename} is not executable");
+    }
+}
+
 #[test]
 fn exact_receipt_ids_digests_origin_and_documents_are_bound() {
     let prepare = job(DOWNSTREAM, "prepare-plan", Some("prepare-payloads"));

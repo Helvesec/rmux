@@ -205,9 +205,7 @@ def validate_predicate_shape(
 def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
     predicate_path = validate_file(args.predicate, "authorization predicate")
     predicate = read_object(predicate_path, "authorization predicate")
-    validate_predicate_shape(
-        predicate, expected_authority=publication_authority(args)
-    )
+    validate_predicate_shape(predicate, expected_authority=publication_authority(args))
     authority = predicate["publication_authority"]
     bundle_path = validate_file(
         args.attestation_bundle, "SHA256SUMS attestation bundle"
@@ -301,9 +299,7 @@ def validate_envelope_shape(
 
 def predicate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--simulation", action="store_true")
-    parser.add_argument(
-        "--activation-ledger", type=Path, default=DEFAULT_LEDGER
-    )
+    parser.add_argument("--activation-ledger", type=Path, default=DEFAULT_LEDGER)
     parser.add_argument("--candidate-manifest", type=Path, required=True)
     parser.add_argument("--candidate-reference", type=Path, required=True)
     parser.add_argument("--signed-tag", type=Path, required=True)
@@ -318,9 +314,7 @@ def predicate_arguments(parser: argparse.ArgumentParser) -> None:
 
 def envelope_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--simulation", action="store_true")
-    parser.add_argument(
-        "--activation-ledger", type=Path, default=DEFAULT_LEDGER
-    )
+    parser.add_argument("--activation-ledger", type=Path, default=DEFAULT_LEDGER)
     parser.add_argument("--predicate", type=Path, required=True)
     parser.add_argument("--attestation-id", required=True)
     parser.add_argument("--attestation-bundle", type=Path, required=True)

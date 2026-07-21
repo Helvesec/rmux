@@ -13,6 +13,7 @@ inputs:
   release-id: {required: true}
   release-ref: {required: true}
   producer-workflow-path: {required: true}
+  producer-workflow-id: {required: false, default: "316435347"}
   runner-image: {required: true}
 
 outputs:
@@ -36,6 +37,7 @@ runs:
         RMUX_REMOTE_REQUEST_ID: ${{ inputs.remote-request-id }}
         RMUX_TARGET_EVIDENCE: ${{ inputs.target-evidence }}
         RMUX_PRODUCER_WORKFLOW_PATH: ${{ inputs.producer-workflow-path }}
+        RMUX_PRODUCER_WORKFLOW_ID: ${{ inputs.producer-workflow-id }}
         RMUX_RUNNER_IMAGE: ${{ inputs.runner-image }}
       run: |
         set -euo pipefail
@@ -49,17 +51,19 @@ runs:
         test -f "$root/plan/downstream-channel-plan.json"
         test -f "$root/plan/receipt-reference.json"
         test -f "$RMUX_TARGET_EVIDENCE"
-        python3 - "$GITHUB_RUN_ID" "$RMUX_PRODUCER_WORKFLOW_PATH" \
-          "$RMUX_RUNNER_IMAGE" "$root/result-producer.json" <<'PY'
+        [[ "$RMUX_PRODUCER_WORKFLOW_ID" =~ ^[1-9][0-9]*$ ]]
+        python3 - "$GITHUB_RUN_ID" "$RMUX_PRODUCER_WORKFLOW_ID" \
+          "$RMUX_PRODUCER_WORKFLOW_PATH" "$RMUX_RUNNER_IMAGE" \
+          "$root/result-producer.json" <<'PY'
         import json
         import pathlib
         import sys
 
-        run_id, workflow_path, runner_image, output_path = sys.argv[1:]
+        run_id, workflow_id, workflow_path, runner_image, output_path = sys.argv[1:]
         value = {
             "run_id": int(run_id),
             "run_attempt": 1,
-            "workflow_id": 316435347,
+            "workflow_id": int(workflow_id),
             "workflow_path": workflow_path,
             "runner_group_id": 0,
             "runner_group_name": "GitHub Actions",

@@ -8,6 +8,10 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+class ChocolateyPublicBytesMismatchException : System.Exception {
+    ChocolateyPublicBytesMismatchException([string]$message) : base($message) {}
+}
+
 if ($ReleaseRef -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
     throw "Chocolatey release ref must be one stable version"
 }
@@ -52,35 +56,59 @@ function Get-ExactPublicPackage {
     }
     $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actualHash -cne $expectedHash) {
-        throw "Public Chocolatey package bytes differ from the canonical payload"
+        throw [ChocolateyPublicBytesMismatchException]::new(
+            "Public Chocolatey package bytes differ from the canonical payload"
+        )
     }
     return $true
 }
 
 $mutationStarted = $false
-if (Get-ExactPublicPackage) {
-    $state = "no-op-exact"
+$remoteId = $null
+$state = $null
+$alreadyPublic = $false
+try {
+    $alreadyPublic = Get-ExactPublicPackage
 }
-else {
+catch [ChocolateyPublicBytesMismatchException] {
+    throw
+}
+catch {
+    Write-Warning "Chocolatey public package lookup failed before mutation"
+    $state = "failed-transient"
+}
+
+if ($null -eq $state -and $alreadyPublic) {
+    $state = "no-op-exact"
+    $remoteId = "rmux.$version"
+}
+elseif ($null -eq $state) {
+    $mutationStarted = $true
+    $remoteId = "rmux.$version"
     choco push $package `
         --source "https://push.chocolatey.org/" `
         --api-key $env:CHOCOLATEY_API_KEY `
         --yes `
         --no-progress
     if ($LASTEXITCODE -ne 0) {
-        throw "Chocolatey rejected the exact package"
+        Write-Warning "Chocolatey submission did not return success after mutation began"
+        $state = "failed-terminal"
     }
-    $mutationStarted = $true
-    $state = "submitted"
+    else {
+        $state = "submitted"
+    }
 }
 
 $observedAt = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
 $evidenceArgs = @(
     "scripts/release/channel-target-evidence.py", "create",
     "--channel", "chocolatey", "--state", $state, "--version", $version,
-    "--external-id", "rmux.$version", "--url", $pageUrl,
-    "--observed-at", $observedAt, "--output", $TargetEvidence
+    "--url", $pageUrl, "--observed-at", $observedAt,
+    "--output", $TargetEvidence
 )
+if ($null -ne $remoteId) {
+    $evidenceArgs += @("--external-id", $remoteId)
+}
 python @evidenceArgs
 if ($LASTEXITCODE -ne 0) {
     throw "Chocolatey target evidence validation failed"
@@ -89,5 +117,5 @@ if ($LASTEXITCODE -ne 0) {
 "state=$state" | Out-File -FilePath $GitHubOutput -Append -Encoding utf8
 "mutation_started=$($mutationStarted.ToString().ToLowerInvariant())" |
     Out-File -FilePath $GitHubOutput -Append -Encoding utf8
-"remote_request_id=rmux.$version" | Out-File -FilePath $GitHubOutput -Append -Encoding utf8
+"remote_request_id=$remoteId" | Out-File -FilePath $GitHubOutput -Append -Encoding utf8
 "observed_at=$observedAt" | Out-File -FilePath $GitHubOutput -Append -Encoding utf8
