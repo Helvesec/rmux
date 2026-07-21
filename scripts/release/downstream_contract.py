@@ -52,7 +52,7 @@ REPOSITORIES = {
     "rmux-packages": (
         1258602064,
         "Helvesec/rmux-packages",
-        "private",
+        "public",
         "main",
         ".",
         "rmux-owned",
@@ -282,7 +282,7 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         or rmux_io.get("blockers")
         != [
             "private_repository_protection_unavailable_on_current_plan",
-            "downstream_writer_app_missing",
+            "manual_site_update_required",
         ]
     ):
         raise ValueError("rmux.io must remain the blocked final channel")
@@ -330,15 +330,21 @@ def _validate_repositories(release: Path) -> None:
         )
         if actual != expected or record.get("activation_ready") is not False:
             raise ValueError(f"downstream repository identity drifted: {key}")
-    for key in ("rmux-packages", "rmux.io"):
-        record = records[key]
-        if (
-            record.get("protection_api_supported") is not False
-            or "private_repository_protection_unavailable_on_current_plan"
-            not in record.get("blockers", [])
-        ):
-            raise ValueError(f"private Free-plan blocker disappeared: {key}")
-    for key in ("homebrew-rmux", "rmux-web-share", "scoop-rmux"):
+    rmux_io = records["rmux.io"]
+    if (
+        rmux_io.get("protection_api_supported") is not False
+        or "private_repository_protection_unavailable_on_current_plan"
+        not in rmux_io.get("blockers", [])
+        or "manual_site_update_required" not in rmux_io.get("blockers", [])
+        or "downstream_writer_app_missing" in rmux_io.get("blockers", [])
+    ):
+        raise ValueError("private rmux.io manual-update contract drifted")
+    for key in (
+        "homebrew-rmux",
+        "rmux-packages",
+        "rmux-web-share",
+        "scoop-rmux",
+    ):
         record = records[key]
         blockers = set(record.get("blockers", []))
         if (

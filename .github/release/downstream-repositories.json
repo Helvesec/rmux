@@ -2,7 +2,7 @@
   "schema_version": 1,
   "status": "review-only-disarmed",
   "description": "Observed downstream repository identities and fail-closed activation blockers. This file grants no write authority.",
-  "observed_at": "2026-07-20T21:47:46Z",
+  "observed_at": "2026-07-21T05:30:51Z",
   "writer_app": {
     "configured": false,
     "app_id": null,
@@ -69,18 +69,18 @@
       "ownership": "rmux-owned",
       "id": 1258602064,
       "full_name": "Helvesec/rmux-packages",
-      "visibility": "private",
+      "visibility": "public",
       "default_branch": "main",
       "required_path": ".",
       "environment": "release-linux-repositories",
       "archived": false,
-      "protection_api_supported": false,
-      "branch_protected": false,
-      "ruleset_count": 0,
-      "environment_count": 0,
+      "protection_api_supported": true,
+      "branch_protected": true,
+      "ruleset_count": 1,
+      "environment_count": 1,
       "activation_ready": false,
       "blockers": [
-        "private_repository_protection_unavailable_on_current_plan",
+        "environment_admin_bypass_enabled",
         "downstream_writer_app_missing"
       ]
     },
@@ -123,7 +123,7 @@
       "activation_ready": false,
       "blockers": [
         "private_repository_protection_unavailable_on_current_plan",
-        "downstream_writer_app_missing"
+        "manual_site_update_required"
       ]
     },
     {

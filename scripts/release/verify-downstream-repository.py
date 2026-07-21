@@ -138,7 +138,7 @@ def validate_owned_fixtures(expected: dict[str, Any], args: argparse.Namespace) 
     owned_ids = sorted(
         item["id"]
         for item in contract["repositories"]
-        if item["ownership"] == "rmux-owned"
+        if item["ownership"] == "rmux-owned" and item["key"] != "rmux.io"
     )
     if repository_ids != owned_ids:
         raise ValueError("downstream writer App repository scope is not exact")

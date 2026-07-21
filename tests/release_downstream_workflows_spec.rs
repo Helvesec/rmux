@@ -393,7 +393,12 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
     .expect("downstream repository registry");
     let repositories = registry["repositories"].as_array().expect("repositories");
 
-    for key in ["homebrew-rmux", "rmux-web-share", "scoop-rmux"] {
+    for key in [
+        "homebrew-rmux",
+        "rmux-packages",
+        "rmux-web-share",
+        "scoop-rmux",
+    ] {
         let repository = repositories
             .iter()
             .find(|repository| repository["key"] == key)
@@ -422,6 +427,20 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
             "{key} still reports missing repository protection"
         );
     }
+
+    let rmux_io = repositories
+        .iter()
+        .find(|repository| repository["key"] == "rmux.io")
+        .expect("missing downstream repository rmux.io");
+    assert_eq!(rmux_io["visibility"], "private");
+    assert_eq!(rmux_io["activation_ready"], false);
+    assert_eq!(
+        rmux_io["blockers"],
+        serde_json::json!([
+            "private_repository_protection_unavailable_on_current_plan",
+            "manual_site_update_required"
+        ])
+    );
 }
 
 #[test]
