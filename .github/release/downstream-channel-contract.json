@@ -142,7 +142,7 @@
       ],
       "retryable": true,
       "blockers": [
-        "private_repository_protection_unavailable_on_current_plan",
+        "environment_admin_bypass_enabled",
         "downstream_writer_app_missing"
       ]
     },
@@ -222,7 +222,7 @@
       "retryable": true,
       "blockers": [
         "private_repository_protection_unavailable_on_current_plan",
-        "downstream_writer_app_missing"
+        "manual_site_update_required"
       ]
     },
     {
