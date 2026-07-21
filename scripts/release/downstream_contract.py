@@ -286,18 +286,32 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         ]
     ):
         raise ValueError("rmux.io must remain the blocked final channel")
+    by_name = {item["name"]: item for item in channels}
+    for name in ("apt_rpm", "homebrew_tap", "scoop"):
+        if by_name[name].get("blockers") != []:
+            raise ValueError(f"configured channel still blocked: {name}")
+    if by_name["web_share"].get("blockers") != [
+        "floating_actions_present",
+        "unprotected_secret_deployment_workflow",
+    ]:
+        raise ValueError("Web Share legacy channel blockers changed")
 
 
 def _validate_repositories(release: Path) -> None:
     registry = _read(release / "downstream-repositories.json")
-    writer = registry.get("writer_app", {})
-    if (
-        writer.get("configured") is not False
-        or writer.get("app_id") is not None
-        or writer.get("installation_id") is not None
-        or writer.get("pat_fallback") is not False
-    ):
-        raise ValueError("downstream writer identity must remain unconfigured")
+    if registry.get("writer_app", {}) != {
+        "configured": True,
+        "app_id": 4352876,
+        "installation_id": 147959477,
+        "repository_selection": "selected",
+        "pat_fallback": False,
+        "required_permissions": {
+            "actions": "read",
+            "contents": "write",
+            "metadata": "read",
+        },
+    }:
+        raise ValueError("downstream writer App identity or permissions changed")
     protection = registry.get("required_protection", {})
     if (
         protection.get("enforce_admins") is not True
@@ -317,18 +331,16 @@ def _validate_repositories(release: Path) -> None:
         raise ValueError("downstream repository inventory changed")
     for key, expected in REPOSITORIES.items():
         record = records[key]
-        actual = tuple(
-            record.get(field)
-            for field in (
-                "id",
-                "full_name",
-                "visibility",
-                "default_branch",
-                "required_path",
-                "ownership",
-            )
+        actual = (
+            record.get("id"),
+            record.get("full_name"),
+            record.get("visibility"),
+            record.get("default_branch"),
+            record.get("required_path"),
+            record.get("ownership"),
         )
-        if actual != expected or record.get("activation_ready") is not False:
+        expected_ready = key in {"homebrew-rmux", "rmux-packages", "scoop-rmux"}
+        if actual != expected or record.get("activation_ready") is not expected_ready:
             raise ValueError(f"downstream repository identity drifted: {key}")
     rmux_io = records["rmux.io"]
     if (
@@ -353,18 +365,17 @@ def _validate_repositories(release: Path) -> None:
             or record.get("ruleset_count") != 1
             or record.get("environment_count") != 1
             or "repository_protection_missing" in blockers
-            or "environment_admin_bypass_enabled" not in blockers
-            or "downstream_writer_app_missing" not in blockers
+            or "environment_admin_bypass_enabled" in blockers
+            or "downstream_writer_app_missing" in blockers
         ):
             raise ValueError(f"public downstream protection snapshot drifted: {key}")
-    web_blockers = set(records["rmux-web-share"].get("blockers", []))
-    if (
-        not {
-            "floating_actions_present",
-            "unprotected_secret_deployment_workflow",
-        }
-        <= web_blockers
-    ):
+    for key in ("homebrew-rmux", "rmux-packages", "scoop-rmux"):
+        if records[key].get("blockers") != []:
+            raise ValueError(f"ready downstream repository still has blockers: {key}")
+    if records["rmux-web-share"].get("blockers") != [
+        "floating_actions_present",
+        "unprotected_secret_deployment_workflow",
+    ]:
         raise ValueError("Web Share legacy deployment blockers disappeared")
 
 

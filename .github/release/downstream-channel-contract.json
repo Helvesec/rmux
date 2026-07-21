@@ -141,10 +141,7 @@
         "rpm"
       ],
       "retryable": true,
-      "blockers": [
-        "environment_admin_bypass_enabled",
-        "downstream_writer_app_missing"
-      ]
+      "blockers": []
     },
     {
       "name": "chocolatey",
@@ -202,10 +199,7 @@
         "homebrew-formula"
       ],
       "retryable": true,
-      "blockers": [
-        "environment_admin_bypass_enabled",
-        "downstream_writer_app_missing"
-      ]
+      "blockers": []
     },
     {
       "name": "rmux_io",
@@ -237,10 +231,7 @@
         "scoop-manifest"
       ],
       "retryable": true,
-      "blockers": [
-        "environment_admin_bypass_enabled",
-        "downstream_writer_app_missing"
-      ]
+      "blockers": []
     },
     {
       "name": "snap_candidate",
@@ -285,8 +276,6 @@
       ],
       "retryable": true,
       "blockers": [
-        "environment_admin_bypass_enabled",
-        "downstream_writer_app_missing",
         "floating_actions_present",
         "unprotected_secret_deployment_workflow"
       ]

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from downstream_channels import REPOSITORY_CONTRACT, exact_keys, read_object
+from strict_json import read_json
 
 EXPECTED_REPOSITORIES = {
     "homebrew-core": (52855516, "Homebrew/homebrew-core", "external"),
@@ -19,6 +20,19 @@ EXPECTED_REPOSITORIES = {
     "scoop-rmux": (1259135161, "Helvesec/scoop-rmux", "rmux-owned"),
     "winget-pkgs": (197275551, "microsoft/winget-pkgs", "external"),
 }
+WRITER_APP = {
+    "configured": True,
+    "app_id": 4352876,
+    "installation_id": 147959477,
+    "repository_selection": "selected",
+    "pat_fallback": False,
+    "required_permissions": {
+        "actions": "read",
+        "contents": "write",
+        "metadata": "read",
+    },
+}
+READY_REPOSITORIES = {"homebrew-rmux", "rmux-packages", "scoop-rmux"}
 
 
 def load_contract() -> dict[str, Any]:
@@ -39,13 +53,8 @@ def load_contract() -> dict[str, Any]:
     if contract["schema_version"] != 1 or contract["status"] != "review-only-disarmed":
         raise ValueError("downstream repository contract must remain disarmed")
     app = contract["writer_app"]
-    if (
-        app.get("configured") is not False
-        or app.get("app_id") is not None
-        or app.get("installation_id") is not None
-        or app.get("pat_fallback") is not False
-    ):
-        raise ValueError("downstream writer identity must remain unconfigured")
+    if app != WRITER_APP:
+        raise ValueError("downstream writer App identity or permissions changed")
     repositories = contract["repositories"]
     if not isinstance(repositories, list):
         raise ValueError("downstream repository inventory must be an array")
@@ -60,8 +69,10 @@ def load_contract() -> dict[str, Any]:
         raise ValueError("downstream registry must contain exactly five owned repos")
     if sum(item["ownership"] == "external" for item in repositories) != 2:
         raise ValueError("downstream registry must contain exactly two external repos")
-    if any(item.get("activation_ready") is not False for item in repositories):
-        raise ValueError("downstream repositories must remain activation-blocked")
+    for item in repositories:
+        expected_ready = item["key"] in READY_REPOSITORIES
+        if item.get("activation_ready") is not expected_ready:
+            raise ValueError("downstream repository readiness changed")
     return contract
 
 
@@ -84,10 +95,19 @@ def validate_metadata(expected: dict[str, Any], value: dict[str, Any]) -> None:
             raise ValueError(f"downstream repository metadata {field} changed")
 
 
-def require_fixture(path: Path | None, label: str) -> dict[str, Any]:
+def require_object_fixture(path: Path | None, label: str) -> dict[str, Any]:
     if path is None:
         raise ValueError(f"owned downstream repository requires {label} fixture")
     return read_object(path, label)
+
+
+def require_array_fixture(path: Path | None, label: str) -> list[Any]:
+    if path is None:
+        raise ValueError(f"owned downstream repository requires {label} fixture")
+    value = read_json(path, label)
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a JSON array")
+    return value
 
 
 def validate_owned_fixtures(expected: dict[str, Any], args: argparse.Namespace) -> None:
@@ -95,7 +115,7 @@ def validate_owned_fixtures(expected: dict[str, Any], args: argparse.Namespace) 
         raise ValueError(
             "private downstream repository protection is unavailable on the current plan"
         )
-    protection = require_fixture(args.protection, "branch protection")
+    protection = require_object_fixture(args.protection, "branch protection")
     enforce_admins = protection.get("enforce_admins", {})
     if (
         not isinstance(enforce_admins, dict)
@@ -105,14 +125,14 @@ def validate_owned_fixtures(expected: dict[str, Any], args: argparse.Namespace) 
         or protection.get("required_signatures", {}).get("enabled") is not True
     ):
         raise ValueError("owned downstream branch protection is incomplete")
-    rulesets = require_fixture(args.rulesets, "repository rulesets")
-    if not isinstance(rulesets, list) or not any(
+    rulesets = require_array_fixture(args.rulesets, "repository rulesets")
+    if not any(
         item.get("enforcement") == "active"
         for item in rulesets
         if isinstance(item, dict)
     ):
         raise ValueError("owned downstream repository has no active ruleset")
-    environments = require_fixture(args.environments, "repository environments")
+    environments = require_object_fixture(args.environments, "repository environments")
     matches = [
         item
         for item in environments.get("environments", [])
@@ -124,15 +144,21 @@ def validate_owned_fixtures(expected: dict[str, Any], args: argparse.Namespace) 
         or not matches[0].get("protection_rules")
     ):
         raise ValueError("owned downstream environment is not protected")
-    runners = require_fixture(args.runners, "self-hosted runners")
+    runners = require_object_fixture(args.runners, "self-hosted runners")
     if runners.get("total_count") != 0:
         raise ValueError("self-hosted downstream runners are forbidden")
-    installation = require_fixture(args.installation, "writer App installation")
+    installation = require_object_fixture(args.installation, "writer App installation")
     contract = load_contract()
     app = contract["writer_app"]
     if app["configured"] is not True:
         raise ValueError("downstream writer App is intentionally not configured")
-    if installation.get("id") != app["installation_id"]:
+    if (
+        installation.get("id") != app["installation_id"]
+        or installation.get("app_id") != app["app_id"]
+        or installation.get("repository_selection") != "selected"
+        or installation.get("permissions") != app["required_permissions"]
+        or installation.get("events") != []
+    ):
         raise ValueError("downstream writer App installation identity changed")
     repository_ids = installation.get("repository_ids")
     owned_ids = sorted(
