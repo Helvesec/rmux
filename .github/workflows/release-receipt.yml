@@ -12,7 +12,15 @@ on:
       expected_source_sha: {required: true, type: string}
       release_id: {required: true, type: string}
       release_ref: {required: true, type: string}
+      release_kind:
+        required: true
+        type: choice
+        options: [rc, stable]
       receipt_workflow_id: {required: true, type: string}
+      snap_candidate_opt_in:
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: rmux-release-receipt-${{ inputs.release_ref }}
@@ -36,6 +44,8 @@ jobs:
       receipt_artifact_digest: sha256:${{ steps.receipt-upload.outputs.artifact-digest }}
       envelope_artifact_id: ${{ steps.envelope-upload.outputs.artifact-id }}
       envelope_artifact_digest: sha256:${{ steps.envelope-upload.outputs.artifact-digest }}
+      receipt_predicate_sha256: ${{ steps.evidence.outputs.receipt_predicate_sha256 }}
+      receipt_envelope_sha256: ${{ steps.evidence.outputs.receipt_envelope_sha256 }}
     env:
       RMUX_AUTHORIZATION_RUN_ID: ${{ inputs.authorization_run_id }}
       RMUX_AUTHORIZATION_ARTIFACT_ID: ${{ inputs.authorization_artifact_id }}
@@ -46,6 +56,7 @@ jobs:
       RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
       RMUX_RELEASE_ID: ${{ inputs.release_id }}
       RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
       RMUX_RECEIPT_WORKFLOW_ID: ${{ inputs.receipt_workflow_id }}
     steps:
       - name: Reject malformed receipt inputs
@@ -59,6 +70,12 @@ jobs:
           [[ "$RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$RMUX_RELEASE_KIND" =~ ^(rc|stable)$ ]]
+          if [ "$RMUX_RELEASE_KIND" = rc ]; then
+            [[ "$RMUX_RELEASE_REF" =~ -rc\.[0-9]+$ ]]
+          else
+            [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          fi
           test "$GITHUB_RUN_ATTEMPT" = 1
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -360,3 +377,49 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
+
+      - id: evidence
+        name: Export exact receipt document digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-receipt"
+          python3 - "$root/publication-receipt-predicate.json" \
+            "$root/publication-receipt-envelope.json" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+
+          predicate, envelope, output_path = map(pathlib.Path, sys.argv[1:])
+          with output_path.open("a", encoding="utf-8") as output:
+              output.write(
+                  f"receipt_predicate_sha256={hashlib.sha256(predicate.read_bytes()).hexdigest()}\n"
+              )
+              output.write(
+                  f"receipt_envelope_sha256={hashlib.sha256(envelope.read_bytes()).hexdigest()}\n"
+              )
+          PY
+
+  downstream:
+    name: Disabled receipt-gated downstream publication
+    needs: receipt-only
+    if: ${{ false }}
+    uses: ./.github/workflows/release-downstream.yml
+    permissions:
+      actions: read
+      contents: read
+    with:
+      receipt_run_id: ${{ github.run_id }}
+      receipt_run_workflow_id: ${{ inputs.receipt_workflow_id }}
+      receipt_workflow_id: ${{ inputs.receipt_workflow_id }}
+      receipt_artifact_id: ${{ needs.receipt-only.outputs.receipt_artifact_id }}
+      receipt_artifact_digest: ${{ needs.receipt-only.outputs.receipt_artifact_digest }}
+      receipt_envelope_artifact_id: ${{ needs.receipt-only.outputs.envelope_artifact_id }}
+      receipt_envelope_artifact_digest: ${{ needs.receipt-only.outputs.envelope_artifact_digest }}
+      receipt_predicate_sha256: ${{ needs.receipt-only.outputs.receipt_predicate_sha256 }}
+      receipt_envelope_sha256: ${{ needs.receipt-only.outputs.receipt_envelope_sha256 }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+      release_kind: ${{ inputs.release_kind }}
+      snap_candidate_opt_in: ${{ inputs.snap_candidate_opt_in }}

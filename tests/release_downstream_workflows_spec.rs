@@ -103,10 +103,19 @@ fn downstream_workflow_is_uncalled_read_only_and_disarmed() {
     for entry in fs::read_dir(workflows).expect("list workflows") {
         let path = entry.expect("workflow entry").path();
         let text = fs::read_to_string(&path).expect("read workflow");
+        let calls_downstream = text
+            .lines()
+            .any(|line| calls_disarmed_workflow(line, "release-downstream.yml"));
+        if path.ends_with("release-receipt.yml") {
+            assert!(
+                calls_downstream,
+                "receipt must retain the guarded downstream call"
+            );
+            assert!(text.contains("if: ${{ false }}"));
+            continue;
+        }
         assert!(
-            !text
-                .lines()
-                .any(|line| calls_disarmed_workflow(line, "release-downstream.yml")),
+            !calls_downstream,
             "existing workflow {} calls the disarmed downstream workflow",
             path.display()
         );
@@ -308,13 +317,7 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
         .iter()
         .find(|channel| channel["name"] == "web_share")
         .expect("web-share channel");
-    assert_eq!(
-        web_share["blockers"],
-        serde_json::json!([
-            "floating_actions_present",
-            "unprotected_secret_deployment_workflow"
-        ])
-    );
+    assert_eq!(web_share["blockers"], serde_json::json!([]));
     let snap_stable = channels
         .iter()
         .find(|channel| channel["name"] == "snap_stable")
@@ -432,7 +435,12 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
         );
     }
 
-    for key in ["homebrew-rmux", "rmux-packages", "scoop-rmux"] {
+    for key in [
+        "homebrew-rmux",
+        "rmux-packages",
+        "rmux-web-share",
+        "scoop-rmux",
+    ] {
         let repository = repositories
             .iter()
             .find(|repository| repository["key"] == key)
@@ -440,19 +448,6 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
         assert_eq!(repository["activation_ready"], true, "{key}");
         assert_eq!(repository["blockers"], serde_json::json!([]), "{key}");
     }
-
-    let web_share = repositories
-        .iter()
-        .find(|repository| repository["key"] == "rmux-web-share")
-        .expect("missing downstream repository rmux-web-share");
-    assert_eq!(web_share["activation_ready"], false);
-    assert_eq!(
-        web_share["blockers"],
-        serde_json::json!([
-            "floating_actions_present",
-            "unprotected_secret_deployment_workflow"
-        ])
-    );
 
     let rmux_io = repositories
         .iter()

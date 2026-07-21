@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
-DISARMED_SCHEMA_STATUS = "disarmed-non-authoritative"
+ATOMIC_SCHEMA_STATUS = "atomic-authority-bound"
 
 EXPECTED_PUBLICATION = {
     "enabled": False,
     "promoter_concurrency": "rmux-release-promote-${release_ref}",
-    "promoter_trigger": "workflow_call",
+    "promoter_trigger": "workflow_dispatch",
     "promoter_workflow": ".github/workflows/release-promote.yml",
     "public_triggers": False,
     "publication_permissions": False,
@@ -23,19 +23,19 @@ EXPECTED_PUBLICATION = {
     "receipt_trigger": "workflow_dispatch",
     "receipt_workflow": ".github/workflows/release-receipt.yml",
     "tag_authoring_concurrency": "rmux-release-tag-authoring-${release_ref}",
-    "tag_authoring_trigger": "workflow_call",
+    "tag_authoring_trigger": "workflow_dispatch",
     "tag_authoring_workflow": ".github/workflows/release-tag-authoring.yml",
 }
 
 RELEASE_WORKFLOWS = {
     "tag authoring": (
         ".github/workflows/release-tag-authoring.yml",
-        "workflow_call",
+        "workflow_dispatch",
         "rmux-release-tag-authoring-${{ inputs.release_ref }}",
     ),
     "promoter": (
         ".github/workflows/release-promote.yml",
-        "workflow_call",
+        "workflow_dispatch",
         "rmux-release-promote-${{ inputs.release_ref }}",
     ),
     "receipt": (
@@ -134,10 +134,10 @@ def validate_schemas(schema_dir: Path) -> None:
     }
     for filename, required_fields in SCHEMA_REQUIRED_FIELDS.items():
         schema = schemas[filename]
-        if schema.get("x-rmux-status") != DISARMED_SCHEMA_STATUS:
-            raise ValueError(f"{filename} must remain explicitly non-authoritative")
-        if "MUST NOT authorize" not in schema.get("description", ""):
-            raise ValueError(f"{filename} must state its publication prohibition")
+        if schema.get("x-rmux-status") != ATOMIC_SCHEMA_STATUS:
+            raise ValueError(f"{filename} lost its atomic authority binding")
+        if len(schema.get("oneOf", [])) != 2:
+            raise ValueError(f"{filename} must define disarmed and authorized states")
         if schema.get("additionalProperties") is not False:
             raise ValueError(f"{filename} must fail closed on unknown fields")
         required = _required_strings(schema.get("required"), f"{filename}.required")

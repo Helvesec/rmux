@@ -275,10 +275,7 @@
         "wasm-provenance"
       ],
       "retryable": true,
-      "blockers": [
-        "floating_actions_present",
-        "unprotected_secret_deployment_workflow"
-      ]
+      "blockers": []
     },
     {
       "name": "winget",

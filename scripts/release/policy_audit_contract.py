@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from release_authority import validate_activation
+
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
 PREPARER_WORKFLOW_PATH = ".github/workflows/release-policy-audit.yml"
@@ -82,16 +84,6 @@ API_GETS = (
         "/repos/Helvesec/rmux/rulesets/18792083",
     ),
 )
-CAPABILITIES = {
-    "downstream_channels",
-    "github_release_publication",
-    "policy_audit",
-    "promotion_authorization",
-    "publication_receipt",
-    "signed_tag_creation",
-}
-
-
 def read_object(path: Path, label: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -105,33 +97,6 @@ def read_object(path: Path, label: str) -> dict[str, Any]:
 def _positive(value: Any, label: str) -> None:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
-
-
-def validate_activation(value: dict[str, Any]) -> None:
-    expected_keys = {
-        "schema_version",
-        "status",
-        "description",
-        "cutover_pr",
-        "runtime_override_allowed",
-        "capabilities",
-    }
-    if set(value) != expected_keys:
-        raise ValueError("release activation ledger keys changed")
-    if (
-        value["schema_version"] != 1
-        or value["status"] != "disarmed"
-        or value["cutover_pr"] != "PR8"
-        or value["runtime_override_allowed"] is not False
-        or not isinstance(value["description"], str)
-        or not value["description"]
-    ):
-        raise ValueError("release activation ledger is not fail-closed")
-    capabilities = value["capabilities"]
-    if not isinstance(capabilities, dict) or set(capabilities) != CAPABILITIES:
-        raise ValueError("release activation capabilities changed")
-    if any(capabilities[name] is not False for name in CAPABILITIES):
-        raise ValueError("every release capability must remain false before PR8")
 
 
 def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
@@ -407,12 +372,20 @@ def validate_repository_contracts(root: Path) -> None:
     ):
         if authority in simulation:
             raise ValueError(f"release simulation gained forbidden authority {authority}")
-    schema_names = (
+    activation_schema = read_object(
+        release / "schemas" / "release-activation.schema.json",
         "release-activation.schema.json",
+    )
+    if (
+        activation_schema.get("x-rmux-status") != "atomic-authority-ledger"
+        or activation_schema.get("additionalProperties") is not False
+        or len(activation_schema.get("oneOf", [])) != 2
+    ):
+        raise ValueError("release activation schema lost its atomic authority states")
+    for name in (
         "policy-audit-predicate.schema.json",
         "policy-audit-reference.schema.json",
-    )
-    for name in schema_names:
+    ):
         schema = read_object(release / "schemas" / name, name)
         if (
             schema.get("x-rmux-status") != "disarmed-non-authoritative"

@@ -31,6 +31,7 @@ from release_evidence import (
     write_object,
 )
 from publication_release_state import validate_release_state
+from release_authority import DEFAULT_LEDGER, load_authority
 
 PREDICATE_TYPE = "https://rmux.io/attestations/release-publication-receipt/v1"
 ENVELOPE_TYPE = "https://rmux.io/envelopes/release-publication-receipt/v1"
@@ -38,10 +39,19 @@ AUTHORIZATION_TYPE = "https://rmux.io/attestations/release-promotion-authorizati
 AUTHORIZATION_ENVELOPE_TYPE = AUTHORIZATION_TYPE.replace("attestations", "envelopes")
 RECEIPT_WORKFLOW_ID = 316435347
 RECEIPT_WORKFLOW_PATH = ".github/workflows/release-receipt.yml"
+AUTHORIZED_STATUS = "downstream-authorized"
+
+
+def downstream_authority(args: argparse.Namespace) -> bool:
+    if args.simulation:
+        return False
+    return load_authority(args.activation_ledger).permits(
+        ("publication_receipt", "downstream_channels")
+    )
 
 
 def validate_authorization_predicate(
-    value: dict[str, Any], *, simulation: bool = False
+    value: dict[str, Any], *, simulation: bool, activation_ledger: Path
 ) -> None:
     exact_keys(
         value,
@@ -66,14 +76,20 @@ def validate_authorization_predicate(
         },
         "authorization predicate",
     )
+    authority = value["publication_authority"]
+    expected_authority = False if simulation else load_authority(
+        activation_ledger
+    ).permits(("promotion_authorization", "github_release_publication"))
+    expected_status = "promotion-authorized" if authority is True else STATUS
     if (
         value["schema_version"] != 1
         or value["predicate_type"] != AUTHORIZATION_TYPE
-        or value["status"] != STATUS
-        or value["publication_authority"] is not False
+        or type(authority) is not bool
+        or authority is not expected_authority
+        or value["status"] != expected_status
         or value["repository"] != {"id": REPOSITORY_ID, "full_name": "Helvesec/rmux"}
     ):
-        raise ValueError("authorization predicate is not exact disarmed RMUX evidence")
+        raise ValueError("authorization predicate authority differs from the ledger")
     require_match(value["source_git_sha"], SHA40, "authorization source SHA")
     release = value["release"]
     if not isinstance(release, dict):
@@ -244,11 +260,13 @@ def validate_authorization_envelope(
         },
         "authorization envelope",
     )
+    authority = predicate["publication_authority"]
+    expected_status = "promotion-authorized" if authority is True else STATUS
     if (
         value["schema_version"] != 1
         or value["envelope_type"] != AUTHORIZATION_ENVELOPE_TYPE
-        or value["status"] != STATUS
-        or value["publication_authority"] is not False
+        or value["status"] != expected_status
+        or value["publication_authority"] is not authority
         or value["repository_id"] != REPOSITORY_ID
         or value["source_git_sha"] != predicate["source_git_sha"]
         or value["release_ref"] != predicate["release"]["ref"]
@@ -308,7 +326,11 @@ def receipt_identity(args: argparse.Namespace) -> dict[str, Any]:
 def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
     auth_path = validate_file(args.authorization_predicate, "authorization predicate")
     authorization = read_object(auth_path, "authorization predicate")
-    validate_authorization_predicate(authorization, simulation=args.simulation)
+    validate_authorization_predicate(
+        authorization,
+        simulation=args.simulation,
+        activation_ledger=args.activation_ledger,
+    )
     envelope_path = validate_file(args.authorization_envelope, "authorization envelope")
     envelope = read_object(envelope_path, "authorization envelope")
     validate_authorization_envelope(envelope, auth_path, authorization)
@@ -318,11 +340,12 @@ def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
     if verified < timestamp(state["published_at"], "GitHub Release published_at"):
         raise ValueError("publication receipt predates publication")
     policy_audit = authorization["policy_audit"]
+    authority = downstream_authority(args)
     return {
         "schema_version": 1,
         "predicate_type": PREDICATE_TYPE,
-        "status": STATUS,
-        "downstream_authority": False,
+        "status": AUTHORIZED_STATUS if authority else STATUS,
+        "downstream_authority": authority,
         "repository_id": REPOSITORY_ID,
         "source_git_sha": authorization["source_git_sha"],
         "release": {
@@ -352,7 +375,9 @@ def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def validate_predicate_shape(value: dict[str, Any]) -> None:
+def validate_predicate_shape(
+    value: dict[str, Any], *, simulation: bool, activation_ledger: Path
+) -> None:
     exact_keys(
         value,
         {
@@ -374,13 +399,19 @@ def validate_predicate_shape(value: dict[str, Any]) -> None:
         },
         "publication receipt predicate",
     )
+    authority = value["downstream_authority"]
+    expected_authority = False if simulation else load_authority(
+        activation_ledger
+    ).permits(("publication_receipt", "downstream_channels"))
+    expected_status = AUTHORIZED_STATUS if authority is True else STATUS
     if (
         value["schema_version"] != 1
         or value["predicate_type"] != PREDICATE_TYPE
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
+        or type(authority) is not bool
+        or authority is not expected_authority
+        or value["status"] != expected_status
     ):
-        raise ValueError("publication receipt predicate must remain disarmed")
+        raise ValueError("publication receipt predicate authority differs from the ledger")
     if "attestation_id" in value or "receipt_bundle_artifact_id" in value:
         raise ValueError("receipt predicate contains post-signature identifiers")
 
@@ -388,7 +419,11 @@ def validate_predicate_shape(value: dict[str, Any]) -> None:
 def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
     predicate_path = validate_file(args.predicate, "publication receipt predicate")
     predicate = read_object(predicate_path, "publication receipt predicate")
-    validate_predicate_shape(predicate)
+    validate_predicate_shape(
+        predicate,
+        simulation=args.simulation,
+        activation_ledger=args.activation_ledger,
+    )
     bundle_path = validate_file(args.attestation_bundle, "receipt attestation bundle")
     if bundle_path.name != "publication-receipt.sigstore.json":
         raise ValueError("receipt attestation bundle name changed")
@@ -410,11 +445,12 @@ def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
     )
     if artifact["name"] != expected_name:
         raise ValueError("receipt bundle artifact name changed")
+    authority = predicate["downstream_authority"]
     return {
         "schema_version": 1,
         "envelope_type": ENVELOPE_TYPE,
-        "status": STATUS,
-        "downstream_authority": False,
+        "status": AUTHORIZED_STATUS if authority else STATUS,
+        "downstream_authority": authority,
         "repository_id": REPOSITORY_ID,
         "source_git_sha": predicate["source_git_sha"],
         "release_id": predicate["release"]["id"],
@@ -432,7 +468,9 @@ def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def validate_envelope_shape(value: dict[str, Any]) -> None:
+def validate_envelope_shape(
+    value: dict[str, Any], *, simulation: bool, activation_ledger: Path
+) -> None:
     exact_keys(
         value,
         {
@@ -453,19 +491,28 @@ def validate_envelope_shape(value: dict[str, Any]) -> None:
         },
         "publication receipt envelope",
     )
+    authority = value["downstream_authority"]
+    expected_authority = False if simulation else load_authority(
+        activation_ledger
+    ).permits(("publication_receipt", "downstream_channels"))
+    expected_status = AUTHORIZED_STATUS if authority is True else STATUS
     if (
         value["schema_version"] != 1
         or value["envelope_type"] != ENVELOPE_TYPE
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
+        or type(authority) is not bool
+        or authority is not expected_authority
+        or value["status"] != expected_status
     ):
-        raise ValueError("publication receipt envelope must remain disarmed")
+        raise ValueError("publication receipt envelope authority differs from the ledger")
     if "envelope_sha256" in value or "envelope_artifact_id" in value:
         raise ValueError("publication receipt envelope cannot refer to its own upload")
 
 
 def predicate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--simulation", action="store_true")
+    parser.add_argument(
+        "--activation-ledger", type=Path, default=DEFAULT_LEDGER
+    )
     parser.add_argument("--authorization-predicate", type=Path, required=True)
     parser.add_argument("--authorization-envelope", type=Path, required=True)
     parser.add_argument("--release-state", type=Path, required=True)
@@ -476,6 +523,10 @@ def predicate_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def envelope_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--simulation", action="store_true")
+    parser.add_argument(
+        "--activation-ledger", type=Path, default=DEFAULT_LEDGER
+    )
     parser.add_argument("--predicate", type=Path, required=True)
     parser.add_argument("--attestation-id", required=True)
     parser.add_argument("--attestation-bundle", type=Path, required=True)
@@ -512,10 +563,18 @@ def main() -> int:
     args = parse_args()
     if args.command.endswith("predicate"):
         expected = expected_predicate(args)
-        validate_predicate_shape(expected)
+        validate_predicate_shape(
+            expected,
+            simulation=args.simulation,
+            activation_ledger=args.activation_ledger,
+        )
     else:
         expected = expected_envelope(args)
-        validate_envelope_shape(expected)
+        validate_envelope_shape(
+            expected,
+            simulation=args.simulation,
+            activation_ledger=args.activation_ledger,
+        )
     if args.command.startswith("create"):
         write_object(args.output, expected)
         print(file_hash(args.output))

@@ -1,7 +1,7 @@
-name: Disarmed signed release tag authoring
+name: Disarmed candidate-first signed release tag authoring
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       candidate_run_id:
         required: true
@@ -16,6 +16,12 @@ on:
         required: true
         type: string
       candidate_manifest_sha256:
+        required: true
+        type: string
+      candidate_manifest_created_at:
+        required: true
+        type: string
+      candidate_manifest_expires_at:
         required: true
         type: string
       expected_source_sha:
@@ -33,16 +39,13 @@ on:
       release_policy_sha256:
         required: true
         type: string
-    outputs:
-      signed_tag_artifact_id:
-        description: Exact signed-tag evidence artifact ID, unavailable while disarmed
-        value: ${{ jobs.create-signed-tag.outputs.artifact_id }}
-      signed_tag_artifact_digest:
-        description: Exact signed-tag evidence artifact digest, unavailable while disarmed
-        value: ${{ jobs.create-signed-tag.outputs.artifact_digest }}
-      tag_object_sha:
-        description: Exact annotated tag object SHA, unavailable while disarmed
-        value: ${{ jobs.create-signed-tag.outputs.tag_object_sha }}
+      release_policy_contract_blob_oid:
+        required: true
+        type: string
+      snap_candidate_opt_in:
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: rmux-release-tag-authoring-${{ inputs.release_ref }}
@@ -68,11 +71,14 @@ jobs:
       RMUX_MANIFEST_ARTIFACT_ID: ${{ inputs.candidate_manifest_artifact_id }}
       RMUX_MANIFEST_ARTIFACT_DIGEST: ${{ inputs.candidate_manifest_artifact_digest }}
       RMUX_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+      RMUX_MANIFEST_CREATED_AT: ${{ inputs.candidate_manifest_created_at }}
+      RMUX_MANIFEST_EXPIRES_AT: ${{ inputs.candidate_manifest_expires_at }}
       RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
       RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
       RMUX_RELEASE_REF: ${{ inputs.release_ref }}
       RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
       RMUX_RELEASE_POLICY_SHA256: ${{ inputs.release_policy_sha256 }}
+      RMUX_RELEASE_POLICY_CONTRACT_BLOB_OID: ${{ inputs.release_policy_contract_blob_oid }}
     steps:
       - name: Reject malformed tag inputs
         shell: bash
@@ -83,11 +89,14 @@ jobs:
           [[ "$RMUX_MANIFEST_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$RMUX_MANIFEST_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           [[ "$RMUX_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RMUX_MANIFEST_CREATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+          [[ "$RMUX_MANIFEST_EXPIRES_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
           [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RMUX_RELEASE_INTENT_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]
           [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
           [[ "$RMUX_RELEASE_KIND" =~ ^(rc|stable)$ ]]
           [[ "$RMUX_RELEASE_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RMUX_RELEASE_POLICY_CONTRACT_BLOB_OID" =~ ^[0-9a-f]{40}$ ]]
           test "$GITHUB_RUN_ATTEMPT" = 1
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -144,12 +153,16 @@ jobs:
               "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
               "planned_release_ref": os.environ["RMUX_RELEASE_REF"],
               "release_kind": os.environ["RMUX_RELEASE_KIND"],
+              "created_at": os.environ["RMUX_MANIFEST_CREATED_AT"],
+              "expires_at": os.environ["RMUX_MANIFEST_EXPIRES_AT"],
           }
           for field, wanted in expected.items():
               if value.get(field) != wanted:
                   raise SystemExit(f"candidate manifest {field} differs")
           if value.get("release_policy", {}).get("sha256") != os.environ["RMUX_RELEASE_POLICY_SHA256"]:
               raise SystemExit("candidate release policy root differs")
+          if value.get("release_policy", {}).get("contract_blob_oid") != os.environ["RMUX_RELEASE_POLICY_CONTRACT_BLOB_OID"]:
+              raise SystemExit("candidate release policy contract blob differs")
           if hashlib.sha256(raw).hexdigest() != os.environ["RMUX_MANIFEST_SHA256"]:
               raise SystemExit("candidate manifest file hash differs")
           PY
@@ -325,3 +338,117 @@ jobs:
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
+
+  dispatch-promoter:
+    name: Dispatch the promoter on the exact signed tag ref
+    needs: create-signed-tag
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    env:
+      RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      RMUX_MANIFEST_RUN_ID: ${{ inputs.candidate_manifest_run_id }}
+      RMUX_MANIFEST_ARTIFACT_ID: ${{ inputs.candidate_manifest_artifact_id }}
+      RMUX_MANIFEST_ARTIFACT_DIGEST: ${{ inputs.candidate_manifest_artifact_digest }}
+      RMUX_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+      RMUX_MANIFEST_CREATED_AT: ${{ inputs.candidate_manifest_created_at }}
+      RMUX_MANIFEST_EXPIRES_AT: ${{ inputs.candidate_manifest_expires_at }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
+      RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
+      RMUX_RELEASE_POLICY_SHA256: ${{ inputs.release_policy_sha256 }}
+      RMUX_RELEASE_POLICY_CONTRACT_BLOB_OID: ${{ inputs.release_policy_contract_blob_oid }}
+      RMUX_SNAP_CANDIDATE_OPT_IN: ${{ inputs.snap_candidate_opt_in }}
+      RMUX_TAG_ARTIFACT_ID: ${{ needs.create-signed-tag.outputs.artifact_id }}
+      RMUX_TAG_ARTIFACT_DIGEST: ${{ needs.create-signed-tag.outputs.artifact_digest }}
+      RMUX_TAG_OBJECT_SHA: ${{ needs.create-signed-tag.outputs.tag_object_sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Fail closed before dispatching promotion
+        run: scripts/release/assert-release-capability.py promotion_authorization
+
+      - name: Dispatch exact-tag promotion
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          payload=$(python3 - <<'PY'
+          import json
+          import os
+
+          inputs = {
+              "candidate_run_id": os.environ["RMUX_CANDIDATE_RUN_ID"],
+              "candidate_manifest_run_id": os.environ["RMUX_MANIFEST_RUN_ID"],
+              "candidate_manifest_artifact_id": os.environ["RMUX_MANIFEST_ARTIFACT_ID"],
+              "candidate_manifest_artifact_digest": os.environ["RMUX_MANIFEST_ARTIFACT_DIGEST"],
+              "candidate_manifest_sha256": os.environ["RMUX_MANIFEST_SHA256"],
+              "candidate_manifest_created_at": os.environ["RMUX_MANIFEST_CREATED_AT"],
+              "candidate_manifest_expires_at": os.environ["RMUX_MANIFEST_EXPIRES_AT"],
+              "signed_tag_run_id": os.environ["GITHUB_RUN_ID"],
+              "signed_tag_artifact_id": os.environ["RMUX_TAG_ARTIFACT_ID"],
+              "signed_tag_artifact_digest": os.environ["RMUX_TAG_ARTIFACT_DIGEST"],
+              "tag_object_sha": os.environ["RMUX_TAG_OBJECT_SHA"],
+              "expected_source_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
+              "release_ref": os.environ["RMUX_RELEASE_REF"],
+              "release_kind": os.environ["RMUX_RELEASE_KIND"],
+              "release_policy_sha256": os.environ["RMUX_RELEASE_POLICY_SHA256"],
+              "release_policy_contract_blob_oid": os.environ["RMUX_RELEASE_POLICY_CONTRACT_BLOB_OID"],
+              "snap_candidate_opt_in": os.environ["RMUX_SNAP_CANDIDATE_OPT_IN"],
+          }
+          print(json.dumps({
+              "ref": inputs["release_ref"],
+              "return_run_details": True,
+              "inputs": inputs,
+          }, separators=(",", ":")))
+          PY
+          )
+          response=$(gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/release-promote.yml/dispatches" \
+            --input - <<<"$payload")
+          run_id=$(python3 - "$response" <<'PY'
+          import json
+          import sys
+
+          value = json.loads(sys.argv[1])
+          run_id = value.get("workflow_run_id")
+          if type(run_id) is not int or run_id <= 0:
+              raise SystemExit("promotion dispatch did not return one workflow run ID")
+          print(run_id)
+          PY
+          )
+          gh api -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/promotion-run.json"
+          python3 - "$RUNNER_TEMP/promotion-run.json" "$run_id" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "id": int(sys.argv[2]),
+              "workflow_id": 316435346,
+              "path": ".github/workflows/release-promote.yml",
+              "event": "workflow_dispatch",
+              "head_branch": os.environ["RMUX_RELEASE_REF"],
+              "head_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "run_attempt": 1,
+          }
+          if any(value.get(field) != wanted for field, wanted in expected.items()):
+              raise SystemExit("dispatched promotion run identity differs")
+          if value.get("repository", {}).get("id") != 1239918790:
+              raise SystemExit("dispatched promotion repository differs")
+          print(f"promotion-run-id={value['id']}")
+          PY

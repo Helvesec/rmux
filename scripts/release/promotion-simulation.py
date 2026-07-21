@@ -426,6 +426,7 @@ def main() -> int:
         "promotion-authorization.py",
         [
             "create-envelope",
+            "--simulation",
             "--predicate",
             str(predicate_path),
             "--attestation-id",

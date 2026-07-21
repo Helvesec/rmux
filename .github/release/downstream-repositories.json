@@ -92,11 +92,8 @@
       "branch_protected": true,
       "ruleset_count": 1,
       "environment_count": 1,
-      "activation_ready": false,
-      "blockers": [
-        "floating_actions_present",
-        "unprotected_secret_deployment_workflow"
-      ]
+      "activation_ready": true,
+      "blockers": []
     },
     {
       "key": "rmux.io",

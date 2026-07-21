@@ -4,6 +4,8 @@ use std::path::PathBuf;
 const TAG: &str = include_str!("../.github/workflows/release-tag-authoring.yml");
 const PROMOTE: &str = include_str!("../.github/workflows/release-promote.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
+const GITHUB_PUBLISH: &str = include_str!("../.github/workflows/release-github-publish.yml");
+const RECEIPT_DISPATCH: &str = include_str!("../.github/workflows/release-receipt-dispatch.yml");
 const SIMULATION: &str = include_str!("../.github/workflows/release-promotion-simulation.yml");
 const SCHEMA_VALIDATOR_REQUIREMENTS: &str =
     include_str!("../.github/release/schema-validator-requirements.txt");
@@ -96,12 +98,15 @@ fn assert_workflow_dispatch_only(workflow: &str) {
 #[test]
 fn promoter_workflows_have_exact_triggers_and_remain_disarmed() {
     for workflow in [TAG, PROMOTE] {
-        assert_workflow_call_only(workflow);
+        assert_workflow_dispatch_only(workflow);
     }
     assert_workflow_dispatch_only(RECEIPT);
+    for workflow in [GITHUB_PUBLISH, RECEIPT_DISPATCH] {
+        assert_workflow_call_only(workflow);
+    }
     assert_eq!(TAG.matches("if: ${{ false }}").count(), 1);
-    assert_eq!(PROMOTE.matches("if: ${{ false }}").count(), 4);
-    assert_eq!(RECEIPT.matches("if: ${{ false }}").count(), 1);
+    assert_eq!(PROMOTE.matches("if: ${{ false }}").count(), 5);
+    assert_eq!(RECEIPT.matches("if: ${{ false }}").count(), 2);
 
     let activation: serde_json::Value =
         serde_json::from_str(include_str!("../.github/release/release-activation.json"))
@@ -138,7 +143,7 @@ fn promoter_workflows_have_exact_triggers_and_remain_disarmed() {
 
 #[test]
 fn signed_tag_gate_preserves_dedicated_ssh_signature_and_app_boundary() {
-    let create = job(TAG, "create-signed-tag", None);
+    let create = job(TAG, "create-signed-tag", Some("dispatch-promoter"));
     assert!(create.contains("if: ${{ false }}"));
     assert!(create.contains("environment: release-tagging"));
     assert!(create.contains("assert-release-capability.py signed_tag_creation"));
@@ -160,7 +165,7 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
     let prepare = job(PROMOTE, "prepare-policy-audit", Some("policy-audit"));
     let audit = job(PROMOTE, "policy-audit", Some("authorize-promotion"));
     let authorize = job(PROMOTE, "authorize-promotion", Some("publish"));
-    let publish = job(PROMOTE, "publish", None);
+    let publish = job(PROMOTE, "publish", Some("dispatch-receipt"));
     assert!(verify.contains("verify-candidate-artifacts.py verify-downloaded"));
     assert!(verify.contains("verify-candidate-attestations.sh"));
     assert!(verify.contains("GH_TOKEN: ${{ github.token }}"));
@@ -183,21 +188,19 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
     assert!(authorize.contains("needs: [verify-candidate, policy-audit]"));
     assert!(authorize.contains("id-token: write"));
     assert!(authorize.contains("attestations: write"));
-    assert!(authorize
-        .contains("RMUX_AUTHORIZATION_WORKFLOW_ID: ${{ inputs.authorization_workflow_id }}"));
+    assert!(authorize.contains("RMUX_AUTHORIZATION_WORKFLOW_ID: \"316435346\""));
     assert!(authorize.contains("[[ ! \"$RMUX_AUTHORIZATION_WORKFLOW_ID\" =~ ^[1-9][0-9]*$ ]]"));
     assert!(authorize.contains("--authorization-workflow-id \"$RMUX_AUTHORIZATION_WORKFLOW_ID\""));
-    assert!(!authorize
-        .contains("--authorization-workflow-id \"${{ inputs.authorization_workflow_id }}\""));
     assert!(!authorize.contains("contents: write"));
     assert!(publish.contains("needs: [verify-candidate, policy-audit, authorize-promotion]"));
     assert!(publish.contains("contents: write"));
     assert!(!publish.contains("id-token: write"));
-    assert!(publish.contains("environment: release-publication"));
-    assert!(publish.contains("publish-github-release.py"));
-    assert!(publish.contains("SHA256SUMS.sigstore.json"));
+    assert!(publish.contains("uses: ./.github/workflows/release-github-publish.yml"));
+    assert!(GITHUB_PUBLISH.contains("environment: release-publication"));
+    assert!(GITHUB_PUBLISH.contains("publish-github-release.py"));
+    assert!(GITHUB_PUBLISH.contains("SHA256SUMS.sigstore.json"));
     assert!(PUBLICATION_INPUTS.contains("actions-artifact.py verify"));
-    assert!(publish.contains("uses: ./.github/actions/release-publication-inputs"));
+    assert!(GITHUB_PUBLISH.contains("uses: ./.github/actions/release-publication-inputs"));
     assert!(PUBLICATION_INPUTS.contains("Resolve the eleven original candidate artifact IDs again"));
     assert!(PUBLICATION_INPUTS.contains("inputs.manifest-artifact-id"));
     assert!(PUBLICATION_INPUTS.contains("inputs.manifest-run-id"));
@@ -209,14 +212,14 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
     );
     assert!(!publish.contains("rmux-publication/verified"));
     assert!(!publish.contains("needs.verify-candidate.outputs.bundle_artifact_id"));
-    assert!(!publish.contains("--execute"));
+    assert!(GITHUB_PUBLISH.contains("--execute --token \"$GH_TOKEN\""));
     assert!(!PROMOTE.contains("gh release"));
     assert!(!PROMOTE.contains("--clobber"));
 }
 
 #[test]
 fn receipt_is_separate_receipt_only_and_never_writes_contents() {
-    let receipt = job(RECEIPT, "receipt-only", None);
+    let receipt = job(RECEIPT, "receipt-only", Some("downstream"));
     assert!(receipt.contains("if: ${{ false }}"));
     assert!(RECEIPT.contains("on:\n  workflow_dispatch:"));
     assert!(!RECEIPT.contains("\n  workflow_call:"));
@@ -248,6 +251,25 @@ fn receipt_is_separate_receipt_only_and_never_writes_contents() {
     assert!(RECEIPT.contains("signed authorization predicate differs"));
     assert!(RECEIPT.contains("${{ runner.temp }}/rmux-receipt/release-state.json"));
     assert!(!RECEIPT.contains("release_state_artifact_id"));
+}
+
+#[test]
+fn dispatch_chain_binds_main_to_the_exact_signed_tag() {
+    let tag_dispatch = job(TAG, "dispatch-promoter", None);
+    assert!(tag_dispatch.contains("assert-release-capability.py promotion_authorization"));
+    assert!(tag_dispatch.contains("actions/workflows/release-promote.yml/dispatches"));
+    assert!(tag_dispatch.contains("\"ref\": inputs[\"release_ref\"]"));
+    assert!(tag_dispatch.contains("\"workflow_id\": 316435346"));
+    assert!(tag_dispatch.contains("\"head_branch\": os.environ[\"RMUX_RELEASE_REF\"]"));
+    assert!(tag_dispatch.contains("\"head_sha\": os.environ[\"RMUX_EXPECTED_SOURCE_SHA\"]"));
+
+    assert!(PROMOTE.contains("test \"$GITHUB_REF\" = \"refs/tags/$RMUX_RELEASE_REF\""));
+    assert!(PROMOTE.contains("test \"$GITHUB_SHA\" = \"$RMUX_EXPECTED_SOURCE_SHA\""));
+    assert!(RECEIPT_DISPATCH.contains("assert-release-capability.py publication_receipt"));
+    assert!(RECEIPT_DISPATCH.contains("actions/workflows/release-receipt.yml/dispatches"));
+    assert!(RECEIPT_DISPATCH.contains("\"workflow_id\": 316435347"));
+    assert!(RECEIPT_DISPATCH.contains("\"head_branch\": os.environ[\"RMUX_RELEASE_REF\"]"));
+    assert!(RECEIPT_DISPATCH.contains("\"head_sha\": os.environ[\"RMUX_EXPECTED_SOURCE_SHA\"]"));
 }
 
 #[test]

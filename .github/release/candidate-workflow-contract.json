@@ -77,7 +77,7 @@
   "publication": {
     "enabled": false,
     "promoter_concurrency": "rmux-release-promote-${release_ref}",
-    "promoter_trigger": "workflow_call",
+    "promoter_trigger": "workflow_dispatch",
     "promoter_workflow": ".github/workflows/release-promote.yml",
     "public_triggers": false,
     "publication_permissions": false,
@@ -87,7 +87,7 @@
     "receipt_trigger": "workflow_dispatch",
     "receipt_workflow": ".github/workflows/release-receipt.yml",
     "tag_authoring_concurrency": "rmux-release-tag-authoring-${release_ref}",
-    "tag_authoring_trigger": "workflow_call",
+    "tag_authoring_trigger": "workflow_dispatch",
     "tag_authoring_workflow": ".github/workflows/release-tag-authoring.yml"
   }
 }

@@ -748,7 +748,7 @@ fn candidate_artifacts_allow_only_standard_github_runner_labels() {
 
 #[test]
 #[cfg(unix)]
-fn disarmed_authority_schemas_cannot_drive_a_workflow() {
+fn atomic_authority_schemas_cannot_drive_a_workflow_directly() {
     let candidate: serde_json::Value = serde_json::from_str(include_str!(
         "../.github/release/schemas/candidate-manifest.schema.json"
     ))
@@ -765,13 +765,12 @@ fn disarmed_authority_schemas_cannot_drive_a_workflow() {
         include_str!("../.github/release/schemas/publication-receipt-predicate.schema.json"),
         include_str!("../.github/release/schemas/publication-receipt-envelope.schema.json"),
     ] {
-        let schema: serde_json::Value =
-            serde_json::from_str(schema).expect("parse disarmed schema");
-        assert_eq!(schema["x-rmux-status"], "disarmed-non-authoritative");
-        assert!(schema["description"]
-            .as_str()
-            .expect("schema description")
-            .contains("MUST NOT authorize"));
+        let schema: serde_json::Value = serde_json::from_str(schema).expect("parse schema");
+        assert_eq!(schema["x-rmux-status"], "atomic-authority-bound");
+        assert_eq!(
+            schema["oneOf"].as_array().expect("authority states").len(),
+            2
+        );
     }
 
     for entry in

@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/release-promotion-authorization-envelope-v1.json",
-  "title": "RMUX disarmed promotion authorization post-upload envelope",
-  "description": "Review-only post-upload binding. It MUST NOT authorize or publish anything before PR8 and never identifies its own upload.",
-  "x-rmux-status": "disarmed-non-authoritative",
+  "title": "RMUX promotion authorization post-upload envelope",
+  "description": "Post-upload binding whose authority state must match its predicate and the tracked atomic release ledger.",
+  "x-rmux-status": "atomic-authority-bound",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -26,8 +26,8 @@
   "properties": {
     "schema_version": {"const": 1},
     "envelope_type": {"const": "https://rmux.io/envelopes/release-promotion-authorization/v1"},
-    "status": {"const": "disarmed-non-authoritative"},
-    "publication_authority": {"const": false},
+    "status": {"enum": ["disarmed-non-authoritative", "promotion-authorized"]},
+    "publication_authority": {"type": "boolean"},
     "repository_id": {"const": 1239918790},
     "source_git_sha": {"$ref": "#/$defs/sha40"},
     "release_ref": {"$ref": "#/$defs/release_ref"},
@@ -64,6 +64,20 @@
     },
     "created_at": {"type": "string", "format": "date-time"}
   },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "disarmed-non-authoritative"},
+        "publication_authority": {"const": false}
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "promotion-authorized"},
+        "publication_authority": {"const": true}
+      }
+    }
+  ],
   "$defs": {
     "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

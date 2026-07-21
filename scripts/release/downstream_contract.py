@@ -287,14 +287,9 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
     ):
         raise ValueError("rmux.io must remain the blocked final channel")
     by_name = {item["name"]: item for item in channels}
-    for name in ("apt_rpm", "homebrew_tap", "scoop"):
+    for name in ("apt_rpm", "homebrew_tap", "scoop", "web_share"):
         if by_name[name].get("blockers") != []:
             raise ValueError(f"configured channel still blocked: {name}")
-    if by_name["web_share"].get("blockers") != [
-        "floating_actions_present",
-        "unprotected_secret_deployment_workflow",
-    ]:
-        raise ValueError("Web Share legacy channel blockers changed")
 
 
 def _validate_repositories(release: Path) -> None:
@@ -339,7 +334,12 @@ def _validate_repositories(release: Path) -> None:
             record.get("required_path"),
             record.get("ownership"),
         )
-        expected_ready = key in {"homebrew-rmux", "rmux-packages", "scoop-rmux"}
+        expected_ready = key in {
+            "homebrew-rmux",
+            "rmux-packages",
+            "rmux-web-share",
+            "scoop-rmux",
+        }
         if actual != expected or record.get("activation_ready") is not expected_ready:
             raise ValueError(f"downstream repository identity drifted: {key}")
     rmux_io = records["rmux.io"]
@@ -369,14 +369,9 @@ def _validate_repositories(release: Path) -> None:
             or "downstream_writer_app_missing" in blockers
         ):
             raise ValueError(f"public downstream protection snapshot drifted: {key}")
-    for key in ("homebrew-rmux", "rmux-packages", "scoop-rmux"):
+    for key in ("homebrew-rmux", "rmux-packages", "rmux-web-share", "scoop-rmux"):
         if records[key].get("blockers") != []:
             raise ValueError(f"ready downstream repository still has blockers: {key}")
-    if records["rmux-web-share"].get("blockers") != [
-        "floating_actions_present",
-        "unprotected_secret_deployment_workflow",
-    ]:
-        raise ValueError("Web Share legacy deployment blockers disappeared")
 
 
 def _validate_schemas(release: Path) -> None:
@@ -494,6 +489,17 @@ def _validate_workflows(root: Path) -> None:
                 relative = f"./.github/workflows/{downstream.name}".lower()
                 absolute = f"helvesec/rmux/.github/workflows/{downstream.name}@".lower()
                 if lowered == relative or lowered.startswith(absolute):
+                    if (
+                        path.name == "release-receipt.yml"
+                        and downstream.name == "release-downstream.yml"
+                        and "\n  downstream:\n" in text
+                    ):
+                        receipt_caller = text.split("\n  downstream:\n", 1)[1]
+                        if (
+                            "if: ${{ false }}" in receipt_caller
+                            and receipt_caller.count(relative) == 1
+                        ):
+                            continue
                     raise ValueError(f"{path.name} calls disarmed {downstream.name}")
     main = paths[0].read_text(encoding="utf-8")
     receipt_origin = "--expected-workflow-path .github/workflows/release-receipt.yml"

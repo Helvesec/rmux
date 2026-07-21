@@ -487,7 +487,7 @@ fn complete_release_state(fixture: &Fixture) {
 }
 
 #[test]
-fn authority_schemas_are_split_disarmed_and_non_circular() {
+fn authority_schemas_are_split_atomic_and_non_circular() {
     let schemas = repo_root().join(".github/release/schemas");
     assert!(!schemas.join("promotion-authorization.schema.json").exists());
     assert!(!schemas.join("publication-receipt.schema.json").exists());
@@ -498,12 +498,12 @@ fn authority_schemas_are_split_disarmed_and_non_circular() {
         "publication-receipt-envelope.schema.json",
     ] {
         let schema = read_json(&schemas.join(name));
-        assert_eq!(schema["x-rmux-status"], "disarmed-non-authoritative");
+        assert_eq!(schema["x-rmux-status"], "atomic-authority-bound");
         assert_eq!(schema["additionalProperties"], false);
-        assert!(schema["description"]
-            .as_str()
-            .unwrap()
-            .contains("MUST NOT authorize"));
+        assert_eq!(
+            schema["oneOf"].as_array().expect("authority states").len(),
+            2
+        );
     }
     for name in [
         "promotion-authorization-predicate.schema.json",
