@@ -1,0 +1,117 @@
+name: Exact immutable Release receipt dispatcher
+
+on:
+  workflow_call:
+    inputs:
+      authorization_run_id: {required: true, type: string}
+      authorization_artifact_id: {required: true, type: string}
+      authorization_artifact_digest: {required: true, type: string}
+      authorization_envelope_artifact_id: {required: true, type: string}
+      authorization_envelope_artifact_digest: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+      release_kind: {required: true, type: string}
+      snap_candidate_opt_in: {required: true, type: boolean}
+
+permissions: {}
+
+jobs:
+  dispatch:
+    name: Dispatch exact receipt verification on the signed tag
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    env:
+      RMUX_AUTHORIZATION_RUN_ID: ${{ inputs.authorization_run_id }}
+      RMUX_AUTHORIZATION_ARTIFACT_ID: ${{ inputs.authorization_artifact_id }}
+      RMUX_AUTHORIZATION_ARTIFACT_DIGEST: ${{ inputs.authorization_artifact_digest }}
+      RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_ID: ${{ inputs.authorization_envelope_artifact_id }}
+      RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.authorization_envelope_artifact_digest }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_ID: ${{ inputs.release_id }}
+      RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
+      RMUX_SNAP_CANDIDATE_OPT_IN: ${{ inputs.snap_candidate_opt_in }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Fail closed before dispatching receipt verification
+        run: scripts/release/assert-release-capability.py publication_receipt
+
+      - name: Dispatch receipt-only verification
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          payload=$(python3 - <<'PY'
+          import json
+          import os
+
+          print(json.dumps({
+              "ref": os.environ["RMUX_RELEASE_REF"],
+              "return_run_details": True,
+              "inputs": {
+                  "authorization_run_id": os.environ["RMUX_AUTHORIZATION_RUN_ID"],
+                  "authorization_artifact_id": os.environ["RMUX_AUTHORIZATION_ARTIFACT_ID"],
+                  "authorization_artifact_digest": os.environ["RMUX_AUTHORIZATION_ARTIFACT_DIGEST"],
+                  "authorization_envelope_artifact_id": os.environ["RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_ID"],
+                  "authorization_envelope_artifact_digest": os.environ["RMUX_AUTHORIZATION_ENVELOPE_ARTIFACT_DIGEST"],
+                  "authorization_workflow_id": "316435346",
+                  "expected_source_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+                  "release_id": os.environ["RMUX_RELEASE_ID"],
+                  "release_ref": os.environ["RMUX_RELEASE_REF"],
+                  "release_kind": os.environ["RMUX_RELEASE_KIND"],
+                  "receipt_workflow_id": "316435347",
+                  "snap_candidate_opt_in": os.environ["RMUX_SNAP_CANDIDATE_OPT_IN"],
+              },
+          }, separators=(",", ":")))
+          PY
+          )
+          response=$(gh api --method POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/release-receipt.yml/dispatches" \
+            --input - <<<"$payload")
+          run_id=$(python3 - "$response" <<'PY'
+          import json
+          import sys
+
+          value = json.loads(sys.argv[1])
+          run_id = value.get("workflow_run_id")
+          if type(run_id) is not int or run_id <= 0:
+              raise SystemExit("receipt dispatch did not return one workflow run ID")
+          print(run_id)
+          PY
+          )
+          gh api -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$RUNNER_TEMP/receipt-run.json"
+          python3 - "$RUNNER_TEMP/receipt-run.json" "$run_id" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "id": int(sys.argv[2]),
+              "workflow_id": 316435347,
+              "path": ".github/workflows/release-receipt.yml",
+              "event": "workflow_dispatch",
+              "head_branch": os.environ["RMUX_RELEASE_REF"],
+              "head_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "run_attempt": 1,
+          }
+          if any(value.get(field) != wanted for field, wanted in expected.items()):
+              raise SystemExit("dispatched receipt run identity differs")
+          if value.get("repository", {}).get("id") != 1239918790:
+              raise SystemExit("dispatched receipt repository differs")
+          print(f"receipt-run-id={value['id']}")
+          PY

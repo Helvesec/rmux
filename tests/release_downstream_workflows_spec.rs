@@ -5,6 +5,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOWNSTREAM: &str = include_str!("../.github/workflows/release-downstream.yml");
+const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
+const RECEIPT_REFERENCE_BUILDER: &str =
+    include_str!("../scripts/release/build-downstream-receipt-reference.py");
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -83,11 +86,9 @@ fn calls_disarmed_workflow(line: &str, workflow_name: &str) -> bool {
 #[test]
 fn downstream_workflow_is_uncalled_read_only_and_disarmed() {
     assert_workflow_call_only(DOWNSTREAM);
-    assert_eq!(DOWNSTREAM.matches("if: ${{ false }}").count(), 5);
+    assert_eq!(DOWNSTREAM.matches("if: ${{ false }}").count(), 0);
     assert!(!DOWNSTREAM.contains("contents: write"));
-    assert!(!DOWNSTREAM.contains("id-token: write"));
-    assert!(!DOWNSTREAM.contains("attestations: write"));
-    assert!(!DOWNSTREAM.contains("secrets:"));
+    assert_eq!(DOWNSTREAM.matches("secrets: inherit").count(), 8);
     assert!(!DOWNSTREAM.contains("environment:"));
     assert!(!DOWNSTREAM.contains("self-hosted"));
     assert!(!DOWNSTREAM.contains("larger-runner"));
@@ -98,15 +99,27 @@ fn downstream_workflow_is_uncalled_read_only_and_disarmed() {
     assert_eq!(activation["status"], "disarmed");
     assert_eq!(activation["runtime_override_allowed"], false);
     assert_eq!(activation["capabilities"]["downstream_channels"], false);
+    let caller = job(RECEIPT, "downstream", None);
+    assert!(caller.contains("if: ${{ false }}"));
+    assert!(caller.contains("uses: ./.github/workflows/release-downstream.yml"));
 
     let workflows = repo_root().join(".github/workflows");
     for entry in fs::read_dir(workflows).expect("list workflows") {
         let path = entry.expect("workflow entry").path();
         let text = fs::read_to_string(&path).expect("read workflow");
+        let calls_downstream = text
+            .lines()
+            .any(|line| calls_disarmed_workflow(line, "release-downstream.yml"));
+        if path.ends_with("release-receipt.yml") {
+            assert!(
+                calls_downstream,
+                "receipt must retain the guarded downstream call"
+            );
+            assert!(text.contains("if: ${{ false }}"));
+            continue;
+        }
         assert!(
-            !text
-                .lines()
-                .any(|line| calls_disarmed_workflow(line, "release-downstream.yml")),
+            !calls_downstream,
             "existing workflow {} calls the disarmed downstream workflow",
             path.display()
         );
@@ -128,9 +141,40 @@ fn downstream_caller_guard_rejects_relative_and_absolute_targets() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn downstream_workflow_entry_points_are_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for filename in [
+        "build-downstream-receipt-reference.py",
+        "channel-execution.py",
+        "channel-request.py",
+        "channel-summary.py",
+        "channel-target-evidence.py",
+        "downstream_payload.py",
+        "prepare-channel-retry.py",
+        "publish-crate-set.py",
+        "publish-linux-repository.py",
+        "publish-owned-repository.py",
+        "snap-candidate-status.py",
+        "stage-downstream-payloads.py",
+        "stage-rmux-io-payload.py",
+        "verify-exact-file-set.py",
+        "verify-receipt-attestation.py",
+    ] {
+        let path = repo_root().join("scripts/release").join(filename);
+        let mode = fs::metadata(&path)
+            .unwrap_or_else(|error| panic!("read {filename} metadata: {error}"))
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "{filename} is not executable");
+    }
+}
+
 #[test]
 fn exact_receipt_ids_digests_origin_and_documents_are_bound() {
-    let prepare = job(DOWNSTREAM, "prepare-plan", Some("stage-linux-channels"));
+    let prepare = job(DOWNSTREAM, "prepare-plan", Some("prepare-payloads"));
     for input in [
         "receipt_run_id:",
         "receipt_run_workflow_id:",
@@ -177,10 +221,12 @@ fn exact_receipt_ids_digests_origin_and_documents_are_bound() {
     );
     assert!(!prepare.contains("pattern:"));
     assert_eq!(prepare.matches("merge-multiple: true").count(), 2);
-    assert!(prepare.contains("receipt predicate acquired downstream authority"));
-    assert!(prepare.contains("receipt envelope acquired downstream authority"));
-    assert!(prepare.contains("receipt artifact contains a symlink"));
-    assert!(prepare.contains("receipt artifact file set differs"));
+    assert!(prepare.contains("assert-release-capability.py downstream_channels"));
+    assert!(prepare.contains("build-downstream-receipt-reference.py"));
+    assert!(RECEIPT_REFERENCE_BUILDER.contains("receipt artifact contains a symlink"));
+    assert!(RECEIPT_REFERENCE_BUILDER.contains("receipt artifact file set differs"));
+    assert!(RECEIPT_REFERENCE_BUILDER.contains("publication receipt predicate identity differs"));
+    assert!(RECEIPT_REFERENCE_BUILDER.contains("publication receipt envelope identity differs"));
     assert!(prepare.contains("release-state.json"));
     assert!(prepare.contains("verify-receipt-attestation.py"));
     assert!(prepare.contains("GH_TOKEN: ${{ github.token }}"));
@@ -198,7 +244,7 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
         "../.github/release/downstream-channel-contract.json"
     ))
     .expect("downstream contract");
-    assert_eq!(contract["status"], "review-only-disarmed");
+    assert_eq!(contract["status"], "atomic-authority-bound");
     assert_eq!(contract["execution"]["only_trigger"], "workflow_call");
     assert_eq!(contract["execution"]["public_callers"], 0);
     assert_eq!(
@@ -209,7 +255,10 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
         contract["execution"]["required_caller_repository_id"],
         1239918790
     );
-    assert_eq!(contract["execution"]["privileged_job_condition"], "false");
+    assert_eq!(
+        contract["execution"]["privileged_job_condition"],
+        "release-activation-ledger"
+    );
     assert_eq!(contract["execution"]["maximum_parallel_channels"], 4);
     assert_eq!(contract["execution"]["github_hosted_only"], true);
     assert_eq!(contract["execution"]["native_rebuild_allowed"], false);
@@ -228,7 +277,10 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
         serde_json::json!({
             "workflow_id": 316435347,
             "workflow_path": ".github/workflows/release-receipt.yml",
-            "job_workflow_path": ".github/workflows/release-downstream.yml",
+            "job_workflow_paths": {
+                "default": ".github/workflows/release-downstream-prepare.yml",
+                "rmux_io": ".github/workflows/release-rmux-io-payload.yml"
+            },
             "required_run_attempt": 1
         })
     );
@@ -308,19 +360,16 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
         .iter()
         .find(|channel| channel["name"] == "web_share")
         .expect("web-share channel");
-    assert_eq!(
-        web_share["blockers"],
-        serde_json::json!([
-            "floating_actions_present",
-            "unprotected_secret_deployment_workflow"
-        ])
-    );
+    assert_eq!(web_share["blockers"], serde_json::json!([]));
     let snap_stable = channels
         .iter()
         .find(|channel| channel["name"] == "snap_stable")
         .expect("Snap stable channel");
-    assert_eq!(snap_stable["payload_ready"], false);
-    assert_eq!(snap_stable["payload_roles"], serde_json::json!([]));
+    assert_eq!(snap_stable["payload_ready"], true);
+    assert_eq!(
+        snap_stable["payload_roles"],
+        serde_json::json!(["policy-decision"])
+    );
     assert_eq!(
         snap_stable["blockers"],
         serde_json::json!(["denied_until_support_decision"])
@@ -355,34 +404,42 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
         );
     }
 
-    let linux = job(DOWNSTREAM, "stage-linux-channels", Some("stage-chocolatey"));
-    let chocolatey = job(DOWNSTREAM, "stage-chocolatey", Some("channel-summary"));
-    let summary = job(DOWNSTREAM, "channel-summary", Some("deploy-rmux-io"));
-    let rmux_io = job(DOWNSTREAM, "deploy-rmux-io", Some("final-channel-summary"));
+    let summary = job(
+        DOWNSTREAM,
+        "pre-site-summary",
+        Some("prepare-rmux-io-handoff"),
+    );
+    let rmux_io = job(
+        DOWNSTREAM,
+        "prepare-rmux-io-handoff",
+        Some("record-rmux-io-handoff"),
+    );
+    let rmux_io_result = job(
+        DOWNSTREAM,
+        "record-rmux-io-handoff",
+        Some("final-channel-summary"),
+    );
     let final_summary = job(DOWNSTREAM, "final-channel-summary", None);
-    assert!(linux.contains("max-parallel: 3"));
-    assert!(linux.contains("if: ${{ false }}"));
-    assert!(chocolatey.contains("if: ${{ false }}"));
-    assert!(summary.contains("if: ${{ false }}"));
-    assert!(rmux_io.contains("if: ${{ false }}"));
-    assert!(final_summary.contains("if: ${{ false }}"));
-    assert!(summary.contains("needs: [prepare-plan, stage-linux-channels, stage-chocolatey]"));
-    assert!(rmux_io.contains("needs: [prepare-plan, channel-summary]"));
-    assert!(final_summary.contains("needs: [prepare-plan, channel-summary, deploy-rmux-io]"));
-    assert!(summary.contains("Disabled pre-site aggregation wiring"));
-    assert!(summary.contains("writers expose ten exact result references"));
-    assert!(rmux_io.contains("Disabled rmux.io writer"));
-    assert!(rmux_io.contains("consumes the exact pre-site summary"));
-    assert!(final_summary.contains("Disabled final aggregation wiring"));
-    assert!(final_summary.contains("exact rmux.io result reference"));
-    assert!(!DOWNSTREAM.contains("Consume eleven exact"));
-    assert!(!DOWNSTREAM.contains("Consume ten exact"));
+    assert!(summary.contains("Aggregate ten exact pre-site results"));
+    assert!(summary.contains("release-channel-summary.yml"));
+    assert!(rmux_io.contains("needs: [prepare-plan, pre-site-summary]"));
+    assert!(rmux_io.contains("release-rmux-io-payload.yml"));
+    assert!(rmux_io_result.contains("release-rmux-io-channel.yml"));
+    assert!(final_summary.contains("Aggregate all eleven exact channel results"));
+    assert!(final_summary.contains("release-channel-summary.yml"));
+    assert_eq!(
+        DOWNSTREAM
+            .matches("release-owned-repository-channel.yml")
+            .count(),
+        3
+    );
+    assert_eq!(DOWNSTREAM.matches("release-policy-channel.yml").count(), 4);
+    assert_eq!(DOWNSTREAM.matches("release-channel-summary.yml").count(), 2);
+    assert_eq!(DOWNSTREAM.matches("if: ${{ false }}").count(), 0);
     assert!(DOWNSTREAM.contains("test \"$GITHUB_REPOSITORY\" = \"Helvesec/rmux\""));
     assert!(DOWNSTREAM.contains("test \"$GITHUB_REPOSITORY_ID\" = \"1239918790\""));
     assert_eq!(DOWNSTREAM.matches("channel-summary.py create").count(), 0);
-    for writer in [linux, chocolatey, rmux_io] {
-        assert!(writer.contains("assert-release-capability.py downstream_channels"));
-    }
+    assert!(RECEIPT.contains("if: ${{ false }}"));
 }
 
 #[test]
@@ -432,7 +489,12 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
         );
     }
 
-    for key in ["homebrew-rmux", "rmux-packages", "scoop-rmux"] {
+    for key in [
+        "homebrew-rmux",
+        "rmux-packages",
+        "rmux-web-share",
+        "scoop-rmux",
+    ] {
         let repository = repositories
             .iter()
             .find(|repository| repository["key"] == key)
@@ -440,19 +502,6 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
         assert_eq!(repository["activation_ready"], true, "{key}");
         assert_eq!(repository["blockers"], serde_json::json!([]), "{key}");
     }
-
-    let web_share = repositories
-        .iter()
-        .find(|repository| repository["key"] == "rmux-web-share")
-        .expect("missing downstream repository rmux-web-share");
-    assert_eq!(web_share["activation_ready"], false);
-    assert_eq!(
-        web_share["blockers"],
-        serde_json::json!([
-            "floating_actions_present",
-            "unprotected_secret_deployment_workflow"
-        ])
-    );
 
     let rmux_io = repositories
         .iter()

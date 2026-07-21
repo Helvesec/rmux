@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/downstream-channel-plan-v1.json",
-  "title": "RMUX disarmed downstream channel plan",
-  "description": "Review-only downstream plan. It MUST NOT authorize publication before PR8.",
-  "x-rmux-status": "disarmed-non-authoritative",
+  "title": "RMUX downstream channel plan",
+  "description": "Downstream plan atomically bound to the tracked release authority ledger.",
+  "x-rmux-status": "atomic-authority-bound",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -24,10 +24,10 @@
   ],
   "properties": {
     "schema_version": {"const": 1},
-    "status": {"const": "disarmed-non-authoritative"},
-    "downstream_authority": {"const": false},
-    "execution_authority": {"const": false},
-    "execution_enabled": {"const": false},
+    "status": {"enum": ["disarmed-non-authoritative", "downstream-authorized"]},
+    "downstream_authority": {"type": "boolean"},
+    "execution_authority": {"type": "boolean"},
+    "execution_enabled": {"type": "boolean"},
     "repository_id": {"const": 1239918790},
     "source_git_sha": {"$ref": "#/$defs/sha40"},
     "release": {"$ref": "#/$defs/release"},
@@ -70,8 +70,8 @@
           "phase": {"type": "integer", "minimum": 1, "maximum": 3},
           "policy_decision": {"enum": ["allow", "deny", "explicit-opt-in"]},
           "explicit_opt_in": {"type": "boolean"},
-          "execution_decision": {"enum": ["blocked", "denied", "disarmed"]},
-          "execution_enabled": {"const": false},
+          "execution_decision": {"enum": ["blocked", "denied", "disarmed", "enabled"]},
+          "execution_enabled": {"type": "boolean"},
           "payload_ready": {"type": "boolean"},
           "payload_roles": {
             "type": "array",
@@ -92,6 +92,24 @@
       }
     }
   },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "disarmed-non-authoritative"},
+        "downstream_authority": {"const": false},
+        "execution_authority": {"const": false},
+        "execution_enabled": {"const": false}
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "downstream-authorized"},
+        "downstream_authority": {"const": true},
+        "execution_authority": {"const": true},
+        "execution_enabled": {"const": true}
+      }
+    }
+  ],
   "$defs": {
     "positive": {"type": "integer", "minimum": 1},
     "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},

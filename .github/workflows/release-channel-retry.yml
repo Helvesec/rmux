@@ -1,0 +1,105 @@
+name: Disarmed downstream channel retry
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        required: true
+        type: choice
+        options: [chocolatey, snap_candidate]
+      receipt_run_id: {required: true, type: string}
+      receipt_run_workflow_id: {required: true, type: string}
+      receipt_workflow_id: {required: true, type: string}
+      receipt_artifact_id: {required: true, type: string}
+      receipt_artifact_digest: {required: true, type: string}
+      receipt_envelope_artifact_id: {required: true, type: string}
+      receipt_envelope_artifact_digest: {required: true, type: string}
+      receipt_predicate_sha256: {required: true, type: string}
+      receipt_envelope_sha256: {required: true, type: string}
+      prior_result_run_id: {required: true, type: string}
+      prior_result_run_workflow_id: {required: true, type: string}
+      prior_result_producer_workflow_id: {required: true, type: string}
+      prior_result_producer_workflow_path: {required: true, type: string}
+      prior_result_artifact_id: {required: true, type: string}
+      prior_result_artifact_digest: {required: true, type: string}
+      prior_result_predicate_sha256: {required: true, type: string}
+      prior_result_envelope_artifact_id: {required: true, type: string}
+      prior_result_envelope_artifact_digest: {required: true, type: string}
+      prior_result_envelope_sha256: {required: true, type: string}
+      request_idempotency_key: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+
+permissions: {}
+
+jobs:
+  chocolatey:
+    name: Retry one exact Chocolatey result
+    if: inputs.channel == 'chocolatey'
+    uses: ./.github/workflows/release-chocolatey-retry.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      receipt_run_workflow_id: ${{ inputs.receipt_run_workflow_id }}
+      receipt_workflow_id: ${{ inputs.receipt_workflow_id }}
+      receipt_artifact_id: ${{ inputs.receipt_artifact_id }}
+      receipt_artifact_digest: ${{ inputs.receipt_artifact_digest }}
+      receipt_envelope_artifact_id: ${{ inputs.receipt_envelope_artifact_id }}
+      receipt_envelope_artifact_digest: ${{ inputs.receipt_envelope_artifact_digest }}
+      receipt_predicate_sha256: ${{ inputs.receipt_predicate_sha256 }}
+      receipt_envelope_sha256: ${{ inputs.receipt_envelope_sha256 }}
+      prior_result_run_id: ${{ inputs.prior_result_run_id }}
+      prior_result_run_workflow_id: ${{ inputs.prior_result_run_workflow_id }}
+      prior_result_producer_workflow_id: ${{ inputs.prior_result_producer_workflow_id }}
+      prior_result_producer_workflow_path: ${{ inputs.prior_result_producer_workflow_path }}
+      prior_result_artifact_id: ${{ inputs.prior_result_artifact_id }}
+      prior_result_artifact_digest: ${{ inputs.prior_result_artifact_digest }}
+      prior_result_predicate_sha256: ${{ inputs.prior_result_predicate_sha256 }}
+      prior_result_envelope_artifact_id: ${{ inputs.prior_result_envelope_artifact_id }}
+      prior_result_envelope_artifact_digest: ${{ inputs.prior_result_envelope_artifact_digest }}
+      prior_result_envelope_sha256: ${{ inputs.prior_result_envelope_sha256 }}
+      request_idempotency_key: ${{ inputs.request_idempotency_key }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  snap-candidate:
+    name: Retry one exact Snap candidate result
+    if: inputs.channel == 'snap_candidate'
+    uses: ./.github/workflows/release-snap-retry.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      receipt_run_workflow_id: ${{ inputs.receipt_run_workflow_id }}
+      receipt_workflow_id: ${{ inputs.receipt_workflow_id }}
+      receipt_artifact_id: ${{ inputs.receipt_artifact_id }}
+      receipt_artifact_digest: ${{ inputs.receipt_artifact_digest }}
+      receipt_envelope_artifact_id: ${{ inputs.receipt_envelope_artifact_id }}
+      receipt_envelope_artifact_digest: ${{ inputs.receipt_envelope_artifact_digest }}
+      receipt_predicate_sha256: ${{ inputs.receipt_predicate_sha256 }}
+      receipt_envelope_sha256: ${{ inputs.receipt_envelope_sha256 }}
+      prior_result_run_id: ${{ inputs.prior_result_run_id }}
+      prior_result_run_workflow_id: ${{ inputs.prior_result_run_workflow_id }}
+      prior_result_producer_workflow_id: ${{ inputs.prior_result_producer_workflow_id }}
+      prior_result_producer_workflow_path: ${{ inputs.prior_result_producer_workflow_path }}
+      prior_result_artifact_id: ${{ inputs.prior_result_artifact_id }}
+      prior_result_artifact_digest: ${{ inputs.prior_result_artifact_digest }}
+      prior_result_predicate_sha256: ${{ inputs.prior_result_predicate_sha256 }}
+      prior_result_envelope_artifact_id: ${{ inputs.prior_result_envelope_artifact_id }}
+      prior_result_envelope_artifact_digest: ${{ inputs.prior_result_envelope_artifact_digest }}
+      prior_result_envelope_sha256: ${{ inputs.prior_result_envelope_sha256 }}
+      request_idempotency_key: ${{ inputs.request_idempotency_key }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}

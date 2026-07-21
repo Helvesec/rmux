@@ -1,0 +1,116 @@
+name: Publish exact crates.io channel
+
+on:
+  workflow_call:
+    inputs:
+      receipt_run_id: {required: true, type: string}
+      plan_artifact_id: {required: true, type: string}
+      plan_artifact_digest: {required: true, type: string}
+      payload_artifact_id: {required: true, type: string}
+      payload_artifact_digest: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish exact crates.io package set
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    concurrency:
+      group: rmux-channel-crates-io-${{ inputs.release_ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - id: prepare
+        uses: ./.github/actions/release-channel-prepare
+        with:
+          channel: crates_io
+          receipt-run-id: ${{ inputs.receipt_run_id }}
+          plan-artifact-id: ${{ inputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ inputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ inputs.payload_artifact_id }}
+          payload-artifact-digest: ${{ inputs.payload_artifact_digest }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+
+      - id: decision
+        name: Resolve exact crates.io execution authority
+        shell: bash
+        run: >-
+          scripts/release/channel-execution.py
+          --request "${{ steps.prepare.outputs.request }}" --channel crates_io
+          --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
+          --github-output "$GITHUB_OUTPUT"
+
+      - id: auth
+        name: Exchange GitHub OIDC for a short-lived crates.io token
+        if: steps.decision.outputs.execute == 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
+
+      - id: writer
+        name: Publish and redownload every exact crate
+        if: steps.decision.outputs.execute == 'true'
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: >-
+          scripts/release/publish-crate-set.py
+          --payload-dir "${{ steps.prepare.outputs.payload-root }}"
+          --source-sha "${{ inputs.expected_source_sha }}"
+          --release-ref "${{ inputs.release_ref }}"
+          --target-dir "$RUNNER_TEMP/rmux-crates-publish"
+          --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
+          --github-output "$GITHUB_OUTPUT"
+
+      - id: outcome
+        name: Normalize executable and policy-only outcomes
+        shell: bash
+        env:
+          RMUX_EXECUTE: ${{ steps.decision.outputs.execute }}
+          RMUX_EXECUTED_STATE: ${{ steps.writer.outputs.state }}
+          RMUX_BLOCKED_STATE: ${{ steps.decision.outputs.state }}
+          RMUX_EXECUTED_MUTATION: ${{ steps.writer.outputs.mutation_started }}
+          RMUX_BLOCKED_MUTATION: ${{ steps.decision.outputs.mutation_started }}
+          RMUX_EXECUTED_REMOTE_ID: ${{ steps.writer.outputs.remote_request_id }}
+          RMUX_BLOCKED_REMOTE_ID: ${{ steps.decision.outputs.remote_request_id }}
+        run: |
+          set -euo pipefail
+          if [ "$RMUX_EXECUTE" = true ]; then
+            state="$RMUX_EXECUTED_STATE"; mutation="$RMUX_EXECUTED_MUTATION"; remote_id="$RMUX_EXECUTED_REMOTE_ID"
+          else
+            state="$RMUX_BLOCKED_STATE"; mutation="$RMUX_BLOCKED_MUTATION"; remote_id="$RMUX_BLOCKED_REMOTE_ID"
+          fi
+          test -n "$state" && [[ "$mutation" =~ ^(true|false)$ ]]
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "mutation_started=$mutation" >> "$GITHUB_OUTPUT"
+          echo "remote_request_id=$remote_id" >> "$GITHUB_OUTPUT"
+
+      - name: Seal exact crates.io result evidence
+        uses: ./.github/actions/release-channel-result
+        with:
+          channel: crates_io
+          prepared-root: ${{ steps.prepare.outputs.root }}
+          state: ${{ steps.outcome.outputs.state }}
+          started-at: ${{ steps.decision.outputs.started_at }}
+          mutation-started: ${{ steps.outcome.outputs.mutation_started }}
+          remote-request-id: ${{ steps.outcome.outputs.remote_request_id }}
+          target-evidence: ${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          producer-workflow-path: .github/workflows/release-crates-channel.yml
+          runner-image: ubuntu-22.04

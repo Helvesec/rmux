@@ -8,6 +8,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from release_authority import DEFAULT_LEDGER, load_authority
+
 from release_evidence import (
     PROMOTION_WORKFLOW_ID,
     PROMOTION_WORKFLOW_PATH,
@@ -33,6 +35,20 @@ from release_evidence import (
 
 PREDICATE_TYPE = "https://rmux.io/attestations/release-promotion-authorization/v1"
 ENVELOPE_TYPE = "https://rmux.io/envelopes/release-promotion-authorization/v1"
+AUTHORIZED_STATUS = "promotion-authorized"
+
+
+def publication_authority(args: argparse.Namespace) -> bool:
+    if args.simulation:
+        return False
+    return load_authority(args.activation_ledger).permits(
+        (
+            "signed_tag_creation",
+            "policy_audit",
+            "promotion_authorization",
+            "github_release_publication",
+        )
+    )
 
 
 def authorization_identity(args: argparse.Namespace) -> dict[str, Any]:
@@ -105,11 +121,12 @@ def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
     if expires > audit_expires or expires > candidate_expires:
         raise ValueError("authorization outlives its candidate or policy audit")
     assets = publishable_assets(manifest, args.sha256sums)
+    authority = publication_authority(args)
     return {
         "schema_version": 1,
         "predicate_type": PREDICATE_TYPE,
-        "status": STATUS,
-        "publication_authority": False,
+        "status": AUTHORIZED_STATUS if authority else STATUS,
+        "publication_authority": authority,
         "repository": {"id": REPOSITORY_ID, "full_name": REPOSITORY},
         "source_git_sha": manifest["source_git_sha"],
         "release": {
@@ -139,7 +156,9 @@ def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def validate_predicate_shape(predicate: dict[str, Any]) -> None:
+def validate_predicate_shape(
+    predicate: dict[str, Any], *, expected_authority: bool
+) -> None:
     exact_keys(
         predicate,
         {
@@ -163,13 +182,16 @@ def validate_predicate_shape(predicate: dict[str, Any]) -> None:
         },
         "promotion authorization predicate",
     )
+    authority = predicate["publication_authority"]
+    expected_status = AUTHORIZED_STATUS if authority is True else STATUS
     if (
         predicate["schema_version"] != 1
         or predicate["predicate_type"] != PREDICATE_TYPE
-        or predicate["status"] != STATUS
-        or predicate["publication_authority"] is not False
+        or type(authority) is not bool
+        or authority is not expected_authority
+        or predicate["status"] != expected_status
     ):
-        raise ValueError("promotion authorization must remain disarmed")
+        raise ValueError("promotion authorization authority state is inconsistent")
     forbidden = {
         "attestation_id",
         "authorization_bundle_artifact_id",
@@ -183,7 +205,8 @@ def validate_predicate_shape(predicate: dict[str, Any]) -> None:
 def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
     predicate_path = validate_file(args.predicate, "authorization predicate")
     predicate = read_object(predicate_path, "authorization predicate")
-    validate_predicate_shape(predicate)
+    validate_predicate_shape(predicate, expected_authority=publication_authority(args))
+    authority = predicate["publication_authority"]
     bundle_path = validate_file(
         args.attestation_bundle, "SHA256SUMS attestation bundle"
     )
@@ -209,8 +232,8 @@ def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "envelope_type": ENVELOPE_TYPE,
-        "status": STATUS,
-        "publication_authority": False,
+        "status": AUTHORIZED_STATUS if authority else STATUS,
+        "publication_authority": authority,
         "repository_id": REPOSITORY_ID,
         "source_git_sha": predicate["source_git_sha"],
         "release_ref": predicate["release"]["ref"],
@@ -236,7 +259,9 @@ def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def validate_envelope_shape(envelope: dict[str, Any]) -> None:
+def validate_envelope_shape(
+    envelope: dict[str, Any], *, expected_authority: bool
+) -> None:
     exact_keys(
         envelope,
         {
@@ -258,19 +283,23 @@ def validate_envelope_shape(envelope: dict[str, Any]) -> None:
         },
         "promotion authorization envelope",
     )
+    authority = envelope["publication_authority"]
+    expected_status = AUTHORIZED_STATUS if authority is True else STATUS
     if (
         envelope["schema_version"] != 1
         or envelope["envelope_type"] != ENVELOPE_TYPE
-        or envelope["status"] != STATUS
-        or envelope["publication_authority"] is not False
+        or type(authority) is not bool
+        or authority is not expected_authority
+        or envelope["status"] != expected_status
     ):
-        raise ValueError("promotion authorization envelope must remain disarmed")
+        raise ValueError("promotion authorization envelope authority is inconsistent")
     if "envelope_sha256" in envelope or "envelope_artifact_id" in envelope:
         raise ValueError("authorization envelope cannot refer to its own upload")
 
 
 def predicate_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--simulation", action="store_true")
+    parser.add_argument("--activation-ledger", type=Path, default=DEFAULT_LEDGER)
     parser.add_argument("--candidate-manifest", type=Path, required=True)
     parser.add_argument("--candidate-reference", type=Path, required=True)
     parser.add_argument("--signed-tag", type=Path, required=True)
@@ -284,6 +313,8 @@ def predicate_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def envelope_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--simulation", action="store_true")
+    parser.add_argument("--activation-ledger", type=Path, default=DEFAULT_LEDGER)
     parser.add_argument("--predicate", type=Path, required=True)
     parser.add_argument("--attestation-id", required=True)
     parser.add_argument("--attestation-bundle", type=Path, required=True)
@@ -320,10 +351,14 @@ def main() -> int:
     args = parse_args()
     if args.command.endswith("predicate"):
         expected = expected_predicate(args)
-        validate_predicate_shape(expected)
+        validate_predicate_shape(
+            expected, expected_authority=publication_authority(args)
+        )
     else:
         expected = expected_envelope(args)
-        validate_envelope_shape(expected)
+        validate_envelope_shape(
+            expected, expected_authority=publication_authority(args)
+        )
     if args.command.startswith("create"):
         write_object(args.output, expected)
         print(file_hash(args.output))

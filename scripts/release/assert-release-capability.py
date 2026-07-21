@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from policy_audit_contract import read_object, validate_activation
+from release_authority import load_authority
 
 
 def main() -> int:
@@ -19,11 +19,8 @@ def main() -> int:
         default=Path(".github/release/release-activation.json"),
     )
     args = parser.parse_args()
-    ledger = read_object(args.ledger, "release activation ledger")
-    validate_activation(ledger)
-    if args.capability not in ledger["capabilities"]:
-        raise ValueError("unknown release capability")
-    if ledger["capabilities"][args.capability] is not True:
+    authority = load_authority(args.ledger)
+    if not authority.permits((args.capability,)):
         raise ValueError(
             f"release capability {args.capability!r} is disabled until reviewed PR8 cut-over"
         )

@@ -1,18 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/downstream-channel-result-predicate-v1.json",
-  "title": "RMUX disarmed downstream channel result predicate",
-  "description": "Review-only channel observation. It MUST NOT authorize publication or equate submission with public-live.",
-  "x-rmux-status": "disarmed-non-authoritative",
+  "title": "RMUX downstream channel result predicate",
+  "description": "Authority-bound channel observation that never equates submission with public-live.",
+  "x-rmux-status": "atomic-authority-bound",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "predicate_type", "status", "downstream_authority", "execution_authority", "repository_id", "source_git_sha", "release", "receipt", "request_sha256", "payload_set_sha256", "idempotency_key", "channel", "target", "producer", "subject", "state", "started_at", "mutation_started", "remote_request_id", "target_evidence", "observed_at"],
   "properties": {
     "schema_version": {"const": 1},
     "predicate_type": {"const": "https://rmux.io/attestations/release-downstream-channel-result/v1"},
-    "status": {"const": "disarmed-non-authoritative"},
-    "downstream_authority": {"const": false},
-    "execution_authority": {"const": false},
+    "status": {"enum": ["disarmed-non-authoritative", "downstream-authorized"]},
+    "downstream_authority": {"type": "boolean"},
+    "execution_authority": {"type": "boolean"},
     "repository_id": {"const": 1239918790},
     "source_git_sha": {"$ref": "#/$defs/sha40"},
     "release": {"$ref": "#/$defs/release"},
@@ -44,6 +44,22 @@
     "target_evidence": {"$ref": "#/$defs/target_evidence"},
     "observed_at": {"type": "string", "format": "date-time"}
   },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "disarmed-non-authoritative"},
+        "downstream_authority": {"const": false},
+        "execution_authority": {"const": false}
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "downstream-authorized"},
+        "downstream_authority": {"const": true},
+        "execution_authority": {"type": "boolean"}
+      }
+    }
+  ],
   "allOf": [
     {
       "if": {"properties": {"state": {"enum": ["no-op-exact", "public-live"]}}, "required": ["state"]},

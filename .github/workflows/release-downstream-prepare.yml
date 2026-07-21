@@ -1,0 +1,296 @@
+name: Prepare exact downstream payloads
+
+on:
+  workflow_call:
+    inputs:
+      receipt_run_id: {required: true, type: string}
+      plan_artifact_id: {required: true, type: string}
+      plan_artifact_digest: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+      release_kind: {required: true, type: string}
+    outputs:
+      payload_artifact_ids:
+        value: ${{ jobs.prepare.outputs.payload_artifact_ids }}
+      payload_artifact_digests:
+        value: ${{ jobs.prepare.outputs.payload_artifact_digests }}
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: Materialize exact channel payloads
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      payload_artifact_ids: ${{ steps.payload-map.outputs.ids }}
+      payload_artifact_digests: ${{ steps.payload-map.outputs.digests }}
+    env:
+      RMUX_RECEIPT_RUN_ID: ${{ inputs.receipt_run_id }}
+      RMUX_PLAN_ARTIFACT_ID: ${{ inputs.plan_artifact_id }}
+      RMUX_PLAN_ARTIFACT_DIGEST: ${{ inputs.plan_artifact_digest }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_ID: ${{ inputs.release_id }}
+      RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
+    steps:
+      - name: Reject malformed payload preparation inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
+          test "$GITHUB_REPOSITORY_ID" = "1239918790"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          for value in "$RMUX_RECEIPT_RUN_ID" "$RMUX_PLAN_ARTIFACT_ID" "$RMUX_RELEASE_ID"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          [[ "$RMUX_PLAN_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$RMUX_RELEASE_KIND" =~ ^(rc|stable)$ ]]
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Verify exact plan artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
+            --artifact-id "$RMUX_PLAN_ARTIFACT_ID" \
+            --name "rmux-downstream-plan-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_PLAN_ARTIFACT_DIGEST" \
+            --expected-workflow-id 316435347 \
+            --expected-workflow-path .github/workflows/release-receipt.yml \
+            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            --allow-running-current-run \
+            --max-attempts 1
+
+      - name: Download only the exact downstream plan artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.plan_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-downstream-prepare/plan
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - id: candidate
+        name: Verify plan bundle and resolve candidate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-downstream-prepare"
+          python3 - "$root/plan" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          root, output_path = map(pathlib.Path, sys.argv[1:])
+          expected = {
+              "downstream-channel-plan.json",
+              "publication-receipt-predicate.json",
+              "receipt-reference.json",
+          }
+          paths = list(root.rglob("*"))
+          if any(path.is_symlink() for path in paths):
+              raise SystemExit("downstream plan artifact contains a symlink")
+          names = {path.relative_to(root).as_posix() for path in paths if path.is_file()}
+          if names != expected:
+              raise SystemExit(f"downstream plan artifact files differ: {sorted(names)}")
+          sys.path.insert(0, "scripts/release")
+          from downstream_plan import validate_plan
+          from strict_json import read_json_object
+          plan = read_json_object(root / "downstream-channel-plan.json", "downstream plan")
+          validate_plan(plan)
+          predicate = read_json_object(root / "publication-receipt-predicate.json", "receipt predicate")
+          candidate = predicate.get("candidate", {})
+          fields = {
+              "candidate_run_id": candidate.get("candidate_run_id"),
+              "manifest_run_id": candidate.get("manifest_run_id"),
+              "manifest_artifact_id": candidate.get("manifest_artifact_id"),
+              "manifest_artifact_digest": candidate.get("manifest_artifact_digest"),
+              "manifest_sha256": candidate.get("manifest_sha256"),
+          }
+          if any(value is None for value in fields.values()):
+              raise SystemExit("receipt candidate identity is incomplete")
+          with output_path.open("a", encoding="utf-8") as output:
+              for name, value in fields.items():
+                  output.write(f"{name}={value}\n")
+          PY
+
+      - name: Verify exact candidate manifest artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "${{ steps.candidate.outputs.manifest_run_id }}" \
+            --artifact-id "${{ steps.candidate.outputs.manifest_artifact_id }}" \
+            --name "rmux-candidate-manifest-${{ steps.candidate.outputs.candidate_run_id }}" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "${{ steps.candidate.outputs.manifest_artifact_digest }}" \
+            --expected-workflow-path .github/workflows/release-shadow.yml \
+            --max-attempts 1
+
+      - name: Download only the exact candidate manifest artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ steps.candidate.outputs.manifest_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-downstream-prepare/manifest
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate.outputs.manifest_run_id }}
+
+      - id: artifacts
+        name: Resolve all eleven candidate artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-downstream-prepare"
+          test "$(sha256sum "$root/manifest/candidate-manifest.json" | cut -d' ' -f1)" = \
+            "${{ steps.candidate.outputs.manifest_sha256 }}"
+          scripts/release/verify-candidate-artifacts.py resolve \
+            --repository "$GITHUB_REPOSITORY" \
+            --candidate-run-id "${{ steps.candidate.outputs.candidate_run_id }}" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --output "$root/candidate-artifacts.json"
+          python3 - "$root/candidate-artifacts.json" "$GITHUB_OUTPUT" <<'PY'
+          import json, pathlib, sys
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          artifacts = value.get("artifacts", [])
+          if len(artifacts) != 11:
+              raise SystemExit("candidate artifact count differs")
+          ids = ",".join(str(item["artifact_id"]) for item in artifacts)
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"ids={ids}\n")
+          PY
+
+      - name: Download only all eleven resolved candidate artifact IDs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ steps.artifacts.outputs.ids }}
+          path: ${{ runner.temp }}/rmux-downstream-prepare/candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate.outputs.candidate_run_id }}
+
+      - id: gh
+        name: Install the pinned candidate attestation verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/rmux-gh-2.93.0"
+          scripts/release/install-gh-2.93.0.sh "$install_root"
+          echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Verify and materialize exact channel payloads
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-downstream-prepare"
+          manifest="$root/manifest/candidate-manifest.json"
+          fast_run_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fast_run_id"])' "$manifest")
+          release_intent_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["release_intent_id"])' "$manifest")
+          scripts/release/verify-candidate-artifacts.py verify-downloaded \
+            --repository "$GITHUB_REPOSITORY" \
+            --candidate-run-id "${{ steps.candidate.outputs.candidate_run_id }}" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" --fast-run-id "$fast_run_id" \
+            --release-intent-id "$release_intent_id" --planned-release-ref "$RMUX_RELEASE_REF" \
+            --release-kind "$RMUX_RELEASE_KIND" --resolution "$root/candidate-artifacts.json" \
+            --downloads-dir "$root/candidate" --output "$root/verified-candidate.json"
+          scripts/release/verify-candidate-attestations.sh \
+            "$root/candidate" "$RMUX_EXPECTED_SOURCE_SHA" "${{ steps.gh.outputs.binary }}"
+          mkdir "$root/release"
+          scripts/release/stage-candidate-release.py \
+            --manifest "$manifest" --resolution "$root/candidate-artifacts.json" \
+            --downloads-dir "$root/candidate" \
+            --candidate-run-id "${{ steps.candidate.outputs.candidate_run_id }}" \
+            --source-sha "$RMUX_EXPECTED_SOURCE_SHA" --output "$root/release/assets"
+          scripts/release/stage-downstream-payloads.py \
+            --manifest "$manifest" --downloads-dir "$root/candidate" \
+            --release-assets-dir "$root/release/assets" \
+            --plan "$root/plan/downstream-channel-plan.json" \
+            --release-date "$(date -u +%F)" --output-dir "$root/payloads"
+
+      - id: payload-apt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-apt_rpm-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/apt_rpm", if-no-files-found: error, retention-days: 7, compression-level: 0}
+      - id: payload-chocolatey
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-chocolatey-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/chocolatey", if-no-files-found: error, retention-days: 7, compression-level: 0}
+      - id: payload-crates
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-crates_io-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/crates_io", if-no-files-found: error, retention-days: 7, compression-level: 0}
+      - id: payload-homebrew-core
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-homebrew_core-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/homebrew_core", if-no-files-found: error, retention-days: 7, compression-level: 0}
+      - id: payload-homebrew-tap
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-homebrew_tap-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/homebrew_tap", if-no-files-found: error, retention-days: 7, compression-level: 0}
+      - id: payload-scoop
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-scoop-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/scoop", if-no-files-found: error, retention-days: 7, compression-level: 0}
+      - id: payload-snap-candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-snap_candidate-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/snap_candidate", if-no-files-found: error, retention-days: 7, compression-level: 0}
+      - id: payload-snap-stable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-snap_stable-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/snap_stable", if-no-files-found: error, retention-days: 7, compression-level: 0}
+      - id: payload-web-share
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-web_share-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/web_share", if-no-files-found: error, retention-days: 7, compression-level: 0}
+      - id: payload-winget
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with: {name: "rmux-downstream-winget-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}", path: "${{ runner.temp }}/rmux-downstream-prepare/payloads/winget", if-no-files-found: error, retention-days: 7, compression-level: 0}
+
+      - id: payload-map
+        name: Export exact payload artifact maps
+        shell: bash
+        env:
+          APT_RPM_ID: ${{ steps.payload-apt.outputs.artifact-id }}
+          APT_RPM_DIGEST: ${{ steps.payload-apt.outputs.artifact-digest }}
+          CHOCOLATEY_ID: ${{ steps.payload-chocolatey.outputs.artifact-id }}
+          CHOCOLATEY_DIGEST: ${{ steps.payload-chocolatey.outputs.artifact-digest }}
+          CRATES_IO_ID: ${{ steps.payload-crates.outputs.artifact-id }}
+          CRATES_IO_DIGEST: ${{ steps.payload-crates.outputs.artifact-digest }}
+          HOMEBREW_CORE_ID: ${{ steps.payload-homebrew-core.outputs.artifact-id }}
+          HOMEBREW_CORE_DIGEST: ${{ steps.payload-homebrew-core.outputs.artifact-digest }}
+          HOMEBREW_TAP_ID: ${{ steps.payload-homebrew-tap.outputs.artifact-id }}
+          HOMEBREW_TAP_DIGEST: ${{ steps.payload-homebrew-tap.outputs.artifact-digest }}
+          SCOOP_ID: ${{ steps.payload-scoop.outputs.artifact-id }}
+          SCOOP_DIGEST: ${{ steps.payload-scoop.outputs.artifact-digest }}
+          SNAP_CANDIDATE_ID: ${{ steps.payload-snap-candidate.outputs.artifact-id }}
+          SNAP_CANDIDATE_DIGEST: ${{ steps.payload-snap-candidate.outputs.artifact-digest }}
+          SNAP_STABLE_ID: ${{ steps.payload-snap-stable.outputs.artifact-id }}
+          SNAP_STABLE_DIGEST: ${{ steps.payload-snap-stable.outputs.artifact-digest }}
+          WEB_SHARE_ID: ${{ steps.payload-web-share.outputs.artifact-id }}
+          WEB_SHARE_DIGEST: ${{ steps.payload-web-share.outputs.artifact-digest }}
+          WINGET_ID: ${{ steps.payload-winget.outputs.artifact-id }}
+          WINGET_DIGEST: ${{ steps.payload-winget.outputs.artifact-digest }}
+        run: |
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json, os, pathlib, sys
+          names = ("apt_rpm", "chocolatey", "crates_io", "homebrew_core", "homebrew_tap", "scoop", "snap_candidate", "snap_stable", "web_share", "winget")
+          keys = {name: name.upper() for name in names}
+          ids = {name: int(os.environ[f"{keys[name]}_ID"]) for name in names}
+          digests = {name: f"sha256:{os.environ[f'{keys[name]}_DIGEST']}" for name in names}
+          with pathlib.Path(sys.argv[1]).open("a", encoding="utf-8") as output:
+              output.write(f"ids={json.dumps(ids, separators=(',', ':'), sort_keys=True)}\n")
+              output.write(f"digests={json.dumps(digests, separators=(',', ':'), sort_keys=True)}\n")
+          PY

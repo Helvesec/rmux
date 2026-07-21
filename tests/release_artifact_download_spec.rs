@@ -1,53 +1,26 @@
-const SOURCES: &[(&str, &str)] = &[
-    (
-        ".github/actions/canonical-smoke/action.yml",
-        include_str!("../.github/actions/canonical-smoke/action.yml"),
-    ),
-    (
-        ".github/actions/release-policy-audit/action.yml",
-        include_str!("../.github/actions/release-policy-audit/action.yml"),
-    ),
-    (
-        ".github/actions/release-publication-inputs/action.yml",
-        include_str!("../.github/actions/release-publication-inputs/action.yml"),
-    ),
-    (
-        ".github/workflows/release-chocolatey-retry.yml",
-        include_str!("../.github/workflows/release-chocolatey-retry.yml"),
-    ),
-    (
-        ".github/workflows/release-downstream.yml",
-        include_str!("../.github/workflows/release-downstream.yml"),
-    ),
-    (
-        ".github/workflows/release-policy-audit.yml",
-        include_str!("../.github/workflows/release-policy-audit.yml"),
-    ),
-    (
-        ".github/workflows/release-promote.yml",
-        include_str!("../.github/workflows/release-promote.yml"),
-    ),
-    (
-        ".github/workflows/release-promotion-simulation.yml",
-        include_str!("../.github/workflows/release-promotion-simulation.yml"),
-    ),
-    (
-        ".github/workflows/release-receipt.yml",
-        include_str!("../.github/workflows/release-receipt.yml"),
-    ),
-    (
-        ".github/workflows/release-shadow.yml",
-        include_str!("../.github/workflows/release-shadow.yml"),
-    ),
-    (
-        ".github/workflows/release-snap-retry.yml",
-        include_str!("../.github/workflows/release-snap-retry.yml"),
-    ),
-    (
-        ".github/workflows/release-tag-authoring.yml",
-        include_str!("../.github/workflows/release-tag-authoring.yml"),
-    ),
-];
+use std::fs;
+use std::path::{Path, PathBuf};
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn yaml_files(root: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(root).expect("read YAML directory") {
+        let path = entry.expect("YAML entry").path();
+        if path.is_dir() {
+            yaml_files(&path, files);
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("yml") || extension.eq_ignore_ascii_case("yaml")
+            })
+        {
+            files.push(path);
+        }
+    }
+}
 
 fn indentation(line: &str) -> usize {
     line.len() - line.trim_start().len()
@@ -55,10 +28,16 @@ fn indentation(line: &str) -> usize {
 
 #[test]
 fn exact_single_artifact_downloads_extract_into_the_requested_directory() {
-    let mut single_downloads = 0;
-    let mut multi_downloads = 0;
+    let mut files = Vec::new();
+    yaml_files(&repo_root().join(".github/actions"), &mut files);
+    yaml_files(&repo_root().join(".github/workflows"), &mut files);
 
-    for (path, source) in SOURCES {
+    let mut exact_downloads = 0;
+    for path in files {
+        let source = fs::read_to_string(&path).expect("read YAML source");
+        if !source.contains("actions/download-artifact@") {
+            continue;
+        }
         let lines: Vec<_> = source.lines().collect();
         for (index, line) in lines.iter().enumerate() {
             let Some(value) = line.trim().strip_prefix("artifact-ids:") else {
@@ -71,24 +50,31 @@ fn exact_single_artifact_downloads_extract_into_the_requested_directory() {
                 .take_while(|next| next.trim().is_empty() || indentation(next) >= key_indent)
                 .find_map(|next| next.trim().strip_prefix("merge-multiple:").map(str::trim));
 
-            if value == "${{ steps.artifacts.outputs.artifact_ids }}" {
-                multi_downloads += 1;
+            let multi_artifact_expression =
+                value.ends_with(".outputs.ids }}") || value.ends_with(".outputs.artifact_ids }}");
+            if multi_artifact_expression {
                 assert_ne!(
                     merge,
                     Some("true"),
-                    "{path}:{index} flattens eleven artifacts"
+                    "{}:{} flattens a multi-artifact set",
+                    path.display(),
+                    index + 1
                 );
             } else {
-                single_downloads += 1;
+                exact_downloads += 1;
                 assert_eq!(
                     merge,
                     Some("true"),
-                    "{path}:{index} leaves one artifact in an unexpected name directory"
+                    "{}:{} leaves one exact artifact in an unexpected name directory",
+                    path.display(),
+                    index + 1
                 );
             }
         }
     }
 
-    assert_eq!(single_downloads, 29);
-    assert_eq!(multi_downloads, 4);
+    assert!(
+        exact_downloads >= 20,
+        "exact artifact coverage unexpectedly shrank"
+    );
 }

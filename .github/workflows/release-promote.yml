@@ -1,7 +1,7 @@
-name: Disarmed exact-SHA GitHub Release promoter
+name: Disarmed exact-tag GitHub Release promoter
 
 on:
-  workflow_call:
+  workflow_dispatch:
     inputs:
       candidate_run_id: {required: true, type: string}
       candidate_manifest_run_id: {required: true, type: string}
@@ -17,19 +17,16 @@ on:
       expected_source_sha: {required: true, type: string}
       release_intent_id: {required: true, type: string}
       release_ref: {required: true, type: string}
-      release_kind: {required: true, type: string}
+      release_kind:
+        required: true
+        type: choice
+        options: [rc, stable]
       release_policy_sha256: {required: true, type: string}
       release_policy_contract_blob_oid: {required: true, type: string}
-      authorization_workflow_id: {required: true, type: string}
-    outputs:
-      authorization_artifact_id:
-        value: ${{ jobs.authorize-promotion.outputs.authorization_artifact_id }}
-      authorization_artifact_digest:
-        value: ${{ jobs.authorize-promotion.outputs.authorization_artifact_digest }}
-      authorization_envelope_artifact_id:
-        value: ${{ jobs.authorize-promotion.outputs.envelope_artifact_id }}
-      authorization_envelope_artifact_digest:
-        value: ${{ jobs.authorize-promotion.outputs.envelope_artifact_digest }}
+      snap_candidate_opt_in:
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: rmux-release-promote-${{ inputs.release_ref }}
@@ -79,6 +76,9 @@ jobs:
           [[ "$RMUX_TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
           [[ "$RMUX_RELEASE_KIND" =~ ^(rc|stable)$ ]]
+          test "$GITHUB_REF" = "refs/tags/$RMUX_RELEASE_REF"
+          test "$GITHUB_REF_NAME" = "$RMUX_RELEASE_REF"
+          test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
           test "$GITHUB_RUN_ATTEMPT" = 1
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -106,7 +106,11 @@ jobs:
             --artifact-id "$RMUX_TAG_ARTIFACT_ID" \
             --name "rmux-signed-tag-$RMUX_EXPECTED_SOURCE_SHA" \
             --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
-            --expected-digest "$RMUX_TAG_ARTIFACT_DIGEST" --max-attempts 1
+            --expected-digest "$RMUX_TAG_ARTIFACT_DIGEST" \
+            --expected-workflow-id 316435348 \
+            --expected-workflow-path .github/workflows/release-tag-authoring.yml \
+            --expected-event workflow_dispatch --expected-head-branch main \
+            --max-attempts 1
 
       - name: Download only exact candidate and signed-tag evidence IDs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -439,7 +443,7 @@ jobs:
       - name: Create and verify non-circular authorization predicate
         shell: bash
         env:
-          RMUX_AUTHORIZATION_WORKFLOW_ID: ${{ inputs.authorization_workflow_id }}
+          RMUX_AUTHORIZATION_WORKFLOW_ID: "316435346"
         run: |
           set -euo pipefail
           if [[ ! "$RMUX_AUTHORIZATION_WORKFLOW_ID" =~ ^[1-9][0-9]*$ ]]; then
@@ -540,60 +544,45 @@ jobs:
           compression-level: 0
 
   publish:
-    name: Disabled atomic GitHub Release publication plan
+    name: Disabled atomic GitHub Release publication
     needs: [verify-candidate, policy-audit, authorize-promotion]
     if: ${{ false }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    environment: release-publication
+    uses: ./.github/workflows/release-github-publish.yml
     permissions:
       actions: read
       contents: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.expected_source_sha }}
-          persist-credentials: false
+    with:
+      candidate_run_id: ${{ inputs.candidate_run_id }}
+      candidate_manifest_run_id: ${{ inputs.candidate_manifest_run_id }}
+      candidate_manifest_artifact_id: ${{ inputs.candidate_manifest_artifact_id }}
+      candidate_manifest_artifact_digest: ${{ inputs.candidate_manifest_artifact_digest }}
+      candidate_manifest_sha256: ${{ inputs.candidate_manifest_sha256 }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_intent_id: ${{ inputs.release_intent_id }}
+      release_ref: ${{ inputs.release_ref }}
+      release_kind: ${{ inputs.release_kind }}
+      authorization_run_id: ${{ github.run_id }}
+      authorization_artifact_id: ${{ needs.authorize-promotion.outputs.authorization_artifact_id }}
+      authorization_artifact_digest: ${{ needs.authorize-promotion.outputs.authorization_artifact_digest }}
+      authorization_envelope_artifact_id: ${{ needs.authorize-promotion.outputs.envelope_artifact_id }}
+      authorization_envelope_artifact_digest: ${{ needs.authorize-promotion.outputs.envelope_artifact_digest }}
 
-      - name: Fail closed before obtaining publication authority
-        run: scripts/release/assert-release-capability.py github_release_publication
-
-      - name: Re-download and verify original candidate publication inputs
-        uses: ./.github/actions/release-publication-inputs
-        with:
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          candidate-run-id: ${{ inputs.candidate_run_id }}
-          manifest-run-id: ${{ inputs.candidate_manifest_run_id }}
-          manifest-artifact-id: ${{ inputs.candidate_manifest_artifact_id }}
-          manifest-artifact-digest: ${{ inputs.candidate_manifest_artifact_digest }}
-          manifest-sha256: ${{ inputs.candidate_manifest_sha256 }}
-          source-sha: ${{ inputs.expected_source_sha }}
-          release-intent-id: ${{ inputs.release_intent_id }}
-          release-ref: ${{ inputs.release_ref }}
-          release-kind: ${{ inputs.release_kind }}
-          authorization-run-id: ${{ github.run_id }}
-          authorization-artifact-id: ${{ needs.authorize-promotion.outputs.authorization_artifact_id }}
-          authorization-artifact-digest: ${{ needs.authorize-promotion.outputs.authorization_artifact_digest }}
-          envelope-artifact-id: ${{ needs.authorize-promotion.outputs.envelope_artifact_id }}
-          envelope-artifact-digest: ${{ needs.authorize-promotion.outputs.envelope_artifact_digest }}
-
-      - name: Prepare an exact read-only publication plan from original bytes
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/rmux-publication"
-          test -f "$root/authorization/promotion-authorization-predicate.json"
-          test -f "$root/envelope/promotion-authorization-envelope.json"
-          cp -- "$root/authorization/SHA256SUMS.sigstore.json" \
-            "$root/release-assets/SHA256SUMS.sigstore.json"
-          printf '# RMUX %s\n\nExact candidate `%s` from `%s`.\n' \
-            "${{ inputs.release_ref }}" "${{ inputs.candidate_run_id }}" \
-            "${{ inputs.expected_source_sha }}" > "$root/release-notes.md"
-          # PR8 alone may add execution mode after all capabilities and simulations pass.
-          python3 scripts/release/publish-github-release.py \
-            --predicate "$root/authorization/promotion-authorization-predicate.json" \
-            --envelope "$root/envelope/promotion-authorization-envelope.json" \
-            --assets-dir "$root/release-assets" \
-            --notes-file "$root/release-notes.md" \
-            --title "RMUX ${{ inputs.release_ref }}"
+  dispatch-receipt:
+    name: Disabled exact receipt-only dispatch
+    needs: [authorize-promotion, publish]
+    if: ${{ false }}
+    uses: ./.github/workflows/release-receipt-dispatch.yml
+    permissions:
+      actions: write
+      contents: read
+    with:
+      authorization_run_id: ${{ github.run_id }}
+      authorization_artifact_id: ${{ needs.authorize-promotion.outputs.authorization_artifact_id }}
+      authorization_artifact_digest: ${{ needs.authorize-promotion.outputs.authorization_artifact_digest }}
+      authorization_envelope_artifact_id: ${{ needs.authorize-promotion.outputs.envelope_artifact_id }}
+      authorization_envelope_artifact_digest: ${{ needs.authorize-promotion.outputs.envelope_artifact_digest }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ needs.publish.outputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+      release_kind: ${{ inputs.release_kind }}
+      snap_candidate_opt_in: ${{ inputs.snap_candidate_opt_in }}

@@ -39,6 +39,7 @@ from downstream_channels import (
     CHANNELS,
     CHANNEL_POLICY,
     file_hash,
+    load_contract,
     target_for_channel,
     write_object,
 )
@@ -87,6 +88,13 @@ HOSTS = {
     'snap_candidate': 'https://snapcraft.io/rmux',
     'snap_stable': 'https://snapcraft.io/rmux',
 }
+
+PRODUCERS = {}
+for channel, workflows in load_contract()['result_evidence']['producer_workflows'].items():
+    initial = [(path, workflow_id) for path, workflow_id in workflows.items() if '-retry.yml' not in path]
+    if len(initial) != 1:
+        raise RuntimeError(f'channel {channel} lacks one exact initial producer')
+    PRODUCERS[channel] = initial[0]
 
 def write_plan(root):
     plan = {
@@ -139,6 +147,7 @@ def write_reference(root, channel, plan_path, plan, offset):
         'observed_at': '2026-07-20T00:00:20Z',
     }
     run_id = 100 + offset
+    workflow_path, workflow_id = PRODUCERS[channel]
     reference = {
         'schema_version': 1,
         'status': 'disarmed-non-authoritative',
@@ -153,8 +162,8 @@ def write_reference(root, channel, plan_path, plan, offset):
         'producer': {
             'run_id': run_id,
             'run_attempt': 1,
-            'workflow_id': 200,
-            'workflow_path': '.github/workflows/release-downstream.yml',
+            'workflow_id': workflow_id,
+            'workflow_path': workflow_path,
             'runner_group_id': 0,
             'runner_group_name': 'GitHub Actions',
             'runner_image': ('windows-latest' if channel == 'chocolatey' else 'ubuntu-22.04'),

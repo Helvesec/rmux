@@ -141,7 +141,7 @@ def fixture(root):
         'run_attempt': 1,
         'workflow_id': 316435347,
         'workflow_path': '.github/workflows/release-receipt.yml',
-        'job_workflow_path': '.github/workflows/release-downstream.yml',
+        'job_workflow_path': '.github/workflows/release-downstream-prepare.yml',
         'runner_group_id': 0,
         'runner_group_name': 'GitHub Actions',
         'runner_image': 'ubuntu-22.04',

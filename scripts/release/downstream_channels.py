@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from strict_json import read_json_object
+from release_authority import (
+    DISARMED_EVIDENCE_STATUS,
+    DOWNSTREAM_AUTHORIZED_STATUS,
+    evidence_status,
+    validate_evidence_authority,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_DIR = ROOT / ".github" / "release"
@@ -18,7 +24,8 @@ CHANNEL_CONTRACT = RELEASE_DIR / "downstream-channel-contract.json"
 CHANNEL_POLICY = RELEASE_DIR / "channel-policy.json"
 REPOSITORY_CONTRACT = RELEASE_DIR / "downstream-repositories.json"
 REPOSITORY_ID = 1239918790
-STATUS = "disarmed-non-authoritative"
+STATUS = DISARMED_EVIDENCE_STATUS
+AUTHORIZED_STATUS = DOWNSTREAM_AUTHORIZED_STATUS
 CHANNELS = (
     "apt_rpm",
     "chocolatey",
@@ -44,6 +51,40 @@ RESULT_PREDICATE_TYPE = (
     "https://rmux.io/attestations/release-downstream-channel-result/v1"
 )
 RESULT_ENVELOPE_TYPE = "https://rmux.io/envelopes/release-downstream-channel-result/v1"
+
+
+def downstream_status(active: bool) -> str:
+    return evidence_status(active, AUTHORIZED_STATUS)
+
+
+def validate_downstream_authority(
+    value: dict[str, Any], *, include_execution: bool = False
+) -> bool:
+    fields = ["downstream_authority"]
+    if include_execution:
+        fields.append("execution_authority")
+    return validate_evidence_authority(
+        value,
+        authority_fields=fields,
+        active_status=AUTHORIZED_STATUS,
+    )
+
+
+def validate_execution_authority(
+    value: dict[str, Any], *, downstream_active: bool, include_enabled: bool = False
+) -> bool:
+    fields = ["execution_authority"]
+    if include_enabled:
+        fields.append("execution_enabled")
+    authorities = [value.get(field) for field in fields]
+    if any(type(authority) is not bool for authority in authorities):
+        raise ValueError("execution authority fields must be boolean")
+    if len(set(authorities)) != 1:
+        raise ValueError("execution authority fields disagree")
+    active = authorities[0]
+    if active and not downstream_active:
+        raise ValueError("execution authority cannot exceed downstream authority")
+    return active
 
 
 def read_object(path: Path, label: str) -> dict[str, Any]:
@@ -221,13 +262,9 @@ def validate_receipt_reference(value: dict[str, Any]) -> dict[str, Any]:
         },
         "receipt reference",
     )
-    if (
-        value["schema_version"] != 1
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
-        or value["repository_id"] != REPOSITORY_ID
-    ):
-        raise ValueError("publication receipt reference must remain disarmed")
+    validate_downstream_authority(value)
+    if value["schema_version"] != 1 or value["repository_id"] != REPOSITORY_ID:
+        raise ValueError("publication receipt reference identity changed")
     source_sha = match(value["source_git_sha"], SHA40, "receipt source SHA")
     release = validate_release(value["release"], source_sha)
     embedded = {
@@ -253,11 +290,15 @@ def load_contract() -> dict[str, Any]:
         raise ValueError("downstream channels must be exhaustive, sorted, and unique")
     result_evidence = contract.get("result_evidence", {})
     retry = contract.get("retry", {})
+    receipt_gate = contract.get("receipt_gate", {})
     if (
-        contract.get("status") != "review-only-disarmed"
-        or contract.get("activation", {}).get("required_value") is not False
-        or contract.get("execution", {}).get("privileged_job_condition") != "false"
+        contract.get("status") != "atomic-authority-bound"
+        or contract.get("activation", {}).get("required_value")
+        != "matches-atomic-ledger"
+        or contract.get("execution", {}).get("privileged_job_condition")
+        != "release-activation-ledger"
         or contract.get("execution", {}).get("rmux_io_last") is not True
+        or receipt_gate.get("required_downstream_authority") != "matches-atomic-ledger"
         or retry.get("native_rebuild_allowed") is not False
         or retry.get("maximum_retry_depth") != 1
         or retry.get("retryable_states") != ["failed-transient", "prepared"]
@@ -342,6 +383,7 @@ def validate_request(value: dict[str, Any]) -> dict[str, Any]:
             "release",
             "receipt",
             "plan_sha256",
+            "plan_entry",
             "channel",
             "operation",
             "retry_depth",
@@ -358,25 +400,65 @@ def validate_request(value: dict[str, Any]) -> dict[str, Any]:
         },
         "channel request",
     )
+    downstream_active = validate_downstream_authority(value)
+    execution_active = validate_execution_authority(
+        value,
+        downstream_active=downstream_active,
+        include_enabled=True,
+    )
     if (
         value["schema_version"] != 1
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
-        or value["execution_authority"] is not False
-        or value["execution_enabled"] is not False
         or value["repository_id"] != REPOSITORY_ID
         or value["rebuild_native"] is not False
     ):
-        raise ValueError("channel request must remain exactly disarmed")
+        raise ValueError("channel request identity changed")
     source_sha = match(value["source_git_sha"], SHA40, "request source SHA")
     validate_release(value["release"], source_sha)
     validate_embedded_receipt(value["receipt"], source_sha, value["release"])
     channel = value["channel"]
     if channel not in CHANNELS:
         raise ValueError("channel request names an unknown channel")
-    contracted = contract_channels()[channel]
-    if contracted["payload_ready"] is not True or contracted["blockers"] != []:
-        raise ValueError("channel request retains unresolved activation blockers")
+    plan_entry = value["plan_entry"]
+    if not isinstance(plan_entry, dict):
+        raise ValueError("channel request plan entry must be an object")
+    exact_keys(
+        plan_entry,
+        {
+            "name",
+            "phase",
+            "policy_decision",
+            "explicit_opt_in",
+            "execution_decision",
+            "execution_enabled",
+            "payload_ready",
+            "payload_roles",
+            "depends_on",
+            "blockers",
+        },
+        "channel request plan entry",
+    )
+    if (
+        plan_entry["name"] != channel
+        or type(plan_entry["execution_enabled"]) is not bool
+    ):
+        raise ValueError("channel request plan entry identity changed")
+    decision = plan_entry["execution_decision"]
+    expected_execution = decision == "enabled"
+    if decision not in {"blocked", "denied", "disarmed", "enabled"}:
+        raise ValueError("channel request plan decision is invalid")
+    if (
+        plan_entry["execution_enabled"] is not expected_execution
+        or execution_active is not expected_execution
+        or (decision == "enabled" and not downstream_active)
+        or (decision == "disarmed" and downstream_active)
+        or (
+            decision in {"disarmed", "enabled"}
+            and (
+                plan_entry["payload_ready"] is not True or plan_entry["blockers"] != []
+            )
+        )
+    ):
+        raise ValueError("channel request authority differs from its exact plan entry")
     from downstream_payload import validate_payload_document
 
     validate_payload_document(

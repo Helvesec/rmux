@@ -32,7 +32,12 @@ WRITER_APP = {
         "metadata": "read",
     },
 }
-READY_REPOSITORIES = {"homebrew-rmux", "rmux-packages", "scoop-rmux"}
+READY_REPOSITORIES = {
+    "homebrew-rmux",
+    "rmux-packages",
+    "rmux-web-share",
+    "scoop-rmux",
+}
 
 
 def load_contract() -> dict[str, Any]:

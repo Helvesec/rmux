@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/release-publication-receipt-predicate-v1.json",
-  "title": "RMUX disarmed publication receipt predicate",
-  "description": "Review-only immutable-release receipt. It MUST NOT authorize downstream publication before the separately reviewed PR8 cut-over.",
-  "x-rmux-status": "disarmed-non-authoritative",
+  "title": "RMUX publication receipt predicate",
+  "description": "Immutable-release receipt whose downstream authority must match the tracked atomic release ledger.",
+  "x-rmux-status": "atomic-authority-bound",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -26,8 +26,8 @@
   "properties": {
     "schema_version": {"const": 1},
     "predicate_type": {"const": "https://rmux.io/attestations/release-publication-receipt/v1"},
-    "status": {"const": "disarmed-non-authoritative"},
-    "downstream_authority": {"const": false},
+    "status": {"enum": ["disarmed-non-authoritative", "downstream-authorized"]},
+    "downstream_authority": {"type": "boolean"},
     "repository_id": {"const": 1239918790},
     "source_git_sha": {"$ref": "#/$defs/sha40"},
     "release": {
@@ -81,6 +81,20 @@
     },
     "sha256sums_sha256": {"$ref": "#/$defs/sha256"}
   },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "disarmed-non-authoritative"},
+        "downstream_authority": {"const": false}
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "downstream-authorized"},
+        "downstream_authority": {"const": true}
+      }
+    }
+  ],
   "$defs": {
     "positive": {"type": "integer", "minimum": 1},
     "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},

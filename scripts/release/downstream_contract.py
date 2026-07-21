@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the static, disarmed downstream release contract."""
+"""Validate the static downstream release contract."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from strict_json import read_json_object
+from downstream_workflow_contract import validate_downstream_workflows
 
 
 CHANNELS = (
@@ -107,6 +108,27 @@ RESULT_STATES = {
     "public-live",
     "submitted",
 }
+RESULT_PRODUCERS = {
+    "apt_rpm": {".github/workflows/release-linux-repository-publish.yml": 316435347},
+    "chocolatey": {
+        ".github/workflows/release-chocolatey-channel.yml": 316435347,
+        ".github/workflows/release-chocolatey-retry.yml": 316439352,
+    },
+    "crates_io": {".github/workflows/release-crates-channel.yml": 316435347},
+    "homebrew_core": {".github/workflows/release-policy-channel.yml": 316435347},
+    "homebrew_tap": {
+        ".github/workflows/release-owned-repository-channel.yml": 316435347
+    },
+    "rmux_io": {".github/workflows/release-rmux-io-channel.yml": 316435347},
+    "scoop": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+    "snap_candidate": {
+        ".github/workflows/release-snap-channel.yml": 316435347,
+        ".github/workflows/release-snap-retry.yml": 316439354,
+    },
+    "snap_stable": {".github/workflows/release-policy-channel.yml": 316435347},
+    "web_share": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+    "winget": {".github/workflows/release-policy-channel.yml": 316435347},
+}
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -148,7 +170,7 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
     contract = _read(release / "downstream-channel-contract.json")
     if (
         contract.get("schema_version") != 1
-        or contract.get("status") != "review-only-disarmed"
+        or contract.get("status") != "atomic-authority-bound"
         or contract.get("repository")
         != {"id": 1239918790, "full_name": "Helvesec/rmux"}
     ):
@@ -157,10 +179,10 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
     if activation != {
         "ledger": ".github/release/release-activation.json",
         "capability": "downstream_channels",
-        "required_value": False,
+        "required_value": "matches-atomic-ledger",
         "runtime_override_allowed": False,
     }:
-        raise ValueError("downstream activation contract must remain false")
+        raise ValueError("downstream activation contract lost its atomic binding")
     receipt = contract.get("receipt_gate", {})
     if (
         receipt.get("workflow_path") != ".github/workflows/release-receipt.yml"
@@ -172,16 +194,16 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         or receipt.get("attestation_subject_name") != "release-state.json"
         or receipt.get("attestation_subject_in_bundle") is not True
         or receipt.get("activation_blockers") != []
-        or receipt.get("required_downstream_authority") is not False
+        or receipt.get("required_downstream_authority") != "matches-atomic-ledger"
     ):
-        raise ValueError("downstream receipt gate is not exact and disarmed")
+        raise ValueError("downstream receipt gate is not exact and authority-bound")
     execution = contract.get("execution", {})
     if (
         execution.get("only_trigger") != "workflow_call"
         or execution.get("public_callers") != 0
         or execution.get("required_caller_repository") != "Helvesec/rmux"
         or execution.get("required_caller_repository_id") != 1239918790
-        or execution.get("privileged_job_condition") != "false"
+        or execution.get("privileged_job_condition") != "release-activation-ledger"
         or execution.get("maximum_parallel_channels") != 4
         or execution.get("github_hosted_only") is not True
         or execution.get("native_rebuild_allowed") is not False
@@ -198,7 +220,11 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         if retry.get(key) is not True:
             raise ValueError(f"downstream retry lost {key}")
     if (
-        retry.get("actions_run_attempt") != 1
+        retry.get("entry_workflow_path")
+        != ".github/workflows/release-channel-retry.yml"
+        or retry.get("entry_trigger") != "workflow_dispatch"
+        or retry.get("channels") != ["chocolatey", "snap_candidate"]
+        or retry.get("actions_run_attempt") != 1
         or retry.get("actions_rerun_allowed") is not False
         or retry.get("native_rebuild_allowed") is not False
     ):
@@ -214,7 +240,10 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         "producer": {
             "workflow_id": 316435347,
             "workflow_path": ".github/workflows/release-receipt.yml",
-            "job_workflow_path": ".github/workflows/release-downstream.yml",
+            "job_workflow_paths": {
+                "default": ".github/workflows/release-downstream-prepare.yml",
+                "rmux_io": ".github/workflows/release-rmux-io-payload.yml",
+            },
             "required_run_attempt": 1,
         },
         "activation_blockers": [],
@@ -236,6 +265,7 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
         or result.get("pre_site_result_count") != len(CHANNELS) - 1
         or result.get("final_result_count") != len(CHANNELS)
         or result.get("rmux_io_pre_site_digest_field") != "pre_site_summary_sha256"
+        or result.get("producer_workflows") != RESULT_PRODUCERS
     ):
         raise ValueError("downstream result evidence readiness changed")
     channels = contract.get("channels")
@@ -268,13 +298,16 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
                 or not expected_roles <= canonical_roles
             ):
                 raise ValueError(f"{name} must consume its sealed canonical payload")
+    retryable = [entry["name"] for entry in channels if entry.get("retryable") is True]
+    if retryable != ["chocolatey", "snap_candidate"]:
+        raise ValueError("only implemented exact-byte channels may advertise retry")
     snap_stable = next(item for item in channels if item["name"] == "snap_stable")
     if (
-        snap_stable.get("payload_ready") is not False
-        or snap_stable.get("payload_roles") != []
+        snap_stable.get("payload_ready") is not True
+        or snap_stable.get("payload_roles") != ["policy-decision"]
         or snap_stable.get("blockers") != ["denied_until_support_decision"]
     ):
-        raise ValueError("Snap stable must remain explicitly unsupported")
+        raise ValueError("Snap stable must retain explicit denial evidence")
     rmux_io = next(item for item in channels if item["name"] == "rmux_io")
     if (
         rmux_io.get("phase") != 3
@@ -287,14 +320,9 @@ def _validate_channel_contract(release: Path, policy: dict[str, Any]) -> None:
     ):
         raise ValueError("rmux.io must remain the blocked final channel")
     by_name = {item["name"]: item for item in channels}
-    for name in ("apt_rpm", "homebrew_tap", "scoop"):
+    for name in ("apt_rpm", "homebrew_tap", "scoop", "web_share"):
         if by_name[name].get("blockers") != []:
             raise ValueError(f"configured channel still blocked: {name}")
-    if by_name["web_share"].get("blockers") != [
-        "floating_actions_present",
-        "unprotected_secret_deployment_workflow",
-    ]:
-        raise ValueError("Web Share legacy channel blockers changed")
 
 
 def _validate_repositories(release: Path) -> None:
@@ -339,7 +367,12 @@ def _validate_repositories(release: Path) -> None:
             record.get("required_path"),
             record.get("ownership"),
         )
-        expected_ready = key in {"homebrew-rmux", "rmux-packages", "scoop-rmux"}
+        expected_ready = key in {
+            "homebrew-rmux",
+            "rmux-packages",
+            "rmux-web-share",
+            "scoop-rmux",
+        }
         if actual != expected or record.get("activation_ready") is not expected_ready:
             raise ValueError(f"downstream repository identity drifted: {key}")
     rmux_io = records["rmux.io"]
@@ -369,14 +402,9 @@ def _validate_repositories(release: Path) -> None:
             or "downstream_writer_app_missing" in blockers
         ):
             raise ValueError(f"public downstream protection snapshot drifted: {key}")
-    for key in ("homebrew-rmux", "rmux-packages", "scoop-rmux"):
+    for key in ("homebrew-rmux", "rmux-packages", "rmux-web-share", "scoop-rmux"):
         if records[key].get("blockers") != []:
             raise ValueError(f"ready downstream repository still has blockers: {key}")
-    if records["rmux-web-share"].get("blockers") != [
-        "floating_actions_present",
-        "unprotected_secret_deployment_workflow",
-    ]:
-        raise ValueError("Web Share legacy deployment blockers disappeared")
 
 
 def _validate_schemas(release: Path) -> None:
@@ -384,11 +412,11 @@ def _validate_schemas(release: Path) -> None:
     for filename in SCHEMAS:
         schema = _read(schemas / filename)
         if (
-            schema.get("x-rmux-status") != "disarmed-non-authoritative"
+            schema.get("x-rmux-status") != "atomic-authority-bound"
             or schema.get("additionalProperties") is not False
-            or "MUST NOT authorize" not in schema.get("description", "")
+            or "authority" not in schema.get("description", "").lower()
         ):
-            raise ValueError(f"{filename} is not explicitly disarmed")
+            raise ValueError(f"{filename} is not atomically authority-bound")
         required = schema.get("required")
         properties = schema.get("properties", {})
         if not isinstance(required, list) or not isinstance(properties, dict):
@@ -396,9 +424,18 @@ def _validate_schemas(release: Path) -> None:
         for field in ("downstream_authority", "execution_authority"):
             if (
                 field not in required
-                or properties.get(field, {}).get("const") is not False
+                or properties.get(field, {}).get("type") != "boolean"
             ):
-                raise ValueError(f"{filename} lost false {field}")
+                raise ValueError(f"{filename} lost boolean {field}")
+        authority_rules = json.dumps(schema.get("oneOf", []), sort_keys=True)
+        for expected in (
+            "disarmed-non-authoritative",
+            "downstream-authorized",
+            '"const": false',
+            '"const": true',
+        ):
+            if expected not in authority_rules:
+                raise ValueError(f"{filename} lost atomic authority rule {expected}")
     request = _read(schemas / "downstream-channel-request.schema.json")
     if "pre_site_summary_sha256" not in request[
         "required"
@@ -419,7 +456,7 @@ def _validate_schemas(release: Path) -> None:
         or producer["workflow_path"].get("const")
         != ".github/workflows/release-receipt.yml"
         or producer["job_workflow_path"].get("const")
-        != ".github/workflows/release-downstream.yml"
+        != ".github/workflows/release-downstream-prepare.yml"
         or producer["runner_group_id"].get("const") != 0
         or payload["properties"]["retention_expires_at"].get("format") != "date-time"
     ):
@@ -458,142 +495,10 @@ def _validate_schemas(release: Path) -> None:
         raise ValueError("downstream summary no longer keeps rmux.io last")
 
 
-def _validate_workflows(root: Path) -> None:
-    paths = (
-        root / ".github/workflows/release-downstream.yml",
-        root / ".github/workflows/release-chocolatey-retry.yml",
-        root / ".github/workflows/release-snap-retry.yml",
-    )
-    for path in paths:
-        text = path.read_text(encoding="utf-8")
-        if "on:\n  workflow_call:" not in text or "permissions: {}" not in text:
-            raise ValueError(f"{path.name} must remain reusable and default-deny")
-        for forbidden in (
-            "\n  push:",
-            "\n  workflow_dispatch:",
-            "contents: write",
-            "id-token: write",
-            "secrets:",
-            "environment:",
-            "larger-runner",
-        ):
-            if forbidden in text:
-                raise ValueError(f"{path.name} contains forbidden value {forbidden}")
-        if "runs-on: self-hosted" in text or "\n      - self-hosted" in text:
-            raise ValueError(f"{path.name} gained a self-hosted runner label")
-    workflows = root / ".github/workflows"
-    for path in workflows.glob("*.y*ml"):
-        text = path.read_text(encoding="utf-8")
-        for line in text.splitlines():
-            normalized = line.strip().removeprefix("- ").strip()
-            if not normalized.startswith("uses:"):
-                continue
-            target = normalized.split(":", 1)[1].strip().split()[0].strip("'\"")
-            lowered = target.lower()
-            for downstream in paths:
-                relative = f"./.github/workflows/{downstream.name}".lower()
-                absolute = f"helvesec/rmux/.github/workflows/{downstream.name}@".lower()
-                if lowered == relative or lowered.startswith(absolute):
-                    raise ValueError(f"{path.name} calls disarmed {downstream.name}")
-    main = paths[0].read_text(encoding="utf-8")
-    receipt_origin = "--expected-workflow-path .github/workflows/release-receipt.yml"
-    promotion_origin = "--expected-workflow-path .github/workflows/release-promote.yml"
-    workflow_identity_binding = (
-        'test "$RMUX_RECEIPT_RUN_WORKFLOW_ID" = "$RMUX_RECEIPT_WORKFLOW_ID"'
-    )
-    if (
-        main.count(receipt_origin) != 2
-        or main.count(promotion_origin) != 0
-        or main.count(workflow_identity_binding) != 1
-    ):
-        raise ValueError("downstream receipt artifacts must come from release-receipt")
-    for path in paths:
-        workflow = path.read_text(encoding="utf-8")
-        if (
-            'test "$GITHUB_REPOSITORY" = "Helvesec/rmux"' not in workflow
-            or 'test "$GITHUB_REPOSITORY_ID" = "1239918790"' not in workflow
-        ):
-            raise ValueError(f"{path.name} does not reject external callers")
-    if "max-parallel: 3" not in main:
-        raise ValueError("downstream Linux fanout must leave one slot for Chocolatey")
-    for required in (
-        "Disabled pre-site aggregation wiring",
-        "Disabled rmux.io writer",
-        "Disabled final aggregation wiring",
-    ):
-        if required not in main:
-            raise ValueError(
-                "downstream unavailable phase acquired an authoritative name"
-            )
-    for overstated in ("Consume ten exact", "Consume eleven exact"):
-        if overstated in main:
-            raise ValueError(
-                "downstream unavailable aggregation overstates its evidence"
-            )
-    summary = main.find("\n  channel-summary:\n")
-    site = main.find("\n  deploy-rmux-io:\n")
-    final = main.find("\n  final-channel-summary:\n")
-    if not 0 < summary < site < final:
-        raise ValueError(
-            "disabled rmux.io placeholder must remain between aggregation placeholders"
-        )
-    if "needs: [prepare-plan, channel-summary]" not in main[site:final]:
-        raise ValueError(
-            "disabled rmux.io placeholder lost its pre-site aggregation dependency"
-        )
-    if main.count("verify-receipt-attestation.py") != 1:
-        raise ValueError("downstream plan must verify one exact signed receipt")
-    for path in paths[1:]:
-        retry = path.read_text(encoding="utf-8")
-        if (
-            retry.count("verify-receipt-attestation.py") != 1
-            or retry.count(receipt_origin) != 2
-            or retry.count(promotion_origin) != 2
-            or retry.count(workflow_identity_binding) != 1
-            or retry.count("--deny-self-hosted-runners") != 1
-            or retry.count("live payload artifact identity differs") != 1
-            or retry.count("--include-retention") != 1
-            or retry.count(".github/workflows/release-downstream.yml") != 1
-            or retry.count("prior result is not safe for one exact retry") != 1
-            or retry.count("prior result started outside the original request TTL") != 1
-            or retry.count('request["retry_depth"] != 0') != 1
-            or retry.count('"request_sha256": result["request_sha256"]') != 1
-            or retry.count('"mutation_started": result["mutation_started"]') != 1
-            or retry.count('"remote_request_id": result["remote_request_id"]') != 1
-        ):
-            raise ValueError(
-                f"{path.name} must verify receipt, result, and payload provenance"
-            )
-        if f".github/workflows/{path.name}" in retry:
-            raise ValueError(f"{path.name} must allow at most one retry")
-    receipt_verifier = (
-        root / "scripts/release/verify-receipt-attestation.py"
-    ).read_text(encoding="utf-8")
-    if "--deny-self-hosted-runners" not in receipt_verifier:
-        raise ValueError("receipt verifier lost its GitHub-hosted runner gate")
-    for path in paths:
-        for script in (
-            "channel-policy.py",
-            "channel-request.py",
-            "channel-result.py",
-            "channel-result-reference.py",
-            "channel-summary.py",
-            "downstream_channels.py",
-            "downstream_result_document.py",
-            "downstream_result_reference.py",
-            "downstream_summary.py",
-            "verify-downstream-repository.py",
-            "verify-channel-result-attestation.py",
-        ):
-            script_path = root / "scripts/release" / script
-            if len(script_path.read_text(encoding="utf-8").splitlines()) >= 600:
-                raise ValueError(f"{script} exceeds the release helper size budget")
-
-
 def validate_downstream_contracts(root: Path) -> None:
     release = root / ".github/release"
     policy = _validate_policy(release)
     _validate_channel_contract(release, policy)
     _validate_repositories(release)
     _validate_schemas(release)
-    _validate_workflows(root)
+    validate_downstream_workflows(root)

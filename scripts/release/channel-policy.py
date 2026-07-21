@@ -12,7 +12,7 @@ from downstream_channels import (
     CHANNELS,
     CHANNEL_POLICY,
     REPOSITORY_ID,
-    STATUS,
+    downstream_status,
     file_hash,
     read_object,
     timestamp,
@@ -20,11 +20,15 @@ from downstream_channels import (
     write_object,
 )
 from downstream_plan import expected_channel_entries
+from release_authority import load_authority
 
 
 def expected_plan(args: argparse.Namespace) -> dict[str, Any]:
     reference = read_object(args.receipt_reference, "publication receipt reference")
     validate_receipt_reference(reference)
+    authority = load_authority()
+    if reference["downstream_authority"] is not authority.active:
+        raise ValueError("receipt authority differs from the tracked activation ledger")
     release = reference["release"]
     if release["kind"] != args.release_kind:
         raise ValueError("requested release kind differs from the immutable receipt")
@@ -32,7 +36,9 @@ def expected_plan(args: argparse.Namespace) -> dict[str, Any]:
     if created < timestamp(reference["verified_at"], "receipt verified_at"):
         raise ValueError("channel plan predates its publication receipt")
     entries = expected_channel_entries(
-        args.release_kind, args.snap_candidate_opt_in
+        args.release_kind,
+        args.snap_candidate_opt_in,
+        authority_active=authority.active,
     )
     receipt = {
         **reference["receipt"],
@@ -45,10 +51,10 @@ def expected_plan(args: argparse.Namespace) -> dict[str, Any]:
     }
     return {
         "schema_version": 1,
-        "status": STATUS,
-        "downstream_authority": False,
-        "execution_authority": False,
-        "execution_enabled": False,
+        "status": downstream_status(authority.active),
+        "downstream_authority": authority.active,
+        "execution_authority": authority.active,
+        "execution_enabled": authority.active,
         "repository_id": REPOSITORY_ID,
         "source_git_sha": reference["source_git_sha"],
         "release": release,

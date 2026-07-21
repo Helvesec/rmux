@@ -1,0 +1,181 @@
+name: Build exact signed Linux repositories
+
+on:
+  workflow_call:
+    inputs:
+      receipt_run_id: {required: true, type: string}
+      payload_artifact_id: {required: true, type: string}
+      payload_artifact_digest: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+    outputs:
+      repository_artifact_id:
+        value: ${{ jobs.build.outputs.repository_artifact_id }}
+      repository_artifact_digest:
+        value: ${{ jobs.build.outputs.repository_artifact_digest }}
+
+permissions: {}
+
+jobs:
+  build:
+    name: Sign retained APT and RPM repository trees
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      repository_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      repository_artifact_digest: sha256:${{ steps.upload.outputs.artifact-digest }}
+    env:
+      RMUX_RECEIPT_RUN_ID: ${{ inputs.receipt_run_id }}
+      RMUX_PAYLOAD_ARTIFACT_ID: ${{ inputs.payload_artifact_id }}
+      RMUX_PAYLOAD_ARTIFACT_DIGEST: ${{ inputs.payload_artifact_digest }}
+      RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_ID: ${{ inputs.release_id }}
+      RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+    steps:
+      - name: Reject malformed Linux repository inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
+          test "$GITHUB_REPOSITORY_ID" = "1239918790"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          for value in "$RMUX_RECEIPT_RUN_ID" "$RMUX_PAYLOAD_ARTIFACT_ID" "$RMUX_RELEASE_ID"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          [[ "$RMUX_PAYLOAD_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RMUX_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Verify exact APT/RPM payload artifact identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/release/actions-artifact.py verify
+          --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID"
+          --artifact-id "$RMUX_PAYLOAD_ARTIFACT_ID"
+          --name "rmux-downstream-apt_rpm-payload-$RMUX_SOURCE_SHA-$RMUX_RELEASE_ID"
+          --expected-source-sha "$RMUX_SOURCE_SHA"
+          --expected-digest "$RMUX_PAYLOAD_ARTIFACT_DIGEST"
+          --expected-workflow-id 316435347
+          --expected-workflow-path .github/workflows/release-receipt.yml
+          --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF"
+          --allow-running-current-run
+          --max-attempts 1
+
+      - name: Download only the exact APT/RPM payload artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.payload_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-linux-repository/input
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - name: Install repository metadata tooling
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends createrepo-c gnupg rpm
+
+      - name: Import distinct repository signing keys
+        shell: bash
+        env:
+          RMUX_APT_GPG_PRIVATE_KEY: ${{ secrets.RMUX_APT_GPG_PRIVATE_KEY }}
+          RMUX_APT_GPG_KEY: ${{ secrets.RMUX_APT_GPG_KEY }}
+          RMUX_RPM_GPG_PRIVATE_KEY: ${{ secrets.RMUX_RPM_GPG_PRIVATE_KEY }}
+          RMUX_RPM_GPG_KEY: ${{ secrets.RMUX_RPM_GPG_KEY }}
+          RMUX_RPM_REPO_GPG_PRIVATE_KEY: ${{ secrets.RMUX_RPM_REPO_GPG_PRIVATE_KEY }}
+          RMUX_RPM_REPO_GPG_KEY: ${{ secrets.RMUX_RPM_REPO_GPG_KEY }}
+        run: |
+          set -euo pipefail
+          for name in RMUX_APT_GPG_PRIVATE_KEY RMUX_APT_GPG_KEY RMUX_RPM_GPG_PRIVATE_KEY RMUX_RPM_GPG_KEY RMUX_RPM_REPO_GPG_PRIVATE_KEY RMUX_RPM_REPO_GPG_KEY; do
+            test -n "${!name:-}" || { echo "missing release secret: $name" >&2; exit 1; }
+          done
+          install -m 700 -d ~/.gnupg
+          printf '%s\n' "$RMUX_APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          printf '%s\n' "$RMUX_RPM_GPG_PRIVATE_KEY" | gpg --batch --import
+          printf '%s\n' "$RMUX_RPM_REPO_GPG_PRIVATE_KEY" | gpg --batch --import
+          for key in "$RMUX_APT_GPG_KEY" "$RMUX_RPM_GPG_KEY" "$RMUX_RPM_REPO_GPG_KEY"; do
+            gpg --batch --list-secret-keys "$key" >/dev/null
+          done
+          rpm_fingerprint="$(gpg --batch --with-colons --fingerprint "$RMUX_RPM_GPG_KEY" | awk -F: '$1 == "fpr" { print $10; exit }')"
+          repo_fingerprint="$(gpg --batch --with-colons --fingerprint "$RMUX_RPM_REPO_GPG_KEY" | awk -F: '$1 == "fpr" { print $10; exit }')"
+          test -n "$rpm_fingerprint" && test -n "$repo_fingerprint"
+          test "$rpm_fingerprint" != "$repo_fingerprint"
+
+      - name: Authenticate retained history and generate signed repositories
+        shell: bash
+        env:
+          RMUX_APT_GPG_KEY: ${{ secrets.RMUX_APT_GPG_KEY }}
+          RMUX_RPM_GPG_KEY: ${{ secrets.RMUX_RPM_GPG_KEY }}
+          RMUX_RPM_REPO_GPG_KEY: ${{ secrets.RMUX_RPM_REPO_GPG_KEY }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-linux-repository"
+          version="${RMUX_RELEASE_REF#v}"
+          git clone --depth 1 --branch main \
+            https://github.com/Helvesec/rmux-packages.git "$root/history"
+          base="$(git -C "$root/history" rev-parse HEAD)"
+          printf '%s\n' "$base" > "$root/PACKAGE_REPOSITORY_BASE"
+          mkdir "$root/packages" "$root/output"
+          find "$root/input" -maxdepth 1 -type f \( -name '*.deb' -o -name '*.rpm' \) \
+            -exec cp -- {} "$root/packages/" \;
+          test "$(find "$root/packages" -maxdepth 1 -type f | wc -l)" -eq 4
+          scripts/retain-linux-package-history.py \
+            --repository-dir "$root/history" --staging-dir "$root/packages" \
+            --apt-signing-key "$RMUX_APT_GPG_KEY" \
+            --rpm-signing-key "$RMUX_RPM_GPG_KEY" --current-version "$version" \
+            --apt-architecture amd64 --apt-architecture arm64 \
+            --rpm-architecture x86_64 --rpm-architecture aarch64
+          scripts/generate-apt-repository.sh \
+            --input-dir "$root/packages" --output-dir "$root/output/debian" \
+            --suite stable --component main --architecture amd64 --architecture arm64 \
+            --signing-key "$RMUX_APT_GPG_KEY"
+          scripts/generate-rpm-repository.sh \
+            --input-dir "$root/packages" --output-dir "$root/output/rpm" \
+            --baseurl https://packages.rmux.io/rpm \
+            --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
+            --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \
+            --rpm-signing-key "$RMUX_RPM_GPG_KEY" --rpm-signing-version "$version" \
+            --repo-signing-key "$RMUX_RPM_REPO_GPG_KEY"
+          gpg --armor --export "$RMUX_APT_GPG_KEY" > "$root/output/debian/rmux.asc"
+          gpg --armor --export "$RMUX_RPM_GPG_KEY" > "$root/output/rpm/RPM-GPG-KEY-rmux"
+          gpg --armor --export "$RMUX_RPM_REPO_GPG_KEY" > "$root/output/rpm/RPM-GPG-KEY-rmux-repository"
+          cp "$root/PACKAGE_REPOSITORY_BASE" "$root/output/PACKAGE_REPOSITORY_BASE"
+
+      - name: Add static package host files and exact checksum inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-linux-repository/output"
+          cp scripts/release/package-repository-index.html "$root/index.html"
+          cp scripts/release/package-repository-headers "$root/_headers"
+          (
+            cd "$root"
+            find debian rpm -type f -print0 | LC_ALL=C sort -z | \
+              xargs -0 sha256sum > SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
+          test -s "$root/debian/dists/stable/InRelease"
+          test -s "$root/rpm/repodata/repomd.xml.asc"
+
+      - id: upload
+        name: Upload the exact signed repository tree
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-downstream-apt_rpm-signed-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}
+          path: ${{ runner.temp }}/rmux-linux-repository/output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

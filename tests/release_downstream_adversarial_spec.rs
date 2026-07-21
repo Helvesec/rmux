@@ -81,9 +81,61 @@ for opted_in in (False, True):
     snap = next(entry for entry in entries if entry['name'] == 'snap_candidate')
     if snap['explicit_opt_in'] is not opted_in:
         raise SystemExit(f'Snap candidate opt-in was not preserved: {opted_in!r}')
-    expected = 'disarmed' if opted_in else 'denied'
+    expected = 'blocked' if opted_in else 'denied'
     if snap['execution_decision'] != expected:
         raise SystemExit(f'Snap candidate decision differs: {snap!r}')
+"#
+    ));
+}
+
+#[test]
+fn active_authority_is_atomic_and_only_enables_eligible_channels() {
+    assert_fixture(&format!(
+        "{PRELUDE}\n{}",
+        r#"
+from downstream_plan import expected_channel_entries
+from release_authority import validate_activation, validate_evidence_authority
+
+authority = validate_activation({
+    'schema_version': 1,
+    'status': 'active',
+    'description': 'test authority',
+    'cutover_pr': 'PR8',
+    'runtime_override_allowed': False,
+    'capabilities': {
+        'downstream_channels': True,
+        'github_release_publication': True,
+        'policy_audit': True,
+        'promotion_authorization': True,
+        'publication_receipt': True,
+        'signed_tag_creation': True,
+    },
+})
+if not authority.active:
+    raise SystemExit('active ledger did not produce active authority')
+entries = expected_channel_entries('stable', False, authority_active=True)
+by_name = {entry['name']: entry for entry in entries}
+for channel in ('apt_rpm', 'chocolatey', 'crates_io', 'homebrew_tap', 'scoop', 'web_share'):
+    if by_name[channel]['execution_decision'] != 'enabled' or by_name[channel]['execution_enabled'] is not True:
+        raise SystemExit(f'eligible active channel was not enabled: {channel}')
+for channel in ('homebrew_core', 'rmux_io', 'snap_candidate', 'snap_stable', 'winget'):
+    if by_name[channel]['execution_enabled'] is not False:
+        raise SystemExit(f'blocked or denied channel gained authority: {channel}')
+
+for forged in (
+    {'status': 'downstream-authorized', 'downstream_authority': False},
+    {'status': 'disarmed-non-authoritative', 'downstream_authority': True},
+):
+    try:
+        validate_evidence_authority(
+            forged,
+            authority_fields=('downstream_authority',),
+            active_status='downstream-authorized',
+        )
+    except ValueError:
+        pass
+    else:
+        raise SystemExit('mixed evidence authority was accepted')
 "#
     ));
 }

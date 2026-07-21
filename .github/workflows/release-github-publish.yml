@@ -1,0 +1,115 @@
+name: Atomic immutable GitHub Release publisher
+
+on:
+  workflow_call:
+    inputs:
+      candidate_run_id: {required: true, type: string}
+      candidate_manifest_run_id: {required: true, type: string}
+      candidate_manifest_artifact_id: {required: true, type: string}
+      candidate_manifest_artifact_digest: {required: true, type: string}
+      candidate_manifest_sha256: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_intent_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+      release_kind: {required: true, type: string}
+      authorization_run_id: {required: true, type: string}
+      authorization_artifact_id: {required: true, type: string}
+      authorization_artifact_digest: {required: true, type: string}
+      authorization_envelope_artifact_id: {required: true, type: string}
+      authorization_envelope_artifact_digest: {required: true, type: string}
+    outputs:
+      release_id:
+        value: ${{ jobs.publish.outputs.release_id }}
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish one immutable GitHub Release from original bytes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: release-publication
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      release_id: ${{ steps.publish.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Fail closed before obtaining publication authority
+        run: scripts/release/assert-release-capability.py github_release_publication
+
+      - name: Re-download and verify original candidate publication inputs
+        uses: ./.github/actions/release-publication-inputs
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          candidate-run-id: ${{ inputs.candidate_run_id }}
+          manifest-run-id: ${{ inputs.candidate_manifest_run_id }}
+          manifest-artifact-id: ${{ inputs.candidate_manifest_artifact_id }}
+          manifest-artifact-digest: ${{ inputs.candidate_manifest_artifact_digest }}
+          manifest-sha256: ${{ inputs.candidate_manifest_sha256 }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          release-ref: ${{ inputs.release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          authorization-run-id: ${{ inputs.authorization_run_id }}
+          authorization-artifact-id: ${{ inputs.authorization_artifact_id }}
+          authorization-artifact-digest: ${{ inputs.authorization_artifact_digest }}
+          envelope-artifact-id: ${{ inputs.authorization_envelope_artifact_id }}
+          envelope-artifact-digest: ${{ inputs.authorization_envelope_artifact_digest }}
+
+      - id: gh
+        name: Install the pinned publication verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/rmux-publication-gh"
+          scripts/release/install-gh-2.93.0.sh "$install_root"
+          echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+      - id: publish
+        name: Execute the single-state-transition publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-publication"
+          test -f "$root/authorization/promotion-authorization-predicate.json"
+          test -f "$root/envelope/promotion-authorization-envelope.json"
+          cp -- "$root/authorization/SHA256SUMS.sigstore.json" \
+            "$root/release-assets/SHA256SUMS.sigstore.json"
+          printf '# RMUX %s\n\nExact candidate `%s` from `%s`.\n' \
+            "${{ inputs.release_ref }}" "${{ inputs.candidate_run_id }}" \
+            "${{ inputs.expected_source_sha }}" > "$root/release-notes.md"
+          python3 scripts/release/publish-github-release.py \
+            --predicate "$root/authorization/promotion-authorization-predicate.json" \
+            --envelope "$root/envelope/promotion-authorization-envelope.json" \
+            --assets-dir "$root/release-assets" \
+            --notes-file "$root/release-notes.md" \
+            --title "RMUX ${{ inputs.release_ref }}" \
+            --execute --token "$GH_TOKEN" \
+            --gh-verifier "${{ steps.gh.outputs.binary }}" \
+            > "$root/publication-result.json"
+          python3 - "$root/publication-result.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          release_id = value.get("release_id")
+          if (
+              value.get("mode") != "execute"
+              or value.get("published") is not True
+              or type(release_id) is not int
+              or release_id <= 0
+          ):
+              raise SystemExit("publisher did not return one published release identity")
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"release_id={release_id}\n")
+          PY

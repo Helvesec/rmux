@@ -1,0 +1,224 @@
+name: Aggregate exact downstream channel results
+
+on:
+  workflow_call:
+    inputs:
+      phase: {required: true, type: string}
+      receipt_run_id: {required: true, type: string}
+      plan_artifact_id: {required: true, type: string}
+      plan_artifact_digest: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+      pre_site_artifact_id: {required: false, type: string, default: ""}
+      pre_site_artifact_digest: {required: false, type: string, default: ""}
+    outputs:
+      summary_artifact_id:
+        value: ${{ jobs.aggregate.outputs.summary_artifact_id }}
+      summary_artifact_digest:
+        value: ${{ jobs.aggregate.outputs.summary_artifact_digest }}
+      summary_sha256:
+        value: ${{ jobs.aggregate.outputs.summary_sha256 }}
+
+permissions: {}
+
+jobs:
+  aggregate:
+    name: Aggregate exact ${{ inputs.phase }} channel results
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      summary_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      summary_artifact_digest: sha256:${{ steps.upload.outputs.artifact-digest }}
+      summary_sha256: ${{ steps.summary.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - id: paths
+        name: Validate summary identity and allocate paths
+        shell: bash
+        env:
+          RMUX_PHASE: ${{ inputs.phase }}
+          RMUX_RUN_ID: ${{ inputs.receipt_run_id }}
+          RMUX_PLAN_ID: ${{ inputs.plan_artifact_id }}
+          RMUX_PLAN_DIGEST: ${{ inputs.plan_artifact_digest }}
+          RMUX_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          RMUX_RELEASE_ID: ${{ inputs.release_id }}
+          RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+          RMUX_PRE_SITE_ID: ${{ inputs.pre_site_artifact_id }}
+          RMUX_PRE_SITE_DIGEST: ${{ inputs.pre_site_artifact_digest }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
+          test "$GITHUB_REPOSITORY_ID" = "1239918790"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          [[ "$RMUX_PHASE" =~ ^(pre-site|final)$ ]]
+          for value in "$RMUX_RUN_ID" "$RMUX_PLAN_ID" "$RMUX_RELEASE_ID"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          [[ "$RMUX_PLAN_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RMUX_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          if [ "$RMUX_PHASE" = final ]; then
+            [[ "$RMUX_PRE_SITE_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$RMUX_PRE_SITE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          else
+            test -z "$RMUX_PRE_SITE_ID" && test -z "$RMUX_PRE_SITE_DIGEST"
+          fi
+          root="$RUNNER_TEMP/rmux-channel-summary-$RMUX_PHASE"
+          test ! -e "$root"
+          mkdir -p "$root/plan" "$root/references" "$root/pre-site"
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+
+      - name: Verify and download the exact plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="${{ steps.paths.outputs.root }}"
+          scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}" \
+            --artifact-id "${{ inputs.plan_artifact_id }}" \
+            --name "rmux-downstream-plan-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}" \
+            --expected-source-sha "${{ inputs.expected_source_sha }}" \
+            --expected-digest "${{ inputs.plan_artifact_digest }}" \
+            --expected-workflow-id 316435347 \
+            --expected-workflow-path .github/workflows/release-receipt.yml \
+            --expected-event workflow_dispatch --expected-head-branch "${{ inputs.release_ref }}" \
+            --allow-running-current-run --max-attempts 1
+
+      - name: Download only the exact plan artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.plan_artifact_id }}
+          merge-multiple: true
+          path: ${{ steps.paths.outputs.root }}/plan
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - id: references
+        name: Resolve exact result reference artifact IDs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RMUX_PHASE: ${{ inputs.phase }}
+          RMUX_ROOT: ${{ steps.paths.outputs.root }}
+        run: |
+          set -euo pipefail
+          if [ "$RMUX_PHASE" = pre-site ]; then
+            channels=(apt_rpm chocolatey crates_io homebrew_core homebrew_tap scoop snap_candidate snap_stable web_share winget)
+          else
+            channels=(rmux_io)
+          fi
+          ids=()
+          for channel in "${channels[@]}"; do
+            name="rmux-downstream-$channel-result-reference-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}"
+            metadata="$RMUX_ROOT/$channel-reference-artifact.json"
+            for attempt in 1 2 3 4 5 6; do
+              if scripts/release/actions-artifact.py resolve \
+                --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}" \
+                --name "$name" --expected-source-sha "${{ inputs.expected_source_sha }}" \
+                > "$metadata"; then
+                break
+              fi
+              test "$attempt" -lt 6
+              sleep 2
+            done
+            ids+=("$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["artifact_id"])' "$metadata")")
+          done
+          (IFS=,; echo "ids=${ids[*]}") >> "$GITHUB_OUTPUT"
+
+      - name: Download only the exact result reference artifact IDs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ steps.references.outputs.ids }}
+          path: ${{ steps.paths.outputs.root }}/references
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - name: Verify and download the exact pre-site summary
+        if: inputs.phase == 'final'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/release/actions-artifact.py verify
+          --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}"
+          --artifact-id "${{ inputs.pre_site_artifact_id }}"
+          --name "rmux-downstream-pre-site-summary-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}"
+          --expected-source-sha "${{ inputs.expected_source_sha }}"
+          --expected-digest "${{ inputs.pre_site_artifact_digest }}"
+          --expected-workflow-id 316435347
+          --expected-workflow-path .github/workflows/release-receipt.yml
+          --expected-event workflow_dispatch --expected-head-branch "${{ inputs.release_ref }}"
+          --allow-running-current-run --max-attempts 1
+
+      - name: Download only the exact pre-site summary artifact ID
+        if: inputs.phase == 'final'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.pre_site_artifact_id }}
+          merge-multiple: true
+          path: ${{ steps.paths.outputs.root }}/pre-site
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - id: summary
+        name: Create and verify the exact channel summary
+        shell: bash
+        env:
+          RMUX_PHASE: ${{ inputs.phase }}
+          RMUX_ROOT: ${{ steps.paths.outputs.root }}
+        run: |
+          set -euo pipefail
+          scripts/release/assert-release-capability.py downstream_channels
+          scripts/release/verify-exact-file-set.py --root "$RMUX_ROOT/plan" \
+            --file downstream-channel-plan.json \
+            --file publication-receipt-predicate.json --file receipt-reference.json
+          if [ "$RMUX_PHASE" = pre-site ]; then
+            channels=(apt_rpm chocolatey crates_io homebrew_core homebrew_tap scoop snap_candidate snap_stable web_share winget)
+          else
+            channels=(rmux_io)
+          fi
+          arguments=()
+          for channel in "${channels[@]}"; do
+            name="rmux-downstream-$channel-result-reference-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}"
+            directory="$RMUX_ROOT/references/$name"
+            scripts/release/verify-exact-file-set.py --root "$directory" \
+              --file downstream-channel-result-reference.json
+            arguments+=(--result-reference "$channel=$directory/downstream-channel-result-reference.json")
+          done
+          if [ "$RMUX_PHASE" = final ]; then
+            scripts/release/verify-exact-file-set.py --root "$RMUX_ROOT/pre-site" \
+              --file pre-site-channel-summary.json
+            arguments+=(--pre-site-summary "$RMUX_ROOT/pre-site/pre-site-channel-summary.json")
+          fi
+          created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          output="$RMUX_ROOT/$RMUX_PHASE-channel-summary.json"
+          sha="$(scripts/release/channel-summary.py create \
+            --plan "$RMUX_ROOT/plan/downstream-channel-plan.json" --phase "$RMUX_PHASE" \
+            "${arguments[@]}" --created-at "$created_at" --output "$output")"
+          scripts/release/channel-summary.py verify \
+            --plan "$RMUX_ROOT/plan/downstream-channel-plan.json" --phase "$RMUX_PHASE" \
+            "${arguments[@]}" --created-at "$created_at" --document "$output" >/dev/null
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - id: upload
+        name: Upload the exact channel summary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-downstream-${{ inputs.phase }}-summary-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}
+          path: ${{ steps.paths.outputs.root }}/${{ inputs.phase }}-channel-summary.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

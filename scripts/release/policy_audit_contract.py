@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from release_authority import validate_activation
+
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
 PREPARER_WORKFLOW_PATH = ".github/workflows/release-policy-audit.yml"
@@ -63,14 +65,30 @@ API_GETS = (
     ),
     ("release_environment", "/repos/Helvesec/rmux/environments/release"),
     (
+        "release_environment_policies",
+        "/repos/Helvesec/rmux/environments/release/deployment-branch-policies?per_page=100&page=1",
+    ),
+    (
         "release_policy_audit",
         "/repos/Helvesec/rmux/environments/release-policy-audit",
+    ),
+    (
+        "release_policy_audit_policies",
+        "/repos/Helvesec/rmux/environments/release-policy-audit/deployment-branch-policies?per_page=100&page=1",
     ),
     (
         "release_publication",
         "/repos/Helvesec/rmux/environments/release-publication",
     ),
+    (
+        "release_publication_policies",
+        "/repos/Helvesec/rmux/environments/release-publication/deployment-branch-policies?per_page=100&page=1",
+    ),
     ("release_tagging", "/repos/Helvesec/rmux/environments/release-tagging"),
+    (
+        "release_tagging_policies",
+        "/repos/Helvesec/rmux/environments/release-tagging/deployment-branch-policies?per_page=100&page=1",
+    ),
     ("repository", "/repositories/1239918790"),
     (
         "self_hosted_runners",
@@ -82,14 +100,6 @@ API_GETS = (
         "/repos/Helvesec/rmux/rulesets/18792083",
     ),
 )
-CAPABILITIES = {
-    "downstream_channels",
-    "github_release_publication",
-    "policy_audit",
-    "promotion_authorization",
-    "publication_receipt",
-    "signed_tag_creation",
-}
 
 
 def read_object(path: Path, label: str) -> dict[str, Any]:
@@ -105,33 +115,6 @@ def read_object(path: Path, label: str) -> dict[str, Any]:
 def _positive(value: Any, label: str) -> None:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
-
-
-def validate_activation(value: dict[str, Any]) -> None:
-    expected_keys = {
-        "schema_version",
-        "status",
-        "description",
-        "cutover_pr",
-        "runtime_override_allowed",
-        "capabilities",
-    }
-    if set(value) != expected_keys:
-        raise ValueError("release activation ledger keys changed")
-    if (
-        value["schema_version"] != 1
-        or value["status"] != "disarmed"
-        or value["cutover_pr"] != "PR8"
-        or value["runtime_override_allowed"] is not False
-        or not isinstance(value["description"], str)
-        or not value["description"]
-    ):
-        raise ValueError("release activation ledger is not fail-closed")
-    capabilities = value["capabilities"]
-    if not isinstance(capabilities, dict) or set(capabilities) != CAPABILITIES:
-        raise ValueError("release activation capabilities changed")
-    if any(capabilities[name] is not False for name in CAPABILITIES):
-        raise ValueError("every release capability must remain false before PR8")
 
 
 def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
@@ -312,7 +295,9 @@ def validate_repository_contracts(root: Path) -> None:
         "PAT_TOKEN",
     ):
         if authority in workflow:
-            raise ValueError(f"policy audit preparer gained forbidden authority {authority}")
+            raise ValueError(
+                f"policy audit preparer gained forbidden authority {authority}"
+            )
     caller_paths: list[str] = []
     for candidate in sorted((root / ".github" / "workflows").glob("*.y*ml")):
         if candidate == workflow_path:
@@ -351,9 +336,9 @@ def validate_repository_contracts(root: Path) -> None:
     promote = (root / ".github/workflows/release-promote.yml").read_text(
         encoding="utf-8"
     )
-    simulation = (root / ".github/workflows/release-promotion-simulation.yml").read_text(
-        encoding="utf-8"
-    )
+    simulation = (
+        root / ".github/workflows/release-promotion-simulation.yml"
+    ).read_text(encoding="utf-8")
     promote_prepare = _job_block(promote, "prepare-policy-audit", "policy-audit")
     promote_audit = _job_block(promote, "policy-audit", "authorize-promotion")
     simulation_prepare = _job_block(simulation, "prepare-policy-audit", "policy-audit")
@@ -389,8 +374,13 @@ def validate_repository_contracts(root: Path) -> None:
         if any(marker not in audit for marker in required_audit):
             raise ValueError(f"privileged audit boundary changed in {caller_name}")
         if "secrets: inherit" in prepare or "secrets: inherit" in audit:
-            raise ValueError(f"policy audit secret inheritance appeared in {caller_name}")
-    if "if: ${{ false }}" not in promote_prepare or "if: ${{ false }}" not in promote_audit:
+            raise ValueError(
+                f"policy audit secret inheritance appeared in {caller_name}"
+            )
+    if (
+        "if: ${{ false }}" not in promote_prepare
+        or "if: ${{ false }}" not in promote_audit
+    ):
         raise ValueError("release promoter policy audit must remain disabled")
     if (
         "on:\n  workflow_dispatch:" not in simulation
@@ -406,13 +396,23 @@ def validate_repository_contracts(root: Path) -> None:
         "attestations: write",
     ):
         if authority in simulation:
-            raise ValueError(f"release simulation gained forbidden authority {authority}")
-    schema_names = (
+            raise ValueError(
+                f"release simulation gained forbidden authority {authority}"
+            )
+    activation_schema = read_object(
+        release / "schemas" / "release-activation.schema.json",
         "release-activation.schema.json",
+    )
+    if (
+        activation_schema.get("x-rmux-status") != "atomic-authority-ledger"
+        or activation_schema.get("additionalProperties") is not False
+        or len(activation_schema.get("oneOf", [])) != 2
+    ):
+        raise ValueError("release activation schema lost its atomic authority states")
+    for name in (
         "policy-audit-predicate.schema.json",
         "policy-audit-reference.schema.json",
-    )
-    for name in schema_names:
+    ):
         schema = read_object(release / "schemas" / name, name)
         if (
             schema.get("x-rmux-status") != "disarmed-non-authoritative"

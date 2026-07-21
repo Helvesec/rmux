@@ -1,0 +1,248 @@
+name: Seal exact downstream channel result
+description: Attest one channel observation and publish its exact result reference.
+
+inputs:
+  channel: {required: true}
+  prepared-root: {required: true}
+  state: {required: true}
+  started-at: {required: true}
+  mutation-started: {required: true}
+  remote-request-id: {required: false, default: ""}
+  target-evidence: {required: true}
+  source-sha: {required: true}
+  release-id: {required: true}
+  release-ref: {required: true}
+  producer-workflow-path: {required: true}
+  producer-workflow-id: {required: false, default: "316435347"}
+  runner-image: {required: true}
+
+outputs:
+  reference-artifact-id:
+    value: ${{ steps.reference-upload.outputs.artifact-id }}
+  reference-artifact-digest:
+    value: sha256:${{ steps.reference-upload.outputs.artifact-digest }}
+
+runs:
+  using: composite
+  steps:
+    - id: predicate
+      name: Create and verify the exact channel result predicate
+      shell: bash
+      env:
+        RMUX_CHANNEL: ${{ inputs.channel }}
+        RMUX_PREPARED_ROOT: ${{ inputs.prepared-root }}
+        RMUX_STATE: ${{ inputs.state }}
+        RMUX_STARTED_AT: ${{ inputs.started-at }}
+        RMUX_MUTATION_STARTED: ${{ inputs.mutation-started }}
+        RMUX_REMOTE_REQUEST_ID: ${{ inputs.remote-request-id }}
+        RMUX_TARGET_EVIDENCE: ${{ inputs.target-evidence }}
+        RMUX_PRODUCER_WORKFLOW_PATH: ${{ inputs.producer-workflow-path }}
+        RMUX_PRODUCER_WORKFLOW_ID: ${{ inputs.producer-workflow-id }}
+        RMUX_RUNNER_IMAGE: ${{ inputs.runner-image }}
+      run: |
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
+        test "$GITHUB_REPOSITORY_ID" = "1239918790"
+        test "$GITHUB_RUN_ATTEMPT" = 1
+        [[ "$RMUX_MUTATION_STARTED" =~ ^(true|false)$ ]]
+        root="$RMUX_PREPARED_ROOT"
+        test -f "$root/downstream-channel-request.json"
+        test -f "$root/channel-payload.json"
+        test -f "$root/plan/downstream-channel-plan.json"
+        test -f "$root/plan/receipt-reference.json"
+        test -f "$RMUX_TARGET_EVIDENCE"
+        [[ "$RMUX_PRODUCER_WORKFLOW_ID" =~ ^[1-9][0-9]*$ ]]
+        python3 - "$GITHUB_RUN_ID" "$RMUX_PRODUCER_WORKFLOW_ID" \
+          "$RMUX_PRODUCER_WORKFLOW_PATH" "$RMUX_RUNNER_IMAGE" \
+          "$root/result-producer.json" <<'PY'
+        import json
+        import pathlib
+        import sys
+
+        run_id, workflow_id, workflow_path, runner_image, output_path = sys.argv[1:]
+        value = {
+            "run_id": int(run_id),
+            "run_attempt": 1,
+            "workflow_id": int(workflow_id),
+            "workflow_path": workflow_path,
+            "runner_group_id": 0,
+            "runner_group_name": "GitHub Actions",
+            "runner_image": runner_image,
+        }
+        pathlib.Path(output_path).write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        PY
+        observed_at="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["observed_at"])' "$RMUX_TARGET_EVIDENCE")"
+        common=(
+          --request "$root/downstream-channel-request.json"
+          --producer "$root/result-producer.json" --state "$RMUX_STATE"
+          --started-at "$RMUX_STARTED_AT" --target-evidence "$RMUX_TARGET_EVIDENCE"
+          --observed-at "$observed_at"
+        )
+        if [ "$RMUX_MUTATION_STARTED" = true ]; then
+          common+=(--mutation-started)
+        fi
+        if [ -n "$RMUX_REMOTE_REQUEST_ID" ]; then
+          common+=(--remote-request-id "$RMUX_REMOTE_REQUEST_ID")
+        fi
+        scripts/release/channel-result.py create-predicate "${common[@]}" \
+          --output "$root/downstream-channel-result-predicate.json"
+        scripts/release/channel-result.py verify-predicate "${common[@]}" \
+          --document "$root/downstream-channel-result-predicate.json"
+        digest="$(sha256sum "$RMUX_TARGET_EVIDENCE" | cut -d' ' -f1)"
+        echo "subject_digest=$digest" >> "$GITHUB_OUTPUT"
+        echo "observed_at=$observed_at" >> "$GITHUB_OUTPUT"
+
+    - id: attestation
+      name: Attest the exact downstream target observation
+      uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+      with:
+        subject-name: downstream-channel-target-evidence.json
+        subject-digest: ${{ steps.predicate.outputs.subject_digest }}
+        predicate-type: https://rmux.io/attestations/release-downstream-channel-result/v1
+        predicate-path: ${{ inputs.prepared-root }}/downstream-channel-result-predicate.json
+        show-summary: false
+
+    - name: Assemble the exact result predicate bundle
+      shell: bash
+      env:
+        RMUX_PREPARED_ROOT: ${{ inputs.prepared-root }}
+        RMUX_TARGET_EVIDENCE: ${{ inputs.target-evidence }}
+      run: |
+        set -euo pipefail
+        root="$RMUX_PREPARED_ROOT"
+        bundle="$root/result-bundle"
+        test ! -e "$bundle"
+        mkdir "$bundle"
+        cp -- "$root/channel-payload.json" "$bundle/channel-payload.json"
+        cp -- "$root/plan/downstream-channel-plan.json" "$bundle/downstream-channel-plan.json"
+        cp -- "$root/downstream-channel-request.json" "$bundle/downstream-channel-request.json"
+        cp -- "$root/downstream-channel-result-predicate.json" "$bundle/downstream-channel-result-predicate.json"
+        cp -- "$root/plan/receipt-reference.json" "$bundle/receipt-reference.json"
+        cp -- "$RMUX_TARGET_EVIDENCE" "$bundle/downstream-channel-target-evidence.json"
+        cp -- "${{ steps.attestation.outputs.bundle-path }}" "$bundle/downstream-channel-result.sigstore.json"
+
+    - id: result-upload
+      name: Upload the exact result predicate bundle
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rmux-downstream-${{ inputs.channel }}-result-${{ inputs.source-sha }}-${{ inputs.release-id }}
+        path: ${{ inputs.prepared-root }}/result-bundle
+        if-no-files-found: error
+        retention-days: 7
+        compression-level: 0
+
+    - name: Resolve the exact result predicate artifact
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RMUX_PREPARED_ROOT: ${{ inputs.prepared-root }}
+      run: >-
+        scripts/release/actions-artifact.py resolve-id
+        --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"
+        --artifact-id "${{ steps.result-upload.outputs.artifact-id }}"
+        --name "rmux-downstream-${{ inputs.channel }}-result-${{ inputs.source-sha }}-${{ inputs.release-id }}"
+        --expected-source-sha "${{ inputs.source-sha }}" --max-attempts 6
+        --retry-delay-seconds 2
+        > "$RMUX_PREPARED_ROOT/result-artifact.json"
+
+    - name: Create and verify the non-circular result envelope
+      shell: bash
+      env:
+        RMUX_PREPARED_ROOT: ${{ inputs.prepared-root }}
+      run: |
+        set -euo pipefail
+        root="$RMUX_PREPARED_ROOT"
+        created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        common=(
+          --request "$root/downstream-channel-request.json"
+          --predicate "$root/downstream-channel-result-predicate.json"
+          --attestation-id "${{ steps.attestation.outputs.attestation-id }}"
+          --attestation-bundle "$root/result-bundle/downstream-channel-result.sigstore.json"
+          --bundle-artifact "$root/result-artifact.json" --created-at "$created_at"
+        )
+        scripts/release/channel-result.py create-envelope "${common[@]}" \
+          --output "$root/downstream-channel-result-envelope.json"
+        scripts/release/channel-result.py verify-envelope "${common[@]}" \
+          --document "$root/downstream-channel-result-envelope.json"
+
+    - id: envelope-upload
+      name: Upload the exact result envelope separately
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rmux-downstream-${{ inputs.channel }}-result-envelope-${{ inputs.source-sha }}-${{ inputs.release-id }}
+        path: ${{ inputs.prepared-root }}/downstream-channel-result-envelope.json
+        if-no-files-found: error
+        retention-days: 7
+        compression-level: 0
+
+    - name: Resolve the exact result envelope artifact
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RMUX_PREPARED_ROOT: ${{ inputs.prepared-root }}
+      run: >-
+        scripts/release/actions-artifact.py resolve-id
+        --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID"
+        --artifact-id "${{ steps.envelope-upload.outputs.artifact-id }}"
+        --name "rmux-downstream-${{ inputs.channel }}-result-envelope-${{ inputs.source-sha }}-${{ inputs.release-id }}"
+        --expected-source-sha "${{ inputs.source-sha }}" --max-attempts 6
+        --retry-delay-seconds 2
+        > "$RMUX_PREPARED_ROOT/envelope-artifact.json"
+
+    - id: gh
+      name: Install the pinned result attestation verifier
+      shell: bash
+      run: |
+        set -euo pipefail
+        install_root="$RUNNER_TEMP/rmux-gh-2.93.0-result-${{ inputs.channel }}"
+        scripts/release/install-gh-2.93.0.sh "$install_root"
+        echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+    - name: Verify the exact signed channel result
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RMUX_PREPARED_ROOT: ${{ inputs.prepared-root }}
+      run: >-
+        scripts/release/verify-channel-result-attestation.py
+        --gh "${{ steps.gh.outputs.binary }}"
+        --request "$RMUX_PREPARED_ROOT/downstream-channel-request.json"
+        --target-evidence "${{ inputs.target-evidence }}"
+        --bundle "$RMUX_PREPARED_ROOT/result-bundle/downstream-channel-result.sigstore.json"
+        --predicate "$RMUX_PREPARED_ROOT/downstream-channel-result-predicate.json"
+        --envelope "$RMUX_PREPARED_ROOT/downstream-channel-result-envelope.json"
+        --source-sha "${{ inputs.source-sha }}" --release-ref "${{ inputs.release-ref }}"
+        --channel "${{ inputs.channel }}"
+
+    - name: Create and verify the exact result reference
+      shell: bash
+      env:
+        RMUX_PREPARED_ROOT: ${{ inputs.prepared-root }}
+      run: |
+        set -euo pipefail
+        root="$RMUX_PREPARED_ROOT"
+        verified_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        common=(
+          --request "$root/downstream-channel-request.json"
+          --predicate "$root/downstream-channel-result-predicate.json"
+          --envelope "$root/downstream-channel-result-envelope.json"
+          --predicate-artifact "$root/result-artifact.json"
+          --envelope-artifact "$root/envelope-artifact.json"
+          --verified-at "$verified_at"
+        )
+        scripts/release/channel-result-reference.py create "${common[@]}" \
+          --output "$root/downstream-channel-result-reference.json"
+        scripts/release/channel-result-reference.py verify "${common[@]}" \
+          --document "$root/downstream-channel-result-reference.json"
+
+    - id: reference-upload
+      name: Upload the exact result reference
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rmux-downstream-${{ inputs.channel }}-result-reference-${{ inputs.source-sha }}-${{ inputs.release-id }}
+        path: ${{ inputs.prepared-root }}/downstream-channel-result-reference.json
+        if-no-files-found: error
+        retention-days: 7
+        compression-level: 0

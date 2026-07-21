@@ -151,112 +151,25 @@ jobs:
           --source-sha "$RMUX_EXPECTED_SOURCE_SHA"
           --release-ref "$RMUX_RELEASE_REF"
 
-      - name: Bind exact disarmed receipt evidence
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/rmux-downstream"
-          python3 - \
-            "$root/receipt/publication-receipt-predicate.json" \
-            "$root/receipt/publication-receipt.sigstore.json" \
-            "$root/envelope/publication-receipt-envelope.json" \
-            "$root/receipt-artifact.json" "$root/envelope-artifact.json" \
-            "$root/receipt-reference.json" <<'PY'
-          import hashlib
-          import json
-          import os
-          import pathlib
-          import sys
+      - name: Assert active downstream authority
+        run: scripts/release/assert-release-capability.py downstream_channels
 
-          predicate_path, bundle_path, envelope_path, receipt_meta_path, envelope_meta_path, output_path = map(pathlib.Path, sys.argv[1:])
-          expected_files = {
-              predicate_path.parent: {
-                  "publication-receipt-predicate.json",
-                  "publication-receipt.sigstore.json",
-                  "release-state.json",
-              },
-              envelope_path.parent: {"publication-receipt-envelope.json"},
-          }
-          for root, expected in expected_files.items():
-              paths = list(root.rglob("*"))
-              if any(path.is_symlink() for path in paths):
-                  raise SystemExit("receipt artifact contains a symlink")
-              names = {path.relative_to(root).as_posix() for path in paths if path.is_file()}
-              if names != expected:
-                  raise SystemExit(f"receipt artifact file set differs: {sorted(names)}")
-          predicate = json.loads(predicate_path.read_text(encoding="utf-8"))
-          envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
-          receipt_meta = json.loads(receipt_meta_path.read_text(encoding="utf-8"))
-          envelope_meta = json.loads(envelope_meta_path.read_text(encoding="utf-8"))
-          file_hash = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-          source = os.environ["RMUX_EXPECTED_SOURCE_SHA"]
-          release_id = int(os.environ["RMUX_RELEASE_ID"])
-          release_ref = os.environ["RMUX_RELEASE_REF"]
-          release_kind = os.environ["RMUX_RELEASE_KIND"]
-          receipt = predicate.get("receipt", {})
-          release = predicate.get("release", {})
-          if predicate.get("status") != "disarmed-non-authoritative" or predicate.get("downstream_authority") is not False:
-              raise SystemExit("receipt predicate acquired downstream authority")
-          if predicate.get("repository_id") != 1239918790 or predicate.get("source_git_sha") != source:
-              raise SystemExit("receipt predicate repository or source differs")
-          if release.get("id") != release_id or release.get("ref") != release_ref or release.get("kind") != release_kind or release.get("immutable") is not True:
-              raise SystemExit("receipt release identity differs")
-          expected_receipt = {
-              "run_id": int(os.environ["RMUX_RECEIPT_RUN_ID"]),
-              "run_attempt": 1,
-              "workflow_id": int(os.environ["RMUX_RECEIPT_WORKFLOW_ID"]),
-              "workflow_path": ".github/workflows/release-receipt.yml",
-          }
-          if receipt != expected_receipt:
-              raise SystemExit("receipt producer identity differs")
-          predicate_sha = file_hash(predicate_path)
-          envelope_sha = file_hash(envelope_path)
-          if predicate_sha != os.environ["RMUX_RECEIPT_PREDICATE_SHA256"] or envelope_sha != os.environ["RMUX_RECEIPT_ENVELOPE_SHA256"]:
-              raise SystemExit("receipt document digest differs")
-          expected_bundle = {
-              "artifact_id": receipt_meta["artifact_id"],
-              "name": receipt_meta["name"],
-              "archive_digest": receipt_meta["digest"],
-              "size_in_bytes": receipt_meta["size_in_bytes"],
-          }
-          if envelope.get("status") != "disarmed-non-authoritative" or envelope.get("downstream_authority") is not False:
-              raise SystemExit("receipt envelope acquired downstream authority")
-          if envelope.get("source_git_sha") != source or envelope.get("release_id") != release_id or envelope.get("release_ref") != release_ref or envelope.get("receipt") != receipt:
-              raise SystemExit("receipt envelope identity differs")
-          if envelope.get("predicate_sha256") != predicate_sha or envelope.get("receipt_bundle") != expected_bundle:
-              raise SystemExit("receipt envelope predicate or artifact binding differs")
-          attestation = envelope.get("attestation", {})
-          if attestation.get("bundle_file") != "publication-receipt.sigstore.json" or attestation.get("bundle_sha256") != file_hash(bundle_path):
-              raise SystemExit("receipt attestation bundle differs")
-          reference = {
-              "schema_version": 1,
-              "status": "disarmed-non-authoritative",
-              "downstream_authority": False,
-              "repository_id": 1239918790,
-              "source_git_sha": source,
-              "release": {
-                  "id": release_id,
-                  "ref": release_ref,
-                  "intent_id": release["intent_id"],
-                  "kind": release_kind,
-                  "tag_object_sha": release["tag_object_sha"],
-                  "immutable": True,
-              },
-              "receipt": receipt,
-              "predicate_bundle": expected_bundle,
-              "predicate_sha256": predicate_sha,
-              "envelope_bundle": {
-                  "artifact_id": envelope_meta["artifact_id"],
-                  "name": envelope_meta["name"],
-                  "archive_digest": envelope_meta["digest"],
-                  "size_in_bytes": envelope_meta["size_in_bytes"],
-              },
-              "envelope_sha256": envelope_sha,
-              "attestation": attestation,
-              "verified_at": predicate["verified_at"],
-          }
-          output_path.write_text(json.dumps(reference, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-          PY
+      - name: Bind exact authorized receipt evidence
+        shell: bash
+        run: >-
+          scripts/release/build-downstream-receipt-reference.py
+          --predicate "$RUNNER_TEMP/rmux-downstream/receipt/publication-receipt-predicate.json"
+          --bundle "$RUNNER_TEMP/rmux-downstream/receipt/publication-receipt.sigstore.json"
+          --envelope "$RUNNER_TEMP/rmux-downstream/envelope/publication-receipt-envelope.json"
+          --predicate-artifact "$RUNNER_TEMP/rmux-downstream/receipt-artifact.json"
+          --envelope-artifact "$RUNNER_TEMP/rmux-downstream/envelope-artifact.json"
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" --release-id "$RMUX_RELEASE_ID"
+          --release-ref "$RMUX_RELEASE_REF" --release-kind "$RMUX_RELEASE_KIND"
+          --receipt-run-id "$RMUX_RECEIPT_RUN_ID"
+          --receipt-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID"
+          --predicate-sha256 "$RMUX_RECEIPT_PREDICATE_SHA256"
+          --envelope-sha256 "$RMUX_RECEIPT_ENVELOPE_SHA256"
+          --output "$RUNNER_TEMP/rmux-downstream/receipt-reference.json"
 
       - name: Create and verify the default-deny channel plan
         shell: bash
@@ -284,165 +197,347 @@ jobs:
           name: rmux-downstream-plan-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}
           path: |
             ${{ runner.temp }}/rmux-downstream/downstream-channel-plan.json
+            ${{ runner.temp }}/rmux-downstream/receipt/publication-receipt-predicate.json
             ${{ runner.temp }}/rmux-downstream/receipt-reference.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
 
-  stage-linux-channels:
-    name: Disabled channel ${{ matrix.channel }}
+  prepare-payloads:
+    name: Prepare exact downstream payloads
     needs: prepare-plan
-    if: ${{ false }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    uses: ./.github/workflows/release-downstream-prepare.yml
     permissions:
       actions: read
       contents: read
-    concurrency:
-      group: rmux-channel-${{ matrix.channel }}-${{ inputs.release_ref }}
-      cancel-in-progress: false
-    strategy:
-      fail-fast: false
-      # Three Linux workers plus the dedicated Chocolatey worker keep the
-      # downstream fanout within the four-channel contract.
-      max-parallel: 3
-      matrix:
-        channel:
-          - apt_rpm
-          - crates_io
-          - homebrew_core
-          - homebrew_tap
-          - scoop
-          - snap_candidate
-          - snap_stable
-          - web_share
-          - winget
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.expected_source_sha }}
-          persist-credentials: false
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+      release_kind: ${{ inputs.release_kind }}
 
-      - name: Fail closed before any downstream mutation
-        run: scripts/release/assert-release-capability.py downstream_channels
-
-      - name: Refuse the unimplemented channel writer
-        shell: bash
-        run: |
-          echo "PR7 does not implement an active writer for ${{ matrix.channel }}" >&2
-          exit 1
-
-  stage-chocolatey:
-    name: Disabled channel chocolatey
-    needs: prepare-plan
-    if: ${{ false }}
-    runs-on: windows-latest
-    timeout-minutes: 15
+  build-linux-repository:
+    name: Build exact signed Linux repository trees
+    needs: [prepare-plan, prepare-payloads]
+    if: inputs.release_kind == 'stable'
+    uses: ./.github/workflows/release-linux-repository-build.yml
     permissions:
       actions: read
       contents: read
-    concurrency:
-      group: rmux-channel-chocolatey-${{ inputs.release_ref }}
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.expected_source_sha }}
-          persist-credentials: false
+    secrets: inherit
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).apt_rpm }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).apt_rpm }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
 
-      - name: Fail closed before any Chocolatey mutation
-        shell: pwsh
-        run: python scripts/release/assert-release-capability.py downstream_channels
+  publish-homebrew-tap:
+    name: Publish exact Homebrew tap formula
+    needs: [prepare-plan, prepare-payloads]
+    uses: ./.github/workflows/release-owned-repository-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      channel: homebrew_tap
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).homebrew_tap }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).homebrew_tap }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
 
-      - name: Refuse the unimplemented Chocolatey writer
-        shell: pwsh
-        run: throw "PR7 does not implement an active Chocolatey writer"
+  publish-scoop:
+    name: Publish exact Scoop manifest
+    needs: [prepare-plan, prepare-payloads]
+    uses: ./.github/workflows/release-owned-repository-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      channel: scoop
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).scoop }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).scoop }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
 
-  channel-summary:
-    name: Disabled pre-site aggregation wiring
-    needs: [prepare-plan, stage-linux-channels, stage-chocolatey]
-    if: ${{ false }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5
+  publish-web-share:
+    name: Publish exact Web Share WASM bytes
+    needs: [prepare-plan, prepare-payloads]
+    uses: ./.github/workflows/release-owned-repository-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      channel: web_share
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).web_share }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).web_share }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  publish-linux-repository:
+    name: Publish exact signed APT and RPM repositories
+    needs: [prepare-plan, prepare-payloads, build-linux-repository, publish-homebrew-tap, publish-scoop, publish-web-share]
+    if: ${{ !cancelled() && !failure() && inputs.release_kind == 'stable' }}
+    uses: ./.github/workflows/release-linux-repository-publish.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).apt_rpm }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).apt_rpm }}
+      repository_artifact_id: ${{ needs.build-linux-repository.outputs.repository_artifact_id }}
+      repository_artifact_digest: ${{ needs.build-linux-repository.outputs.repository_artifact_digest }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  record-linux-repository-policy:
+    name: Record denied RC Linux repository channel
+    needs: [prepare-plan, prepare-payloads, build-linux-repository, publish-homebrew-tap, publish-scoop, publish-web-share]
+    if: ${{ !cancelled() && !failure() && inputs.release_kind == 'rc' }}
+    uses: ./.github/workflows/release-policy-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    with:
+      channel: apt_rpm
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).apt_rpm }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).apt_rpm }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  publish-crates:
+    name: Publish exact crates.io package set
+    needs: [prepare-plan, prepare-payloads, build-linux-repository, publish-homebrew-tap, publish-scoop, publish-web-share]
+    if: ${{ !cancelled() && !failure() }}
+    uses: ./.github/workflows/release-crates-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).crates_io }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).crates_io }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  record-homebrew-core:
+    name: Record manual Homebrew Core submission
+    needs: [prepare-plan, prepare-payloads, publish-linux-repository, record-linux-repository-policy, publish-crates]
+    if: ${{ !cancelled() && !failure() }}
+    uses: ./.github/workflows/release-policy-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    with:
+      channel: homebrew_core
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).homebrew_core }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).homebrew_core }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  record-winget:
+    name: Record manual WinGet submission
+    needs: [prepare-plan, prepare-payloads, publish-linux-repository, record-linux-repository-policy, publish-crates]
+    if: ${{ !cancelled() && !failure() }}
+    uses: ./.github/workflows/release-policy-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    with:
+      channel: winget
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).winget }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).winget }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  record-snap-stable:
+    name: Record disabled Snap stable channel
+    needs: [prepare-plan, prepare-payloads, publish-linux-repository, record-linux-repository-policy, publish-crates]
+    if: ${{ !cancelled() && !failure() }}
+    uses: ./.github/workflows/release-policy-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    with:
+      channel: snap_stable
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).snap_stable }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).snap_stable }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  publish-chocolatey:
+    name: Submit exact Chocolatey package
+    needs: [prepare-plan, prepare-payloads, publish-linux-repository, record-linux-repository-policy, publish-crates]
+    if: ${{ !cancelled() && !failure() }}
+    uses: ./.github/workflows/release-chocolatey-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).chocolatey }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).chocolatey }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  publish-snap-candidate:
+    name: Publish exact Snap candidate revisions
+    needs: [prepare-plan, prepare-payloads, record-homebrew-core, record-winget, record-snap-stable, publish-chocolatey]
+    if: ${{ !cancelled() && !failure() }}
+    uses: ./.github/workflows/release-snap-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    secrets: inherit
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).snap_candidate }}
+      payload_artifact_digest: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_digests).snap_candidate }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+
+  pre-site-summary:
+    name: Aggregate ten exact pre-site results
+    needs: [prepare-plan, publish-homebrew-tap, publish-scoop, publish-web-share, publish-linux-repository, record-linux-repository-policy, publish-crates, record-homebrew-core, record-winget, record-snap-stable, publish-chocolatey, publish-snap-candidate]
+    if: ${{ !cancelled() && !failure() }}
+    uses: ./.github/workflows/release-channel-summary.yml
     permissions:
       actions: read
       contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.expected_source_sha }}
-          persist-credentials: false
+    with:
+      phase: pre-site
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
 
-      - name: Download only the exact disarmed plan artifact ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/rmux-downstream-summary
-
-      - name: Fail closed before consuming unwired channel results
-        run: scripts/release/assert-release-capability.py downstream_channels
-
-      - name: Refuse missing exact result references
-        shell: bash
-        run: |
-          echo "pre-site aggregation remains disabled until writers expose ten exact result references" >&2
-          exit 1
-
-  deploy-rmux-io:
-    name: Disabled rmux.io writer
-    needs: [prepare-plan, channel-summary]
-    if: ${{ false }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
+  prepare-rmux-io-handoff:
+    name: Prepare manual rmux.io handoff
+    needs: [prepare-plan, pre-site-summary]
+    uses: ./.github/workflows/release-rmux-io-payload.yml
     permissions:
       actions: read
       contents: read
-    concurrency:
-      group: rmux-channel-rmux-io-${{ inputs.release_ref }}
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.expected_source_sha }}
-          persist-credentials: false
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      pre_site_artifact_id: ${{ needs.pre-site-summary.outputs.summary_artifact_id }}
+      pre_site_artifact_digest: ${{ needs.pre-site-summary.outputs.summary_artifact_digest }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
 
-      - name: Fail closed before the final site mutation
-        run: scripts/release/assert-release-capability.py downstream_channels
-
-      - name: Refuse the unimplemented final site writer
-        shell: bash
-        run: |
-          echo "rmux.io writer remains disabled until it consumes the exact pre-site summary" >&2
-          exit 1
+  record-rmux-io-handoff:
+    name: Record blocked automated rmux.io update
+    needs: [prepare-plan, pre-site-summary, prepare-rmux-io-handoff]
+    uses: ./.github/workflows/release-rmux-io-channel.yml
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    with:
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      payload_artifact_id: ${{ needs.prepare-rmux-io-handoff.outputs.payload_artifact_id }}
+      payload_artifact_digest: ${{ needs.prepare-rmux-io-handoff.outputs.payload_artifact_digest }}
+      pre_site_artifact_id: ${{ needs.pre-site-summary.outputs.summary_artifact_id }}
+      pre_site_artifact_digest: ${{ needs.pre-site-summary.outputs.summary_artifact_digest }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
 
   final-channel-summary:
-    name: Disabled final aggregation wiring
-    needs: [prepare-plan, channel-summary, deploy-rmux-io]
-    if: ${{ false }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 5
+    name: Aggregate all eleven exact channel results
+    needs: [prepare-plan, pre-site-summary, record-rmux-io-handoff]
+    uses: ./.github/workflows/release-channel-summary.yml
     permissions:
       actions: read
       contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          ref: ${{ inputs.expected_source_sha }}
-          persist-credentials: false
-
-      - name: Download only the exact disarmed plan artifact ID
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          artifact-ids: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/rmux-downstream-summary
-
-      - name: Fail closed before consuming the unwired rmux.io result
-        run: scripts/release/assert-release-capability.py downstream_channels
-
-      - name: Refuse missing exact rmux.io result reference
-        shell: bash
-        run: |
-          echo "final aggregation remains disabled until rmux.io exposes its exact result reference" >&2
-          exit 1
+    with:
+      phase: final
+      receipt_run_id: ${{ inputs.receipt_run_id }}
+      plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
+      plan_artifact_digest: ${{ needs.prepare-plan.outputs.plan_artifact_digest }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_id: ${{ inputs.release_id }}
+      release_ref: ${{ inputs.release_ref }}
+      pre_site_artifact_id: ${{ needs.pre-site-summary.outputs.summary_artifact_id }}
+      pre_site_artifact_digest: ${{ needs.pre-site-summary.outputs.summary_artifact_digest }}

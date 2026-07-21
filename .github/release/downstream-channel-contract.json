@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "status": "review-only-disarmed",
-  "description": "Fail-closed contract for downstream release channels. It cannot authorize publication before PR8.",
+  "status": "atomic-authority-bound",
+  "description": "Fail-closed contract for downstream release channels, atomically bound to the tracked release activation ledger.",
   "repository": {
     "id": 1239918790,
     "full_name": "Helvesec/rmux"
@@ -9,7 +9,7 @@
   "activation": {
     "ledger": ".github/release/release-activation.json",
     "capability": "downstream_channels",
-    "required_value": false,
+    "required_value": "matches-atomic-ledger",
     "runtime_override_allowed": false
   },
   "receipt_gate": {
@@ -23,7 +23,7 @@
     "attestation_required": true,
     "attestation_subject_name": "release-state.json",
     "attestation_subject_in_bundle": true,
-    "required_downstream_authority": false,
+    "required_downstream_authority": "matches-atomic-ledger",
     "activation_blockers": []
   },
   "execution": {
@@ -31,7 +31,7 @@
     "public_callers": 0,
     "required_caller_repository": "Helvesec/rmux",
     "required_caller_repository_id": 1239918790,
-    "privileged_job_condition": "false",
+    "privileged_job_condition": "release-activation-ledger",
     "maximum_parallel_channels": 4,
     "cancel_in_progress": false,
     "github_hosted_only": true,
@@ -39,6 +39,9 @@
     "rmux_io_last": true
   },
   "retry": {
+    "entry_workflow_path": ".github/workflows/release-channel-retry.yml",
+    "entry_trigger": "workflow_dispatch",
+    "channels": ["chocolatey", "snap_candidate"],
     "actions_run_attempt": 1,
     "actions_rerun_allowed": false,
     "same_receipt_required": true,
@@ -64,7 +67,10 @@
     "producer": {
       "workflow_id": 316435347,
       "workflow_path": ".github/workflows/release-receipt.yml",
-      "job_workflow_path": ".github/workflows/release-downstream.yml",
+      "job_workflow_paths": {
+        "default": ".github/workflows/release-downstream-prepare.yml",
+        "rmux_io": ".github/workflows/release-rmux-io-payload.yml"
+      },
       "required_run_attempt": 1
     },
     "activation_blockers": []
@@ -95,23 +101,23 @@
     "final_result_count": 11,
     "rmux_io_pre_site_digest_field": "pre_site_summary_sha256",
     "producer_workflows": {
-      "apt_rpm": [".github/workflows/release-downstream.yml"],
-      "chocolatey": [
-        ".github/workflows/release-downstream.yml",
-        ".github/workflows/release-chocolatey-retry.yml"
-      ],
-      "crates_io": [".github/workflows/release-downstream.yml"],
-      "homebrew_core": [".github/workflows/release-downstream.yml"],
-      "homebrew_tap": [".github/workflows/release-downstream.yml"],
-      "rmux_io": [".github/workflows/release-downstream.yml"],
-      "scoop": [".github/workflows/release-downstream.yml"],
-      "snap_candidate": [
-        ".github/workflows/release-downstream.yml",
-        ".github/workflows/release-snap-retry.yml"
-      ],
-      "snap_stable": [".github/workflows/release-downstream.yml"],
-      "web_share": [".github/workflows/release-downstream.yml"],
-      "winget": [".github/workflows/release-downstream.yml"]
+      "apt_rpm": {".github/workflows/release-linux-repository-publish.yml": 316435347},
+      "chocolatey": {
+        ".github/workflows/release-chocolatey-channel.yml": 316435347,
+        ".github/workflows/release-chocolatey-retry.yml": 316439352
+      },
+      "crates_io": {".github/workflows/release-crates-channel.yml": 316435347},
+      "homebrew_core": {".github/workflows/release-policy-channel.yml": 316435347},
+      "homebrew_tap": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+      "rmux_io": {".github/workflows/release-rmux-io-channel.yml": 316435347},
+      "scoop": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+      "snap_candidate": {
+        ".github/workflows/release-snap-channel.yml": 316435347,
+        ".github/workflows/release-snap-retry.yml": 316439354
+      },
+      "snap_stable": {".github/workflows/release-policy-channel.yml": 316435347},
+      "web_share": {".github/workflows/release-owned-repository-channel.yml": 316435347},
+      "winget": {".github/workflows/release-policy-channel.yml": 316435347}
     },
     "target_policies": {
       "apt_rpm": {"allowed_hosts": ["github.com", "packages.rmux.io"], "commit_sha_required": true},
@@ -140,7 +146,7 @@
         "debian",
         "rpm"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": []
     },
     {
@@ -168,7 +174,7 @@
       "payload_roles": [
         "crate-package-set"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": []
     },
     {
@@ -182,7 +188,7 @@
       "payload_roles": [
         "homebrew-core-patch"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": [
         "manual_submission_identity_not_configured"
       ]
@@ -198,7 +204,7 @@
       "payload_roles": [
         "homebrew-formula"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": []
     },
     {
@@ -213,7 +219,7 @@
         "site-patch",
         "channel-truth-summary"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": [
         "private_repository_protection_unavailable_on_current_plan",
         "manual_site_update_required"
@@ -230,7 +236,7 @@
       "payload_roles": [
         "scoop-manifest"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": []
     },
     {
@@ -246,7 +252,9 @@
         "snap-arm64"
       ],
       "retryable": true,
-      "blockers": []
+      "blockers": [
+        "classic_confinement_approval_required"
+      ]
     },
     {
       "name": "snap_stable",
@@ -255,8 +263,10 @@
       "target_repository_key": null,
       "rc_policy": "deny",
       "stable_policy": "deny",
-      "payload_ready": false,
-      "payload_roles": [],
+      "payload_ready": true,
+      "payload_roles": [
+        "policy-decision"
+      ],
       "retryable": false,
       "blockers": [
         "denied_until_support_decision"
@@ -274,11 +284,8 @@
         "wasm-byte-set",
         "wasm-provenance"
       ],
-      "retryable": true,
-      "blockers": [
-        "floating_actions_present",
-        "unprotected_secret_deployment_workflow"
-      ]
+      "retryable": false,
+      "blockers": []
     },
     {
       "name": "winget",
@@ -291,7 +298,7 @@
       "payload_roles": [
         "winget-manifest-set"
       ],
-      "retryable": true,
+      "retryable": false,
       "blockers": [
         "manual_submission_identity_not_configured"
       ]

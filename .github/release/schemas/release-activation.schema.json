@@ -2,14 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/release-activation-v1.json",
   "title": "RMUX release capability activation ledger",
-  "description": "Review-only, fail-closed capability ledger. It MUST NOT authorize publication while status is disarmed.",
-  "x-rmux-status": "disarmed-non-authoritative",
+  "description": "Fail-closed capability ledger. It authorizes publication only when status is active and every capability is true.",
+  "x-rmux-status": "atomic-authority-ledger",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "status", "description", "cutover_pr", "runtime_override_allowed", "capabilities"],
   "properties": {
     "schema_version": {"const": 1},
-    "status": {"const": "disarmed"},
+    "status": {"enum": ["disarmed", "active"]},
     "description": {"type": "string", "minLength": 1},
     "cutover_pr": {"const": "PR8"},
     "runtime_override_allowed": {"const": false},
@@ -18,13 +18,45 @@
       "additionalProperties": false,
       "required": ["downstream_channels", "github_release_publication", "policy_audit", "promotion_authorization", "publication_receipt", "signed_tag_creation"],
       "properties": {
-        "downstream_channels": {"const": false},
-        "github_release_publication": {"const": false},
-        "policy_audit": {"const": false},
-        "promotion_authorization": {"const": false},
-        "publication_receipt": {"const": false},
-        "signed_tag_creation": {"const": false}
+        "downstream_channels": {"type": "boolean"},
+        "github_release_publication": {"type": "boolean"},
+        "policy_audit": {"type": "boolean"},
+        "promotion_authorization": {"type": "boolean"},
+        "publication_receipt": {"type": "boolean"},
+        "signed_tag_creation": {"type": "boolean"}
       }
     }
-  }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "disarmed"},
+        "capabilities": {
+          "properties": {
+            "downstream_channels": {"const": false},
+            "github_release_publication": {"const": false},
+            "policy_audit": {"const": false},
+            "promotion_authorization": {"const": false},
+            "publication_receipt": {"const": false},
+            "signed_tag_creation": {"const": false}
+          }
+        }
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "active"},
+        "capabilities": {
+          "properties": {
+            "downstream_channels": {"const": true},
+            "github_release_publication": {"const": true},
+            "policy_audit": {"const": true},
+            "promotion_authorization": {"const": true},
+            "publication_receipt": {"const": true},
+            "signed_tag_creation": {"const": true}
+          }
+        }
+      }
+    }
+  ]
 }
