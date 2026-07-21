@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/downstream-channel-result-predicate-v1.json",
+  "title": "RMUX disarmed downstream channel result predicate",
+  "description": "Review-only channel observation. It MUST NOT authorize publication or equate submission with public-live.",
+  "x-rmux-status": "disarmed-non-authoritative",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "predicate_type", "status", "downstream_authority", "execution_authority", "repository_id", "source_git_sha", "release", "receipt", "request_sha256", "payload_set_sha256", "idempotency_key", "channel", "target", "producer", "subject", "state", "started_at", "mutation_started", "remote_request_id", "target_evidence", "observed_at"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "predicate_type": {"const": "https://rmux.io/attestations/release-downstream-channel-result/v1"},
+    "status": {"const": "disarmed-non-authoritative"},
+    "downstream_authority": {"const": false},
+    "execution_authority": {"const": false},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"$ref": "#/$defs/sha40"},
+    "release": {"$ref": "#/$defs/release"},
+    "receipt": {"$ref": "#/$defs/receipt"},
+    "request_sha256": {"$ref": "#/$defs/sha256"},
+    "payload_set_sha256": {"$ref": "#/$defs/sha256"},
+    "idempotency_key": {"type": "string", "pattern": "^rmux-downstream-v1:[0-9a-f]{64}$"},
+    "channel": {"$ref": "#/$defs/channel"},
+    "target": {"$ref": "#/$defs/target"},
+    "producer": {"$ref": "#/$defs/producer"},
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sha256"],
+      "properties": {
+        "name": {"const": "downstream-channel-target-evidence.json"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "state": {"$ref": "#/$defs/state"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "mutation_started": {"type": "boolean"},
+    "remote_request_id": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._:/#@+-]+$"}
+      ]
+    },
+    "target_evidence": {"$ref": "#/$defs/target_evidence"},
+    "observed_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"state": {"enum": ["no-op-exact", "public-live"]}}, "required": ["state"]},
+      "then": {"properties": {"target_evidence": {"properties": {"public_live": {"const": true}}}}},
+      "else": {"properties": {"target_evidence": {"properties": {"public_live": {"const": false}}}}}
+    },
+    {
+      "if": {"properties": {"state": {"enum": ["blocked", "denied-by-policy", "prepared"]}}, "required": ["state"]},
+      "then": {"properties": {"mutation_started": {"const": false}, "remote_request_id": {"type": "null"}}}
+    },
+    {
+      "if": {"properties": {"state": {"enum": ["submitted", "pending-moderation", "public-live"]}}, "required": ["state"]},
+      "then": {"properties": {"mutation_started": {"const": true}, "remote_request_id": {"type": "string"}}}
+    },
+    {
+      "if": {"properties": {"state": {"const": "no-op-exact"}}, "required": ["state"]},
+      "then": {"properties": {"mutation_started": {"const": false}, "remote_request_id": {"type": "string"}}}
+    },
+    {
+      "if": {"properties": {"mutation_started": {"const": true}}, "required": ["mutation_started"]},
+      "then": {"properties": {"remote_request_id": {"type": "string"}}}
+    }
+  ],
+  "$defs": {
+    "positive": {"type": "integer", "minimum": 1},
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "intent": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+    "release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+    "channel": {"enum": ["apt_rpm", "chocolatey", "crates_io", "homebrew_core", "homebrew_tap", "rmux_io", "scoop", "snap_candidate", "snap_stable", "web_share", "winget"]},
+    "state": {"enum": ["blocked", "denied-by-policy", "failed-terminal", "failed-transient", "no-op-exact", "pending-moderation", "prepared", "public-live", "submitted"]},
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ref", "intent_id", "kind", "tag_object_sha", "immutable"],
+      "properties": {
+        "id": {"$ref": "#/$defs/positive"},
+        "ref": {"$ref": "#/$defs/release_ref"},
+        "intent_id": {"$ref": "#/$defs/intent"},
+        "kind": {"enum": ["rc", "stable"]},
+        "tag_object_sha": {"$ref": "#/$defs/sha40"},
+        "immutable": {"const": true}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "name", "archive_digest", "size_in_bytes"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/positive"},
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9._+@=-]+$"},
+        "archive_digest": {"$ref": "#/$defs/digest"},
+        "size_in_bytes": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "receipt_predicate_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {"name": {"pattern": "^rmux-publication-receipt-[0-9a-f]{40}-[1-9][0-9]*$"}}}
+      ]
+    },
+    "receipt_envelope_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {"name": {"pattern": "^rmux-publication-receipt-envelope-[0-9a-f]{40}-[1-9][0-9]*$"}}}
+      ]
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "workflow_id", "workflow_path", "predicate_bundle", "predicate_sha256", "envelope_bundle", "envelope_sha256", "attestation", "verified_at"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/positive"},
+        "run_attempt": {"const": 1},
+        "workflow_id": {"$ref": "#/$defs/positive"},
+        "workflow_path": {"const": ".github/workflows/release-receipt.yml"},
+        "predicate_bundle": {"$ref": "#/$defs/receipt_predicate_artifact"},
+        "predicate_sha256": {"$ref": "#/$defs/sha256"},
+        "envelope_bundle": {"$ref": "#/$defs/receipt_envelope_artifact"},
+        "envelope_sha256": {"$ref": "#/$defs/sha256"},
+        "attestation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attestation_id", "bundle_file", "bundle_sha256"],
+          "properties": {
+            "attestation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "bundle_file": {"const": "publication-receipt.sigstore.json"},
+            "bundle_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "verified_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "workflow_id", "workflow_path", "runner_group_id", "runner_group_name", "runner_image"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/positive"},
+        "run_attempt": {"const": 1},
+        "workflow_id": {"$ref": "#/$defs/positive"},
+        "workflow_path": {"type": "string", "pattern": "^\\.github/workflows/release-[a-z0-9-]+\\.yml$"},
+        "runner_group_id": {"const": 0},
+        "runner_group_name": {"const": "GitHub Actions"},
+        "runner_image": {"enum": ["ubuntu-22.04", "windows-latest"]}
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_kind", "repository_key", "repository_id", "repository_full_name", "default_branch", "path", "external_service"],
+      "properties": {
+        "target_kind": {"enum": ["github-pull-request", "github-repository", "package-store", "website"]},
+        "repository_key": {"type": ["string", "null"]},
+        "repository_id": {"type": ["integer", "null"], "minimum": 1},
+        "repository_full_name": {"type": ["string", "null"]},
+        "default_branch": {"type": ["string", "null"]},
+        "path": {"type": ["string", "null"]},
+        "external_service": {"type": ["string", "null"]}
+      }
+    },
+    "target_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "channel", "target_kind", "repository_id", "external_id", "url", "version", "commit_sha", "public_live", "observed_at"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "channel": {"$ref": "#/$defs/channel"},
+        "target_kind": {"enum": ["github-pull-request", "github-repository", "package-store", "website"]},
+        "repository_id": {"type": ["integer", "null"], "minimum": 1},
+        "external_id": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._:/#@+-]+$"}
+          ]
+        },
+        "url": {"type": "string", "pattern": "^https://[^\\s]+$"},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+        "commit_sha": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha40"}]},
+        "public_live": {"type": "boolean"},
+        "observed_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}

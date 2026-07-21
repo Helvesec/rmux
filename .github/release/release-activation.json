@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "status": "disarmed",
+  "description": "Review-only activation ledger. Every capability remains false until an explicit PR8 cut-over; no runtime or environment override is permitted.",
+  "cutover_pr": "PR8",
+  "runtime_override_allowed": false,
+  "capabilities": {
+    "downstream_channels": false,
+    "github_release_publication": false,
+    "policy_audit": false,
+    "promotion_authorization": false,
+    "publication_receipt": false,
+    "signed_tag_creation": false
+  }
+}

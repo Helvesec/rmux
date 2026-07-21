@@ -1,0 +1,599 @@
+name: Disarmed exact-SHA GitHub Release promoter
+
+on:
+  workflow_call:
+    inputs:
+      candidate_run_id: {required: true, type: string}
+      candidate_manifest_run_id: {required: true, type: string}
+      candidate_manifest_artifact_id: {required: true, type: string}
+      candidate_manifest_artifact_digest: {required: true, type: string}
+      candidate_manifest_sha256: {required: true, type: string}
+      candidate_manifest_created_at: {required: true, type: string}
+      candidate_manifest_expires_at: {required: true, type: string}
+      signed_tag_run_id: {required: true, type: string}
+      signed_tag_artifact_id: {required: true, type: string}
+      signed_tag_artifact_digest: {required: true, type: string}
+      tag_object_sha: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_intent_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+      release_kind: {required: true, type: string}
+      release_policy_sha256: {required: true, type: string}
+      release_policy_contract_blob_oid: {required: true, type: string}
+      authorization_workflow_id: {required: true, type: string}
+    outputs:
+      authorization_artifact_id:
+        value: ${{ jobs.authorize-promotion.outputs.authorization_artifact_id }}
+      authorization_artifact_digest:
+        value: ${{ jobs.authorize-promotion.outputs.authorization_artifact_digest }}
+      authorization_envelope_artifact_id:
+        value: ${{ jobs.authorize-promotion.outputs.envelope_artifact_id }}
+      authorization_envelope_artifact_digest:
+        value: ${{ jobs.authorize-promotion.outputs.envelope_artifact_digest }}
+
+concurrency:
+  group: rmux-release-promote-${{ inputs.release_ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  verify-candidate:
+    name: Verify candidate, tag, provenance, and exact bytes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      bundle_artifact_id: ${{ steps.bundle.outputs.artifact-id }}
+      bundle_artifact_digest: sha256:${{ steps.bundle.outputs.artifact-digest }}
+      bundle_artifact_name: rmux-promotion-verified-${{ inputs.expected_source_sha }}
+    env:
+      RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      RMUX_MANIFEST_RUN_ID: ${{ inputs.candidate_manifest_run_id }}
+      RMUX_MANIFEST_ARTIFACT_ID: ${{ inputs.candidate_manifest_artifact_id }}
+      RMUX_MANIFEST_ARTIFACT_DIGEST: ${{ inputs.candidate_manifest_artifact_digest }}
+      RMUX_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+      RMUX_TAG_RUN_ID: ${{ inputs.signed_tag_run_id }}
+      RMUX_TAG_ARTIFACT_ID: ${{ inputs.signed_tag_artifact_id }}
+      RMUX_TAG_ARTIFACT_DIGEST: ${{ inputs.signed_tag_artifact_digest }}
+      RMUX_TAG_OBJECT_SHA: ${{ inputs.tag_object_sha }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
+      RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
+      RMUX_RELEASE_POLICY_SHA256: ${{ inputs.release_policy_sha256 }}
+    steps:
+      - name: Reject malformed promotion inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for value in "$RMUX_CANDIDATE_RUN_ID" "$RMUX_MANIFEST_RUN_ID" "$RMUX_MANIFEST_ARTIFACT_ID" "$RMUX_TAG_RUN_ID" "$RMUX_TAG_ARTIFACT_ID"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          [[ "$RMUX_MANIFEST_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RMUX_TAG_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RMUX_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$RMUX_RELEASE_KIND" =~ ^(rc|stable)$ ]]
+          test "$GITHUB_RUN_ATTEMPT" = 1
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Verify exact evidence artifacts through the Actions API
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_MANIFEST_RUN_ID" \
+            --artifact-id "$RMUX_MANIFEST_ARTIFACT_ID" \
+            --name "rmux-candidate-manifest-$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_MANIFEST_ARTIFACT_DIGEST" \
+            --expected-workflow-id 316223904 \
+            --expected-workflow-path .github/workflows/release-shadow.yml \
+            --expected-event workflow_dispatch --expected-head-branch main \
+            --max-attempts 1
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_TAG_RUN_ID" \
+            --artifact-id "$RMUX_TAG_ARTIFACT_ID" \
+            --name "rmux-signed-tag-$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_TAG_ARTIFACT_DIGEST" --max-attempts 1
+
+      - name: Download only exact candidate and signed-tag evidence IDs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.candidate_manifest_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-promotion/evidence
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_manifest_run_id }}
+
+      - name: Download only the signed-tag evidence ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.signed_tag_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-promotion/tag
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.signed_tag_run_id }}
+
+      - id: gh
+        name: Install the pinned read-only GitHub CLI
+        run: |
+          set -euo pipefail
+          scripts/release/install-gh-2.93.0.sh "$RUNNER_TEMP/rmux-gh-2.93.0"
+          echo "binary=$RUNNER_TEMP/rmux-gh-2.93.0/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Re-fetch and verify the exact live signed tag object
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RMUX_GH: ${{ steps.gh.outputs.binary }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-promotion/tag"
+          "$RMUX_GH" api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/git/ref/tags/$RMUX_RELEASE_REF" > "$root/live-ref.json"
+          tag_sha=$(python3 - "$root/live-ref.json" <<'PY'
+          import json, pathlib, sys
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          obj = value.get("object", {})
+          if obj.get("type") != "tag" or obj.get("sha") != __import__("os").environ["RMUX_TAG_OBJECT_SHA"]: raise SystemExit("live tag ref object differs")
+          print(obj["sha"])
+          PY
+          )
+          "$RMUX_GH" api -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" > "$root/live-tag.json"
+          python3 scripts/release/verify-release-tag.py github-json \
+            --ref-json "$root/live-ref.json" --tag-json "$root/live-tag.json" \
+            --release-ref "$RMUX_RELEASE_REF" --release-intent-id "$RMUX_RELEASE_INTENT_ID" \
+            --release-kind "$RMUX_RELEASE_KIND" --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --candidate-manifest-artifact-id "$RMUX_MANIFEST_ARTIFACT_ID" \
+            --candidate-manifest-artifact-digest "$RMUX_MANIFEST_ARTIFACT_DIGEST" \
+            --candidate-manifest-sha256 "$RMUX_MANIFEST_SHA256" \
+            --release-policy-root-sha256 "$RMUX_RELEASE_POLICY_SHA256" \
+            > "$root/live-tag-verification.raw.json"
+          python3 - "$root/live-tag-verification.raw.json" "$root/tag-verification.json" "$root/live-tag-verification.json" <<'PY'
+          import json, pathlib, sys
+          live = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          recorded_path, canonical_path = map(pathlib.Path, sys.argv[2:])
+          canonical = (json.dumps(live, indent=2, sort_keys=True) + "\n").encode()
+          if recorded_path.read_bytes() != canonical: raise SystemExit("recorded tag verification differs byte-for-byte from live tag")
+          canonical_path.write_bytes(canonical)
+          PY
+
+      - name: Verify non-circular candidate and signed-tag proofs
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-promotion"
+          manifest="$root/evidence/candidate-manifest.json"
+          reference="$root/tag/candidate-reference.json"
+          proof="$root/tag/signed-tag-proof.json"
+          verification="$root/tag/tag-verification.json"
+          python3 scripts/release/candidate-reference.py verify \
+            --manifest "$manifest" --manifest-run-id "$RMUX_MANIFEST_RUN_ID" \
+            --manifest-run-attempt 1 --manifest-workflow-id 316223904 \
+            --manifest-artifact-id "$RMUX_MANIFEST_ARTIFACT_ID" \
+            --manifest-artifact-digest "$RMUX_MANIFEST_ARTIFACT_DIGEST" \
+            --document "$reference"
+          verified_at=$(python3 - "$proof" <<'PY'
+          import json, pathlib, sys
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          print(value.get("verified_at", ""))
+          PY
+          )
+          python3 scripts/release/signed-tag-proof.py verify \
+            --verification "$verification" --verified-at "$verified_at" --document "$proof"
+          python3 - "$manifest" "$proof" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          manifest_path, proof_path = map(pathlib.Path, sys.argv[1:])
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          proof = json.loads(proof_path.read_text(encoding="utf-8"))
+          expected = {
+              "candidate_run_id": int(os.environ["RMUX_CANDIDATE_RUN_ID"]),
+              "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+              "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
+              "planned_release_ref": os.environ["RMUX_RELEASE_REF"],
+              "release_kind": os.environ["RMUX_RELEASE_KIND"],
+          }
+          for field, wanted in expected.items():
+              if manifest.get(field) != wanted: raise SystemExit(f"manifest {field} differs")
+          if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != os.environ["RMUX_MANIFEST_SHA256"]:
+              raise SystemExit("manifest SHA-256 differs")
+          if manifest.get("release_policy", {}).get("sha256") != os.environ["RMUX_RELEASE_POLICY_SHA256"]:
+              raise SystemExit("release policy root differs")
+          if proof.get("release_ref") != os.environ["RMUX_RELEASE_REF"] or proof.get("target_git_sha") != os.environ["RMUX_EXPECTED_SOURCE_SHA"] or proof.get("tag_object_sha") != os.environ["RMUX_TAG_OBJECT_SHA"]:
+              raise SystemExit("signed tag proof identity differs")
+          PY
+
+      - id: artifacts
+        name: Resolve all eleven candidate artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          resolution="$RUNNER_TEMP/rmux-promotion/candidate-artifacts.json"
+          scripts/release/verify-candidate-artifacts.py resolve \
+            --repository "$GITHUB_REPOSITORY" --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" --output "$resolution"
+          ids=$(python3 - "$resolution" <<'PY'
+          import json, pathlib, sys
+          artifacts = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["artifacts"]
+          if len(artifacts) != 11: raise SystemExit("expected exactly eleven candidate artifacts")
+          print(",".join(str(item["artifact_id"]) for item in artifacts))
+          PY
+          )
+          echo "artifact_ids=$ids" >> "$GITHUB_OUTPUT"
+
+      - name: Download only all eleven resolved candidate artifact IDs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ steps.artifacts.outputs.artifact_ids }}
+          path: ${{ runner.temp }}/rmux-promotion/candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - name: Verify downloaded candidate bytes and build provenance
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-promotion"
+          manifest="$root/evidence/candidate-manifest.json"
+          fast_run_id=$(python3 - "$manifest" <<'PY'
+          import json, pathlib, sys
+          print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["fast_run_id"])
+          PY
+          )
+          scripts/release/verify-candidate-artifacts.py verify-downloaded \
+            --repository "$GITHUB_REPOSITORY" --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" --fast-run-id "$fast_run_id" \
+            --release-intent-id "$RMUX_RELEASE_INTENT_ID" --planned-release-ref "$RMUX_RELEASE_REF" \
+            --release-kind "$RMUX_RELEASE_KIND" --resolution "$root/candidate-artifacts.json" \
+            --downloads-dir "$root/candidate" --output "$root/verified-candidate-artifacts.json"
+          scripts/release/verify-candidate-attestations.sh \
+            "$root/candidate" "$RMUX_EXPECTED_SOURCE_SHA" "${{ steps.gh.outputs.binary }}"
+
+      - name: Stage exact publishable bytes and deterministic metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-promotion"
+          scripts/release/stage-candidate-release.py \
+            --manifest "$root/evidence/candidate-manifest.json" \
+            --resolution "$root/candidate-artifacts.json" \
+            --downloads-dir "$root/candidate" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --output "$root/release-assets"
+          printf '# RMUX %s\n\nExact candidate `%s` from `%s`.\n' \
+            "$RMUX_RELEASE_REF" "$RMUX_CANDIDATE_RUN_ID" "$RMUX_EXPECTED_SOURCE_SHA" \
+            > "$root/release-notes.md"
+          mkdir "$root/verified-bundle"
+          cp -- "$root/evidence/candidate-manifest.json" "$root/verified-bundle/"
+          cp -- "$root/tag/candidate-reference.json" "$root/verified-bundle/"
+          cp -- "$root/tag/signed-tag-proof.json" "$root/verified-bundle/"
+          cp -- "$root/candidate-artifacts.json" "$root/verified-bundle/"
+          cp -- "$root/verified-candidate-artifacts.json" "$root/verified-bundle/"
+          cp -- "$root/release-notes.md" "$root/verified-bundle/"
+          cp -R -- "$root/release-assets" "$root/verified-bundle/release-assets"
+
+      - id: bundle
+        name: Upload only verified promotion inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-promotion-verified-${{ inputs.expected_source_sha }}
+          path: ${{ runner.temp }}/rmux-promotion/verified-bundle
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+  prepare-policy-audit:
+    name: Disabled exact policy audit preparation
+    needs: verify-candidate
+    if: ${{ false }}
+    uses: ./.github/workflows/release-policy-audit.yml
+    with:
+      candidate_run_id: ${{ inputs.candidate_run_id }}
+      candidate_manifest_run_id: ${{ inputs.candidate_manifest_run_id }}
+      candidate_manifest_artifact_id: ${{ inputs.candidate_manifest_artifact_id }}
+      candidate_manifest_artifact_digest: ${{ inputs.candidate_manifest_artifact_digest }}
+      candidate_manifest_sha256: ${{ inputs.candidate_manifest_sha256 }}
+      candidate_manifest_created_at: ${{ inputs.candidate_manifest_created_at }}
+      candidate_manifest_expires_at: ${{ inputs.candidate_manifest_expires_at }}
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+      release_intent_id: ${{ inputs.release_intent_id }}
+      planned_release_ref: ${{ inputs.release_ref }}
+      release_kind: ${{ inputs.release_kind }}
+      release_policy_sha256: ${{ inputs.release_policy_sha256 }}
+      release_policy_contract_blob_oid: ${{ inputs.release_policy_contract_blob_oid }}
+  policy-audit:
+    name: Disabled exact live policy audit
+    needs: prepare-policy-audit
+    if: ${{ false }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    environment: release-policy-audit
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      policy_audit_reference_artifact_id: ${{ steps.audit.outputs.reference-artifact-id }}
+      policy_audit_reference_artifact_digest: ${{ steps.audit.outputs.reference-artifact-digest }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+          sparse-checkout: .github/actions/release-policy-audit
+      - id: audit
+        uses: ./.github/actions/release-policy-audit
+        with:
+          bundle-artifact-id: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_id }}
+          bundle-artifact-digest: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_digest }}
+          bundle-artifact-name: ${{ needs.prepare-policy-audit.outputs.bundle_artifact_name }}
+          candidate-run-id: ${{ inputs.candidate_run_id }}
+          candidate-manifest-run-id: ${{ inputs.candidate_manifest_run_id }}
+          candidate-manifest-artifact-id: ${{ inputs.candidate_manifest_artifact_id }}
+          candidate-manifest-artifact-digest: ${{ inputs.candidate_manifest_artifact_digest }}
+          candidate-manifest-sha256: ${{ inputs.candidate_manifest_sha256 }}
+          candidate-manifest-created-at: ${{ inputs.candidate_manifest_created_at }}
+          candidate-manifest-expires-at: ${{ inputs.candidate_manifest_expires_at }}
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          audit-workflow-id: 316435346
+          audit-workflow-path: .github/workflows/release-promote.yml
+          audit-app-id: ${{ vars.RMUX_POLICY_AUDIT_APP_ID }}
+          audit-app-private-key: ${{ secrets.RMUX_POLICY_AUDIT_APP_PRIVATE_KEY }}
+          github-token: ${{ github.token }}
+  authorize-promotion:
+    name: Disabled short-lived promotion authorization
+    needs: [verify-candidate, policy-audit]
+    if: ${{ false }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    outputs:
+      authorization_artifact_id: ${{ steps.authorization-upload.outputs.artifact-id }}
+      authorization_artifact_digest: sha256:${{ steps.authorization-upload.outputs.artifact-digest }}
+      envelope_artifact_id: ${{ steps.envelope-upload.outputs.artifact-id }}
+      envelope_artifact_digest: sha256:${{ steps.envelope-upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+      - name: Fail closed before OIDC authorization
+        run: scripts/release/assert-release-capability.py promotion_authorization
+      - name: Verify exact candidate and policy evidence artifact identities
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --artifact-id "${{ needs.verify-candidate.outputs.bundle_artifact_id }}" \
+            --name "${{ needs.verify-candidate.outputs.bundle_artifact_name }}" \
+            --expected-source-sha "${{ inputs.expected_source_sha }}" \
+            --expected-digest "${{ needs.verify-candidate.outputs.bundle_artifact_digest }}" --max-attempts 1
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --artifact-id "${{ needs.policy-audit.outputs.policy_audit_reference_artifact_id }}" \
+            --name "rmux-policy-audit-reference-$GITHUB_RUN_ID" \
+            --expected-source-sha "${{ inputs.expected_source_sha }}" \
+            --expected-digest "${{ needs.policy-audit.outputs.policy_audit_reference_artifact_digest }}" --max-attempts 1
+      - name: Download only the exact verified candidate bundle ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.verify-candidate.outputs.bundle_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-authorization/verified
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - name: Download only the exact policy audit reference ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.policy-audit.outputs.policy_audit_reference_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-authorization/policy
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+
+      - id: times
+        name: Bound authorization to ten minutes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          from datetime import datetime, timedelta, timezone
+          import pathlib, sys
+          issued = datetime.now(timezone.utc).replace(microsecond=0)
+          with pathlib.Path(sys.argv[1]).open("a", encoding="utf-8") as output:
+              output.write(f"issued_at={issued.isoformat().replace('+00:00', 'Z')}\n")
+              output.write(f"expires_at={(issued + timedelta(minutes=10)).isoformat().replace('+00:00', 'Z')}\n")
+          PY
+
+      - name: Create and verify non-circular authorization predicate
+        shell: bash
+        env:
+          RMUX_AUTHORIZATION_WORKFLOW_ID: ${{ inputs.authorization_workflow_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RMUX_AUTHORIZATION_WORKFLOW_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "authorization workflow ID must be a positive integer" >&2
+            exit 1
+          fi
+          root="$RUNNER_TEMP/rmux-authorization"
+          common=(
+            --candidate-manifest "$root/verified/candidate-manifest.json"
+            --candidate-reference "$root/verified/candidate-reference.json"
+            --signed-tag "$root/verified/signed-tag-proof.json"
+            --policy-audit-reference "$root/policy/policy-audit-reference.json"
+            --sha256sums "$root/verified/release-assets/SHA256SUMS"
+            --authorization-run-id "$GITHUB_RUN_ID"
+            --authorization-run-attempt 1
+            --authorization-workflow-id "$RMUX_AUTHORIZATION_WORKFLOW_ID"
+            --issued-at "${{ steps.times.outputs.issued_at }}"
+            --expires-at "${{ steps.times.outputs.expires_at }}"
+          )
+          python3 scripts/release/promotion-authorization.py create-predicate \
+            "${common[@]}" --output "$root/promotion-authorization-predicate.json"
+          python3 scripts/release/promotion-authorization.py verify-predicate \
+            "${common[@]}" --document "$root/promotion-authorization-predicate.json"
+
+      - id: attestation
+        name: Attest exact SHA256SUMS with the authorization predicate
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-checksums: ${{ runner.temp }}/rmux-authorization/verified/release-assets/SHA256SUMS
+          predicate-type: https://rmux.io/attestations/release-promotion-authorization/v1
+          predicate-path: ${{ runner.temp }}/rmux-authorization/promotion-authorization-predicate.json
+          show-summary: false
+
+      - name: Give the attestation bundle its contracted public name
+        shell: bash
+        run: cp -- "${{ steps.attestation.outputs.bundle-path }}" "$RUNNER_TEMP/rmux-authorization/SHA256SUMS.sigstore.json"
+
+      - id: authorization-upload
+        name: Upload predicate and attestation bundle by exact ID
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-promotion-authorization-${{ inputs.expected_source_sha }}
+          path: |
+            ${{ runner.temp }}/rmux-authorization/promotion-authorization-predicate.json
+            ${{ runner.temp }}/rmux-authorization/SHA256SUMS.sigstore.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - id: authorization-api
+        name: Resolve exact authorization bundle size and digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release/actions-artifact.py resolve-id \
+            --repository "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" \
+            --artifact-id "${{ steps.authorization-upload.outputs.artifact-id }}" \
+            --name "rmux-promotion-authorization-${{ inputs.expected_source_sha }}" \
+            --expected-source-sha "${{ inputs.expected_source_sha }}" --max-attempts 6 \
+            --retry-delay-seconds 2 > "$RUNNER_TEMP/rmux-authorization/artifact.json"
+          python3 - "$RUNNER_TEMP/rmux-authorization/artifact.json" "$GITHUB_OUTPUT" <<'PY'
+          import json, pathlib, sys
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          with pathlib.Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              output.write(f"artifact_digest={value['digest']}\n")
+              output.write(f"artifact_size={value['size_in_bytes']}\n")
+          PY
+
+      - name: Create and verify post-upload authorization envelope
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-authorization"
+          common=(
+            --predicate "$root/promotion-authorization-predicate.json"
+            --attestation-id "${{ steps.attestation.outputs.attestation-id }}"
+            --attestation-bundle "$root/SHA256SUMS.sigstore.json"
+            --bundle-artifact-id "${{ steps.authorization-upload.outputs.artifact-id }}"
+            --bundle-artifact-name "rmux-promotion-authorization-${{ inputs.expected_source_sha }}"
+            --bundle-artifact-digest "${{ steps.authorization-api.outputs.artifact_digest }}"
+            --bundle-artifact-size "${{ steps.authorization-api.outputs.artifact_size }}"
+            --created-at "${{ steps.times.outputs.issued_at }}"
+          )
+          python3 scripts/release/promotion-authorization.py create-envelope \
+            "${common[@]}" --output "$root/promotion-authorization-envelope.json"
+          python3 scripts/release/promotion-authorization.py verify-envelope \
+            "${common[@]}" --document "$root/promotion-authorization-envelope.json"
+
+      - id: envelope-upload
+        name: Upload non-circular authorization envelope separately
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-promotion-envelope-${{ inputs.expected_source_sha }}
+          path: ${{ runner.temp }}/rmux-authorization/promotion-authorization-envelope.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Disabled atomic GitHub Release publication plan
+    needs: [verify-candidate, policy-audit, authorize-promotion]
+    if: ${{ false }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    environment: release-publication
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Fail closed before obtaining publication authority
+        run: scripts/release/assert-release-capability.py github_release_publication
+
+      - name: Re-download and verify original candidate publication inputs
+        uses: ./.github/actions/release-publication-inputs
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          candidate-run-id: ${{ inputs.candidate_run_id }}
+          manifest-run-id: ${{ inputs.candidate_manifest_run_id }}
+          manifest-artifact-id: ${{ inputs.candidate_manifest_artifact_id }}
+          manifest-artifact-digest: ${{ inputs.candidate_manifest_artifact_digest }}
+          manifest-sha256: ${{ inputs.candidate_manifest_sha256 }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          release-ref: ${{ inputs.release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          authorization-run-id: ${{ github.run_id }}
+          authorization-artifact-id: ${{ needs.authorize-promotion.outputs.authorization_artifact_id }}
+          authorization-artifact-digest: ${{ needs.authorize-promotion.outputs.authorization_artifact_digest }}
+          envelope-artifact-id: ${{ needs.authorize-promotion.outputs.envelope_artifact_id }}
+          envelope-artifact-digest: ${{ needs.authorize-promotion.outputs.envelope_artifact_digest }}
+
+      - name: Prepare an exact read-only publication plan from original bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-publication"
+          test -f "$root/authorization/promotion-authorization-predicate.json"
+          test -f "$root/envelope/promotion-authorization-envelope.json"
+          cp -- "$root/authorization/SHA256SUMS.sigstore.json" \
+            "$root/release-assets/SHA256SUMS.sigstore.json"
+          printf '# RMUX %s\n\nExact candidate `%s` from `%s`.\n' \
+            "${{ inputs.release_ref }}" "${{ inputs.candidate_run_id }}" \
+            "${{ inputs.expected_source_sha }}" > "$root/release-notes.md"
+          # PR8 alone may add execution mode after all capabilities and simulations pass.
+          python3 scripts/release/publish-github-release.py \
+            --predicate "$root/authorization/promotion-authorization-predicate.json" \
+            --envelope "$root/envelope/promotion-authorization-envelope.json" \
+            --assets-dir "$root/release-assets" \
+            --notes-file "$root/release-notes.md" \
+            --title "RMUX ${{ inputs.release_ref }}"

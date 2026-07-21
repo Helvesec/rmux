@@ -209,6 +209,10 @@ fn rmux_binary() -> TestResult<&'static Path> {
 }
 
 fn resolve_rmux_binary() -> TestResult<PathBuf> {
+    if let Some(path) = windows_cargo_build::prebuilt_rmux_binary()? {
+        return Ok(path);
+    }
+
     if let Some(path) = option_env!("CARGO_BIN_EXE_rmux") {
         let path = PathBuf::from(path);
         if path.is_file() {

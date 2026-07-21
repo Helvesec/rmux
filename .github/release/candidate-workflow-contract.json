@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "status": "review-only-not-authoritative",
+  "repository_id": 1239918790,
+  "workflow": {
+    "id": 277622540,
+    "name": "CI",
+    "path": ".github/workflows/ci.yml",
+    "event": "workflow_dispatch",
+    "branch": "main",
+    "required_run_attempt": 1
+  },
+  "scheduler": {
+    "concurrency_group": "rmux-release-candidate",
+    "cancel_in_progress": false,
+    "maximum_parallel_jobs": 14,
+    "maximum_parallel_macos_jobs": 2,
+    "dispatch_after_fast_success": true
+  },
+  "fast_proof": {
+    "kind": "fast",
+    "selected_by_run_id": true,
+    "required_workflow_id": 277622540,
+    "required_job_contract": ".github/release/candidate-contract.json"
+  },
+  "delta": {
+    "replays_fast_jobs": false,
+    "tmux_oracle_builds": 1,
+    "review_sections": ["cli", "perf", "static", "tmux"],
+    "proof_jobs": [
+      "nix",
+      "release-review-cli",
+      "release-review-perf",
+      "release-review-static",
+      "release-review-tmux",
+      "snap",
+      "windows-ctrl-matrix"
+    ]
+  },
+  "canonical_builds": {
+    "contract": ".github/release/canonical-build-contract.json",
+    "workflow": ".github/workflows/canonical-native-build.yml",
+    "native_platforms": 5,
+    "windows_smokes": ["mouse", "runtime", "sdk"],
+    "artifact_retention_days": 7,
+    "download_by_artifact_id": true,
+    "object_cache_restored": false
+  },
+  "shadow_sealer": {
+    "workflow_id": 316223904,
+    "workflow": ".github/workflows/release-shadow.yml",
+    "selected_by_candidate_run_id": true,
+    "candidate_artifact_count": 11,
+    "canonical_platforms": [
+      "linux-aarch64",
+      "linux-x86_64",
+      "macos-aarch64",
+      "macos-x86_64",
+      "windows-x86_64"
+    ],
+    "manifest_status": "shadow-non-authoritative",
+    "manifest_retention_days": 7,
+    "manifest_self_reference": false
+  },
+  "policy_audit": {
+    "activation_ledger": ".github/release/release-activation.json",
+    "capability_enabled": false,
+    "contract": ".github/release/policy-audit-contract.json",
+    "audit_app_configured": true,
+    "preparer_workflow": ".github/workflows/release-policy-audit.yml",
+    "preparer_callers": 2,
+    "privileged_action": ".github/actions/release-policy-audit/action.yml",
+    "privileged_job_condition": "disabled-in-promoter",
+    "pat_fallback": false,
+    "authorizes_publication": false
+  },
+  "publication": {
+    "enabled": false,
+    "promoter_concurrency": "rmux-release-promote-${release_ref}",
+    "promoter_trigger": "workflow_call",
+    "promoter_workflow": ".github/workflows/release-promote.yml",
+    "public_triggers": false,
+    "publication_permissions": false,
+    "publication_secrets": false,
+    "receipt_concurrency": "rmux-release-receipt-${release_ref}",
+    "receipt_required_run_attempt": 1,
+    "receipt_trigger": "workflow_dispatch",
+    "receipt_workflow": ".github/workflows/release-receipt.yml",
+    "tag_authoring_concurrency": "rmux-release-tag-authoring-${release_ref}",
+    "tag_authoring_trigger": "workflow_call",
+    "tag_authoring_workflow": ".github/workflows/release-tag-authoring.yml"
+  }
+}

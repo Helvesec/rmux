@@ -1,0 +1,188 @@
+name: Prepare exact release publication inputs
+description: Re-download and verify original canonical candidate bytes without publishing
+
+inputs:
+  github-token: {required: true, description: Read-only Actions token}
+  repository: {required: true, description: Exact source repository}
+  candidate-run-id: {required: true, description: Canonical candidate run ID}
+  manifest-run-id: {required: true, description: Shadow manifest run ID}
+  manifest-artifact-id: {required: true, description: Shadow manifest artifact ID}
+  manifest-artifact-digest: {required: true, description: Shadow manifest archive digest}
+  manifest-sha256: {required: true, description: Candidate manifest file digest}
+  source-sha: {required: true, description: Exact candidate commit}
+  release-intent-id: {required: true, description: Exact release intent}
+  release-ref: {required: true, description: Signed release tag}
+  release-kind: {required: true, description: RC or stable}
+  authorization-run-id: {required: true, description: Promotion authorization run ID}
+  authorization-artifact-id: {required: true, description: Authorization artifact ID}
+  authorization-artifact-digest: {required: true, description: Authorization archive digest}
+  envelope-artifact-id: {required: true, description: Authorization envelope artifact ID}
+  envelope-artifact-digest: {required: true, description: Authorization envelope archive digest}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify original manifest and authorization artifact identities
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        python3 scripts/release/actions-artifact.py verify \
+          --repository "${{ inputs.repository }}" --run-id "${{ inputs.manifest-run-id }}" \
+          --artifact-id "${{ inputs.manifest-artifact-id }}" \
+          --name "rmux-candidate-manifest-${{ inputs.candidate-run-id }}" \
+          --expected-source-sha "${{ inputs.source-sha }}" \
+          --expected-digest "${{ inputs.manifest-artifact-digest }}" \
+          --expected-workflow-id 316223904 \
+          --expected-workflow-path .github/workflows/release-shadow.yml \
+          --expected-event workflow_dispatch --expected-head-branch main --max-attempts 1
+        python3 scripts/release/actions-artifact.py verify \
+          --repository "${{ inputs.repository }}" --run-id "${{ inputs.authorization-run-id }}" \
+          --artifact-id "${{ inputs.authorization-artifact-id }}" \
+          --name "rmux-promotion-authorization-${{ inputs.source-sha }}" \
+          --expected-source-sha "${{ inputs.source-sha }}" \
+          --expected-digest "${{ inputs.authorization-artifact-digest }}" --max-attempts 1
+        python3 scripts/release/actions-artifact.py verify \
+          --repository "${{ inputs.repository }}" --run-id "${{ inputs.authorization-run-id }}" \
+          --artifact-id "${{ inputs.envelope-artifact-id }}" \
+          --name "rmux-promotion-envelope-${{ inputs.source-sha }}" \
+          --expected-source-sha "${{ inputs.source-sha }}" \
+          --expected-digest "${{ inputs.envelope-artifact-digest }}" --max-attempts 1
+
+    - id: artifacts
+      name: Resolve the eleven original candidate artifact IDs again
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        root="$RUNNER_TEMP/rmux-publication"
+        mkdir -p "$root"
+        scripts/release/verify-candidate-artifacts.py resolve \
+          --repository "${{ inputs.repository }}" \
+          --candidate-run-id "${{ inputs.candidate-run-id }}" \
+          --expected-source-sha "${{ inputs.source-sha }}" \
+          --output "$root/candidate-artifacts.json"
+        ids=$(python3 - "$root/candidate-artifacts.json" <<'PY'
+        import json, pathlib, sys
+        artifacts = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["artifacts"]
+        if len(artifacts) != 11: raise SystemExit("expected exactly eleven candidate artifacts")
+        print(",".join(str(item["artifact_id"]) for item in artifacts))
+        PY
+        )
+        echo "artifact_ids=$ids" >> "$GITHUB_OUTPUT"
+
+    - name: Download original sealed manifest by exact ID
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.manifest-artifact-id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/rmux-publication/manifest
+        github-token: ${{ inputs.github-token }}
+        repository: ${{ inputs.repository }}
+        run-id: ${{ inputs.manifest-run-id }}
+
+    - name: Download original candidate artifacts by exact IDs
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ steps.artifacts.outputs.artifact_ids }}
+        path: ${{ runner.temp }}/rmux-publication/candidate
+        github-token: ${{ inputs.github-token }}
+        repository: ${{ inputs.repository }}
+        run-id: ${{ inputs.candidate-run-id }}
+
+    - name: Download exact authorization bundle by ID
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.authorization-artifact-id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/rmux-publication/authorization
+        github-token: ${{ inputs.github-token }}
+        repository: ${{ inputs.repository }}
+        run-id: ${{ inputs.authorization-run-id }}
+
+    - name: Download exact authorization envelope by ID
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.envelope-artifact-id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/rmux-publication/envelope
+        github-token: ${{ inputs.github-token }}
+        repository: ${{ inputs.repository }}
+        run-id: ${{ inputs.authorization-run-id }}
+
+    - id: gh
+      name: Install the pinned read-only GitHub CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        scripts/release/install-gh-2.93.0.sh "$RUNNER_TEMP/rmux-publication-gh"
+        echo "binary=$RUNNER_TEMP/rmux-publication-gh/gh" >> "$GITHUB_OUTPUT"
+
+    - name: Revalidate original archive IDs, provenance, and bytes
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate-run-id }}
+        RMUX_MANIFEST_RUN_ID: ${{ inputs.manifest-run-id }}
+        RMUX_MANIFEST_ARTIFACT_ID: ${{ inputs.manifest-artifact-id }}
+        RMUX_MANIFEST_ARTIFACT_DIGEST: ${{ inputs.manifest-artifact-digest }}
+        RMUX_MANIFEST_SHA256: ${{ inputs.manifest-sha256 }}
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.source-sha }}
+        RMUX_RELEASE_INTENT_ID: ${{ inputs.release-intent-id }}
+        RMUX_RELEASE_REF: ${{ inputs.release-ref }}
+        RMUX_RELEASE_KIND: ${{ inputs.release-kind }}
+      run: |
+        set -euo pipefail
+        root="$RUNNER_TEMP/rmux-publication"
+        manifest="$root/manifest/candidate-manifest.json"
+        predicate="$root/authorization/promotion-authorization-predicate.json"
+        python3 - "$manifest" "$predicate" <<'PY'
+        import hashlib, json, os, pathlib, sys
+        manifest_path, predicate_path = map(pathlib.Path, sys.argv[1:])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        predicate = json.loads(predicate_path.read_text(encoding="utf-8"))
+        candidate, release = predicate.get("candidate", {}), predicate.get("release", {})
+        expected = {
+            "candidate_run_id": int(os.environ["RMUX_CANDIDATE_RUN_ID"]),
+            "source_git_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
+            "release_intent_id": os.environ["RMUX_RELEASE_INTENT_ID"],
+            "planned_release_ref": os.environ["RMUX_RELEASE_REF"],
+            "release_kind": os.environ["RMUX_RELEASE_KIND"],
+        }
+        if any(manifest.get(field) != value for field, value in expected.items()): raise SystemExit("original candidate manifest identity differs")
+        if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != os.environ["RMUX_MANIFEST_SHA256"]: raise SystemExit("original candidate manifest bytes differ")
+        bindings = {
+            "candidate_run_id": manifest["candidate_run_id"], "source_git_sha": manifest["source_git_sha"],
+            "manifest_run_id": int(os.environ["RMUX_MANIFEST_RUN_ID"]),
+            "manifest_artifact_id": int(os.environ["RMUX_MANIFEST_ARTIFACT_ID"]),
+            "manifest_artifact_digest": os.environ["RMUX_MANIFEST_ARTIFACT_DIGEST"],
+            "manifest_sha256": os.environ["RMUX_MANIFEST_SHA256"],
+        }
+        if any(candidate.get(field) != value for field, value in bindings.items()): raise SystemExit("authorization does not bind the original candidate manifest")
+        if release.get("intent_id") != manifest["release_intent_id"] or release.get("ref") != manifest["planned_release_ref"] or release.get("kind") != manifest["release_kind"]: raise SystemExit("authorization release identity differs from the manifest")
+        PY
+        fast_run_id=$(python3 - "$manifest" <<'PY'
+        import json, pathlib, sys
+        print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["fast_run_id"])
+        PY
+        )
+        scripts/release/verify-candidate-artifacts.py verify-downloaded \
+          --repository "${{ inputs.repository }}" --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" --fast-run-id "$fast_run_id" \
+          --release-intent-id "$RMUX_RELEASE_INTENT_ID" --planned-release-ref "$RMUX_RELEASE_REF" \
+          --release-kind "$RMUX_RELEASE_KIND" --resolution "$root/candidate-artifacts.json" \
+          --downloads-dir "$root/candidate" --output "$root/verified-candidate-artifacts.json"
+        scripts/release/verify-candidate-attestations.sh \
+          "$root/candidate" "$RMUX_EXPECTED_SOURCE_SHA" "${{ steps.gh.outputs.binary }}"
+        scripts/release/stage-candidate-release.py \
+          --manifest "$manifest" --resolution "$root/candidate-artifacts.json" \
+          --downloads-dir "$root/candidate" --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" --output "$root/release-assets"
+        expected_sums=$(python3 - "$predicate" <<'PY'
+        import json, pathlib, sys
+        print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["sha256sums_sha256"])
+        PY
+        )
+        test "$(sha256sum "$root/release-assets/SHA256SUMS" | cut -d' ' -f1)" = "$expected_sums"

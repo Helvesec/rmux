@@ -1,0 +1,421 @@
+name: Canonical native builds
+
+on:
+  workflow_call:
+    inputs:
+      expected_source_sha:
+        required: true
+        type: string
+      fast_run_id:
+        required: true
+        type: string
+      fast_nextest_artifact_id:
+        required: true
+        type: string
+      fast_nextest_artifact_digest:
+        required: true
+        type: string
+      release_intent_id:
+        required: true
+        type: string
+      planned_release_ref:
+        required: true
+        type: string
+      release_kind:
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  build-linux-x86-64:
+    name: Canonical build linux-x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+    outputs:
+      assets_id: ${{ steps.build.outputs.assets-artifact-id }}
+      assets_digest: ${{ steps.build.outputs.assets-artifact-digest }}
+      assets_name: ${{ steps.build.outputs.assets-artifact-name }}
+      provenance_id: ${{ steps.build.outputs.provenance-artifact-id }}
+      provenance_digest: ${{ steps.build.outputs.provenance-artifact-digest }}
+      attestation_id: ${{ steps.build.outputs.attestation-id }}
+      record_sha256: ${{ steps.build.outputs.build-record-sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build the canonical amd64 Snap
+        id: snapcraft
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79
+        with:
+          path: .
+          snapcraft-args: --platform amd64
+      - name: Smoke the canonical amd64 Snap
+        run: scripts/smoke-snap-package.sh "${{ steps.snapcraft.outputs.snap }}"
+      - id: build
+        uses: ./.github/actions/canonical-build
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: linux-x86_64
+          runner-image: ubuntu-22.04
+          target-triple: x86_64-unknown-linux-gnu
+          snap-package: ${{ steps.snapcraft.outputs.snap }}
+
+  build-linux-aarch64:
+    name: Canonical build linux-aarch64
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+    outputs:
+      assets_id: ${{ steps.build.outputs.assets-artifact-id }}
+      assets_digest: ${{ steps.build.outputs.assets-artifact-digest }}
+      assets_name: ${{ steps.build.outputs.assets-artifact-name }}
+      provenance_id: ${{ steps.build.outputs.provenance-artifact-id }}
+      provenance_digest: ${{ steps.build.outputs.provenance-artifact-digest }}
+      attestation_id: ${{ steps.build.outputs.attestation-id }}
+      record_sha256: ${{ steps.build.outputs.build-record-sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Build the canonical arm64 Snap
+        id: snapcraft
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79
+        with:
+          path: .
+          snapcraft-args: --platform arm64
+      - name: Smoke the canonical arm64 Snap
+        run: scripts/smoke-snap-package.sh "${{ steps.snapcraft.outputs.snap }}"
+      - id: build
+        uses: ./.github/actions/canonical-build
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: linux-aarch64
+          runner-image: ubuntu-22.04-arm
+          target-triple: aarch64-unknown-linux-gnu
+          snap-package: ${{ steps.snapcraft.outputs.snap }}
+
+  build-macos-x86-64:
+    name: Canonical build macos-x86_64
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+    outputs:
+      assets_id: ${{ steps.build.outputs.assets-artifact-id }}
+      assets_digest: ${{ steps.build.outputs.assets-artifact-digest }}
+      assets_name: ${{ steps.build.outputs.assets-artifact-name }}
+      provenance_id: ${{ steps.build.outputs.provenance-artifact-id }}
+      provenance_digest: ${{ steps.build.outputs.provenance-artifact-digest }}
+      attestation_id: ${{ steps.build.outputs.attestation-id }}
+      record_sha256: ${{ steps.build.outputs.build-record-sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: build
+        uses: ./.github/actions/canonical-build
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: macos-x86_64
+          runner-image: macos-15-intel
+          target-triple: x86_64-apple-darwin
+
+  build-macos-aarch64:
+    name: Canonical build macos-aarch64
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+    outputs:
+      assets_id: ${{ steps.build.outputs.assets-artifact-id }}
+      assets_digest: ${{ steps.build.outputs.assets-artifact-digest }}
+      assets_name: ${{ steps.build.outputs.assets-artifact-name }}
+      provenance_id: ${{ steps.build.outputs.provenance-artifact-id }}
+      provenance_digest: ${{ steps.build.outputs.provenance-artifact-digest }}
+      attestation_id: ${{ steps.build.outputs.attestation-id }}
+      record_sha256: ${{ steps.build.outputs.build-record-sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: build
+        uses: ./.github/actions/canonical-build
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: macos-aarch64
+          runner-image: macos-15
+          target-triple: aarch64-apple-darwin
+
+  build-windows-x86-64:
+    name: Canonical build windows-x86_64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+    outputs:
+      assets_id: ${{ steps.build.outputs.assets-artifact-id }}
+      assets_digest: ${{ steps.build.outputs.assets-artifact-digest }}
+      assets_name: ${{ steps.build.outputs.assets-artifact-name }}
+      provenance_id: ${{ steps.build.outputs.provenance-artifact-id }}
+      provenance_digest: ${{ steps.build.outputs.provenance-artifact-digest }}
+      attestation_id: ${{ steps.build.outputs.attestation-id }}
+      record_sha256: ${{ steps.build.outputs.build-record-sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: build
+        uses: ./.github/actions/canonical-build
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: windows-x86_64
+          runner-image: windows-latest
+          target-triple: x86_64-pc-windows-msvc
+
+  smoke-linux-x86-64:
+    name: Canonical smoke linux-x86_64
+    needs: build-linux-x86-64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/canonical-smoke
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          fast-nextest-artifact-id: ${{ inputs.fast_nextest_artifact_id }}
+          fast-nextest-artifact-digest: ${{ inputs.fast_nextest_artifact_digest }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: linux-x86_64
+          assets-artifact-id: ${{ needs.build-linux-x86-64.outputs.assets_id }}
+          assets-artifact-name: ${{ needs.build-linux-x86-64.outputs.assets_name }}
+          assets-artifact-digest: ${{ needs.build-linux-x86-64.outputs.assets_digest }}
+          expected-build-record-sha256: ${{ needs.build-linux-x86-64.outputs.record_sha256 }}
+          smoke-kind: package
+
+  smoke-linux-aarch64:
+    name: Canonical smoke linux-aarch64
+    needs: build-linux-aarch64
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/canonical-smoke
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          fast-nextest-artifact-id: ${{ inputs.fast_nextest_artifact_id }}
+          fast-nextest-artifact-digest: ${{ inputs.fast_nextest_artifact_digest }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: linux-aarch64
+          assets-artifact-id: ${{ needs.build-linux-aarch64.outputs.assets_id }}
+          assets-artifact-name: ${{ needs.build-linux-aarch64.outputs.assets_name }}
+          assets-artifact-digest: ${{ needs.build-linux-aarch64.outputs.assets_digest }}
+          expected-build-record-sha256: ${{ needs.build-linux-aarch64.outputs.record_sha256 }}
+          smoke-kind: package
+
+  smoke-macos-x86-64:
+    name: Canonical smoke macos-x86_64
+    needs: build-macos-x86-64
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/canonical-smoke
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          fast-nextest-artifact-id: ${{ inputs.fast_nextest_artifact_id }}
+          fast-nextest-artifact-digest: ${{ inputs.fast_nextest_artifact_digest }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: macos-x86_64
+          assets-artifact-id: ${{ needs.build-macos-x86-64.outputs.assets_id }}
+          assets-artifact-name: ${{ needs.build-macos-x86-64.outputs.assets_name }}
+          assets-artifact-digest: ${{ needs.build-macos-x86-64.outputs.assets_digest }}
+          expected-build-record-sha256: ${{ needs.build-macos-x86-64.outputs.record_sha256 }}
+          smoke-kind: package
+
+  smoke-macos-aarch64:
+    name: Canonical smoke macos-aarch64
+    needs: build-macos-aarch64
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/canonical-smoke
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          fast-nextest-artifact-id: ${{ inputs.fast_nextest_artifact_id }}
+          fast-nextest-artifact-digest: ${{ inputs.fast_nextest_artifact_digest }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: macos-aarch64
+          assets-artifact-id: ${{ needs.build-macos-aarch64.outputs.assets_id }}
+          assets-artifact-name: ${{ needs.build-macos-aarch64.outputs.assets_name }}
+          assets-artifact-digest: ${{ needs.build-macos-aarch64.outputs.assets_digest }}
+          expected-build-record-sha256: ${{ needs.build-macos-aarch64.outputs.record_sha256 }}
+          smoke-kind: package
+
+  smoke-windows-x86-64:
+    name: Canonical smoke windows-x86_64 (${{ matrix.smoke }})
+    needs: build-windows-x86-64
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        smoke: [runtime, sdk, mouse]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/canonical-smoke
+        with:
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+          fast-run-id: ${{ inputs.fast_run_id }}
+          fast-nextest-artifact-id: ${{ inputs.fast_nextest_artifact_id }}
+          fast-nextest-artifact-digest: ${{ inputs.fast_nextest_artifact_digest }}
+          release-intent-id: ${{ inputs.release_intent_id }}
+          planned-release-ref: ${{ inputs.planned_release_ref }}
+          release-kind: ${{ inputs.release_kind }}
+          platform-key: windows-x86_64
+          assets-artifact-id: ${{ needs.build-windows-x86-64.outputs.assets_id }}
+          assets-artifact-name: ${{ needs.build-windows-x86-64.outputs.assets_name }}
+          assets-artifact-digest: ${{ needs.build-windows-x86-64.outputs.assets_digest }}
+          expected-build-record-sha256: ${{ needs.build-windows-x86-64.outputs.record_sha256 }}
+          smoke-kind: ${{ matrix.smoke }}
+
+  gate:
+    name: Canonical native build gate
+    if: always()
+    needs:
+      - build-linux-x86-64
+      - build-linux-aarch64
+      - build-macos-x86-64
+      - build-macos-aarch64
+      - build-windows-x86-64
+      - smoke-linux-x86-64
+      - smoke-linux-aarch64
+      - smoke-macos-x86-64
+      - smoke-macos-aarch64
+      - smoke-windows-x86-64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require all canonical builds and exact-byte smokes
+        env:
+          BUILD_LINUX_X64: ${{ needs.build-linux-x86-64.result }}
+          BUILD_LINUX_ARM64: ${{ needs.build-linux-aarch64.result }}
+          BUILD_MACOS_X64: ${{ needs.build-macos-x86-64.result }}
+          BUILD_MACOS_ARM64: ${{ needs.build-macos-aarch64.result }}
+          BUILD_WINDOWS_X64: ${{ needs.build-windows-x86-64.result }}
+          SMOKE_LINUX_X64: ${{ needs.smoke-linux-x86-64.result }}
+          SMOKE_LINUX_ARM64: ${{ needs.smoke-linux-aarch64.result }}
+          SMOKE_MACOS_X64: ${{ needs.smoke-macos-x86-64.result }}
+          SMOKE_MACOS_ARM64: ${{ needs.smoke-macos-aarch64.result }}
+          SMOKE_WINDOWS_X64: ${{ needs.smoke-windows-x86-64.result }}
+        run: |
+          for result in \
+            "$BUILD_LINUX_X64" "$BUILD_LINUX_ARM64" \
+            "$BUILD_MACOS_X64" "$BUILD_MACOS_ARM64" "$BUILD_WINDOWS_X64" \
+            "$SMOKE_LINUX_X64" "$SMOKE_LINUX_ARM64" \
+            "$SMOKE_MACOS_X64" "$SMOKE_MACOS_ARM64" "$SMOKE_WINDOWS_X64"; do
+            test "$result" = success
+          done

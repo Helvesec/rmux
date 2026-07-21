@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/downstream-channel-summary-v1.json",
+  "title": "RMUX disarmed downstream channel truth summary",
+  "description": "Review-only two-phase truth summary. It MUST NOT authorize publication or an rmux.io deployment before PR8.",
+  "x-rmux-status": "disarmed-non-authoritative",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "phase",
+    "status",
+    "downstream_authority",
+    "execution_authority",
+    "repository_id",
+    "source_git_sha",
+    "release",
+    "receipt",
+    "plan_sha256",
+    "channel_policy_sha256",
+    "result_aggregation_ready",
+    "aggregation_blockers",
+    "result_count",
+    "results",
+    "advertised_channels",
+    "unresolved_channels",
+    "rmux_io_last",
+    "rmux_io_two_phase_ready",
+    "rmux_io_authority",
+    "pre_site_summary_sha256",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "phase": {"enum": ["pre-site", "final"]},
+    "status": {"const": "disarmed-non-authoritative"},
+    "downstream_authority": {"const": false},
+    "execution_authority": {"const": false},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"$ref": "#/$defs/sha40"},
+    "release": {"$ref": "#/$defs/release"},
+    "receipt": {"$ref": "#/$defs/receipt"},
+    "plan_sha256": {"$ref": "#/$defs/sha256"},
+    "channel_policy_sha256": {"$ref": "#/$defs/sha256"},
+    "result_aggregation_ready": {"const": true},
+    "aggregation_blockers": {"type": "array", "maxItems": 0},
+    "result_count": {"type": "integer", "minimum": 10, "maximum": 11},
+    "results": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 11,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["channel", "reference_sha256", "reference"],
+        "properties": {
+          "channel": {"$ref": "#/$defs/channel"},
+          "reference_sha256": {"$ref": "#/$defs/sha256"},
+          "reference": {"$ref": "downstream-channel-result-reference.schema.json"}
+        }
+      }
+    },
+    "advertised_channels": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/non_site_channel"}
+    },
+    "unresolved_channels": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/channel"}
+    },
+    "rmux_io_last": {"const": true},
+    "rmux_io_two_phase_ready": {"const": true},
+    "rmux_io_authority": {"const": false},
+    "pre_site_summary_sha256": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]
+    },
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"phase": {"const": "pre-site"}}, "required": ["phase"]},
+      "then": {
+        "properties": {
+          "result_count": {"const": 10},
+          "results": {"maxItems": 10},
+          "pre_site_summary_sha256": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"phase": {"const": "final"}}, "required": ["phase"]},
+      "then": {
+        "properties": {
+          "result_count": {"const": 11},
+          "results": {"minItems": 11},
+          "pre_site_summary_sha256": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "positive": {"type": "integer", "minimum": 1},
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "intent": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+    "release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+    "channel": {
+      "enum": [
+        "apt_rpm",
+        "chocolatey",
+        "crates_io",
+        "homebrew_core",
+        "homebrew_tap",
+        "rmux_io",
+        "scoop",
+        "snap_candidate",
+        "snap_stable",
+        "web_share",
+        "winget"
+      ]
+    },
+    "non_site_channel": {
+      "enum": [
+        "apt_rpm",
+        "chocolatey",
+        "crates_io",
+        "homebrew_core",
+        "homebrew_tap",
+        "scoop",
+        "snap_candidate",
+        "snap_stable",
+        "web_share",
+        "winget"
+      ]
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ref", "intent_id", "kind", "tag_object_sha", "immutable"],
+      "properties": {
+        "id": {"$ref": "#/$defs/positive"},
+        "ref": {"$ref": "#/$defs/release_ref"},
+        "intent_id": {"$ref": "#/$defs/intent"},
+        "kind": {"enum": ["rc", "stable"]},
+        "tag_object_sha": {"$ref": "#/$defs/sha40"},
+        "immutable": {"const": true}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "name", "archive_digest", "size_in_bytes"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/positive"},
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9._+@=-]+$"},
+        "archive_digest": {"$ref": "#/$defs/digest"},
+        "size_in_bytes": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "workflow_id", "workflow_path", "predicate_bundle", "predicate_sha256", "envelope_bundle", "envelope_sha256", "attestation", "verified_at"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/positive"},
+        "run_attempt": {"const": 1},
+        "workflow_id": {"$ref": "#/$defs/positive"},
+        "workflow_path": {"const": ".github/workflows/release-receipt.yml"},
+        "predicate_bundle": {"$ref": "#/$defs/receipt_predicate_artifact"},
+        "predicate_sha256": {"$ref": "#/$defs/sha256"},
+        "envelope_bundle": {"$ref": "#/$defs/receipt_envelope_artifact"},
+        "envelope_sha256": {"$ref": "#/$defs/sha256"},
+        "attestation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attestation_id", "bundle_file", "bundle_sha256"],
+          "properties": {
+            "attestation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "bundle_file": {"const": "publication-receipt.sigstore.json"},
+            "bundle_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "verified_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "receipt_predicate_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {"name": {"pattern": "^rmux-publication-receipt-[0-9a-f]{40}-[1-9][0-9]*$"}}}
+      ]
+    },
+    "receipt_envelope_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {"name": {"pattern": "^rmux-publication-receipt-envelope-[0-9a-f]{40}-[1-9][0-9]*$"}}}
+      ]
+    }
+  }
+}

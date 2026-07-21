@@ -30,7 +30,7 @@
   and sourced commands.
 - Improve startup config compatibility, including nested includes, BOM and CRLF
   handling, aliases, assignments, and the gpakosz configuration corpus.
-- Keep XTVERSION product identification honest by reporting RMUX rather than a
+- Report RMUX in XTVERSION product identification rather than a
   tmux release.
 - Disable incomplete Kitty keyboard negotiation while retaining supported
   xterm modifyOtherKeys behavior.

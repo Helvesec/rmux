@@ -91,22 +91,23 @@ fn windows_ctrl_matrix_implementation(script: &str) -> String {
 }
 
 #[test]
-fn platform_runtime_installs_clippy_before_running_the_windows_msvc_gate() {
+fn windows_test_build_installs_clippy_before_running_the_windows_msvc_gate() {
     let workflow = include_str!("../.github/workflows/ci.yml");
-    let platform_runtime = workflow
-        .split_once("\n  platform-runtime:\n")
+    let windows_test_build = workflow
+        .split_once("\n  windows-test-build:\n")
         .map(|(_, suffix)| suffix)
-        .and_then(|suffix| suffix.split_once("\n  windows-cross:\n"))
+        .and_then(|suffix| suffix.split_once("\n  windows-tests:\n"))
         .map(|(section, _)| section)
-        .expect("platform-runtime workflow section");
+        .expect("windows-test-build workflow section");
 
     assert!(
-        platform_runtime.contains("toolchain: \"1.96.1\"\n          components: clippy"),
-        "platform-runtime must install cargo-clippy for windows-latest"
+        windows_test_build.contains("toolchain: \"1.96.1\"\n          components: clippy"),
+        "windows-test-build must install cargo-clippy for windows-latest"
     );
     assert!(
-        platform_runtime.contains("cargo clippy --workspace --all-targets --locked -- -D warnings"),
-        "platform-runtime must keep the Windows MSVC clippy gate"
+        windows_test_build
+            .contains("cargo clippy --workspace --all-targets --locked -- -D warnings"),
+        "windows-test-build must keep the Windows MSVC clippy gate"
     );
 }
 
@@ -116,6 +117,7 @@ fn windows_release_gate_uses_hosted_checks_and_nonempty_cargo_filters() {
     let gate = include_str!("../scripts/gate-windows-fast.ps1");
     let assert_filter = include_str!("../scripts/assert-cargo-filter-nonempty.ps1");
     let package_verify = include_str!("../scripts/verify-package-windows.ps1");
+    let canonical_smoke = include_str!("../.github/actions/canonical-smoke/action.yml");
 
     for required in [
         r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes")"#,
@@ -168,11 +170,24 @@ fn windows_release_gate_uses_hosted_checks_and_nonempty_cargo_filters() {
     assert!(
         package_verify.contains("RunCtrlMatrixSmoke")
             && package_verify.contains("windows_ctrl_matrix.ps1")
-            && package_verify.contains("-PortableSmokeOnly")
+            && package_verify.contains("PortableSmokeOnly = $true")
             && package_verify.contains("ExpectedGitSha")
             && package_verify.contains("CtrlMatrixEvidence")
             && package_verify.contains("produced no passing evidence"),
         "manual Windows package verification must keep the optional interactive Ctrl matrix smoke"
+    );
+    assert!(
+        package_verify.contains("$arguments = @{\n            Rmux =")
+            && package_verify.contains("PortableSmokeOnly = $true")
+            && package_verify.contains("$arguments.EvidencePath =")
+            && !package_verify.contains("\"-Rmux\", [System.IO.Path]::GetFullPath($Binary)"),
+        "PowerShell script parameters must use named hashtable splatting"
+    );
+    assert!(
+        canonical_smoke.contains("-RunBinary")
+            && canonical_smoke.contains("-RunDaemonSmoke")
+            && !canonical_smoke.contains("-RunCtrlMatrixSmoke"),
+        "GitHub-hosted package smokes must not require an interactive Windows session"
     );
     assert!(workflow.contains("if-no-files-found: error"));
 }

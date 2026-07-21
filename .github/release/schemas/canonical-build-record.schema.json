@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/canonical-build-record-v1.json",
+  "title": "RMUX canonical native build record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "repository_id",
+    "source_git_sha",
+    "fast_run_id",
+    "candidate_run_id",
+    "candidate_run_attempt",
+    "release_intent_id",
+    "planned_release_ref",
+    "release_kind",
+    "platform",
+    "runner",
+    "toolchain",
+    "build_policy",
+    "created_at",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "fast_run_id": {"type": "integer", "minimum": 1},
+    "candidate_run_id": {"type": "integer", "minimum": 1},
+    "candidate_run_attempt": {"const": 1},
+    "release_intent_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+    "planned_release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+    "release_kind": {"enum": ["shadow", "rc", "stable"]},
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "target_triple", "archive_format"],
+      "properties": {
+        "key": {"enum": ["linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64", "windows-x86_64"]},
+        "target_triple": {"enum": ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]},
+        "archive_format": {"enum": ["tar.gz", "zip"]}
+      }
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "os", "arch", "environment"],
+      "properties": {
+        "image": {"enum": ["ubuntu-22.04", "ubuntu-22.04-arm", "macos-15-intel", "macos-15", "windows-latest"]},
+        "os": {"enum": ["Linux", "macOS", "Windows"]},
+        "arch": {"enum": ["X64", "ARM64"]},
+        "environment": {"const": "github-hosted"}
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "release", "host", "commit_hash", "rustc_verbose_sha256"],
+      "properties": {
+        "requested": {"const": "1.96.1"},
+        "release": {"const": "1.96.1"},
+        "host": {"enum": ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]},
+        "commit_hash": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "rustc_verbose_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "build_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fresh_target", "cargo_incremental", "cargo_locked", "object_cache_restored", "publication_authority"],
+      "properties": {
+        "fresh_target": {"const": true},
+        "cargo_incremental": {"const": false},
+        "cargo_locked": {"const": true},
+        "object_cache_restored": {"const": false},
+        "publication_authority": {"const": false}
+      }
+    },
+    "created_at": {"type": "string", "format": "date-time"},
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "role", "size", "sha256"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._+@=-]+(?:/[A-Za-z0-9._+@=-]+)*$"},
+          "role": {"enum": ["archive", "checksums", "chocolatey-package", "crate-package-set", "debian", "rpm", "snap-amd64", "snap-arm64", "wasm-byte-set", "wasm-provenance"]},
+          "size": {"type": "integer", "minimum": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    }
+  }
+}

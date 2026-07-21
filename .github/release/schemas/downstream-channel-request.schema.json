@@ -1,0 +1,221 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/downstream-channel-request-v1.json",
+  "title": "RMUX disarmed downstream channel request",
+  "description": "Review-only request bound to an exact receipt, target, and payload set. It MUST NOT authorize publication before PR8.",
+  "x-rmux-status": "disarmed-non-authoritative",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "downstream_authority",
+    "execution_authority",
+    "execution_enabled",
+    "repository_id",
+    "source_git_sha",
+    "release",
+    "receipt",
+    "plan_sha256",
+    "channel",
+    "operation",
+    "retry_depth",
+    "idempotency_key",
+    "retry_of_request_sha256",
+    "payload_artifact",
+    "payload_set_sha256",
+    "pre_site_summary_sha256",
+    "target",
+    "previous_result",
+    "rebuild_native",
+    "requested_at",
+    "expires_at"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "status": {"const": "disarmed-non-authoritative"},
+    "downstream_authority": {"const": false},
+    "execution_authority": {"const": false},
+    "execution_enabled": {"const": false},
+    "repository_id": {"const": 1239918790},
+    "source_git_sha": {"$ref": "#/$defs/sha40"},
+    "release": {"$ref": "#/$defs/release"},
+    "receipt": {"$ref": "#/$defs/receipt"},
+    "plan_sha256": {"$ref": "#/$defs/sha256"},
+    "channel": {"$ref": "#/$defs/channel"},
+    "operation": {"enum": ["initial", "retry"]},
+    "retry_depth": {"type": "integer", "minimum": 0, "maximum": 1},
+    "idempotency_key": {"type": "string", "pattern": "^rmux-downstream-v1:[0-9a-f]{64}$"},
+    "retry_of_request_sha256": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]
+    },
+    "payload_artifact": {"$ref": "#/$defs/payload"},
+    "payload_set_sha256": {"$ref": "#/$defs/sha256"},
+    "pre_site_summary_sha256": {
+      "oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]
+    },
+    "target": {"$ref": "#/$defs/target"},
+    "previous_result": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["predicate_artifact_id", "predicate_artifact_digest", "envelope_artifact_id", "envelope_artifact_digest", "predicate_sha256", "envelope_sha256", "request_sha256", "state", "mutation_started", "remote_request_id"],
+          "properties": {
+            "predicate_artifact_id": {"$ref": "#/$defs/positive"},
+            "predicate_artifact_digest": {"$ref": "#/$defs/digest"},
+            "envelope_artifact_id": {"$ref": "#/$defs/positive"},
+            "envelope_artifact_digest": {"$ref": "#/$defs/digest"},
+            "predicate_sha256": {"$ref": "#/$defs/sha256"},
+            "envelope_sha256": {"$ref": "#/$defs/sha256"},
+            "request_sha256": {"$ref": "#/$defs/sha256"},
+            "state": {"enum": ["failed-transient", "prepared"]},
+            "mutation_started": {"const": false},
+            "remote_request_id": {"type": "null"}
+          }
+        }
+      ]
+    },
+    "rebuild_native": {"const": false},
+    "requested_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"operation": {"const": "initial"}}, "required": ["operation"]},
+      "then": {
+        "properties": {
+          "retry_depth": {"const": 0},
+          "retry_of_request_sha256": {"type": "null"},
+          "previous_result": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"operation": {"const": "retry"}}, "required": ["operation"]},
+      "then": {
+        "properties": {
+          "retry_depth": {"const": 1},
+          "retry_of_request_sha256": {"$ref": "#/$defs/sha256"},
+          "previous_result": {"type": "object"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"channel": {"const": "rmux_io"}}, "required": ["channel"]},
+      "then": {
+        "properties": {
+          "pre_site_summary_sha256": {"$ref": "#/$defs/sha256"}
+        }
+      },
+      "else": {
+        "properties": {
+          "pre_site_summary_sha256": {"type": "null"}
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "positive": {"type": "integer", "minimum": 1},
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "intent": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+    "release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+    "safe_name": {"type": "string", "pattern": "^[A-Za-z0-9._+@=-]+$"},
+    "channel": {
+      "enum": ["apt_rpm", "chocolatey", "crates_io", "homebrew_core", "homebrew_tap", "rmux_io", "scoop", "snap_candidate", "snap_stable", "web_share", "winget"]
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "ref", "intent_id", "kind", "tag_object_sha", "immutable"],
+      "properties": {
+        "id": {"$ref": "#/$defs/positive"},
+        "ref": {"$ref": "#/$defs/release_ref"},
+        "intent_id": {"$ref": "#/$defs/intent"},
+        "kind": {"enum": ["rc", "stable"]},
+        "tag_object_sha": {"$ref": "#/$defs/sha40"},
+        "immutable": {"const": true}
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "name", "archive_digest", "size_in_bytes"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/positive"},
+        "name": {"$ref": "#/$defs/safe_name"},
+        "archive_digest": {"$ref": "#/$defs/digest"},
+        "size_in_bytes": {"$ref": "#/$defs/positive"}
+      }
+    },
+    "receipt_predicate_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {"name": {"pattern": "^rmux-publication-receipt-[0-9a-f]{40}-[1-9][0-9]*$"}}}
+      ]
+    },
+    "receipt_envelope_artifact": {
+      "allOf": [
+        {"$ref": "#/$defs/artifact"},
+        {"properties": {"name": {"pattern": "^rmux-publication-receipt-envelope-[0-9a-f]{40}-[1-9][0-9]*$"}}}
+      ]
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "workflow_id", "workflow_path", "predicate_bundle", "predicate_sha256", "envelope_bundle", "envelope_sha256", "attestation", "verified_at"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/positive"},
+        "run_attempt": {"const": 1},
+        "workflow_id": {"$ref": "#/$defs/positive"},
+        "workflow_path": {"const": ".github/workflows/release-receipt.yml"},
+        "predicate_bundle": {"$ref": "#/$defs/receipt_predicate_artifact"},
+        "predicate_sha256": {"$ref": "#/$defs/sha256"},
+        "envelope_bundle": {"$ref": "#/$defs/receipt_envelope_artifact"},
+        "envelope_sha256": {"$ref": "#/$defs/sha256"},
+        "attestation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["attestation_id", "bundle_file", "bundle_sha256"],
+          "properties": {
+            "attestation_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "bundle_file": {"const": "publication-receipt.sigstore.json"},
+            "bundle_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "verified_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "workflow_id", "workflow_path"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/positive"},
+        "run_attempt": {"const": 1},
+        "workflow_id": {"$ref": "#/$defs/positive"},
+        "workflow_path": {"type": "string", "pattern": "^\\.github/workflows/[a-z0-9-]+\\.yml$"}
+      }
+    },
+    "payload": {
+      "$ref": "https://rmux.io/schemas/downstream-channel-payload-v1.json"
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_kind", "repository_key", "repository_id", "repository_full_name", "default_branch", "path", "external_service"],
+      "properties": {
+        "target_kind": {"enum": ["github-pull-request", "github-repository", "package-store", "website"]},
+        "repository_key": {"type": ["string", "null"]},
+        "repository_id": {"type": ["integer", "null"], "minimum": 1},
+        "repository_full_name": {"type": ["string", "null"]},
+        "default_branch": {"type": ["string", "null"]},
+        "path": {"type": ["string", "null"]},
+        "external_service": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

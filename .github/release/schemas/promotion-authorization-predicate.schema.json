@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rmux.io/schemas/release-promotion-authorization-predicate-v1.json",
+  "title": "RMUX disarmed promotion authorization predicate",
+  "description": "Review-only predicate. It MUST NOT authorize or publish anything before the separately reviewed PR8 cut-over.",
+  "x-rmux-status": "disarmed-non-authoritative",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "predicate_type",
+    "status",
+    "publication_authority",
+    "repository",
+    "source_git_sha",
+    "release",
+    "candidate",
+    "signed_tag",
+    "policy_audit",
+    "release_policy_sha256",
+    "authorization",
+    "issued_at",
+    "expires_at",
+    "asset_count",
+    "assets",
+    "sha256sums_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "predicate_type": {"const": "https://rmux.io/attestations/release-promotion-authorization/v1"},
+    "status": {"const": "disarmed-non-authoritative"},
+    "publication_authority": {"const": false},
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "full_name"],
+      "properties": {
+        "id": {"const": 1239918790},
+        "full_name": {"const": "Helvesec/rmux"}
+      }
+    },
+    "source_git_sha": {"$ref": "#/$defs/sha40"},
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intent_id", "ref", "kind", "version", "is_prerelease"],
+      "properties": {
+        "intent_id": {"$ref": "#/$defs/intent"},
+        "ref": {"$ref": "#/$defs/release_ref"},
+        "kind": {"enum": ["rc", "stable"]},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+        "is_prerelease": {"type": "boolean"}
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "status",
+        "repository_id",
+        "source_git_sha",
+        "candidate_run_id",
+        "candidate_run_attempt",
+        "manifest_run_id",
+        "manifest_run_attempt",
+        "manifest_workflow_id",
+        "manifest_workflow_path",
+        "manifest_artifact_id",
+        "manifest_artifact_digest",
+        "manifest_sha256",
+        "manifest_created_at",
+        "manifest_expires_at"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "status": {"const": "shadow-non-authoritative"},
+        "repository_id": {"const": 1239918790},
+        "source_git_sha": {"$ref": "#/$defs/sha40"},
+        "candidate_run_id": {"$ref": "#/$defs/positive"},
+        "candidate_run_attempt": {"const": 1},
+        "manifest_run_id": {"$ref": "#/$defs/positive"},
+        "manifest_run_attempt": {"const": 1},
+        "manifest_workflow_id": {"const": 316223904},
+        "manifest_workflow_path": {"const": ".github/workflows/release-shadow.yml"},
+        "manifest_artifact_id": {"$ref": "#/$defs/positive"},
+        "manifest_artifact_digest": {"$ref": "#/$defs/digest"},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "manifest_created_at": {"type": "string", "format": "date-time"},
+        "manifest_expires_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "signed_tag": {"$ref": "#/$defs/signed_tag"},
+    "policy_audit": {"$ref": "#/$defs/policy_audit"},
+    "release_policy_sha256": {"$ref": "#/$defs/sha256"},
+    "authorization": {"$ref": "#/$defs/authorization_identity"},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "asset_count": {"type": "integer", "minimum": 2},
+    "assets": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/authorized_asset"}
+    },
+    "sha256sums_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "positive": {"type": "integer", "minimum": 1},
+    "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "intent": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{8,128}$"},
+    "release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
+    "authorization_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_attempt", "workflow_id", "workflow_path"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/positive"},
+        "run_attempt": {"const": 1},
+        "workflow_id": {"$ref": "#/$defs/positive"},
+        "workflow_path": {"const": ".github/workflows/release-promote.yml"}
+      }
+    },
+    "signed_tag": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "status", "repository_id", "release_ref", "release_intent_id", "release_kind", "tag_object_sha", "target_git_sha", "candidate_run_id", "candidate_manifest_artifact_id", "candidate_manifest_artifact_digest", "candidate_manifest_sha256", "release_policy_root_sha256", "object_type", "annotated", "signature", "verified_at"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "status": {"const": "verified-signed-annotated-tag"},
+        "repository_id": {"const": 1239918790},
+        "release_ref": {"$ref": "#/$defs/release_ref"},
+        "release_intent_id": {"$ref": "#/$defs/intent"},
+        "release_kind": {"enum": ["rc", "stable"]},
+        "tag_object_sha": {"$ref": "#/$defs/sha40"},
+        "target_git_sha": {"$ref": "#/$defs/sha40"},
+        "candidate_run_id": {"$ref": "#/$defs/positive"},
+        "candidate_manifest_artifact_id": {"$ref": "#/$defs/positive"},
+        "candidate_manifest_artifact_digest": {"$ref": "#/$defs/digest"},
+        "candidate_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "release_policy_root_sha256": {"$ref": "#/$defs/sha256"},
+        "object_type": {"const": "tag"},
+        "annotated": {"const": true},
+        "signature": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["verified", "format", "key_fingerprint", "signing_principal"],
+          "properties": {
+            "verified": {"const": true},
+            "format": {"const": "ssh"},
+            "key_fingerprint": {"type": "string", "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"},
+            "signing_principal": {"type": "string", "minLength": 3, "maxLength": 254}
+          }
+        },
+        "verified_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "policy_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "status", "repository_id", "source_git_sha", "candidate_run_id", "release_intent_id", "policy_audit_run_id", "policy_audit_run_attempt", "predicate_artifact_id", "predicate_artifact_digest", "predicate_sha256", "emitted_at", "expires_at", "app_id", "installation_id", "workflow_id", "workflow_path", "release_policy_sha256", "reference_sha256"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "status": {"const": "shadow-non-authoritative"},
+        "repository_id": {"const": 1239918790},
+        "source_git_sha": {"$ref": "#/$defs/sha40"},
+        "candidate_run_id": {"$ref": "#/$defs/positive"},
+        "release_intent_id": {"$ref": "#/$defs/intent"},
+        "policy_audit_run_id": {"$ref": "#/$defs/positive"},
+        "policy_audit_run_attempt": {"const": 1},
+        "predicate_artifact_id": {"$ref": "#/$defs/positive"},
+        "predicate_artifact_digest": {"$ref": "#/$defs/digest"},
+        "predicate_sha256": {"$ref": "#/$defs/sha256"},
+        "emitted_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "app_id": {"$ref": "#/$defs/positive"},
+        "installation_id": {"$ref": "#/$defs/positive"},
+        "workflow_id": {"$ref": "#/$defs/positive"},
+        "workflow_path": {"const": ".github/workflows/release-promote.yml"},
+        "release_policy_sha256": {"$ref": "#/$defs/sha256"},
+        "reference_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "authorized_asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "platform_key", "role", "size", "sha256"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9._+@=-]+$"},
+        "platform_key": {
+          "type": ["string", "null"],
+          "enum": [null, "linux-aarch64", "linux-x86_64", "macos-aarch64", "macos-x86_64", "windows-x86_64"]
+        },
+        "role": {"enum": ["archive", "checksums", "debian", "rpm", "snap-amd64", "snap-arm64"]},
+        "size": {"$ref": "#/$defs/positive"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

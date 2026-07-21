@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "status": "review-only-disarmed",
+  "description": "Observed downstream repository identities and fail-closed activation blockers. This file grants no write authority.",
+  "observed_at": "2026-07-20T21:47:46Z",
+  "writer_app": {
+    "configured": false,
+    "app_id": null,
+    "installation_id": null,
+    "repository_selection": "selected",
+    "pat_fallback": false,
+    "required_permissions": {
+      "actions": "read",
+      "contents": "write",
+      "metadata": "read"
+    }
+  },
+  "required_protection": {
+    "enforce_admins": true,
+    "allow_force_pushes": false,
+    "allow_deletions": false,
+    "required_signatures": true,
+    "self_hosted_runner_count": 0,
+    "environment_admin_bypass": false,
+    "second_person_review_required": false
+  },
+  "repositories": [
+    {
+      "key": "homebrew-core",
+      "ownership": "external",
+      "id": 52855516,
+      "full_name": "Homebrew/homebrew-core",
+      "visibility": "public",
+      "default_branch": "main",
+      "required_path": "Formula/r/rmux.rb",
+      "environment": null,
+      "archived": false,
+      "protection_api_supported": true,
+      "branch_protected": true,
+      "ruleset_count": null,
+      "environment_count": null,
+      "activation_ready": false,
+      "blockers": [
+        "manual_submission_identity_not_configured"
+      ]
+    },
+    {
+      "key": "homebrew-rmux",
+      "ownership": "rmux-owned",
+      "id": 1259133629,
+      "full_name": "Helvesec/homebrew-rmux",
+      "visibility": "public",
+      "default_branch": "main",
+      "required_path": "Formula/rmux.rb",
+      "environment": "release-homebrew-tap",
+      "archived": false,
+      "protection_api_supported": true,
+      "branch_protected": true,
+      "ruleset_count": 1,
+      "environment_count": 1,
+      "activation_ready": false,
+      "blockers": [
+        "environment_admin_bypass_enabled",
+        "downstream_writer_app_missing"
+      ]
+    },
+    {
+      "key": "rmux-packages",
+      "ownership": "rmux-owned",
+      "id": 1258602064,
+      "full_name": "Helvesec/rmux-packages",
+      "visibility": "private",
+      "default_branch": "main",
+      "required_path": ".",
+      "environment": "release-linux-repositories",
+      "archived": false,
+      "protection_api_supported": false,
+      "branch_protected": false,
+      "ruleset_count": 0,
+      "environment_count": 0,
+      "activation_ready": false,
+      "blockers": [
+        "private_repository_protection_unavailable_on_current_plan",
+        "downstream_writer_app_missing"
+      ]
+    },
+    {
+      "key": "rmux-web-share",
+      "ownership": "rmux-owned",
+      "id": 1249553407,
+      "full_name": "Helvesec/rmux-web-share",
+      "visibility": "public",
+      "default_branch": "main",
+      "required_path": "src/scripts/share/wasm",
+      "environment": "release-web-share",
+      "archived": false,
+      "protection_api_supported": true,
+      "branch_protected": true,
+      "ruleset_count": 1,
+      "environment_count": 1,
+      "activation_ready": false,
+      "blockers": [
+        "environment_admin_bypass_enabled",
+        "downstream_writer_app_missing",
+        "floating_actions_present",
+        "unprotected_secret_deployment_workflow"
+      ]
+    },
+    {
+      "key": "rmux.io",
+      "ownership": "rmux-owned",
+      "id": 1240176583,
+      "full_name": "Helvesec/rmux.io",
+      "visibility": "private",
+      "default_branch": "main",
+      "required_path": "public",
+      "environment": "release-rmux-io",
+      "archived": false,
+      "protection_api_supported": false,
+      "branch_protected": false,
+      "ruleset_count": 0,
+      "environment_count": 0,
+      "activation_ready": false,
+      "blockers": [
+        "private_repository_protection_unavailable_on_current_plan",
+        "downstream_writer_app_missing"
+      ]
+    },
+    {
+      "key": "scoop-rmux",
+      "ownership": "rmux-owned",
+      "id": 1259135161,
+      "full_name": "Helvesec/scoop-rmux",
+      "visibility": "public",
+      "default_branch": "main",
+      "required_path": "bucket/rmux.json",
+      "environment": "release-scoop",
+      "archived": false,
+      "protection_api_supported": true,
+      "branch_protected": true,
+      "ruleset_count": 1,
+      "environment_count": 1,
+      "activation_ready": false,
+      "blockers": [
+        "environment_admin_bypass_enabled",
+        "downstream_writer_app_missing"
+      ]
+    },
+    {
+      "key": "winget-pkgs",
+      "ownership": "external",
+      "id": 197275551,
+      "full_name": "microsoft/winget-pkgs",
+      "visibility": "public",
+      "default_branch": "master",
+      "required_path": "manifests/h/Helvesec/RMUX",
+      "environment": null,
+      "archived": false,
+      "protection_api_supported": true,
+      "branch_protected": true,
+      "ruleset_count": null,
+      "environment_count": null,
+      "activation_ready": false,
+      "blockers": [
+        "manual_submission_identity_not_configured"
+      ]
+    }
+  ]
+}

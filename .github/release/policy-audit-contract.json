@@ -1,0 +1,222 @@
+{
+  "schema_version": 1,
+  "status": "review-only-disarmed",
+  "repository": {
+    "id": 1239918790,
+    "full_name": "Helvesec/rmux",
+    "default_branch": "main",
+    "visibility": "public"
+  },
+  "activation": {
+    "ledger": ".github/release/release-activation.json",
+    "capability": "policy_audit",
+    "required_value": false,
+    "runtime_override_allowed": false
+  },
+  "workflow": {
+    "path": ".github/workflows/release-policy-audit.yml",
+    "only_trigger": "workflow_call",
+    "caller_count": 2,
+    "required_run_attempt": 1,
+    "preparer_job": "prepare-policy-audit",
+    "privileged_action": ".github/actions/release-policy-audit/action.yml",
+    "privileged_job": "policy-audit",
+    "privileged_job_condition": "disabled-in-promoter",
+    "environment": "release-policy-audit",
+    "runner_image": "ubuntu-22.04",
+    "workflow_id": 316425885,
+    "audit_workflows": [
+      {"id": 316435346, "path": ".github/workflows/release-promote.yml"},
+      {"id": 316591947, "path": ".github/workflows/release-promotion-simulation.yml"}
+    ]
+  },
+  "candidate_binding": {
+    "candidate_run_attempt": 1,
+    "candidate_manifest_run_attempt": 1,
+    "source_branch": "main",
+    "maximum_manifest_age_hours": 48,
+    "release_kinds": ["rc", "stable"]
+  },
+  "audit_app": {
+    "configured": true,
+    "app_id": 4344532,
+    "installation_id": 147749910,
+    "app_slug": "helvesec-rmux-policy-audit",
+    "repository_selection": "selected",
+    "repository_ids": [1239918790],
+    "permissions": {
+      "actions": "read",
+      "administration": "write",
+      "metadata": "read"
+    },
+    "pat_fallback": false,
+    "token_ttl_max_seconds": 3600,
+    "private_key_rotation_max_days": 90
+  },
+  "token_lifecycle": {
+    "action": "actions/create-github-app-token",
+    "action_sha": "fee1f7d63c2ff003460e3d139729b119787bc349",
+    "issuance": {
+      "method": "POST",
+      "path": "/app/installations/{installation_id}/access_tokens",
+      "purpose": "create one repository-scoped installation token"
+    },
+    "revocation": {
+      "method": "DELETE",
+      "path": "/installation/token",
+      "purpose": "revoke only the installation token created by the pinned action"
+    },
+    "collector_methods": ["GET"],
+    "repository_state_mutations": false
+  },
+  "api_gets": [
+    {"key": "audit_app", "path": "/apps/helvesec-rmux-policy-audit"},
+    {"key": "branch_protection", "path": "/repos/Helvesec/rmux/branches/main/protection"},
+    {"key": "immutable_releases", "path": "/repos/Helvesec/rmux/immutable-releases"},
+    {"key": "installation_repositories", "path": "/installation/repositories?per_page=100&page=1"},
+    {"key": "policy_preparer_workflow", "path": "/repos/Helvesec/rmux/actions/workflows/release-policy-audit.yml"},
+    {"key": "policy_promoter_workflow", "path": "/repos/Helvesec/rmux/actions/workflows/release-promote.yml"},
+    {"key": "policy_simulation_workflow", "path": "/repos/Helvesec/rmux/actions/workflows/release-promotion-simulation.yml"},
+    {"key": "release_environment", "path": "/repos/Helvesec/rmux/environments/release"},
+    {"key": "release_policy_audit", "path": "/repos/Helvesec/rmux/environments/release-policy-audit"},
+    {"key": "release_publication", "path": "/repos/Helvesec/rmux/environments/release-publication"},
+    {"key": "release_tagging", "path": "/repos/Helvesec/rmux/environments/release-tagging"},
+    {"key": "repository", "path": "/repositories/1239918790"},
+    {"key": "self_hosted_runners", "path": "/repos/Helvesec/rmux/actions/runners?per_page=100&page=1"},
+    {"key": "tag_creation_ruleset", "path": "/repos/Helvesec/rmux/rulesets/19174415"},
+    {"key": "tag_immutability_ruleset", "path": "/repos/Helvesec/rmux/rulesets/18792083"}
+  ],
+  "expected_state": {
+    "repository": {
+      "archived": false,
+      "default_branch": "main",
+      "full_name": "Helvesec/rmux",
+      "id": 1239918790,
+      "push_protection": "enabled",
+      "secret_scanning": "enabled",
+      "visibility": "public"
+    },
+    "main": {
+      "allow_deletions": false,
+      "allow_force_pushes": false,
+      "enforce_admins": true,
+      "required_approving_review_count": 0,
+      "required_checks": [
+        {"context": "Cross-target Windows build check", "app_id": 15368},
+        {"context": "Linux SDK v1 daemon smoke", "app_id": 15368},
+        {"context": "Linux dependency audit", "app_id": 15368},
+        {"context": "Linux format, lint, and docs", "app_id": 15368},
+        {"context": "Linux non-final performance smoke", "app_id": 15368},
+        {"context": "Linux source boundary gates", "app_id": 15368},
+        {"context": "Linux tests (app-ui)", "app_id": 15368},
+        {"context": "Linux tests (core)", "app_id": 15368},
+        {"context": "Linux tests (pty-sdk)", "app_id": 15368},
+        {"context": "Linux tests (server)", "app_id": 15368},
+        {"context": "Linux workspace build", "app_id": 15368},
+        {"context": "Platform build and smoke on macos-15", "app_id": 15368},
+        {"context": "Platform build and smoke on macos-15-intel", "app_id": 15368},
+        {"context": "Platform build and smoke on windows-latest", "app_id": 15368},
+        {"context": "WASM crypto build and supply-chain gate", "app_id": 15368}
+      ],
+      "required_signatures": true,
+      "strict": true
+    },
+    "tag_creation_ruleset": {
+      "bypass_actor_id": 4339867,
+      "bypass_actor_type": "Integration",
+      "bypass_mode": "always",
+      "enforcement": "active",
+      "id": 19174415,
+      "exclude": [],
+      "include": ["refs/tags/v*"],
+      "name": "RMUX release tag creation",
+      "rules": ["creation"],
+      "target": "tag"
+    },
+    "tag_immutability_ruleset": {
+      "bypass_actor_count": 0,
+      "enforcement": "active",
+      "id": 18792083,
+      "exclude": [],
+      "include": ["refs/tags/v*"],
+      "name": "immutable RMUX release tags",
+      "rules": ["deletion", "update"],
+      "target": "tag"
+    },
+    "release": {
+      "can_admins_bypass": false,
+      "custom_branch_policies": false,
+      "environment_id": 16229050415,
+      "prevent_self_review": false,
+      "protected_branches": true,
+      "reviewer_id": 876824,
+      "reviewer_login": "shideneyu",
+      "reviewer_type": "User"
+    },
+    "release_policy_audit": {
+      "can_admins_bypass": false,
+      "custom_branch_policies": false,
+      "environment_id": 18412850020,
+      "prevent_self_review": false,
+      "protected_branches": true,
+      "reviewer_id": 876824,
+      "reviewer_login": "shideneyu",
+      "reviewer_type": "User"
+    },
+    "release_publication": {
+      "can_admins_bypass": false,
+      "custom_branch_policies": false,
+      "environment_id": 18412849790,
+      "prevent_self_review": false,
+      "protected_branches": true,
+      "reviewer_id": 876824,
+      "reviewer_login": "shideneyu",
+      "reviewer_type": "User"
+    },
+    "release_tagging": {
+      "can_admins_bypass": false,
+      "custom_branch_policies": false,
+      "environment_id": 18400330964,
+      "prevent_self_review": false,
+      "protected_branches": true,
+      "reviewer_id": 876824,
+      "reviewer_login": "shideneyu",
+      "reviewer_type": "User"
+    },
+    "immutable_releases": {
+      "enabled": true,
+      "enforced_by_owner": true
+    },
+    "policy_preparer_workflow": {
+      "id": 316425885,
+      "path": ".github/workflows/release-policy-audit.yml",
+      "state": "active"
+    },
+    "policy_promoter_workflow": {
+      "id": 316435346,
+      "path": ".github/workflows/release-promote.yml",
+      "state": "active"
+    },
+    "policy_simulation_workflow": {
+      "id": 316591947,
+      "path": ".github/workflows/release-promotion-simulation.yml",
+      "state": "active"
+    },
+    "self_hosted_runners": {
+      "total_count": 0
+    },
+    "audit_app_repositories": {
+      "repository_ids": [1239918790],
+      "total_count": 1
+    }
+  },
+  "external_blockers": [],
+  "proof": {
+    "predicate_schema": ".github/release/schemas/policy-audit-predicate.schema.json",
+    "reference_schema": ".github/release/schemas/policy-audit-reference.schema.json",
+    "predicate_artifact_retention_days": 1,
+    "freshness_seconds": 900,
+    "post_upload_reference_required": true,
+    "authorizes_publication": false
+  }
+}

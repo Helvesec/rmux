@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::RequestHandler;
-use rmux_core::{input::InputParser, Screen};
+use rmux_core::{input::InputParser, GridRenderOptions, Screen, ScreenCaptureRange};
 use rmux_proto::types::OptionScopeSelector;
 #[cfg(unix)]
 use rmux_proto::ListBuffersRequest;
@@ -176,19 +176,6 @@ async fn replace_transcript_contents(
         .set_screen_for_test(screen);
 }
 
-async fn append_to_transcript(handler: &RequestHandler, target: &PaneTarget, bytes: &[u8]) {
-    let transcript = {
-        let state = handler.state.lock().await;
-        state
-            .transcript_handle(target)
-            .expect("session transcript must exist")
-    };
-    transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .append_bytes(bytes);
-}
-
 async fn send_marker(handler: &RequestHandler, target: PaneTarget, marker: &str) {
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {
@@ -338,22 +325,21 @@ async fn alternate_screen_off_keeps_program_output_on_main_screen() {
         .await;
     assert!(matches!(response, Response::SetOptionByName(_)));
 
-    append_to_transcript(
-        &handler,
-        &target,
-        b"\x1b[2J\x1b[H\x1b[?1049hALTLINE\r\n\x1b[?1049lMAINLINE\r\n",
-    )
-    .await;
-
-    let response = handler
-        .handle(Request::CapturePane(Box::new(capture_pane_request(
-            target, None, None, true, None,
-        ))))
-        .await;
-    let output = response
-        .command_output()
-        .expect("capture-pane -p returns command output");
-    let output = String::from_utf8(output.stdout().to_vec()).expect("capture output is utf8");
+    let transcript = {
+        let state = handler.state.lock().await;
+        state
+            .transcript_handle(&target)
+            .expect("session transcript must exist")
+    };
+    let output = {
+        let mut transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        transcript.append_bytes(b"\x1b[2J\x1b[H\x1b[?1049hALTLINE\r\n\x1b[?1049lMAINLINE\r\n");
+        assert!(!transcript.is_alternate());
+        transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default())
+    };
+    let output = String::from_utf8(output).expect("capture output is utf8");
     assert!(output.contains("ALTLINE"), "{output:?}");
     assert!(output.contains("MAINLINE"), "{output:?}");
 }

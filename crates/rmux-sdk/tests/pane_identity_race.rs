@@ -1072,7 +1072,17 @@ impl Peer {
                 return Ok(Some(request));
             }
 
-            let read = self.stream.read(&mut buffer).await?;
+            let read = match self.stream.read(&mut buffer).await {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {
+                    // A timed-out client may abort the Unix socket instead of
+                    // completing an orderly EOF handshake. Both mean the test
+                    // peer is closed; expect_request still reports that close
+                    // as an error when a request was required.
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            };
             if read == 0 {
                 return Ok(None);
             }

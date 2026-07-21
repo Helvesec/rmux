@@ -1,0 +1,535 @@
+name: Disarmed Chocolatey channel retry
+
+on:
+  workflow_call:
+    inputs:
+      receipt_run_id: {required: true, type: string}
+      receipt_run_workflow_id: {required: true, type: string}
+      receipt_workflow_id: {required: true, type: string}
+      receipt_artifact_id: {required: true, type: string}
+      receipt_artifact_digest: {required: true, type: string}
+      receipt_envelope_artifact_id: {required: true, type: string}
+      receipt_envelope_artifact_digest: {required: true, type: string}
+      receipt_predicate_sha256: {required: true, type: string}
+      receipt_envelope_sha256: {required: true, type: string}
+      prior_result_run_id: {required: true, type: string}
+      prior_result_run_workflow_id: {required: true, type: string}
+      prior_result_producer_workflow_id: {required: true, type: string}
+      prior_result_producer_workflow_path: {required: true, type: string}
+      prior_result_artifact_id: {required: true, type: string}
+      prior_result_artifact_digest: {required: true, type: string}
+      prior_result_predicate_sha256: {required: true, type: string}
+      prior_result_envelope_artifact_id: {required: true, type: string}
+      prior_result_envelope_artifact_digest: {required: true, type: string}
+      prior_result_envelope_sha256: {required: true, type: string}
+      request_idempotency_key: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+    outputs:
+      retry_request_artifact_id:
+        value: ${{ jobs.prepare-retry.outputs.retry_request_artifact_id }}
+      retry_request_artifact_digest:
+        value: ${{ jobs.prepare-retry.outputs.retry_request_artifact_digest }}
+
+permissions: {}
+
+jobs:
+  prepare-retry:
+    name: Verify exact Chocolatey retry evidence
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      retry_request_artifact_id: ${{ steps.retry-upload.outputs.artifact-id }}
+      retry_request_artifact_digest: sha256:${{ steps.retry-upload.outputs.artifact-digest }}
+    env:
+      RMUX_RECEIPT_RUN_ID: ${{ inputs.receipt_run_id }}
+      RMUX_RECEIPT_RUN_WORKFLOW_ID: ${{ inputs.receipt_run_workflow_id }}
+      RMUX_RECEIPT_WORKFLOW_ID: ${{ inputs.receipt_workflow_id }}
+      RMUX_RECEIPT_ARTIFACT_ID: ${{ inputs.receipt_artifact_id }}
+      RMUX_RECEIPT_ARTIFACT_DIGEST: ${{ inputs.receipt_artifact_digest }}
+      RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID: ${{ inputs.receipt_envelope_artifact_id }}
+      RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.receipt_envelope_artifact_digest }}
+      RMUX_RECEIPT_PREDICATE_SHA256: ${{ inputs.receipt_predicate_sha256 }}
+      RMUX_RECEIPT_ENVELOPE_SHA256: ${{ inputs.receipt_envelope_sha256 }}
+      RMUX_PRIOR_RESULT_RUN_ID: ${{ inputs.prior_result_run_id }}
+      RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID: ${{ inputs.prior_result_run_workflow_id }}
+      RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID: ${{ inputs.prior_result_producer_workflow_id }}
+      RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH: ${{ inputs.prior_result_producer_workflow_path }}
+      RMUX_PRIOR_RESULT_ARTIFACT_ID: ${{ inputs.prior_result_artifact_id }}
+      RMUX_PRIOR_RESULT_ARTIFACT_DIGEST: ${{ inputs.prior_result_artifact_digest }}
+      RMUX_PRIOR_RESULT_PREDICATE_SHA256: ${{ inputs.prior_result_predicate_sha256 }}
+      RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID: ${{ inputs.prior_result_envelope_artifact_id }}
+      RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST: ${{ inputs.prior_result_envelope_artifact_digest }}
+      RMUX_PRIOR_RESULT_ENVELOPE_SHA256: ${{ inputs.prior_result_envelope_sha256 }}
+      RMUX_REQUEST_IDEMPOTENCY_KEY: ${{ inputs.request_idempotency_key }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_ID: ${{ inputs.release_id }}
+      RMUX_RELEASE_REF: ${{ inputs.release_ref }}
+    steps:
+      - name: Reject malformed retry identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
+          test "$GITHUB_REPOSITORY_ID" = "1239918790"
+          for value in \
+            "$RMUX_RECEIPT_RUN_ID" "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
+            "$RMUX_RECEIPT_WORKFLOW_ID" "$RMUX_RECEIPT_ARTIFACT_ID" \
+            "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID" "$RMUX_PRIOR_RESULT_RUN_ID" \
+            "$RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID" \
+            "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID" \
+            "$RMUX_PRIOR_RESULT_ARTIFACT_ID" \
+            "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID" "$RMUX_RELEASE_ID"; do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          test "$RMUX_RECEIPT_RUN_WORKFLOW_ID" = "$RMUX_RECEIPT_WORKFLOW_ID"
+          for value in \
+            "$RMUX_RECEIPT_ARTIFACT_DIGEST" \
+            "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST" \
+            "$RMUX_PRIOR_RESULT_ARTIFACT_DIGEST" \
+            "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST"; do
+            [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]]
+          done
+          for value in \
+            "$RMUX_RECEIPT_PREDICATE_SHA256" \
+            "$RMUX_RECEIPT_ENVELOPE_SHA256" \
+            "$RMUX_PRIOR_RESULT_PREDICATE_SHA256" \
+            "$RMUX_PRIOR_RESULT_ENVELOPE_SHA256"; do
+            [[ "$value" =~ ^[0-9a-f]{64}$ ]]
+          done
+          [[ "$RMUX_REQUEST_IDEMPOTENCY_KEY" =~ ^rmux-downstream-v1:[0-9a-f]{64}$ ]]
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH" = \
+            .github/workflows/release-downstream.yml
+          test "$GITHUB_RUN_ATTEMPT" = 1
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Verify exact receipt and prior result artifact origins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-chocolatey-retry"
+          mkdir -p "$root"
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
+            --artifact-id "$RMUX_RECEIPT_ARTIFACT_ID" \
+            --name "rmux-publication-receipt-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_RECEIPT_ARTIFACT_DIGEST" \
+            --expected-workflow-id "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
+            --expected-workflow-path .github/workflows/release-receipt.yml \
+            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            --max-attempts 1 > "$root/receipt-artifact.json"
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
+            --artifact-id "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID" \
+            --name "rmux-publication-receipt-envelope-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST" \
+            --expected-workflow-id "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
+            --expected-workflow-path .github/workflows/release-receipt.yml \
+            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            --max-attempts 1 > "$root/receipt-envelope-artifact.json"
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_PRIOR_RESULT_RUN_ID" \
+            --artifact-id "$RMUX_PRIOR_RESULT_ARTIFACT_ID" \
+            --name "rmux-downstream-chocolatey-result-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_PRIOR_RESULT_ARTIFACT_DIGEST" \
+            --expected-workflow-id "$RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID" \
+            --expected-workflow-path .github/workflows/release-promote.yml \
+            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            --max-attempts 1 > "$root/result-artifact.json"
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_PRIOR_RESULT_RUN_ID" \
+            --artifact-id "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_ID" \
+            --name "rmux-downstream-chocolatey-result-envelope-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$RMUX_PRIOR_RESULT_ENVELOPE_ARTIFACT_DIGEST" \
+            --expected-workflow-id "$RMUX_PRIOR_RESULT_RUN_WORKFLOW_ID" \
+            --expected-workflow-path .github/workflows/release-promote.yml \
+            --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
+            --max-attempts 1 > "$root/result-envelope-artifact.json"
+
+      - name: Download only the four exact evidence artifact IDs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.receipt_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-chocolatey-retry/receipt
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.receipt_envelope_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-chocolatey-retry/receipt-envelope
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.prior_result_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-chocolatey-retry/result
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.prior_result_run_id }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.prior_result_envelope_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-chocolatey-retry/result-envelope
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.prior_result_run_id }}
+
+      - id: gh
+        name: Install the pinned receipt attestation verifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/rmux-gh-2.93.0"
+          scripts/release/install-gh-2.93.0.sh "$install_root"
+          echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the exact signed receipt subject
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/release/verify-receipt-attestation.py
+          --gh "${{ steps.gh.outputs.binary }}"
+          --release-state "$RUNNER_TEMP/rmux-chocolatey-retry/receipt/release-state.json"
+          --bundle "$RUNNER_TEMP/rmux-chocolatey-retry/receipt/publication-receipt.sigstore.json"
+          --predicate "$RUNNER_TEMP/rmux-chocolatey-retry/receipt/publication-receipt-predicate.json"
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA"
+          --release-ref "$RMUX_RELEASE_REF"
+
+      - name: Verify closed bundle cardinality and exact bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-chocolatey-retry"
+          python3 - "$root" <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          expected = {
+              "receipt": {
+                  "publication-receipt-predicate.json",
+                  "publication-receipt.sigstore.json",
+                  "release-state.json",
+              },
+              "receipt-envelope": {"publication-receipt-envelope.json"},
+              "result": {
+                  "channel-payload.json",
+                  "downstream-channel-plan.json",
+                  "downstream-channel-request.json",
+                  "downstream-channel-result-predicate.json",
+                  "downstream-channel-result.sigstore.json",
+                  "downstream-channel-target-evidence.json",
+                  "receipt-reference.json",
+              },
+              "result-envelope": {"downstream-channel-result-envelope.json"},
+          }
+          for directory, wanted in expected.items():
+              base = root / directory
+              paths = list(base.rglob("*"))
+              if any(path.is_symlink() for path in paths):
+                  raise SystemExit(f"{directory} contains a symlink")
+              names = {path.relative_to(base).as_posix() for path in paths if path.is_file()}
+              if names != wanted:
+                  raise SystemExit(f"{directory} file set differs: {sorted(names)}")
+
+          load = lambda path: json.loads(path.read_text(encoding="utf-8"))
+          digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+          predicate_path = root / "receipt/publication-receipt-predicate.json"
+          receipt_envelope_path = root / "receipt-envelope/publication-receipt-envelope.json"
+          result_dir = root / "result"
+          result_predicate_path = result_dir / "downstream-channel-result-predicate.json"
+          target_evidence_path = result_dir / "downstream-channel-target-evidence.json"
+          result_envelope_path = root / "result-envelope/downstream-channel-result-envelope.json"
+          reference = load(result_dir / "receipt-reference.json")
+          request = load(result_dir / "downstream-channel-request.json")
+          result = load(result_predicate_path)
+          target_evidence = load(target_evidence_path)
+          envelope = load(result_envelope_path)
+          result_meta = load(root / "result-artifact.json")
+          source = os.environ["RMUX_EXPECTED_SOURCE_SHA"]
+          release_id = int(os.environ["RMUX_RELEASE_ID"])
+
+          if digest(predicate_path) != os.environ["RMUX_RECEIPT_PREDICATE_SHA256"]:
+              raise SystemExit("receipt predicate digest differs")
+          if digest(receipt_envelope_path) != os.environ["RMUX_RECEIPT_ENVELOPE_SHA256"]:
+              raise SystemExit("receipt envelope digest differs")
+          if reference["predicate_sha256"] != digest(predicate_path) or reference["envelope_sha256"] != digest(receipt_envelope_path):
+              raise SystemExit("bundled receipt reference differs from exact receipt bytes")
+          if reference["predicate_bundle"]["artifact_id"] != int(os.environ["RMUX_RECEIPT_ARTIFACT_ID"]) or reference["predicate_bundle"]["archive_digest"] != os.environ["RMUX_RECEIPT_ARTIFACT_DIGEST"]:
+              raise SystemExit("receipt predicate artifact identity differs")
+          if reference["envelope_bundle"]["artifact_id"] != int(os.environ["RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID"]) or reference["envelope_bundle"]["archive_digest"] != os.environ["RMUX_RECEIPT_ENVELOPE_ARTIFACT_DIGEST"]:
+              raise SystemExit("receipt envelope artifact identity differs")
+          if reference["receipt"] != {"run_id": int(os.environ["RMUX_RECEIPT_RUN_ID"]), "run_attempt": 1, "workflow_id": int(os.environ["RMUX_RECEIPT_WORKFLOW_ID"]), "workflow_path": ".github/workflows/release-receipt.yml"}:
+              raise SystemExit("receipt producer identity differs")
+          if reference["source_git_sha"] != source or reference["release"]["id"] != release_id or reference["release"]["ref"] != os.environ["RMUX_RELEASE_REF"]:
+              raise SystemExit("receipt release identity differs")
+          if request["channel"] != "chocolatey" or request["operation"] != "initial" or request["retry_depth"] != 0 or request["idempotency_key"] != os.environ["RMUX_REQUEST_IDEMPOTENCY_KEY"]:
+              raise SystemExit("original request identity differs")
+          expected_receipt = {
+              **reference["receipt"],
+              "predicate_bundle": reference["predicate_bundle"],
+              "predicate_sha256": reference["predicate_sha256"],
+              "envelope_bundle": reference["envelope_bundle"],
+              "envelope_sha256": reference["envelope_sha256"],
+              "attestation": reference["attestation"],
+              "verified_at": reference["verified_at"],
+          }
+          if request["receipt"] != expected_receipt:
+              raise SystemExit("request changed its receipt")
+          if digest(result_predicate_path) != os.environ["RMUX_PRIOR_RESULT_PREDICATE_SHA256"] or digest(result_envelope_path) != os.environ["RMUX_PRIOR_RESULT_ENVELOPE_SHA256"]:
+              raise SystemExit("prior result document digest differs")
+          if result["channel"] != "chocolatey" or result["source_git_sha"] != source or result["request_sha256"] != digest(result_dir / "downstream-channel-request.json") or result["idempotency_key"] != request["idempotency_key"] or result["payload_set_sha256"] != request["payload_set_sha256"] or result["target"] != request["target"]:
+              raise SystemExit("prior result request binding differs")
+          if result["state"] not in {"prepared", "failed-transient"} or result["mutation_started"] is not False or result["remote_request_id"] is not None:
+              raise SystemExit("prior result is not safe for one exact retry")
+          parse_time = lambda value: datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+          if not parse_time(request["requested_at"]) <= parse_time(result["started_at"]) <= parse_time(request["expires_at"]):
+              raise SystemExit("prior result started outside the original request TTL")
+          if result["target_evidence"] != target_evidence or result["subject"] != {"name": "downstream-channel-target-evidence.json", "sha256": digest(target_evidence_path)}:
+              raise SystemExit("prior result target-evidence subject differs")
+          producer = result["producer"]
+          if producer["run_id"] != int(os.environ["RMUX_PRIOR_RESULT_RUN_ID"]) or producer["run_attempt"] != 1 or producer["workflow_id"] != int(os.environ["RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_ID"]) or producer["workflow_path"] != os.environ["RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH"]:
+              raise SystemExit("prior result producer differs")
+          if envelope["predicate_sha256"] != digest(result_predicate_path) or envelope["request_sha256"] != result["request_sha256"] or envelope["channel"] != "chocolatey":
+              raise SystemExit("prior result envelope differs")
+          expected_bundle = {"artifact_id": result_meta["artifact_id"], "name": result_meta["name"], "archive_digest": result_meta["digest"], "size_in_bytes": result_meta["size_in_bytes"]}
+          if envelope["result_bundle"] != expected_bundle:
+              raise SystemExit("prior result bundle identity differs")
+
+          (root / "producer.json").write_text(json.dumps(result["producer"], sort_keys=True) + "\n", encoding="utf-8")
+          (root / "result-bundle.json").write_text(json.dumps(expected_bundle, sort_keys=True) + "\n", encoding="utf-8")
+          result_envelope_meta = load(root / "result-envelope-artifact.json")
+          previous = {
+              "predicate_artifact_id": result_meta["artifact_id"],
+              "predicate_artifact_digest": result_meta["digest"],
+              "envelope_artifact_id": result_envelope_meta["artifact_id"],
+              "envelope_artifact_digest": result_envelope_meta["digest"],
+              "predicate_sha256": digest(result_predicate_path),
+              "envelope_sha256": digest(result_envelope_path),
+              "request_sha256": result["request_sha256"],
+              "state": result["state"],
+              "mutation_started": result["mutation_started"],
+              "remote_request_id": result["remote_request_id"],
+          }
+          (root / "previous-result.json").write_text(json.dumps(previous, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Revalidate the exact payload artifact is still available
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-chocolatey-retry"
+          payload="$root/result/channel-payload.json"
+          python3 scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$(jq -er .producer.run_id "$payload")" \
+            --artifact-id "$(jq -er .artifact.artifact_id "$payload")" \
+            --name "$(jq -er .artifact.name "$payload")" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --expected-digest "$(jq -er .artifact.archive_digest "$payload")" \
+            --include-retention --max-attempts 1 > "$root/payload-artifact-live.json"
+          python3 - "$payload" "$root/payload-artifact-live.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          live = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          artifact = payload["artifact"]
+          expected = {
+              "artifact_id": artifact["artifact_id"],
+              "name": artifact["name"],
+              "digest": artifact["archive_digest"],
+              "size_in_bytes": artifact["size_in_bytes"],
+              "created_at": artifact["created_at"],
+              "updated_at": artifact["updated_at"],
+              "expires_at": artifact["expires_at"],
+              "run_id": payload["producer"]["run_id"],
+              "source_git_sha": payload["source_git_sha"],
+          }
+          if live != expected:
+              raise SystemExit("live payload artifact identity differs")
+          PY
+
+      - name: Revalidate every bundled document and create the retry request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-chocolatey-retry"
+          bundle="$root/result"
+          plan_created_at="$(jq -er .created_at "$bundle/downstream-channel-plan.json")"
+          original_requested_at="$(jq -er .requested_at "$bundle/downstream-channel-request.json")"
+          original_expires_at="$(jq -er .expires_at "$bundle/downstream-channel-request.json")"
+          result_state="$(jq -er .state "$bundle/downstream-channel-result-predicate.json")"
+          result_started_at="$(jq -er .started_at "$bundle/downstream-channel-result-predicate.json")"
+          result_observed_at="$(jq -er .observed_at "$bundle/downstream-channel-result-predicate.json")"
+          attestation_id="$(jq -er .attestation.attestation_id "$root/result-envelope/downstream-channel-result-envelope.json")"
+          envelope_created_at="$(jq -er .created_at "$root/result-envelope/downstream-channel-result-envelope.json")"
+          snap_candidate_opt_in="$(jq -er \
+            'if .snap_candidate_opt_in == true then "true" elif .snap_candidate_opt_in == false then "false" else error("snap_candidate_opt_in must be boolean") end' \
+            "$bundle/downstream-channel-plan.json")"
+          plan_args=(
+            --receipt-reference "$bundle/receipt-reference.json"
+            --release-kind stable
+            --created-at "$plan_created_at"
+            --document "$bundle/downstream-channel-plan.json"
+          )
+          if [[ "$snap_candidate_opt_in" == true ]]; then
+            plan_args+=(--snap-candidate-opt-in)
+          fi
+          python3 scripts/release/channel-policy.py verify-plan "${plan_args[@]}"
+          python3 scripts/release/channel-request.py verify \
+            --plan "$bundle/downstream-channel-plan.json" --channel chocolatey \
+            --operation initial --payload-artifact "$bundle/channel-payload.json" \
+            --requested-at "$original_requested_at" --expires-at "$original_expires_at" \
+            --document "$bundle/downstream-channel-request.json"
+          python3 scripts/release/channel-result.py verify-predicate \
+            --request "$bundle/downstream-channel-request.json" --producer "$root/producer.json" \
+            --state "$result_state" --started-at "$result_started_at" \
+            --target-evidence "$bundle/downstream-channel-target-evidence.json" \
+            --observed-at "$result_observed_at" \
+            --document "$bundle/downstream-channel-result-predicate.json"
+          python3 scripts/release/channel-result.py verify-envelope \
+            --request "$bundle/downstream-channel-request.json" \
+            --predicate "$bundle/downstream-channel-result-predicate.json" \
+            --attestation-id "$attestation_id" \
+            --attestation-bundle "$bundle/downstream-channel-result.sigstore.json" \
+            --bundle-artifact "$root/result-bundle.json" --created-at "$envelope_created_at" \
+            --document "$root/result-envelope/downstream-channel-result-envelope.json"
+          "${{ steps.gh.outputs.binary }}" attestation verify \
+            "$bundle/downstream-channel-target-evidence.json" \
+            --bundle "$bundle/downstream-channel-result.sigstore.json" \
+            --repo Helvesec/rmux \
+            --signer-workflow "Helvesec/rmux/$RMUX_PRIOR_RESULT_PRODUCER_WORKFLOW_PATH" \
+            --signer-digest "$RMUX_EXPECTED_SOURCE_SHA" \
+            --source-digest "$RMUX_EXPECTED_SOURCE_SHA" \
+            --source-ref "refs/tags/$RMUX_RELEASE_REF" \
+            --predicate-type https://rmux.io/attestations/release-downstream-channel-result/v1 \
+            --deny-self-hosted-runners --format json > "$root/result-attestation-verification.json"
+          python3 - \
+            "$root/result-attestation-verification.json" \
+            "$bundle/downstream-channel-result-predicate.json" \
+            "$bundle/downstream-channel-target-evidence.json" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import sys
+
+          results = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          predicate = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          target_path = pathlib.Path(sys.argv[3])
+          if not isinstance(results, list) or len(results) != 1:
+              raise SystemExit("result attestation cardinality differs")
+          verification = results[0].get("verificationResult", {})
+          statement = verification.get("statement", {})
+          signature = verification.get("signature", {})
+          timestamps = verification.get("verifiedTimestamps")
+          if not isinstance(signature.get("certificate"), dict) or not isinstance(timestamps, list) or not timestamps:
+              raise SystemExit("result attestation lacks signed verification evidence")
+          if statement.get("predicateType") != "https://rmux.io/attestations/release-downstream-channel-result/v1" or statement.get("predicate") != predicate:
+              raise SystemExit("signed result predicate differs")
+          target_sha256 = hashlib.sha256(target_path.read_bytes()).hexdigest()
+          expected_subject = [{"name": "downstream-channel-target-evidence.json", "digest": {"sha256": target_sha256}}]
+          if statement.get("subject") != expected_subject:
+              raise SystemExit("signed result subject differs")
+          PY
+          readarray -t retry_times < <(python3 - "$bundle/channel-payload.json" <<'PY'
+          import datetime
+          import json
+          import pathlib
+          import sys
+
+          now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+          retention = datetime.datetime.fromisoformat(json.loads(pathlib.Path(sys.argv[1]).read_text())["retention_expires_at"].replace("Z", "+00:00"))
+          expires = min(now + datetime.timedelta(hours=24), retention)
+          if expires <= now:
+              raise SystemExit("exact payload has expired")
+          render = lambda value: value.isoformat().replace("+00:00", "Z")
+          print(render(now))
+          print(render(expires))
+          PY
+          )
+          common=(
+            --plan "$bundle/downstream-channel-plan.json" --channel chocolatey
+            --operation retry --payload-artifact "$bundle/channel-payload.json"
+            --retry-of "$bundle/downstream-channel-request.json"
+            --previous-result "$root/previous-result.json"
+            --requested-at "${retry_times[0]}" --expires-at "${retry_times[1]}"
+          )
+          python3 scripts/release/channel-request.py create \
+            "${common[@]}" --output "$root/downstream-channel-retry-request.json"
+          python3 scripts/release/channel-request.py verify \
+            "${common[@]}" --document "$root/downstream-channel-retry-request.json"
+          test "$(jq -er .idempotency_key "$root/downstream-channel-retry-request.json")" = \
+            "$RMUX_REQUEST_IDEMPOTENCY_KEY"
+          test "$(jq -er .rebuild_native "$root/downstream-channel-retry-request.json")" = false
+
+      - id: retry-upload
+        name: Upload only the disarmed retry request
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-downstream-chocolatey-retry-request-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/rmux-chocolatey-retry/downstream-channel-retry-request.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  retry-chocolatey:
+    name: Disabled exact-result Chocolatey retry writer
+    needs: prepare-retry
+    if: ${{ false }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    concurrency:
+      group: rmux-channel-chocolatey-${{ inputs.release_ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Fail closed before retrying the channel
+        shell: pwsh
+        run: python scripts/release/assert-release-capability.py downstream_channels
+
+      - name: Refuse rebuild or resubmission in PR7
+        shell: pwsh
+        run: throw "Chocolatey retry remains disabled; no package is rebuilt or submitted"

@@ -1,0 +1,439 @@
+name: Build one canonical RMUX platform
+description: Build, attest, and persist one native release bundle without publication authority
+
+inputs:
+  expected-source-sha:
+    description: Exact protected main commit to build
+    required: true
+  fast-run-id:
+    description: Numeric Actions run ID containing the accepted fast proof
+    required: true
+  release-intent-id:
+    description: Unique allowlisted identifier for this release intent
+    required: true
+  planned-release-ref:
+    description: Planned stable or release-candidate tag name
+    required: true
+  release-kind:
+    description: Shadow, release-candidate, or stable intent kind
+    required: true
+  platform-key:
+    description: Contracted canonical platform key
+    required: true
+  runner-image:
+    description: Literal GitHub-hosted runner image contracted for the platform
+    required: true
+  target-triple:
+    description: Native Rust target triple contracted for the platform
+    required: true
+  snap-package:
+    description: Exact native Snap already smoke-tested on Linux
+    required: false
+    default: ""
+
+outputs:
+  assets-artifact-id:
+    description: Numeric ID of the canonical asset artifact
+    value: ${{ steps.assets-api.outputs.artifact_id }}
+  assets-artifact-digest:
+    description: Canonical API digest of the canonical asset artifact
+    value: ${{ steps.assets-api.outputs.artifact_digest }}
+  assets-artifact-name:
+    description: SHA-scoped canonical asset artifact name
+    value: ${{ steps.identity.outputs.assets_name }}
+  provenance-artifact-id:
+    description: Numeric ID of the post-upload provenance artifact
+    value: ${{ steps.provenance-api.outputs.artifact_id }}
+  provenance-artifact-digest:
+    description: Canonical API digest of the provenance artifact
+    value: ${{ steps.provenance-api.outputs.artifact_digest }}
+  attestation-id:
+    description: Opaque GitHub build-provenance attestation identifier
+    value: ${{ steps.attest.outputs.attestation-id }}
+  build-record-sha256:
+    description: SHA-256 of the canonical build record
+    value: ${{ steps.record.outputs.build_record_sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - id: identity
+      name: Validate source, runner, target, and cold object policy
+      shell: bash
+      env:
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+        RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
+        RMUX_RUNNER_IMAGE: ${{ inputs.runner-image }}
+        RMUX_SNAP_PACKAGE: ${{ inputs.snap-package }}
+        RMUX_TARGET_TRIPLE: ${{ inputs.target-triple }}
+      run: |
+        set -euo pipefail
+        test "$GITHUB_EVENT_NAME" = workflow_dispatch
+        test "$GITHUB_REF" = refs/heads/main
+        test "$GITHUB_RUN_ATTEMPT" = 1
+        test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+        test "$(git rev-parse HEAD)" = "$RMUX_EXPECTED_SOURCE_SHA"
+        test -z "$(git status --porcelain --untracked-files=no)"
+        test "$RUNNER_ENVIRONMENT" = github-hosted
+        test -z "${RUSTC_WRAPPER:-}"
+        test -z "${RUSTC_WORKSPACE_WRAPPER:-}"
+        test "$CARGO_INCREMENTAL" = 0
+        if [[ "$RMUX_PLATFORM_KEY" == linux-* ]]; then
+          test -n "$RMUX_SNAP_PACKAGE"
+        else
+          test -z "$RMUX_SNAP_PACKAGE"
+        fi
+        canonical_target="$RUNNER_TEMP/rmux-canonical-target"
+        canonical_bundle="$RUNNER_TEMP/rmux-canonical-bundle"
+        canonical_assets="$canonical_bundle/assets"
+        canonical_completions="$RUNNER_TEMP/rmux-canonical-completions"
+        test ! -e "$canonical_target"
+        test ! -e "$canonical_bundle"
+        python3 - "$RMUX_PLATFORM_KEY" "$RMUX_RUNNER_IMAGE" "$RMUX_TARGET_TRIPLE" "$RUNNER_OS" "$RUNNER_ARCH" <<'PY'
+        import json
+        import pathlib
+        import sys
+
+        contract = json.loads(pathlib.Path(".github/release/canonical-build-contract.json").read_text())
+        matches = [entry for entry in contract["platforms"] if entry["key"] == sys.argv[1]]
+        if len(matches) != 1:
+            raise SystemExit("canonical platform key is not unique")
+        entry = matches[0]
+        observed = (sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        expected = (entry["runner_image"], entry["target_triple"], entry["runner_os"], entry["runner_arch"])
+        if observed != expected:
+            raise SystemExit(f"canonical platform mapping differs: {observed!r} != {expected!r}")
+        PY
+        mkdir -p "$canonical_target" "$canonical_assets"
+        {
+          echo "CARGO_TARGET_DIR=$canonical_target"
+          echo "CANONICAL_BUNDLE=$canonical_bundle"
+          echo "CANONICAL_ASSETS=$canonical_assets"
+          echo "RMUX_COMPLETIONS_DIR=$canonical_completions"
+        } >> "$GITHUB_ENV"
+        echo "assets_name=rmux-canonical-$RMUX_PLATFORM_KEY-$RMUX_EXPECTED_SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+    - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+      with:
+        toolchain: "1.96.1"
+        targets: ${{ inputs.target-triple }}
+
+    - name: Resolve the exact workspace version
+      shell: bash
+      env:
+        RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned-release-ref }}
+      run: |
+        set -euo pipefail
+        metadata="$RUNNER_TEMP/rmux-canonical-cargo-metadata.json"
+        cargo metadata --locked --no-deps --format-version 1 > "$metadata"
+        version="$(python3 - "$metadata" "$GITHUB_WORKSPACE/Cargo.toml" <<'PY'
+        import json
+        import pathlib
+        import sys
+
+        metadata = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+        root_manifest = pathlib.Path(sys.argv[2]).resolve()
+        versions = [
+            package["version"]
+            for package in metadata["packages"]
+            if pathlib.Path(package["manifest_path"]).resolve() == root_manifest
+        ]
+        if len(versions) != 1:
+            raise SystemExit("cargo metadata did not identify one root package")
+        print(versions[0])
+        PY
+        )"
+        [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+        planned_version="${RMUX_PLANNED_RELEASE_REF#v}"
+        planned_version="${planned_version%%-rc.*}"
+        test "$planned_version" = "$version"
+        echo "RMUX_PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+
+    - name: Capture toolchain and fetch locked dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustc -vV > "$CANONICAL_BUNDLE/rustc-vV.txt"
+        cargo fetch --locked
+
+    - name: Install Linux packaging tools
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y binutils cpio rpm createrepo-c
+
+    - name: Build and package Unix assets once
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        RMUX_PACKAGE_CODESIGN_ADHOC: ${{ runner.os == 'macOS' && '1' || '0' }}
+        RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
+        RMUX_TARGET_TRIPLE: ${{ inputs.target-triple }}
+      run: |
+        set -euo pipefail
+        scripts/package-unix.sh \
+          --configuration release \
+          --target "$RMUX_TARGET_TRIPLE" \
+          --platform-label "$RMUX_PLATFORM_KEY" \
+          --output-dir "$CANONICAL_ASSETS"
+        if [[ "$RUNNER_OS" == Linux ]]; then
+          scripts/package-debian.sh \
+            --configuration release \
+            --target "$RMUX_TARGET_TRIPLE" \
+            --output-dir "$CANONICAL_ASSETS" \
+            --skip-build \
+            --reuse-release-binary
+          scripts/package-rpm.sh \
+            --configuration release \
+            --target "$RMUX_TARGET_TRIPLE" \
+            --output-dir "$CANONICAL_ASSETS" \
+            --skip-build \
+            --reuse-release-binary
+        fi
+
+    - name: Build and package Windows assets once
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
+        RMUX_TARGET_TRIPLE: ${{ inputs.target-triple }}
+      run: |
+        ./scripts/package-windows.ps1 `
+          -Configuration release `
+          -Target $env:RMUX_TARGET_TRIPLE `
+          -PlatformLabel $env:RMUX_PLATFORM_KEY `
+          -OutputDir $env:CANONICAL_ASSETS
+
+    - name: Stage the native Snap bytes
+      if: runner.os == 'Linux'
+      shell: bash
+      env:
+        RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
+        RMUX_SNAP_PACKAGE: ${{ inputs.snap-package }}
+      run: |
+        set -euo pipefail
+        test -f "$RMUX_SNAP_PACKAGE"
+        test ! -L "$RMUX_SNAP_PACKAGE"
+        version="$RMUX_PACKAGE_VERSION"
+        case "$RMUX_PLATFORM_KEY" in
+          linux-x86_64) snap_arch=amd64 ;;
+          linux-aarch64) snap_arch=arm64 ;;
+          *) echo "unexpected Snap platform: $RMUX_PLATFORM_KEY" >&2; exit 1 ;;
+        esac
+        cp -- "$RMUX_SNAP_PACKAGE" "$CANONICAL_ASSETS/rmux-$version-snap-$snap_arch.snap"
+
+    - name: Build the canonical crates.io and browser WASM payloads
+      if: inputs.platform-key == 'linux-x86_64'
+      shell: bash
+      env:
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+      run: |
+        set -euo pipefail
+        version="$RMUX_PACKAGE_VERSION"
+        tools="$RUNNER_TEMP/rmux-canonical-tools"
+        wasm_target="$RUNNER_TEMP/rmux-canonical-wasm-target"
+        crate_target="$RUNNER_TEMP/rmux-canonical-crate-target"
+        test ! -e "$tools"
+        test ! -e "$wasm_target"
+        test ! -e "$crate_target"
+        rustup toolchain install 1.94.1 --profile minimal --target wasm32-unknown-unknown
+        CARGO_TARGET_DIR="$RUNNER_TEMP/rmux-wasm-pack-target" \
+          cargo install wasm-pack --version 0.13.1 --locked --root "$tools"
+        cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+        rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+        remap="--remap-path-prefix=$GITHUB_WORKSPACE=/rmux-source --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$rustup_home=/rustup"
+        PATH="$tools/bin:$PATH" \
+          CARGO_TARGET_DIR="$wasm_target" \
+          RUSTFLAGS="$remap" \
+          RUSTUP_TOOLCHAIN=1.94.1 \
+          scripts/build-web-crypto-wasm.sh wasm
+        scripts/release/canonical-wasm-bundle.py create \
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --version "$version" \
+          --package-dir crates/rmux-web-crypto/pkg \
+          --output-dir "$CANONICAL_ASSETS"
+        scripts/release/canonical-crate-set.py create \
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --version "$version" \
+          --target-dir "$crate_target" \
+          --output-dir "$CANONICAL_ASSETS"
+
+    - name: Generate the canonical Chocolatey package source
+      if: runner.os == 'Windows'
+      shell: bash
+      env:
+        RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned-release-ref }}
+      run: |
+        set -euo pipefail
+        version="$RMUX_PACKAGE_VERSION"
+        package_root="$RUNNER_TEMP/rmux-canonical-chocolatey"
+        test ! -e "$package_root"
+        scripts/generate-chocolatey-package.sh \
+          --version "$version" \
+          --release-tag "$RMUX_PLANNED_RELEASE_REF" \
+          --checksums "$CANONICAL_ASSETS/SHA256SUMS.txt" \
+          --output-dir "$package_root"
+        echo "RMUX_CHOCOLATEY_ROOT=$package_root" >> "$GITHUB_ENV"
+        echo "RMUX_PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+
+    - name: Pack the canonical Chocolatey payload
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        Push-Location $env:RMUX_CHOCOLATEY_ROOT
+        try {
+          choco pack .\rmux.nuspec --outputdirectory .
+        } finally {
+          Pop-Location
+        }
+        $package = Join-Path $env:RMUX_CHOCOLATEY_ROOT "rmux.$env:RMUX_PACKAGE_VERSION.nupkg"
+        if (-not (Test-Path -LiteralPath $package -PathType Leaf)) {
+          throw "canonical Chocolatey package was not generated"
+        }
+        Copy-Item -LiteralPath $package -Destination $env:CANONICAL_ASSETS
+
+    - name: Regenerate checksums over native and supplemental bytes
+      shell: bash
+      run: >-
+        scripts/release/canonical-build-record.py checksums
+        --assets-dir "$CANONICAL_ASSETS"
+
+    - id: record
+      name: Record and enumerate every subject
+      shell: bash
+      env:
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+        RMUX_FAST_RUN_ID: ${{ inputs.fast-run-id }}
+        RMUX_RELEASE_INTENT_ID: ${{ inputs.release-intent-id }}
+        RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned-release-ref }}
+        RMUX_RELEASE_KIND: ${{ inputs.release-kind }}
+        RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
+        RMUX_RUNNER_IMAGE: ${{ inputs.runner-image }}
+      run: |
+        set -euo pipefail
+        test -z "$(git status --porcelain --untracked-files=no)"
+        record_sha=$(scripts/release/canonical-build-record.py create \
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --fast-run-id "$RMUX_FAST_RUN_ID" \
+          --candidate-run-id "$GITHUB_RUN_ID" \
+          --candidate-run-attempt "$GITHUB_RUN_ATTEMPT" \
+          --release-intent-id "$RMUX_RELEASE_INTENT_ID" \
+          --planned-release-ref "$RMUX_PLANNED_RELEASE_REF" \
+          --release-kind "$RMUX_RELEASE_KIND" \
+          --platform-key "$RMUX_PLATFORM_KEY" \
+          --assets-dir "$CANONICAL_ASSETS" \
+          --runner-image "$RMUX_RUNNER_IMAGE" \
+          --runner-os "$RUNNER_OS" \
+          --runner-arch "$RUNNER_ARCH" \
+          --runner-environment "$RUNNER_ENVIRONMENT" \
+          --rustc-verbose "$CANONICAL_BUNDLE/rustc-vV.txt" \
+          --output "$CANONICAL_BUNDLE/canonical-build-record.json")
+        scripts/release/canonical-build-record.py subjects \
+          --record "$CANONICAL_BUNDLE/canonical-build-record.json" \
+          --assets-dir "$CANONICAL_ASSETS" \
+          --output "$CANONICAL_BUNDLE/canonical-subjects.sha256"
+        echo "build_record_sha256=$record_sha" >> "$GITHUB_OUTPUT"
+
+    - id: attest
+      name: Attest the canonical checksum subjects
+      uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
+      with:
+        subject-checksums: ${{ env.CANONICAL_BUNDLE }}/canonical-subjects.sha256
+        create-storage-record: false
+        show-summary: false
+
+    - id: assets-upload
+      name: Persist the canonical assets and record
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: ${{ steps.identity.outputs.assets_name }}
+        path: |
+          ${{ env.CANONICAL_ASSETS }}
+          ${{ env.CANONICAL_BUNDLE }}/canonical-build-record.json
+        if-no-files-found: error
+        retention-days: 7
+        compression-level: 0
+
+    - id: assets-api
+      name: Resolve the persisted asset by numeric ID
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RMUX_ASSETS_ARTIFACT_ID: ${{ steps.assets-upload.outputs.artifact-id }}
+        RMUX_ASSETS_ARTIFACT_NAME: ${{ steps.identity.outputs.assets_name }}
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+      run: |
+        set -euo pipefail
+        scripts/release/actions-artifact.py resolve-id \
+          --repository "$GITHUB_REPOSITORY" \
+          --run-id "$GITHUB_RUN_ID" \
+          --artifact-id "$RMUX_ASSETS_ARTIFACT_ID" \
+          --name "$RMUX_ASSETS_ARTIFACT_NAME" \
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --max-attempts 6 \
+          --retry-delay-seconds 2 \
+          --github-output "$GITHUB_OUTPUT"
+
+    - name: Bind post-upload IDs without self-reference
+      shell: bash
+      env:
+        RMUX_ASSETS_ARTIFACT_DIGEST: ${{ steps.assets-api.outputs.artifact_digest }}
+        RMUX_ASSETS_ARTIFACT_ID: ${{ steps.assets-api.outputs.artifact_id }}
+        RMUX_ASSETS_ARTIFACT_NAME: ${{ steps.assets-api.outputs.artifact_name }}
+        RMUX_ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        RMUX_ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
+        RMUX_BUILD_RECORD_SHA256: ${{ steps.record.outputs.build_record_sha256 }}
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+        RMUX_PLATFORM_KEY: ${{ inputs.platform-key }}
+      run: |
+        set -euo pipefail
+        provenance="$RUNNER_TEMP/rmux-canonical-provenance"
+        test ! -e "$provenance"
+        mkdir -p "$provenance"
+        cp "$CANONICAL_BUNDLE/canonical-build-record.json" "$provenance/"
+        cp "$CANONICAL_BUNDLE/rustc-vV.txt" "$provenance/"
+        cp "$RMUX_ATTESTATION_BUNDLE" "$provenance/build-provenance.sigstore.json"
+        scripts/release/canonical-artifact-binding.py create \
+          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --candidate-run-id "$GITHUB_RUN_ID" \
+          --platform-key "$RMUX_PLATFORM_KEY" \
+          --assets-artifact-id "$RMUX_ASSETS_ARTIFACT_ID" \
+          --assets-artifact-name "$RMUX_ASSETS_ARTIFACT_NAME" \
+          --assets-artifact-digest "$RMUX_ASSETS_ARTIFACT_DIGEST" \
+          --build-record "$provenance/canonical-build-record.json" \
+          --build-record-sha256 "$RMUX_BUILD_RECORD_SHA256" \
+          --attestation-id "$RMUX_ATTESTATION_ID" \
+          --attestation-bundle "$provenance/build-provenance.sigstore.json" \
+          --output "$provenance/canonical-artifact-binding.json"
+
+    - id: provenance-upload
+      name: Persist provenance separately from public assets
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rmux-canonical-provenance-${{ inputs.platform-key }}-${{ inputs.expected-source-sha }}
+        path: ${{ runner.temp }}/rmux-canonical-provenance
+        if-no-files-found: error
+        retention-days: 7
+        compression-level: 0
+
+    - id: provenance-api
+      name: Resolve the persisted provenance by numeric ID
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+        RMUX_PROVENANCE_ARTIFACT_ID: ${{ steps.provenance-upload.outputs.artifact-id }}
+        RMUX_PROVENANCE_ARTIFACT_NAME: rmux-canonical-provenance-${{ inputs.platform-key }}-${{ inputs.expected-source-sha }}
+      run: |
+        set -euo pipefail
+        scripts/release/actions-artifact.py resolve-id \
+          --repository "$GITHUB_REPOSITORY" \
+          --run-id "$GITHUB_RUN_ID" \
+          --artifact-id "$RMUX_PROVENANCE_ARTIFACT_ID" \
+          --name "$RMUX_PROVENANCE_ARTIFACT_NAME" \
+          --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+          --max-attempts 6 \
+          --retry-delay-seconds 2 \
+          --github-output "$GITHUB_OUTPUT"

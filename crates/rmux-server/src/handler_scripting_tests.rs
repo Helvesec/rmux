@@ -193,7 +193,10 @@ async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usi
 fn background_shell_test_timeout() -> std::time::Duration {
     #[cfg(windows)]
     {
-        std::time::Duration::from_secs(10)
+        // A cold Windows PowerShell process can start slowly when hosted CI is
+        // compiling and running several test shards. This is a liveness bound,
+        // not a process-start latency assertion.
+        std::time::Duration::from_secs(30)
     }
     #[cfg(not(windows))]
     {

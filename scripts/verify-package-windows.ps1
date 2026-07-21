@@ -9,7 +9,8 @@ param(
     [switch]$RunCtrlMatrixSmoke,
     [switch]$RequireReleaseArtifact,
     [string]$ExpectedGitSha = $env:RMUX_EXPECTED_GIT_SHA,
-    [string]$CtrlMatrixEvidence = ""
+    [string]$CtrlMatrixEvidence = "",
+    [string]$NextestArchive = ""
 )
 
 Set-StrictMode -Version Latest
@@ -105,6 +106,155 @@ function AssertDaemonBinary([string]$Binary) {
     }
 }
 
+function NewPackagePipeName([string]$Binary, [string]$Label) {
+    $result = Invoke-NativeCapture $Binary @("-L", $Label, "diagnose", "--json")
+    if ($result.Status -ne 0) {
+        Fail "failed to resolve package pipe for label '$Label': $Binary diagnose --json; $($result.Output)"
+    }
+
+    try {
+        $diagnostics = ($result.Output -join [Environment]::NewLine) | ConvertFrom-Json
+    } catch {
+        Fail "package binary returned invalid diagnose JSON for label '$Label': $($result.Output)"
+    }
+
+    $pipePath = [string]$diagnostics.socket_path
+    if ([string]::IsNullOrWhiteSpace($pipePath) -or
+        $pipePath -notmatch '^\\\\\.\\pipe\\rmux-.+-il-(untrusted|low|medium|high|system)-.+$') {
+        Fail "package binary returned a non-canonical Windows pipe for label '$Label': $pipePath"
+    }
+    return $pipePath
+}
+
+function Remove-PackageDaemon([object]$Daemon) {
+    if ($null -eq $Daemon) {
+        return
+    }
+    try {
+        $Daemon.Process.Refresh()
+        if (-not $Daemon.Process.HasExited) {
+            $Daemon.Process.Kill()
+            $Daemon.Process.WaitForExit()
+        }
+    } finally {
+        $Daemon.Process.Dispose()
+        Remove-Item -Force -LiteralPath $Daemon.Stdout -ErrorAction SilentlyContinue
+        Remove-Item -Force -LiteralPath $Daemon.Stderr -ErrorAction SilentlyContinue
+    }
+}
+
+function Start-PackageDaemon([string]$DaemonBinary, [string]$PipePath, [string[]]$ExtraArguments = @()) {
+    if ($PipePath -notmatch '^\\\\\.\\pipe\\rmux-') {
+        Fail "package daemon requires an explicit RMUX named pipe: $PipePath"
+    }
+
+    $id = "$PID-$([guid]::NewGuid().ToString('N'))"
+    $readyEventName = "Local\rmux-package-ready-$id"
+    $stdout = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-package-daemon-$id.stdout"
+    $stderr = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-package-daemon-$id.stderr"
+    $readyEvent = [System.Threading.EventWaitHandle]::new(
+        $false,
+        [System.Threading.EventResetMode]::ManualReset,
+        $readyEventName
+    )
+    $process = $null
+    try {
+        $arguments = @(
+            "--__internal-daemon",
+            $PipePath,
+            "--startup-ready-event",
+            $readyEventName
+        ) + $ExtraArguments
+        $process = Start-Process `
+            -FilePath $DaemonBinary `
+            -ArgumentList $arguments `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru
+
+        if (-not $readyEvent.WaitOne(15000)) {
+            $process.Refresh()
+            if (-not $process.HasExited) {
+                $process.Kill()
+                $process.WaitForExit()
+            }
+            $details = if (Test-Path -LiteralPath $stderr) {
+                Get-Content -LiteralPath $stderr -Raw
+            } else {
+                ""
+            }
+            Fail "package daemon did not become ready on $PipePath`n$details"
+        }
+        $process.Refresh()
+        if ($process.HasExited) {
+            $details = if (Test-Path -LiteralPath $stderr) {
+                Get-Content -LiteralPath $stderr -Raw
+            } else {
+                ""
+            }
+            Fail "package daemon exited during startup with $($process.ExitCode)`n$details"
+        }
+
+        return [pscustomobject]@{
+            Process = $process
+            Pipe = $PipePath
+            Stdout = $stdout
+            Stderr = $stderr
+        }
+    } catch {
+        if ($null -ne $process) {
+            Remove-PackageDaemon ([pscustomobject]@{
+                Process = $process
+                Pipe = $PipePath
+                Stdout = $stdout
+                Stderr = $stderr
+            })
+        } else {
+            Remove-Item -Force -LiteralPath $stdout -ErrorAction SilentlyContinue
+            Remove-Item -Force -LiteralPath $stderr -ErrorAction SilentlyContinue
+        }
+        throw
+    } finally {
+        $readyEvent.Dispose()
+    }
+}
+
+function Stop-PackageDaemon([string]$ClientBinary, [object]$Daemon) {
+    if ($null -eq $Daemon) {
+        return
+    }
+
+    $failure = $null
+    try {
+        $Daemon.Process.Refresh()
+        if (-not $Daemon.Process.HasExited) {
+            $shutdown = Invoke-NativeCapture $ClientBinary @("-S", $Daemon.Pipe, "kill-server")
+            if ($shutdown.Status -ne 0) {
+                if (-not $Daemon.Process.WaitForExit(2000)) {
+                    $failure = "package daemon shutdown failed: $($shutdown.Output -join "`n")"
+                }
+            } elseif (-not $Daemon.Process.WaitForExit(10000)) {
+                $failure = "package daemon did not exit after kill-server"
+            }
+        }
+        $Daemon.Process.Refresh()
+        if ($null -eq $failure -and $Daemon.Process.HasExited -and $Daemon.Process.ExitCode -ne 0) {
+            $details = if (Test-Path -LiteralPath $Daemon.Stderr) {
+                Get-Content -LiteralPath $Daemon.Stderr -Raw
+            } else {
+                ""
+            }
+            $failure = "package daemon exited with $($Daemon.Process.ExitCode)`n$details"
+        }
+    } finally {
+        Remove-PackageDaemon $Daemon
+    }
+
+    if ($null -ne $failure) {
+        Fail $failure
+    }
+}
+
 function NewPortableAliasSmoke([string]$Binary, [string]$Root) {
     $links = Join-Path $Root "winget-links"
     New-Item -ItemType Directory -Force -Path $links | Out-Null
@@ -169,30 +319,48 @@ function AssertOutputContains([object[]]$Output, [string]$Needle, [string]$Conte
     }
 }
 
-function InvokeSdkWindowsSmoke([string]$Binary) {
+function InvokeSdkWindowsSmoke(
+    [string]$Binary,
+    [string]$DaemonBinary,
+    [string]$NextestArchive
+) {
     $previousBinary = $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN
+    $previousPipe = $env:RMUX_SDK_WINDOWS_SMOKE_PIPE
+    $pipePath = NewPackagePipeName $Binary "sdk-smoke-$PID-$([guid]::NewGuid().ToString('N'))"
+    $daemon = Start-PackageDaemon $DaemonBinary $pipePath
     try {
         $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
-        Assert-CargoFilter 1 @(
-            "test",
-            "--locked",
-            "-p",
-            "rmux-sdk",
-            "--test",
-            "smoke_v1_windows",
-            "daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon"
-        )
-        & cargo @(
-            "test",
-            "--locked",
-            "-p",
-            "rmux-sdk",
-            "--test",
-            "smoke_v1_windows",
-            "daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon"
-        )
-        if ($LASTEXITCODE -ne 0) {
-            Fail "Windows SDK package smoke failed with exit code $LASTEXITCODE"
+        $env:RMUX_SDK_WINDOWS_SMOKE_PIPE = $pipePath
+        $sdkTest = "daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon"
+        if ([string]::IsNullOrWhiteSpace($NextestArchive)) {
+            Assert-CargoFilter 1 @(
+                "test",
+                "--locked",
+                "-p",
+                "rmux-sdk",
+                "--test",
+                "smoke_v1_windows",
+                $sdkTest
+            )
+            & cargo @(
+                "test",
+                "--locked",
+                "-p",
+                "rmux-sdk",
+                "--test",
+                "smoke_v1_windows",
+                $sdkTest
+            )
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Windows SDK package smoke failed with exit code $LASTEXITCODE"
+            }
+        } else {
+            $nextestSdkTest = "windows::$sdkTest"
+            & (Join-Path $PSScriptRoot "run-nextest-package-smoke.ps1") `
+                -Archive $NextestArchive `
+                -Package "rmux-sdk" `
+                -TestTarget "smoke_v1_windows" `
+                -TestName $nextestSdkTest
         }
     } finally {
         if ($null -eq $previousBinary) {
@@ -200,29 +368,74 @@ function InvokeSdkWindowsSmoke([string]$Binary) {
         } else {
             $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN = $previousBinary
         }
+        if ($null -eq $previousPipe) {
+            Remove-Item Env:\RMUX_SDK_WINDOWS_SMOKE_PIPE -ErrorAction SilentlyContinue
+        } else {
+            $env:RMUX_SDK_WINDOWS_SMOKE_PIPE = $previousPipe
+        }
+        Stop-PackageDaemon $Binary $daemon
     }
 }
 
-function InvokeMouseBorderSmoke([string]$Binary) {
+function InvokeMouseBorderSmoke(
+    [string]$Binary,
+    [string]$DaemonBinary,
+    [string]$NextestArchive
+) {
     $previousBinary = $env:RMUX_MOUSE_BORDER_RMUX_BIN
+    $previousDaemon = $env:RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN
+    $mouseTest = "mouse_drag_on_vertical_border_resizes_horizontal_split_through_attach_binding"
     try {
         $env:RMUX_MOUSE_BORDER_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
-        & cargo @(
-            "test",
-            "--locked",
-            "-p",
-            "rmux",
-            "--test",
-            "windows_mouse_border_resize"
-        )
-        if ($LASTEXITCODE -ne 0) {
-            Fail "Windows mouse border package smoke failed with exit code $LASTEXITCODE"
+        $env:RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN = [System.IO.Path]::GetFullPath($DaemonBinary)
+        if ([string]::IsNullOrWhiteSpace($NextestArchive)) {
+            $filterArgs = @(
+                "1",
+                "--",
+                "test",
+                "--locked",
+                "-p",
+                "rmux",
+                "--test",
+                "windows_mouse_border_resize",
+                $mouseTest
+            )
+            & "$PSScriptRoot/assert-cargo-filter-nonempty.ps1" @filterArgs
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Windows mouse border package smoke filter failed with exit code $LASTEXITCODE"
+            }
+            & cargo @(
+                "test",
+                "--locked",
+                "-p",
+                "rmux",
+                "--test",
+                "windows_mouse_border_resize",
+                $mouseTest,
+                "--",
+                "--exact",
+                "--test-threads=1"
+            )
+            if ($LASTEXITCODE -ne 0) {
+                Fail "Windows mouse border package smoke failed with exit code $LASTEXITCODE"
+            }
+        } else {
+            & (Join-Path $PSScriptRoot "run-nextest-package-smoke.ps1") `
+                -Archive $NextestArchive `
+                -Package "rmux" `
+                -TestTarget "windows_mouse_border_resize" `
+                -TestName $mouseTest
         }
     } finally {
         if ($null -eq $previousBinary) {
             Remove-Item Env:\RMUX_MOUSE_BORDER_RMUX_BIN -ErrorAction SilentlyContinue
         } else {
             $env:RMUX_MOUSE_BORDER_RMUX_BIN = $previousBinary
+        }
+        if ($null -eq $previousDaemon) {
+            Remove-Item Env:\RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN -ErrorAction SilentlyContinue
+        } else {
+            $env:RMUX_MOUSE_BORDER_RMUX_DAEMON_BIN = $previousDaemon
         }
     }
 }
@@ -234,14 +447,14 @@ function InvokeCtrlMatrixSmoke([string]$Binary, [string]$GitSha, [string]$Eviden
     $outDir = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-package-ctrl-matrix-$PID-$([guid]::NewGuid().ToString('N'))"
     try {
         $global:LASTEXITCODE = 0
-        $arguments = @(
-            "-Rmux", [System.IO.Path]::GetFullPath($Binary),
-            "-OutDir", $outDir,
-            "-PortableSmokeOnly",
-            "-ExpectedGitSha", $GitSha
-        )
+        $arguments = @{
+            Rmux = [System.IO.Path]::GetFullPath($Binary)
+            OutDir = $outDir
+            PortableSmokeOnly = $true
+            ExpectedGitSha = $GitSha
+        }
         if (-not [string]::IsNullOrWhiteSpace($Evidence)) {
-            $arguments += @("-EvidencePath", [System.IO.Path]::GetFullPath($Evidence))
+            $arguments.EvidencePath = [System.IO.Path]::GetFullPath($Evidence)
         }
         & (Join-Path $PSScriptRoot "windows_ctrl_matrix.ps1") @arguments
         if ($LASTEXITCODE -ne 0) {
@@ -321,15 +534,16 @@ function AssertArchiveInstallerTransaction([string]$InstallScript, [string]$Pack
     $helperBackup = Join-Path $Root "package-helper-backup.exe"
     $readmeBackup = Join-Path $Root "package-readme-backup.md"
     $label = "package-installer-transaction-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    $daemonStarted = $false
+    $pipePath = NewPackagePipeName $installedBinary $label
+    $daemon = $null
 
     Copy-Item -LiteralPath $packageHelper -Destination $helperBackup
     Copy-Item -LiteralPath $packageReadme -Destination $readmeBackup
     try {
+        $daemon = Start-PackageDaemon $installedDaemon $pipePath
         AssertSuccessNoCapture $installedBinary @(
-            "-L", $label, "new-session", "-d", "-s", "installer_transaction", "cmd.exe", "/d", "/q", "/k"
+            "-S", $pipePath, "new-session", "-d", "-s", "installer_transaction", "cmd.exe", "/d", "/q", "/k"
         )
-        $daemonStarted = $true
 
         $before = @{
             Rmux = Sha256File $installedBinary
@@ -367,8 +581,8 @@ function AssertArchiveInstallerTransaction([string]$InstallScript, [string]$Pack
             Fail "install.ps1 left a mixed package after the locked-daemon failure"
         }
 
-        AssertSuccessNoCapture $helperBackup @("-L", $label, "kill-server")
-        $daemonStarted = $false
+        Stop-PackageDaemon $helperBackup $daemon
+        $daemon = $null
         Wait-BinaryReplaceable $installedDaemon 5000
 
         $rollback = Invoke-NativeCapture $powerShell @(
@@ -568,8 +782,8 @@ function AssertArchiveInstallerTransaction([string]$InstallScript, [string]$Pack
             Fail "install.ps1 mutated another slot before rejecting a non-file destination"
         }
     } finally {
-        if ($daemonStarted) {
-            & $helperBackup "-L" $label "kill-server" | Out-Null
+        if ($null -ne $daemon) {
+            Remove-PackageDaemon $daemon
         }
         Copy-Item -Force -LiteralPath $helperBackup -Destination $packageHelper
         Copy-Item -Force -LiteralPath $readmeBackup -Destination $packageReadme
@@ -634,6 +848,12 @@ if (-not (Test-Path -LiteralPath $archiveFull -PathType Leaf)) {
 if (-not $archiveFull.EndsWith(".zip", [System.StringComparison]::OrdinalIgnoreCase)) {
     Fail "unsupported archive extension, expected .zip: $Archive"
 }
+if (-not [string]::IsNullOrWhiteSpace($NextestArchive)) {
+    $NextestArchive = [System.IO.Path]::GetFullPath($NextestArchive)
+    if (-not (Test-Path -LiteralPath $NextestArchive -PathType Leaf)) {
+        Fail "nextest archive not found: $NextestArchive"
+    }
+}
 
 $archiveDir = Split-Path -Parent $archiveFull
 $archiveName = [System.IO.Path]::GetFileName($archiveFull)
@@ -694,6 +914,19 @@ try {
         }
         if ($metadata.configuration -ne "release") {
             Fail "release artifact metadata configuration is not release"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedGitSha)) {
+            if ($ExpectedGitSha -notmatch '^[0-9a-f]{40}$') {
+                Fail "expected Git SHA must be a canonical full lowercase SHA"
+            }
+            if (-not ($metadata.PSObject.Properties.Name -contains "git_commit") -or
+                -not [string]::Equals(
+                    [string]$metadata.git_commit,
+                    $ExpectedGitSha,
+                    [System.StringComparison]::Ordinal
+                )) {
+                Fail "release artifact metadata git_commit does not match expected Git SHA"
+            }
         }
     }
     $packagedBinaryHash = Sha256File $binary
@@ -766,34 +999,41 @@ try {
 
     if ($RunDaemonSmoke) {
         $label = "package-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+        $pipePath = NewPackagePipeName $binary $label
+        $daemon = $null
         try {
             $webPort = Get-FreeTcpPort
-            AssertSuccessNoCapture $binary @("-L", $label, "start-server", "--web-port", "$webPort")
-            AssertSuccessNoCapture $binary @("-L", $label, "new-session", "-d", "-s", "package_smoke", "cmd.exe", "/d", "/q", "/k")
-            $sessions = AssertSuccess $binary @("-L", $label, "list-sessions", "-F", "#{session_name}")
+            $daemon = Start-PackageDaemon $daemonBinary $pipePath @("--web-port", "$webPort")
+            AssertSuccessNoCapture $binary @("-S", $pipePath, "new-session", "-d", "-s", "package_smoke", "cmd.exe", "/d", "/q", "/k")
+            $sessions = AssertSuccess $binary @("-S", $pipePath, "list-sessions", "-F", "#{session_name}")
             if (($sessions -join "`n") -notmatch 'package_smoke') {
                 Fail "daemon smoke did not list package_smoke session"
             }
             $sourceFile = Join-Path $tmpRoot "package-source.conf"
             Set-Content -LiteralPath $sourceFile -Encoding ASCII -Value "set -g status off"
-            AssertSuccessNoCapture $binary @("-L", $label, "source-file", $sourceFile)
-            $status = AssertSuccess $binary @("-L", $label, "show-options", "-gv", "status")
+            AssertSuccessNoCapture $binary @("-S", $pipePath, "source-file", $sourceFile)
+            $status = AssertSuccess $binary @("-S", $pipePath, "show-options", "-gv", "status")
             AssertOutputContains $status "off" "package source-file smoke"
-            $webShare = AssertSuccess $binary @("-L", $label, "web-share", "-t", "package_smoke", "--no-pin", "--ttl", "30")
+            $webShare = AssertSuccess $binary @("-S", $pipePath, "web-share", "-t", "package_smoke", "--no-pin", "--ttl", "30")
             AssertOutputContains $webShare "http" "package web-share smoke"
-            $webList = AssertSuccess $binary @("-L", $label, "web-share", "list")
+            $webList = AssertSuccess $binary @("-S", $pipePath, "web-share", "list")
             AssertOutputContains $webList "package_smoke" "package web-share list smoke"
-            AssertSuccessNoCapture $binary @("-L", $label, "web-share", "off")
+            AssertSuccessNoCapture $binary @("-S", $pipePath, "web-share", "off")
         } finally {
-            & $binary "-L" $label "kill-server" | Out-Null
+            if ($null -ne $daemon) {
+                Stop-PackageDaemon $binary $daemon
+            }
         }
 
         $fallbackLabel = "package-fallback-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+        $fallbackPipePath = NewPackagePipeName $binary $fallbackLabel
         $previousDisableTiny = $env:RMUX_DISABLE_TINY_CLI
+        $fallbackDaemon = $null
         try {
             $env:RMUX_DISABLE_TINY_CLI = "1"
-            AssertSuccessNoCapture $binary @("-L", $fallbackLabel, "new-session", "-d", "-s", "package_fallback_smoke", "cmd.exe", "/d", "/q", "/k")
-            $sessions = AssertSuccess $binary @("-L", $fallbackLabel, "list-sessions", "-F", "#{session_name}")
+            $fallbackDaemon = Start-PackageDaemon $daemonBinary $fallbackPipePath
+            AssertSuccessNoCapture $binary @("-S", $fallbackPipePath, "new-session", "-d", "-s", "package_fallback_smoke", "cmd.exe", "/d", "/q", "/k")
+            $sessions = AssertSuccess $binary @("-S", $fallbackPipePath, "list-sessions", "-F", "#{session_name}")
             if (($sessions -join "`n") -notmatch 'package_fallback_smoke') {
                 Fail "fallback daemon smoke did not list package_fallback_smoke session"
             }
@@ -803,33 +1043,38 @@ try {
             } else {
                 $env:RMUX_DISABLE_TINY_CLI = $previousDisableTiny
             }
-            & $binary "-L" $fallbackLabel "kill-server" | Out-Null
+            if ($null -ne $fallbackDaemon) {
+                Stop-PackageDaemon $binary $fallbackDaemon
+            }
         }
 
         if ($portableAlias.Available) {
             $portableAliasLabel = "package-alias-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+            $portableAliasPipePath = NewPackagePipeName $binary $portableAliasLabel
+            $portableAliasDaemon = $null
             try {
+                $portableAliasDaemon = Start-PackageDaemon $daemonBinary $portableAliasPipePath
                 InvokeWithPathPrefix $portableAlias.Directory {
-                    AssertSuccessNoCapture "rmux" @("-L", $portableAliasLabel, "new-session", "-d", "-s", "package_alias_smoke", "cmd.exe", "/d", "/q", "/k")
-                    $sessions = AssertSuccess "rmux" @("-L", $portableAliasLabel, "list-sessions", "-F", "#{session_name}")
+                    AssertSuccessNoCapture "rmux" @("-S", $portableAliasPipePath, "new-session", "-d", "-s", "package_alias_smoke", "cmd.exe", "/d", "/q", "/k")
+                    $sessions = AssertSuccess "rmux" @("-S", $portableAliasPipePath, "list-sessions", "-F", "#{session_name}")
                     if (($sessions -join "`n") -notmatch 'package_alias_smoke') {
                         Fail "portable alias daemon smoke did not list package_alias_smoke session"
                     }
                 }
             } finally {
-                InvokeWithPathPrefix $portableAlias.Directory {
-                    & "rmux" "-L" $portableAliasLabel "kill-server" | Out-Null
+                if ($null -ne $portableAliasDaemon) {
+                    Stop-PackageDaemon $binary $portableAliasDaemon
                 }
             }
         }
     }
 
     if ($RunSdkSmoke) {
-        InvokeSdkWindowsSmoke $binary
+        InvokeSdkWindowsSmoke $binary $daemonBinary $NextestArchive
     }
 
     if ($RunMouseBorderSmoke) {
-        InvokeMouseBorderSmoke $binary
+        InvokeMouseBorderSmoke $binary $daemonBinary $NextestArchive
     }
 
     $ctrlMatrixStatus = "not-requested"

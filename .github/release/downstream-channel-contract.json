@@ -1,0 +1,311 @@
+{
+  "schema_version": 1,
+  "status": "review-only-disarmed",
+  "description": "Fail-closed contract for downstream release channels. It cannot authorize publication before PR8.",
+  "repository": {
+    "id": 1239918790,
+    "full_name": "Helvesec/rmux"
+  },
+  "activation": {
+    "ledger": ".github/release/release-activation.json",
+    "capability": "downstream_channels",
+    "required_value": false,
+    "runtime_override_allowed": false
+  },
+  "receipt_gate": {
+    "predicate_type": "https://rmux.io/attestations/release-publication-receipt/v1",
+    "envelope_type": "https://rmux.io/envelopes/release-publication-receipt/v1",
+    "workflow_path": ".github/workflows/release-receipt.yml",
+    "workflow_id": 316435347,
+    "required_run_attempt": 1,
+    "download_by_artifact_id": true,
+    "exact_artifact_digest_required": true,
+    "attestation_required": true,
+    "attestation_subject_name": "release-state.json",
+    "attestation_subject_in_bundle": true,
+    "required_downstream_authority": false,
+    "activation_blockers": []
+  },
+  "execution": {
+    "only_trigger": "workflow_call",
+    "public_callers": 0,
+    "required_caller_repository": "Helvesec/rmux",
+    "required_caller_repository_id": 1239918790,
+    "privileged_job_condition": "false",
+    "maximum_parallel_channels": 4,
+    "cancel_in_progress": false,
+    "github_hosted_only": true,
+    "native_rebuild_allowed": false,
+    "rmux_io_last": true
+  },
+  "retry": {
+    "actions_run_attempt": 1,
+    "actions_rerun_allowed": false,
+    "same_receipt_required": true,
+    "same_request_required": true,
+    "same_idempotency_key_required": true,
+    "same_payload_bytes_required": true,
+    "native_rebuild_allowed": false,
+    "maximum_retry_depth": 1,
+    "retryable_states": [
+      "failed-transient",
+      "prepared"
+    ],
+    "retry_requires_mutation_started": false,
+    "retry_requires_remote_request_id": null
+  },
+  "payload_evidence": {
+    "schema": ".github/release/schemas/downstream-channel-payload.schema.json",
+    "predicate_type": "https://rmux.io/attestations/release-downstream-channel-payload/v1",
+    "subject_name": "downstream-channel-payload-subject.json",
+    "canonical_provenance_ready": true,
+    "actions_expiry_bound": true,
+    "producer_workflow_allowlist_ready": true,
+    "producer": {
+      "workflow_id": 316435347,
+      "workflow_path": ".github/workflows/release-receipt.yml",
+      "job_workflow_path": ".github/workflows/release-downstream.yml",
+      "required_run_attempt": 1
+    },
+    "activation_blockers": []
+  },
+  "result_evidence": {
+    "predicate_type": "https://rmux.io/attestations/release-downstream-channel-result/v1",
+    "subject_name": "downstream-channel-target-evidence.json",
+    "subject_digest_algorithm": "sha256",
+    "predicate_bundle_exact_files": [
+      "channel-payload.json",
+      "downstream-channel-plan.json",
+      "downstream-channel-request.json",
+      "downstream-channel-result-predicate.json",
+      "downstream-channel-result.sigstore.json",
+      "downstream-channel-target-evidence.json",
+      "receipt-reference.json"
+    ],
+    "envelope_separate": true,
+    "result_reference_ready": true,
+    "result_reference_schema": ".github/release/schemas/downstream-channel-result-reference.schema.json",
+    "attestation_verification_ready": true,
+    "attestation_verifier": "scripts/release/verify-channel-result-attestation.py",
+    "result_aggregation_ready": true,
+    "aggregation_blockers": [],
+    "summary_schema": ".github/release/schemas/downstream-channel-summary.schema.json",
+    "summary_phases": ["pre-site", "final"],
+    "pre_site_result_count": 10,
+    "final_result_count": 11,
+    "rmux_io_pre_site_digest_field": "pre_site_summary_sha256",
+    "producer_workflows": {
+      "apt_rpm": [".github/workflows/release-downstream.yml"],
+      "chocolatey": [
+        ".github/workflows/release-downstream.yml",
+        ".github/workflows/release-chocolatey-retry.yml"
+      ],
+      "crates_io": [".github/workflows/release-downstream.yml"],
+      "homebrew_core": [".github/workflows/release-downstream.yml"],
+      "homebrew_tap": [".github/workflows/release-downstream.yml"],
+      "rmux_io": [".github/workflows/release-downstream.yml"],
+      "scoop": [".github/workflows/release-downstream.yml"],
+      "snap_candidate": [
+        ".github/workflows/release-downstream.yml",
+        ".github/workflows/release-snap-retry.yml"
+      ],
+      "snap_stable": [".github/workflows/release-downstream.yml"],
+      "web_share": [".github/workflows/release-downstream.yml"],
+      "winget": [".github/workflows/release-downstream.yml"]
+    },
+    "target_policies": {
+      "apt_rpm": {"allowed_hosts": ["github.com", "packages.rmux.io"], "commit_sha_required": true},
+      "chocolatey": {"allowed_hosts": ["community.chocolatey.org"], "commit_sha_required": false},
+      "crates_io": {"allowed_hosts": ["crates.io"], "commit_sha_required": false},
+      "homebrew_core": {"allowed_hosts": ["github.com"], "commit_sha_required": true},
+      "homebrew_tap": {"allowed_hosts": ["github.com"], "commit_sha_required": true},
+      "rmux_io": {"allowed_hosts": ["rmux.io"], "commit_sha_required": true},
+      "scoop": {"allowed_hosts": ["github.com"], "commit_sha_required": true},
+      "snap_candidate": {"allowed_hosts": ["snapcraft.io"], "commit_sha_required": false},
+      "snap_stable": {"allowed_hosts": ["snapcraft.io"], "commit_sha_required": false},
+      "web_share": {"allowed_hosts": ["github.com", "share.rmux.io"], "commit_sha_required": true},
+      "winget": {"allowed_hosts": ["github.com"], "commit_sha_required": true}
+    }
+  },
+  "channels": [
+    {
+      "name": "apt_rpm",
+      "phase": 1,
+      "target_kind": "github-repository",
+      "target_repository_key": "rmux-packages",
+      "rc_policy": "deny",
+      "stable_policy": "allow",
+      "payload_ready": true,
+      "payload_roles": [
+        "debian",
+        "rpm"
+      ],
+      "retryable": true,
+      "blockers": [
+        "private_repository_protection_unavailable_on_current_plan",
+        "downstream_writer_app_missing"
+      ]
+    },
+    {
+      "name": "chocolatey",
+      "phase": 2,
+      "target_kind": "package-store",
+      "target_repository_key": null,
+      "rc_policy": "deny",
+      "stable_policy": "allow",
+      "payload_ready": true,
+      "payload_roles": [
+        "chocolatey-package"
+      ],
+      "retryable": true,
+      "blockers": []
+    },
+    {
+      "name": "crates_io",
+      "phase": 1,
+      "target_kind": "package-store",
+      "target_repository_key": null,
+      "rc_policy": "deny",
+      "stable_policy": "allow",
+      "payload_ready": true,
+      "payload_roles": [
+        "crate-package-set"
+      ],
+      "retryable": true,
+      "blockers": []
+    },
+    {
+      "name": "homebrew_core",
+      "phase": 2,
+      "target_kind": "github-pull-request",
+      "target_repository_key": "homebrew-core",
+      "rc_policy": "deny",
+      "stable_policy": "allow",
+      "payload_ready": true,
+      "payload_roles": [
+        "homebrew-core-patch"
+      ],
+      "retryable": true,
+      "blockers": [
+        "manual_submission_identity_not_configured"
+      ]
+    },
+    {
+      "name": "homebrew_tap",
+      "phase": 1,
+      "target_kind": "github-repository",
+      "target_repository_key": "homebrew-rmux",
+      "rc_policy": "deny",
+      "stable_policy": "allow",
+      "payload_ready": true,
+      "payload_roles": [
+        "homebrew-formula"
+      ],
+      "retryable": true,
+      "blockers": [
+        "environment_admin_bypass_enabled",
+        "downstream_writer_app_missing"
+      ]
+    },
+    {
+      "name": "rmux_io",
+      "phase": 3,
+      "target_kind": "website",
+      "target_repository_key": "rmux.io",
+      "rc_policy": "deny",
+      "stable_policy": "allow",
+      "payload_ready": true,
+      "payload_roles": [
+        "site-patch",
+        "channel-truth-summary"
+      ],
+      "retryable": true,
+      "blockers": [
+        "private_repository_protection_unavailable_on_current_plan",
+        "downstream_writer_app_missing"
+      ]
+    },
+    {
+      "name": "scoop",
+      "phase": 1,
+      "target_kind": "github-repository",
+      "target_repository_key": "scoop-rmux",
+      "rc_policy": "deny",
+      "stable_policy": "allow",
+      "payload_ready": true,
+      "payload_roles": [
+        "scoop-manifest"
+      ],
+      "retryable": true,
+      "blockers": [
+        "environment_admin_bypass_enabled",
+        "downstream_writer_app_missing"
+      ]
+    },
+    {
+      "name": "snap_candidate",
+      "phase": 2,
+      "target_kind": "package-store",
+      "target_repository_key": null,
+      "rc_policy": "explicit-opt-in",
+      "stable_policy": "explicit-opt-in",
+      "payload_ready": true,
+      "payload_roles": [
+        "snap-amd64",
+        "snap-arm64"
+      ],
+      "retryable": true,
+      "blockers": []
+    },
+    {
+      "name": "snap_stable",
+      "phase": 2,
+      "target_kind": "package-store",
+      "target_repository_key": null,
+      "rc_policy": "deny",
+      "stable_policy": "deny",
+      "payload_ready": false,
+      "payload_roles": [],
+      "retryable": false,
+      "blockers": [
+        "denied_until_support_decision"
+      ]
+    },
+    {
+      "name": "web_share",
+      "phase": 1,
+      "target_kind": "github-repository",
+      "target_repository_key": "rmux-web-share",
+      "rc_policy": "deny",
+      "stable_policy": "allow",
+      "payload_ready": true,
+      "payload_roles": [
+        "wasm-byte-set",
+        "wasm-provenance"
+      ],
+      "retryable": true,
+      "blockers": [
+        "environment_admin_bypass_enabled",
+        "downstream_writer_app_missing",
+        "floating_actions_present",
+        "unprotected_secret_deployment_workflow"
+      ]
+    },
+    {
+      "name": "winget",
+      "phase": 2,
+      "target_kind": "github-pull-request",
+      "target_repository_key": "winget-pkgs",
+      "rc_policy": "deny",
+      "stable_policy": "allow",
+      "payload_ready": true,
+      "payload_roles": [
+        "winget-manifest-set"
+      ],
+      "retryable": true,
+      "blockers": [
+        "manual_submission_identity_not_configured"
+      ]
+    }
+  ]
+}

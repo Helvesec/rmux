@@ -1,0 +1,181 @@
+name: Publish Chocolatey release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Published RMUX tag, for example v0.9.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rmux-chocolatey-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Validate and publish Chocolatey package
+    runs-on: windows-latest
+    timeout-minutes: 45
+    environment: release
+    env:
+      RELEASE_REF: ${{ inputs.ref }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          persist-credentials: false
+
+      - name: Verify signed tag and public release identity
+        id: identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = $env:RELEASE_REF
+          if ($tag -notmatch '^v(?<version>[0-9]+\.[0-9]+\.[0-9]+)$') {
+            throw "ref must be a stable RMUX tag such as v0.9.0"
+          }
+          $version = $Matches.version
+          $actualSha = (& git rev-parse HEAD).Trim()
+
+          $tagRef = gh api "repos/${{ github.repository }}/git/ref/tags/$tag" | ConvertFrom-Json
+          if ($tagRef.object.type -ne "tag") {
+            throw "release tag must be annotated and signed"
+          }
+          $tagObject = gh api "repos/${{ github.repository }}/git/tags/$($tagRef.object.sha)" | ConvertFrom-Json
+          if (-not $tagObject.verification.verified) {
+            throw "release tag signature is not verified by GitHub"
+          }
+          if ($tagObject.object.type -ne "commit" -or $tagObject.object.sha -ne $actualSha) {
+            throw "signed tag target does not match checked-out source"
+          }
+
+          $release = gh api "repos/${{ github.repository }}/releases/tags/$tag" | ConvertFrom-Json
+          if ($release.draft -or $release.target_commitish -ne $actualSha) {
+            throw "public release target does not match the signed tag"
+          }
+
+          $manifest = Get-Content -LiteralPath Cargo.toml -Raw
+          $workspaceVersion = [regex]::Match(
+            $manifest,
+            '(?ms)^\[workspace\.package\]\s*.*?^version\s*=\s*"(?<version>[^"]+)"\s*$'
+          ).Groups['version'].Value
+          if ($workspaceVersion -ne $version) {
+            throw "workspace version $workspaceVersion does not match $tag"
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "source_sha=$actualSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Download canonical release inputs
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          gh release download $env:RELEASE_REF `
+            --repo "${{ github.repository }}" `
+            --pattern SHA256SUMS `
+            --pattern "rmux-${{ steps.identity.outputs.version }}-windows-x86_64.zip" `
+            --dir release-assets
+
+      - name: Verify canonical Windows archive checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.identity.outputs.version }}"
+          $archiveName = "rmux-$version-windows-x86_64.zip"
+          $archive = Join-Path release-assets $archiveName
+          $lines = @(
+            Get-Content -LiteralPath release-assets\SHA256SUMS |
+              Where-Object { $_ -match "^[0-9a-fA-F]{64}\s+\*?$([regex]::Escape($archiveName))$" }
+          )
+          if ($lines.Count -ne 1) {
+            throw "SHA256SUMS has no unique entry for $archiveName"
+          }
+          $line = $lines[0]
+          $expected = ($line -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "checksum mismatch for $archiveName"
+          }
+
+      - name: Generate and pack Chocolatey package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='${{ steps.identity.outputs.version }}'
+          scripts/generate-chocolatey-package.sh \
+            --version "$version" \
+            --checksums release-assets/SHA256SUMS \
+            --output-dir target/chocolatey/rmux
+          cd target/chocolatey/rmux
+          choco pack rmux.nuspec --output-directory .. --limit-output
+
+      - name: Install and smoke-test package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "${{ steps.identity.outputs.version }}"
+          $packageRoot = (Resolve-Path target\chocolatey).Path
+          $package = Join-Path $packageRoot "rmux.$version.nupkg"
+          if (-not (Test-Path -LiteralPath $package)) {
+            throw "Chocolatey package was not generated: $package"
+          }
+
+          choco install rmux `
+            --source $packageRoot `
+            --version $version `
+            --yes `
+            --no-progress `
+            --force
+
+          $versionOutput = (& rmux -V).Trim()
+          if ($versionOutput -ne "rmux $version") {
+            throw "Unexpected rmux version from Chocolatey install: $versionOutput"
+          }
+          .\scripts\smoke-installed-rmux.ps1 `
+            -Rmux rmux `
+            -SkipDaemon `
+            -RequireDaemonCommand
+          choco uninstall rmux --yes --no-progress
+          "CHOCOLATEY_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Push package once
+        shell: pwsh
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
+            throw "Missing required release environment secret: CHOCOLATEY_API_KEY"
+          }
+
+          $version = "${{ steps.identity.outputs.version }}"
+          $query = "https://community.chocolatey.org/api/v2/FindPackagesById()?id='rmux'"
+          $response = Invoke-WebRequest -Uri $query -Method Get
+          [xml]$feed = $response.Content
+          $namespaces = [System.Xml.XmlNamespaceManager]::new($feed.NameTable)
+          $namespaces.AddNamespace("atom", "http://www.w3.org/2005/Atom")
+          $namespaces.AddNamespace("m", "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata")
+          $namespaces.AddNamespace("d", "http://schemas.microsoft.com/ado/2007/08/dataservices")
+          $existing = $feed.SelectSingleNode(
+            "//atom:entry/m:properties[d:Version='$version']/d:Version",
+            $namespaces
+          )
+          if ($existing) {
+            Write-Host "Chocolatey package rmux $version already exists; skipping push."
+            exit 0
+          }
+
+          choco push $env:CHOCOLATEY_PACKAGE `
+            --source "https://push.chocolatey.org/" `
+            --api-key $env:CHOCOLATEY_API_KEY `
+            --yes `
+            --no-progress

@@ -27,8 +27,11 @@ pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 // real prompt/output transitions without making successful tests slower.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const OUTPUT_BUDGET: usize = 64 * 1024;
+const DAEMON_UNAVAILABLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const DAEMON_UNAVAILABLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SNAPSHOT_STABLE_PERIOD: Duration = Duration::from_millis(500);
 const RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN_ENV: &str = "RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN";
+const RMUX_SDK_WINDOWS_SMOKE_PIPE_ENV: &str = "RMUX_SDK_WINDOWS_SMOKE_PIPE";
 
 pub static LIVE_DAEMON_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -42,10 +45,20 @@ pub struct Harness {
 
 impl Harness {
     pub async fn start(label: &str) -> TestResult<Self> {
-        let pipe_name = unique_pipe_name(label)?;
+        let package_pipe = std::env::var(RMUX_SDK_WINDOWS_SMOKE_PIPE_ENV)
+            .ok()
+            .filter(|pipe_name| !pipe_name.is_empty());
+        let pipe_name = match &package_pipe {
+            Some(pipe_name) => pipe_name.clone(),
+            None => unique_pipe_name(label)?,
+        };
         let daemon_binary = rmux_binary()?.to_path_buf();
         let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
-        let rmux = builder(&pipe_name).connect_or_start().await?;
+        let rmux = if package_pipe.is_some() {
+            builder(&pipe_name).connect().await?
+        } else {
+            builder(&pipe_name).connect_or_start().await?
+        };
         Ok(Self {
             pipe_name,
             rmux: Some(rmux),
@@ -144,9 +157,13 @@ impl Drop for Harness {
 }
 
 pub fn builder(pipe_name: &str) -> RmuxBuilder {
+    builder_with_timeout(pipe_name, DEFAULT_TIMEOUT)
+}
+
+fn builder_with_timeout(pipe_name: &str, default_timeout: Duration) -> RmuxBuilder {
     RmuxBuilder::new()
         .windows_pipe(pipe_name.to_owned())
-        .default_timeout(DEFAULT_TIMEOUT)
+        .default_timeout(default_timeout)
 }
 
 pub fn session_name(prefix: &str) -> SessionName {
@@ -272,13 +289,27 @@ pub async fn wait_for_stable_snapshot(
 pub async fn wait_for_daemon_unavailable(pipe_name: &str) -> TestResult {
     let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
-        if builder(pipe_name).connect().await.is_err() {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(format!("daemon endpoint remained reachable: {pipe_name}").into());
         }
-        sleep(Duration::from_millis(25)).await;
+
+        let connect =
+            builder_with_timeout(pipe_name, DAEMON_UNAVAILABLE_CONNECT_TIMEOUT.min(remaining))
+                .connect();
+        match timeout(remaining, connect).await {
+            Ok(Err(_)) => return Ok(()),
+            Ok(Ok(_)) => {}
+            Err(_) => {
+                return Err(format!("daemon endpoint remained reachable: {pipe_name}").into());
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("daemon endpoint remained reachable: {pipe_name}").into());
+        }
+        sleep(DAEMON_UNAVAILABLE_POLL_INTERVAL.min(remaining)).await;
     }
 }
 
@@ -338,6 +369,10 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
             path.display()
         )
         .into());
+    }
+
+    if let Some(path) = windows_cargo_build::prebuilt_rmux_binary()? {
+        return Ok(path);
     }
 
     if let Some(path) = option_env!("CARGO_BIN_EXE_rmux") {

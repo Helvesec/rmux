@@ -1,0 +1,228 @@
+name: Release candidate shadow sealer
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Exact completed canonical candidate run ID to seal
+        required: true
+        type: string
+      expected_source_sha:
+        description: Exact protected main SHA shared with the candidate
+        required: true
+        type: string
+      release_intent_id:
+        description: Exact release intent bound by the candidate
+        required: true
+        type: string
+      planned_release_ref:
+        description: Planned stable or release-candidate tag name
+        required: true
+        type: string
+      release_kind:
+        description: Non-publishing shadow, RC, or stable intent
+        required: true
+        type: choice
+        options: [shadow, rc, stable]
+
+permissions: {}
+
+concurrency:
+  group: rmux-release-shadow-${{ inputs.release_intent_id }}
+  cancel-in-progress: false
+
+jobs:
+  seal-candidate:
+    name: Seal exact candidate without publication authority
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    env:
+      RMUX_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+      RMUX_RELEASE_INTENT_ID: ${{ inputs.release_intent_id }}
+      RMUX_PLANNED_RELEASE_REF: ${{ inputs.planned_release_ref }}
+      RMUX_RELEASE_KIND: ${{ inputs.release_kind }}
+    steps:
+      - name: Reject untrusted inputs before checkout or API access
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RMUX_CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RMUX_RELEASE_INTENT_ID" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]
+          [[ "$RMUX_PLANNED_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+          [[ "$RMUX_RELEASE_KIND" =~ ^(shadow|rc|stable)$ ]]
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify the exact completed candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RMUX_EXPECTED_SOURCE_SHA"
+          scripts/release/verify-fast-run.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --kind candidate \
+            > "$RUNNER_TEMP/candidate-run-proof.json"
+
+      - id: artifacts
+        name: Resolve the exact eleven candidate artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          resolution="$RUNNER_TEMP/candidate-artifact-resolution.json"
+          scripts/release/verify-candidate-artifacts.py resolve \
+            --repository "$GITHUB_REPOSITORY" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --output "$resolution"
+          artifact_ids=$(python3 - "$resolution" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          artifacts = value.get("artifacts")
+          if not isinstance(artifacts, list) or len(artifacts) != 11:
+              raise SystemExit("candidate artifact resolution must contain eleven artifacts")
+          identifiers = [item.get("artifact_id") for item in artifacts]
+          if any(type(identifier) is not int or identifier <= 0 for identifier in identifiers):
+              raise SystemExit("candidate artifact IDs must be positive integers")
+          if len(identifiers) != len(set(identifiers)):
+              raise SystemExit("candidate artifact IDs must be unique")
+          print(",".join(str(identifier) for identifier in identifiers))
+          PY
+          )
+          echo "artifact_ids=$artifact_ids" >> "$GITHUB_OUTPUT"
+
+      - name: Download only the resolved artifact IDs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ steps.artifacts.outputs.artifact_ids }}
+          path: ${{ runner.temp }}/rmux-candidate-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - id: identity
+        name: Recover and bind the selected fast run ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          intent="$RUNNER_TEMP/rmux-candidate-download/rmux-fast-proof-$RMUX_EXPECTED_SOURCE_SHA/candidate-intent.json"
+          fast_run_id=$(python3 - "$intent" "$RMUX_EXPECTED_SOURCE_SHA" "$RMUX_RELEASE_INTENT_ID" "$RMUX_PLANNED_RELEASE_REF" "$RMUX_RELEASE_KIND" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = {
+              "source_git_sha": sys.argv[2],
+              "release_intent_id": sys.argv[3],
+              "planned_release_ref": sys.argv[4],
+              "release_kind": sys.argv[5],
+              "candidate_run_attempt": 1,
+          }
+          for field, wanted in expected.items():
+              if value.get(field) != wanted:
+                  raise SystemExit(f"candidate intent {field} differs")
+          run_id = value.get("fast_run_id")
+          if type(run_id) is not int or run_id <= 0:
+              raise SystemExit("candidate intent fast run ID is invalid")
+          print(run_id)
+          PY
+          )
+          echo "fast_run_id=$fast_run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Verify every downloaded record, binding, and byte
+        env:
+          RMUX_FAST_RUN_ID: ${{ steps.identity.outputs.fast_run_id }}
+        run: |
+          set -euo pipefail
+          scripts/release/verify-candidate-artifacts.py verify-downloaded \
+            --repository "$GITHUB_REPOSITORY" \
+            --candidate-run-id "$RMUX_CANDIDATE_RUN_ID" \
+            --expected-source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --fast-run-id "$RMUX_FAST_RUN_ID" \
+            --release-intent-id "$RMUX_RELEASE_INTENT_ID" \
+            --planned-release-ref "$RMUX_PLANNED_RELEASE_REF" \
+            --release-kind "$RMUX_RELEASE_KIND" \
+            --resolution "$RUNNER_TEMP/candidate-artifact-resolution.json" \
+            --downloads-dir "$RUNNER_TEMP/rmux-candidate-download" \
+            --output "$RUNNER_TEMP/verified-candidate-artifacts.json"
+
+      - id: gh
+        name: Install the pinned attestation verifier
+        run: |
+          set -euo pipefail
+          install_root="$RUNNER_TEMP/rmux-gh-2.93.0"
+          test ! -e "$install_root"
+          scripts/release/install-gh-2.93.0.sh "$install_root"
+          echo "binary=$install_root/gh" >> "$GITHUB_OUTPUT"
+
+      - name: Verify every build-provenance signature offline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RMUX_GH_BINARY: ${{ steps.gh.outputs.binary }}
+        run: >-
+          scripts/release/verify-candidate-attestations.sh
+          "$RUNNER_TEMP/rmux-candidate-download"
+          "$RMUX_EXPECTED_SOURCE_SHA"
+          "$RMUX_GH_BINARY"
+
+      - name: Recompute the immutable policy root
+        run: |
+          set -euo pipefail
+          scripts/release/policy-root.py \
+            --source-sha "$RMUX_EXPECTED_SOURCE_SHA" \
+            --output "$RUNNER_TEMP/release-policy-root.json"
+
+      - name: Seal and independently reproduce the candidate manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          download="$RUNNER_TEMP/rmux-candidate-download"
+          proof="$download/rmux-fast-proof-$RMUX_EXPECTED_SOURCE_SHA"
+          common=(
+            --candidate-proof "$RUNNER_TEMP/candidate-run-proof.json"
+            --fast-proof "$proof/fast-proof.json"
+            --candidate-intent "$proof/candidate-intent.json"
+            --policy-root "$RUNNER_TEMP/release-policy-root.json"
+            --canonical-artifacts "$RUNNER_TEMP/verified-candidate-artifacts.json"
+          )
+          for platform in linux-aarch64 linux-x86_64 macos-aarch64 macos-x86_64 windows-x86_64; do
+            common+=(
+              --build-record "$platform=$download/rmux-canonical-$platform-$RMUX_EXPECTED_SOURCE_SHA/canonical-build-record.json"
+              --artifact-binding "$platform=$download/rmux-canonical-provenance-$platform-$RMUX_EXPECTED_SOURCE_SHA/canonical-artifact-binding.json"
+            )
+          done
+          manifest="$RUNNER_TEMP/candidate-manifest.json"
+          scripts/release/candidate-manifest.py create "${common[@]}" --output "$manifest"
+          scripts/release/candidate-manifest.py verify "${common[@]}" --manifest "$manifest"
+
+      - name: Persist only the non-authoritative shadow evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-candidate-manifest-${{ inputs.candidate_run_id }}
+          path: |
+            ${{ runner.temp }}/candidate-manifest.json
+            ${{ runner.temp }}/candidate-run-proof.json
+            ${{ runner.temp }}/release-policy-root.json
+            ${{ runner.temp }}/verified-candidate-artifacts.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

@@ -31,6 +31,10 @@ const EXIT_WATCHER_HOLDER_PID_PATH_ENV: &str = "RMUX_TEST_EXIT_WATCHER_HOLDER_PI
 
 static CTRL_C_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+fn read_ctrl_c_count(path: &std::path::Path) -> Option<usize> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 unsafe extern "system" fn count_ctrl_c(kind: u32) -> i32 {
     if kind == CTRL_C_EVENT {
         CTRL_C_CALLBACK_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -193,10 +197,7 @@ fn conpty_processed_ctrl_c_emits_one_interrupt_per_key() -> Result<(), Box<dyn s
     )?;
     let deadline = Instant::now() + Duration::from_secs(2);
     let observed = loop {
-        let callbacks = fs::read_to_string(&count_path)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
+        let callbacks = read_ctrl_c_count(&count_path).unwrap_or(0);
         if callbacks > 0 || Instant::now() >= deadline {
             break callbacks;
         }
@@ -204,7 +205,20 @@ fn conpty_processed_ctrl_c_emits_one_interrupt_per_key() -> Result<(), Box<dyn s
     };
     assert!(observed > 0, "Ctrl-C helper did not receive an interrupt");
     thread::sleep(Duration::from_millis(250));
-    let callbacks = fs::read_to_string(&count_path)?.parse::<usize>()?;
+    let parse_deadline = Instant::now() + Duration::from_secs(1);
+    let callbacks = loop {
+        if let Some(callbacks) = read_ctrl_c_count(&count_path) {
+            break callbacks;
+        }
+        if Instant::now() >= parse_deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Ctrl-C helper counter remained unreadable",
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
 
     spawned.child().terminate_forcefully()?;
     let _ = spawned.child_mut().wait()?;

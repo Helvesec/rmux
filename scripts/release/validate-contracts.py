@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""Validate release contracts without network access or publication credentials."""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from canonical_contract import (
+    validate_build as validate_canonical_build,
+    validate_candidate_policy as validate_canonical_candidate_policy,
+    validate_schemas as validate_canonical_schemas,
+)
+from downstream_contract import validate_downstream_contracts
+from local_action_policy import validate_local_action_policy
+from policy_audit_contract import validate_repository_contracts
+from promotion_contract import (
+    validate_candidate_policy as validate_promotion_candidate_policy,
+    validate_schemas as validate_promotion_schemas,
+)
+from shadow_contract import (
+    validate_candidate_policy as validate_shadow_candidate_policy,
+)
+from strict_json import read_json_object
+
+ROOT = Path(__file__).resolve().parents[2]
+CONTRACT_DIR = ROOT / ".github" / "release"
+STANDARD_RUNNER_LABELS = {
+    "macos-15",
+    "macos-15-intel",
+    "ubuntu-22.04",
+    "ubuntu-22.04-arm",
+    "ubuntu-latest",
+    "windows-latest",
+}
+SHADOW_SCHEMA_STATUS = "shadow-non-authoritative"
+ALLOWED_WINDOWS_PROOFS = {
+    "fast_exact",
+    "release_delta",
+    "canonical_build",
+    "canonical_smoke",
+}
+IRREVERSIBLE_RC_CHANNELS = {
+    "apt_rpm",
+    "chocolatey",
+    "crates_io",
+    "homebrew_core",
+    "homebrew_tap",
+    "rmux_io",
+    "scoop",
+    "web_share",
+    "winget",
+    "snap_stable",
+}
+
+
+def load(path: Path) -> dict[str, Any]:
+    return read_json_object(path, str(path.relative_to(ROOT)))
+
+
+def require_unique_strings(values: Any, label: str) -> list[str]:
+    if not isinstance(values, list) or not all(
+        isinstance(value, str) for value in values
+    ):
+        raise ValueError(f"{label} must be an array of strings")
+    if len(values) != len(set(values)):
+        raise ValueError(f"{label} contains duplicates")
+    return values
+
+
+def validate_candidate() -> None:
+    contract = load(CONTRACT_DIR / "candidate-contract.json")
+    if contract.get("schema_version") != 1:
+        raise ValueError("candidate contract schema_version must be 1")
+    repository = contract.get("repository", {})
+    if (
+        repository.get("full_name") != "Helvesec/rmux"
+        or repository.get("id") != 1239918790
+    ):
+        raise ValueError("candidate contract repository identity drifted")
+    fast = contract.get("fast_run", {})
+    expected = {
+        "branch": "main",
+        "event": "push",
+        "required_run_attempt": 1,
+        "workflow_id": 277622540,
+        "workflow_name": "CI",
+        "workflow_path": ".github/workflows/ci.yml",
+        "freshness_hours": 48,
+    }
+    for key, value in expected.items():
+        if fast.get(key) != value:
+            raise ValueError(f"fast_run.{key} must equal {value!r}")
+    if "maximum_signed_extension_hours" in fast:
+        raise ValueError("unsigned fast evidence cannot claim a freshness extension")
+    success = require_unique_strings(fast.get("success_jobs"), "fast_run.success_jobs")
+    skipped = require_unique_strings(fast.get("skipped_jobs"), "fast_run.skipped_jobs")
+    allowed = fast.get("allowed_jobs")
+    if not isinstance(allowed, dict) or allowed != {
+        "Cache reusable Windows test archive": ["success", "skipped"]
+    }:
+        raise ValueError(
+            "fast_run must explicitly allow the archive cache to succeed or skip"
+        )
+    overlap = (
+        (set(success) & set(skipped))
+        | (set(success) & set(allowed))
+        | (set(skipped) & set(allowed))
+    )
+    if overlap:
+        raise ValueError(
+            f"fast jobs cannot be both success and skipped: {sorted(overlap)}"
+        )
+    shards = {
+        name
+        for name in success
+        if re.fullmatch(r"Windows workspace tests \([0-9]+/18\)", name)
+    }
+    expected_shards = {
+        f"Windows workspace tests ({index}/18)" for index in range(1, 19)
+    }
+    if shards != expected_shards:
+        raise ValueError(
+            "candidate contract must cover every Windows slice 1..18 exactly once"
+        )
+    qualification = contract.get("qualification_run", {})
+    for key, value in {
+        "branch": "main",
+        "event": "workflow_dispatch",
+        "required_run_attempt": 1,
+        "workflow_id": 277622540,
+        "workflow_name": "CI",
+        "workflow_path": ".github/workflows/ci.yml",
+    }.items():
+        if qualification.get(key) != value:
+            raise ValueError(f"qualification_run.{key} must equal {value!r}")
+    qualification_success = require_unique_strings(
+        qualification.get("success_jobs"), "qualification_run.success_jobs"
+    )
+    qualification_skipped = require_unique_strings(
+        qualification.get("skipped_jobs"), "qualification_run.skipped_jobs"
+    )
+    qualification_allowed = qualification.get("allowed_jobs")
+    if qualification_allowed != {
+        "Cache reusable Windows test archive": ["success", "skipped"]
+    }:
+        raise ValueError(
+            "qualification cache job must explicitly allow success or skip"
+        )
+    qualification_sets = [
+        set(qualification_success),
+        set(qualification_skipped),
+        set(qualification_allowed),
+    ]
+    if any(
+        qualification_sets[left] & qualification_sets[right]
+        for left in range(len(qualification_sets))
+        for right in range(left + 1, len(qualification_sets))
+    ):
+        raise ValueError("qualification job conclusion sets overlap")
+    if len(set.union(*qualification_sets)) != 53 or len(qualification_success) != 52:
+        raise ValueError(
+            "qualification contract must contain 52 successes and one variable cache job"
+        )
+    qualification_shards = {
+        name
+        for name in qualification_success
+        if re.fullmatch(r"Windows workspace tests \([0-9]+/18\)", name)
+    }
+    if qualification_shards != expected_shards:
+        raise ValueError("qualification contract must cover every Windows slice 1..18")
+    candidate = contract.get("candidate_run", {})
+    for key, value in {
+        "branch": "main",
+        "event": "workflow_dispatch",
+        "freshness_hours": 48,
+        "required_run_attempt": 1,
+        "workflow_id": 277622540,
+        "workflow_name": "CI",
+        "workflow_path": ".github/workflows/ci.yml",
+    }.items():
+        if candidate.get(key) != value:
+            raise ValueError(f"candidate_run.{key} must equal {value!r}")
+    candidate_success = require_unique_strings(
+        candidate.get("success_jobs"), "candidate_run.success_jobs"
+    )
+    candidate_skipped = require_unique_strings(
+        candidate.get("skipped_jobs"), "candidate_run.skipped_jobs"
+    )
+    if candidate.get("allowed_jobs") != {}:
+        raise ValueError("candidate run cannot have variable job conclusions")
+    if (
+        len(candidate_success) != 24
+        or len(candidate_skipped) != 26
+        or set(candidate_success) & set(candidate_skipped)
+    ):
+        raise ValueError("candidate contract must contain 24 successes and 26 skips")
+    runner_policy = contract.get("runner_policy")
+    if not isinstance(runner_policy, dict) or runner_policy.get("provider") != (
+        "github_standard_hosted"
+    ):
+        raise ValueError("runner policy must require standard GitHub-hosted runners")
+    runner_group_id = runner_policy.get("runner_group_id")
+    if (
+        type(runner_group_id) is not int
+        or runner_group_id != 0
+        or runner_policy.get("runner_group_name") != "GitHub Actions"
+    ):
+        raise ValueError("runner policy must require the standard GitHub Actions group")
+    jobs_by_label = runner_policy.get("jobs_by_label")
+    if not isinstance(jobs_by_label, dict) or set(jobs_by_label) != (
+        STANDARD_RUNNER_LABELS
+    ):
+        raise ValueError("runner policy must define exactly the standard runner labels")
+    non_runner_jobs = require_unique_strings(
+        runner_policy.get("non_runner_jobs"), "runner_policy.non_runner_jobs"
+    )
+    if non_runner_jobs != [
+        "Build canonical native artifacts",
+        "Platform build and smoke on ${{ matrix.os }}",
+        "Run release-only candidate delta",
+    ]:
+        raise ValueError("runner policy virtual job inventory changed")
+    contracted_jobs = (
+        set(success)
+        | set(skipped)
+        | set(allowed)
+        | set(qualification_success)
+        | set(qualification_skipped)
+        | set(qualification_allowed)
+        | set(candidate_success)
+        | set(candidate_skipped)
+    )
+    assigned_jobs: list[str] = []
+    for label in sorted(jobs_by_label):
+        names = require_unique_strings(
+            jobs_by_label[label], f"runner_policy.jobs_by_label.{label}"
+        )
+        if names != sorted(names):
+            raise ValueError(f"runner jobs for {label} must be bytewise sorted")
+        assigned_jobs.extend(names)
+    duplicate_runner_jobs = sorted(
+        name for name in set(assigned_jobs) if assigned_jobs.count(name) != 1
+    )
+    if duplicate_runner_jobs:
+        raise ValueError(
+            f"runner policy assigns jobs more than once: {duplicate_runner_jobs}"
+        )
+    assigned_or_virtual = set(assigned_jobs) | set(non_runner_jobs)
+    if set(assigned_jobs) & set(non_runner_jobs):
+        raise ValueError("a virtual workflow call cannot also have a runner label")
+    if assigned_or_virtual != contracted_jobs:
+        raise ValueError(
+            "runner policy job set mismatch; "
+            f"missing={sorted(contracted_jobs - assigned_or_virtual)}, "
+            f"unexpected={sorted(assigned_or_virtual - contracted_jobs)}"
+        )
+    paths = require_unique_strings(contract.get("policy_paths"), "policy_paths")
+    if paths != sorted(paths):
+        raise ValueError("policy_paths must be bytewise sorted")
+    missing = [path for path in paths if not (ROOT / path).is_file()]
+    if missing:
+        raise ValueError(f"policy paths do not exist: {missing}")
+    tracked_result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+    )
+    if tracked_result.returncode != 0:
+        raise ValueError("cannot enumerate tracked files for the release policy")
+    tracked = {
+        value.decode("utf-8") for value in tracked_result.stdout.split(b"\x00") if value
+    }
+    untracked = sorted(set(paths) - tracked)
+    if untracked:
+        raise ValueError(f"policy paths are not tracked by Git: {untracked}")
+    if ".github/release/candidate-contract.json" not in paths:
+        raise ValueError("candidate contract must include itself in policy_paths")
+    workflow_paths = {
+        path.relative_to(ROOT).as_posix()
+        for suffix in ("*.yml", "*.yaml")
+        for path in (ROOT / ".github" / "workflows").glob(suffix)
+    }
+    referenced_scripts: set[str] = set()
+    for workflow_path in workflow_paths:
+        workflow = (ROOT / workflow_path).read_text(encoding="utf-8")
+        referenced_scripts.update(
+            re.findall(
+                r"(?:\./)?(scripts/[A-Za-z0-9_./-]+\.(?:sh|ps1|py))",
+                workflow,
+            )
+        )
+    all_scripts = {path for path in tracked if path.startswith("scripts/")}
+    local_actions = {path for path in tracked if path.startswith(".github/actions/")}
+    validate_local_action_policy(ROOT, tracked)
+    release_gate_data = {
+        "CHANGELOG.md",
+        "benches/perf/baselines/release-0.7.0.json",
+        "benches/perf/baselines/release-0.9.0-linux.json",
+        "benches/perf/baselines/release-0.9.0.json",
+        "deny.toml",
+        "tests/reference/tmux_compat/divergences.toml",
+        "tests/reference/tmux_compat/error_exit_matrix.yaml",
+        "tests/reference/tmux_compat/frozen_reference.yaml",
+    }
+    uncovered = sorted(
+        (
+            workflow_paths
+            | referenced_scripts
+            | all_scripts
+            | local_actions
+            | release_gate_data
+        )
+        - set(paths)
+    )
+    if uncovered:
+        raise ValueError(
+            f"release policy does not cover workflow-reachable files: {uncovered}"
+        )
+
+
+def validate_windows_coverage() -> None:
+    contract = load(CONTRACT_DIR / "windows-coverage-contract.json")
+    source = ROOT / str(contract.get("source", ""))
+    source_text = source.read_text(encoding="utf-8")
+    source_steps = re.findall(r'^\s*Step "([^"]+)"', source_text, re.MULTILINE)
+    entries = contract.get("steps")
+    if not isinstance(entries, list) or not all(
+        isinstance(entry, dict) for entry in entries
+    ):
+        raise ValueError("Windows coverage steps must be an array of objects")
+    contract_steps = [entry.get("name") for entry in entries]
+    if len(contract_steps) != len(set(contract_steps)):
+        raise ValueError("Windows coverage contract contains duplicate step names")
+    if set(contract_steps) != set(source_steps):
+        missing = sorted(set(source_steps) - set(contract_steps))
+        stale = sorted(set(contract_steps) - set(source_steps))
+        raise ValueError(f"Windows coverage mismatch; missing={missing}, stale={stale}")
+    for entry in entries:
+        if entry.get("proof") not in ALLOWED_WINDOWS_PROOFS:
+            raise ValueError(f"invalid proof for Windows step {entry.get('name')}")
+        if not isinstance(entry.get("evidence"), str) or not entry["evidence"].strip():
+            raise ValueError(f"Windows step {entry.get('name')} has no evidence")
+
+
+def validate_candidate_workflow() -> None:
+    contract = load(CONTRACT_DIR / "candidate-workflow-contract.json")
+    if contract.get("schema_version") != 1:
+        raise ValueError("candidate workflow contract schema_version must be 1")
+    if contract.get("status") != "review-only-not-authoritative":
+        raise ValueError("candidate workflow must remain review-only before cut-over")
+    workflow = contract.get("workflow")
+    if workflow != {
+        "id": 277622540,
+        "name": "CI",
+        "path": ".github/workflows/ci.yml",
+        "event": "workflow_dispatch",
+        "branch": "main",
+        "required_run_attempt": 1,
+    }:
+        raise ValueError("candidate workflow identity drifted")
+    scheduler = contract.get("scheduler")
+    if not isinstance(scheduler, dict):
+        raise ValueError("candidate scheduler policy is missing")
+    if (
+        scheduler.get("concurrency_group") != "rmux-release-candidate"
+        or scheduler.get("cancel_in_progress") is not False
+        or scheduler.get("dispatch_after_fast_success") is not True
+        or scheduler.get("maximum_parallel_jobs") != 14
+        or scheduler.get("maximum_parallel_macos_jobs") != 2
+    ):
+        raise ValueError("candidate scheduler invariants drifted")
+    delta = contract.get("delta")
+    if not isinstance(delta, dict) or delta.get("replays_fast_jobs") is not False:
+        raise ValueError("candidate delta must not replay fast jobs")
+    sections = require_unique_strings(
+        delta.get("review_sections"), "candidate delta review_sections"
+    )
+    if sections != sorted(sections) or sections != ["cli", "perf", "static", "tmux"]:
+        raise ValueError("candidate delta contains a fast-covered review section")
+    if delta.get("tmux_oracle_builds") != 1:
+        raise ValueError("the fast and candidate path must build tmux exactly once")
+    validate_canonical_candidate_policy(contract.get("canonical_builds"))
+    validate_shadow_candidate_policy(contract.get("shadow_sealer"))
+    validate_promotion_candidate_policy(contract.get("publication"))
+
+    ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    delta_workflow = (ROOT / ".github/workflows/release-candidate-delta.yml").read_text(
+        encoding="utf-8"
+    )
+    for required_input in (
+        "fast_run_id:",
+        "expected_source_sha:",
+        "release_intent_id:",
+        "planned_release_ref:",
+        "release_kind:",
+    ):
+        if required_input not in ci:
+            raise ValueError(f"CI candidate route is missing {required_input}")
+    if "uses: ./.github/workflows/release-candidate-delta.yml" not in ci:
+        raise ValueError("CI does not call the release-only delta workflow")
+    if "--retries 0" not in ci:
+        raise ValueError("Windows fast proof must disable Nextest retries")
+    if "workflow_call:" not in delta_workflow or "workflow_dispatch:" in delta_workflow:
+        raise ValueError("release delta must only be reachable through workflow_call")
+    forbidden = ("contents: write", "packages: write", "id-token: write", "secrets:")
+    if any(value in delta_workflow for value in forbidden):
+        raise ValueError("release delta contains a publication capability")
+    if "--evidence-mode candidate-delta" not in delta_workflow:
+        raise ValueError("release delta does not request deduplicated evidence")
+
+
+def validate_channels() -> None:
+    policy = load(CONTRACT_DIR / "channel-policy.json")
+    if policy.get("schema_version") != 1 or policy.get("default_decision") != "deny":
+        raise ValueError("channel policy must be schema v1 and default-deny")
+    kinds = policy.get("release_kinds")
+    if not isinstance(kinds, dict) or set(kinds) != {"shadow", "rc", "stable"}:
+        raise ValueError("channel policy must define exactly shadow, rc, and stable")
+    channel_sets = {
+        kind: set(values) for kind, values in kinds.items() if isinstance(values, dict)
+    }
+    if (
+        len(channel_sets) != 3
+        or len({frozenset(channels) for channels in channel_sets.values()}) != 1
+    ):
+        raise ValueError("every release kind must define the same channel set")
+    if any(value is not False for value in kinds["shadow"].values()):
+        raise ValueError("shadow releases must deny every channel")
+    for channel in IRREVERSIBLE_RC_CHANNELS:
+        if kinds["rc"].get(channel) is not False:
+            raise ValueError(f"RC must deny irreversible channel {channel}")
+    if kinds["rc"].get("snap_candidate") != "explicit_opt_in":
+        raise ValueError("RC Snap candidate must require explicit opt-in")
+    if kinds["stable"].get("snap_candidate") != "explicit_opt_in":
+        raise ValueError("stable Snap candidate must require explicit opt-in")
+    if kinds["stable"].get("snap_stable") is not False:
+        raise ValueError("Snap stable must remain denied pending a support decision")
+    if policy.get("snap_stable_publication") != "denied_until_support_decision":
+        raise ValueError("Snap stable denial must be explicit")
+    if policy.get("downstream_gate") != "publication_receipt_success":
+        raise ValueError(
+            "every downstream channel must gate on the publication receipt"
+        )
+
+
+def validate_schemas() -> None:
+    schema_dir = CONTRACT_DIR / "schemas"
+    expected = {
+        "candidate-manifest.schema.json": {
+            "candidate_run_attempt",
+            "producer",
+            "proofs",
+            "canonical_build_policy",
+            "release_policy",
+            "artifacts",
+        },
+    }
+    for filename, required_fields in expected.items():
+        schema = load(schema_dir / filename)
+        if schema.get("x-rmux-status") != SHADOW_SCHEMA_STATUS:
+            raise ValueError(f"{filename} must remain explicitly non-authoritative")
+        if "MUST NOT authorize" not in schema.get("description", ""):
+            raise ValueError(f"{filename} must state its publication prohibition")
+        if schema.get("additionalProperties") is not False:
+            raise ValueError(f"{filename} must fail closed on unknown fields")
+        required = set(
+            require_unique_strings(schema.get("required"), f"{filename}.required")
+        )
+        missing = required_fields - required
+        if missing:
+            raise ValueError(f"{filename} is missing required fields {sorted(missing)}")
+    validate_promotion_schemas(schema_dir)
+    candidate = load(schema_dir / "candidate-manifest.schema.json")
+    intent_pattern = candidate["properties"]["release_intent_id"].get("pattern")
+    if intent_pattern != "^[A-Za-z0-9._:-]{8,128}$":
+        raise ValueError("release intent IDs must use the canonical ASCII allowlist")
+    if not isinstance(candidate.get("allOf"), list) or len(candidate["allOf"]) < 3:
+        raise ValueError(
+            "candidate schema must bind stable/RC kind and prerelease state"
+        )
+    validate_canonical_schemas(candidate, schema_dir)
+
+
+def validate_measurement_budget() -> None:
+    budget = load(CONTRACT_DIR / "measurement-budget.json")
+    policy = budget.get("percentile_policy")
+    if (
+        not isinstance(policy, dict)
+        or policy.get("minimum_samples_for_percentiles") != 7
+    ):
+        raise ValueError(
+            "measurement percentiles require at least seven comparable samples"
+        )
+    if policy.get("below_minimum_report") != ["raw_values", "median", "maximum"]:
+        raise ValueError("small samples must report raw values, median, and maximum")
+    ceilings = budget.get("initial_ceilings_seconds")
+    if not isinstance(ceilings, dict) or ceilings.get("fast_required_checks") != 600:
+        raise ValueError("fast required checks ceiling must remain ten minutes")
+    if any(not isinstance(value, int) or value <= 0 for value in ceilings.values()):
+        raise ValueError("measurement ceilings must be positive integer seconds")
+    if budget.get("observed_anchor_aggregation") != (
+        "individual-observations-not-percentiles"
+    ):
+        raise ValueError("observed anchors must not be presented as percentiles")
+    pathological = [
+        anchor
+        for anchor in budget.get("observed_anchors", [])
+        if anchor.get("run_id") == 29647419533
+    ]
+    if len(pathological) != 5 or any(
+        anchor.get("run_conclusion") != "failure"
+        or anchor.get("job_conclusion") != "success"
+        or anchor.get("step_name") != "Build rmux"
+        or anchor.get("measurement") != "step_wallclock"
+        for anchor in pathological
+    ):
+        raise ValueError("failed release baseline anchors must disclose their scope")
+
+
+def main() -> int:
+    validate_candidate()
+    validate_candidate_workflow()
+    validate_canonical_build()
+    validate_windows_coverage()
+    validate_channels()
+    validate_schemas()
+    validate_downstream_contracts(ROOT)
+    validate_measurement_budget()
+    validate_repository_contracts(ROOT)
+    print("release-contracts-ok")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
