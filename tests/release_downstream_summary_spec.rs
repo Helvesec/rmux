@@ -283,7 +283,10 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
 
     references['apt_rpm'] = write_reference(root, 'apt_rpm', plan_path, plan, 0)
     value = __import__('json').loads(reference.read_text(encoding='utf-8'))
-    value['state'] = 'prepared'
+    decision = next(item for item in plan['channels'] if item['name'] == 'apt_rpm')['execution_decision']
+    value['state'] = {
+        'denied': 'prepared', 'blocked': 'prepared', 'disarmed': 'blocked'
+    }[decision]
     write_object(reference, value)
     try:
         create_summary(
@@ -294,7 +297,7 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
             created_at='2026-07-20T00:00:40Z',
         )
     except ValueError as error:
-        if 'differs from its exact plan' not in str(error):
+        if 'exact plan' not in str(error):
             raise
     else:
         raise SystemExit('result state contradicting the plan was accepted')
@@ -328,7 +331,10 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
 
     changed = copy.deepcopy(pre)
     apt = next(item for item in changed['results'] if item['channel'] == 'apt_rpm')
-    apt['reference']['state'] = 'prepared'
+    decision = next(item for item in plan['channels'] if item['name'] == 'apt_rpm')['execution_decision']
+    apt['reference']['state'] = {
+        'denied': 'prepared', 'blocked': 'prepared', 'disarmed': 'blocked'
+    }[decision]
     write_object(pre_path, changed)
     try:
         channel_request = None
@@ -345,7 +351,7 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
             requested_at='2026-07-20T00:00:45Z',
         )
     except ValueError as error:
-        if 'differs from its exact plan' not in str(error):
+        if 'exact plan' not in str(error):
             raise
     else:
         raise SystemExit('pre-site summary contradicting the plan was accepted')

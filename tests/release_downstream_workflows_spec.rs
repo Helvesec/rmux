@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DOWNSTREAM: &str = include_str!("../.github/workflows/release-downstream.yml");
 
@@ -309,8 +311,6 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
     assert_eq!(
         web_share["blockers"],
         serde_json::json!([
-            "environment_admin_bypass_enabled",
-            "downstream_writer_app_missing",
             "floating_actions_present",
             "unprotected_secret_deployment_workflow"
         ])
@@ -391,6 +391,11 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
         "../.github/release/downstream-repositories.json"
     ))
     .expect("downstream repository registry");
+    assert_eq!(registry["writer_app"]["configured"], true);
+    assert_eq!(registry["writer_app"]["app_id"], 4352876);
+    assert_eq!(registry["writer_app"]["installation_id"], 147959477);
+    assert_eq!(registry["writer_app"]["repository_selection"], "selected");
+    assert_eq!(registry["writer_app"]["pat_fallback"], false);
     let repositories = registry["repositories"].as_array().expect("repositories");
 
     for key in [
@@ -406,19 +411,18 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
         assert_eq!(repository["branch_protected"], true, "{key}");
         assert_eq!(repository["ruleset_count"], 1, "{key}");
         assert_eq!(repository["environment_count"], 1, "{key}");
-        assert_eq!(repository["activation_ready"], false, "{key}");
         let blockers = repository["blockers"].as_array().expect("blockers");
         assert!(
             blockers
                 .iter()
-                .any(|blocker| blocker == "environment_admin_bypass_enabled"),
-            "{key} lost its environment bypass blocker"
+                .all(|blocker| blocker != "environment_admin_bypass_enabled"),
+            "{key} still reports environment bypass"
         );
         assert!(
             blockers
                 .iter()
-                .any(|blocker| blocker == "downstream_writer_app_missing"),
-            "{key} lost its writer App blocker"
+                .all(|blocker| blocker != "downstream_writer_app_missing"),
+            "{key} still reports a missing writer App"
         );
         assert!(
             blockers
@@ -427,6 +431,28 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
             "{key} still reports missing repository protection"
         );
     }
+
+    for key in ["homebrew-rmux", "rmux-packages", "scoop-rmux"] {
+        let repository = repositories
+            .iter()
+            .find(|repository| repository["key"] == key)
+            .unwrap_or_else(|| panic!("missing downstream repository {key}"));
+        assert_eq!(repository["activation_ready"], true, "{key}");
+        assert_eq!(repository["blockers"], serde_json::json!([]), "{key}");
+    }
+
+    let web_share = repositories
+        .iter()
+        .find(|repository| repository["key"] == "rmux-web-share")
+        .expect("missing downstream repository rmux-web-share");
+    assert_eq!(web_share["activation_ready"], false);
+    assert_eq!(
+        web_share["blockers"],
+        serde_json::json!([
+            "floating_actions_present",
+            "unprotected_secret_deployment_workflow"
+        ])
+    );
 
     let rmux_io = repositories
         .iter()
@@ -440,6 +466,92 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
             "private_repository_protection_unavailable_on_current_plan",
             "manual_site_update_required"
         ])
+    );
+}
+
+#[test]
+fn downstream_repository_verifier_accepts_github_ruleset_arrays() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "rmux-downstream-repository-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).expect("create fixture directory");
+    let write = |name: &str, value: serde_json::Value| {
+        let path = root.join(name);
+        fs::write(&path, serde_json::to_vec(&value).expect("encode fixture"))
+            .expect("write fixture");
+        path
+    };
+    let metadata = write(
+        "metadata.json",
+        serde_json::json!({
+            "id": 1259133629,
+            "full_name": "Helvesec/homebrew-rmux",
+            "visibility": "public",
+            "default_branch": "main",
+            "archived": false
+        }),
+    );
+    let protection = write(
+        "protection.json",
+        serde_json::json!({
+            "enforce_admins": {"enabled": true},
+            "allow_force_pushes": {"enabled": false},
+            "allow_deletions": {"enabled": false},
+            "required_signatures": {"enabled": true}
+        }),
+    );
+    let rulesets = write(
+        "rulesets.json",
+        serde_json::json!([{"enforcement": "active"}]),
+    );
+    let environments = write(
+        "environments.json",
+        serde_json::json!({"environments": [{
+            "name": "release-homebrew-tap",
+            "can_admins_bypass": false,
+            "protection_rules": [{"type": "required_reviewers"}]
+        }]}),
+    );
+    let runners = write("runners.json", serde_json::json!({"total_count": 0}));
+    let installation = write(
+        "installation.json",
+        serde_json::json!({
+            "id": 147959477,
+            "app_id": 4352876,
+            "repository_selection": "selected",
+            "permissions": {"actions": "read", "contents": "write", "metadata": "read"},
+            "events": [],
+            "repository_ids": [1249553407, 1258602064, 1259133629, 1259135161]
+        }),
+    );
+    let output = Command::new("python3")
+        .arg(repo_root().join("scripts/release/verify-downstream-repository.py"))
+        .args(["fixtures", "--repository-key", "homebrew-rmux"])
+        .arg("--metadata")
+        .arg(metadata)
+        .arg("--protection")
+        .arg(protection)
+        .arg("--rulesets")
+        .arg(rulesets)
+        .arg("--environments")
+        .arg(environments)
+        .arg("--runners")
+        .arg(runners)
+        .arg("--installation")
+        .arg(installation)
+        .current_dir(repo_root())
+        .output()
+        .expect("run downstream repository verifier");
+    fs::remove_dir_all(root).expect("remove fixture directory");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
