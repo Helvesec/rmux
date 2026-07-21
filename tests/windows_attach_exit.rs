@@ -877,11 +877,10 @@ fn windows_send_keys_ctrl_d_releases_cmd_timeout() -> Result<(), Box<dyn Error>>
         &label,
         ["send-keys", "-t", target, "timeout /T 10000", "Enter"],
     )?;
-    thread::sleep(Duration::from_millis(500));
-    run_rmux(&binary, &label, ["send-keys", "-t", target, "C-d"])?;
+    wait_for_timeout_countdown_started(&binary, &label, target)?;
 
     let (returned, output) =
-        capture_until_occurrences(&binary, &label, target, prompt, 2, EXIT_TIMEOUT)?;
+        send_ctrl_d_until_cmd_timeout_releases(&binary, &label, target, prompt)?;
     assert!(
         returned,
         "send-keys C-d did not release cmd.exe/timeout.exe; observed output: {}",
@@ -1314,6 +1313,27 @@ fn send_synchronized_ctrl_d_until_cmd_timeout_releases(
     }
 
     Ok((false, last_cmd_output))
+}
+
+fn send_ctrl_d_until_cmd_timeout_releases(
+    binary: &Path,
+    label: &str,
+    target: &str,
+    prompt: &[u8],
+) -> Result<(bool, Vec<u8>), Box<dyn Error>> {
+    let mut last_output = Vec::new();
+
+    for _ in 0..CTRL_D_SYNTHETIC_ATTEMPTS {
+        run_rmux(binary, label, ["send-keys", "-t", target, "C-d"])?;
+        let (returned, output) =
+            capture_until_occurrences(binary, label, target, prompt, 2, Duration::from_secs(2))?;
+        last_output = output;
+        if returned {
+            return Ok((true, last_output));
+        }
+    }
+
+    Ok((false, last_output))
 }
 
 #[test]
