@@ -19,6 +19,12 @@ const ITERATIVE_INPUT_CHAIN_TIMEOUT: Duration = if cfg!(windows) {
     Duration::from_secs(30)
 };
 const BOUNDED_REROUTE_CHAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const BACKGROUND_RUN_SHELL_TIMEOUT: Duration = if cfg!(windows) {
+    // A cold PowerShell process can exceed ten seconds on hosted Windows CI.
+    Duration::from_secs(30)
+} else {
+    Duration::from_secs(10)
+};
 
 async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &str) {
     let response = handler
@@ -3204,7 +3210,7 @@ async fn live_attach_mouse_binding_run_shell_tail_writes_its_file() {
         .await
         .expect("live attach mouse down input");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + BACKGROUND_RUN_SHELL_TIMEOUT;
     loop {
         {
             let state = handler.state.lock().await;
