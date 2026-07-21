@@ -433,7 +433,7 @@ jobs:
       - name: Upload the nonauthoritative simulation record
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: rmux-promotion-simulation-${{ inputs.simulation_id }}
+          name: rmux-promotion-simulation-${{ github.run_id }}
           path: ${{ runner.temp }}/rmux-promotion-simulation/e2e/promotion-simulation-record.json
           if-no-files-found: error
           retention-days: 7
