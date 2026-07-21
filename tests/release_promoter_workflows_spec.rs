@@ -365,6 +365,12 @@ fn promotion_simulation_reports_only_the_work_it_executes() {
 }
 
 #[test]
+fn promotion_simulation_uses_a_portable_unique_artifact_name() {
+    assert!(SIMULATION.contains("name: rmux-promotion-simulation-${{ github.run_id }}"));
+    assert!(!SIMULATION.contains("name: rmux-promotion-simulation-${{ inputs.simulation_id }}"));
+}
+
+#[test]
 fn promotion_simulation_and_publisher_stay_below_the_release_file_budget() {
     assert!(PROMOTION_SIMULATION.lines().count() < 600);
     let publisher = include_str!("../scripts/release/publish-github-release.py");
