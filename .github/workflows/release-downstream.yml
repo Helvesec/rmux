@@ -203,9 +203,18 @@ jobs:
           retention-days: 7
           compression-level: 0
 
+  audit-downstream-authority:
+    name: Audit live downstream repository authority
+    needs: prepare-plan
+    uses: ./.github/workflows/release-downstream-audit.yml
+    permissions:
+      contents: read
+    with:
+      expected_source_sha: ${{ inputs.expected_source_sha }}
+
   prepare-payloads:
     name: Prepare exact downstream payloads
-    needs: prepare-plan
+    needs: [prepare-plan, audit-downstream-authority]
     uses: ./.github/workflows/release-downstream-prepare.yml
     permissions:
       actions: read
@@ -227,7 +236,6 @@ jobs:
     permissions:
       actions: read
       contents: read
-    secrets: inherit
     with:
       receipt_run_id: ${{ inputs.receipt_run_id }}
       payload_artifact_id: ${{ fromJSON(needs.prepare-payloads.outputs.payload_artifact_ids).apt_rpm }}
@@ -245,7 +253,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets: inherit
     with:
       channel: homebrew_tap
       receipt_run_id: ${{ inputs.receipt_run_id }}
@@ -266,7 +273,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets: inherit
     with:
       channel: scoop
       receipt_run_id: ${{ inputs.receipt_run_id }}
@@ -287,7 +293,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets: inherit
     with:
       channel: web_share
       receipt_run_id: ${{ inputs.receipt_run_id }}
@@ -309,7 +314,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets: inherit
     with:
       receipt_run_id: ${{ inputs.receipt_run_id }}
       plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
@@ -353,7 +357,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets: inherit
     with:
       receipt_run_id: ${{ inputs.receipt_run_id }}
       plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
@@ -437,7 +440,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets: inherit
     with:
       receipt_run_id: ${{ inputs.receipt_run_id }}
       plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}
@@ -458,7 +460,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets: inherit
     with:
       receipt_run_id: ${{ inputs.receipt_run_id }}
       plan_artifact_id: ${{ needs.prepare-plan.outputs.plan_artifact_id }}

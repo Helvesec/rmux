@@ -51,7 +51,7 @@ fn retry_entry_point_is_dispatch_only_and_ledger_disarmed() {
     assert_eq!(DISPATCH.matches("permissions: {}").count(), 1);
     assert_eq!(workflow_calls(DISPATCH, "release-chocolatey-retry.yml"), 1);
     assert_eq!(workflow_calls(DISPATCH, "release-snap-retry.yml"), 1);
-    assert_eq!(DISPATCH.matches("secrets: inherit").count(), 2);
+    assert!(!DISPATCH.contains("secrets: inherit"));
     assert!(DISPATCH.contains("inputs.channel == 'chocolatey'"));
     assert!(DISPATCH.contains("inputs.channel == 'snap_candidate'"));
 

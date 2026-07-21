@@ -394,7 +394,9 @@ def main() -> int:
     run_script("promotion-authorization.py", auth_args)
 
     expired_audit = dict(audit)
-    expired_audit["expires_at"] = expired_audit["emitted_at"]
+    expired_at = issued - timedelta(minutes=1)
+    expired_audit["emitted_at"] = render_timestamp(expired_at - timedelta(minutes=5))
+    expired_audit["expires_at"] = render_timestamp(expired_at)
     expired_path = args.output_dir / "expired-policy-audit-reference.json"
     write_object(expired_path, expired_audit)
     expired_args = authorization_arguments(
@@ -409,7 +411,7 @@ def main() -> int:
     run_script(
         "promotion-authorization.py",
         expired_args,
-        rejected_by="policy audit TTL must be positive",
+        rejected_by="policy audit expired before authorization",
     )
 
     assets = args.output_dir / "assets"

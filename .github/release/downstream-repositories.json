@@ -11,6 +11,7 @@
     "pat_fallback": false,
     "required_permissions": {
       "actions": "read",
+      "administration": "read",
       "contents": "write",
       "metadata": "read"
     }

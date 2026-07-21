@@ -96,7 +96,7 @@ manifest = {
     "source_git_sha": source, "fast_run_id": 55,
     "candidate_run_id": run_id, "candidate_run_attempt": 1,
     "release_intent_id": "release:staging:test", "planned_release_ref": "v1.0.0",
-    "release_kind": "stable", "release_version": "1.0.0", "is_prerelease": False,
+    "release_kind": "stable", "release_version": "1.0.0", "package_version": "1.0.0", "is_prerelease": False,
     "release_policy": {"sha256": "b" * 64},
     "created_at": "2026-07-19T00:00:00Z", "expires_at": "2026-07-21T00:00:00Z",
     "artifacts": manifest_platforms,

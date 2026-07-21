@@ -43,7 +43,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets: inherit
     with:
       receipt_run_id: ${{ inputs.receipt_run_id }}
       receipt_run_workflow_id: ${{ inputs.receipt_run_workflow_id }}
@@ -78,7 +77,6 @@ jobs:
       attestations: write
       contents: read
       id-token: write
-    secrets: inherit
     with:
       receipt_run_id: ${{ inputs.receipt_run_id }}
       receipt_run_workflow_id: ${{ inputs.receipt_run_workflow_id }}

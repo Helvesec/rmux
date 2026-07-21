@@ -179,7 +179,7 @@ def stage(args: argparse.Namespace) -> None:
     ):
         raise ValueError("candidate and downstream plan identities differ")
     release_ref = plan["release"]["ref"]
-    version = release_ref.removeprefix("v")
+    version = manifest["package_version"]
     checksums = release_assets / "SHA256SUMS"
     if checksums.is_symlink() or not checksums.is_file():
         raise ValueError("exact release checksums are missing")

@@ -11,7 +11,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-evidence", type=Path)
     parser.add_argument("--mutation-started", action="store_true")
     return parser.parse_args()
+
+
+def package_version(release_ref: str) -> str:
+    if RELEASE_REF.fullmatch(release_ref) is None:
+        raise ValueError("Snap candidate release ref is malformed")
+    release_version = release_ref.removeprefix("v")
+    if "-rc." not in release_version:
+        return release_version
+    version, rc_number = release_version.rsplit("-rc.", maxsplit=1)
+    if not rc_number.isdigit() or rc_number.startswith("0"):
+        raise ValueError("Snap candidate RC number is not canonical")
+    return version
 
 
 def payloads(root: Path, version: str) -> dict[str, Path]:
@@ -114,9 +126,7 @@ def append_outputs(path: Path, values: dict[str, str]) -> None:
 
 
 def execute(args: argparse.Namespace) -> None:
-    if RELEASE_REF.fullmatch(args.release_ref) is None:
-        raise ValueError("Snap candidate release ref is malformed")
-    version = args.release_ref.removeprefix("v")
+    version = package_version(args.release_ref)
     files = payloads(args.payload_dir, version)
     status = exact_status(files, version)
     if args.command == "inspect":
@@ -146,7 +156,10 @@ def execute(args: argparse.Namespace) -> None:
     if not all(status.values()):
         raise ValueError("exact Snap candidate revisions did not become visible")
     observed_at = (
-        datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
     state = "public-live" if args.mutation_started else "no-op-exact"
     external_id = f"snapcraft:rmux@{version}:candidate"

@@ -4,6 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+const GITHUB_REPOSITORY_WRITER: &str =
+    include_str!("../scripts/release/github_repository_writer.py");
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -108,6 +111,14 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
     for architecture in ('amd64', 'arm64'):
         (payload / f'rmux-1.2.3-snap-{architecture}.snap').write_bytes(architecture.encode())
     snap.payloads(payload, '1.2.3')
+    if snap.package_version('v1.2.3-rc.1') != '1.2.3':
+        raise SystemExit('RC Snap payload did not preserve the package version')
+    try:
+        snap.package_version('v1.2.3-rc.01')
+    except ValueError:
+        pass
+    else:
+        raise SystemExit('non-canonical RC Snap ref was accepted')
     (payload / 'extra').mkdir()
     try:
         snap.payloads(payload, '1.2.3')
@@ -188,6 +199,76 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
         pass
     else:
         raise SystemExit('non-object Web Share provenance was accepted')
+"#,
+    );
+}
+
+#[test]
+fn downstream_collector_rejects_repository_scope_and_ruleset_drift() {
+    assert_python(
+        r#"
+import importlib.util
+import sys
+
+sys.path.insert(0, 'scripts/release')
+spec = importlib.util.spec_from_file_location(
+    'collect_downstream_repository',
+    'scripts/release/collect-downstream-repository.py',
+)
+collector = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(collector)
+
+_, repositories = collector.repository_contract()
+
+class Api:
+    def __init__(self, values):
+        self.values = values
+
+    def get(self, path):
+        return self.values[path]
+
+selected = [
+    {'id': item['id'], 'full_name': item['full_name']}
+    for item in repositories
+]
+api = Api({
+    '/installation/repositories?per_page=100': {
+        'total_count': len(selected),
+        'repositories': selected,
+    },
+})
+if collector.exact_installation_repositories(api, repositories) != sorted(
+    item['id'] for item in repositories
+):
+    raise SystemExit('exact downstream repository scope was not preserved')
+
+api.values['/installation/repositories?per_page=100']['repositories'].append({
+    'id': 1,
+    'full_name': 'Helvesec/unexpected',
+})
+api.values['/installation/repositories?per_page=100']['total_count'] += 1
+try:
+    collector.exact_installation_repositories(api, repositories)
+except ValueError:
+    pass
+else:
+    raise SystemExit('expanded downstream repository scope was accepted')
+
+ruleset_api = Api({
+    '/repos/Helvesec/homebrew-rmux/rulesets?per_page=100': [{'id': 42}],
+    '/repos/Helvesec/homebrew-rmux/rulesets/42': {'id': 42},
+})
+if collector.collect_rulesets(ruleset_api, 'Helvesec/homebrew-rmux') != [{'id': 42}]:
+    raise SystemExit('exact downstream ruleset was not collected')
+ruleset_api.values['/repos/Helvesec/homebrew-rmux/rulesets?per_page=100'] = [
+    {'id': '../../installation'}
+]
+try:
+    collector.collect_rulesets(ruleset_api, 'Helvesec/homebrew-rmux')
+except ValueError:
+    pass
+else:
+    raise SystemExit('unsafe downstream ruleset identity was accepted')
 "#,
     );
 }
@@ -276,6 +357,11 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as directory:
 
 #[test]
 fn github_repository_writer_is_atomic_idempotent_and_prefix_exact() {
+    assert!(GITHUB_REPOSITORY_WRITER.contains("createCommitOnBranch"));
+    assert!(GITHUB_REPOSITORY_WRITER.contains("wasSignedByGitHub"));
+    assert!(GITHUB_REPOSITORY_WRITER.contains("verification.get(\"verified\") is not True"));
+    assert!(!GITHUB_REPOSITORY_WRITER.contains("/git/refs/heads/"));
+    assert!(!GITHUB_REPOSITORY_WRITER.contains("f\"/repos/{full_name}/git/commits\""));
     assert_python(
         r#"
 import urllib.parse
@@ -285,13 +371,12 @@ sys.path.insert(0, 'scripts/release')
 from github_repository_writer import publish
 
 class FakeApi:
-    def __init__(self, files):
+    def __init__(self, files, verified=True):
         self.head = '1' * 40
         self.files = dict(files)
-        self.blobs = {}
-        self.trees = {}
         self.commits = {}
         self.posts = 0
+        self.verified = verified
 
     def sha(self):
         self.posts += 1
@@ -301,6 +386,16 @@ class FakeApi:
         if '/git/ref/heads/' in path:
             return {'object': {'type': 'commit', 'sha': self.head}}
         if '/git/commits/' in path:
+            sha = path.rsplit('/', 1)[1]
+            if sha in self.commits:
+                return {
+                    'tree': {'sha': 'f' * 40},
+                    'verification': {
+                        'verified': self.verified,
+                        'reason': 'valid' if self.verified else 'unsigned',
+                        'signature': 'github-signature' if self.verified else None,
+                    },
+                }
             return {'tree': {'sha': 'f' * 40}}
         if '/git/trees/' in path:
             return {
@@ -321,31 +416,42 @@ class FakeApi:
             raise AssertionError('fixture exceeds limit')
         return data
 
-    def post(self, path, payload):
+    def graphql(self, query, variables):
+        if 'createCommitOnBranch' not in query:
+            raise AssertionError('wrong mutation')
+        payload = variables['input']
+        branch = payload['branch']
+        if branch != {
+            'repositoryNameWithOwner': 'Helvesec/rmux-packages',
+            'branchName': 'main',
+        }:
+            raise AssertionError('wrong branch identity')
+        if payload['expectedHeadOid'] != self.head:
+            raise AssertionError('non-atomic branch update')
         sha = self.sha()
-        if path.endswith('/git/blobs'):
-            import base64
-            self.blobs[sha] = base64.b64decode(payload['content'])
-        elif path.endswith('/git/trees'):
-            self.trees[sha] = payload['tree']
-        elif path.endswith('/git/commits'):
-            files = dict(self.files)
-            for entry in self.trees[payload['tree']]:
-                if entry['sha'] is None:
-                    files.pop(entry['path'], None)
-                else:
-                    files[entry['path']] = self.blobs[entry['sha']]
-            self.commits[sha] = files
-        else:
-            raise AssertionError(path)
-        return {'sha': sha}
-
-    def patch(self, path, payload):
-        if payload.get('force') is not False or payload['sha'] not in self.commits:
-            raise AssertionError('non-atomic ref update')
-        self.files = self.commits[payload['sha']]
-        self.head = payload['sha']
-        return {'object': {'sha': self.head}}
+        import base64
+        files = dict(self.files)
+        changes = payload['fileChanges']
+        for entry in changes['deletions']:
+            files.pop(entry['path'], None)
+        for entry in changes['additions']:
+            files[entry['path']] = base64.b64decode(entry['contents'])
+        self.commits[sha] = files
+        self.files = files
+        self.head = sha
+        return {
+            'createCommitOnBranch': {
+                'commit': {
+                    'oid': sha,
+                    'signature': {
+                        'isValid': self.verified,
+                        'state': 'VALID' if self.verified else 'UNSIGNED',
+                        'wasSignedByGitHub': self.verified,
+                    },
+                },
+                'ref': {'target': {'oid': sha}},
+            }
+        }
 
 api = FakeApi({'managed/old.bin': b'old', 'keep.txt': b'keep'})
 base = api.head
@@ -390,6 +496,23 @@ except ValueError:
     pass
 else:
     raise SystemExit('stale repository base was accepted')
+
+unsigned = FakeApi({'managed/old.bin': b'old'}, verified=False)
+try:
+    publish(
+        unsigned,
+        full_name='Helvesec/rmux-packages',
+        branch='main',
+        updates={'managed/new.bin': b'new'},
+        message='unsigned',
+        managed_prefixes=('managed',),
+        expected_base=unsigned.head,
+    )
+except ValueError as error:
+    if 'platform-signed commit' not in str(error):
+        raise
+else:
+    raise SystemExit('unsigned repository commit was accepted')
 "#,
     );
 }

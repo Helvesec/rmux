@@ -110,6 +110,8 @@ def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
     tag_verified = timestamp(signed_tag["verified_at"], "tag verified_at")
     audit_emitted = timestamp(policy_audit["emitted_at"], "policy audit emitted_at")
     audit_expires = timestamp(policy_audit["expires_at"], "policy audit expires_at")
+    if audit_expires <= issued:
+        raise ValueError("policy audit expired before authorization")
     if not (
         candidate_created <= tag_verified <= issued
         and audit_emitted <= issued < audit_expires

@@ -227,6 +227,41 @@ fn candidate_intent_validator_binds_source_version_and_attempt() {
     assert!(payload.contains("\"planned_release_ref\": \"v0.9.0\""));
     fs::remove_file(&output).expect("remove candidate output");
 
+    let rc_output = temp_path("candidate-rc-intent");
+    let rc = Command::new("python3")
+        .args([
+            "scripts/release/validate-candidate-intent.py",
+            "--expected-source-sha",
+            sha,
+            "--actual-source-sha",
+            sha,
+            "--fast-run-id",
+            "29692655372",
+            "--release-intent-id",
+            "release:0.9.0-rc.1:test",
+            "--planned-release-ref",
+            "v0.9.0-rc.1",
+            "--release-kind",
+            "rc",
+            "--github-ref",
+            "refs/heads/main",
+            "--github-run-attempt",
+            "1",
+            "--output",
+        ])
+        .arg(&rc_output)
+        .output()
+        .expect("run RC candidate intent validator");
+    assert!(
+        rc.status.success(),
+        "RC validator failed: {}",
+        String::from_utf8_lossy(&rc.stderr)
+    );
+    let rc_payload = fs::read_to_string(&rc_output).expect("RC candidate output");
+    assert!(rc_payload.contains("\"release_version\": \"0.9.0-rc.1\""));
+    assert!(rc_payload.contains("\"package_version\": \"0.9.0\""));
+    fs::remove_file(&rc_output).expect("remove RC candidate output");
+
     let rejected = Command::new("python3")
         .args([
             "scripts/release/validate-candidate-intent.py",
@@ -252,6 +287,55 @@ fn candidate_intent_validator_binds_source_version_and_attempt() {
         .status()
         .expect("run rejected candidate intent");
     assert!(!rejected.success());
+}
+
+#[test]
+fn candidate_manifest_identity_preserves_rc_and_package_versions() {
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            r#"
+import sys
+sys.path.insert(0, 'scripts/release')
+from candidate_manifest_evidence import validate_intent
+
+base = {
+    'schema_version': 1,
+    'repository_id': 1239918790,
+    'source_git_sha': 'a' * 40,
+    'fast_run_id': 1,
+    'release_intent_id': 'release:0.9.0-rc.1:test',
+    'planned_release_ref': 'v0.9.0-rc.1',
+    'release_kind': 'rc',
+    'release_version': '0.9.0-rc.1',
+    'package_version': '0.9.0',
+    'is_prerelease': True,
+    'candidate_run_attempt': 1,
+}
+validate_intent(base)
+for field, value in (
+    ('package_version', '0.9.0-rc.1'),
+    ('release_version', '0.9.0-rc.01'),
+    ('planned_release_ref', 'v0.9.0'),
+):
+    forged = dict(base)
+    forged[field] = value
+    try:
+        validate_intent(forged)
+    except ValueError:
+        pass
+    else:
+        raise SystemExit(f'forged RC identity was accepted: {field}')
+"#,
+        ])
+        .output()
+        .expect("validate RC candidate manifest identity");
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

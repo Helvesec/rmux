@@ -12,9 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 INTENT_RE = re.compile(r"[A-Za-z0-9._:-]{8,128}")
-VERSION_RE = re.compile(
-    r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?)"
-)
+VERSION_RE = re.compile(r"(?P<version>[0-9]+\.[0-9]+\.[0-9]+)")
 
 
 def workspace_version(repository_root: Path) -> str:
@@ -44,16 +42,19 @@ def validate(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("release intent ID uses characters outside the allowlist")
 
     package_version = workspace_version(args.repository_root.resolve())
-    expected_ref = f"v{package_version}"
-    if args.planned_release_ref != expected_ref:
+    stable_ref = f"v{package_version}"
+    rc_ref = re.fullmatch(
+        rf"{re.escape(stable_ref)}-rc\.([1-9][0-9]*)", args.planned_release_ref
+    )
+    is_rc = rc_ref is not None
+    if args.release_kind == "rc":
+        if not is_rc:
+            raise ValueError(f"an RC release requires {stable_ref}-rc.N")
+    elif args.planned_release_ref != stable_ref:
         raise ValueError(
-            f"planned release ref must be {expected_ref!r} for this source tree"
+            f"{args.release_kind} release ref must be {stable_ref!r} for this source tree"
         )
-    is_rc = "-rc." in package_version
-    if args.release_kind == "stable" and is_rc:
-        raise ValueError("a stable release cannot use an RC package version")
-    if args.release_kind == "rc" and not is_rc:
-        raise ValueError("an RC release requires a -rc.N package version")
+    release_version = args.planned_release_ref.removeprefix("v")
 
     return {
         "schema_version": 1,
@@ -63,7 +64,7 @@ def validate(args: argparse.Namespace) -> dict[str, object]:
         "release_intent_id": args.release_intent_id,
         "planned_release_ref": args.planned_release_ref,
         "release_kind": args.release_kind,
-        "release_version": package_version,
+        "release_version": release_version,
         "package_version": package_version,
         "is_prerelease": is_rc,
         "candidate_run_attempt": args.github_run_attempt,
@@ -78,7 +79,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-run-id", required=True, type=int)
     parser.add_argument("--release-intent-id", required=True)
     parser.add_argument("--planned-release-ref", required=True)
-    parser.add_argument("--release-kind", choices=("shadow", "rc", "stable"), required=True)
+    parser.add_argument(
+        "--release-kind", choices=("shadow", "rc", "stable"), required=True
+    )
     parser.add_argument("--github-ref", required=True)
     parser.add_argument("--github-run-attempt", required=True, type=int)
     parser.add_argument("--output", type=Path, required=True)

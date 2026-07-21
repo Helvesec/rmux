@@ -13,6 +13,7 @@ CONTRACT_PATH = ".github/release/candidate-contract.json"
 POLICY_DOMAIN = b"RMUX-RELEASE-POLICY\x00\x02"
 SHA40 = re.compile(r"[0-9a-f]{40}")
 SHA64 = re.compile(r"[0-9a-f]{64}")
+PACKAGE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 SAFE_PATH = re.compile(r"[A-Za-z0-9._+@=-]+(?:/[A-Za-z0-9._+@=-]+)*")
 PROOF_KEYS = set(
     "schema_version kind repository_id run_id run_attempt source_git_sha "
@@ -141,17 +142,26 @@ def validate_intent(intent: dict[str, Any]) -> None:
     if intent["release_kind"] not in {"shadow", "rc", "stable"}:
         raise ValueError("candidate intent release kind is invalid")
     version = intent["release_version"]
-    if intent["package_version"] != version or intent["planned_release_ref"] != (
-        f"v{version}"
+    package_version = intent["package_version"]
+    if (
+        not isinstance(version, str)
+        or not isinstance(package_version, str)
+        or PACKAGE_VERSION.fullmatch(package_version) is None
+        or intent["planned_release_ref"] != f"v{version}"
     ):
         raise ValueError("candidate intent version fields disagree")
-    is_rc = isinstance(version, str) and "-rc." in version
+    rc_match = re.fullmatch(rf"{re.escape(package_version)}-rc\.([1-9][0-9]*)", version)
+    is_rc = rc_match is not None
+    if version != package_version and not is_rc:
+        raise ValueError("candidate intent release does not identify its package")
     if intent["is_prerelease"] is not is_rc:
         raise ValueError("candidate intent prerelease flag disagrees with its version")
     if intent["release_kind"] == "stable" and is_rc:
         raise ValueError("stable intent cannot carry an RC version")
     if intent["release_kind"] == "rc" and not is_rc:
         raise ValueError("RC intent requires an RC version")
+    if intent["release_kind"] == "shadow" and is_rc:
+        raise ValueError("shadow intent cannot carry an RC version")
 
 
 def encode_field(value: bytes) -> bytes:
