@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/downstream-channel-payload-v1.json",
-  "title": "RMUX disarmed downstream channel payload",
-  "description": "Review-only payload evidence bound to an exact receipt, producer, Actions artifact, and retention deadline. It MUST NOT authorize publication before PR8.",
-  "x-rmux-status": "disarmed-non-authoritative",
+  "title": "RMUX downstream channel payload",
+  "description": "Payload evidence bound to an exact receipt, producer, Actions artifact, retention deadline, and atomic authority state.",
+  "x-rmux-status": "atomic-authority-bound",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -28,9 +28,9 @@
   "properties": {
     "schema_version": {"const": 1},
     "predicate_type": {"const": "https://rmux.io/attestations/release-downstream-channel-payload/v1"},
-    "status": {"const": "disarmed-non-authoritative"},
-    "downstream_authority": {"const": false},
-    "execution_authority": {"const": false},
+    "status": {"enum": ["disarmed-non-authoritative", "downstream-authorized"]},
+    "downstream_authority": {"type": "boolean"},
+    "execution_authority": {"type": "boolean"},
     "repository_id": {"const": 1239918790},
     "source_git_sha": {"$ref": "#/$defs/sha40"},
     "release": {"$ref": "#/$defs/release"},
@@ -49,6 +49,22 @@
       "items": {"$ref": "#/$defs/file"}
     }
   },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "disarmed-non-authoritative"},
+        "downstream_authority": {"const": false},
+        "execution_authority": {"const": false}
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "downstream-authorized"},
+        "downstream_authority": {"const": true},
+        "execution_authority": {"const": true}
+      }
+    }
+  ],
   "$defs": {
     "positive": {"type": "integer", "minimum": 1},
     "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
@@ -82,7 +98,7 @@
         "run_attempt": {"const": 1},
         "workflow_id": {"const": 316435347},
         "workflow_path": {"const": ".github/workflows/release-receipt.yml"},
-        "job_workflow_path": {"const": ".github/workflows/release-downstream.yml"},
+        "job_workflow_path": {"const": ".github/workflows/release-downstream-prepare.yml"},
         "runner_group_id": {"const": 0},
         "runner_group_name": {"const": "GitHub Actions"},
         "runner_image": {"enum": ["ubuntu-22.04", "windows-latest"]}

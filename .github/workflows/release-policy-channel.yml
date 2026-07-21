@@ -1,0 +1,78 @@
+name: Record exact non-executable downstream channel
+
+on:
+  workflow_call:
+    inputs:
+      channel: {required: true, type: string}
+      receipt_run_id: {required: true, type: string}
+      plan_artifact_id: {required: true, type: string}
+      plan_artifact_digest: {required: true, type: string}
+      payload_artifact_id: {required: true, type: string}
+      payload_artifact_digest: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+
+permissions: {}
+
+jobs:
+  record:
+    name: Record policy result ${{ inputs.channel }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    concurrency:
+      group: rmux-channel-${{ inputs.channel }}-${{ inputs.release_ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - id: prepare
+        uses: ./.github/actions/release-channel-prepare
+        with:
+          channel: ${{ inputs.channel }}
+          receipt-run-id: ${{ inputs.receipt_run_id }}
+          plan-artifact-id: ${{ inputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ inputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ inputs.payload_artifact_id }}
+          payload-artifact-digest: ${{ inputs.payload_artifact_digest }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+
+      - id: decision
+        name: Materialize the exact blocked or denied observation
+        shell: bash
+        run: >-
+          scripts/release/channel-execution.py
+          --request "${{ steps.prepare.outputs.request }}"
+          --channel "${{ inputs.channel }}"
+          --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Refuse an executable request in the policy-only worker
+        shell: bash
+        run: test "${{ steps.decision.outputs.execute }}" = false
+
+      - name: Seal exact policy-only channel result evidence
+        uses: ./.github/actions/release-channel-result
+        with:
+          channel: ${{ inputs.channel }}
+          prepared-root: ${{ steps.prepare.outputs.root }}
+          state: ${{ steps.decision.outputs.state }}
+          started-at: ${{ steps.decision.outputs.started_at }}
+          mutation-started: false
+          remote-request-id: ""
+          target-evidence: ${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          producer-workflow-path: .github/workflows/release-policy-channel.yml
+          runner-image: ubuntu-22.04

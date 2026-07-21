@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/downstream-channel-result-reference-v1.json",
-  "title": "RMUX disarmed downstream result reference",
-  "description": "Review-only exact post-upload binding. It MUST NOT authorize publication before PR8.",
-  "x-rmux-status": "disarmed-non-authoritative",
+  "title": "RMUX downstream result reference",
+  "description": "Exact post-upload binding tied to one atomic authority state.",
+  "x-rmux-status": "atomic-authority-bound",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -35,9 +35,9 @@
   ],
   "properties": {
     "schema_version": {"const": 1},
-    "status": {"const": "disarmed-non-authoritative"},
-    "downstream_authority": {"const": false},
-    "execution_authority": {"const": false},
+    "status": {"enum": ["disarmed-non-authoritative", "downstream-authorized"]},
+    "downstream_authority": {"type": "boolean"},
+    "execution_authority": {"type": "boolean"},
     "repository_id": {"const": 1239918790},
     "source_git_sha": {"$ref": "#/$defs/sha40"},
     "release": {"$ref": "#/$defs/release"},
@@ -68,6 +68,22 @@
     "attestation": {"$ref": "#/$defs/result_attestation"},
     "verified_at": {"type": "string", "format": "date-time"}
   },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "disarmed-non-authoritative"},
+        "downstream_authority": {"const": false},
+        "execution_authority": {"const": false}
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "downstream-authorized"},
+        "downstream_authority": {"const": true},
+        "execution_authority": {"type": "boolean"}
+      }
+    }
+  ],
   "$defs": {
     "positive": {"type": "integer", "minimum": 1},
     "sha40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},

@@ -9,12 +9,13 @@ from downstream_channels import (
     CHANNELS,
     REPOSITORY_ID,
     SHA256,
-    STATUS,
     exact_keys,
     file_hash,
     match,
     read_object,
     timestamp,
+    validate_downstream_authority,
+    validate_execution_authority,
     validate_embedded_receipt,
     validate_release,
 )
@@ -89,20 +90,24 @@ def validate_summary(value: dict[str, Any]) -> dict[str, Any]:
         "downstream channel summary",
     )
     phase = value["phase"]
+    downstream_active = validate_downstream_authority(value)
+    execution_active = validate_execution_authority(
+        value, downstream_active=downstream_active
+    )
     if (
         value["schema_version"] != 1
         or phase not in PHASES
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
-        or value["execution_authority"] is not False
         or value["repository_id"] != REPOSITORY_ID
         or value["result_aggregation_ready"] is not True
         or value["aggregation_blockers"] != []
         or value["rmux_io_last"] is not True
         or value["rmux_io_two_phase_ready"] is not True
-        or value["rmux_io_authority"] is not False
     ):
-        raise ValueError("channel summary must remain disarmed and two-phase")
+        raise ValueError("channel summary identity or two-phase contract changed")
+    if type(value["rmux_io_authority"]) is not bool or (
+        value["rmux_io_authority"] and not execution_active
+    ):
+        raise ValueError("rmux.io authority exceeds downstream execution authority")
     source_sha = value["source_git_sha"]
     release = validate_release(value["release"], source_sha)
     receipt = validate_embedded_receipt(value["receipt"], source_sha, release)
@@ -125,6 +130,11 @@ def validate_summary(value: dict[str, Any]) -> dict[str, Any]:
         )
         for channel, item in zip(expected_channels, results, strict=True)
     ]
+    if any(
+        reference["downstream_authority"] is not downstream_active
+        for reference in references
+    ):
+        raise ValueError("channel summary mixes authority states")
     advertised = [
         reference["channel"]
         for reference in references
@@ -170,7 +180,10 @@ def _validate_planned_state(reference: dict[str, Any], planned: dict[str, Any]) 
         raise ValueError("denied channel result differs from its exact plan")
     if decision == "blocked" and state != "blocked":
         raise ValueError("blocked channel result differs from its exact plan")
-    if decision == "disarmed" and state in {"blocked", "denied-by-policy"}:
+    if decision in {"disarmed", "enabled"} and state in {
+        "blocked",
+        "denied-by-policy",
+    }:
         raise ValueError("unblocked channel result contradicts its exact plan")
 
 
@@ -264,9 +277,9 @@ def create_summary(
     value = {
         "schema_version": 1,
         "phase": phase,
-        "status": STATUS,
-        "downstream_authority": False,
-        "execution_authority": False,
+        "status": plan["status"],
+        "downstream_authority": plan["downstream_authority"],
+        "execution_authority": plan["execution_authority"],
         "repository_id": REPOSITORY_ID,
         "source_git_sha": plan["source_git_sha"],
         "release": plan["release"],
@@ -289,7 +302,7 @@ def create_summary(
         ],
         "rmux_io_last": True,
         "rmux_io_two_phase_ready": True,
-        "rmux_io_authority": False,
+        "rmux_io_authority": planned["rmux_io"]["execution_enabled"],
         "pre_site_summary_sha256": parent_digest,
         "created_at": created_at,
     }

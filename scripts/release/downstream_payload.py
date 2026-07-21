@@ -14,25 +14,29 @@ from downstream_channels import (
     RUNNER_IMAGES,
     SAFE_NAME,
     SHA256,
-    STATUS,
     canonical_hash,
     contract_channels,
+    downstream_status,
     exact_keys,
     file_hash,
     match,
     positive,
     read_object,
     timestamp,
+    validate_downstream_authority,
+    validate_execution_authority,
     validate_receipt_reference,
     validate_release,
     write_object,
 )
+from release_authority import load_authority
 
 PREDICATE_TYPE = "https://rmux.io/attestations/release-downstream-channel-payload/v1"
 SUBJECT_NAME = "downstream-channel-payload-subject.json"
 PRODUCER_WORKFLOW_ID = 316435347
 PRODUCER_WORKFLOW_PATH = ".github/workflows/release-receipt.yml"
-PRODUCER_JOB_WORKFLOW_PATH = ".github/workflows/release-downstream.yml"
+DEFAULT_PRODUCER_JOB_WORKFLOW_PATH = ".github/workflows/release-downstream-prepare.yml"
+RMUX_IO_PRODUCER_JOB_WORKFLOW_PATH = ".github/workflows/release-rmux-io-payload.yml"
 
 
 def payload_contract() -> dict[str, Any]:
@@ -51,7 +55,10 @@ def payload_contract() -> dict[str, Any]:
         "producer": {
             "workflow_id": PRODUCER_WORKFLOW_ID,
             "workflow_path": PRODUCER_WORKFLOW_PATH,
-            "job_workflow_path": PRODUCER_JOB_WORKFLOW_PATH,
+            "job_workflow_paths": {
+                "default": DEFAULT_PRODUCER_JOB_WORKFLOW_PATH,
+                "rmux_io": RMUX_IO_PRODUCER_JOB_WORKFLOW_PATH,
+            },
             "required_run_attempt": 1,
         },
         "activation_blockers": [],
@@ -79,13 +86,18 @@ def validate_producer(value: Any, channel: str) -> dict[str, Any]:
         "payload producer",
     )
     positive(value["run_id"], "payload producer run ID")
-    expected_image = "windows-latest" if channel == "chocolatey" else "ubuntu-22.04"
+    expected_image = "ubuntu-22.04"
+    expected_job_workflow_path = (
+        RMUX_IO_PRODUCER_JOB_WORKFLOW_PATH
+        if channel == "rmux_io"
+        else DEFAULT_PRODUCER_JOB_WORKFLOW_PATH
+    )
     if (
         type(value["run_attempt"]) is not int
         or value["run_attempt"] != 1
         or value["workflow_id"] != PRODUCER_WORKFLOW_ID
         or value["workflow_path"] != PRODUCER_WORKFLOW_PATH
-        or value["job_workflow_path"] != PRODUCER_JOB_WORKFLOW_PATH
+        or value["job_workflow_path"] != expected_job_workflow_path
         or type(value["runner_group_id"]) is not int
         or value["runner_group_id"] != 0
         or value["runner_group_name"] != "GitHub Actions"
@@ -224,13 +236,15 @@ def validate_payload_document(
         },
         "channel payload",
     )
+    downstream_active = validate_downstream_authority(value)
+    execution_active = validate_execution_authority(
+        value, downstream_active=downstream_active
+    )
     if (
         type(value["schema_version"]) is not int
         or value["schema_version"] != 1
         or value["predicate_type"] != PREDICATE_TYPE
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
-        or value["execution_authority"] is not False
+        or execution_active is not downstream_active
         or value["repository_id"] != REPOSITORY_ID
         or value["source_git_sha"] != source_sha
         or value["channel"] != channel
@@ -280,10 +294,11 @@ def validate_receipt_predicate(
         raise ValueError("publication receipt predicate digest differs")
     release = predicate.get("release")
     receipt = predicate.get("receipt")
+    reference_active = validate_downstream_authority(reference)
+    predicate_active = validate_downstream_authority(predicate)
     if (
         predicate.get("schema_version") != 1
-        or predicate.get("status") != STATUS
-        or predicate.get("downstream_authority") is not False
+        or predicate_active is not reference_active
         or predicate.get("repository_id") != REPOSITORY_ID
         or predicate.get("source_git_sha") != reference["source_git_sha"]
         or not isinstance(release, dict)
@@ -362,11 +377,70 @@ def collect_files(root: Path, values: list[str] | None) -> list[dict[str, Any]]:
     return files
 
 
+def infer_file_mappings(root: Path, channel: str) -> list[str]:
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("payload root must be one real directory")
+    mappings: list[str] = []
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        name = path.name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("payload root can contain only regular files")
+        role: str | None = None
+        if channel == "apt_rpm":
+            role = (
+                "debian"
+                if name.endswith(".deb")
+                else "rpm"
+                if name.endswith(".rpm")
+                else None
+            )
+        elif channel == "chocolatey" and name.endswith(".nupkg"):
+            role = "chocolatey-package"
+        elif channel == "crates_io" and name.endswith("-crate-package-set.tar"):
+            role = "crate-package-set"
+        elif channel in {"homebrew_core", "homebrew_tap"} and name == "rmux.rb":
+            role = (
+                "homebrew-core-patch"
+                if channel == "homebrew_core"
+                else "homebrew-formula"
+            )
+        elif channel == "rmux_io":
+            if name == "rmux-io-update.json":
+                role = "site-patch"
+            elif name == "pre-site-channel-summary.json":
+                role = "channel-truth-summary"
+        elif channel == "scoop" and name == "rmux.json":
+            role = "scoop-manifest"
+        elif channel == "snap_candidate" and name.endswith(".snap"):
+            if "amd64" in name:
+                role = "snap-amd64"
+            elif "arm64" in name:
+                role = "snap-arm64"
+        elif channel == "snap_stable" and name == "snap-stable-policy.json":
+            role = "policy-decision"
+        elif channel == "web_share":
+            if name.endswith(".tar"):
+                role = "wasm-byte-set"
+            elif name.endswith(".provenance.json"):
+                role = "wasm-provenance"
+        elif channel == "winget" and name.endswith(".yaml"):
+            role = "winget-manifest-set"
+        if role is None:
+            raise ValueError(f"unexpected {channel} payload file: {name}")
+        mappings.append(f"{role}={name}")
+    if not mappings:
+        raise ValueError("inferred payload file set is empty")
+    return mappings
+
+
 def expected_documents(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     reference = read_object(args.receipt_reference, "publication receipt reference")
     validate_receipt_reference(reference)
+    authority = load_authority()
+    if reference["downstream_authority"] is not authority.active:
+        raise ValueError("payload receipt differs from the activation ledger")
     predicate_path = args.receipt_predicate.resolve(strict=True)
     predicate = read_object(predicate_path, "publication receipt predicate")
     validate_receipt_predicate(predicate, reference, predicate_path)
@@ -387,7 +461,13 @@ def expected_documents(
     ):
         raise ValueError("payload artifact API identity differs from its producer")
     release = reference["release"]
-    files = collect_files(args.payload_dir.resolve(strict=True), args.file)
+    payload_root = args.payload_dir.resolve(strict=True)
+    mappings = args.file
+    if args.infer_files:
+        if mappings is not None:
+            raise ValueError("explicit and inferred payload mappings are exclusive")
+        mappings = infer_file_mappings(payload_root, args.channel)
+    files = collect_files(payload_root, mappings)
     candidate = predicate["candidate"]
     source_evidence = {
         "receipt_predicate_sha256": reference["predicate_sha256"],
@@ -409,9 +489,9 @@ def expected_documents(
     payload = {
         "schema_version": 1,
         "predicate_type": PREDICATE_TYPE,
-        "status": STATUS,
-        "downstream_authority": False,
-        "execution_authority": False,
+        "status": downstream_status(authority.active),
+        "downstream_authority": authority.active,
+        "execution_authority": authority.active,
         "repository_id": REPOSITORY_ID,
         "source_git_sha": reference["source_git_sha"],
         "release": release,
@@ -464,6 +544,7 @@ def parse_args() -> argparse.Namespace:
         )
         command.add_argument("--payload-dir", type=Path, required=True)
         command.add_argument("--file", action="append")
+        command.add_argument("--infer-files", action="store_true")
         command.add_argument("--created-at", required=True)
         if name == "create":
             command.add_argument("--output", type=Path, required=True)

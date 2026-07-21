@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -73,6 +74,8 @@ def verify_run_identity(args: argparse.Namespace) -> None:
         args.expected_event,
         args.expected_head_branch,
     )
+    if args.allow_running_current_run and all(value is None for value in expected):
+        raise ValueError("running artifact verification requires exact run identity")
     if all(value is None for value in expected):
         return
     if any(value is None for value in expected):
@@ -92,8 +95,6 @@ def verify_run_identity(args: argparse.Namespace) -> None:
         "run_attempt": 1,
         "head_sha": args.expected_source_sha,
         "head_branch": args.expected_head_branch,
-        "status": "completed",
-        "conclusion": "success",
     }
     for field, value in wanted.items():
         if run.get(field) != value:
@@ -103,6 +104,25 @@ def verify_run_identity(args: argparse.Namespace) -> None:
         or run.get("head_repository", {}).get("id") != REPOSITORY_ID
     ):
         raise ValueError("workflow run repository identity mismatch")
+    if args.allow_running_current_run:
+        current_run = os.environ.get("GITHUB_RUN_ID")
+        current_attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
+        if current_run != str(args.run_id) or current_attempt != "1":
+            raise ValueError(
+                "running artifact verification is not the current attempt-1 run"
+            )
+        if (
+            os.environ.get("GITHUB_SHA") != args.expected_source_sha
+            or os.environ.get("GITHUB_REF_NAME") != args.expected_head_branch
+            or os.environ.get("GITHUB_EVENT_NAME") != args.expected_event
+        ):
+            raise ValueError(
+                "running artifact verification differs from the current context"
+            )
+        if run.get("status") != "in_progress" or run.get("conclusion") is not None:
+            raise ValueError("current workflow run is not actively in progress")
+    elif run.get("status") != "completed" or run.get("conclusion") != "success":
+        raise ValueError("workflow run is not completed successfully")
 
 
 def load_artifacts(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -216,6 +236,7 @@ def parse_args() -> argparse.Namespace:
             "--expected-event", choices=("workflow_call", "workflow_dispatch")
         )
         command.add_argument("--expected-head-branch")
+        command.add_argument("--allow-running-current-run", action="store_true")
         command.add_argument("--include-retention", action="store_true")
         if name in {"resolve-id", "verify"}:
             command.add_argument("--artifact-id", type=int, required=True)

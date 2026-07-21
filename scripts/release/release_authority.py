@@ -22,6 +22,7 @@ DISARMED_STATUS = "disarmed"
 ACTIVE_STATUS = "active"
 DISARMED_EVIDENCE_STATUS = "disarmed-non-authoritative"
 ACTIVE_EVIDENCE_STATUS = "authorized"
+DOWNSTREAM_AUTHORIZED_STATUS = "downstream-authorized"
 
 
 @dataclass(frozen=True)
@@ -85,3 +86,29 @@ def load_authority(path: Path = DEFAULT_LEDGER) -> ReleaseAuthority:
     if not isinstance(value, dict):
         raise ValueError("release activation ledger must be an object")
     return validate_activation(value)
+
+
+def evidence_status(active: bool, active_status: str) -> str:
+    if type(active) is not bool or not active_status:
+        raise ValueError("evidence authority inputs are invalid")
+    return active_status if active else DISARMED_EVIDENCE_STATUS
+
+
+def validate_evidence_authority(
+    value: dict[str, Any],
+    *,
+    authority_fields: Iterable[str],
+    active_status: str,
+) -> bool:
+    fields = tuple(authority_fields)
+    if not fields or any(field not in value for field in fields):
+        raise ValueError("evidence authority fields are incomplete")
+    authorities = [value[field] for field in fields]
+    if any(type(authority) is not bool for authority in authorities):
+        raise ValueError("evidence authority fields must be boolean")
+    if len(set(authorities)) != 1:
+        raise ValueError("evidence authority fields disagree")
+    active = authorities[0]
+    if value.get("status") != evidence_status(active, active_status):
+        raise ValueError("evidence status and authority disagree")
+    return active

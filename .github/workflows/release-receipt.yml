@@ -407,7 +407,10 @@ jobs:
     uses: ./.github/workflows/release-downstream.yml
     permissions:
       actions: read
+      attestations: write
       contents: read
+      id-token: write
+    secrets: inherit
     with:
       receipt_run_id: ${{ github.run_id }}
       receipt_run_workflow_id: ${{ inputs.receipt_workflow_id }}

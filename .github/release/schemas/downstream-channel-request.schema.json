@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/downstream-channel-request-v1.json",
-  "title": "RMUX disarmed downstream channel request",
-  "description": "Review-only request bound to an exact receipt, target, and payload set. It MUST NOT authorize publication before PR8.",
-  "x-rmux-status": "disarmed-non-authoritative",
+  "title": "RMUX downstream channel request",
+  "description": "Request bound to an exact receipt, target, payload set, and atomic authority state.",
+  "x-rmux-status": "atomic-authority-bound",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -17,6 +17,7 @@
     "release",
     "receipt",
     "plan_sha256",
+    "plan_entry",
     "channel",
     "operation",
     "retry_depth",
@@ -33,15 +34,16 @@
   ],
   "properties": {
     "schema_version": {"const": 1},
-    "status": {"const": "disarmed-non-authoritative"},
-    "downstream_authority": {"const": false},
-    "execution_authority": {"const": false},
-    "execution_enabled": {"const": false},
+    "status": {"enum": ["disarmed-non-authoritative", "downstream-authorized"]},
+    "downstream_authority": {"type": "boolean"},
+    "execution_authority": {"type": "boolean"},
+    "execution_enabled": {"type": "boolean"},
     "repository_id": {"const": 1239918790},
     "source_git_sha": {"$ref": "#/$defs/sha40"},
     "release": {"$ref": "#/$defs/release"},
     "receipt": {"$ref": "#/$defs/receipt"},
     "plan_sha256": {"$ref": "#/$defs/sha256"},
+    "plan_entry": {"$ref": "#/$defs/plan_entry"},
     "channel": {"$ref": "#/$defs/channel"},
     "operation": {"enum": ["initial", "retry"]},
     "retry_depth": {"type": "integer", "minimum": 0, "maximum": 1},
@@ -81,6 +83,28 @@
     "requested_at": {"type": "string", "format": "date-time"},
     "expires_at": {"type": "string", "format": "date-time"}
   },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "disarmed-non-authoritative"},
+        "downstream_authority": {"const": false},
+        "execution_authority": {"const": false},
+        "execution_enabled": {"const": false}
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "downstream-authorized"},
+        "downstream_authority": {"const": true},
+        "execution_authority": {"type": "boolean"},
+        "execution_enabled": {"type": "boolean"}
+      },
+      "oneOf": [
+        {"properties": {"execution_authority": {"const": false}, "execution_enabled": {"const": false}}},
+        {"properties": {"execution_authority": {"const": true}, "execution_enabled": {"const": true}}}
+      ]
+    }
+  ],
   "allOf": [
     {
       "if": {"properties": {"operation": {"const": "initial"}}, "required": ["operation"]},
@@ -126,6 +150,23 @@
     "safe_name": {"type": "string", "pattern": "^[A-Za-z0-9._+@=-]+$"},
     "channel": {
       "enum": ["apt_rpm", "chocolatey", "crates_io", "homebrew_core", "homebrew_tap", "rmux_io", "scoop", "snap_candidate", "snap_stable", "web_share", "winget"]
+    },
+    "plan_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "phase", "policy_decision", "explicit_opt_in", "execution_decision", "execution_enabled", "payload_ready", "payload_roles", "depends_on", "blockers"],
+      "properties": {
+        "name": {"$ref": "#/$defs/channel"},
+        "phase": {"type": "integer", "minimum": 1, "maximum": 3},
+        "policy_decision": {"enum": ["allow", "deny", "explicit-opt-in"]},
+        "explicit_opt_in": {"type": "boolean"},
+        "execution_decision": {"enum": ["blocked", "denied", "disarmed", "enabled"]},
+        "execution_enabled": {"type": "boolean"},
+        "payload_ready": {"type": "boolean"},
+        "payload_roles": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9-]+$"}},
+        "depends_on": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/channel"}},
+        "blockers": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9_]+$"}}
+      }
     },
     "release": {
       "type": "object",

@@ -1,0 +1,112 @@
+name: Prepare exact manual rmux.io handoff
+
+on:
+  workflow_call:
+    inputs:
+      receipt_run_id: {required: true, type: string}
+      plan_artifact_id: {required: true, type: string}
+      plan_artifact_digest: {required: true, type: string}
+      pre_site_artifact_id: {required: true, type: string}
+      pre_site_artifact_digest: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+    outputs:
+      payload_artifact_id:
+        value: ${{ jobs.prepare.outputs.payload_artifact_id }}
+      payload_artifact_digest:
+        value: ${{ jobs.prepare.outputs.payload_artifact_digest }}
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: Prepare exact manual site handoff
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      payload_artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      payload_artifact_digest: sha256:${{ steps.upload.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - name: Verify exact plan and pre-site summary artifacts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
+          test "$GITHUB_REPOSITORY_ID" = "1239918790"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          scripts/release/assert-release-capability.py downstream_channels
+          scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}" \
+            --artifact-id "${{ inputs.plan_artifact_id }}" \
+            --name "rmux-downstream-plan-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}" \
+            --expected-source-sha "${{ inputs.expected_source_sha }}" \
+            --expected-digest "${{ inputs.plan_artifact_digest }}" \
+            --expected-workflow-id 316435347 \
+            --expected-workflow-path .github/workflows/release-receipt.yml \
+            --expected-event workflow_dispatch --expected-head-branch "${{ inputs.release_ref }}" \
+            --allow-running-current-run --max-attempts 1
+          scripts/release/actions-artifact.py verify \
+            --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}" \
+            --artifact-id "${{ inputs.pre_site_artifact_id }}" \
+            --name "rmux-downstream-pre-site-summary-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}" \
+            --expected-source-sha "${{ inputs.expected_source_sha }}" \
+            --expected-digest "${{ inputs.pre_site_artifact_digest }}" \
+            --expected-workflow-id 316435347 \
+            --expected-workflow-path .github/workflows/release-receipt.yml \
+            --expected-event workflow_dispatch --expected-head-branch "${{ inputs.release_ref }}" \
+            --allow-running-current-run --max-attempts 1
+
+      - name: Download only the exact plan artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.plan_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-io-handoff/plan
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - name: Download only the exact pre-site summary artifact ID
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.pre_site_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-io-handoff/pre-site
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - name: Materialize the exact manual site handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/verify-exact-file-set.py --root "$RUNNER_TEMP/rmux-io-handoff/plan" \
+            --file downstream-channel-plan.json \
+            --file publication-receipt-predicate.json --file receipt-reference.json
+          scripts/release/verify-exact-file-set.py --root "$RUNNER_TEMP/rmux-io-handoff/pre-site" \
+            --file pre-site-channel-summary.json
+          scripts/release/stage-rmux-io-payload.py \
+            --plan "$RUNNER_TEMP/rmux-io-handoff/plan/downstream-channel-plan.json" \
+            --pre-site-summary "$RUNNER_TEMP/rmux-io-handoff/pre-site/pre-site-channel-summary.json" \
+            --output-dir "$RUNNER_TEMP/rmux-io-handoff/payload"
+
+      - id: upload
+        name: Upload the exact manual site handoff
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-downstream-rmux_io-payload-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}
+          path: ${{ runner.temp }}/rmux-io-handoff/payload
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

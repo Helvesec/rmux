@@ -1,0 +1,152 @@
+name: Publish exact signed Linux repositories
+
+on:
+  workflow_call:
+    inputs:
+      receipt_run_id: {required: true, type: string}
+      plan_artifact_id: {required: true, type: string}
+      plan_artifact_digest: {required: true, type: string}
+      payload_artifact_id: {required: true, type: string}
+      payload_artifact_digest: {required: true, type: string}
+      repository_artifact_id: {required: true, type: string}
+      repository_artifact_digest: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      release_id: {required: true, type: string}
+      release_ref: {required: true, type: string}
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish exact APT and RPM repository trees
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    environment: release-publication
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    concurrency:
+      group: rmux-channel-apt-rpm-${{ inputs.release_ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - id: prepare
+        uses: ./.github/actions/release-channel-prepare
+        with:
+          channel: apt_rpm
+          receipt-run-id: ${{ inputs.receipt_run_id }}
+          plan-artifact-id: ${{ inputs.plan_artifact_id }}
+          plan-artifact-digest: ${{ inputs.plan_artifact_digest }}
+          payload-artifact-id: ${{ inputs.payload_artifact_id }}
+          payload-artifact-digest: ${{ inputs.payload_artifact_digest }}
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+
+      - id: decision
+        name: Resolve exact Linux repository execution authority
+        shell: bash
+        run: >-
+          scripts/release/channel-execution.py
+          --request "${{ steps.prepare.outputs.request }}" --channel apt_rpm
+          --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify exact signed repository artifact identity
+        if: steps.decision.outputs.execute == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/release/actions-artifact.py verify
+          --repository "$GITHUB_REPOSITORY" --run-id "${{ inputs.receipt_run_id }}"
+          --artifact-id "${{ inputs.repository_artifact_id }}"
+          --name "rmux-downstream-apt_rpm-signed-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}"
+          --expected-source-sha "${{ inputs.expected_source_sha }}"
+          --expected-digest "${{ inputs.repository_artifact_digest }}"
+          --expected-workflow-id 316435347
+          --expected-workflow-path .github/workflows/release-receipt.yml
+          --expected-event workflow_dispatch --expected-head-branch "${{ inputs.release_ref }}"
+          --allow-running-current-run --max-attempts 1
+
+      - name: Download only the exact signed repository artifact ID
+        if: steps.decision.outputs.execute == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ inputs.repository_artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/rmux-linux-repository/publish
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.receipt_run_id }}
+
+      - id: app
+        name: Mint a repository-scoped package writer token
+        if: steps.decision.outputs.execute == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ vars.RMUX_DOWNSTREAM_APP_ID }}
+          private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
+          owner: Helvesec
+          repositories: rmux-packages
+          permission-actions: read
+          permission-contents: write
+
+      - id: writer
+        name: Publish and reread exact signed repository bytes
+        if: steps.decision.outputs.execute == 'true'
+        shell: bash
+        env:
+          RMUX_DOWNSTREAM_TOKEN: ${{ steps.app.outputs.token }}
+        run: >-
+          scripts/release/publish-linux-repository.py
+          --repository-dir "$RUNNER_TEMP/rmux-linux-repository/publish"
+          --source-sha "${{ inputs.expected_source_sha }}"
+          --release-ref "${{ inputs.release_ref }}"
+          --target-evidence "${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json"
+          --github-output "$GITHUB_OUTPUT"
+
+      - id: outcome
+        name: Normalize executable and policy-only outcomes
+        shell: bash
+        env:
+          RMUX_EXECUTE: ${{ steps.decision.outputs.execute }}
+          RMUX_EXECUTED_STATE: ${{ steps.writer.outputs.state }}
+          RMUX_BLOCKED_STATE: ${{ steps.decision.outputs.state }}
+          RMUX_EXECUTED_MUTATION: ${{ steps.writer.outputs.mutation_started }}
+          RMUX_BLOCKED_MUTATION: ${{ steps.decision.outputs.mutation_started }}
+          RMUX_EXECUTED_REMOTE_ID: ${{ steps.writer.outputs.remote_request_id }}
+          RMUX_BLOCKED_REMOTE_ID: ${{ steps.decision.outputs.remote_request_id }}
+        run: |
+          set -euo pipefail
+          if [ "$RMUX_EXECUTE" = true ]; then
+            state="$RMUX_EXECUTED_STATE"; mutation="$RMUX_EXECUTED_MUTATION"; remote_id="$RMUX_EXECUTED_REMOTE_ID"
+          else
+            state="$RMUX_BLOCKED_STATE"; mutation="$RMUX_BLOCKED_MUTATION"; remote_id="$RMUX_BLOCKED_REMOTE_ID"
+          fi
+          test -n "$state" && [[ "$mutation" =~ ^(true|false)$ ]]
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "mutation_started=$mutation" >> "$GITHUB_OUTPUT"
+          echo "remote_request_id=$remote_id" >> "$GITHUB_OUTPUT"
+
+      - name: Seal exact Linux repository result evidence
+        uses: ./.github/actions/release-channel-result
+        with:
+          channel: apt_rpm
+          prepared-root: ${{ steps.prepare.outputs.root }}
+          state: ${{ steps.outcome.outputs.state }}
+          started-at: ${{ steps.decision.outputs.started_at }}
+          mutation-started: ${{ steps.outcome.outputs.mutation_started }}
+          remote-request-id: ${{ steps.outcome.outputs.remote_request_id }}
+          target-evidence: ${{ steps.prepare.outputs.root }}/downstream-channel-target-evidence.json
+          source-sha: ${{ inputs.expected_source_sha }}
+          release-id: ${{ inputs.release_id }}
+          release-ref: ${{ inputs.release_ref }}
+          producer-workflow-path: .github/workflows/release-linux-repository-publish.yml
+          runner-image: ubuntu-22.04

@@ -33,6 +33,7 @@ REMOTE_MUTATION_STATES = {"submitted", "pending-moderation", "public-live"}
 NO_MUTATION_STATES = {"blocked", "denied-by-policy", "prepared"}
 OBSERVED_TARGET_STATES = REMOTE_MUTATION_STATES | {"no-op-exact"}
 RETRYABLE_STATES = {"prepared", "failed-transient"}
+RESULT_PRODUCER_WORKFLOW_ID = 316435347
 
 
 def result_state(value: Any) -> str:
@@ -65,7 +66,11 @@ def validate_producer(value: Any, channel: str) -> dict[str, Any]:
         "channel result producer",
     )
     positive(value["run_id"], "result run ID")
-    positive(value["workflow_id"], "result workflow ID")
+    if (
+        positive(value["workflow_id"], "result workflow ID")
+        != RESULT_PRODUCER_WORKFLOW_ID
+    ):
+        raise ValueError("result producer workflow ID changed")
     workflows = _result_contract().get("producer_workflows", {}).get(channel)
     if not isinstance(workflows, list) or value["workflow_path"] not in workflows:
         raise ValueError("result producer workflow is not allowlisted for its channel")
@@ -89,7 +94,9 @@ def validate_mutation_state(
         raise ValueError("mutation_started must be boolean")
     if remote_request_id is not None:
         match(remote_request_id, SAFE_EXTERNAL_ID, "remote request ID")
-    if state in NO_MUTATION_STATES and (mutation_started or remote_request_id is not None):
+    if state in NO_MUTATION_STATES and (
+        mutation_started or remote_request_id is not None
+    ):
         raise ValueError(f"{state} cannot claim a remote mutation")
     if state in REMOTE_MUTATION_STATES and (
         not mutation_started or remote_request_id is None
@@ -115,7 +122,9 @@ def validate_retryable_previous(value: dict[str, Any]) -> None:
         raise ValueError("previous result is not safely retryable without mutation")
 
 
-def validate_remote_identity(target_evidence: dict[str, Any], remote_request_id: Any) -> None:
+def validate_remote_identity(
+    target_evidence: dict[str, Any], remote_request_id: Any
+) -> None:
     if target_evidence.get("external_id") != remote_request_id:
         raise ValueError("target evidence and remote mutation identity differ")
 

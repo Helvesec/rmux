@@ -12,7 +12,6 @@ from downstream_channels import (
     DIGEST,
     REPOSITORY_ID,
     SHA256,
-    STATUS,
     canonical_hash,
     exact_keys,
     file_hash,
@@ -125,13 +124,10 @@ def expected_request(args: argparse.Namespace) -> dict[str, Any]:
     )
     if entry is None:
         raise ValueError("requested channel is absent from the exact plan")
-    if (
-        entry["execution_decision"] != "disarmed"
-        or entry["execution_enabled"] is not False
-        or entry["blockers"] != []
-        or entry["payload_ready"] is not True
-    ):
-        raise ValueError("channel is not an exact blocker-free disarmed request")
+    authority_active = plan["downstream_authority"]
+    execution_active = entry["execution_decision"] == "enabled"
+    if entry["execution_enabled"] is not execution_active:
+        raise ValueError("channel plan entry execution fields disagree")
     payload = read_object(args.payload_artifact, "channel payload artifact")
     validate_payload(payload, args.channel, plan["source_git_sha"])
     requested = timestamp(args.requested_at, "request requested_at")
@@ -178,6 +174,7 @@ def expected_request(args: argparse.Namespace) -> dict[str, Any]:
             ("release", plan["release"]),
             ("receipt", plan["receipt"]),
             ("plan_sha256", file_hash(plan_path)),
+            ("plan_entry", entry),
             ("channel", args.channel),
             ("idempotency_key", idempotency_key),
             ("payload_artifact", payload),
@@ -189,15 +186,16 @@ def expected_request(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError(f"retry changed exact original field {field}")
     value = {
         "schema_version": 1,
-        "status": STATUS,
-        "downstream_authority": False,
-        "execution_authority": False,
-        "execution_enabled": False,
+        "status": plan["status"],
+        "downstream_authority": authority_active,
+        "execution_authority": execution_active,
+        "execution_enabled": execution_active,
         "repository_id": REPOSITORY_ID,
         "source_git_sha": plan["source_git_sha"],
         "release": plan["release"],
         "receipt": plan["receipt"],
         "plan_sha256": file_hash(plan_path),
+        "plan_entry": entry,
         "channel": args.channel,
         "operation": args.operation,
         "retry_depth": retry_depth,

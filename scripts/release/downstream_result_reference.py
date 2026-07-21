@@ -10,7 +10,6 @@ from downstream_channels import (
     REPOSITORY_ID,
     SHA40,
     SHA256,
-    STATUS,
     exact_keys,
     file_hash,
     match,
@@ -19,7 +18,9 @@ from downstream_channels import (
     target_for_channel,
     timestamp,
     validate_artifact,
+    validate_downstream_authority,
     validate_embedded_receipt,
+    validate_execution_authority,
     validate_release,
     validate_request,
     write_object,
@@ -95,14 +96,12 @@ def _artifact_reference(
 
 def validate_reference(value: dict[str, Any]) -> dict[str, Any]:
     exact_keys(value, REFERENCE_KEYS, "channel result reference")
-    if (
-        value["schema_version"] != 1
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
-        or value["execution_authority"] is not False
-        or value["repository_id"] != REPOSITORY_ID
-    ):
-        raise ValueError("channel result reference must remain disarmed")
+    downstream_active = validate_downstream_authority(value)
+    execution_active = validate_execution_authority(
+        value, downstream_active=downstream_active
+    )
+    if value["schema_version"] != 1 or value["repository_id"] != REPOSITORY_ID:
+        raise ValueError("channel result reference identity changed")
     source_sha = match(value["source_git_sha"], SHA40, "result reference source SHA")
     release = validate_release(value["release"], source_sha)
     validate_embedded_receipt(value["receipt"], source_sha, release)
@@ -123,6 +122,11 @@ def validate_reference(value: dict[str, Any]) -> dict[str, Any]:
         "result reference idempotency digest",
     )
     state = result_state(value["state"])
+    if (
+        state not in {"blocked", "denied-by-policy", "prepared"}
+        and not execution_active
+    ):
+        raise ValueError("channel result reference lacks execution authority")
     validate_mutation_state(
         state, value["mutation_started"], value["remote_request_id"]
     )
@@ -224,9 +228,9 @@ def create_reference(
         raise ValueError("result reference predates its exact envelope")
     value = {
         "schema_version": 1,
-        "status": STATUS,
-        "downstream_authority": False,
-        "execution_authority": False,
+        "status": predicate["status"],
+        "downstream_authority": predicate["downstream_authority"],
+        "execution_authority": predicate["execution_authority"],
         "repository_id": REPOSITORY_ID,
         "source_git_sha": source_sha,
         "release": release,

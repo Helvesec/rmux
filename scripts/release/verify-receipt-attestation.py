@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from strict_json import read_json_object
+from release_authority import (
+    DOWNSTREAM_AUTHORIZED_STATUS,
+    validate_evidence_authority,
+)
 
 
 REPOSITORY = "Helvesec/rmux"
@@ -54,13 +58,16 @@ def verify(args: argparse.Namespace) -> None:
     if RELEASE_REF.fullmatch(args.release_ref) is None:
         raise ValueError("receipt release ref is invalid")
     predicate = read_object(predicate_path, "receipt predicate")
+    validate_evidence_authority(
+        predicate,
+        authority_fields=("downstream_authority",),
+        active_status=DOWNSTREAM_AUTHORIZED_STATUS,
+    )
     if (
         predicate.get("predicate_type") != PREDICATE_TYPE
         or predicate.get("repository_id") != 1239918790
         or predicate.get("source_git_sha") != args.source_sha
         or predicate.get("release", {}).get("ref") != args.release_ref
-        or predicate.get("status") != "disarmed-non-authoritative"
-        or predicate.get("downstream_authority") is not False
     ):
         raise ValueError("receipt predicate identity or authority changed")
     command = [
@@ -99,7 +106,9 @@ def verify(args: argparse.Namespace) -> None:
     try:
         output = json.loads(result.stdout.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("receipt attestation verification output is invalid") from error
+        raise ValueError(
+            "receipt attestation verification output is invalid"
+        ) from error
     if not isinstance(output, list) or len(output) != 1:
         raise ValueError("exactly one receipt attestation must verify")
     verification = output[0].get("verificationResult")

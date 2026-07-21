@@ -1,0 +1,20 @@
+/debian/dists/*
+  Cache-Control: public, max-age=300
+
+/debian/rmux.asc
+  Cache-Control: public, max-age=3600
+
+/debian/pool/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/rpm/repodata/*
+  Cache-Control: public, max-age=300
+
+/rpm/RPM-GPG-KEY-rmux
+  Cache-Control: public, max-age=3600
+
+/rpm/rmux.repo
+  Cache-Control: public, max-age=300
+
+/rpm/*.rpm
+  Cache-Control: public, max-age=31536000, immutable

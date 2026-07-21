@@ -65,14 +65,30 @@ API_GETS = (
     ),
     ("release_environment", "/repos/Helvesec/rmux/environments/release"),
     (
+        "release_environment_policies",
+        "/repos/Helvesec/rmux/environments/release/deployment-branch-policies?per_page=100&page=1",
+    ),
+    (
         "release_policy_audit",
         "/repos/Helvesec/rmux/environments/release-policy-audit",
+    ),
+    (
+        "release_policy_audit_policies",
+        "/repos/Helvesec/rmux/environments/release-policy-audit/deployment-branch-policies?per_page=100&page=1",
     ),
     (
         "release_publication",
         "/repos/Helvesec/rmux/environments/release-publication",
     ),
+    (
+        "release_publication_policies",
+        "/repos/Helvesec/rmux/environments/release-publication/deployment-branch-policies?per_page=100&page=1",
+    ),
     ("release_tagging", "/repos/Helvesec/rmux/environments/release-tagging"),
+    (
+        "release_tagging_policies",
+        "/repos/Helvesec/rmux/environments/release-tagging/deployment-branch-policies?per_page=100&page=1",
+    ),
     ("repository", "/repositories/1239918790"),
     (
         "self_hosted_runners",
@@ -84,6 +100,8 @@ API_GETS = (
         "/repos/Helvesec/rmux/rulesets/18792083",
     ),
 )
+
+
 def read_object(path: Path, label: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -277,7 +295,9 @@ def validate_repository_contracts(root: Path) -> None:
         "PAT_TOKEN",
     ):
         if authority in workflow:
-            raise ValueError(f"policy audit preparer gained forbidden authority {authority}")
+            raise ValueError(
+                f"policy audit preparer gained forbidden authority {authority}"
+            )
     caller_paths: list[str] = []
     for candidate in sorted((root / ".github" / "workflows").glob("*.y*ml")):
         if candidate == workflow_path:
@@ -316,9 +336,9 @@ def validate_repository_contracts(root: Path) -> None:
     promote = (root / ".github/workflows/release-promote.yml").read_text(
         encoding="utf-8"
     )
-    simulation = (root / ".github/workflows/release-promotion-simulation.yml").read_text(
-        encoding="utf-8"
-    )
+    simulation = (
+        root / ".github/workflows/release-promotion-simulation.yml"
+    ).read_text(encoding="utf-8")
     promote_prepare = _job_block(promote, "prepare-policy-audit", "policy-audit")
     promote_audit = _job_block(promote, "policy-audit", "authorize-promotion")
     simulation_prepare = _job_block(simulation, "prepare-policy-audit", "policy-audit")
@@ -354,8 +374,13 @@ def validate_repository_contracts(root: Path) -> None:
         if any(marker not in audit for marker in required_audit):
             raise ValueError(f"privileged audit boundary changed in {caller_name}")
         if "secrets: inherit" in prepare or "secrets: inherit" in audit:
-            raise ValueError(f"policy audit secret inheritance appeared in {caller_name}")
-    if "if: ${{ false }}" not in promote_prepare or "if: ${{ false }}" not in promote_audit:
+            raise ValueError(
+                f"policy audit secret inheritance appeared in {caller_name}"
+            )
+    if (
+        "if: ${{ false }}" not in promote_prepare
+        or "if: ${{ false }}" not in promote_audit
+    ):
         raise ValueError("release promoter policy audit must remain disabled")
     if (
         "on:\n  workflow_dispatch:" not in simulation
@@ -371,7 +396,9 @@ def validate_repository_contracts(root: Path) -> None:
         "attestations: write",
     ):
         if authority in simulation:
-            raise ValueError(f"release simulation gained forbidden authority {authority}")
+            raise ValueError(
+                f"release simulation gained forbidden authority {authority}"
+            )
     activation_schema = read_object(
         release / "schemas" / "release-activation.schema.json",
         "release-activation.schema.json",

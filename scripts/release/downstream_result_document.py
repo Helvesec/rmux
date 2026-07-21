@@ -13,7 +13,6 @@ from downstream_channels import (
     RESULT_PREDICATE_TYPE,
     SHA40,
     SHA256,
-    STATUS,
     canonical_file_hash,
     exact_keys,
     file_hash,
@@ -21,7 +20,9 @@ from downstream_channels import (
     target_for_channel,
     timestamp,
     validate_artifact,
+    validate_downstream_authority,
     validate_embedded_receipt,
+    validate_execution_authority,
     validate_release,
     validate_request,
 )
@@ -71,15 +72,16 @@ def validate_predicate(
         raise ValueError("exact request document cannot be a symlink")
     request_path = request_path.resolve(strict=True)
     exact_keys(value, PREDICATE_KEYS, "channel result predicate")
+    downstream_active = validate_downstream_authority(value)
+    execution_active = validate_execution_authority(
+        value, downstream_active=downstream_active
+    )
     if (
         value["schema_version"] != 1
         or value["predicate_type"] != RESULT_PREDICATE_TYPE
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
-        or value["execution_authority"] is not False
         or value["repository_id"] != REPOSITORY_ID
     ):
-        raise ValueError("channel result predicate must remain disarmed")
+        raise ValueError("channel result predicate identity changed")
     source_sha = match(value["source_git_sha"], SHA40, "result source SHA")
     release = validate_release(value["release"], source_sha)
     validate_embedded_receipt(value["receipt"], source_sha, release)
@@ -97,6 +99,11 @@ def validate_predicate(
     if value["target"] != expected_target:
         raise ValueError("result target differs from the pinned channel target")
     state = result_state(value["state"])
+    if (
+        state not in {"blocked", "denied-by-policy", "prepared"}
+        and not execution_active
+    ):
+        raise ValueError("channel mutation result lacks execution authority")
     subject = value["subject"]
     if not isinstance(subject, dict):
         raise ValueError("channel result subject must be an object")
@@ -137,6 +144,11 @@ def validate_predicate(
     for field, expected_value in expected.items():
         if value[field] != expected_value:
             raise ValueError(f"result changed exact request field {field}")
+    if (
+        downstream_active is not request["downstream_authority"]
+        or execution_active is not request["execution_authority"]
+    ):
+        raise ValueError("result authority differs from its exact request")
     request_started = timestamp(request["requested_at"], "request requested_at")
     request_expires = timestamp(request["expires_at"], "request expires_at")
     if not request_started <= started <= request_expires:
@@ -170,15 +182,16 @@ def validate_envelope(
         },
         "channel result envelope",
     )
+    downstream_active = validate_downstream_authority(value)
+    execution_active = validate_execution_authority(
+        value, downstream_active=downstream_active
+    )
     if (
         value["schema_version"] != 1
         or value["envelope_type"] != RESULT_ENVELOPE_TYPE
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
-        or value["execution_authority"] is not False
         or value["repository_id"] != REPOSITORY_ID
     ):
-        raise ValueError("channel result envelope must remain disarmed")
+        raise ValueError("channel result envelope identity changed")
     match(value["request_sha256"], SHA256, "envelope request digest")
     match(value["predicate_sha256"], SHA256, "envelope predicate digest")
     validate_artifact(value["result_bundle"], "result bundle")
@@ -214,4 +227,9 @@ def validate_envelope(
         for field, expected_value in expected.items():
             if value[field] != expected_value:
                 raise ValueError(f"result envelope changed exact field {field}")
+        if (
+            downstream_active is not predicate["downstream_authority"]
+            or execution_active is not predicate["execution_authority"]
+        ):
+            raise ValueError("result envelope authority differs from its predicate")
     return value

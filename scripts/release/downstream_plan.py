@@ -10,13 +10,14 @@ from downstream_channels import (
     CHANNEL_POLICY,
     REPOSITORY_ID,
     SHA40,
-    STATUS,
     exact_keys,
     file_hash,
     load_contract,
     match,
     read_object,
     timestamp,
+    validate_downstream_authority,
+    validate_execution_authority,
     validate_embedded_receipt,
     validate_release,
 )
@@ -48,7 +49,7 @@ def _policy() -> dict[str, Any]:
 
 
 def expected_channel_entries(
-    release_kind: str, snap_candidate_opt_in: bool
+    release_kind: str, snap_candidate_opt_in: bool, *, authority_active: bool = False
 ) -> list[dict[str, Any]]:
     if release_kind not in {"rc", "stable"}:
         raise ValueError("downstream plan release kind must be rc or stable")
@@ -86,7 +87,8 @@ def expected_channel_entries(
         elif contracted["payload_ready"] is not True or blockers:
             execution_decision = "blocked"
         else:
-            execution_decision = "disarmed"
+            execution_decision = "enabled" if authority_active else "disarmed"
+        execution_enabled = execution_decision == "enabled"
         result.append(
             {
                 "name": channel,
@@ -94,7 +96,7 @@ def expected_channel_entries(
                 "policy_decision": decision,
                 "explicit_opt_in": opted_in,
                 "execution_decision": execution_decision,
-                "execution_enabled": False,
+                "execution_enabled": execution_enabled,
                 "payload_ready": contracted["payload_ready"],
                 "payload_roles": contracted["payload_roles"],
                 "depends_on": (
@@ -129,25 +131,26 @@ def validate_plan(value: dict[str, Any]) -> dict[str, Any]:
         },
         "downstream plan",
     )
+    downstream_active = validate_downstream_authority(value)
+    execution_active = validate_execution_authority(
+        value,
+        downstream_active=downstream_active,
+        include_enabled=True,
+    )
     if (
         value["schema_version"] != 1
-        or value["status"] != STATUS
-        or value["downstream_authority"] is not False
-        or value["execution_authority"] is not False
-        or value["execution_enabled"] is not False
+        or execution_active is not downstream_active
         or value["repository_id"] != REPOSITORY_ID
         or value["channel_count"] != len(CHANNELS)
     ):
-        raise ValueError("downstream plan must remain exactly disarmed")
+        raise ValueError("downstream plan authority or identity changed")
     source_sha = match(value["source_git_sha"], SHA40, "plan source SHA")
     release = validate_release(value["release"], source_sha)
     receipt = validate_embedded_receipt(value["receipt"], source_sha, release)
     channel_policy = value["channel_policy"]
     if not isinstance(channel_policy, dict):
         raise ValueError("plan channel policy must be an object")
-    exact_keys(
-        channel_policy, {"path", "schema_version", "sha256"}, "channel policy"
-    )
+    exact_keys(channel_policy, {"path", "schema_version", "sha256"}, "channel policy")
     if channel_policy != {
         "path": ".github/release/channel-policy.json",
         "schema_version": 1,
@@ -158,7 +161,9 @@ def validate_plan(value: dict[str, Any]) -> dict[str, Any]:
     if created < timestamp(receipt["verified_at"], "receipt verified_at"):
         raise ValueError("downstream plan predates its receipt")
     expected = expected_channel_entries(
-        release["kind"], value["snap_candidate_opt_in"]
+        release["kind"],
+        value["snap_candidate_opt_in"],
+        authority_active=downstream_active,
     )
     if value["channels"] != expected:
         raise ValueError("downstream plan entries differ from policy and contract")

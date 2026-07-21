@@ -11,7 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from policy_audit_contract import API_GETS, AUDIT_WORKFLOW_STATE_KEYS
-from policy_audit_live_state import normalize_environment, normalize_workflow
+from policy_audit_live_state import (
+    normalize_environment,
+    normalize_main,
+    normalize_ruleset,
+    normalize_workflow,
+)
 
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
@@ -86,75 +91,6 @@ def render_timestamp(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _enabled(value: dict[str, Any], field: str) -> bool:
-    item = value.get(field)
-    if not isinstance(item, dict) or type(item.get("enabled")) is not bool:
-        raise ValueError(f"branch protection {field} state is unavailable")
-    return item["enabled"]
-
-
-def _normalize_ruleset(value: dict[str, Any], *, immutable: bool) -> dict[str, Any]:
-    conditions = value.get("conditions", {}).get("ref_name", {})
-    rules = value.get("rules")
-    if not isinstance(rules, list):
-        raise ValueError("ruleset rules must be an array")
-    normalized: dict[str, Any] = {
-        "id": value.get("id"),
-        "name": value.get("name"),
-        "target": value.get("target"),
-        "enforcement": value.get("enforcement"),
-        "exclude": sorted(conditions.get("exclude", [])),
-        "include": sorted(conditions.get("include", [])),
-        "rules": sorted(item.get("type") for item in rules if isinstance(item, dict)),
-    }
-    bypass = value.get("bypass_actors")
-    if not isinstance(bypass, list):
-        raise ValueError("ruleset bypass actors must be an array")
-    if immutable:
-        normalized["bypass_actor_count"] = len(bypass)
-    else:
-        if len(bypass) != 1 or not isinstance(bypass[0], dict):
-            raise ValueError("tag creation ruleset needs exactly one bypass actor")
-        normalized.update(
-            {
-                "bypass_actor_id": bypass[0].get("actor_id"),
-                "bypass_actor_type": bypass[0].get("actor_type"),
-                "bypass_mode": bypass[0].get("bypass_mode"),
-            }
-        )
-    return normalized
-
-
-def _normalize_required_checks(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, dict):
-        raise ValueError("required status checks are unavailable")
-    contexts = value.get("contexts")
-    checks = value.get("checks")
-    if not isinstance(contexts, list) or not all(
-        isinstance(context, str) and context for context in contexts
-    ):
-        raise ValueError("required status check contexts are unavailable")
-    if not isinstance(checks, list):
-        raise ValueError("required status check App bindings are unavailable")
-    normalized: list[dict[str, Any]] = []
-    for check in checks:
-        if not isinstance(check, dict):
-            raise ValueError("required status check App binding is invalid")
-        context = check.get("context")
-        app_id = check.get("app_id")
-        if not isinstance(context, str) or not context:
-            raise ValueError("required status check context is invalid")
-        if type(app_id) is not int or app_id <= 0:
-            raise ValueError("required status check app_id must be positive")
-        normalized.append({"context": context, "app_id": app_id})
-    names = [check["context"] for check in normalized]
-    if len(names) != len(set(names)):
-        raise ValueError("required status check contexts must be unique")
-    if sorted(contexts) != sorted(names):
-        raise ValueError("required status check contexts and App bindings differ")
-    return sorted(normalized, key=lambda check: check["context"])
-
-
 def normalize_state(
     responses: dict[str, dict[str, Any]],
     contract: dict[str, Any],
@@ -178,21 +114,7 @@ def normalize_state(
         ),
     }
     branch = responses["branch_protection"]
-    required_status_checks = branch.get("required_status_checks")
-    required_checks = _normalize_required_checks(required_status_checks)
-    reviews = branch.get("required_pull_request_reviews")
-    review_count = (
-        0 if reviews is None else reviews.get("required_approving_review_count")
-    )
-    normalized_main = {
-        "enforce_admins": _enabled(branch, "enforce_admins"),
-        "strict": required_status_checks.get("strict"),
-        "required_checks": required_checks,
-        "required_approving_review_count": review_count,
-        "required_signatures": _enabled(branch, "required_signatures"),
-        "allow_force_pushes": _enabled(branch, "allow_force_pushes"),
-        "allow_deletions": _enabled(branch, "allow_deletions"),
-    }
+    normalized_main = normalize_main(branch)
     runners = responses["self_hosted_runners"]
     if runners.get("runners") != []:
         raise ValueError("self-hosted runner inventory must be empty")
@@ -244,21 +166,31 @@ def normalize_state(
     state = {
         "repository": normalized_repository,
         "main": normalized_main,
-        "tag_creation_ruleset": _normalize_ruleset(
+        "tag_creation_ruleset": normalize_ruleset(
             responses["tag_creation_ruleset"], immutable=False
         ),
-        "tag_immutability_ruleset": _normalize_ruleset(
+        "tag_immutability_ruleset": normalize_ruleset(
             responses["tag_immutability_ruleset"], immutable=True
         ),
-        "release": normalize_environment(responses["release_environment"], "release"),
+        "release": normalize_environment(
+            responses["release_environment"],
+            responses["release_environment_policies"],
+            "release",
+        ),
         "release_policy_audit": normalize_environment(
-            responses["release_policy_audit"], "release-policy-audit"
+            responses["release_policy_audit"],
+            responses["release_policy_audit_policies"],
+            "release-policy-audit",
         ),
         "release_publication": normalize_environment(
-            responses["release_publication"], "release-publication"
+            responses["release_publication"],
+            responses["release_publication_policies"],
+            "release-publication",
         ),
         "release_tagging": normalize_environment(
-            responses["release_tagging"], "release-tagging"
+            responses["release_tagging"],
+            responses["release_tagging_policies"],
+            "release-tagging",
         ),
         "immutable_releases": responses["immutable_releases"],
         "self_hosted_runners": {"total_count": runners.get("total_count")},

@@ -716,6 +716,45 @@ fn actions_artifact_binding_rejects_digest_or_run_drift() {
     assert!(!forged_origin.status.success());
     assert!(String::from_utf8_lossy(&forged_origin.stderr)
         .contains("workflow run workflow_id mismatch"));
+    let mut running_run: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&run_path).expect("read forged fixture"))
+            .expect("parse forged fixture");
+    running_run["workflow_id"] = serde_json::json!(316223904);
+    running_run["status"] = serde_json::json!("in_progress");
+    running_run["conclusion"] = serde_json::Value::Null;
+    fs::write(&run_path, running_run.to_string()).expect("write running fixture");
+    let running = Command::new(python())
+        .arg(&script)
+        .args(strict_args)
+        .arg("--allow-running-current-run")
+        .env("GITHUB_RUN_ID", "77")
+        .env("GITHUB_RUN_ATTEMPT", "1")
+        .env("GITHUB_SHA", source)
+        .env("GITHUB_REF_NAME", "main")
+        .env("GITHUB_EVENT_NAME", "workflow_dispatch")
+        .current_dir(repo_root())
+        .output()
+        .expect("verify current running artifact");
+    assert!(
+        running.status.success(),
+        "{}",
+        String::from_utf8_lossy(&running.stderr)
+    );
+    let wrong_current_run = Command::new(python())
+        .arg(&script)
+        .args(strict_args)
+        .arg("--allow-running-current-run")
+        .env("GITHUB_RUN_ID", "78")
+        .env("GITHUB_RUN_ATTEMPT", "1")
+        .env("GITHUB_SHA", source)
+        .env("GITHUB_REF_NAME", "main")
+        .env("GITHUB_EVENT_NAME", "workflow_dispatch")
+        .current_dir(repo_root())
+        .output()
+        .expect("reject another running artifact");
+    assert!(!wrong_current_run.status.success());
+    assert!(String::from_utf8_lossy(&wrong_current_run.stderr)
+        .contains("not the current attempt-1 run"));
     let rejected = run(
         &script,
         &[

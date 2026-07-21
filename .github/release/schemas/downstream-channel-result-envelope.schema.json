@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://rmux.io/schemas/downstream-channel-result-envelope-v1.json",
-  "title": "RMUX disarmed downstream result envelope",
-  "description": "Review-only post-upload binding. It MUST NOT authorize publication before PR8 and never refers to its own upload.",
-  "x-rmux-status": "disarmed-non-authoritative",
+  "title": "RMUX downstream result envelope",
+  "description": "Authority-bound post-upload evidence that never refers to its own upload.",
+  "x-rmux-status": "atomic-authority-bound",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -25,9 +25,9 @@
   "properties": {
     "schema_version": {"const": 1},
     "envelope_type": {"const": "https://rmux.io/envelopes/release-downstream-channel-result/v1"},
-    "status": {"const": "disarmed-non-authoritative"},
-    "downstream_authority": {"const": false},
-    "execution_authority": {"const": false},
+    "status": {"enum": ["disarmed-non-authoritative", "downstream-authorized"]},
+    "downstream_authority": {"type": "boolean"},
+    "execution_authority": {"type": "boolean"},
     "repository_id": {"const": 1239918790},
     "source_git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "release_ref": {"type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:-rc\\.[0-9]+)?$"},
@@ -70,5 +70,21 @@
       }
     },
     "created_at": {"type": "string", "format": "date-time"}
-  }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "status": {"const": "disarmed-non-authoritative"},
+        "downstream_authority": {"const": false},
+        "execution_authority": {"const": false}
+      }
+    },
+    {
+      "properties": {
+        "status": {"const": "downstream-authorized"},
+        "downstream_authority": {"const": true},
+        "execution_authority": {"type": "boolean"}
+      }
+    }
+  ]
 }

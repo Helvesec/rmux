@@ -315,13 +315,19 @@ expected_contexts = [check["context"] for check in expected_checks]
 def environment(environment_id):
     return {
         "id": environment_id, "can_admins_bypass": False,
-        "deployment_branch_policy": {"protected_branches": True, "custom_branch_policies": False},
+        "deployment_branch_policy": {"protected_branches": False, "custom_branch_policies": True},
         "protection_rules": [
             {"type": "required_reviewers", "prevent_self_review": False,
              "reviewers": [{"type": "User", "reviewer": {"id": 876824, "login": "shideneyu"}}]},
             {"type": "branch_policy"},
         ],
     }
+
+def environment_policies():
+    return {"total_count": 2, "branch_policies": [
+        {"id": 1, "name": "main", "type": "branch"},
+        {"id": 2, "name": "v*", "type": "tag"},
+    ]}
 
 responses = {
     "repository": {
@@ -354,9 +360,13 @@ responses = {
         "rules": [{"type": "update"}, {"type": "deletion"}], "bypass_actors": [],
     },
     "release_environment": environment(16229050415),
+    "release_environment_policies": environment_policies(),
     "release_policy_audit": environment(18412850020),
+    "release_policy_audit_policies": environment_policies(),
     "release_publication": environment(18412849790),
+    "release_publication_policies": environment_policies(),
     "release_tagging": environment(18400330964),
+    "release_tagging_policies": environment_policies(),
     "immutable_releases": {"enabled": True, "enforced_by_owner": True},
     "self_hosted_runners": {"total_count": 0, "runners": []},
     "audit_app": {
@@ -531,6 +541,7 @@ reject_response("release_environment", lambda v: v.update(can_admins_bypass=True
 reject_response("release_policy_audit", lambda v: v.update(can_admins_bypass=True), "release_policy_audit differs")
 reject_response("release_publication", lambda v: v.update(can_admins_bypass=True), "release_publication differs")
 reject_response("release_tagging", lambda v: v.update(can_admins_bypass=True), "release_tagging differs")
+reject_response("release_environment_policies", lambda v: v["branch_policies"][1].update(name="attacker/*"), "release differs")
 reject_response("self_hosted_runners", lambda v: v.update(total_count=1, runners=[{"id": 1}]), "inventory must be empty")
 reject_response("audit_app", lambda v: v.update(id=1), "action identity differs")
 reject_response("audit_app", lambda v: v["owner"].update(login="attacker"), "owner changed")
