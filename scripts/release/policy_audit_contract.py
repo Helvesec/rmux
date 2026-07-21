@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -26,6 +27,20 @@ AUDIT_WORKFLOW_STATE_KEYS = {
     ".github/workflows/release-promotion-simulation.yml": "policy_simulation_workflow",
 }
 GITHUB_ACTIONS_APP_ID = 15368
+POLICY_BUNDLE_PATHS = (
+    ".github/release/policy-audit-contract.json",
+    ".github/release/release-activation.json",
+    ".github/release/schemas/policy-audit-predicate.schema.json",
+    ".github/release/schemas/policy-audit-reference.schema.json",
+    ".rmux-policy-audit/release-policy-root.json",
+    "scripts/release/actions-artifact.py",
+    "scripts/release/github_actions.py",
+    "scripts/release/policy-audit.py",
+    "scripts/release/policy_audit_contract.py",
+    "scripts/release/policy_audit_live_state.py",
+    "scripts/release/policy_audit_model.py",
+    "scripts/release/release_authority.py",
+)
 REQUIRED_CHECK_CONTEXTS = (
     "Cross-target Windows build check",
     "Linux SDK v1 daemon smoke",
@@ -240,6 +255,63 @@ def _job_block(workflow: str, name: str, next_name: str) -> str:
     return workflow.split(marker, 1)[1].split(next_marker, 1)[0]
 
 
+def _policy_bundle_paths(workflow: str) -> tuple[str, ...]:
+    step_marker = "      - id: bundle\n"
+    path_marker = "          path: |\n"
+    end_marker = "          if-no-files-found: error\n"
+    if workflow.count(step_marker) != 1:
+        raise ValueError("policy audit bundle step boundary changed")
+    step = workflow.split(step_marker, 1)[1].split("\n      - ", 1)[0]
+    if step.count(path_marker) != 1 or step.count(end_marker) != 1:
+        raise ValueError("policy audit bundle path boundary changed")
+    block = step.split(path_marker, 1)[1].split(end_marker, 1)[0]
+    paths: list[str] = []
+    for line in block.splitlines():
+        if not line.startswith("            "):
+            raise ValueError("policy audit bundle path indentation changed")
+        path = line.strip()
+        if not path or path in paths:
+            raise ValueError("policy audit bundle contains an empty or duplicate path")
+        paths.append(path)
+    return tuple(paths)
+
+
+def _validate_policy_bundle_imports(root: Path, paths: tuple[str, ...]) -> None:
+    bundled_python = {
+        path
+        for path in paths
+        if path.startswith("scripts/release/") and path.endswith(".py")
+    }
+    local_modules = {
+        candidate.stem: candidate.relative_to(root).as_posix()
+        for candidate in (root / "scripts" / "release").glob("*.py")
+        if candidate.stem.isidentifier()
+    }
+    for relative_path in sorted(bundled_python):
+        source_path = root / relative_path
+        try:
+            tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, SyntaxError) as error:
+            raise ValueError(
+                f"policy audit bundle Python source is invalid: {relative_path}"
+            ) from error
+        imported_modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.update(
+                    alias.name.split(".", 1)[0] for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported_modules.add(node.module.split(".", 1)[0])
+        for module in sorted(imported_modules & local_modules.keys()):
+            dependency = local_modules[module]
+            if dependency not in bundled_python:
+                raise ValueError(
+                    f"policy audit bundle omits local import {dependency} "
+                    f"required by {relative_path}"
+                )
+
+
 def validate_repository_contracts(root: Path) -> None:
     release = root / ".github" / "release"
     activation = read_object(release / "release-activation.json", "activation ledger")
@@ -264,6 +336,10 @@ def validate_repository_contracts(root: Path) -> None:
         raise ValueError("candidate workflow policy audit binding changed")
     workflow_path = root / PREPARER_WORKFLOW_PATH
     workflow = workflow_path.read_text(encoding="utf-8")
+    bundle_paths = _policy_bundle_paths(workflow)
+    if bundle_paths != POLICY_BUNDLE_PATHS:
+        raise ValueError("policy audit bundle differs from the exact path allowlist")
+    _validate_policy_bundle_imports(root, bundle_paths)
     if "on:\n  workflow_call:" not in workflow:
         raise ValueError("policy audit must remain workflow_call-only")
     for trigger in (

@@ -36,6 +36,7 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
         action.contains("actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349")
     );
     assert!(workflow.contains("scripts/release/policy-root.py"));
+    assert!(workflow.contains("scripts/release/release_authority.py"));
     assert!(workflow.contains("--expected-workflow-id 316223904"));
     assert!(workflow.contains("candidate manifest SHA-256 differs"));
     for permission in [

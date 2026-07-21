@@ -244,6 +244,7 @@ jobs:
             scripts/release/policy_audit_contract.py
             scripts/release/policy_audit_live_state.py
             scripts/release/policy_audit_model.py
+            scripts/release/release_authority.py
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
