@@ -53,7 +53,9 @@ jobs:
             rmux-web-share
             scoop-rmux
           permission-actions: read
-          permission-administration: read
+          # GitHub only returns ruleset bypass_actors with write access.
+          # The collector remains GET-only and receives no contents write token.
+          permission-administration: write
           permission-contents: read
 
       - name: Collect and verify live downstream authority

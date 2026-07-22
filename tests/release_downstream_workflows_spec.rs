@@ -180,9 +180,9 @@ fn downstream_authority_is_rechecked_live_before_payload_staging() {
     assert!(DOWNSTREAM_AUDIT.contains("on:\n  workflow_call:"));
     assert!(DOWNSTREAM_AUDIT.contains("  workflow_dispatch:"));
     assert!(DOWNSTREAM_AUDIT.contains("environment: release-publication"));
-    assert!(DOWNSTREAM_AUDIT.contains("permission-administration: read"));
+    assert!(DOWNSTREAM_AUDIT.contains("permission-administration: write"));
     assert!(DOWNSTREAM_AUDIT.contains("permission-contents: read"));
-    assert!(!DOWNSTREAM_AUDIT.contains("permission-administration: write"));
+    assert!(!DOWNSTREAM_AUDIT.contains("permission-administration: read"));
     assert!(!DOWNSTREAM_AUDIT.contains("permission-contents: write"));
     assert!(!DOWNSTREAM_AUDIT.contains("secrets: inherit"));
     assert!(DOWNSTREAM_AUDIT.contains("collect-downstream-repository.py"));
@@ -519,7 +519,7 @@ fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
     assert_eq!(registry["writer_app"]["pat_fallback"], false);
     assert_eq!(
         registry["writer_app"]["required_permissions"]["administration"],
-        "read"
+        "write"
     );
     let repositories = registry["repositories"].as_array().expect("repositories");
 
@@ -646,7 +646,7 @@ fn downstream_repository_verifier_accepts_github_ruleset_arrays() {
             "id": 147959477,
             "app_id": 4352876,
             "repository_selection": "selected",
-            "permissions": {"actions": "read", "administration": "read", "contents": "write", "metadata": "read"},
+            "permissions": {"actions": "read", "administration": "write", "contents": "write", "metadata": "read"},
             "events": [],
             "repository_ids": [1249553407, 1258602064, 1259133629, 1259135161]
         }),

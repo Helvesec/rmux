@@ -335,7 +335,7 @@ def _validate_repositories(release: Path) -> None:
         "pat_fallback": False,
         "required_permissions": {
             "actions": "read",
-            "administration": "read",
+            "administration": "write",
             "contents": "write",
             "metadata": "read",
         },

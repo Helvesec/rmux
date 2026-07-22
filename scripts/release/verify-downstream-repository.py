@@ -28,7 +28,7 @@ WRITER_APP = {
     "pat_fallback": False,
     "required_permissions": {
         "actions": "read",
-        "administration": "read",
+        "administration": "write",
         "contents": "write",
         "metadata": "read",
     },
