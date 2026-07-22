@@ -7,13 +7,16 @@ use rmux_core::events::{
 };
 use rmux_proto::{
     ErrorResponse, PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse,
-    PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
+    PaneOutputEvent, PaneOutputKeyframe, PaneOutputLagNotice, PaneOutputLagResponse,
+    PaneOutputRecoveryRequest, PaneOutputRecoveryResponse, PaneOutputSubscriptionId,
     PaneOutputSubscriptionStart, PaneRecentOutput, PaneTarget, PaneTargetRef, Response, RmuxError,
     SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
     UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
 };
 
+use super::pane_support::capture_pane_snapshot;
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
+use crate::pane_recovery_keyframe::PaneRecoveryState;
 use crate::pane_terminals::{session_not_found, HandlerState};
 
 use super::{PaneOutputSubscriptionReconciliation, RequestHandler};
@@ -135,6 +138,102 @@ impl OutputSubscriptionState {
 }
 
 impl RequestHandler {
+    pub(in crate::handler) async fn handle_pane_output_recovery(
+        &self,
+        connection_id: u64,
+        request: PaneOutputRecoveryRequest,
+    ) -> Response {
+        let now = Instant::now();
+        let (target, pane_key, next_sequence, keyframe, snapshot, subscription_id, cursor) = {
+            // Runtime mutation and output publication both order state before
+            // the output ring. Holding state here keeps the resolved identity,
+            // keyframe, exact cursor, and subscription registry commit in one
+            // lifecycle transaction.
+            let state = self.state.lock().await;
+            let target = match resolve_pane_target_ref(&state, &request.target) {
+                Ok(target) => target,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let pane_key = match state.pane_output_subscription_key_for_target(&target) {
+                Ok(pane_key) => pane_key,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let output = match state.pane_output_for_target(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+            ) {
+                Ok(output) => output,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let transcript = match state.transcript_handle(&target) {
+                Ok(transcript) => transcript,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let (next_sequence, captured, receiver) = output.capture_with_receiver(|| {
+                let transcript = transcript
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let keyframe = PaneRecoveryState::capture(
+                    transcript.screen(),
+                    transcript.pending_bytes(),
+                    transcript.active_cell_state_ansi(),
+                );
+                capture_pane_snapshot(&transcript).map(|snapshot| (keyframe, snapshot))
+            });
+            let (keyframe, snapshot) = match captured {
+                Ok(captured) => captured,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let mut subscriptions = self
+                .subscriptions
+                .lock()
+                .expect("subscription registry mutex must not be poisoned");
+            subscriptions.cleanup_stale(now);
+            let record =
+                match subscriptions
+                    .registry
+                    .subscribe(connection_id, pane_key.clone(), now)
+                {
+                    Ok(record) => record,
+                    Err(error) => {
+                        return Response::Error(ErrorResponse {
+                            error: subscription_limit_error(error),
+                        });
+                    }
+                };
+            let cursor = cursor_dto(receiver.cursor());
+            debug_assert_eq!(cursor.next_sequence, next_sequence);
+            let subscription_id = record.id();
+            subscriptions.receivers.insert(subscription_id, receiver);
+            (
+                target,
+                pane_key,
+                next_sequence,
+                keyframe,
+                snapshot,
+                subscription_id,
+                cursor,
+            )
+        };
+        let snapshot = self.pane_snapshot_response(pane_key.pane_id(), snapshot);
+        let response = Response::PaneOutputRecovery(Box::new(PaneOutputRecoveryResponse {
+            subscription_id,
+            target,
+            pane_id: pane_key.pane_id(),
+            cursor,
+            snapshot,
+            keyframe: PaneOutputKeyframe {
+                cols: keyframe.cols,
+                rows: keyframe.rows,
+                bytes: keyframe.ansi_bytes(),
+                alternate: keyframe.alternate,
+                next_sequence,
+            },
+        }));
+        validate_recovery_response(&self.subscriptions, subscription_id, response)
+    }
+
     #[cfg(test)]
     pub(in crate::handler) fn pane_output_subscription_key_for_test(
         &self,
@@ -499,6 +598,23 @@ impl RequestHandler {
             .lock()
             .expect("subscription registry mutex must not be poisoned");
         subscriptions.pane_drain_idle_for(pane, Instant::now())
+    }
+}
+
+fn validate_recovery_response(
+    subscriptions: &std::sync::Mutex<OutputSubscriptionState>,
+    subscription_id: PaneOutputSubscriptionId,
+    response: Response,
+) -> Response {
+    match rmux_proto::encode_frame(&response) {
+        Ok(_) => response,
+        Err(error) => {
+            subscriptions
+                .lock()
+                .expect("subscription registry mutex must not be poisoned")
+                .remove_subscription(subscription_id);
+            Response::Error(ErrorResponse { error })
+        }
     }
 }
 

@@ -1327,6 +1327,15 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         Some("split_window_identity_request"),
         "Atomic SDK split identity request; pinned bincode tag 127.",
     ),
+    entry(
+        c2s(128),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "PaneOutputRecoveryRequest",
+        FrameFeature::Panes,
+        None,
+        "Atomic SDK pane renderer recovery request; pinned bincode tag 128.",
+    ),
     // Reserved client→server slot. Removed values must be listed and never reused.
     entry(
         c2s(0x7FFE),
@@ -2265,6 +2274,15 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         Some("split_window_identity_response"),
         "Atomic SDK split identity response; pinned bincode tag 101.",
     ),
+    entry(
+        s2c(102),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "PaneOutputRecoveryResponse",
+        FrameFeature::Panes,
+        None,
+        "Atomic SDK pane renderer recovery response; pinned bincode tag 102.",
+    ),
     // Reserved server→client slot. Removed values must be listed and never reused.
     entry(
         s2c(0x7FFE),
@@ -2422,6 +2440,7 @@ pub const fn frame_kind_for_request(request: &Request) -> FrameKind {
         Request::UnsubscribePaneState(_) => c2s(125),
         Request::PaneForegroundState(_) => c2s(126),
         Request::SplitWindowIdentity(_) => c2s(127),
+        Request::PaneOutputRecovery(_) => c2s(128),
     }
 }
 
@@ -2531,6 +2550,7 @@ pub const fn frame_kind_for_response(response: &Response) -> FrameKind {
         Response::UnsubscribePaneState(_) => s2c(99),
         Response::PaneForegroundState(_) => s2c(100),
         Response::SplitWindowIdentity(_) => s2c(101),
+        Response::PaneOutputRecovery(_) => s2c(102),
     }
 }
 

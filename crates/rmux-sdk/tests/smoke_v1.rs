@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use rmux_sdk::{
     bootstrap::discovery::SDK_DAEMON_BINARY_ENV, EnsureSession, EnsureSessionPolicy, PaneInfo,
-    PaneOutputChunk, PaneOutputStart, PaneOutputStream, PaneProcessState, RmuxBuilder, SessionName,
+    PaneOutputChunk, PaneOutputStream, PaneProcessState, RmuxBuilder, SessionName,
 };
 use tokio::time::{sleep, timeout, Instant};
 
@@ -77,12 +77,25 @@ async fn daemon_backed_sdk_happy_path_cleans_tmp_socket_lock_daemon_and_child() 
 
     let pane = session.pane(0, 0);
     let pane_pid = wait_for_pane_pid(&pane).await?;
-    let mut output = pane.output_stream_starting_at(PaneOutputStart::Now).await?;
+    let recovery = pane.recover_output().await?;
+    assert!(recovery.cols > 0 && recovery.rows > 0);
+    assert_eq!(
+        (recovery.snapshot.cols, recovery.snapshot.rows),
+        (recovery.cols, recovery.rows)
+    );
+    recovery.snapshot.validate_shape()?;
+    assert!(recovery.keyframe.starts_with(b"\x1b[?2026l"));
+    let mut output = recovery.output;
     pane.send_text(format!("printf '{MARKER}\\n'\n")).await?;
     wait_for_output_marker(&mut output, MARKER.as_bytes()).await?;
     drop(output);
     pane.wait_for_text(MARKER).await?;
     assert!(pane.snapshot().await?.visible_text().contains(MARKER));
+
+    let recovery_after_output = pane.recover_output().await?;
+    assert!(recovery_after_output.next_sequence > recovery.next_sequence);
+    drop(recovery_after_output.output);
+    exercise_atomic_recovery_after_lag(&pane).await?;
 
     rmux.shutdown().await?;
     wait_for_daemon_absent(&socket_path, daemon_pid).await?;
@@ -211,6 +224,37 @@ async fn wait_for_output_marker(stream: &mut PaneOutputStream, marker: &[u8]) ->
             None => return Err("pane output stream closed before smoke marker".into()),
         }
     }
+}
+
+async fn exercise_atomic_recovery_after_lag(pane: &rmux_sdk::Pane) -> TestResult {
+    const FIRST: &str = "RMUX_SDK_LAG_BURST_ONE";
+    const SECOND: &str = "RMUX_SDK_LAG_BURST_TWO";
+    const AFTER: &str = "RMUX_SDK_POST_LAG_RECOVERY";
+
+    let initial = pane.recover_output().await?;
+    let initial_sequence = initial.next_sequence;
+    let mut stale = initial.output;
+    pane.send_text("yes A | head -c 180000; printf '\\nRMUX_SDK_LAG_%s\\n' BURST_ONE\n")
+        .await?;
+    pane.wait_for_text(FIRST).await?;
+    pane.send_text("yes B | head -c 180000; printf '\\nRMUX_SDK_LAG_%s\\n' BURST_TWO\n")
+        .await?;
+    pane.wait_for_text(SECOND).await?;
+
+    let Some(PaneOutputChunk::Lag(lag)) = timeout(DEFAULT_TIMEOUT, stale.next()).await?? else {
+        return Err("stale recovery stream did not report bounded lag".into());
+    };
+    assert!(lag.missed_events > 0);
+    drop(stale);
+
+    let recovered = pane.recover_output().await?;
+    assert!(recovered.next_sequence > initial_sequence);
+    assert!(recovered.snapshot.visible_text().contains(SECOND));
+    let mut output = recovered.output;
+    pane.send_text("printf 'RMUX_SDK_POST_%s_RECOVERY\\n' LAG\n")
+        .await?;
+    wait_for_output_marker(&mut output, AFTER.as_bytes()).await?;
+    Ok(())
 }
 
 async fn wait_for_daemon_pid(socket_path: &Path) -> TestResult<u32> {

@@ -82,6 +82,7 @@ mod pane_indices;
 mod pane_io;
 #[cfg(unix)]
 mod pane_reader_runtime;
+mod pane_recovery_keyframe;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_screen_state;

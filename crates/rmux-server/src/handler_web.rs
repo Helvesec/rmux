@@ -547,8 +547,24 @@ impl RequestHandler {
                 mode_bits: screen.mode(),
                 cursor_style: screen.cursor_style(),
                 alternate: screen.is_alternate(),
+                saved_ansi_lines: screen.capture_saved_transcript_lines_independent(
+                    rmux_core::ScreenCaptureRange::default(),
+                    rmux_core::GridRenderOptions {
+                        with_sequences: true,
+                        trim_spaces: false,
+                        ..rmux_core::GridRenderOptions::default()
+                    },
+                ),
+                saved_cursor: screen.alternate_saved_cursor_position().map(|(col, row)| {
+                    (
+                        row.min(u32::from(size.rows.saturating_sub(1))) as u16,
+                        col.min(u32::from(size.cols.saturating_sub(1))) as u16,
+                    )
+                }),
                 scroll_top,
                 scroll_bottom,
+                pending_bytes: transcript.pending_bytes(),
+                active_cell_state: transcript.active_cell_state_ansi(),
             }
         });
         let snapshot = WebPaneSnapshot {

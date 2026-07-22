@@ -241,6 +241,26 @@ struct PaneSubscription {
 }
 
 impl PaneOutputStream {
+    pub(crate) fn from_registered(
+        transport: TransportClient,
+        subscription_id: PaneOutputSubscriptionId,
+    ) -> Result<Self> {
+        let transport = transport.reusable();
+        let unsubscribe =
+            Request::UnsubscribePaneOutput(UnsubscribePaneOutputRequest { subscription_id });
+        let drop_guard = DropGuard::best_effort(transport.clone(), unsubscribe);
+        Ok(Self {
+            inner: PaneSubscription {
+                transport,
+                subscription_id,
+                _drop_guard: drop_guard,
+                closed: false,
+            },
+            pending: VecDeque::new(),
+            poll_delay: POLL_INITIAL_DELAY,
+        })
+    }
+
     pub(crate) async fn open(
         transport: TransportClient,
         target: PaneTargetRef,
@@ -271,23 +291,7 @@ impl PaneOutputStream {
             response => return Err(unexpected_response("subscribe-pane-output", response)),
         };
 
-        // Stream polling is a sequence of independent operations. Do not
-        // retain the already-consumed setup deadline in the returned stream.
-        let transport = transport.reusable();
-        let unsubscribe =
-            Request::UnsubscribePaneOutput(UnsubscribePaneOutputRequest { subscription_id });
-        let drop_guard = DropGuard::best_effort(transport.clone(), unsubscribe);
-
-        Ok(Self {
-            inner: PaneSubscription {
-                transport,
-                subscription_id,
-                _drop_guard: drop_guard,
-                closed: false,
-            },
-            pending: VecDeque::new(),
-            poll_delay: POLL_INITIAL_DELAY,
-        })
+        Self::from_registered(transport, subscription_id)
     }
 
     /// Returns the next chunk, awaiting daemon output if necessary.

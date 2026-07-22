@@ -49,6 +49,7 @@ async fn main() -> rmux_sdk::Result<()> {
 - Typed handles: `Session`, `Window`, `Pane`.
 - `Session::window(index)` — lazy handle for a window slot; `Session::new_window()` creates one now.
 - `Pane::send_text`, `Pane::wait_for_text`, `Pane::snapshot`, plus streams and events for incremental output.
+- `Pane::recover_output()` — atomically capture a daemon-rendered ANSI keyframe and the raw output stream beginning at its exact next sequence. Apply the keyframe before consuming the stream; call `recover_output()` again after a lag notice instead of reconstructing renderer state client-side.
 
 The SDK is a peer of the local IPC client, not a wrapper — no dependency on internal RMUX runtime crates.
 

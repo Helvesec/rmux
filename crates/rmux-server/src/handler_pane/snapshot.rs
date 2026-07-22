@@ -26,6 +26,16 @@ pub(in crate::handler) struct PaneSnapshotInputs {
     transcript: SharedPaneTranscript,
 }
 
+pub(in crate::handler) struct PaneSnapshotCapture {
+    cols: u16,
+    rows: u16,
+    cells: Vec<PaneSnapshotCell>,
+    cursor: PaneSnapshotCursor,
+    pub(in crate::handler) transcript_sequence: u64,
+    history_size: usize,
+    history_bytes: usize,
+}
+
 /// Saturating cast for cursor coordinates emitted by `Screen::cursor_position`.
 ///
 /// `Screen` stores the cursor as `u32` while the wire protocol uses `u16`. A
@@ -82,50 +92,32 @@ impl RequestHandler {
         let pane_id = inputs.pane_id;
         let _snapshot_span = crate::perf_instrument::span("snapshot")
             .with_u64("pane_id", u64::from(pane_id.as_u32()));
-        let (cols, rows, cells, cursor, output_sequence, history_size, history_bytes) = {
+        let capture = {
             let transcript = inputs
                 .transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned");
-            let screen = transcript.screen();
-            let size = screen.size();
-            let cols = size.cols;
-            let rows = size.rows;
-            let history_size = screen.history_size();
-            let history_bytes = screen.history_bytes();
-            let (cursor_x, cursor_y) = screen.cursor_position();
-            let cursor_visible = (screen.mode() & mode::MODE_CURSOR) != 0;
-            let cursor = PaneSnapshotCursor {
-                row: cursor_coord_to_u16(cursor_y),
-                col: cursor_coord_to_u16(cursor_x),
-                visible: cursor_visible,
-                style: screen.cursor_style(),
-            };
-            let output_sequence = transcript.output_sequence();
-
-            let cells = match collect_cells(screen, cols, rows, history_size) {
-                Ok(cells) => cells,
+            match capture_pane_snapshot(&transcript) {
+                Ok(capture) => capture,
                 Err(error) => return Response::Error(ErrorResponse { error }),
-            };
-            (
-                cols,
-                rows,
-                cells,
-                cursor,
-                output_sequence,
-                history_size,
-                history_bytes,
-            )
+            }
         };
+        Response::PaneSnapshot(self.pane_snapshot_response(pane_id, capture))
+    }
 
+    pub(in crate::handler) fn pane_snapshot_response(
+        &self,
+        pane_id: PaneId,
+        capture: PaneSnapshotCapture,
+    ) -> PaneSnapshotResponse {
         let fingerprint = compute_snapshot_fingerprint(
-            cols,
-            rows,
-            &cells,
-            &cursor,
-            output_sequence,
-            history_size,
-            history_bytes,
+            capture.cols,
+            capture.rows,
+            &capture.cells,
+            &capture.cursor,
+            capture.transcript_sequence,
+            capture.history_size,
+            capture.history_bytes,
             pane_id.as_u32(),
         );
         let revision = self.assign_pane_snapshot_revision(pane_id, fingerprint);
@@ -138,13 +130,13 @@ impl RequestHandler {
         // notification path.
         self.observe_pane_snapshot_revision(pane_id, revision, Instant::now());
 
-        Response::PaneSnapshot(PaneSnapshotResponse {
-            cols,
-            rows,
-            cells,
-            cursor,
+        PaneSnapshotResponse {
+            cols: capture.cols,
+            rows: capture.rows,
+            cells: capture.cells,
+            cursor: capture.cursor,
             revision,
-        })
+        }
     }
 
     /// Records a freshly observed pane snapshot revision in the per-pane
@@ -213,6 +205,29 @@ impl RequestHandler {
             revisions.forget(*pane_id);
         }
     }
+}
+
+pub(in crate::handler) fn capture_pane_snapshot(
+    transcript: &crate::pane_transcript::PaneTranscript,
+) -> Result<PaneSnapshotCapture, RmuxError> {
+    let screen = transcript.screen();
+    let size = screen.size();
+    let history_size = screen.history_size();
+    let (cursor_x, cursor_y) = screen.cursor_position();
+    Ok(PaneSnapshotCapture {
+        cols: size.cols,
+        rows: size.rows,
+        cells: collect_cells(screen, size.cols, size.rows, history_size)?,
+        cursor: PaneSnapshotCursor {
+            row: cursor_coord_to_u16(cursor_y),
+            col: cursor_coord_to_u16(cursor_x),
+            visible: (screen.mode() & mode::MODE_CURSOR) != 0,
+            style: screen.cursor_style(),
+        },
+        transcript_sequence: transcript.output_sequence(),
+        history_size,
+        history_bytes: screen.history_bytes(),
+    })
 }
 
 fn collect_cells(

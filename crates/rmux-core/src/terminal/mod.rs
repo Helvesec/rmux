@@ -171,6 +171,23 @@ impl TerminalParser {
         self.parser.pending_bytes()
     }
 
+    pub(crate) fn active_cell_state_ansi(&self) -> Vec<u8> {
+        let mut out = self.screen.render_cell_state_ansi(self.parser.cell_state());
+        let cell = self.parser.cell_state();
+        out.extend_from_slice(if cell.g0set != 0 {
+            b"\x1b(0"
+        } else {
+            b"\x1b(B"
+        });
+        out.extend_from_slice(if cell.g1set != 0 {
+            b"\x1b)0"
+        } else {
+            b"\x1b)B"
+        });
+        out.push(if cell.set == 0 { 0x0f } else { 0x0e });
+        out
+    }
+
     /// Returns whether the parser ground timer would currently be running.
     #[must_use]
     pub(crate) fn ground_timer_active(&self) -> bool {

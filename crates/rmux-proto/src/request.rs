@@ -33,12 +33,12 @@ pub use pane::{
     BreakPaneRequest, DisplayPanesRequest, JoinPaneRequest, KillPaneRequest, LastPaneRequest,
     MovePaneRequest, PaneBroadcastInputRequest, PaneForegroundStateRequest, PaneInputRequest,
     PaneKillRequest, PaneOptionGetRequest, PaneOptionSetRequest, PaneOutputCursorRequest,
-    PaneOutputSubscriptionStart, PaneResizeRequest, PaneRespawnRequest, PaneSelectRequest,
-    PaneSnapshotRefRequest, PaneSnapshotRequest, PaneSplitSize, PaneStateCursorRequest,
-    PipePaneRequest, ResizePaneRequest, ResizePaneTargetActionRequest, RespawnPaneRequest,
-    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
-    SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest, SplitWindowExtRequest,
-    SplitWindowIdentityRequest, SplitWindowRequest, SplitWindowTarget,
+    PaneOutputRecoveryRequest, PaneOutputSubscriptionStart, PaneResizeRequest, PaneRespawnRequest,
+    PaneSelectRequest, PaneSnapshotRefRequest, PaneSnapshotRequest, PaneSplitSize,
+    PaneStateCursorRequest, PipePaneRequest, ResizePaneRequest, ResizePaneTargetActionRequest,
+    RespawnPaneRequest, SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest,
+    SelectPaneRequest, SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest,
+    SplitWindowExtRequest, SplitWindowIdentityRequest, SplitWindowRequest, SplitWindowTarget,
     SplitWindowTargetActionRequest, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
     SubscribePaneStateRequest, SwapPaneDirection, SwapPaneRequest, UnsubscribePaneOutputRequest,
     UnsubscribePaneStateRequest,
@@ -371,6 +371,8 @@ pub enum Request {
     PaneForegroundState(PaneForegroundStateRequest),
     /// SDK split endpoint returning visible and stable pane identity atomically.
     SplitWindowIdentity(Box<SplitWindowIdentityRequest>),
+    /// Atomic renderer keyframe plus exact post-keyframe output subscription.
+    PaneOutputRecovery(PaneOutputRecoveryRequest),
 }
 
 impl Request {
@@ -444,6 +446,7 @@ impl Request {
             Self::PaneKill(_) => "kill-pane",
             Self::PaneRespawn(_) => "respawn-pane",
             Self::PaneSnapshotRef(_) => "pane-snapshot",
+            Self::PaneOutputRecovery(_) => "pane-output-recovery",
             Self::PaneSelect(_) => "select-pane",
             Self::PaneOptionSet(_) => "pane-option-set",
             Self::PaneOptionGet(_) => "pane-option-get",
