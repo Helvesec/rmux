@@ -191,7 +191,7 @@ def _validate_live_audit(path: Path) -> None:
         "  workflow_dispatch:",
         "permissions: {}",
         "environment: release-publication",
-        "permission-administration: read",
+        "permission-administration: write",
         "permission-contents: read",
         "collect-downstream-repository.py",
         "verify-downstream-repository.py fixtures",
@@ -209,8 +209,7 @@ def _validate_live_audit(path: Path) -> None:
         if text.count(repository) != 2:
             raise ValueError(f"downstream live audit lost repository {repository}")
     if (
-        "permission-administration: write" in text
-        or "permission-contents: write" in text
+        "permission-contents: write" in text
         or "secrets: inherit" in text
         or "self-hosted" in text
     ):
