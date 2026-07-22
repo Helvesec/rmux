@@ -227,14 +227,24 @@ fn full_helper_candidates(current_exe: &Path) -> Vec<PathBuf> {
     let Some(parent) = current_exe.parent() else {
         return Vec::new();
     };
-    vec![
+    let mut candidates = vec![
         parent.join("libexec").join("rmux").join(helper_file_name()),
         parent
             .join("..")
             .join("libexec")
             .join("rmux")
             .join(helper_file_name()),
-    ]
+    ];
+    #[cfg(unix)]
+    candidates.push(
+        parent
+            .join("..")
+            .join("lib")
+            .join("rmux")
+            .join("libexec")
+            .join(helper_file_name()),
+    );
+    candidates
 }
 
 #[cfg(not(windows))]

@@ -1295,6 +1295,12 @@ fn unix_full_helper_candidates(public: &Path) -> Vec<PathBuf> {
             .join("libexec")
             .join("rmux")
             .join(rmux_file_name()),
+        parent
+            .join("..")
+            .join("lib")
+            .join("rmux")
+            .join("libexec")
+            .join(rmux_file_name()),
     ]
 }
 
