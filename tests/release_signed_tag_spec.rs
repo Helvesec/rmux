@@ -658,6 +658,9 @@ tag = {
 Path(sys.argv[3]).write_text(json.dumps(ref), encoding="utf-8")
 Path(sys.argv[4]).write_text(json.dumps(tag), encoding="utf-8")
 PY
+  printf 'To https://github.com/Helvesec/rmux.git\n'
+  printf '*\trefs/tags/v0.9.1:refs/tags/v0.9.1\t[new tag]\n'
+  printf 'Done\n'
   exit 0
 fi
 exec "$REAL_GIT" "$@"

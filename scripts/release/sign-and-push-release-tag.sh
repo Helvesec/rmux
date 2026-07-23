@@ -229,11 +229,11 @@ printf '%s\n' \
 chmod 700 "$askpass"
 git -C "$clone" remote add release-origin 'https://github.com/Helvesec/rmux.git'
 set +e
-GIT_ASKPASS=$askpass \
+  GIT_ASKPASS=$askpass \
   GIT_TERMINAL_PROMPT=0 \
   RMUX_RELEASE_APP_TOKEN=$RMUX_RELEASE_APP_TOKEN \
   git -C "$clone" push --porcelain release-origin \
-    "refs/tags/$release_ref:refs/tags/$release_ref"
+    "refs/tags/$release_ref:refs/tags/$release_ref" >&2
 push_status=$?
 set -e
 
