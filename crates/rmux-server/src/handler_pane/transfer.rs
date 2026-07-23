@@ -5,10 +5,11 @@ use rmux_proto::{
 };
 
 use super::super::{
-    attach_support::SessionDetachOnDestroy, defer_lifecycle_event,
-    prepare_deferred_lifecycle_event, prepare_lifecycle_event_if_enabled,
-    scripting_support::format_context_for_target, DeferredLifecycleEvent,
-    PaneOutputSubscriptionKeySnapshot, QueuedLifecycleEvent, RequestHandler,
+    attach_support::{PreparedAttachedDestroySwitches, SessionDetachOnDestroy},
+    defer_lifecycle_event, prepare_deferred_lifecycle_event, prepare_lifecycle_event,
+    scripting_support::format_context_for_target,
+    DeferredLifecycleEvent, PaneOutputSubscriptionKeySnapshot, QueuedLifecycleEvent,
+    RequestHandler,
 };
 use super::pane_timer_mutations::BreakPaneTimerTargetPlan;
 use crate::format_runtime::render_runtime_template;
@@ -32,6 +33,8 @@ struct PaneTransferEffects {
 struct PreparedPaneTransferEffects {
     refresh_sessions: Vec<SessionName>,
     unlinked_windows: Vec<QueuedLifecycleEvent>,
+    layout_events: Vec<QueuedLifecycleEvent>,
+    linked_event: Option<QueuedLifecycleEvent>,
     closed_sessions: Vec<(
         SessionName,
         SessionId,
@@ -155,6 +158,8 @@ impl PaneTransferEffects {
         self,
         state: &mut HandlerState,
         removed_sessions: &[SessionName],
+        layout_targets: &[WindowTarget],
+        linked_event: Option<LifecycleEvent>,
     ) -> PreparedPaneTransferEffects {
         let Self {
             refresh_sessions,
@@ -167,6 +172,16 @@ impl PaneTransferEffects {
             .into_iter()
             .map(|event| prepare_deferred_lifecycle_event(state, &mut hook_snapshot, event))
             .collect();
+        let layout_events = layout_targets
+            .iter()
+            .cloned()
+            .map(|target| {
+                prepare_lifecycle_event(state, &LifecycleEvent::WindowLayoutChanged { target })
+            })
+            .collect();
+        let linked_event = linked_event
+            .as_ref()
+            .map(|event| prepare_lifecycle_event(state, event));
         let closed_sessions = closed_sessions
             .into_iter()
             .filter(|(session_name, _, _, _)| removed_sessions.contains(session_name))
@@ -182,6 +197,8 @@ impl PaneTransferEffects {
         PreparedPaneTransferEffects {
             refresh_sessions,
             unlinked_windows,
+            layout_events,
+            linked_event,
             closed_sessions,
         }
     }
@@ -257,8 +274,15 @@ impl RequestHandler {
         } else {
             SourceWindowEffect::RemoveLinkedFamily
         };
-        let (response, effects, removed_sessions, layout_targets) = {
+        let (response, effects, removed_sessions) = {
             let mut state = self.state.lock().await;
+            if let Err(error) =
+                super::super::require_expected_pane_identity(&state, &request.source).and_then(
+                    |()| super::super::require_expected_pane_identity(&state, &request.target),
+                )
+            {
+                return Response::Error(ErrorResponse { error });
+            }
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
                 &[source_session_name.clone(), target_session_name.clone()],
@@ -274,6 +298,7 @@ impl RequestHandler {
             );
             let response = match state.join_pane(request) {
                 Ok(response) => {
+                    state.retire_removed_lifecycle_targets();
                     self.apply_window_mutation_silence_timers_and_arm_all_locked(
                         &state,
                         timer_mutation,
@@ -297,19 +322,21 @@ impl RequestHandler {
                     )
                 })
                 .unwrap_or_default();
-            let effects = matches!(response, Response::JoinPane(_))
-                .then(|| effects.prepare_emitted(&mut state, &removed_sessions));
-            (response, effects, removed_sessions, layout_targets)
+            let effects = matches!(response, Response::JoinPane(_)).then(|| {
+                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None)
+            });
+            (response, effects, removed_sessions)
         };
 
         if let Some(effects) = effects {
-            self.emit_prepared_unlinked_windows(&effects).await;
-            for target in layout_targets {
-                self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                    .await;
-            }
-            self.finish_pane_transfer_effects(effects, &removed_sessions, &target_session_name)
-                .await;
+            let prepared_rehomes = self.emit_prepared_pane_transfer_lifecycle(&effects).await;
+            self.finish_pane_transfer_effects(
+                effects,
+                &removed_sessions,
+                &target_session_name,
+                prepared_rehomes,
+            )
+            .await;
         }
 
         response
@@ -330,7 +357,7 @@ impl RequestHandler {
         } else {
             SourceWindowEffect::RemoveLinkedFamily
         };
-        let (response, effects, removed_sessions, layout_targets) = {
+        let (response, effects, removed_sessions) = {
             let mut state = self.state.lock().await;
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
@@ -347,6 +374,7 @@ impl RequestHandler {
             );
             let response = match state.move_pane(request) {
                 Ok(response) => {
+                    state.retire_removed_lifecycle_targets();
                     self.apply_window_mutation_silence_timers_and_arm_all_locked(
                         &state,
                         timer_mutation,
@@ -370,19 +398,21 @@ impl RequestHandler {
                     )
                 })
                 .unwrap_or_default();
-            let effects = matches!(response, Response::MovePane(_))
-                .then(|| effects.prepare_emitted(&mut state, &removed_sessions));
-            (response, effects, removed_sessions, layout_targets)
+            let effects = matches!(response, Response::MovePane(_)).then(|| {
+                effects.prepare_emitted(&mut state, &removed_sessions, &layout_targets, None)
+            });
+            (response, effects, removed_sessions)
         };
 
         if let Some(effects) = effects {
-            self.emit_prepared_unlinked_windows(&effects).await;
-            for target in layout_targets {
-                self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                    .await;
-            }
-            self.finish_pane_transfer_effects(effects, &removed_sessions, &target_session_name)
-                .await;
+            let prepared_rehomes = self.emit_prepared_pane_transfer_lifecycle(&effects).await;
+            self.finish_pane_transfer_effects(
+                effects,
+                &removed_sessions,
+                &target_session_name,
+                prepared_rehomes,
+            )
+            .await;
         }
 
         response
@@ -399,7 +429,7 @@ impl RequestHandler {
         let print_target = request.print_target;
         let print_format = request.format.clone();
         let explicit_name = request.name.is_some();
-        let (response, effects, removed_sessions, source_layout_target, linked_event) = {
+        let (response, effects, removed_sessions) = {
             let mut state = self.state.lock().await;
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
@@ -423,6 +453,7 @@ impl RequestHandler {
             );
             let response = match state.break_pane(request) {
                 Ok(response) => {
+                    state.retire_removed_lifecycle_targets();
                     let destination = WindowTarget::with_window(
                         response.target.session_name().clone(),
                         response.target.window_index(),
@@ -458,44 +489,39 @@ impl RequestHandler {
                 }
                 _ => None,
             };
-            let effects = matches!(response, Response::BreakPane(_))
-                .then(|| effects.prepare_emitted(&mut state, &removed_sessions));
             let linked_event = if let Response::BreakPane(success) = &response {
                 let target_window = WindowTarget::with_window(
                     success.target.session_name().clone(),
                     success.target.window_index(),
                 );
-                prepare_lifecycle_event_if_enabled(
-                    &mut state,
-                    &LifecycleEvent::WindowLinked {
-                        session_name: target_session_name.clone(),
-                        target: Some(target_window),
-                    },
-                )
+                Some(LifecycleEvent::WindowLinked {
+                    session_name: target_session_name.clone(),
+                    target: Some(target_window),
+                })
             } else {
                 None
             };
-            (
-                response,
-                effects,
-                removed_sessions,
-                source_layout_target,
-                linked_event,
-            )
+            let layout_targets = source_layout_target.into_iter().collect::<Vec<_>>();
+            let effects = matches!(response, Response::BreakPane(_)).then(|| {
+                effects.prepare_emitted(
+                    &mut state,
+                    &removed_sessions,
+                    &layout_targets,
+                    linked_event,
+                )
+            });
+            (response, effects, removed_sessions)
         };
 
         if let Some(effects) = effects {
-            self.emit_prepared_unlinked_windows(&effects).await;
-            if let Some(target) = source_layout_target {
-                self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                    .await;
-            }
-            if let Some(linked_event) = linked_event {
-                self.pause_before_window_lifecycle_emit().await;
-                self.emit_prepared(linked_event).await;
-            }
-            self.finish_pane_transfer_effects(effects, &removed_sessions, &target_session_name)
-                .await;
+            let prepared_rehomes = self.emit_prepared_pane_transfer_lifecycle(&effects).await;
+            self.finish_pane_transfer_effects(
+                effects,
+                &removed_sessions,
+                &target_session_name,
+                prepared_rehomes,
+            )
+            .await;
             if !explicit_name {
                 if let Response::BreakPane(success) = &response {
                     self.refresh_automatic_window_name_for_pane_target(&success.target)
@@ -534,10 +560,38 @@ impl RequestHandler {
         response
     }
 
-    async fn emit_prepared_unlinked_windows(&self, effects: &PreparedPaneTransferEffects) {
+    async fn emit_prepared_pane_transfer_lifecycle(
+        &self,
+        effects: &PreparedPaneTransferEffects,
+    ) -> std::collections::HashMap<SessionId, PreparedAttachedDestroySwitches> {
+        let mut prepared_rehomes = std::collections::HashMap::new();
+        for (session_name, session_id, detach_on_destroy, _) in &effects.closed_sessions {
+            let prepared = self
+                .prepare_destroy_session_rehome(session_name, *session_id, *detach_on_destroy)
+                .await;
+            prepared_rehomes.insert(*session_id, prepared);
+        }
         for event in &effects.unlinked_windows {
             self.emit_prepared(event.clone()).await;
         }
+        for event in &effects.layout_events {
+            self.emit_prepared(event.clone()).await;
+        }
+        if let Some(event) = &effects.linked_event {
+            self.pause_before_window_lifecycle_emit().await;
+            self.emit_prepared(event.clone()).await;
+        }
+        for (_, _, _, event) in &effects.closed_sessions {
+            self.emit_prepared(event.clone()).await;
+        }
+        for (_, session_id, _, _) in &effects.closed_sessions {
+            if let Some(prepared) = prepared_rehomes.get_mut(session_id) {
+                for event in prepared.control_lifecycle_events.drain(..) {
+                    self.emit_prepared(event).await;
+                }
+            }
+        }
+        prepared_rehomes
     }
 
     async fn finish_pane_transfer_effects(
@@ -545,6 +599,10 @@ impl RequestHandler {
         effects: PreparedPaneTransferEffects,
         removed_sessions: &[SessionName],
         target_session_name: &SessionName,
+        mut prepared_attached_switches: std::collections::HashMap<
+            SessionId,
+            PreparedAttachedDestroySwitches,
+        >,
     ) {
         let removed_attached_identities = effects
             .closed_sessions
@@ -557,25 +615,15 @@ impl RequestHandler {
             .iter()
             .map(|(session_name, session_id, _)| (session_name.clone(), *session_id))
             .collect::<Vec<_>>();
-        let mut prepared_attached_switches = std::collections::HashMap::new();
-        for (session_name, session_id, detach_on_destroy) in &removed_attached_identities {
-            let prepared = self
-                .rehome_control_session_identity(session_name, *session_id, *detach_on_destroy)
-                .await;
-            prepared_attached_switches.insert(*session_id, prepared);
-        }
-        for (session_name, session_id, _, event) in effects.closed_sessions {
+        for (session_name, session_id, _, _) in effects.closed_sessions {
             self.prune_web_session(Some((session_name, session_id)));
-            self.emit_prepared(event).await;
         }
         self.remove_session_leases(&removed_identities);
-        for (session_name, session_id, detach_on_destroy) in removed_attached_identities {
-            if let Some(prepared) = prepared_attached_switches.remove(&session_id) {
-                self.exit_prepared_attached_session_identity(prepared).await;
-            } else {
-                self.exit_attached_session_identity(&session_name, session_id, detach_on_destroy)
-                    .await;
-            }
+        for (session_name, session_id, _detach_on_destroy) in removed_attached_identities {
+            let prepared = prepared_attached_switches
+                .remove(&session_id)
+                .expect("pane transfer destroy rehome must be prepared before publication");
+            self.exit_prepared_attached_session_identity(prepared).await;
             self.cancel_session_silence_timers(&session_name).await;
             self.refresh_control_session(&session_name).await;
         }

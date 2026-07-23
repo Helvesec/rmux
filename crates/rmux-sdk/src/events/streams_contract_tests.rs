@@ -222,6 +222,10 @@ async fn drive_cursor_with_events(stream: &mut DuplexStream, events: Vec<PaneOut
         }
         other => panic!("expected pane-output-cursor, got {other:?}"),
     }
+    write_cursor_events_response(stream, events).await;
+}
+
+async fn write_cursor_events_response(stream: &mut DuplexStream, events: Vec<PaneOutputEvent>) {
     write_response(
         stream,
         &Response::PaneOutputCursor(PaneOutputCursorResponse {
@@ -318,11 +322,9 @@ async fn drive_lag_with_mismatched_subscription(stream: &mut DuplexStream) {
 
 async fn open_output_stream(
     target: PaneRef,
-    server: &mut DuplexStream,
     start: PaneOutputStart,
-) -> PaneOutputStream {
-    let (client_stream, server_stream) = tokio::io::duplex(8192);
-    *server = server_stream;
+) -> (PaneOutputStream, DuplexStream) {
+    let (client_stream, mut server_stream) = tokio::io::duplex(8192);
     let proto_target = target.to_proto();
     let proto_start = match start {
         PaneOutputStart::Now => PaneOutputSubscriptionStart::Now,
@@ -332,8 +334,9 @@ async fn open_output_stream(
         let target = target.clone();
         async move { pane_output_stream_from_duplex(target, client_stream, start).await }
     });
-    drive_subscribe_response(server, &proto_target, proto_start).await;
-    subscribe.await.expect("subscribe task").expect("opens")
+    drive_subscribe_response(&mut server_stream, &proto_target, proto_start).await;
+    let stream = subscribe.await.expect("subscribe task").expect("opens");
+    (stream, server_stream)
 }
 
 #[tokio::test(start_paused = true)]
@@ -437,6 +440,184 @@ async fn output_stream_drives_subscribe_then_cursor_then_unsubscribe() {
         }) => assert_eq!(id, subscription_id()),
         other => panic!("expected unsubscribe-pane-output on drop, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn cancelled_output_next_reuses_the_inflight_cursor_response() {
+    let target = alpha_target();
+    let (mut stream, mut server_stream) = open_output_stream(target, PaneOutputStart::Now).await;
+
+    let mut interrupted = Box::pin(stream.next());
+    let request = tokio::select! {
+        result = &mut interrupted => panic!("cursor poll completed before cancellation: {result:?}"),
+        request = read_request(&mut server_stream) => request,
+    };
+    assert!(
+        matches!(request, Request::PaneOutputCursor(_)),
+        "expected pane-output cursor, got {request:?}"
+    );
+    drop(interrupted);
+
+    write_cursor_events_response(
+        &mut server_stream,
+        vec![PaneOutputEvent {
+            sequence: 1,
+            bytes: b"retained".to_vec(),
+        }],
+    )
+    .await;
+
+    let mut resumed = Box::pin(stream.next());
+    let chunk = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = &mut resumed => result,
+            request = read_request(&mut server_stream) => {
+                panic!("resuming next() must reuse the cursor response, got {request:?}")
+            }
+        }
+    })
+    .await
+    .expect("retained cursor response completes")
+    .expect("resumed next succeeds")
+    .expect("retained chunk");
+    assert_eq!(
+        chunk,
+        PaneOutputChunk::Bytes {
+            sequence: 1,
+            bytes: b"retained".to_vec(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn cancelled_poll_once_preserves_buffered_and_inflight_chunks() {
+    let target = alpha_target();
+    let (mut stream, mut server_stream) = open_output_stream(target, PaneOutputStart::Now).await;
+
+    let first = tokio::spawn(async move {
+        let chunk = stream.next().await.expect("first cursor succeeds");
+        (stream, chunk)
+    });
+    drive_cursor_with_events(
+        &mut server_stream,
+        vec![
+            PaneOutputEvent {
+                sequence: 1,
+                bytes: b"returned".to_vec(),
+            },
+            PaneOutputEvent {
+                sequence: 2,
+                bytes: b"buffered".to_vec(),
+            },
+        ],
+    )
+    .await;
+    let (mut stream, first) = first.await.expect("first next task");
+    assert!(matches!(
+        first,
+        Some(PaneOutputChunk::Bytes { sequence: 1, .. })
+    ));
+
+    let mut interrupted = Box::pin(stream.poll_once());
+    let request = tokio::select! {
+        result = &mut interrupted => panic!("cursor poll completed before cancellation: {result:?}"),
+        request = read_request(&mut server_stream) => request,
+    };
+    assert!(
+        matches!(request, Request::PaneOutputCursor(_)),
+        "expected pane-output cursor, got {request:?}"
+    );
+    drop(interrupted);
+
+    write_cursor_events_response(
+        &mut server_stream,
+        vec![PaneOutputEvent {
+            sequence: 3,
+            bytes: b"inflight".to_vec(),
+        }],
+    )
+    .await;
+
+    let mut resumed = Box::pin(stream.poll_once());
+    let chunks = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = &mut resumed => result,
+            request = read_request(&mut server_stream) => {
+                panic!("resuming poll_once() must reuse the cursor response, got {request:?}")
+            }
+        }
+    })
+    .await
+    .expect("retained cursor response completes")
+    .expect("resumed poll succeeds");
+    let sequences: Vec<u64> = chunks
+        .into_iter()
+        .map(|chunk| match chunk {
+            PaneOutputChunk::Bytes { sequence, .. } => sequence,
+            other => panic!("expected byte chunk, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(sequences, vec![2, 3]);
+}
+
+#[tokio::test]
+async fn cancelled_line_next_reuses_the_inflight_cursor_response() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(8192);
+    let target = alpha_target();
+    let proto_target = target.to_proto();
+    let subscribe_task = tokio::spawn(async move {
+        pane_line_stream_from_duplex(target, client_stream, PaneOutputStart::Now).await
+    });
+    drive_subscribe_response(
+        &mut server_stream,
+        &proto_target,
+        PaneOutputSubscriptionStart::Now,
+    )
+    .await;
+    let mut stream = subscribe_task
+        .await
+        .expect("subscribe task")
+        .expect("subscribe succeeds");
+
+    let mut interrupted = Box::pin(stream.next());
+    let request = tokio::select! {
+        result = &mut interrupted => panic!("cursor poll completed before cancellation: {result:?}"),
+        request = read_request(&mut server_stream) => request,
+    };
+    assert!(
+        matches!(request, Request::PaneOutputCursor(_)),
+        "expected pane-output cursor, got {request:?}"
+    );
+    drop(interrupted);
+
+    write_cursor_events_response(
+        &mut server_stream,
+        vec![PaneOutputEvent {
+            sequence: 1,
+            bytes: b"retained line\n".to_vec(),
+        }],
+    )
+    .await;
+
+    let mut resumed = Box::pin(stream.next());
+    let item = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            result = &mut resumed => result,
+            request = read_request(&mut server_stream) => {
+                panic!("resuming line next() must reuse the cursor response, got {request:?}")
+            }
+        }
+    })
+    .await
+    .expect("retained cursor response completes")
+    .expect("resumed line next succeeds")
+    .expect("retained line");
+    assert_eq!(
+        item,
+        PaneLineItem::Line {
+            text: "retained line".to_owned(),
+        }
+    );
 }
 
 #[tokio::test]

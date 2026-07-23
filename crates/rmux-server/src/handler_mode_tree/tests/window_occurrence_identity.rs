@@ -14,6 +14,7 @@ struct LinkedOccurrenceFixture {
     session_id: rmux_proto::SessionId,
     window_id: rmux_proto::WindowId,
     pane_id: rmux_proto::PaneId,
+    pane_output_generation: u64,
     old_occurrence_id: WindowLinkOccurrenceId,
     old_window_item_id: String,
     _control_rx: mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
@@ -38,17 +39,22 @@ async fn linked_occurrence_fixture(
     ));
     link_replacement_occurrence(handler, &session_name).await;
 
-    let (session_id, window_id, pane_id, old_occurrence_id) = {
+    let (session_id, window_id, pane_id, pane_output_generation, old_occurrence_id) = {
         let state = handler.state.lock().await;
         let session = state
             .sessions
             .session(&session_name)
             .expect("session exists");
         let window = session.window_at(2).expect("linked occurrence exists");
+        let pane = window.active_pane().expect("active pane exists");
         (
             session.id(),
             window.id(),
-            window.active_pane().expect("active pane exists").id(),
+            pane.id(),
+            state.pane_output_generation_for_target(
+                &rmux_proto::PaneTarget::with_window(session_name.clone(), 2, pane.index()),
+                pane.id(),
+            ),
             state
                 .window_link_occurrence_id(&session_name, 2)
                 .expect("linked occurrence has an identity"),
@@ -83,6 +89,7 @@ async fn linked_occurrence_fixture(
         session_id,
         window_id,
         pane_id,
+        pane_output_generation,
         old_occurrence_id,
         old_window_item_id,
         _control_rx: control_rx,
@@ -198,13 +205,12 @@ async fn choose_tree_stale_pane_action_rejects_relinked_window_occurrence() {
     let fixture =
         linked_occurrence_fixture(&handler, "choose-tree-pane-occurrence-action-aba", 502).await;
     let stale_action = ModeTreeAction::pane_tree_target(
-        fixture.session_name.clone(),
+        rmux_proto::PaneTarget::with_window(fixture.session_name.clone(), 2, 0),
         fixture.session_id,
-        2,
         fixture.window_id,
         fixture.old_occurrence_id,
-        0,
         fixture.pane_id,
+        fixture.pane_output_generation,
     );
     let replacement_occurrence_id = replace_linked_occurrence(&handler, &fixture).await;
 
@@ -225,13 +231,12 @@ async fn choose_tree_pane_action_resolves_exact_alias_when_pane_id_is_duplicated
     let fixture =
         linked_occurrence_fixture(&handler, "choose-tree-pane-duplicate-alias", 506).await;
     let action = ModeTreeAction::pane_tree_target(
-        fixture.session_name.clone(),
+        rmux_proto::PaneTarget::with_window(fixture.session_name.clone(), 2, 0),
         fixture.session_id,
-        2,
         fixture.window_id,
         fixture.old_occurrence_id,
-        0,
         fixture.pane_id,
+        fixture.pane_output_generation,
     );
 
     handler
@@ -349,6 +354,7 @@ async fn choose_tree_default_accept_revalidates_occurrence_at_selection_lock() {
         window_occurrence_id: Some(fixture.old_occurrence_id),
         pane_index: None,
         pane_id: None,
+        pane_output_generation: None,
     };
     let replacement_occurrence_id = replace_linked_occurrence(&handler, &fixture).await;
     let action_identity = {

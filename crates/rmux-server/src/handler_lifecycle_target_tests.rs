@@ -681,25 +681,23 @@ async fn window_unlinked_hook_fails_closed_after_the_selected_occurrence_is_reli
         )
     };
 
-    handler
-        .state
-        .lock()
-        .await
-        .unlink_window(WindowTarget::with_window(session.clone(), 0), false)
-        .expect("selected occurrence unlinks without dispatching its hook");
-    assert!(matches!(
-        handler
-            .handle(Request::LinkWindow(LinkWindowRequest {
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .unlink_window(WindowTarget::with_window(session.clone(), 0), false)
+            .expect("selected occurrence unlinks without dispatching its hook");
+        state.retire_removed_lifecycle_targets();
+        state
+            .link_window(LinkWindowRequest {
                 source: WindowTarget::with_window(session.clone(), 2),
                 target: WindowTarget::with_window(session.clone(), 0),
                 after: false,
                 before: false,
                 kill_destination: false,
                 detached: true,
-            }))
-            .await,
-        Response::LinkWindow(_)
-    ));
+            })
+            .expect("selected window relinks without reserving a later lifecycle ticket");
+    }
 
     handler.dispatch_lifecycle_hook(queued).await;
 

@@ -17,8 +17,8 @@ use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeI
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
     attach_support::AttachRegistration, with_session_lease_create_addressing,
-    ControlClientIdentity, ControlRegistration, DetachedRequestGuard, PreparedSdkWait,
-    RequestHandler, SessionLeaseCreateAddressing,
+    ControlClientIdentity, ControlRegistration, DetachedRequestGuard, NormalRequestGuard,
+    PreparedSdkWait, RequestHandler, SessionLeaseCreateAddressing,
 };
 use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
@@ -29,6 +29,7 @@ use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
 
 mod legacy_shutdown;
+mod lifecycle_shutdown;
 
 use legacy_shutdown::{
     encode_legacy_kill_server_response, inspect_legacy_kill_server_frame, LegacyKillServerFrame,
@@ -36,8 +37,32 @@ use legacy_shutdown::{
 };
 
 const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+const CONNECTION_QUIESCE_GRACE: Duration = Duration::from_secs(6);
+const FOREGROUND_SHELL_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const LIFECYCLE_HOOK_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const DETACHED_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestQuiesceBehavior {
+    CancelSafe,
+    BoundedDrain,
+    Drain,
+    Upgrade,
+}
+
+impl RequestQuiesceBehavior {
+    const fn requires_drain_barrier(self) -> bool {
+        matches!(self, Self::BoundedDrain | Self::Drain | Self::Upgrade)
+    }
+
+    const fn cancels_on_shutdown(self) -> bool {
+        matches!(self, Self::CancelSafe | Self::BoundedDrain)
+    }
+
+    const fn cancels_on_peer_disconnect(self) -> bool {
+        matches!(self, Self::CancelSafe)
+    }
+}
 
 /// Accept loop: spawns a per-connection task for each incoming client.
 pub(crate) async fn serve(
@@ -72,6 +97,10 @@ pub(crate) async fn serve(
         options.owner_uid,
         options.subscription_limits,
     ));
+    #[cfg(unix)]
+    handler.install_unix_socket_access_controller(options.socket_access.ok_or_else(|| {
+        io::Error::other("Unix socket access controller is missing from serve options")
+    })?)?;
     handler.install_shutdown_handle(shutdown_handle.clone());
     handler.set_socket_path(&socket_path);
     let lifecycle_events = handler
@@ -154,6 +183,10 @@ pub(crate) async fn serve(
         }
     }
 
+    // Close the admission gate before waking connections. The gate's
+    // optimistic increment/post-check protocol makes this a linearization
+    // point: every request is either already counted or cannot start.
+    handler.close_normal_request_admission();
     drop(connection_shutdown);
     startup_task.abort();
     match startup_task.await {
@@ -162,34 +195,68 @@ pub(crate) async fn serve(
         Err(error) => warn!("startup config task failed: {error}"),
     }
 
-    drain_connection_tasks_for_shutdown(&mut connection_tasks).await;
+    handler.shutdown_status_jobs().await;
     handler.shutdown_wait_for();
-    let _ = hook_shutdown.send(());
-    // Keep shell registration open while already accepted lifecycle hooks drain. The
-    // shared deadline also bounds older background jobs before the final tree cleanup.
-    let hook_result = tokio::time::timeout(LIFECYCLE_HOOK_SHUTDOWN_GRACE, &mut hook_task).await;
-    handler.shutdown_shell_processes();
-    match hook_result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => warn!("lifecycle hook task failed: {error}"),
-        Err(_) => {
-            warn!("aborting lifecycle hooks that did not drain during daemon shutdown");
-            hook_task.abort();
-            match hook_task.await {
-                Err(error) if error.is_cancelled() => {}
-                Err(error) => warn!("lifecycle hook task failed after abort: {error}"),
-                Ok(()) => {}
-            }
-        }
+    quiesce_and_drain_connection_tasks_for_shutdown(&handler, &mut connection_tasks).await;
+    let lifecycle_shutdown_deadline = tokio::time::Instant::now() + LIFECYCLE_HOOK_SHUTDOWN_GRACE;
+    let _ = lifecycle_shutdown::drain_lifecycle_hooks_before_deadline(
+        &handler,
+        hook_shutdown,
+        &mut hook_task,
+        lifecycle_shutdown_deadline,
+    )
+    .await;
+    // Keep shell registration open while already accepted lifecycle hooks drain. Once that
+    // window closes, reject and join every background task before releasing the daemon process.
+    let unfinished_background_tasks = handler
+        .shutdown_background_tasks_and_shell_processes()
+        .await;
+    if !unfinished_background_tasks.is_empty() {
+        warn!(
+            tasks = ?unfinished_background_tasks,
+            "background tasks did not join before the shutdown deadline"
+        );
     }
+    handler.close_and_drain_lifecycle_producers().await;
+    handler.close_and_drain_post_commit_operations().await;
+    handler.seal_and_wait_for_lifecycle_publications().await;
 
     // Keep the old endpoint reserved until every accepted lifecycle hook has either
     // completed or been cancelled. Releasing it earlier lets an old hook reconnect
     // to a new daemon generation through its inherited RMUX/TMUX environment.
+    #[cfg(unix)]
+    if let Err(error) = handler.restore_owner_only_unix_transport().await {
+        warn!(
+            path = %socket_path.display(),
+            "failed to restore owner-only Unix socket permissions during shutdown: {error}"
+        );
+    }
     drop(listener);
     cleanup_on_drop.cleanup_now();
 
     Ok(())
+}
+
+async fn quiesce_and_drain_connection_tasks_for_shutdown(
+    handler: &RequestHandler,
+    connection_tasks: &mut JoinSet<io::Result<()>>,
+) {
+    if tokio::time::timeout(CONNECTION_QUIESCE_GRACE, async {
+        while !handler.normal_requests_quiesced() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        warn!("normal requests did not quiesce before the shutdown deadline");
+        // Cancel-safe waits and upgraded streams may be abandoned by the
+        // transport drain, but an admitted mutation has no safe timeout.
+        while !handler.normal_drain_requests_quiesced() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    drain_connection_tasks_for_shutdown(connection_tasks).await;
 }
 
 /// Read-dispatch-write loop for a single client connection.
@@ -201,7 +268,7 @@ async fn serve_connection(
     mut shutdown: watch::Receiver<()>,
     shutdown_handle: ShutdownHandle,
 ) -> io::Result<()> {
-    let Some(_) = handler.access_mode_for_peer(&requester) else {
+    let Some(_) = handler.server_access_admission_for_peer(&requester) else {
         let mut conn = Connection::new(stream);
         conn.write_response(&Response::Error(ErrorResponse {
             error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),
@@ -222,14 +289,16 @@ async fn serve_connection(
                 };
                 let legacy_kill_server_wire = incoming_request.legacy_kill_server_wire;
                 let request = incoming_request.request;
-                let Some(access_mode) = handler.access_mode_for_peer(&requester) else {
+                let Some(access_admission) =
+                    handler.server_access_admission_for_peer(&requester)
+                else {
                     conn.write_response(&Response::Error(ErrorResponse {
                         error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),
                     }))
                     .await?;
                     continue;
                 };
-                let can_write = access_mode.can_write();
+                let can_write = access_admission.can_write();
                 let request = match apply_access_policy(request, can_write) {
                     Ok(request) => request,
                     Err(error) => {
@@ -237,8 +306,17 @@ async fn serve_connection(
                         continue;
                     }
                 };
-                let _requester_access_guard =
-                    handler.begin_detached_requester_access(requester.pid, can_write);
+                let quiesce_behavior = request_quiesce_behavior(&request);
+                let mut request_shutdown = shutdown.clone();
+                let mut normal_request_guard: Option<NormalRequestGuard> =
+                    match handler.try_begin_normal_request(
+                        quiesce_behavior.requires_drain_barrier(),
+                    ) {
+                        Some(guard) => Some(guard),
+                        None => return Ok(()),
+                    };
+                let _requester_access_guard = handler
+                    .begin_detached_requester_access(requester.pid, access_admission.clone());
                 let mut detached_request_guard = request_counts_as_detached_activity(&request)
                     .then(|| handler.begin_detached_request());
 
@@ -252,7 +330,6 @@ async fn serve_connection(
                 } else {
                     SessionLeaseCreateAddressing::Nominal
                 };
-                let cancel_on_peer_disconnect = request_cancels_on_peer_disconnect(&request);
                 debug!("dispatching {}", request.command_name());
                 #[cfg(feature = "web")]
                 let mut undelivered_web_share;
@@ -321,13 +398,18 @@ async fn serve_connection(
                                 #[cfg(not(feature = "web"))]
                                 outcome
                             },
-                            result = shutdown.changed() => {
+                            result = wait_for_request_shutdown(
+                                &mut request_shutdown,
+                                quiesce_behavior,
+                            ),
+                                if quiesce_behavior.cancels_on_shutdown() => {
                                 if result.is_ok() {
                                     debug!("closing client connection during shutdown");
                                 }
                                 return Ok(());
                             }
-                            result = wait_for_peer_close(&conn.stream), if cancel_on_peer_disconnect => {
+                            result = wait_for_peer_close(&conn.stream),
+                                if quiesce_behavior.cancels_on_peer_disconnect() => {
                                 result?;
                                 debug!("closing client connection after peer disconnect");
                                 return Ok(());
@@ -365,7 +447,7 @@ async fn serve_connection(
                         );
                     let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let control_id = match handler
-                        .register_control_with_access(
+                        .register_control_with_server_access(
                             requester.pid,
                             control_upgrade,
                             ControlRegistration {
@@ -375,6 +457,7 @@ async fn serve_connection(
                                 user: requester.user.clone(),
                                 can_write,
                             },
+                            access_admission.clone(),
                         )
                         .await
                     {
@@ -432,7 +515,7 @@ async fn serve_connection(
                     let session_name = response.session_name.clone();
                     let terminal_context = attach.target.outer_terminal.context().clone();
                     let attach_identity = handler
-                        .register_attach_identity_with_access(
+                        .register_attach_identity_with_server_access(
                             requester.pid,
                             session_name.clone(),
                             Some(attach.session_id),
@@ -449,6 +532,7 @@ async fn serve_connection(
                                 can_write,
                                 client_size: attach.client_size,
                             },
+                            access_admission.clone(),
                         )
                         .await
                         .ok_or_else(|| {
@@ -463,6 +547,7 @@ async fn serve_connection(
                             attach.session_id,
                         )
                         .await;
+                    drop(normal_request_guard.take());
                     let (stream, buffered_bytes) = conn.into_raw_parts();
                     if !buffered_bytes.is_empty() {
                         warn!(
@@ -503,6 +588,7 @@ async fn serve_connection(
                 {
                     drop(detached_connection_guard);
                     drop(detached_request_guard.take());
+                    drop(normal_request_guard.take());
                     let (stream, buffered_bytes) = conn.into_raw_parts();
                     let result = control::forward_control(
                         stream,
@@ -665,21 +751,44 @@ fn request_enables_session_lease_by_id(request: &Request) -> bool {
     )
 }
 
-fn request_cancels_on_peer_disconnect(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::WaitFor(wait)
-            if matches!(wait.mode, WaitForMode::Wait | WaitForMode::Lock)
-    ) || matches!(
-        request,
-        Request::SdkWaitForOutput(_)
-            | Request::SdkWaitForOutputRef(_)
-            | Request::PaneStateCursor(rmux_proto::PaneStateCursorRequest { wait: true, .. })
-    ) || matches!(
-        request,
+fn request_quiesce_behavior(request: &Request) -> RequestQuiesceBehavior {
+    match request {
+        Request::LoadBuffer(_) | Request::SaveBuffer(_) | Request::SourceFile(_) => {
+            RequestQuiesceBehavior::CancelSafe
+        }
         Request::WebShare(web_share)
-            if matches!(web_share.as_ref(), rmux_proto::WebShareRequest::Create(_))
-    )
+            if matches!(web_share.as_ref(), rmux_proto::WebShareRequest::Create(_)) =>
+        {
+            RequestQuiesceBehavior::CancelSafe
+        }
+        Request::SdkWaitForOutput(_)
+        | Request::SdkWaitForOutputRef(_)
+        | Request::PaneStateCursor(rmux_proto::PaneStateCursorRequest { wait: true, .. })
+        | Request::WaitFor(rmux_proto::WaitForRequest {
+            mode: WaitForMode::Wait | WaitForMode::Lock,
+            ..
+        }) => RequestQuiesceBehavior::CancelSafe,
+        Request::RunShell(request) if !request.background && !request.as_commands => {
+            RequestQuiesceBehavior::BoundedDrain
+        }
+        Request::AttachSession(_)
+        | Request::AttachSessionExt(_)
+        | Request::AttachSessionExt2(_)
+        | Request::AttachSessionExt3(_)
+        | Request::ControlMode(_) => RequestQuiesceBehavior::Upgrade,
+        _ => RequestQuiesceBehavior::Drain,
+    }
+}
+
+async fn wait_for_request_shutdown(
+    shutdown: &mut watch::Receiver<()>,
+    behavior: RequestQuiesceBehavior,
+) -> Result<(), watch::error::RecvError> {
+    let result = shutdown.changed().await;
+    if behavior == RequestQuiesceBehavior::BoundedDrain {
+        tokio::time::sleep(FOREGROUND_SHELL_SHUTDOWN_GRACE).await;
+    }
+    result
 }
 
 fn request_counts_as_detached_activity(request: &Request) -> bool {
@@ -846,13 +955,16 @@ mod tests {
     use super::*;
     use crate::server_access::AccessMode;
     use rmux_proto::{
-        decode_frame, AttachSessionRequest, CancelSdkWaitResponse, ClientTerminalContext,
-        ControlMode, ControlModeRequest, CreateSessionLeaseRequest, DaemonStatusRequest,
-        ErrorResponse, HandshakeRequest, HasSessionRequest, ListSessionsRequest, NewSessionRequest,
-        PaneOutputSubscriptionStart, PaneTarget, RenameSessionRequest, RmuxError,
-        SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome,
-        SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest, ShutdownIfIdleResponse, TerminalSize,
-        WaitForMode, WaitForRequest, WaitForResponse, RMUX_WIRE_VERSION,
+        decode_frame, encode_internal_runtime_command_arguments, AttachSessionRequest,
+        CancelSdkWaitResponse, ClientTerminalContext, ControlMode, ControlModeRequest,
+        CreateSessionLeaseRequest, DaemonStatusRequest, ErrorResponse, HandshakeRequest,
+        HasSessionRequest, ListSessionsRequest, NewSessionRequest, OptionName,
+        PaneOutputSubscriptionStart, PaneTarget, RenameSessionRequest, RmuxError, RunShellRequest,
+        ScopeSelector, SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId,
+        SdkWaitOutcome, SdkWaitOwnerId, SessionName, SetOptionMode, SetOptionRequest,
+        ShutdownIfIdleRequest, ShutdownIfIdleResponse, SourceFileRequest, TerminalSize,
+        WaitForMode, WaitForRequest, WaitForResponse, INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH,
+        RMUX_WIRE_VERSION,
     };
 
     #[test]
@@ -891,6 +1003,32 @@ mod tests {
         drain_connection_tasks_for_shutdown(&mut tasks).await;
         assert!(tasks.is_empty());
         drop(client);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_quiesces_drain_requests_before_transport_abort() -> io::Result<()> {
+        let handler = Arc::new(RequestHandler::new());
+        let request_guard = handler
+            .try_begin_normal_request(true)
+            .expect("request admitted before shutdown");
+        let committed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_committed = Arc::clone(&committed);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _request_guard = request_guard;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            task_committed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+
+        handler.close_normal_request_admission();
+        quiesce_and_drain_connection_tasks_for_shutdown(&handler, &mut tasks).await;
+
+        assert!(
+            committed.load(std::sync::atomic::Ordering::SeqCst),
+            "the admitted mutation must finish before the 250 ms transport abort applies"
+        );
         Ok(())
     }
 
@@ -974,6 +1112,172 @@ mod tests {
             })
         ));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_an_admitted_effect_before_closing_the_connection() -> io::Result<()> {
+        let handler = Arc::new(RequestHandler::new());
+        let (mut client, shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+        let marker = std::env::temp_dir().join(format!(
+            "rmux-listener-quiesce-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        let command = format!(
+            "printf started > {}; sleep 0.4; printf committed >> {}",
+            marker.display(),
+            marker.display()
+        );
+        write_test_request(
+            &mut client,
+            Request::RunShell(Box::new(RunShellRequest {
+                command,
+                arguments: Vec::new(),
+                background: false,
+                as_commands: false,
+                show_stderr: false,
+                delay_seconds: None,
+                start_directory: None,
+                target: None,
+                source_depth: None,
+            })),
+        )
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("foreground command starts before quiesce");
+        assert!(!handler.normal_drain_requests_quiesced());
+
+        handler.close_normal_request_admission();
+        shutdown_tx.send_replace(());
+
+        let response =
+            tokio::time::timeout(Duration::from_secs(3), read_test_response(&mut client))
+                .await
+                .expect("admitted mutation returns after shutdown")?;
+        assert!(matches!(response, Response::RunShell(_)), "{response:?}");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !handler.normal_drain_requests_quiesced() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completed response releases the drain barrier");
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the admitted shell effect commits"),
+            "startedcommitted"
+        );
+
+        connection_task.await.expect("connection task")?;
+        let _ = std::fs::remove_file(marker);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_bounds_and_reaps_a_foreground_run_shell_tree() -> io::Result<()> {
+        let handler = Arc::new(RequestHandler::new());
+        let (mut client, shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+        let marker = std::env::temp_dir().join(format!(
+            "rmux-listener-foreground-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        let command = format!("printf '%s' $$ > {}; sleep 30", marker.display());
+        write_test_request(
+            &mut client,
+            Request::RunShell(Box::new(RunShellRequest {
+                command,
+                arguments: Vec::new(),
+                background: false,
+                as_commands: false,
+                show_stderr: false,
+                delay_seconds: None,
+                start_directory: None,
+                target: None,
+                source_depth: None,
+            })),
+        )
+        .await?;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("foreground command starts before shutdown");
+        let shell_pid = std::fs::read_to_string(&marker)
+            .expect("foreground command writes its pid")
+            .parse::<u32>()
+            .expect("foreground command pid is numeric");
+        assert!(rmux_os::process::is_live(shell_pid));
+        assert!(!handler.normal_drain_requests_quiesced());
+
+        tokio::time::pause();
+        handler.close_normal_request_admission();
+        shutdown_tx.send_replace(());
+        tokio::task::yield_now().await;
+        tokio::time::advance(FOREGROUND_SHELL_SHUTDOWN_GRACE + Duration::from_millis(1)).await;
+
+        tokio::time::timeout(Duration::from_secs(1), connection_task)
+            .await
+            .expect("bounded foreground request must release its connection")
+            .expect("connection task joins")?;
+        assert!(
+            handler.normal_drain_requests_quiesced(),
+            "bounded cancellation must release the drain barrier"
+        );
+        assert!(
+            !rmux_os::process::is_live(shell_pid),
+            "foreground shell process tree survived bounded shutdown"
+        );
+
+        let _ = std::fs::remove_file(marker);
+        Ok(())
+    }
+
+    #[test]
+    fn only_external_foreground_run_shell_uses_bounded_drain() {
+        let request = |background, as_commands| {
+            Request::RunShell(Box::new(RunShellRequest {
+                command: "true".to_owned(),
+                arguments: Vec::new(),
+                background,
+                as_commands,
+                show_stderr: false,
+                delay_seconds: None,
+                start_directory: None,
+                target: None,
+                source_depth: None,
+            }))
+        };
+
+        assert_eq!(
+            request_quiesce_behavior(&request(false, false)),
+            RequestQuiesceBehavior::BoundedDrain
+        );
+        assert_eq!(
+            request_quiesce_behavior(&request(true, false)),
+            RequestQuiesceBehavior::Drain,
+            "background jobs are owned by the background-task lifecycle"
+        );
+        assert_eq!(
+            request_quiesce_behavior(&request(false, true)),
+            RequestQuiesceBehavior::Drain,
+            "run-shell -C may contain admitted server mutations"
+        );
     }
 
     #[tokio::test]
@@ -1099,6 +1403,139 @@ mod tests {
                 error: RmuxError::Server("access not allowed".to_owned())
             })
         );
+
+        drop(client);
+        connection_task.await.expect("connection task")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_only_peer_can_execute_validated_list_windows_all_path() -> io::Result<()> {
+        let peer_uid = rmux_os::identity::real_user_id().saturating_add(20_000);
+        let peer = PeerIdentity {
+            pid: std::process::id(),
+            uid: peer_uid,
+            user: rmux_os::identity::UserIdentity::Uid(peer_uid),
+        };
+        let handler = Arc::new(RequestHandler::new());
+        for session_name in ["readonly-list-a", "readonly-list-b"] {
+            assert!(matches!(
+                handler
+                    .handle(Request::NewSession(NewSessionRequest {
+                        session_name: SessionName::new(session_name).expect("valid session"),
+                        detached: true,
+                        size: Some(TerminalSize { cols: 80, rows: 24 }),
+                        environment: None,
+                    }))
+                    .await,
+                Response::NewSession(_)
+            ));
+        }
+        assert!(matches!(
+            handler
+                .handle(Request::SetOption(SetOptionRequest {
+                    scope: ScopeSelector::Global,
+                    option: OptionName::CommandAlias,
+                    value: "list-windows=kill-session".to_owned(),
+                    mode: SetOptionMode::Replace,
+                }))
+                .await,
+            Response::SetOption(_)
+        ));
+        handler
+            .set_test_access_mode_for_uid(peer_uid, AccessMode::ReadOnly)
+            .expect("test peer is read-only");
+        let (mut client, _shutdown_tx, connection_task) =
+            spawn_test_connection_with_peer(&handler, peer)?;
+
+        let payload = encode_internal_runtime_command_arguments(&[
+            "list-windows".to_owned(),
+            "-a".to_owned(),
+        ])
+        .expect("list-windows argv encodes");
+        write_test_request(
+            &mut client,
+            Request::SourceFile(Box::new(SourceFileRequest {
+                paths: vec![INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH.to_owned()],
+                quiet: false,
+                parse_only: false,
+                verbose: false,
+                expand_paths: false,
+                target: None,
+                caller_cwd: None,
+                stdin: Some(payload),
+            })),
+        )
+        .await?;
+
+        let Response::SourceFile(response) = read_test_response(&mut client).await? else {
+            panic!("validated list-windows path must reach the read-only queue");
+        };
+        assert_eq!(
+            response.exit_status(),
+            None,
+            "the built-in listing must not be rewritten through command-alias"
+        );
+        let output = response
+            .command_output()
+            .expect("listing has output")
+            .stdout();
+        for session_name in [b"readonly-list-a".as_slice(), b"readonly-list-b".as_slice()] {
+            assert!(
+                output
+                    .windows(session_name.len())
+                    .any(|window| window == session_name),
+                "listing output must contain {}",
+                String::from_utf8_lossy(session_name)
+            );
+        }
+
+        let mutating_payload = encode_internal_runtime_command_arguments(&[
+            "kill-session".to_owned(),
+            "-a".to_owned(),
+        ])
+        .expect("mutating argv encodes");
+        write_test_request(
+            &mut client,
+            Request::SourceFile(Box::new(SourceFileRequest {
+                paths: vec![INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH.to_owned()],
+                quiet: false,
+                parse_only: false,
+                verbose: false,
+                expand_paths: false,
+                target: None,
+                caller_cwd: None,
+                stdin: Some(mutating_payload),
+            })),
+        )
+        .await?;
+        assert_eq!(
+            read_test_response(&mut client).await?,
+            Response::Error(ErrorResponse {
+                error: RmuxError::Server("client is read-only".to_owned()),
+            })
+        );
+
+        let Response::ListSessions(sessions) = handler
+            .handle(Request::ListSessions(ListSessionsRequest {
+                format: Some("#{session_name}".to_owned()),
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            }))
+            .await
+        else {
+            panic!("sessions must remain listable after the read-only request");
+        };
+        let surviving_sessions = sessions
+            .command_output()
+            .stdout()
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(surviving_sessions.len(), 2);
+        assert!(surviving_sessions.contains(&b"readonly-list-a".as_slice()));
+        assert!(surviving_sessions.contains(&b"readonly-list-b".as_slice()));
 
         drop(client);
         connection_task.await.expect("connection task")?;

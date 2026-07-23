@@ -64,6 +64,31 @@ fn resolve(
 }
 
 #[test]
+fn missing_current_target_fallback_can_be_forbidden_without_changing_the_default() {
+    let store = populated_store();
+    let missing = Target::Window(WindowTarget::with_window(session_name("removed"), 0));
+
+    let fallback = store.resolve_unresolved_target(
+        &UnresolvedTarget::none(),
+        TargetFindType::Window,
+        TargetFindFlags::NONE,
+        &TargetFindContext::from_target(missing.clone()),
+    );
+    assert!(
+        fallback.is_ok(),
+        "ordinary lookup keeps its default fallback"
+    );
+
+    let strict = store.resolve_unresolved_target(
+        &UnresolvedTarget::none(),
+        TargetFindType::Window,
+        TargetFindFlags::NONE,
+        &TargetFindContext::from_target(missing).forbid_missing_current_target_fallback(),
+    );
+    assert!(strict.is_err(), "retained tombstones must fail closed");
+}
+
+#[test]
 fn resolves_exact_target_to_existing_protocol_types() {
     let store = populated_store();
 

@@ -3,6 +3,7 @@ use std::io;
 use rmux_core::{key_code_lookup_bits, key_string_lookup_string, KeyCode};
 use rmux_proto::{CommandOutput, RmuxError, SessionId, SessionName, Target};
 
+use super::identity::OverlayIdentity;
 use super::parse::{ParsedDisplayPopupCommand, PopupSizeSpec};
 use super::state::ClientOverlayState;
 use super::RequestHandler;
@@ -83,7 +84,6 @@ enum ScrollablePopupAction {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::handler) struct AttachedHelpContext<'a> {
     pub(in crate::handler) attach_pid: u32,
-    pub(in crate::handler) requester_pid: u32,
     pub(in crate::handler) expected_identity: Option<ActiveAttachIdentity>,
     pub(in crate::handler) expected_session_name: &'a SessionName,
     pub(in crate::handler) expected_session_id: SessionId,
@@ -131,7 +131,6 @@ impl RequestHandler {
     ) -> Result<bool, RmuxError> {
         let AttachedHelpContext {
             attach_pid,
-            requester_pid,
             expected_identity,
             expected_session_name,
             expected_session_id,
@@ -140,7 +139,7 @@ impl RequestHandler {
         if output.stdout().is_empty() || target.session_name() != expected_session_name {
             return Ok(false);
         }
-        {
+        let attach_identity = {
             let active_attach = self.active_attach.lock().await;
             let Some(active) = active_attach.by_pid.get(&attach_pid) else {
                 return Ok(false);
@@ -153,7 +152,8 @@ impl RequestHandler {
             ) {
                 return Ok(false);
             }
-        }
+            active.identity(attach_pid)
+        };
 
         let command = ParsedDisplayPopupCommand {
             target_client: None,
@@ -175,12 +175,17 @@ impl RequestHandler {
             environment: Vec::new(),
             command: None,
         };
+        let overlay_identity = {
+            let mut state = self.state.lock().await;
+            OverlayIdentity::capture(&mut state, attach_identity, target.clone())?
+        };
         let mut popup = self
-            .build_display_popup_state(attach_pid, requester_pid, command, target.clone())
+            .build_display_popup_state(attach_pid, command, target.clone(), overlay_identity)
             .await?;
         popup.scrollable_text = Some(ScrollablePopupText::from_stdout(output.stdout()));
 
         {
+            let state = self.state.lock().await;
             let mut active_attach = self.active_attach.lock().await;
             let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
                 return Ok(false);
@@ -191,6 +196,12 @@ impl RequestHandler {
                 expected_session_name,
                 expected_session_id,
             ) {
+                return Ok(false);
+            }
+            if !popup
+                .identity
+                .matches(&state, active, &popup.current_target)
+            {
                 return Ok(false);
             }
             active.overlay_state_id = active.overlay_state_id.saturating_add(1);

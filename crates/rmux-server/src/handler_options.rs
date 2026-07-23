@@ -2,8 +2,7 @@ use std::path::Path;
 
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    ErrorResponse, OptionName, Response, RmuxError, ScopeSelector, SessionName,
-    SetOptionByNameResponse, SetOptionResponse, WindowTarget,
+    ErrorResponse, OptionName, Response, SetOptionByNameResponse, SetOptionResponse, WindowTarget,
 };
 
 use crate::format_runtime::render_runtime_template;
@@ -20,12 +19,17 @@ mod pane_sdk;
 mod pane_state_events;
 #[path = "handler_options/resize_reconciliation.rs"]
 mod resize_reconciliation;
+#[path = "handler_options/terminal_geometry.rs"]
+mod terminal_geometry;
 
 use default_shell::{validate_named_mutation, validate_typed_mutation};
 use pane_state_events::{
     pane_option_events_for_outcome, synchronize_pane_option_aliases_for_outcome,
 };
 use resize_reconciliation::ResizePolicyReconcileScope;
+use terminal_geometry::{
+    resize_terminals_for_named_option_change, resize_terminals_for_option_change,
+};
 
 impl RequestHandler {
     pub(super) async fn handle_set_option(
@@ -54,6 +58,7 @@ impl RequestHandler {
         let automatic_rename_scope = (request.option == OptionName::AutomaticRename)
             .then(|| legacy_scope_to_refresh_scope(&request.scope));
         let mut alerts_changed = false;
+        let mut linked_geometry_refreshes = Vec::new();
         let response = {
             let mut state = self.state.lock().await;
 
@@ -105,11 +110,14 @@ impl RequestHandler {
                         request.option,
                         &request.scope,
                     ) {
-                        Ok(()) => Response::SetOption(SetOptionResponse {
-                            scope: request.scope,
-                            option: request.option,
-                            mode: request.mode,
-                        }),
+                        Ok(refreshes) => {
+                            linked_geometry_refreshes = refreshes;
+                            Response::SetOption(SetOptionResponse {
+                                scope: request.scope,
+                                option: request.option,
+                                mode: request.mode,
+                            })
+                        }
                         Err(error) => Response::Error(ErrorResponse { error }),
                     };
                     for (pane_id, generation, outcome) in &pane_option_events {
@@ -157,6 +165,9 @@ impl RequestHandler {
             for session_name in resize_family_refreshes {
                 self.refresh_attached_session(&session_name).await;
             }
+            for session_name in linked_geometry_refreshes {
+                self.refresh_attached_session(&session_name).await;
+            }
             if alerts_changed {
                 self.sync_alert_timers_for_option_scope(&alert_scope).await;
             }
@@ -177,7 +188,7 @@ impl RequestHandler {
         &self,
         request: rmux_proto::SetOptionByNameRequest,
     ) -> Response {
-        self.handle_set_option_by_name_with_client_name(request, None)
+        self.handle_set_option_by_name_inner(request, None, None)
             .await
     }
 
@@ -186,12 +197,43 @@ impl RequestHandler {
         request: rmux_proto::SetOptionByNameRequest,
         client_name: Option<String>,
     ) -> Response {
+        self.handle_set_option_by_name_inner(request, client_name, None)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_set_option_by_name_for_mode_tree(
+        &self,
+        request: rmux_proto::SetOptionByNameRequest,
+        identity: super::mode_tree_support::ModeTreeActionIdentity,
+    ) -> Response {
+        self.handle_set_option_by_name_inner(request, None, Some(identity))
+            .await
+    }
+
+    async fn handle_set_option_by_name_inner(
+        &self,
+        request: rmux_proto::SetOptionByNameRequest,
+        client_name: Option<String>,
+        mode_tree_identity: Option<super::mode_tree_support::ModeTreeActionIdentity>,
+    ) -> Response {
         let refresh_scope = request.scope.clone();
         let mut alerts_changed = false;
         let mut destroy_unattached_scope = None;
         let mut resize_policy_scope = None;
+        let mut linked_geometry_refreshes = Vec::new();
         let response = {
             let mut state = self.state.lock().await;
+            let _mode_tree_guard = if let Some(identity) = mode_tree_identity {
+                let active_attach = self.active_attach.lock().await;
+                if !identity.matches_active(&state, &active_attach) {
+                    return Response::Error(rmux_proto::ErrorResponse {
+                        error: rmux_proto::RmuxError::Server("mode-tree is not active".to_owned()),
+                    });
+                }
+                Some(active_attach)
+            } else {
+                None
+            };
 
             if let Err(error) = ensure_option_scope_exists(&state, &request.scope) {
                 return Response::Error(ErrorResponse { error });
@@ -296,13 +338,16 @@ impl RequestHandler {
                                 &request.scope,
                             )
                         })
-                        .unwrap_or(Ok(()))
+                        .unwrap_or(Ok(Vec::new()))
                     {
-                        Ok(()) => Response::SetOptionByName(SetOptionByNameResponse {
-                            scope: request.scope,
-                            name: outcome.name,
-                            mode: request.mode,
-                        }),
+                        Ok(refreshes) => {
+                            linked_geometry_refreshes = refreshes;
+                            Response::SetOptionByName(SetOptionByNameResponse {
+                                scope: request.scope,
+                                name: outcome.name,
+                                mode: request.mode,
+                            })
+                        }
                         Err(error) => Response::Error(ErrorResponse { error }),
                     };
                     for (pane_id, generation, outcome) in &pane_option_events {
@@ -345,6 +390,9 @@ impl RequestHandler {
                 }
             }
             for session_name in resize_family_refreshes {
+                self.refresh_attached_session(&session_name).await;
+            }
+            for session_name in linked_geometry_refreshes {
                 self.refresh_attached_session(&session_name).await;
             }
             if alerts_changed {
@@ -444,56 +492,6 @@ fn option_scope_to_legacy_scope(scope: &OptionScopeSelector) -> Option<rmux_prot
     }
 }
 
-fn resize_terminals_for_option_change(
-    state: &mut crate::pane_terminals::HandlerState,
-    option: OptionName,
-    scope: &ScopeSelector,
-) -> Result<(), RmuxError> {
-    if !option_affects_pane_terminal_geometry(option) {
-        return Ok(());
-    }
-
-    let session_names = match scope {
-        ScopeSelector::Global => all_session_names(state),
-        ScopeSelector::Session(session_name) => vec![session_name.clone()],
-        ScopeSelector::Window(target) => vec![target.session_name().clone()],
-        ScopeSelector::Pane(target) => vec![target.session_name().clone()],
-    };
-    resize_terminals_for_sessions(state, session_names)
-}
-
-fn resize_terminals_for_named_option_change(
-    state: &mut crate::pane_terminals::HandlerState,
-    option: OptionName,
-    scope: &OptionScopeSelector,
-) -> Result<(), RmuxError> {
-    if !option_affects_pane_terminal_geometry(option) {
-        return Ok(());
-    }
-
-    let session_names = match scope {
-        OptionScopeSelector::ServerGlobal
-        | OptionScopeSelector::SessionGlobal
-        | OptionScopeSelector::WindowGlobal => all_session_names(state),
-        OptionScopeSelector::Session(session_name) => vec![session_name.clone()],
-        OptionScopeSelector::Window(target) => vec![target.session_name().clone()],
-        OptionScopeSelector::Pane(target) => vec![target.session_name().clone()],
-    };
-    resize_terminals_for_sessions(state, session_names)
-}
-
-fn option_affects_pane_terminal_geometry(option: OptionName) -> bool {
-    matches!(option, OptionName::PaneBorderStatus | OptionName::Status)
-}
-
-fn all_session_names(state: &crate::pane_terminals::HandlerState) -> Vec<SessionName> {
-    state
-        .sessions
-        .iter()
-        .map(|(session_name, _)| session_name.clone())
-        .collect()
-}
-
 fn automatic_rename_targets_for_scope(
     state: &mut crate::pane_terminals::HandlerState,
     scope: &OptionScopeSelector,
@@ -558,16 +556,6 @@ fn window_targets_for_option_scope(
             target.window_index(),
         )],
     }
-}
-
-fn resize_terminals_for_sessions(
-    state: &mut crate::pane_terminals::HandlerState,
-    session_names: Vec<SessionName>,
-) -> Result<(), RmuxError> {
-    for session_name in session_names {
-        state.resize_terminals(&session_name)?;
-    }
-    Ok(())
 }
 
 pub(super) fn option_value_u32(

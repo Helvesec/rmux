@@ -331,7 +331,10 @@ impl HandlerState {
             session,
             &self.options,
             window_index,
+            pane.index(),
             pane.geometry(),
+            false,
+            false,
         );
         let window_id = session
             .window_at(window_index)

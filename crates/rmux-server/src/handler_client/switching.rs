@@ -5,8 +5,10 @@ use std::time::Instant;
 
 use rmux_core::{TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget};
 use rmux_proto::request::{SwitchClientExt2Request, SwitchClientExt3Request};
+#[cfg(test)]
+use rmux_proto::OptionName;
 use rmux_proto::{
-    ErrorResponse, OptionName, PaneId, PaneTarget, Response, RmuxError, SessionId, SessionName,
+    ErrorResponse, PaneId, PaneTarget, Response, RmuxError, SessionId, SessionName,
     SwitchClientResponse, Target, TerminalGeometry, WindowId, WindowTarget,
 };
 
@@ -42,6 +44,7 @@ pub(in crate::handler) enum SwitchTargetSelection {
         target: PaneTarget,
         window_id: WindowId,
         pane_id: PaneId,
+        pane_output_generation: Option<u64>,
         zoom: bool,
     },
 }
@@ -79,19 +82,37 @@ impl SwitchTargetSelection {
             .filter(|session| session.id() == expected_session_id)
             .ok_or_else(|| session_not_found(expected_session_name))?;
         let mut preview = session.clone();
-        self.apply_to_session(&mut preview)
+        self.apply_to_session(&mut preview)?;
+        if let Self::Pane {
+            target,
+            pane_id,
+            pane_output_generation: Some(expected_generation),
+            ..
+        } = self
+        {
+            let current_generation = state.pane_output_generation_for_target(target, *pane_id);
+            if current_generation != *expected_generation {
+                return Err(RmuxError::invalid_target(
+                    target.to_string(),
+                    "pane output generation changed before switch commit",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(in crate::handler) fn apply_to_state(
         &self,
         state: &mut HandlerState,
-    ) -> Result<(), RmuxError> {
+    ) -> Result<Vec<SessionName>, RmuxError> {
         let session_name = self.session_name().clone();
-        let session = state
-            .sessions
-            .session_mut(&session_name)
-            .ok_or_else(|| session_not_found(&session_name))?;
-        self.apply_to_session(session)
+        let window_index = self.window_target().window_index();
+        let (_, refresh_sessions) = state.mutate_session_and_resize_window_terminal_with_family(
+            &session_name,
+            window_index,
+            |session| self.apply_to_session(session),
+        )?;
+        Ok(refresh_sessions)
     }
 
     pub(in crate::handler) fn apply_to_session(
@@ -118,6 +139,7 @@ impl SwitchTargetSelection {
                 target,
                 window_id,
                 pane_id,
+                pane_output_generation: _,
                 zoom,
             } => {
                 let (was_zoomed, zoom_pane) = {
@@ -520,9 +542,7 @@ impl RequestHandler {
             }
             Err(_) => None,
         };
-        let mut session_name = current_session
-            .as_ref()
-            .map(|identity| identity.session_name.clone());
+        let mut session_identity = current_session.clone();
 
         let switch_target = if let Some(target) = request.target.as_deref() {
             match self
@@ -620,7 +640,7 @@ impl RequestHandler {
         if let Some(target_session) = switch_target {
             #[cfg(test)]
             pause_after_switch_target_identity_capture(&target_session.session.session_name).await;
-            let target_session_name = target_session.session.session_name.clone();
+            let target_session_identity = target_session.session.clone();
             let response = self
                 .switch_managed_client_to_session_identity(
                     requester_pid,
@@ -633,14 +653,15 @@ impl RequestHandler {
             let Response::SwitchClient(_) = &response else {
                 return response;
             };
-            session_name = Some(target_session_name);
+            session_identity = Some(target_session_identity);
         }
 
-        let Some(session_name) = session_name else {
+        let Some(session_identity) = session_identity else {
             return Response::Error(ErrorResponse {
                 error: attached_client_required("switch-client"),
             });
         };
+        let session_name = session_identity.session_name;
 
         if let Some(key_table) = request.key_table {
             let SwitchManagedClientIdentity::Attach {
@@ -655,7 +676,13 @@ impl RequestHandler {
                 });
             };
             if let Err(error) = self
-                .apply_attached_key_table(attach_pid, attach_id, &session_name, key_table)
+                .apply_attached_key_table(
+                    attach_pid,
+                    attach_id,
+                    &session_name,
+                    session_identity.session_id,
+                    key_table,
+                )
                 .await
             {
                 return Response::Error(ErrorResponse { error });
@@ -1093,45 +1120,31 @@ impl RequestHandler {
         attach_pid: u32,
         attach_id: u64,
         session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
         key_table: String,
     ) -> Result<(), RmuxError> {
+        #[cfg(test)]
+        self.pause_before_attached_key_table_switch_apply(attach_pid)
+            .await;
         let key_table_set_at = Instant::now();
-        self.set_attached_key_table_for_client_identity(
-            attach_pid,
-            attach_id,
-            Some(key_table.clone()),
-            Some(key_table_set_at),
-        )
-        .await?;
-        let mut active_attach = self.active_attach.lock().await;
-        let Some(active) = active_attach
-            .by_pid
-            .get_mut(&attach_pid)
-            .filter(|active| active.id == attach_id && &active.session_name == session_name)
-        else {
-            return Err(attached_client_required("switch-client"));
-        };
-        active.repeat_active = false;
-        active.repeat_deadline = None;
-        active.last_key = None;
-        drop(active_attach);
+        let commit = self
+            .set_attached_key_table_for_client_session_identity_and_reset_repeat(
+                super::super::attach_support::ActiveAttachIdentity::new(
+                    attach_pid, attach_id, session_id,
+                ),
+                session_name,
+                Some(key_table.clone()),
+                Some(key_table_set_at),
+            )
+            .await?;
 
-        if key_table == "prefix" {
-            let prefix_timeout_ms = {
-                let state = self.state.lock().await;
-                state
-                    .options
-                    .resolve(Some(session_name), OptionName::PrefixTimeout)
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(0)
-            };
-            if prefix_timeout_ms != 0 {
-                self.schedule_attached_prefix_timeout(
-                    attach_pid,
-                    key_table_set_at,
-                    prefix_timeout_ms,
-                );
-            }
+        if key_table == "prefix" && commit.prefix_timeout_ms != 0 {
+            self.schedule_attached_prefix_timeout_for_identity(
+                commit.identity,
+                key_table_set_at,
+                commit.key_table_generation,
+                commit.prefix_timeout_ms,
+            );
         }
 
         Ok(())
@@ -1171,7 +1184,7 @@ impl RequestHandler {
         apply_selection: bool,
     ) -> Result<ResolvedSwitchTarget, RmuxError> {
         let find_type = switch_client_target_find_type(target);
-        self.with_switch_client_state(client, |state| {
+        let outcome = self.with_switch_client_state(client, |state| {
             let current_target = match current_session {
                 Some(identity) => {
                     if state
@@ -1254,30 +1267,40 @@ impl RequestHandler {
                             target,
                             window_id,
                             pane_id,
+                            pane_output_generation: None,
                             zoom,
                         }),
                     )
                 }
             };
-            if apply_selection {
+            let refresh_sessions = if apply_selection {
                 if let Some(selection) = selection.as_ref() {
-                    selection.apply_to_state(state)?;
+                    selection.apply_to_state(state)?
+                } else {
+                    Vec::new()
                 }
-            }
+            } else {
+                Vec::new()
+            };
             let session_id = state
                 .sessions
                 .session(&session_name)
                 .ok_or_else(|| session_not_found(&session_name))?
                 .id();
-            Ok(ResolvedSwitchTarget {
-                session: SwitchSessionIdentity {
-                    session_name,
-                    session_id,
+            Ok((
+                ResolvedSwitchTarget {
+                    session: SwitchSessionIdentity {
+                        session_name,
+                        session_id,
+                    },
+                    selection,
                 },
-                selection,
-            })
-        })
-        .await
+                refresh_sessions,
+            ))
+        });
+        let (resolved, refresh_sessions) = outcome.await?;
+        self.refresh_linked_window_sessions(refresh_sessions).await;
+        Ok(resolved)
     }
 
     async fn adjacent_session_name(
@@ -1414,6 +1437,16 @@ mod tests {
 
     fn session_name(value: &str) -> SessionName {
         SessionName::new(value).expect("valid session name")
+    }
+
+    fn drain_control_events(
+        events: &mut mpsc::Receiver<ControlServerEvent>,
+    ) -> Vec<ControlServerEvent> {
+        let mut drained = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            drained.push(event);
+        }
+        drained
     }
 
     struct SwitchEnvironmentChild(std::process::Child);
@@ -1616,6 +1649,7 @@ mod tests {
             target: PaneTarget::with_window(beta.clone(), 0, pane_index),
             window_id,
             pane_id: captured_pane_id,
+            pane_output_generation: None,
             zoom: false,
         };
 
@@ -2545,15 +2579,16 @@ mod tests {
             .set_control_session(control_pid, Some(alpha.clone()))
             .await
             .expect("replacement control session set succeeds");
-        assert!(matches!(
-            replacement_rx.try_recv(),
-            Ok(ControlServerEvent::SessionChanged(Some(ref session_name)))
-                | Ok(ControlServerEvent::SessionChangedAt {
-                    ref session_name,
-                    ..
-                })
-                if session_name == &alpha
-        ));
+        let replacement_events = drain_control_events(&mut replacement_rx);
+        assert!(
+            replacement_events.iter().any(|event| matches!(
+                event,
+                ControlServerEvent::SessionChanged(Some(session_name))
+                    | ControlServerEvent::SessionChangedAt { session_name, .. }
+                    if session_name == &alpha
+            )),
+            "replacement control did not enter the original session: {replacement_events:?}"
+        );
         pause.release.notify_one();
 
         assert_eq!(
@@ -2566,7 +2601,13 @@ mod tests {
             replacement_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
-        assert!(matches!(old_rx.try_recv(), Ok(ControlServerEvent::Exit(_))));
+        let old_events = drain_control_events(&mut old_rx);
+        assert!(
+            old_events
+                .iter()
+                .any(|event| matches!(event, ControlServerEvent::Exit(_))),
+            "replaced control did not exit: {old_events:?}"
+        );
         let active_control = handler.active_control.lock().await;
         let replacement = active_control
             .by_pid

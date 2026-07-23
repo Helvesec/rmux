@@ -55,6 +55,14 @@ pub(crate) struct NewWindowArgs {
     pub(crate) detached: bool,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) command: Vec<String>,
+    #[arg(skip = String::new())]
+    pub(crate) queue_command: String,
+}
+
+impl QueuedCommand for NewWindowArgs {
+    fn set_queue_command(&mut self, queue_command: String) {
+        self.queue_command = queue_command;
+    }
 }
 
 #[derive(Debug, Clone, Args)]

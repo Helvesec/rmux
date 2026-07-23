@@ -5,8 +5,6 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
 use rmux_client::attach_terminal_with_initial_bytes;
@@ -16,9 +14,9 @@ use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
 use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
 use rmux_client::{
     connect, connect_or_absent, ensure_server_running_with_config_outcome, resolve_socket_path,
-    resolve_tmux_compatible_socket_path, AttachTransition, AutoStartConfig, ClientError,
-    ConnectResult, Connection, EnsuredServerConnection, ServerConnectionProvenance,
-    StartServerError,
+    resolve_tmux_compatible_socket_path, wait_for_server_endpoint_cleanup, AttachTransition,
+    AutoStartConfig, ClientError, ConnectResult, Connection, EnsuredServerConnection,
+    ServerConnectionProvenance, StartServerError,
 };
 use rmux_core::formats::{DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT};
 use rmux_core::{
@@ -60,16 +58,6 @@ use parse::{
     TinySelectWindow, TinySendKeys, TinySetOption, TinyShowOptions, TinySourceFile,
 };
 use trace::{trace_direct, trace_fallback};
-
-#[cfg(unix)]
-// The daemon may spend up to five seconds draining accepted lifecycle hooks
-// before it releases the endpoint. Keep enough margin for connection cleanup
-// and scheduler contention so a successful kill-server is a restart barrier.
-const KILL_SERVER_SOCKET_CLEANUP_TIMEOUT: Duration = Duration::from_secs(7);
-#[cfg(unix)]
-const KILL_SERVER_SOCKET_CLEANUP_MIN_POLL: Duration = Duration::from_millis(1);
-#[cfg(unix)]
-const KILL_SERVER_SOCKET_CLEANUP_MAX_POLL: Duration = Duration::from_millis(10);
 
 pub(crate) fn main() {
     let args: Vec<OsString> = env::args_os().collect();
@@ -1140,7 +1128,11 @@ fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     match probe_kill_server_compatible(&mut connection) {
         Ok(()) => {}
-        Err(error) if kill_server_connection_closed(&error) => return Ok(0),
+        Err(error) if kill_server_connection_closed(&error) => {
+            drop(connection);
+            wait_for_killed_server_socket_cleanup(socket_path)?;
+            return Ok(0);
+        }
         Err(error) => {
             if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
                 return run_legacy_wire_kill_server(socket_path, wire_version);
@@ -1148,9 +1140,17 @@ fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
             return Err(error.to_string());
         }
     }
-    match connection.kill_server_after_write() {
-        Ok(()) => Ok(0),
-        Err(error) if kill_server_connection_closed(&error) => Ok(0),
+    let shutdown = connection.kill_server_after_write();
+    drop(connection);
+    match shutdown {
+        Ok(()) => {
+            wait_for_killed_server_socket_cleanup(socket_path)?;
+            Ok(0)
+        }
+        Err(error) if kill_server_connection_closed(&error) => {
+            wait_for_killed_server_socket_cleanup(socket_path)?;
+            Ok(0)
+        }
         Err(error) => Err(error.to_string()),
     }
 }
@@ -1168,11 +1168,13 @@ fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
     match connection.kill_server() {
         Ok(response) => {
             let code = write_response_output_or_error(response, "kill-server")?;
-            wait_for_killed_server_socket_cleanup(socket_path);
+            drop(connection);
+            wait_for_killed_server_socket_cleanup(socket_path)?;
             Ok(code)
         }
         Err(error) if kill_server_connection_closed(&error) => {
-            wait_for_killed_server_socket_cleanup(socket_path);
+            drop(connection);
+            wait_for_killed_server_socket_cleanup(socket_path)?;
             Ok(0)
         }
         Err(error) => {
@@ -1416,7 +1418,8 @@ fn run_attach_session(
     if !server_has_sessions(&mut connection)? {
         if started_by_caller {
             let _ = connection.shutdown_if_idle();
-            wait_for_killed_server_socket_cleanup(socket_path);
+            drop(connection);
+            let _ = wait_for_killed_server_socket_cleanup(socket_path);
         }
         return Err("no sessions".to_owned());
     }
@@ -1611,18 +1614,20 @@ fn run_legacy_wire_kill_server(socket_path: &Path, wire_version: u32) -> Result<
         match connect_or_absent(socket_path).map_err(|error| client_error(socket_path, error))? {
             ConnectResult::Connected(connection) => connection,
             ConnectResult::Absent => {
-                wait_for_killed_server_socket_cleanup(socket_path);
+                wait_for_killed_server_socket_cleanup(socket_path)?;
                 return Ok(0);
             }
         };
 
-    match connection.kill_server_legacy_wire(wire_version) {
+    let shutdown = connection.kill_server_legacy_wire(wire_version);
+    drop(connection);
+    match shutdown {
         Ok(()) => {
-            wait_for_killed_server_socket_cleanup(socket_path);
+            wait_for_killed_server_socket_cleanup(socket_path)?;
             Ok(0)
         }
         Err(error) if kill_server_connection_closed(&error) => {
-            wait_for_killed_server_socket_cleanup(socket_path);
+            wait_for_killed_server_socket_cleanup(socket_path)?;
             Ok(0)
         }
         Err(error) => Err(error.to_string()),
@@ -1728,18 +1733,9 @@ fn response_is_decode_error(response: &Response) -> bool {
     matches!(response, Response::Error(error) if matches!(error.error, RmuxError::Decode(_)))
 }
 
-#[cfg(unix)]
-fn wait_for_killed_server_socket_cleanup(socket_path: &Path) {
-    let deadline = Instant::now() + KILL_SERVER_SOCKET_CLEANUP_TIMEOUT;
-    let mut next_poll = KILL_SERVER_SOCKET_CLEANUP_MIN_POLL;
-    while socket_path.exists() && Instant::now() < deadline {
-        std::thread::sleep(next_poll);
-        next_poll = (next_poll + next_poll).min(KILL_SERVER_SOCKET_CLEANUP_MAX_POLL);
-    }
+fn wait_for_killed_server_socket_cleanup(socket_path: &Path) -> Result<(), String> {
+    wait_for_server_endpoint_cleanup(socket_path).map_err(|error| error.to_string())
 }
-
-#[cfg(not(unix))]
-fn wait_for_killed_server_socket_cleanup(_socket_path: &Path) {}
 
 #[cfg(test)]
 mod tests;

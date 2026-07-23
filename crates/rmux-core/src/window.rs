@@ -104,6 +104,8 @@ pub struct Window {
     requested_main_height: Option<u16>,
 }
 
+#[path = "window/activity.rs"]
+mod activity;
 #[path = "window/layout_cycle.rs"]
 mod layout_cycle;
 #[path = "window/layout_ops.rs"]
@@ -113,6 +115,7 @@ mod panes;
 #[path = "window/zoom.rs"]
 mod zoom;
 
+pub use activity::WindowPaneActivity;
 use panes::layout_for_split;
 
 impl Window {
@@ -159,32 +162,6 @@ impl Window {
     #[must_use]
     pub const fn id(&self) -> WindowId {
         self.id
-    }
-
-    /// Returns the window creation timestamp as Unix seconds.
-    #[must_use]
-    pub const fn created_at(&self) -> i64 {
-        self.created_at
-    }
-
-    /// Returns the last window activity timestamp as Unix seconds.
-    #[must_use]
-    pub const fn activity_at(&self) -> i64 {
-        self.activity_at
-    }
-
-    /// Records output activity for a specific pane in this window.
-    pub fn touch_activity_for_pane(&mut self, pane_index: u32) -> bool {
-        let Some(position) = self
-            .panes
-            .iter()
-            .position(|pane| pane.index() == pane_index)
-        else {
-            return false;
-        };
-        self.activity_at = current_unix_timestamp();
-        self.panes[position].touch_activity();
-        true
     }
 
     /// Returns the panes in window order.

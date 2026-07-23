@@ -1,6 +1,7 @@
 use rmux_core::{OptionStore, Pane, PaneGeometry, Session, Window};
 use rmux_proto::{OptionName, PaneTarget};
 
+use crate::pane_terminals::HandlerState;
 use crate::pane_visible_geometry::visible_pane_content_geometry;
 
 const DISPLAY_PANE_GLYPHS: [[[u8; 5]; 5]; 10] = [
@@ -96,8 +97,21 @@ pub(crate) fn render_display_panes_overlay(session: &Session, options: &OptionSt
     frame
 }
 
-pub(crate) fn render_display_panes_clear(session: &Session, options: &OptionStore) -> Vec<u8> {
-    render_display_panes_clear_with_base(session, options, &super::render(session, options))
+pub(crate) fn render_display_panes_clear(
+    session: &Session,
+    options: &OptionStore,
+    state: &HandlerState,
+) -> Vec<u8> {
+    let base = super::render_with_attached_count_prompt_and_pane_title(
+        session,
+        options,
+        0,
+        super::StatusRenderContext {
+            state: Some(state),
+            ..super::StatusRenderContext::default()
+        },
+    );
+    render_display_panes_clear_with_base(session, options, &base)
 }
 
 pub(crate) fn render_display_panes_clear_with_base(
@@ -475,6 +489,35 @@ mod tests {
         assert!(frame.contains("\u{1b}[41m "));
         assert!(frame.contains("15x7") || frame.contains("16x7"));
         assert!(!frame.contains("\u{1b}[7m"));
+    }
+
+    #[test]
+    fn display_panes_clear_uses_the_daemon_status_job_runtime() {
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 32, rows: 8 });
+        let mut state = HandlerState::default();
+        let marker = "dp-owned";
+        state
+            .options
+            .set(
+                ScopeSelector::Session(session.name().clone()),
+                OptionName::StatusLeft,
+                format!("#(echo {marker})"),
+                SetOptionMode::Replace,
+            )
+            .expect("status-left set succeeds");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let frame = render_display_panes_clear(&session, &state.options, &state);
+            if String::from_utf8_lossy(&frame).contains(marker) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "display-panes clear never rendered its daemon-owned status job"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

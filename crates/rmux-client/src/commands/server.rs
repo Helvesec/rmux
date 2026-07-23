@@ -33,10 +33,9 @@ impl Connection {
 
     /// Sends a `kill-server` request and returns after the frame is written.
     ///
-    /// Windows package clients use this for the tmux-style fire-and-forget
-    /// shutdown path, where waiting for the daemon's final cleanup dominates
-    /// the command latency and the named pipe does not need client-side socket
-    /// removal.
+    /// Windows package clients use this because the daemon can close its reply
+    /// pipe during shutdown. Callers must then drop this connection and wait
+    /// for endpoint release with [`crate::wait_for_server_endpoint_cleanup`].
     pub fn kill_server_after_write(&mut self) -> Result<(), ClientError> {
         self.write_request(&Request::KillServer(KillServerRequest))
     }

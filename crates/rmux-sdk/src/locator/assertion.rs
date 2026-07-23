@@ -10,9 +10,11 @@ pub(super) async fn wait_for_locator_state(
     locator: Locator,
     state: LocatorState,
 ) -> Result<PaneSnapshot> {
-    let locator = locator.begin_operation_handle();
+    let (locator, timeout, deadline) = locator.begin_pinned_operation().await?;
     wait_until(
         locator,
+        timeout,
+        deadline,
         move |matches, _snapshot| match state {
             LocatorState::Visible => !matches.is_empty(),
             LocatorState::Hidden => matches.is_empty(),
@@ -26,13 +28,8 @@ pub(super) async fn wait_for_assertion(
     locator: Locator,
     kind: LocatorAssertionKind,
 ) -> Result<PaneSnapshot> {
-    let locator = locator.begin_operation_handle();
+    let (locator, timeout, deadline) = locator.begin_pinned_operation().await?;
     let description = assertion_description(&kind);
-    let timeout = crate::wait::resolved_wait_timeout_override(
-        locator.timeout,
-        locator.pane.configured_default_timeout(),
-    );
-    let deadline = crate::wait::wait_deadline(timeout);
     let mut last_snapshot = None;
     loop {
         let snapshot = crate::wait::snapshot_with_wait_deadline(
@@ -70,14 +67,11 @@ pub(super) async fn wait_for_assertion(
 
 async fn wait_until(
     locator: Locator,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
     predicate: impl Fn(&[LocatorMatch], &PaneSnapshot) -> bool,
     description: String,
 ) -> Result<PaneSnapshot> {
-    let timeout = crate::wait::resolved_wait_timeout_override(
-        locator.timeout,
-        locator.pane.configured_default_timeout(),
-    );
-    let deadline = crate::wait::wait_deadline(timeout);
     let mut last_snapshot = None;
     loop {
         let snapshot = crate::wait::snapshot_with_wait_deadline(

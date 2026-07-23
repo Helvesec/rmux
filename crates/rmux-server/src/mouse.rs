@@ -2,30 +2,37 @@
 
 use std::time::{Duration, Instant};
 
-use rmux_core::{
-    key_string_lookup_string, KeyCode, PaneGeometry, KEYC_CTRL, KEYC_DRAGGING, KEYC_META,
-    KEYC_SHIFT,
-};
+use rmux_core::{PaneGeometry, KEYC_DRAGGING};
 use rmux_proto::{OptionName, PaneTarget, SessionId, SessionName};
 
-use crate::copy_mode::CopyModeMouseContext;
+use crate::copy_mode::{CopyModeLineNumberLayout, CopyModeMouseContext};
 use crate::input_keys::MouseForwardEvent;
 use crate::pane_terminals::HandlerState;
 use crate::status_lines::status_line_count;
 
+mod event_keys;
 mod hit;
+mod scrollbar_geometry;
 mod types;
 
+use event_keys::{
+    build_classified_event, button_number, is_mouse_move, modifier_bits, mouse_buttons, mouse_drag,
+    mouse_release, mouse_wheel, synthesize_mouse_key,
+};
 use hit::{hit_to_attached_event, resolve_mouse_hit};
+pub(crate) use scrollbar_geometry::pane_content_geometry_for_target;
+use scrollbar_geometry::resolve_pane_scrollbar_layout;
 #[allow(unused_imports)]
 pub(crate) use types::StatusRange;
 pub(crate) use types::{
-    AttachedMouseEvent, ClassifiedMouseEvent, ClientMouseState, MouseEventKind, MouseLayout,
-    MouseLocation, PaneBorderStatus, PaneMouseTarget, PaneScrollbar, PaneScrollbarsMode,
-    ScrollbarPosition,
+    AttachedMouseEvent, ClassifiedMouseEvent, ClientMouseState, MouseClickTimerToken,
+    MouseEventKind, MouseLayout, MouseLocation, PaneBorderStatus, PaneMouseTarget,
+    PanePassthroughMouseEvent, PaneScrollbar,
 };
 #[cfg(test)]
-pub(crate) use types::{BorderControlRange, MouseDragHandler};
+pub(crate) use types::{
+    BorderControlRange, MouseDragHandler, PaneScrollbarsMode, ScrollbarPosition,
+};
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{StatusLineLayout, StatusRangeType};
 
@@ -47,6 +54,12 @@ const MOUSE_BUTTON_8: u16 = 128;
 const MOUSE_BUTTON_9: u16 = 129;
 const MOUSE_BUTTON_10: u16 = 130;
 const MOUSE_BUTTON_11: u16 = 131;
+
+impl AttachedMouseEvent {
+    pub(crate) fn is_wheel(&self) -> bool {
+        mouse_wheel(self.raw.b)
+    }
+}
 
 impl ClientMouseState {
     pub(crate) fn rename_session_targets(
@@ -78,10 +91,6 @@ impl ClientMouseState {
         }
     }
 
-    pub(crate) fn click_deadline(&self) -> Option<Instant> {
-        self.click_deadline
-    }
-
     pub(crate) fn expire_click_timer(
         &mut self,
         now: Instant,
@@ -106,10 +115,7 @@ impl ClientMouseState {
             None
         };
 
-        self.click_deadline = None;
-        self.double_click_pending = false;
-        self.triple_click_pending = false;
-        self.click_event = None;
+        self.clear_click_timer_state();
         double_click.flatten()
     }
 }
@@ -166,16 +172,7 @@ pub(crate) fn layout_for_session(
         window_index,
         OptionName::PaneBorderStatus,
     ));
-    let scrollbar_mode = parse_pane_scrollbars_mode(state.options.resolve_for_window(
-        session_name,
-        window_index,
-        OptionName::PaneScrollbars,
-    ));
-    let scrollbar_position = parse_scrollbar_position(state.options.resolve_for_window(
-        session_name,
-        window_index,
-        OptionName::PaneScrollbarsPosition,
-    ));
+    let content_rows = window.size().rows.saturating_sub(status_lines);
     let focus_follows_mouse = state
         .options
         .resolve(Some(session_name), OptionName::FocusFollowsMouse)
@@ -190,20 +187,19 @@ pub(crate) fn layout_for_session(
         session_id: session.id().as_u32(),
         status_at,
         status_lines,
-        status: crate::renderer::status_line_layout(session, &state.options, attached_count, None),
+        status: crate::renderer::status_line_layout(
+            session,
+            &state.options,
+            attached_count,
+            None,
+            Some(state),
+        ),
         pane_border_status,
         focus_follows_mouse,
         active_pane: window.active_pane().map(|pane| pane.id()),
         panes: panes
             .into_iter()
             .map(|pane| {
-                let (scrollbar_width, scrollbar_pad) =
-                    parse_scrollbar_style(state.options.resolve_for_pane(
-                        session_name,
-                        window_index,
-                        pane.index(),
-                        OptionName::PaneScrollbarsStyle,
-                    ));
                 let history_size = state
                     .pane_history_size_stats(session_name, pane.id())
                     .map(|stats| stats.size)
@@ -215,14 +211,21 @@ pub(crate) fn layout_for_session(
                 let copy_mode_offset = state
                     .pane_copy_mode_summary(session_name, pane.id())
                     .map(|summary| summary.scroll_position);
-                let scrollbar = PaneScrollbar::from_view(
-                    pane.geometry().rows(),
+                let (scrollbar_config, scrollbar_layout) = resolve_pane_scrollbar_layout(
+                    state,
+                    session_name,
+                    window_index,
+                    pane,
+                    content_rows,
+                    alternate_on,
+                    copy_mode_offset.is_some(),
+                );
+                let geometry = scrollbar_layout.content;
+                let scrollbar = PaneScrollbar::from_layout(
+                    scrollbar_layout,
                     history_size,
                     alternate_on,
-                    scrollbar_mode,
-                    scrollbar_position,
-                    scrollbar_width,
-                    scrollbar_pad,
+                    &scrollbar_config,
                     copy_mode_offset,
                 );
                 PaneMouseTarget {
@@ -233,7 +236,7 @@ pub(crate) fn layout_for_session(
                         pane.index(),
                     )),
                     window_id: window.id().as_u32(),
-                    geometry: pane.geometry(),
+                    geometry,
                     scrollbar,
                     border_controls: Vec::new(),
                 }
@@ -271,10 +274,17 @@ pub(crate) fn classify_mouse_events(
 pub(crate) fn mouse_event_for_pane_passthrough(
     layout: &MouseLayout,
     raw: MouseForwardEvent,
-) -> Option<AttachedMouseEvent> {
+) -> Option<PanePassthroughMouseEvent> {
     let hit = resolve_mouse_hit(layout, raw.x, raw.y, false, None);
     let event = hit_to_attached_event(layout, raw, hit, false)?;
-    (event.location == MouseLocation::Pane).then_some(event)
+    if event.location != MouseLocation::Pane {
+        return None;
+    }
+    let focus_target = mouse_focus_target(layout, &event, is_mouse_move(raw));
+    Some(PanePassthroughMouseEvent {
+        event,
+        focus_target,
+    })
 }
 
 fn classify_current_mouse_event(
@@ -375,7 +385,7 @@ fn classify_current_mouse_event(
         }
 
         if !matches!(kind, MouseEventKind::TripleClick) {
-            state.click_deadline = Some(now + KEYC_CLICK_TIMEOUT);
+            state.arm_click_timer(now + KEYC_CLICK_TIMEOUT);
             state.click_button = button_bits;
             state.click_location = attached_event.location;
             state.click_pane = attached_event.pane_id;
@@ -415,15 +425,11 @@ fn classify_current_mouse_event(
         state.drag_start_event = None;
     }
 
-    let focus_target = if matches!(kind, MouseEventKind::MouseMove)
-        && attached_event.location == MouseLocation::Pane
-        && layout.focus_follows_mouse
-        && attached_event.pane_id != layout.active_pane
-    {
-        attached_event.pane_id
-    } else {
-        None
-    };
+    let focus_target = mouse_focus_target(
+        layout,
+        &attached_event,
+        matches!(kind, MouseEventKind::MouseMove),
+    );
 
     let key = if matches!(kind, MouseEventKind::MouseMove)
         && attached_event.location == MouseLocation::Pane
@@ -461,6 +467,22 @@ fn classify_current_mouse_event(
     })
 }
 
+fn mouse_focus_target(
+    layout: &MouseLayout,
+    event: &AttachedMouseEvent,
+    is_mouse_move: bool,
+) -> Option<rmux_core::PaneId> {
+    if is_mouse_move
+        && event.location == MouseLocation::Pane
+        && layout.focus_follows_mouse
+        && event.pane_id != layout.active_pane
+    {
+        event.pane_id
+    } else {
+        None
+    }
+}
+
 fn drag_origin_should_lock_location(
     kind: MouseEventKind,
     drag_flag: u8,
@@ -486,6 +508,15 @@ pub(crate) fn copy_mode_mouse_context(
     pane: PaneGeometry,
     slider_mpos: i32,
 ) -> Option<CopyModeMouseContext> {
+    copy_mode_mouse_context_with_line_numbers(event, pane, slider_mpos, None)
+}
+
+pub(crate) fn copy_mode_mouse_context_with_line_numbers(
+    event: &AttachedMouseEvent,
+    pane: PaneGeometry,
+    slider_mpos: i32,
+    line_numbers: Option<CopyModeLineNumberLayout>,
+) -> Option<CopyModeMouseContext> {
     event.pane_id?;
 
     let adjusted_y = match event.status_at {
@@ -498,7 +529,10 @@ pub(crate) fn copy_mode_mouse_context(
 
     let relative_x = event.raw.x.saturating_sub(pane.x());
     let relative_y = adjusted_y.saturating_sub(pane.y());
-    let content_x = u32::from(relative_x.min(pane.cols().saturating_sub(1)));
+    let content_x = line_numbers.map_or_else(
+        || u32::from(relative_x.min(pane.cols().saturating_sub(1))),
+        |layout| layout.mouse_content_x(pane.cols(), relative_x),
+    );
     let content_y = relative_y.min(pane.rows().saturating_sub(1));
     let scroll_y = if event.status_at == Some(0) {
         relative_y.saturating_add(event.status_lines)
@@ -512,6 +546,7 @@ pub(crate) fn copy_mode_mouse_context(
         selection_anchor: None,
         scroll_y,
         slider_mpos,
+        move_cursor_before_command: false,
     })
 }
 
@@ -520,9 +555,19 @@ pub(crate) fn copy_mode_mouse_drag_start_context(
     pane: PaneGeometry,
     slider_mpos: i32,
 ) -> Option<CopyModeMouseContext> {
+    copy_mode_mouse_drag_start_context_with_line_numbers(event, pane, slider_mpos, None)
+}
+
+pub(crate) fn copy_mode_mouse_drag_start_context_with_line_numbers(
+    event: &AttachedMouseEvent,
+    pane: PaneGeometry,
+    slider_mpos: i32,
+    line_numbers: Option<CopyModeLineNumberLayout>,
+) -> Option<CopyModeMouseContext> {
     const MOUSE_MASK_DRAG: u16 = 32;
 
-    let mut current = copy_mode_mouse_context(event, pane, slider_mpos)?;
+    let mut current =
+        copy_mode_mouse_context_with_line_numbers(event, pane, slider_mpos, line_numbers)?;
     if event.raw.b & MOUSE_MASK_DRAG == 0 {
         return Some(current);
     }
@@ -532,141 +577,10 @@ pub(crate) fn copy_mode_mouse_drag_start_context(
     anchor_event.raw.sgr_b = event.raw.lb;
     anchor_event.raw.x = event.raw.lx;
     anchor_event.raw.y = event.raw.ly;
-    let anchor = copy_mode_mouse_context(&anchor_event, pane, slider_mpos)?;
+    let anchor =
+        copy_mode_mouse_context_with_line_numbers(&anchor_event, pane, slider_mpos, line_numbers)?;
     current.selection_anchor = Some((anchor.content_x, anchor.content_y));
     Some(current)
-}
-
-fn is_mouse_move(raw: MouseForwardEvent) -> bool {
-    (raw.sgr_type != ' ' && mouse_drag(raw.sgr_b) && mouse_release(raw.sgr_b))
-        || (raw.sgr_type == ' '
-            && mouse_drag(raw.b)
-            && mouse_release(raw.b)
-            && mouse_release(raw.lb))
-}
-
-fn build_classified_event(
-    kind: MouseEventKind,
-    event: AttachedMouseEvent,
-    button: u64,
-    dragging: bool,
-    _layout: &MouseLayout,
-) -> Option<ClassifiedMouseEvent> {
-    let key = if matches!(kind, MouseEventKind::MouseDrag) && dragging {
-        KEYC_DRAGGING
-    } else {
-        synthesize_mouse_key(kind, button, event.location)? | modifier_bits(event.raw.b)
-    };
-    Some(ClassifiedMouseEvent {
-        key,
-        event,
-        focus_target: None,
-    })
-}
-
-fn synthesize_mouse_key(
-    kind: MouseEventKind,
-    button: u64,
-    location: MouseLocation,
-) -> Option<KeyCode> {
-    let suffix = match location {
-        MouseLocation::Pane => "Pane",
-        MouseLocation::Status => "Status",
-        MouseLocation::StatusLeft => "StatusLeft",
-        MouseLocation::StatusRight => "StatusRight",
-        MouseLocation::StatusDefault => "StatusDefault",
-        MouseLocation::ScrollbarUp => "ScrollbarUp",
-        MouseLocation::ScrollbarSlider => "ScrollbarSlider",
-        MouseLocation::ScrollbarDown => "ScrollbarDown",
-        MouseLocation::Border => "Border",
-        MouseLocation::Control(value) => {
-            return key_string_lookup_string(&format!(
-                "{}{}Control{}",
-                mouse_prefix(kind),
-                button_string(kind, button),
-                value
-            ))
-        }
-        MouseLocation::Nowhere => return None,
-    };
-    key_string_lookup_string(&format!(
-        "{}{}{}",
-        mouse_prefix(kind),
-        button_string(kind, button),
-        suffix
-    ))
-}
-
-fn button_string(kind: MouseEventKind, button: u64) -> String {
-    if matches!(
-        kind,
-        MouseEventKind::MouseMove | MouseEventKind::WheelDown | MouseEventKind::WheelUp
-    ) {
-        String::new()
-    } else {
-        button.to_string()
-    }
-}
-
-fn mouse_prefix(kind: MouseEventKind) -> &'static str {
-    match kind {
-        MouseEventKind::MouseMove => "MouseMove",
-        MouseEventKind::MouseDown => "MouseDown",
-        MouseEventKind::MouseUp => "MouseUp",
-        MouseEventKind::MouseDrag => "MouseDrag",
-        MouseEventKind::MouseDragEnd => "MouseDragEnd",
-        MouseEventKind::WheelDown => "WheelDown",
-        MouseEventKind::WheelUp => "WheelUp",
-        MouseEventKind::SecondClick => "SecondClick",
-        MouseEventKind::DoubleClick => "DoubleClick",
-        MouseEventKind::TripleClick => "TripleClick",
-    }
-}
-
-fn modifier_bits(button: u16) -> KeyCode {
-    let mut key = 0;
-    if (button & MOUSE_MASK_META) != 0 {
-        key |= KEYC_META;
-    }
-    if (button & MOUSE_MASK_CTRL) != 0 {
-        key |= KEYC_CTRL;
-    }
-    if (button & MOUSE_MASK_SHIFT) != 0 {
-        key |= KEYC_SHIFT;
-    }
-    key
-}
-
-fn button_number(button: u16) -> u64 {
-    match button {
-        MOUSE_BUTTON_1 => 1,
-        MOUSE_BUTTON_2 => 2,
-        MOUSE_BUTTON_3 => 3,
-        MOUSE_BUTTON_6 => 6,
-        MOUSE_BUTTON_7 => 7,
-        MOUSE_BUTTON_8 => 8,
-        MOUSE_BUTTON_9 => 9,
-        MOUSE_BUTTON_10 => 10,
-        MOUSE_BUTTON_11 => 11,
-        _ => 0,
-    }
-}
-
-fn mouse_buttons(button: u16) -> u16 {
-    button & MOUSE_MASK_BUTTONS
-}
-
-fn mouse_wheel(button: u16) -> bool {
-    let button = mouse_buttons(button);
-    button == MOUSE_WHEEL_UP || button == MOUSE_WHEEL_DOWN
-}
-
-fn mouse_drag(button: u16) -> bool {
-    (button & MOUSE_MASK_DRAG) != 0
-}
-
-fn mouse_release(button: u16) -> bool {
-    mouse_buttons(button) == 3
 }
 
 fn parse_pane_border_status(value: Option<&str>) -> PaneBorderStatus {
@@ -675,38 +589,6 @@ fn parse_pane_border_status(value: Option<&str>) -> PaneBorderStatus {
         Some("bottom") => PaneBorderStatus::Bottom,
         _ => PaneBorderStatus::Off,
     }
-}
-
-fn parse_pane_scrollbars_mode(value: Option<&str>) -> PaneScrollbarsMode {
-    match value {
-        Some("modal") => PaneScrollbarsMode::Modal,
-        Some("on") => PaneScrollbarsMode::On,
-        _ => PaneScrollbarsMode::Off,
-    }
-}
-
-fn parse_scrollbar_position(value: Option<&str>) -> ScrollbarPosition {
-    match value {
-        Some("left") => ScrollbarPosition::Left,
-        _ => ScrollbarPosition::Right,
-    }
-}
-
-fn parse_scrollbar_style(value: Option<&str>) -> (u16, u16) {
-    let mut width = 1;
-    let mut pad = 0;
-    for token in value.unwrap_or_default().split(',').map(str::trim) {
-        if let Some(parsed) = token.strip_prefix("width=") {
-            if let Ok(parsed) = parsed.parse::<u16>() {
-                width = parsed;
-            }
-        } else if let Some(parsed) = token.strip_prefix("pad=") {
-            if let Ok(parsed) = parsed.parse::<u16>() {
-                pad = parsed;
-            }
-        }
-    }
-    (width, pad)
 }
 
 #[cfg(test)]

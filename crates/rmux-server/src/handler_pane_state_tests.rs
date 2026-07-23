@@ -19,6 +19,9 @@ use rmux_proto::{
     SplitWindowTarget, SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
 
+#[path = "handler_pane_state_tests/foreground_watch_lifecycle.rs"]
+mod foreground_watch_lifecycle;
+
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
@@ -1037,7 +1040,16 @@ async fn select_pane_style_origin_emits_pane_state_option_event() {
     let handler = RequestHandler::new();
     let (_session, target, pane_id) =
         create_session_with_pane(&handler, "pane-state-select-style-origin").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
     let subscription_id = subscribe(&handler, 983, target.clone(), false, true).await;
+    let resize_count_before = {
+        let mut state = handler.state.lock().await;
+        let resize_count = state.window_runtime_resize_count_for_test();
+        state.fail_next_resize_for_test();
+        resize_count
+    };
 
     let response = handler
         .handle(Request::SelectPane(Box::new(SelectPaneRequest {
@@ -1049,6 +1061,15 @@ async fn select_pane_style_origin_emits_pane_state_option_event() {
         })))
         .await;
     assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .window_runtime_resize_count_for_test(),
+        resize_count_before,
+        "re-selecting the active pane must not resize its unchanged runtime"
+    );
 
     let event =
         expect_single_pane_state_event(read_cursor(&handler, 983, subscription_id, 0).await);
@@ -1062,6 +1083,91 @@ async fn select_pane_style_origin_emits_pane_state_option_event() {
             ..
         } if event_pane_id == pane_id && name == "window-style" && new_value == "fg=red"
     ));
+}
+
+#[cfg(windows)]
+#[test]
+fn select_pane_style_succeeds_while_initial_conpty_is_deferred() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build isolated deferred-pane runtime");
+
+    runtime.block_on(async {
+        let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
+        let (blocker_release_tx, blocker_release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = blocker_started_tx.send(());
+            blocker_release_rx
+                .recv()
+                .expect("release deferred-pane blocking worker");
+        });
+        blocker_started_rx
+            .await
+            .expect("blocking worker reports that it is occupied");
+
+        let handler = RequestHandler::new();
+        let (session, target, pane_id) =
+            create_session_with_pane(&handler, "pane-state-select-style-deferred").await;
+        {
+            let state = handler.state.lock().await;
+            assert!(state.pane_is_starting_in_window(&session, 0, 0));
+            assert!(state.pane_pid_in_window(&session, 0, 0).is_err());
+        }
+        let subscription_id = subscribe(&handler, 988, target.clone(), false, true).await;
+        let resize_count_before = handler
+            .state
+            .lock()
+            .await
+            .window_runtime_resize_count_for_test();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            handler.handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                target: target.clone(),
+                title: None,
+                input_disabled: None,
+                preserve_zoom: false,
+                style: Some("fg=blue".to_owned()),
+            }))),
+        )
+        .await
+        .expect("active-pane style does not wait for its deferred terminal");
+        assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
+        {
+            let state = handler.state.lock().await;
+            assert!(state.pane_is_starting_in_window(&session, 0, 0));
+            assert!(state.pane_pid_in_window(&session, 0, 0).is_err());
+            assert_eq!(
+                state.window_runtime_resize_count_for_test(),
+                resize_count_before,
+                "deferred active-pane style must not attempt a runtime resize"
+            );
+        }
+
+        let event =
+            expect_single_pane_state_event(read_cursor(&handler, 988, subscription_id, 0).await);
+        assert!(matches!(
+            event,
+            PaneStateEventDto::OptionSet {
+                pane_id: event_pane_id,
+                name,
+                old_value: None,
+                new_value,
+                ..
+            } if event_pane_id == pane_id && name == "window-style" && new_value == "fg=blue"
+        ));
+
+        blocker_release_tx
+            .send(())
+            .expect("release deferred-pane blocking worker");
+        blocker.await.expect("blocking worker joins");
+        handler
+            .wait_for_pane_startup_to_finish_for_test(&target)
+            .await;
+    });
 }
 
 #[tokio::test]

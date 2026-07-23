@@ -2,14 +2,16 @@ use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_proto::{
     DisplayMessageRequest, HookLifecycle, HookName, KillSessionRequest, KillWindowRequest,
-    LastWindowRequest, LinkWindowRequest, ListPanesRequest, ListWindowsRequest, MoveWindowRequest,
-    MoveWindowTarget, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest,
-    OptionName, PaneTarget, PreviousWindowRequest, ProcessCommand, RenameSessionRequest,
-    RenameWindowRequest, Request, ResizeWindowAdjustment, ResizeWindowRequest,
-    ResolveTargetRequest, ResolveTargetType, RespawnWindowRequest, Response, RotateWindowDirection,
-    RotateWindowRequest, ScopeSelector, SelectWindowRequest, SessionName, SetOptionMode,
-    SetOptionRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapWindowRequest,
-    Target, TerminalSize, UnlinkWindowRequest, WindowTarget,
+    LastPaneRequest, LastWindowRequest, LinkWindowRequest, ListPanesRequest, ListWindowsRequest,
+    MoveWindowRequest, MoveWindowTarget, NewSessionExtRequest, NewSessionRequest, NewWindowRequest,
+    NextWindowRequest, OptionName, PaneSelectRequest, PaneTarget, PaneTargetRef,
+    PreviousWindowRequest, ProcessCommand, RenameSessionRequest, RenameWindowRequest, Request,
+    ResizeWindowAdjustment, ResizeWindowRequest, ResolveTargetRequest, ResolveTargetType,
+    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest, ScopeSelector,
+    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest, SelectWindowRequest,
+    SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest, SplitDirection,
+    SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, Target, TerminalSize,
+    UnlinkWindowRequest, WindowTarget,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -293,6 +295,35 @@ async fn drain_attach_controls(control_rx: &mut mpsc::UnboundedReceiver<AttachCo
     }
 }
 
+async fn drain_attach_control_pair(
+    first: &mut mpsc::UnboundedReceiver<AttachControl>,
+    second: &mut mpsc::UnboundedReceiver<AttachControl>,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let idle = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(250));
+        tokio::select! {
+            message = first.recv() => {
+                if message.is_none() {
+                    break;
+                }
+            }
+            message = second.recv() => {
+                if message.is_none() {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(idle) => break,
+        }
+    }
+}
+
 #[path = "handler_window_tests/lifecycle.rs"]
 mod lifecycle;
 
@@ -321,6 +352,18 @@ mod link_unlink;
 
 #[path = "handler_window_tests/active_selection.rs"]
 mod active_selection;
+
+#[path = "handler_window_tests/linked_pane_selection.rs"]
+mod linked_pane_selection;
+
+#[path = "handler_window_tests/pane_selection_hooks.rs"]
+mod pane_selection_hooks;
+
+#[path = "handler_window_tests/pane_selection_noop.rs"]
+mod pane_selection_noop;
+
+#[path = "handler_window_tests/linked_window_mutations.rs"]
+mod linked_window_mutations;
 
 #[path = "handler_window_tests/resize_respawn.rs"]
 mod resize_respawn;

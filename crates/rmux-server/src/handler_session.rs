@@ -345,7 +345,11 @@ impl RequestHandler {
             {
                 continue;
             }
-            if self.attached_count(&session_name).await != 0 {
+            if self
+                .attached_count_for_session_identity(&session_name, session_id)
+                .await
+                != 0
+            {
                 continue;
             }
             let _ = self
@@ -1321,6 +1325,7 @@ impl RequestHandler {
 
                 match state.sessions.remove_session(session_name) {
                     Ok(removed_session) => {
+                        state.retire_removed_lifecycle_targets();
                         removed_window_ids.extend(
                             removed_session
                                 .windows()
@@ -1405,15 +1410,33 @@ impl RequestHandler {
             let _ = self.request_shutdown_if_pending();
         }
 
+        // Rehome control clients before publishing SessionClosed effects, but
+        // defer their later ClientSessionChanged tickets until the teardown
+        // batch reserved by the state mutation has been published.
+        let mut prepared_rehomes = Vec::with_capacity(removed_attached_sessions.len());
         for (removed_session_name, removed_session_id, detach_on_destroy) in
             removed_attached_sessions
         {
-            self.exit_attached_session_identity(
-                &removed_session_name,
-                removed_session_id,
-                detach_on_destroy,
-            )
-            .await;
+            prepared_rehomes.push(
+                self.prepare_destroy_session_rehome(
+                    &removed_session_name,
+                    removed_session_id,
+                    detach_on_destroy,
+                )
+                .await,
+            );
+        }
+
+        for event in queued_lifecycle_events {
+            self.emit_prepared(event).await;
+        }
+        for prepared in &mut prepared_rehomes {
+            for event in prepared.control_lifecycle_events.drain(..) {
+                self.emit_prepared(event).await;
+            }
+        }
+        for prepared in prepared_rehomes {
+            self.exit_prepared_attached_session_identity(prepared).await;
         }
 
         #[cfg(test)]
@@ -1429,9 +1452,6 @@ impl RequestHandler {
         let _ = &removed_sessions;
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-        }
-        for event in queued_lifecycle_events {
-            self.emit_prepared(event).await;
         }
         self.remove_session_leases(&removed_sessions);
         let removed_session_names = removed_sessions

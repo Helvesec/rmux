@@ -347,7 +347,7 @@ async fn create_synchronized_two_pane_session(
     // transcripts and assert per-pane input encoding, so a real login shell's
     // startup output must not race the stamped modes (the same class as the
     // double-click content race fixed in live_attach.rs).
-    create_quiet_mouse_session(handler, alpha).await;
+    create_quiet_input_session(handler, alpha).await;
     let split = handler
         .handle(Request::SplitWindowExt(Box::new(
             rmux_proto::SplitWindowExtRequest {

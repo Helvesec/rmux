@@ -48,20 +48,6 @@ evidence = ["crates/rmux-core/src/command_inventory/signatures.rs"]
 deferred = ["floating-pane", "new-pane"]
 
 [[entry]]
-id = "C-D33"
-summary = "Scrollbar flags are accepted without rendering a scrollbar"
-inventory = "deferred"
-evidence = ["src/cli_args_tests/pane_io.rs"]
-
-[[entry]]
-id = "C-D34"
-summary = "Copy-mode line-number options do not render a gutter"
-inventory = "deferred"
-evidence = ["crates/rmux-core/src/options/tests/registry_metadata.rs"]
-accepted_options = ["copy-mode-line-numbers"]
-limitations = ["line-number-gutter-rendering"]
-
-[[entry]]
 id = "C-D35"
 summary = "Invalid capture-pane bounds are rejected"
 inventory = "bounded"
@@ -72,12 +58,6 @@ id = "C-D36"
 summary = "A trailing bare format marker remains literal"
 inventory = "bounded"
 tests = ["crates/rmux-core/src/formats/tests/transformations.rs::trailing_bare_hash_is_literal_product_divergence"]
-
-[[entry]]
-id = "C-D37"
-summary = "Float comparison expressions render integer booleans"
-inventory = "bounded"
-tests = ["crates/rmux-core/src/formats/tests/operators.rs::float_comparisons_render_integer_booleans_product_divergence"]
 
 [[entry]]
 id = "C-D38"
@@ -99,9 +79,18 @@ evidence = ["src/cli_args_tests/surface_docs.rs", "crates/rmux-server/src/handle
 
 [[entry]]
 id = "C-D44"
-summary = "Asynchronous run-shell hooks are not drained after daemon shutdown"
+summary = "RMUX bounds run-shell shutdown and terminates the tracked Unix process group or Windows Job Object; tmux 3.7b preserves started jobs"
 inventory = "bounded"
-evidence = ["tests/scripting.rs"]
+tests = [
+  "tests/unix_background_lifecycle_acceptance.rs::kill_server_terminates_direct_background_run_shell_tree_product_divergence",
+  "tests/unix_background_lifecycle_acceptance.rs::kill_server_terminates_queued_background_run_shell_tree_product_divergence",
+  "tests/unix_background_lifecycle_acceptance.rs::kill_server_bounds_slow_session_closed_hook_tree_product_divergence",
+  "tests/unix_background_lifecycle_acceptance.rs::kill_server_joins_background_session_closed_hook_trees_product_divergence",
+]
+limitations = [
+  "Unix descendants that call setsid() and leave the tracked process group may survive shutdown",
+  "RMUX drains accepted background session-closed hooks that tmux 3.7b drops during final shutdown",
+]
 
 [[entry]]
 id = "C-D45"
@@ -168,7 +157,7 @@ tests = [
   "crates/rmux-server/src/control/tests.rs::eof_queued_if_shell_cancels_only_a_selected_wait_frame_product_divergence",
   "crates/rmux-server/src/control/tests.rs::eof_queue_skips_parse_errors_and_blocking_frames_before_later_finite_frame_product_divergence",
   "crates/rmux-server/src/control/tests.rs::eof_after_deferred_exit_with_removed_registration_finishes_only_active_frame_product_divergence",
-  "crates/rmux-server/src/control/tests.rs::external_shutdown_cancels_finite_eof_queue_drain_product_divergence",
+  "crates/rmux-server/src/control/tests.rs::external_shutdown_drains_admitted_finite_eof_mutation_product_divergence",
   "crates/rmux-server/src/control/tests.rs::eof_drains_finite_queue_through_kill_server_product_divergence",
   "crates/rmux-server/src/control/tests.rs::eof_queue_lease_blocks_same_pid_registration_and_preserves_permissions_product_divergence",
 ]
@@ -300,3 +289,9 @@ tests = [
   "crates/rmux-core/src/screen/tests.rs::insert_mode_on_wide_padding_preserves_valid_cells_product_divergence",
   "crates/rmux-core/src/screen/tests.rs::insert_mode_on_wide_padding_handles_edges_product_divergence",
 ]
+
+[[entry]]
+id = "C-D73"
+summary = "scroll-to-mouse without a mouse event is a safe no-op"
+inventory = "bounded"
+tests = ["crates/rmux-server/src/handler_send_keys_tests/copy_mode_mouse_origin.rs::non_mouse_scroll_to_mouse_is_a_safe_noop_product_divergence"]

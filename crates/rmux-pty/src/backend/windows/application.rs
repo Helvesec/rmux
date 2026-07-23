@@ -306,6 +306,30 @@ mod tests {
     }
 
     #[test]
+    fn skips_extensionless_explicit_paths_that_resolve_only_to_batch_scripts() {
+        let root = temp_root("explicit-batch-wrapper");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("create bin");
+        fs::write(bin.join("absolute-tool.cmd"), b"").expect("create cmd placeholder");
+        fs::write(bin.join("relative-tool.bat"), b"").expect("create bat placeholder");
+
+        for program in [
+            bin.join("absolute-tool"),
+            PathBuf::from("bin").join("relative-tool"),
+        ] {
+            let command = ChildCommand::new(program)
+                .current_dir(root.clone())
+                .clear_env()
+                .env("PATHEXT", ".CMD;.BAT");
+            let error = resolve_application_path(&command)
+                .expect_err("batch-only explicit path is not a direct ConPTY application");
+
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn unresolved_relative_application_is_rejected_before_create_process() {
         let command = ChildCommand::new("not-present").clear_env();
 

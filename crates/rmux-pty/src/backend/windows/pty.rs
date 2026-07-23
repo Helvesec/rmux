@@ -1,6 +1,8 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::sync::Arc;
 use std::sync::{Mutex, RwLock};
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_BROKEN_PIPE, ERROR_INVALID_PARAMETER, E_HANDLE, HANDLE, S_OK,
@@ -11,10 +13,11 @@ use windows_sys::Win32::System::Console::{
 
 use crate::{Result, TerminalGeometry, TerminalSize};
 
+use super::bounded_write::OverlappedPipeWriter;
 use super::flags::{
     conpty_flags_without_passthrough, selected_conpty_flags, standard_conpty_flags, ConptyFlags,
 };
-use super::io::{create_pipe, PipePair};
+use super::io::{create_conpty_input_pipe, create_pipe, PipePair};
 use super::perf;
 use super::DsrBootstrap;
 
@@ -66,7 +69,7 @@ impl WindowsPty {
                 filtered
             };
             if let Some(response) = filtered.response {
-                self.write_all(response)?;
+                self.write_all_with_timeout(response, Duration::from_secs(2))?;
             }
             if filtered.len > 0 || bytes_read == 0 {
                 return Ok(filtered.len);
@@ -74,9 +77,9 @@ impl WindowsPty {
         }
     }
 
-    pub(crate) fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        let input_write = self.input_write_handle()?;
-        super::io::write_all(&input_write, bytes)
+    pub(crate) fn write_all_with_timeout(&self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
+        let input_writer = self.input_writer()?;
+        input_writer.write_all_with_timeout(bytes, timeout)
     }
 
     fn output_read_handle(&self) -> io::Result<OwnedHandle> {
@@ -87,12 +90,12 @@ impl WindowsPty {
         state.output_read.try_clone()
     }
 
-    fn input_write_handle(&self) -> io::Result<OwnedHandle> {
+    fn input_writer(&self) -> io::Result<Arc<OverlappedPipeWriter>> {
         let state = self
             .state
             .read()
             .map_err(|_| io::Error::other("ConPTY state lock poisoned"))?;
-        state.input_write.try_clone()
+        Ok(Arc::clone(&state.input_writer))
     }
 
     pub(crate) fn enable_dsr_bootstrap(&self) -> io::Result<()> {
@@ -253,7 +256,10 @@ fn create_pty_state_with_fallback(
 fn create_pty_state(size: TerminalSize, flags: ConptyFlags) -> Result<WindowsPtyState> {
     let (input, output) = {
         let _span = perf::span("conpty_create_pipes");
-        (create_pipe(64 * 1024)?, create_pipe(64 * 1024)?)
+        (
+            create_conpty_input_pipe(64 * 1024)?,
+            create_pipe(64 * 1024)?,
+        )
     };
     let hpc = {
         let _span = perf::span("conpty_create_pseudoconsole");
@@ -261,9 +267,10 @@ fn create_pty_state(size: TerminalSize, flags: ConptyFlags) -> Result<WindowsPty
     };
     drop(input.read);
     drop(output.write);
+    let input_writer = Arc::new(OverlappedPipeWriter::new(input.write)?);
     Ok(WindowsPtyState {
         hpc,
-        input_write: input.write,
+        input_writer,
         output_read: output.read,
         flags,
     })
@@ -326,7 +333,7 @@ fn coord_from_size(size: TerminalSize) -> Result<COORD> {
 #[derive(Debug)]
 struct WindowsPtyState {
     hpc: OwnedHpcon,
-    input_write: OwnedHandle,
+    input_writer: Arc<OverlappedPipeWriter>,
     output_read: OwnedHandle,
     flags: ConptyFlags,
 }

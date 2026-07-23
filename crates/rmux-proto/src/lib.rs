@@ -25,10 +25,10 @@ pub use capabilities::{
     capabilities_for_features, HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
     CAPABILITY_ATTACH_RESIZE_GEOMETRY, CAPABILITY_ATTACH_STREAM,
     CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
-    CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION, CAPABILITY_CLI_TARGET_ACTIONS,
-    CAPABILITY_CONTROL_STREAM, CAPABILITY_DAEMON_SHUTDOWN, CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE,
-    CAPABILITY_DAEMON_STATUS, CAPABILITY_DETACHED_RPC, CAPABILITY_FRAMED_ERRORS,
-    CAPABILITY_HANDSHAKE, CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
+    CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE, CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION,
+    CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_CONTROL_STREAM, CAPABILITY_DAEMON_SHUTDOWN,
+    CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, CAPABILITY_DAEMON_STATUS, CAPABILITY_DETACHED_RPC,
+    CAPABILITY_FRAMED_ERRORS, CAPABILITY_HANDSHAKE, CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY,
     CAPABILITY_SDK_PANE_BROADCAST, CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PANE_FOREGROUND,
     CAPABILITY_SDK_PANE_OPTIONS, CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
     CAPABILITY_SDK_PANE_STATE_EVENTS, CAPABILITY_SDK_PROCESS_COMMAND, CAPABILITY_SDK_SESSION_LEASE,
@@ -84,6 +84,10 @@ pub const INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH: &str = "\0rmux-parse-time-assign
 /// applying the current `command-alias` table a second time.
 pub const INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH: &str = "\0rmux-canonical-command-execution-v1";
 
+/// Non-filesystem path used for a validated, read-only `list-windows -a`
+/// invocation encoded as a single argument vector.
+pub const INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH: &str = "\0rmux-list-windows-all-execution-v1";
+
 /// Prefix for the CLI's internal stable pane-exit probe carried through the
 /// existing `list-panes` format field. OS argument vectors cannot contain NUL,
 /// so a public format cannot collide with this transport-only request.
@@ -129,6 +133,50 @@ pub fn decode_internal_runtime_command_arguments(
     serde_json::from_str(payload)
 }
 
+/// Decodes and validates the dedicated read-only `list-windows -a` argument
+/// vector. Only the exact non-mutating flags emitted by the CLI are accepted.
+#[must_use]
+pub fn decode_internal_list_windows_all_arguments(payload: &str) -> Option<Vec<String>> {
+    let arguments = decode_internal_runtime_command_arguments(payload).ok()?;
+    internal_list_windows_all_arguments_are_valid(&arguments).then_some(arguments)
+}
+
+/// Checks the narrow argument-vector schema accepted by the internal
+/// all-session window listing path.
+#[must_use]
+pub fn internal_list_windows_all_arguments_are_valid(arguments: &[String]) -> bool {
+    if arguments.first().map(String::as_str) != Some("list-windows") {
+        return false;
+    }
+
+    let mut seen_flags = 0_u8;
+    let mut index = 1;
+    while index < arguments.len() {
+        let (bit, takes_value) = match arguments[index].as_str() {
+            "-a" => (1 << 0, false),
+            "-r" => (1 << 1, false),
+            "-t" => (1 << 2, true),
+            "-F" => (1 << 3, true),
+            "-f" => (1 << 4, true),
+            "-O" => (1 << 5, true),
+            _ => return false,
+        };
+        if seen_flags & bit != 0 {
+            return false;
+        }
+        seen_flags |= bit;
+        index += 1;
+        if takes_value {
+            if index == arguments.len() {
+                return false;
+            }
+            index += 1;
+        }
+    }
+
+    seen_flags & 1 != 0
+}
+
 /// Minimum daemon-side TTL accepted for owned-session leases.
 pub const MIN_SESSION_LEASE_TTL_MILLIS: u64 = 500;
 
@@ -155,6 +203,39 @@ mod internal_pane_exit_probe_tests {
             "\0rmux-pane-exit-probe-v1:session:2",
         ] {
             assert_eq!(decode_internal_pane_exit_probe(value), None);
+        }
+    }
+
+    #[test]
+    fn list_windows_all_arguments_accept_only_the_read_only_internal_shape() {
+        let valid = vec![
+            "list-windows".to_owned(),
+            "-a".to_owned(),
+            "-t".to_owned(),
+            "alpha".to_owned(),
+            "-F".to_owned(),
+            "#{window_name}".to_owned(),
+            "-r".to_owned(),
+        ];
+        let encoded = encode_internal_runtime_command_arguments(&valid).expect("argv encodes");
+        assert_eq!(
+            decode_internal_list_windows_all_arguments(&encoded),
+            Some(valid)
+        );
+
+        for invalid in [
+            vec!["list-windows".to_owned()],
+            vec!["list-windows".to_owned(), "-aFname".to_owned()],
+            vec![
+                "list-windows".to_owned(),
+                "-a".to_owned(),
+                "; kill-server".to_owned(),
+            ],
+            vec!["kill-server".to_owned(), "-a".to_owned()],
+        ] {
+            let encoded =
+                encode_internal_runtime_command_arguments(&invalid).expect("argv encodes");
+            assert_eq!(decode_internal_list_windows_all_arguments(&encoded), None);
         }
     }
 }

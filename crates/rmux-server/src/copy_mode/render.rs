@@ -18,6 +18,10 @@ impl CopyModeState {
         CopyModeRenderSnapshot {
             screen: self.render_screen(),
             overlays: self.render_overlays(),
+            history_size: self.backing.history_size(),
+            scroll_position: self.bottom_top_line().saturating_sub(self.top_line),
+            alternate_on: self.backing.is_alternate(),
+            line_numbers_enabled: self.line_numbers_enabled,
         }
     }
 

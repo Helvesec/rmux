@@ -84,6 +84,32 @@ async fn create_window_direct(
         .await
 }
 
+async fn wait_for_window_presence(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+    window_index: u32,
+    present: bool,
+) -> Option<rmux_core::WindowId> {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let window_id = handler
+                .state
+                .lock()
+                .await
+                .sessions
+                .session(session_name)
+                .and_then(|session| session.window_at(window_index))
+                .map(|window| window.id());
+            if window_id.is_some() == present {
+                return window_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("follow-on window mutation becomes observable")
+}
+
 async fn receive_window_unlinked(
     events: &mut tokio::sync::broadcast::Receiver<super::QueuedLifecycleEvent>,
     session_name: &SessionName,
@@ -644,21 +670,24 @@ async fn unlink_window_prepares_lifecycle_identity_before_same_slot_reuse() {
         .await
         .expect("unlink-window reaches post-commit lifecycle pause");
 
-    create_window(&handler, &owner, 0).await;
-    let replacement_id = handler
-        .state
-        .lock()
+    let replacement_handler = Arc::clone(&handler);
+    let replacement_owner = owner.clone();
+    let replacing = tokio::spawn(async move {
+        create_window_direct(&replacement_handler, &replacement_owner, 0).await
+    });
+    let replacement_id = wait_for_window_presence(&handler, &owner, 0, true)
         .await
-        .sessions
-        .session(&owner)
-        .and_then(|session| session.window_at(0))
-        .expect("replacement window exists")
-        .id();
+        .expect("replacement window exists");
     pause.release.notify_one();
     let response = unlinking.await.expect("unlink-window task joins");
     assert!(
         matches!(response, Response::UnlinkWindow(_)),
         "{response:?}"
+    );
+    let replacement = replacing.await.expect("replacement new-window task joins");
+    assert!(
+        matches!(replacement, Response::NewWindow(_)),
+        "{replacement:?}"
     );
 
     let event = receive_window_unlinked(&mut events, &owner).await;
@@ -693,31 +722,41 @@ async fn new_window_prepares_lifecycle_identity_before_same_slot_reuse() {
         .await
         .expect("new-window reaches post-commit lifecycle pause");
 
-    let removed = handler
-        .handle_kill_window(KillWindowRequest {
-            target: WindowTarget::with_window(session.clone(), 1),
-            kill_all_others: false,
-        })
-        .await;
-    assert!(matches!(removed, Response::KillWindow(_)), "{removed:?}");
-    let replacement = create_window_direct(&handler, &session, 1).await;
+    let remove_handler = Arc::clone(&handler);
+    let remove_session = session.clone();
+    let removing = tokio::spawn(async move {
+        remove_handler
+            .handle_kill_window(KillWindowRequest {
+                target: WindowTarget::with_window(remove_session, 1),
+                kill_all_others: false,
+            })
+            .await
+    });
     assert!(
-        matches!(replacement, Response::NewWindow(_)),
-        "{replacement:?}"
+        wait_for_window_presence(&handler, &session, 1, false)
+            .await
+            .is_none(),
+        "original window is removed"
     );
-    let replacement_id = handler
-        .state
-        .lock()
+    let replacement_handler = Arc::clone(&handler);
+    let replacement_session = session.clone();
+    let replacing = tokio::spawn(async move {
+        create_window_direct(&replacement_handler, &replacement_session, 1).await
+    });
+    let replacement_id = wait_for_window_presence(&handler, &session, 1, true)
         .await
-        .sessions
-        .session(&session)
-        .and_then(|session| session.window_at(1))
-        .expect("replacement window exists")
-        .id();
+        .expect("replacement window exists");
     while events.try_recv().is_ok() {}
     pause.release.notify_one();
     let response = creating.await.expect("new-window task joins");
     assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
+    let removed = removing.await.expect("kill-window task joins");
+    assert!(matches!(removed, Response::KillWindow(_)), "{removed:?}");
+    let replacement = replacing.await.expect("replacement new-window task joins");
+    assert!(
+        matches!(replacement, Response::NewWindow(_)),
+        "{replacement:?}"
+    );
 
     let event = receive_window_linked(&mut events, &session).await;
     handler.dispatch_lifecycle_hook(event).await;
@@ -762,34 +801,44 @@ async fn link_window_prepares_lifecycle_identity_before_same_slot_reuse() {
         .await
         .expect("link-window reaches post-commit lifecycle pause");
 
-    let unlinked = handler
-        .handle_unlink_window(UnlinkWindowRequest {
-            target: WindowTarget::with_window(destination.clone(), 1),
-            kill_if_last: false,
-        })
-        .await;
+    let unlink_handler = Arc::clone(&handler);
+    let unlink_destination = destination.clone();
+    let unlinking = tokio::spawn(async move {
+        unlink_handler
+            .handle_unlink_window(UnlinkWindowRequest {
+                target: WindowTarget::with_window(unlink_destination, 1),
+                kill_if_last: false,
+            })
+            .await
+    });
     assert!(
-        matches!(unlinked, Response::UnlinkWindow(_)),
-        "{unlinked:?}"
+        wait_for_window_presence(&handler, &destination, 1, false)
+            .await
+            .is_none(),
+        "linked window is removed"
     );
-    let replacement = create_window_direct(&handler, &destination, 1).await;
-    assert!(
-        matches!(replacement, Response::NewWindow(_)),
-        "{replacement:?}"
-    );
-    let replacement_id = handler
-        .state
-        .lock()
+    let replacement_handler = Arc::clone(&handler);
+    let replacement_destination = destination.clone();
+    let replacing = tokio::spawn(async move {
+        create_window_direct(&replacement_handler, &replacement_destination, 1).await
+    });
+    let replacement_id = wait_for_window_presence(&handler, &destination, 1, true)
         .await
-        .sessions
-        .session(&destination)
-        .and_then(|session| session.window_at(1))
-        .expect("replacement window exists")
-        .id();
+        .expect("replacement window exists");
     while events.try_recv().is_ok() {}
     pause.release.notify_one();
     let response = linking.await.expect("link-window task joins");
     assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
+    let unlinked = unlinking.await.expect("unlink-window task joins");
+    assert!(
+        matches!(unlinked, Response::UnlinkWindow(_)),
+        "{unlinked:?}"
+    );
+    let replacement = replacing.await.expect("replacement new-window task joins");
+    assert!(
+        matches!(replacement, Response::NewWindow(_)),
+        "{replacement:?}"
+    );
 
     let event = receive_window_linked(&mut events, &destination).await;
     handler.dispatch_lifecycle_hook(event).await;
@@ -835,31 +884,41 @@ async fn move_window_prepares_linked_identity_before_same_slot_reuse() {
         .await
         .expect("move-window reaches post-commit lifecycle pause");
 
-    let removed = handler
-        .handle_kill_window(KillWindowRequest {
-            target: WindowTarget::with_window(destination.clone(), 1),
-            kill_all_others: false,
-        })
-        .await;
-    assert!(matches!(removed, Response::KillWindow(_)), "{removed:?}");
-    let replacement = create_window_direct(&handler, &destination, 1).await;
+    let remove_handler = Arc::clone(&handler);
+    let remove_destination = destination.clone();
+    let removing = tokio::spawn(async move {
+        remove_handler
+            .handle_kill_window(KillWindowRequest {
+                target: WindowTarget::with_window(remove_destination, 1),
+                kill_all_others: false,
+            })
+            .await
+    });
     assert!(
-        matches!(replacement, Response::NewWindow(_)),
-        "{replacement:?}"
+        wait_for_window_presence(&handler, &destination, 1, false)
+            .await
+            .is_none(),
+        "moved window is removed"
     );
-    let replacement_id = handler
-        .state
-        .lock()
+    let replacement_handler = Arc::clone(&handler);
+    let replacement_destination = destination.clone();
+    let replacing = tokio::spawn(async move {
+        create_window_direct(&replacement_handler, &replacement_destination, 1).await
+    });
+    let replacement_id = wait_for_window_presence(&handler, &destination, 1, true)
         .await
-        .sessions
-        .session(&destination)
-        .and_then(|session| session.window_at(1))
-        .expect("replacement window exists")
-        .id();
+        .expect("replacement window exists");
     while events.try_recv().is_ok() {}
     pause.release.notify_one();
     let response = moving.await.expect("move-window task joins");
     assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
+    let removed = removing.await.expect("kill-window task joins");
+    assert!(matches!(removed, Response::KillWindow(_)), "{removed:?}");
+    let replacement = replacing.await.expect("replacement new-window task joins");
+    assert!(
+        matches!(replacement, Response::NewWindow(_)),
+        "{replacement:?}"
+    );
 
     let event = receive_window_linked(&mut events, &destination).await;
     handler.dispatch_lifecycle_hook(event).await;
@@ -912,31 +971,41 @@ async fn break_pane_prepares_linked_identity_before_same_slot_reuse() {
         .await
         .expect("break-pane reaches post-commit lifecycle pause");
 
-    let removed = handler
-        .handle_kill_window(KillWindowRequest {
-            target: WindowTarget::with_window(session.clone(), 1),
-            kill_all_others: false,
-        })
-        .await;
-    assert!(matches!(removed, Response::KillWindow(_)), "{removed:?}");
-    let replacement = create_window_direct(&handler, &session, 1).await;
+    let remove_handler = Arc::clone(&handler);
+    let remove_session = session.clone();
+    let removing = tokio::spawn(async move {
+        remove_handler
+            .handle_kill_window(KillWindowRequest {
+                target: WindowTarget::with_window(remove_session, 1),
+                kill_all_others: false,
+            })
+            .await
+    });
     assert!(
-        matches!(replacement, Response::NewWindow(_)),
-        "{replacement:?}"
+        wait_for_window_presence(&handler, &session, 1, false)
+            .await
+            .is_none(),
+        "broken-out window is removed"
     );
-    let replacement_id = handler
-        .state
-        .lock()
+    let replacement_handler = Arc::clone(&handler);
+    let replacement_session = session.clone();
+    let replacing = tokio::spawn(async move {
+        create_window_direct(&replacement_handler, &replacement_session, 1).await
+    });
+    let replacement_id = wait_for_window_presence(&handler, &session, 1, true)
         .await
-        .sessions
-        .session(&session)
-        .and_then(|session| session.window_at(1))
-        .expect("replacement window exists")
-        .id();
+        .expect("replacement window exists");
     while events.try_recv().is_ok() {}
     pause.release.notify_one();
     let response = breaking.await.expect("break-pane task joins");
     assert!(matches!(response, Response::BreakPane(_)), "{response:?}");
+    let removed = removing.await.expect("kill-window task joins");
+    assert!(matches!(removed, Response::KillWindow(_)), "{removed:?}");
+    let replacement = replacing.await.expect("replacement new-window task joins");
+    assert!(
+        matches!(replacement, Response::NewWindow(_)),
+        "{replacement:?}"
+    );
 
     let event = receive_window_linked(&mut events, &session).await;
     handler.dispatch_lifecycle_hook(event).await;

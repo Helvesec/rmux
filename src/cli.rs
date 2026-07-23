@@ -758,6 +758,7 @@ mod tests {
                 start_directory: None,
                 environment: Vec::new(),
                 command: Vec::new(),
+                queue_command: String::new(),
             }
         )));
         let web_create = parse_cli(["rmux", "web-share", "-t", "alpha"])

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::Path;
-#[cfg(test)]
 use std::sync::Mutex as StdMutex;
 
 use rmux_core::{
@@ -22,6 +21,7 @@ use crate::pane_io::{PaneAlertCallback, PaneExitCallback, PaneOutputSender};
 use crate::pane_reader_runtime::PaneReaderRuntime;
 use crate::pane_transcript::SharedPaneTranscript;
 use crate::pane_visible_geometry::visible_pane_content_geometry;
+use crate::status_jobs::StatusJobRuntime;
 #[cfg(windows)]
 use crate::terminal::TerminalProfile;
 
@@ -64,13 +64,15 @@ pub(crate) use session_mutation::SessionTransferSnapshot;
 mod session_runtime;
 #[path = "pane_terminals/window_indices.rs"]
 mod window_indices;
+#[path = "pane_terminals/window_listing.rs"]
+mod window_listing;
+pub(crate) use window_listing::{ListWindowsAllSelection, ListWindowsSelection};
 #[path = "pane_terminals/window_link_runtime.rs"]
 mod window_link_runtime;
 #[path = "pane_terminals/window_links.rs"]
 mod window_links;
 #[path = "pane_terminals_window.rs"]
 mod window_support;
-pub(crate) use window_support::ListWindowsSelection;
 
 #[cfg(test)]
 pub(crate) use lifecycle_state::PaneLifecycleProcessState;
@@ -85,7 +87,7 @@ pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
 use pane_pipe::PanePipeStore;
 #[cfg(test)]
-pub(crate) use pane_pipe::{active_pipe_child_count_for_test, PipeProcessGroupProbe};
+pub(crate) use pane_pipe::PipeProcessGroupProbe;
 use pane_terminal_store::PaneTerminalStore;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use pane_transcripts::PaneCaptureRequest;
@@ -239,7 +241,11 @@ pub(crate) struct HandlerState {
     pub(crate) hooks: HookStore,
     pub(crate) buffers: BufferStore,
     pub(crate) key_bindings: KeyBindingStore,
+    pub(crate) retained_lifecycle_targets:
+        StdMutex<crate::handler::RetainedLifecycleTargetRegistry>,
     pub(crate) message_log: VecDeque<MessageEntry>,
+    lifecycle_commit_order: crate::lifecycle_commit_order::LifecycleCommitOrder,
+    status_jobs: StatusJobRuntime,
     startup_config_files: String,
     next_message_number: u64,
     terminals: PaneTerminalStore,
@@ -311,6 +317,8 @@ pub(crate) struct KilledWindowResult {
     pub(crate) response: KillWindowResponse,
     pub(crate) removed_windows: Vec<RemovedWindowHookContext>,
     pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) destroyed_sessions: Vec<(SessionName, rmux_proto::SessionId)>,
+    pub(crate) removed_window_ids: Vec<rmux_proto::WindowId>,
     pub(crate) reindexed_windows: Vec<(SessionName, BTreeMap<u32, u32>)>,
 }
 
@@ -338,6 +346,34 @@ pub(crate) struct UnlinkedWindowResult {
 }
 
 impl HandlerState {
+    pub(crate) fn reserve_lifecycle_commit_order(
+        &self,
+    ) -> Option<crate::lifecycle_commit_order::LifecycleCommitTicket> {
+        self.lifecycle_commit_order.try_reserve()
+    }
+
+    pub(crate) fn track_unordered_lifecycle_publication(
+        &self,
+    ) -> Option<crate::lifecycle_commit_order::LifecyclePublicationGuard> {
+        self.lifecycle_commit_order.track_unordered_publication()
+    }
+
+    pub(crate) fn close_lifecycle_commit_order(
+        &self,
+    ) -> crate::lifecycle_commit_order::LifecycleCommitPending {
+        self.lifecycle_commit_order.close()
+    }
+
+    pub(crate) fn seal_lifecycle_publications(
+        &self,
+    ) -> crate::lifecycle_commit_order::LifecycleCommitPending {
+        self.lifecycle_commit_order.seal_publications()
+    }
+
+    pub(crate) fn status_jobs(&self) -> &StatusJobRuntime {
+        &self.status_jobs
+    }
+
     pub(crate) fn set_startup_config_files(&mut self, paths: &[String]) {
         self.startup_config_files = paths.join(",");
     }
@@ -500,16 +536,26 @@ fn pane_terminal_geometry_for_session(
     session: &Session,
     options: &OptionStore,
     window_index: u32,
+    pane_index: u32,
     geometry: PaneGeometry,
+    alternate_on: bool,
+    copy_mode_active: bool,
 ) -> PaneGeometry {
     let content_rows = session_content_rows(session, options, window_index);
-    visible_pane_content_geometry(
+    let geometry = visible_pane_content_geometry(
         options,
         session.name(),
         window_index,
         geometry,
         content_rows,
+    );
+    crate::pane_scrollbar::PaneScrollbarConfig::resolve(
+        options,
+        session.name(),
+        window_index,
+        pane_index,
     )
+    .content_geometry(geometry, alternate_on, copy_mode_active)
 }
 
 fn session_content_rows(session: &Session, options: &OptionStore, window_index: u32) -> u16 {
@@ -539,8 +585,11 @@ pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{session_content_rows, HandlerState, InitialPaneSpawnOptions};
-    use rmux_core::Session;
+    use super::{
+        pane_terminal_geometry_for_session, session_content_rows, HandlerState,
+        InitialPaneSpawnOptions,
+    };
+    use rmux_core::{PaneGeometry, Session};
     use rmux_proto::{
         HookLifecycle, HookName, OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName,
         SetOptionMode, TerminalSize, WindowTarget,
@@ -589,6 +638,101 @@ mod tests {
             )
             .expect("session status set succeeds");
         assert_eq!(session_content_rows(&session, &state.options, 0), 24);
+    }
+
+    #[test]
+    fn pane_terminal_geometry_tracks_scrollbar_mode_position_and_alternate_screen() {
+        let alpha = session_name("alpha");
+        let session = Session::new(alpha.clone(), TerminalSize { cols: 20, rows: 8 });
+        let mut state = HandlerState::default();
+        let target = WindowTarget::with_window(alpha.clone(), 0);
+        state
+            .options
+            .set(
+                ScopeSelector::Window(target.clone()),
+                OptionName::PaneScrollbars,
+                "on".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("scrollbar mode");
+        state
+            .options
+            .set(
+                ScopeSelector::Window(target.clone()),
+                OptionName::PaneScrollbarsPosition,
+                "left".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("scrollbar position");
+        state
+            .options
+            .set(
+                ScopeSelector::Window(target.clone()),
+                OptionName::PaneScrollbarsStyle,
+                "width=2,pad=1".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("scrollbar style");
+
+        assert_eq!(
+            pane_terminal_geometry_for_session(
+                &session,
+                &state.options,
+                0,
+                0,
+                PaneGeometry::new(0, 0, 20, 8),
+                false,
+                false,
+            ),
+            PaneGeometry::new(3, 0, 17, 8)
+        );
+        assert_eq!(
+            pane_terminal_geometry_for_session(
+                &session,
+                &state.options,
+                0,
+                0,
+                PaneGeometry::new(0, 0, 20, 8),
+                true,
+                false,
+            ),
+            PaneGeometry::new(0, 0, 20, 8),
+            "alternate screen restores the full PTY width"
+        );
+
+        state
+            .options
+            .set(
+                ScopeSelector::Window(target),
+                OptionName::PaneScrollbars,
+                "modal".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("modal scrollbar mode");
+        assert_eq!(
+            pane_terminal_geometry_for_session(
+                &session,
+                &state.options,
+                0,
+                0,
+                PaneGeometry::new(0, 0, 20, 8),
+                false,
+                false,
+            ),
+            PaneGeometry::new(0, 0, 20, 8)
+        );
+        assert_eq!(
+            pane_terminal_geometry_for_session(
+                &session,
+                &state.options,
+                0,
+                0,
+                PaneGeometry::new(0, 0, 20, 8),
+                false,
+                true,
+            ),
+            PaneGeometry::new(3, 0, 17, 8)
+        );
     }
 
     #[tokio::test]

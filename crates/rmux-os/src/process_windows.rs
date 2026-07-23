@@ -92,6 +92,10 @@ impl ProcessJob {
         Ok(())
     }
 
+    pub(crate) fn raw_handle(&self) -> RawHandle {
+        self.handle.as_raw_handle()
+    }
+
     /// Clears the kill-on-close policy while keeping the process assigned to
     /// the job until this handle is dropped.
     ///

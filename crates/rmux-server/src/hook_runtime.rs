@@ -7,7 +7,7 @@ use rmux_proto::{HookName, ScopeSelector, SessionId, Target};
 use crate::pane_terminals::WindowLinkOccurrenceId;
 
 tokio::task_local! {
-    static HOOKS_DISABLED: bool;
+    static HOOK_EXECUTION: HookExecutionContext;
 }
 
 tokio::task_local! {
@@ -44,10 +44,64 @@ pub(crate) struct ExactPaneHookTarget {
     pub(crate) window_occurrence_id: Option<WindowLinkOccurrenceId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HookExecutionKind {
+    /// An inline, after-command, or command-error hook.
+    ///
+    /// tmux may deliver lifecycle notifications deferred by this command once
+    /// the command queue advances.
+    Command,
+    /// A lifecycle notification hook.
+    ///
+    /// Commands run by lifecycle hooks use tmux's no-hooks state, so they must
+    /// not enqueue another lifecycle generation.
+    Lifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HookExecutionContext {
+    hook: HookName,
+    kind: HookExecutionKind,
+}
+
+impl HookExecutionContext {
+    pub(crate) const fn command(hook: HookName) -> Self {
+        Self {
+            hook,
+            kind: HookExecutionKind::Command,
+        }
+    }
+
+    pub(crate) const fn lifecycle(hook: HookName) -> Self {
+        Self {
+            hook,
+            kind: HookExecutionKind::Lifecycle,
+        }
+    }
+
+    pub(crate) const fn hook(self) -> HookName {
+        self.hook
+    }
+
+    fn allows_lifecycle_hook(self) -> bool {
+        matches!(self.kind, HookExecutionKind::Command)
+    }
+}
+
 pub(crate) fn hooks_disabled() -> bool {
-    HOOKS_DISABLED
-        .try_with(|disabled| *disabled)
+    HOOK_EXECUTION.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn lifecycle_hooks_disabled() -> bool {
+    // A command hook may release one lifecycle generation. Lifecycle contexts
+    // bound the chain after that first generation, including same-hook events.
+    HOOK_EXECUTION
+        .try_with(|execution| !execution.allows_lifecycle_hook())
         .unwrap_or(false)
+}
+
+pub(crate) fn current_hook_execution() -> Option<HookExecutionContext> {
+    HOOK_EXECUTION.try_with(|execution| *execution).ok()
 }
 
 pub(crate) fn current_hook_format_value(name: &str) -> Option<String> {
@@ -88,14 +142,31 @@ where
         .await
 }
 
-pub(crate) async fn with_hook_execution<T, F>(formats: Vec<(String, String)>, future: F) -> T
+pub(crate) async fn with_hook_execution<T, F>(
+    execution: HookExecutionContext,
+    formats: Vec<(String, String)>,
+    future: F,
+) -> T
 where
     F: Future<Output = T>,
 {
-    HOOKS_DISABLED
-        .scope(
-            true,
-            async move { HOOK_FORMATS.scope(formats, future).await },
-        )
+    HOOK_EXECUTION
+        .scope(execution, async move {
+            HOOK_FORMATS.scope(formats, future).await
+        })
         .await
+}
+
+pub(crate) async fn with_optional_hook_execution<T, F>(
+    execution: Option<HookExecutionContext>,
+    formats: Vec<(String, String)>,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    match execution {
+        Some(execution) => with_hook_execution(execution, formats, future).await,
+        None => future.await,
+    }
 }

@@ -23,9 +23,13 @@ fn parse_choose_buffer_command_preserves_preview_and_sort_flags() {
 #[test]
 fn tag_all_descends_through_no_tag_headers() {
     let mut mode = ModeTreeClientState {
+        origin: test_origin(),
         kind: ModeTreeKind::Customize,
         session_name: SessionName::new("alpha").expect("valid session"),
+        session_id: rmux_proto::SessionId::new(1),
         host_pane: None,
+        host_identity: None,
+        host_transcript: None,
         preview_mode: PreviewMode::Normal,
         row_format: None,
         filter_format: None,

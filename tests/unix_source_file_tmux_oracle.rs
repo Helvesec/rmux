@@ -50,6 +50,71 @@ fn source_file_parse_only_clear_history_matches_tmux_oracle() -> Result<(), Box<
 }
 
 #[test]
+fn source_file_missing_canfail_target_matches_tmux_oracle() -> Result<(), Box<dyn Error>> {
+    let tmux = match FrozenTmuxBinary::discover() {
+        FrozenTmuxBinary::Available(path) => path,
+        FrozenTmuxBinary::Unavailable {
+            checked_path,
+            reason,
+        } => {
+            eprintln!(
+                "runtime skip: tmux 3.7b oracle unavailable via {TMUX_ORACLE_ENV}/{FROZEN_TMUX_ENV} or default '{}': {reason}",
+                checked_path.display()
+            );
+            return Ok(());
+        }
+    };
+    let harness = SourceFileOracleHarness::new("source-canfail-target")?;
+    let child = harness.tmpdir().join("child.conf");
+    let outer = harness.tmpdir().join("outer.conf");
+    fs::write(
+        &child,
+        "display-message -p '#{session_name}:#{window_index}.#{pane_index}'\n",
+    )?;
+    fs::write(
+        &outer,
+        format!("source-file -t %9999 {}\n", child.display()),
+    )?;
+
+    harness.rmux_success(["-f", "/dev/null", "new-session", "-d", "-s", "alpha"])?;
+    harness.tmux_success(
+        &tmux,
+        ["-f", "/dev/null", "new-session", "-d", "-s", "alpha"],
+    )?;
+
+    for path in [&child, &outer] {
+        let rmux_output = harness.rmux_output(["source-file", "-t", "%9999"], path)?;
+        let tmux_output = harness.tmux_output(&tmux, ["source-file", "-t", "%9999"], path)?;
+        assert_eq!(rmux_output.status.code(), tmux_output.status.code());
+        assert_eq!(rmux_output.stdout, tmux_output.stdout);
+        assert_eq!(rmux_output.stderr, tmux_output.stderr);
+        assert_eq!(String::from_utf8_lossy(&rmux_output.stdout), "alpha:0.0\n");
+    }
+
+    harness.rmux_success(["set-option", "-g", "base-index", "3"])?;
+    harness.tmux_success(&tmux, ["set-option", "-g", "base-index", "3"])?;
+    harness.rmux_success(["set-option", "-g", "pane-base-index", "4"])?;
+    harness.tmux_success(&tmux, ["set-option", "-g", "pane-base-index", "4"])?;
+    harness.rmux_success(["new-window", "-d", "-t", "alpha:5", "sleep 30"])?;
+    harness.tmux_success(&tmux, ["new-window", "-d", "-t", "alpha:5", "sleep 30"])?;
+    harness.rmux_success(["split-window", "-d", "-t", "alpha:5", "sleep 30"])?;
+    harness.tmux_success(&tmux, ["split-window", "-d", "-t", "alpha:5", "sleep 30"])?;
+    harness.rmux_success(["select-window", "-t", "alpha:5"])?;
+    harness.tmux_success(&tmux, ["select-window", "-t", "alpha:5"])?;
+    harness.rmux_success(["select-pane", "-t", "alpha:5.5"])?;
+    harness.tmux_success(&tmux, ["select-pane", "-t", "alpha:5.5"])?;
+
+    let rmux_output = harness.rmux_output(["source-file", "-t", "alpha:5.4"], &outer)?;
+    let tmux_output = harness.tmux_output(&tmux, ["source-file", "-t", "alpha:5.4"], &outer)?;
+    assert_eq!(rmux_output.status.code(), tmux_output.status.code());
+    assert_eq!(rmux_output.stdout, tmux_output.stdout);
+    assert_eq!(rmux_output.stderr, tmux_output.stderr);
+    assert_eq!(String::from_utf8_lossy(&rmux_output.stdout), "alpha:5.5\n");
+
+    Ok(())
+}
+
+#[test]
 fn source_file_parse_only_does_not_execute_shell_or_apply_options() -> Result<(), Box<dyn Error>> {
     let harness = SourceFileOracleHarness::new("source-file-parse-only-effects")?;
     let marker = harness.tmpdir().join("parse-only-run-shell-marker");

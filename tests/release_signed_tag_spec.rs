@@ -566,7 +566,21 @@ fn tag_driver_is_local_only_in_dry_run_and_fails_without_app_authority() {
     );
 
     args.retain(|value| value != "--dry-run");
-    let no_app = run(Command::new(&driver).args(&args));
+    let authority_bin = fixture.root.join("authority-bin");
+    fs::create_dir_all(&authority_bin).expect("create authority bin");
+    let inert_gh = authority_bin.join("gh");
+    fs::write(&inert_gh, "#!/bin/sh\nexit 99\n").expect("write inert gh");
+    make_executable(&inert_gh);
+    let authority_path = format!(
+        "{}:{}",
+        authority_bin.display(),
+        std::env::var("PATH").expect("PATH")
+    );
+    let no_app = run(Command::new(&driver)
+        .args(&args)
+        .env("PATH", authority_path)
+        .env_remove("RMUX_RELEASE_APP_ID")
+        .env_remove("RMUX_RELEASE_APP_TOKEN"));
     assert!(!no_app.status.success());
     assert!(stderr(&no_app).contains("RMUX_RELEASE_APP_ID"));
 

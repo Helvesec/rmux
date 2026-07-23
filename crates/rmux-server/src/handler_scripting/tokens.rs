@@ -1,7 +1,101 @@
 use std::collections::VecDeque;
 
-use rmux_core::command_inventory::{command_short_option_spec, CommandShortOptionSpec};
+use rmux_core::{
+    command_inventory::{command_short_option_spec, CommandShortOptionSpec},
+    command_parser::{CommandArgument, ParsedCommand},
+    command_target_metadata,
+};
 use rmux_proto::RmuxError;
+
+/// Applies tmux's last-value precedence before queued target lookup.
+///
+/// Superseded source and target values must be removed before any parser can
+/// resolve or validate them; only the final value for each flag is meaningful.
+pub(super) fn normalize_repeated_target_options(command: ParsedCommand) -> ParsedCommand {
+    let Some(metadata) = command_target_metadata(command.name()) else {
+        return command;
+    };
+    let target_flags = [metadata.source, metadata.target]
+        .into_iter()
+        .flatten()
+        .map(|spec| spec.flag)
+        .collect::<Vec<_>>();
+    let scalar_arguments = command
+        .arguments()
+        .iter()
+        .map_while(CommandArgument::as_string)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let option_prefix_len = short_option_prefix_len(command.name(), &scalar_arguments);
+    if option_prefix_len == 0 {
+        return command;
+    }
+
+    let option_prefix = normalize_compact_short_options(
+        command.name(),
+        scalar_arguments[..option_prefix_len].to_vec(),
+    );
+    let option_prefix = retain_last_target_options(command.name(), option_prefix, &target_flags);
+    let mut arguments = option_prefix
+        .into_iter()
+        .map(CommandArgument::String)
+        .collect::<Vec<_>>();
+    arguments.extend(command.arguments()[option_prefix_len..].iter().cloned());
+    command.with_arguments(arguments)
+}
+
+fn retain_last_target_options(
+    command_name: &str,
+    arguments: Vec<String>,
+    target_flags: &[char],
+) -> Vec<String> {
+    let Some(spec) = command_short_option_spec(command_name) else {
+        return arguments;
+    };
+    let mut last_occurrences = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        if let Some(flag) = separated_short_flag(&arguments[index]) {
+            if target_flags.contains(&flag) {
+                last_occurrences.retain(|(candidate, _)| *candidate != flag);
+                last_occurrences.push((flag, index));
+            }
+            index += usize::from(spec.takes_value(flag));
+        }
+        index += 1;
+    }
+
+    let mut retained = Vec::with_capacity(arguments.len());
+    let mut index = 0;
+    while index < arguments.len() {
+        if let Some(flag) = separated_short_flag(&arguments[index]) {
+            let takes_value = spec.takes_value(flag);
+            if !target_flags.contains(&flag)
+                || last_occurrences
+                    .iter()
+                    .any(|(candidate, last_index)| *candidate == flag && *last_index == index)
+            {
+                retained.push(arguments[index].clone());
+                if takes_value {
+                    if let Some(value) = arguments.get(index + 1) {
+                        retained.push(value.clone());
+                    }
+                }
+            }
+            index += usize::from(takes_value);
+        } else {
+            retained.push(arguments[index].clone());
+        }
+        index += 1;
+    }
+    retained
+}
+
+fn separated_short_flag(argument: &str) -> Option<char> {
+    let mut characters = argument.strip_prefix('-')?.chars();
+    let flag = characters.next()?;
+    characters.next().is_none().then_some(flag)
+}
 
 pub(super) fn normalize_compact_short_options(
     command_name: &str,
@@ -278,10 +372,29 @@ impl CommandTokens {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_compact_short_options, short_option_prefix_len};
+    use rmux_core::command_parser::{CommandArgument, CommandParser};
+
+    use super::{
+        normalize_compact_short_options, normalize_repeated_target_options, short_option_prefix_len,
+    };
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn normalized_arguments(command: &str) -> Vec<CommandArgument> {
+        let parsed = CommandParser::new().parse(command).expect("command parses");
+        assert_eq!(parsed.commands().len(), 1);
+        normalize_repeated_target_options(parsed.commands()[0].clone())
+            .arguments()
+            .to_vec()
+    }
+
+    fn string_arguments(values: &[&str]) -> Vec<CommandArgument> {
+        values
+            .iter()
+            .map(|value| CommandArgument::String((*value).to_owned()))
+            .collect()
     }
 
     #[test]
@@ -361,5 +474,39 @@ mod tests {
             normalize_compact_short_options("show-messages", vec![repeated]),
             args(&["-J", "-T"])
         );
+    }
+
+    #[test]
+    fn repeated_target_options_keep_only_the_last_value_for_each_target_flag() {
+        assert_eq!(
+            normalized_arguments("swap-window -smissing -salpha:0 -t bad:xyz.??? -tbeta:0 -d"),
+            string_arguments(&["-s", "alpha:0", "-t", "beta:0", "-d"])
+        );
+        assert_eq!(
+            normalized_arguments("new-window -t bad:xyz.??? -t alpha -n chosen"),
+            string_arguments(&["-t", "alpha", "-n", "chosen"])
+        );
+    }
+
+    #[test]
+    fn repeated_target_normalization_respects_option_and_positional_boundaries() {
+        assert_eq!(
+            normalized_arguments("display-message -F -t -t missing -t alpha:0 message -t tail"),
+            string_arguments(&["-F", "-t", "-t", "alpha:0", "message", "-t", "tail"])
+        );
+    }
+
+    #[test]
+    fn repeated_target_normalization_preserves_nested_command_arguments() {
+        let normalized =
+            normalized_arguments("if-shell -t missing -t alpha:0.0 -F 1 { display-message -p ok }");
+        assert_eq!(
+            &normalized[..4],
+            string_arguments(&["-t", "alpha:0.0", "-F", "1"])
+        );
+        assert!(matches!(
+            normalized.last(),
+            Some(CommandArgument::Commands(_))
+        ));
     }
 }

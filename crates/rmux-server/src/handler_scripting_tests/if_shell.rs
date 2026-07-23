@@ -38,13 +38,80 @@ async fn if_shell_format_mode_dispatches_selected_rmux_command() {
 }
 
 #[tokio::test]
+async fn queued_if_shell_returns_nested_command_output() {
+    let handler = RequestHandler::new();
+    let set_buffer = handler
+        .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
+            name: Some("queued-selected".to_owned()),
+            content: b"queued-output".to_vec(),
+            append: false,
+            new_name: None,
+            set_clipboard: false,
+            target_client: None,
+        })))
+        .await;
+    assert!(matches!(set_buffer, Response::SetBuffer(_)));
+
+    let parsed = handler
+        .parse_control_commands("if-shell -F 1 'show-buffer -b queued-selected'")
+        .await
+        .expect("queued if-shell parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::new(None)
+                .with_client_name(Some("queued-if-shell-client".to_owned())),
+        )
+        .await
+        .expect("queued if-shell executes");
+
+    assert_eq!(output.stdout(), b"queued-output");
+}
+
+#[tokio::test]
+async fn if_shell_format_mode_ignores_background_flag_like_tmux() {
+    let handler = RequestHandler::new();
+
+    let response = handler
+        .handle_if_shell(
+            std::process::id(),
+            IfShellRequest {
+                condition: "1".to_owned(),
+                format_mode: true,
+                then_command: "display-message -p marker".to_owned(),
+                else_command: None,
+                target: None,
+                caller_cwd: None,
+                background: true,
+            },
+        )
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .expect("format-mode if-shell returns inline output")
+            .stdout(),
+        b"marker\n"
+    );
+    assert_eq!(
+        handler
+            .active_detached_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
 async fn background_if_shell_keeps_detached_write_access_after_response() {
     let handler = RequestHandler::new();
     use_platform_test_shell(&handler).await;
     let requester_pid = 424_006;
 
     {
-        let _access = handler.begin_detached_requester_access(requester_pid, true);
+        let _access =
+            handler.begin_test_detached_requester_access(requester_pid, AccessMode::ReadWrite);
         let response = handler
             .dispatch(
                 requester_pid,
@@ -72,6 +139,7 @@ async fn background_if_shell_keeps_detached_write_access_after_response() {
 #[tokio::test]
 async fn background_if_shell_request_rejects_a_reused_control_registration() {
     let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
     let requester_pid = 424_106;
     let original = session_name("if-shell-request-control-original");
     let replacement = session_name("if-shell-request-control-replacement");
@@ -86,8 +154,8 @@ async fn background_if_shell_request_rejects_a_reused_control_registration() {
         handler.handle_if_shell(
             requester_pid,
             IfShellRequest {
-                condition: "1".to_owned(),
-                format_mode: true,
+                condition: delayed_true_shell_condition(),
+                format_mode: false,
                 then_command: format!(
                     "wait-for {wait_channel} ; kill-session -t {}",
                     replacement.as_str()
@@ -127,7 +195,8 @@ async fn queued_background_if_shell_keeps_detached_write_access_after_response()
         .expect("background if-shell command parses");
 
     {
-        let _access = handler.begin_detached_requester_access(requester_pid, true);
+        let _access =
+            handler.begin_test_detached_requester_access(requester_pid, AccessMode::ReadWrite);
         let output = handler
             .execute_parsed_commands_for_test(requester_pid, parsed)
             .await
@@ -167,6 +236,7 @@ async fn queued_if_shell_rejects_unknown_option_before_condition() {
 #[tokio::test]
 async fn queued_background_if_shell_rejects_a_reused_control_registration() {
     let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
     let requester_pid = 424_107;
     let original = session_name("if-shell-queue-control-original");
     let replacement = session_name("if-shell-queue-control-replacement");
@@ -178,7 +248,8 @@ async fn queued_background_if_shell_rejects_a_reused_control_registration() {
 
     let commands = CommandParser::new()
         .parse(&format!(
-            "if-shell -b -F 1 {{ wait-for {wait_channel} ; kill-session -t {} }}",
+            "if-shell -b {} {{ wait-for {wait_channel} ; kill-session -t {} }}",
+            command_quote(&delayed_true_shell_condition()),
             replacement.as_str()
         ))
         .expect("background queued if-shell command parses");
@@ -198,6 +269,7 @@ async fn queued_background_if_shell_rejects_a_reused_control_registration() {
 
 async fn assert_background_if_shell_rejects_reused_attach_registration(queued: bool) {
     let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
     let requester_pid = if queued { 424_208 } else { 424_207 };
     let suffix = if queued { "queue" } else { "request" };
     let original = session_name(&format!("if-shell-{suffix}-attach-original"));
@@ -214,7 +286,8 @@ async fn assert_background_if_shell_rejects_reused_attach_registration(queued: b
     if queued {
         let commands = CommandParser::new()
             .parse(&format!(
-                "if-shell -b -F 1 {{ wait-for {wait_channel} ; detach-client }}"
+                "if-shell -b {} {{ wait-for {wait_channel} ; detach-client }}",
+                command_quote(&delayed_true_shell_condition())
             ))
             .expect("background queued if-shell command parses");
         let output = with_expected_attach_and_session_identity(
@@ -234,8 +307,8 @@ async fn assert_background_if_shell_rejects_reused_attach_registration(queued: b
             handler.handle_if_shell(
                 requester_pid,
                 IfShellRequest {
-                    condition: "1".to_owned(),
-                    format_mode: true,
+                    condition: delayed_true_shell_condition(),
+                    format_mode: false,
                     then_command: format!("wait-for {wait_channel} ; detach-client"),
                     else_command: None,
                     target: None,
@@ -289,6 +362,7 @@ async fn background_if_shell_rejects_a_reused_attach_registration() {
 #[tokio::test]
 async fn background_if_shell_queue_survives_a_same_registration_session_switch() {
     let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
     let requester_pid = 424_308;
     let alpha = session_name("if-shell-attach-switch-alpha");
     let beta = session_name("if-shell-attach-switch-beta");
@@ -304,7 +378,8 @@ async fn background_if_shell_queue_survives_a_same_registration_session_switch()
 
     let commands = CommandParser::new()
         .parse(&format!(
-            "if-shell -b -F 1 {{ wait-for {wait_channel} ; rename-window {followed_window_name} }} ; switch-client -t {beta}"
+            "if-shell -b {} {{ wait-for {wait_channel} ; rename-window {followed_window_name} }} ; switch-client -t {beta}",
+            command_quote(&delayed_true_shell_condition())
         ))
         .expect("background if-shell and attached switch parse");
     let output = with_expected_attach_and_session_identity(
@@ -350,6 +425,7 @@ async fn background_if_shell_queue_survives_a_same_registration_session_switch()
 
 async fn assert_explicit_background_if_shell_target_survives_switch(queued: bool) {
     let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
     let requester_pid = if queued { 424_310 } else { 424_309 };
     let suffix = if queued { "queue" } else { "request" };
     let alpha = session_name(&format!("if-shell-explicit-{suffix}-alpha"));
@@ -369,7 +445,8 @@ async fn assert_explicit_background_if_shell_target_survives_switch(queued: bool
     if queued {
         let commands = CommandParser::new()
             .parse(&format!(
-                "if-shell -b -F -t {gamma}:0.0 1 {{ wait-for {wait_channel} ; rename-window {expected_window_name} }}"
+                "if-shell -b -t {gamma}:0.0 {} {{ wait-for {wait_channel} ; rename-window {expected_window_name} }}",
+                command_quote(&delayed_true_shell_condition())
             ))
             .expect("queued explicit background if-shell parses");
         with_expected_attach_and_session_identity(
@@ -388,8 +465,8 @@ async fn assert_explicit_background_if_shell_target_survives_switch(queued: bool
             handler.handle_if_shell(
                 requester_pid,
                 IfShellRequest {
-                    condition: "1".to_owned(),
-                    format_mode: true,
+                    condition: delayed_true_shell_condition(),
+                    format_mode: false,
                     then_command: format!(
                         "wait-for {wait_channel} ; rename-window {expected_window_name}"
                     ),

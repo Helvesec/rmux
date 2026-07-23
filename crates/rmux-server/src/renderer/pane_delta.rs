@@ -6,6 +6,9 @@ use rmux_core::{input::mode, GridRenderOptions, OptionStore, Pane, Screen, Sessi
 use crate::pane_transcript::PaneTranscript;
 
 use super::pane_screen::{pane_default_style, pane_selection_overlay_style};
+use super::pane_scrollbar::{
+    resolve_pane_scrollbar, PaneScrollbarRenderContext, RenderedPaneScrollbar,
+};
 use super::{
     cursor_position_bytes, replace_cursor_position_bytes, styled_pane_screen,
     truncate_rendered_pane_line, visible_pane_geometry, StatusGeometry,
@@ -62,6 +65,7 @@ pub(crate) struct PaneRenderSnapshot {
     path: String,
     mode: u32,
     line_revisions: Vec<u64>,
+    scrollbar: Option<RenderedPaneScrollbar>,
 }
 
 impl PaneRenderSnapshot {
@@ -93,7 +97,20 @@ impl PaneRenderSnapshot {
         screen: &Screen,
     ) -> Option<Self> {
         let geometry = StatusGeometry::for_session(session, options);
-        let pane_geometry = visible_pane_geometry(session, options, pane, geometry.content_rows)?;
+        let raw_pane_geometry =
+            visible_pane_geometry(session, options, pane, geometry.content_rows)?;
+        let (pane_geometry, scrollbar) = resolve_pane_scrollbar(
+            session,
+            options,
+            pane,
+            PaneScrollbarRenderContext {
+                geometry: raw_pane_geometry,
+                history_size: screen.history_size(),
+                alternate_on: screen.is_alternate(),
+                copy_mode_scroll_position: None,
+                content_y_offset: geometry.content_y_offset,
+            },
+        );
         if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
             return None;
         }
@@ -137,6 +154,7 @@ impl PaneRenderSnapshot {
             path: screen.path().to_owned(),
             mode: screen.mode(),
             line_revisions,
+            scrollbar,
         })
     }
 
@@ -154,7 +172,20 @@ impl PaneRenderSnapshot {
         }
 
         let geometry = StatusGeometry::for_session(session, options);
-        let pane_geometry = visible_pane_geometry(session, options, pane, geometry.content_rows)?;
+        let raw_pane_geometry =
+            visible_pane_geometry(session, options, pane, geometry.content_rows)?;
+        let (pane_geometry, scrollbar) = resolve_pane_scrollbar(
+            session,
+            options,
+            pane,
+            PaneScrollbarRenderContext {
+                geometry: raw_pane_geometry,
+                history_size: transcript.history_size(),
+                alternate_on: transcript.is_alternate(),
+                copy_mode_scroll_position: None,
+                content_y_offset: geometry.content_y_offset,
+            },
+        );
         if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
             return None;
         }
@@ -227,6 +258,7 @@ impl PaneRenderSnapshot {
             path: state.path,
             mode: state.mode,
             line_revisions,
+            scrollbar,
         })
     }
 
@@ -275,6 +307,15 @@ impl PaneRenderSnapshot {
             }
         }
 
+        if self.scrollbar != next.scrollbar {
+            if frame.is_empty() {
+                frame.extend_from_slice(b"\x1b[s\x1b[?25l");
+            }
+            if let Some(scrollbar) = next.scrollbar.as_ref() {
+                frame.extend_from_slice(scrollbar.frame().as_slice());
+            }
+        }
+
         if !frame.is_empty() {
             frame.extend_from_slice(b"\x1b[0m\x1b[u");
             next.append_final_cursor_state(&mut frame);
@@ -302,6 +343,9 @@ impl PaneRenderSnapshot {
             );
             frame.extend_from_slice(b"\x1b[0m");
             frame.extend_from_slice(line);
+        }
+        if let Some(scrollbar) = self.scrollbar.as_ref() {
+            frame.extend_from_slice(scrollbar.frame().as_slice());
         }
         frame.extend_from_slice(b"\x1b[0m\x1b[u");
         self.append_final_cursor_state(&mut frame);
@@ -686,6 +730,11 @@ impl PaneRenderSnapshot {
         let line_bytes = self.lines.iter().map(|line| line.len()).sum::<usize>();
         line_bytes
             .saturating_add(usize::from(self.rows).saturating_mul(16))
+            .saturating_add(
+                self.scrollbar
+                    .as_ref()
+                    .map_or(0, |scrollbar| scrollbar.frame().len()),
+            )
             .saturating_add(32)
     }
 }
@@ -848,6 +897,7 @@ mod tests {
             path: String::new(),
             mode: 0,
             line_revisions: vec![0, 0, 0],
+            scrollbar: None,
         };
         let after = PaneRenderSnapshot {
             cursor: b"\x1b[1;2H".to_vec(),
@@ -885,6 +935,7 @@ mod tests {
             path: String::new(),
             mode: 0,
             line_revisions: vec![7, 11],
+            scrollbar: None,
         };
 
         assert!(snapshot.apply_forwarded_plain_bytes(b"abc\r\ndef"));
@@ -910,6 +961,42 @@ mod tests {
         let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
 
         assert_eq!(text, "d");
+    }
+
+    #[test]
+    fn pane_delta_repaints_scrollbar_when_history_changes() {
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
+        let pane = session.window().active_pane().expect("active pane");
+        let mut options = OptionStore::new();
+        options
+            .set(
+                ScopeSelector::Window(WindowTarget::with_window(session.name().clone(), 0)),
+                OptionName::PaneScrollbars,
+                "on".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("scrollbar mode");
+        let before = screen_with(b"one\r\ntwo\r\nthree");
+        let after = screen_with(b"one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(before.history_size(), 0);
+        assert_eq!(after.history_size(), 1);
+        let before = PaneRenderSnapshot::capture(&session, &options, pane, &before)
+            .expect("before snapshot");
+        let after =
+            PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
+
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+            panic!("history update should stay incremental");
+        };
+
+        assert!(delta
+            .frame()
+            .windows(b"\x1b[1;10H\x1b[0;37;40m ".len())
+            .any(|window| window == b"\x1b[1;10H\x1b[0;37;40m "));
+        assert!(delta
+            .frame()
+            .windows(b"\x1b[2;10H\x1b[0;30;47m ".len())
+            .any(|window| window == b"\x1b[2;10H\x1b[0;30;47m "));
     }
 
     #[test]
@@ -1036,6 +1123,7 @@ mod tests {
             path: String::new(),
             mode: 0,
             line_revisions: vec![1, 0, 0],
+            scrollbar: None,
         };
 
         let frame = snapshot
@@ -1063,6 +1151,7 @@ mod tests {
             path: String::new(),
             mode: 0,
             line_revisions: vec![1],
+            scrollbar: None,
         };
 
         assert!(snapshot.positioned_plain_echo_frame(b"x").is_none());
@@ -1109,6 +1198,7 @@ mod tests {
             path: String::new(),
             mode: 0,
             line_revisions: vec![1, 0, 0],
+            scrollbar: None,
         };
 
         assert!(!snapshot.can_forward_plain_bytes(b"abc"));
@@ -1161,6 +1251,7 @@ mod tests {
             path: String::new(),
             mode: 0,
             line_revisions: vec![1],
+            scrollbar: None,
         };
         let after = PaneRenderSnapshot {
             lines: render_lines(&[b"ab   "]),

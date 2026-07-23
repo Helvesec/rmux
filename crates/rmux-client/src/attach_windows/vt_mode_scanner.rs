@@ -75,10 +75,10 @@ impl VtModeScanner {
         chunks
     }
 
-    /// Releases an incomplete candidate as ordinary output when the writer is
-    /// being destroyed. Normal `flush` deliberately does not call this: attach
-    /// frames can split a DECSET sequence and the output worker flushes every
-    /// frame.
+    /// Releases an incomplete candidate as ordinary output when an exclusive
+    /// action fences the writer or the writer is destroyed. Normal `flush`
+    /// deliberately does not call this: attach frames can split a DECSET
+    /// sequence and the output worker flushes every frame.
     pub(super) fn finish(&mut self) -> Option<OutputChunk> {
         (!self.pending.is_empty()).then(|| OutputChunk {
             kind: OutputWriteKind::Normal,

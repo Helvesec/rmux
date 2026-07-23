@@ -9,28 +9,12 @@ use std::time::Duration;
 use rmux_os::process_tree::{ProcessTreeChild, ProcessTreeController};
 
 const PIPE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
-#[cfg(test)]
-static ACTIVE_PIPE_CHILDREN: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
-pub(crate) fn active_pipe_child_count_for_test() -> usize {
-    ACTIVE_PIPE_CHILDREN.load(Ordering::SeqCst)
-}
+struct ActivePipeChildGuard<'a>(&'a PipeChildProcessGroup);
 
-#[cfg(test)]
-pub(super) fn mark_pipe_child_started_for_test() {
-    ACTIVE_PIPE_CHILDREN.fetch_add(1, Ordering::SeqCst);
-}
-
-#[cfg(not(test))]
-pub(super) fn mark_pipe_child_started_for_test() {}
-
-struct ActivePipeChildGuard;
-
-impl Drop for ActivePipeChildGuard {
+impl Drop for ActivePipeChildGuard<'_> {
     fn drop(&mut self) {
-        #[cfg(test)]
-        ACTIVE_PIPE_CHILDREN.fetch_sub(1, Ordering::SeqCst);
+        self.0.mark_child_stopped_for_test();
     }
 }
 
@@ -39,7 +23,7 @@ pub(super) fn wait_for_pipe_child(
     stop_flag: Arc<AtomicBool>,
     process_group: Arc<PipeChildProcessGroup>,
 ) -> ProcessTreeChild {
-    let _active_child = ActivePipeChildGuard;
+    let _active_child = ActivePipeChildGuard(&process_group);
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             process_group.terminate();
@@ -59,6 +43,8 @@ pub(super) struct PipeChildProcessGroup {
     armed: AtomicBool,
     #[cfg(test)]
     termination_count: AtomicUsize,
+    #[cfg(test)]
+    child_wait_pending: AtomicBool,
 }
 
 impl PipeChildProcessGroup {
@@ -68,7 +54,14 @@ impl PipeChildProcessGroup {
             armed: AtomicBool::new(true),
             #[cfg(test)]
             termination_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            child_wait_pending: AtomicBool::new(true),
         }
+    }
+
+    fn mark_child_stopped_for_test(&self) {
+        #[cfg(test)]
+        self.child_wait_pending.store(false, Ordering::SeqCst);
     }
 
     pub(super) fn child_exited(&self, child: &mut ProcessTreeChild) -> io::Result<bool> {
@@ -92,5 +85,10 @@ impl PipeChildProcessGroup {
     #[cfg(test)]
     pub(super) fn termination_count_for_test(&self) -> usize {
         self.termination_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(super) fn child_wait_pending_for_test(&self) -> bool {
+        self.child_wait_pending.load(Ordering::SeqCst)
     }
 }

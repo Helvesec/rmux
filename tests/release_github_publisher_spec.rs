@@ -8,7 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +20,7 @@ const AUDIT_DIGEST: &str =
 const TITLE: &str = "RMUX 1.2.3";
 const NOTES: &str = "Exact release notes.\n";
 const NOW: &str = "2026-07-19T00:05:00Z";
+static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct AssetSpec {
@@ -127,7 +128,12 @@ impl FakeServer {
         let handle = thread::spawn(move || {
             while !thread_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((stream, _)) => handle_request(stream, &thread_state),
+                    Ok((stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("set fake API client blocking");
+                        handle_request(stream, &thread_state);
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
                     }
@@ -175,8 +181,9 @@ fn temp_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_nanos();
+    let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "rmux-release-github-publisher-{}-{nonce}",
+        "rmux-release-github-publisher-{}-{nonce}-{sequence}",
         std::process::id()
     ));
     fs::create_dir_all(&path).expect("create publisher fixture");

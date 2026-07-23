@@ -22,12 +22,11 @@ use super::command_args::CommandListArgument;
 use super::format_context::{format_context_for_target_with_server_values, global_format_context};
 use super::queue::{QueueCommandAction, QueueExecutionContext};
 use super::queue_parse::ParsedIfShellCommand;
-use super::runtime::{
-    run_shell_delay_duration, run_shell_foreground, shell_condition_is_true, spawn_background_async,
-};
+use super::queue_special_target::QueueSpecialTargetBinding;
+use super::runtime::{run_shell_delay_duration, run_shell_foreground, shell_condition_is_true};
 use super::targets::active_session_target;
 use crate::format_runtime::render_runtime_template;
-use crate::hook_runtime::current_hook_formats;
+use crate::hook_runtime::{current_hook_execution, current_hook_formats, with_hook_execution};
 use crate::terminal::{SessionBaseEnvironment, TerminalProfile};
 
 async fn with_background_control_identity<T, F>(
@@ -70,6 +69,17 @@ impl ShellTargetPolicy {
     }
 }
 
+fn if_shell_runs_in_background(background: bool, format_mode: bool) -> bool {
+    background && !format_mode
+}
+
+#[derive(Debug, Clone)]
+struct QueuedRunShellState {
+    parent_depth: usize,
+    parent_context: Option<QueueExecutionContext>,
+    target_binding: Option<QueueSpecialTargetBinding>,
+}
+
 impl RequestHandler {
     pub(in crate::handler) async fn handle_run_shell(
         &self,
@@ -77,11 +87,11 @@ impl RequestHandler {
         request: RunShellRequest,
     ) -> Response {
         let explicit_target = match request.target.as_ref() {
-            Some(target) => self
+            Some(target) if !request.as_commands => self
                 .pane_id_for_slot_target(target)
                 .await
                 .map(|pane_id| (target.clone(), pane_id)),
-            None => None,
+            _ => None,
         };
         let mut response = self
             .handle_run_shell_with_client_name(requester_pid, request, None)
@@ -110,22 +120,28 @@ impl RequestHandler {
             request,
             client_name,
             false,
+            None,
+            None,
         )
         .await
     }
 
-    pub(in crate::handler) async fn handle_queued_run_shell_with_client_name(
+    pub(super) async fn handle_queued_run_shell_with_client_name(
         &self,
         requester_pid: u32,
         request: RunShellRequest,
         client_name: Option<String>,
         target_missing_canfail: bool,
+        parent_context: &QueueExecutionContext,
+        target_binding: Option<&QueueSpecialTargetBinding>,
     ) -> Response {
         self.handle_run_shell_with_client_name_and_target_state(
             requester_pid,
             request,
             client_name,
             target_missing_canfail,
+            Some(parent_context.clone()),
+            target_binding.cloned(),
         )
         .await
     }
@@ -136,7 +152,27 @@ impl RequestHandler {
         mut request: RunShellRequest,
         client_name: Option<String>,
         target_missing_canfail: bool,
+        parent_context: Option<QueueExecutionContext>,
+        target_binding: Option<QueueSpecialTargetBinding>,
     ) -> Response {
+        if let Some(target_binding) = target_binding.as_ref() {
+            if let Err(error) = target_binding.require_live_for(self).await {
+                return Response::Error(ErrorResponse { error });
+            }
+        }
+        let parent_depth = super::queued_command_context()
+            .map(|context| context.run_shell_command_depth())
+            .unwrap_or_default();
+        let parent_context = if request.background {
+            parent_context.map(QueueExecutionContext::without_mouse_origin)
+        } else {
+            parent_context
+        };
+        let queue_state = QueuedRunShellState {
+            parent_depth,
+            parent_context,
+            target_binding,
+        };
         let target_was_captured = request.target.is_some() || target_missing_canfail;
         if request.target.is_none() && !target_missing_canfail {
             request.target = self.inherited_run_shell_target(requester_pid).await;
@@ -157,14 +193,14 @@ impl RequestHandler {
                     return Response::Error(ErrorResponse { error });
                 }
             }
-            let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
-            let requester_access_guard =
-                self.begin_detached_requester_access(requester_pid, can_write);
+            let requester_access_guard = self
+                .begin_inherited_detached_requester_access(requester_pid)
+                .await;
             let handler = self.clone();
             let hook_formats = current_hook_formats();
-            let hook_context_active = crate::hook_runtime::hooks_disabled();
-            if let Err(error) = spawn_background_async("rmux-run-shell", move || async move {
+            let hook_execution = current_hook_execution();
+            if let Err(error) = self.spawn_background_task("rmux-run-shell", move || async move {
                 let task = async move {
                     let _detached_request_guard = detached_request_guard;
                     let _requester_access_guard = requester_access_guard;
@@ -175,14 +211,14 @@ impl RequestHandler {
                             client_name,
                             target_policy,
                             target_missing_canfail,
+                            queue_state,
                         )
                         .await;
                 };
                 with_background_client_identities(control_identity, attach_identity, async move {
-                    if hook_context_active {
-                        crate::hook_runtime::with_hook_execution(hook_formats, task).await;
-                    } else {
-                        task.await;
+                    match hook_execution {
+                        Some(execution) => with_hook_execution(execution, hook_formats, task).await,
+                        None => task.await,
                     }
                 })
                 .await;
@@ -199,6 +235,7 @@ impl RequestHandler {
                 client_name,
                 ShellTargetPolicy::Fixed,
                 target_missing_canfail,
+                queue_state,
             )
             .await
         {
@@ -260,7 +297,7 @@ impl RequestHandler {
         request: IfShellRequest,
         client_name: Option<String>,
     ) -> Response {
-        if request.background {
+        if if_shell_runs_in_background(request.background, request.format_mode) {
             let control_identity = current_control_queue_identity(requester_pid);
             let attach_identity = current_expected_attach_identity();
             let target_policy = if attach_identity.is_some() && request.target.is_none() {
@@ -268,14 +305,14 @@ impl RequestHandler {
             } else {
                 ShellTargetPolicy::Fixed
             };
-            let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
-            let requester_access_guard =
-                self.begin_detached_requester_access(requester_pid, can_write);
+            let requester_access_guard = self
+                .begin_inherited_detached_requester_access(requester_pid)
+                .await;
             let handler = self.clone();
             let hook_formats = current_hook_formats();
-            let hook_context_active = crate::hook_runtime::hooks_disabled();
-            if let Err(error) = spawn_background_async("rmux-if-shell", move || async move {
+            let hook_execution = current_hook_execution();
+            if let Err(error) = self.spawn_background_task("rmux-if-shell", move || async move {
                 let task = async move {
                     let _detached_request_guard = detached_request_guard;
                     let _requester_access_guard = requester_access_guard;
@@ -284,10 +321,9 @@ impl RequestHandler {
                         .await;
                 };
                 with_background_client_identities(control_identity, attach_identity, async move {
-                    if hook_context_active {
-                        crate::hook_runtime::with_hook_execution(hook_formats, task).await;
-                    } else {
-                        task.await;
+                    match hook_execution {
+                        Some(execution) => with_hook_execution(execution, hook_formats, task).await,
+                        None => task.await,
                     }
                 })
                 .await;
@@ -317,66 +353,36 @@ impl RequestHandler {
     async fn run_shell_task(
         &self,
         requester_pid: u32,
-        mut request: RunShellRequest,
+        request: RunShellRequest,
         client_name: Option<String>,
         target_policy: ShellTargetPolicy,
         target_missing_canfail: bool,
+        queue_state: QueuedRunShellState,
     ) -> Result<RunShellTaskOutput, RmuxError> {
-        if let Some(delay_seconds) = request.delay_seconds {
-            tokio::time::sleep(run_shell_delay_duration(delay_seconds.as_secs_f64())?).await;
+        if let Some(target_binding) = queue_state.target_binding.as_ref() {
+            target_binding.require_live_for(self).await?;
         }
-
-        if target_policy.follows_attached_session() {
-            let identity = validate_expected_attach_identity(self, requester_pid)
-                .await?
-                .ok_or_else(|| {
-                    RmuxError::Server(
-                        "background command lost its attached client identity".to_owned(),
-                    )
-                })?;
-            request.target = Some(self.followed_attached_pane_target(identity).await?);
-        } else if request.as_commands {
-            // Command-mode jobs can act on the attached registration even
-            // with a fixed pane target, so retain the same-PID reuse guard.
-            let _ = validate_expected_attach_identity(self, requester_pid).await?;
-        }
-
-        if request.command.is_empty() {
+        let Some(request) = self
+            .prepare_run_shell_request(requester_pid, request, target_policy)
+            .await?
+        else {
             return Ok(RunShellTaskOutput::NoOutput);
+        };
+        if let Some(target_binding) = queue_state.target_binding.as_ref() {
+            target_binding.require_live_for(self).await?;
         }
 
         if request.as_commands {
-            let has_fixed_target = request.target.is_some();
-            let command = self
-                .expand_run_shell_command(&request, client_name.as_deref(), target_missing_canfail)
+            let (parsed, context) = self
+                .prepare_run_shell_commands(
+                    requester_pid,
+                    request,
+                    client_name,
+                    target_policy,
+                    target_missing_canfail,
+                    &queue_state,
+                )
                 .await?;
-            let parsed = self.parse_command_string_one_group(&command).await?;
-            if parsed_contains_attach_session(&parsed) {
-                return Err(RmuxError::Server(
-                    "open terminal failed: not a terminal".to_owned(),
-                ));
-            }
-            let current_target = if target_missing_canfail {
-                None
-            } else {
-                self.run_shell_commands_current_target(requester_pid, request.target)
-                    .await
-            };
-            let context = QueueExecutionContext::new(request.start_directory.clone());
-            let context = match target_policy {
-                ShellTargetPolicy::FollowAttachedSession => context
-                    .with_implicit_current_target(current_target)
-                    .following_attached_session(),
-                ShellTargetPolicy::Fixed if has_fixed_target => {
-                    context.with_current_target(current_target)
-                }
-                ShellTargetPolicy::Fixed => context.with_implicit_current_target(current_target),
-            }
-            .with_client_name(client_name.clone());
-            let context = match request.source_depth {
-                Some(depth) => context.for_sourced_commands(depth, None),
-                None => context,
-            };
             let output = self
                 .execute_parsed_commands(requester_pid, parsed, context)
                 .await?;
@@ -388,9 +394,15 @@ impl RequestHandler {
         }
 
         let profile = self.run_shell_profile(&request).await?;
+        if let Some(target_binding) = queue_state.target_binding.as_ref() {
+            target_binding.require_live_for(self).await?;
+        }
         let command = self
             .expand_run_shell_command(&request, client_name.as_deref(), target_missing_canfail)
             .await?;
+        if let Some(target_binding) = queue_state.target_binding.as_ref() {
+            target_binding.require_live_for(self).await?;
+        }
         let output = run_shell_foreground(
             command.clone(),
             &profile,
@@ -410,6 +422,150 @@ impl RequestHandler {
             output,
             exit_status,
         })
+    }
+
+    pub(super) async fn execute_queued_run_shell_commands(
+        &self,
+        requester_pid: u32,
+        mut request: RunShellRequest,
+        client_name: Option<String>,
+        target_missing_canfail: bool,
+        parent_context: &QueueExecutionContext,
+        target_binding: Option<&QueueSpecialTargetBinding>,
+    ) -> Result<QueueCommandAction, RmuxError> {
+        debug_assert!(request.as_commands);
+        debug_assert!(!request.background);
+        if let Some(target_binding) = target_binding {
+            target_binding.require_live_for(self).await?;
+        }
+        if request.target.is_none() && !target_missing_canfail {
+            request.target = self.inherited_run_shell_target(requester_pid).await;
+        }
+        let Some(request) = self
+            .prepare_run_shell_request(requester_pid, request, ShellTargetPolicy::Fixed)
+            .await?
+        else {
+            return Ok(QueueCommandAction::Normal {
+                output: None,
+                error: None,
+                source_file_error: None,
+                exit_status: None,
+            });
+        };
+        if let Some(target_binding) = target_binding {
+            target_binding.require_live_for(self).await?;
+        }
+        let queue_state = QueuedRunShellState {
+            parent_depth: parent_context.run_shell_command_depth(),
+            parent_context: Some(parent_context.clone()),
+            target_binding: target_binding.cloned(),
+        };
+        let (commands, context) = self
+            .prepare_run_shell_commands(
+                requester_pid,
+                request,
+                client_name,
+                ShellTargetPolicy::Fixed,
+                target_missing_canfail,
+                &queue_state,
+            )
+            .await?;
+        if let Some(target_binding) = target_binding {
+            target_binding.require_live_for(self).await?;
+        }
+        Ok(QueueCommandAction::InsertAfter {
+            batches: vec![(commands, context)],
+            output: None,
+            error: None,
+            source_file_error: None,
+            exit_status: None,
+        })
+    }
+
+    async fn prepare_run_shell_request(
+        &self,
+        requester_pid: u32,
+        mut request: RunShellRequest,
+        target_policy: ShellTargetPolicy,
+    ) -> Result<Option<RunShellRequest>, RmuxError> {
+        if let Some(delay_seconds) = request.delay_seconds {
+            tokio::time::sleep(run_shell_delay_duration(delay_seconds.as_secs_f64())?).await;
+        }
+        if target_policy.follows_attached_session() {
+            let identity = validate_expected_attach_identity(self, requester_pid)
+                .await?
+                .ok_or_else(|| {
+                    RmuxError::Server(
+                        "background command lost its attached client identity".to_owned(),
+                    )
+                })?;
+            request.target = Some(self.followed_attached_pane_target(identity).await?);
+        } else if request.as_commands {
+            // Command-mode jobs can act on the attached registration even
+            // with a fixed pane target, so retain the same-PID reuse guard.
+            let _ = validate_expected_attach_identity(self, requester_pid).await?;
+        }
+        Ok((!request.command.is_empty()).then_some(request))
+    }
+
+    async fn prepare_run_shell_commands(
+        &self,
+        requester_pid: u32,
+        request: RunShellRequest,
+        client_name: Option<String>,
+        target_policy: ShellTargetPolicy,
+        target_missing_canfail: bool,
+        queue_state: &QueuedRunShellState,
+    ) -> Result<(ParsedCommands, QueueExecutionContext), RmuxError> {
+        let has_fixed_target = request.target.is_some();
+        let command = self
+            .expand_run_shell_command(&request, client_name.as_deref(), target_missing_canfail)
+            .await?;
+        let parsed = self.parse_command_string_one_group(&command).await?;
+        if parsed_contains_attach_session(&parsed) {
+            return Err(RmuxError::Server(
+                "open terminal failed: not a terminal".to_owned(),
+            ));
+        }
+        let current_target = if target_missing_canfail {
+            None
+        } else {
+            self.run_shell_commands_current_target(requester_pid, request.target.clone())
+                .await
+        };
+        let context = match queue_state.parent_context.as_ref() {
+            Some(context) => match request.start_directory.clone() {
+                Some(caller_cwd) => context.clone().with_caller_cwd(Some(caller_cwd)),
+                None => context.clone(),
+            },
+            None => QueueExecutionContext::new(request.start_directory.clone()),
+        };
+        let context = if let Some(target_binding) = queue_state.target_binding.as_ref() {
+            target_binding.child_context(&context)
+        } else {
+            match target_policy {
+                ShellTargetPolicy::FollowAttachedSession => context
+                    .with_implicit_current_target(current_target)
+                    .following_attached_session(),
+                ShellTargetPolicy::Fixed if has_fixed_target => {
+                    context.with_current_target(current_target)
+                }
+                ShellTargetPolicy::Fixed => context.with_implicit_current_target(current_target),
+            }
+        }
+        .with_client_name(client_name)
+        .with_mouse_event(super::queued_command_mouse_event().or_else(|| {
+            queue_state
+                .parent_context
+                .as_ref()
+                .and_then(|context| context.mouse_event.clone())
+        }));
+        let context = match request.source_depth {
+            Some(depth) => context.for_sourced_commands(depth, None),
+            None => context,
+        }
+        .for_run_shell_commands(queue_state.parent_depth)?;
+        Ok((parsed, context))
     }
 
     async fn run_shell_commands_current_target(
@@ -710,43 +866,61 @@ impl RequestHandler {
         requester_pid: u32,
         command: ParsedIfShellCommand,
         context: &QueueExecutionContext,
+        target_binding: Option<&QueueSpecialTargetBinding>,
     ) -> Result<QueueCommandAction, RmuxError> {
-        if command.background {
+        if let Some(target_binding) = target_binding {
+            target_binding.require_live_for(self).await?;
+        }
+        if if_shell_runs_in_background(command.background, command.format_mode) {
             let control_identity = current_control_queue_identity(requester_pid);
             let attach_identity = current_expected_attach_identity();
             let follow_attached_session = attach_identity.is_some()
                 && command.target.is_none()
                 && !context.uses_explicit_current_target();
-            let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
-            let requester_access_guard =
-                self.begin_detached_requester_access(requester_pid, can_write);
+            let requester_access_guard = self
+                .begin_inherited_detached_requester_access(requester_pid)
+                .await;
             let handler = self.clone();
             let command = command.clone();
+            let target_binding = target_binding.cloned();
             let context = if follow_attached_session {
                 context.clone().following_attached_session()
             } else {
                 context.clone()
-            };
+            }
+            .without_mouse_origin();
             let hook_formats = current_hook_formats();
-            let hook_context_active = crate::hook_runtime::hooks_disabled();
-            if let Err(error) = spawn_background_async("rmux-if-shell-queue", move || async move {
-                let task = async move {
-                    let _detached_request_guard = detached_request_guard;
-                    let _requester_access_guard = requester_access_guard;
-                    let _ = handler
-                        .execute_queued_if_shell_background(requester_pid, command, context)
-                        .await;
-                };
-                with_background_client_identities(control_identity, attach_identity, async move {
-                    if hook_context_active {
-                        crate::hook_runtime::with_hook_execution(hook_formats, task).await;
-                    } else {
-                        task.await;
-                    }
+            let hook_execution = current_hook_execution();
+            if let Err(error) =
+                self.spawn_background_task("rmux-if-shell-queue", move || async move {
+                    let task = async move {
+                        let _detached_request_guard = detached_request_guard;
+                        let _requester_access_guard = requester_access_guard;
+                        let _ = handler
+                            .execute_queued_if_shell_background(
+                                requester_pid,
+                                command,
+                                context,
+                                target_binding,
+                            )
+                            .await;
+                    };
+                    with_background_client_identities(
+                        control_identity,
+                        attach_identity,
+                        async move {
+                            match hook_execution {
+                                Some(execution) => {
+                                    with_hook_execution(execution, hook_formats, task).await;
+                                }
+                                None => task.await,
+                            }
+                        },
+                    )
+                    .await;
                 })
-                .await;
-            }) {
+            {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: Some(error),
@@ -802,6 +976,10 @@ impl RequestHandler {
             .await?
         };
 
+        if let Some(target_binding) = target_binding {
+            target_binding.require_live_for(self).await?;
+        }
+
         let branch_target = command.target.clone();
         let selected_commands = if condition_is_true {
             Some(command.then_commands)
@@ -817,7 +995,9 @@ impl RequestHandler {
             });
         };
 
-        let branch_context = if branch_target.is_some() {
+        let branch_context = if let Some(target_binding) = target_binding {
+            target_binding.child_context(context)
+        } else if branch_target.is_some() {
             context.clone().with_current_target(branch_target)
         } else {
             context.clone()
@@ -841,7 +1021,11 @@ impl RequestHandler {
         requester_pid: u32,
         command: ParsedIfShellCommand,
         mut context: QueueExecutionContext,
+        target_binding: Option<QueueSpecialTargetBinding>,
     ) -> Result<(), RmuxError> {
+        if let Some(target_binding) = target_binding.as_ref() {
+            target_binding.require_live_for(self).await?;
+        }
         let expected_attach = validate_expected_attach_identity(self, requester_pid).await?;
         if context.follows_attached_session() {
             let identity = expected_attach.ok_or_else(|| {
@@ -890,6 +1074,10 @@ impl RequestHandler {
             .await?
         };
 
+        if let Some(target_binding) = target_binding.as_ref() {
+            target_binding.require_live_for(self).await?;
+        }
+
         let branch_target = command.target.clone();
         let selected_commands = if condition_is_true {
             Some(command.then_commands)
@@ -900,7 +1088,9 @@ impl RequestHandler {
             return Ok(());
         };
 
-        let branch_context = if branch_target.is_some() {
+        let branch_context = if let Some(target_binding) = target_binding.as_ref() {
+            target_binding.child_context(&context)
+        } else if branch_target.is_some() {
             context.clone().with_current_target(branch_target)
         } else {
             context.clone()

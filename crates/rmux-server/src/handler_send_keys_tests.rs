@@ -60,6 +60,9 @@ mod attached_input_bounds;
 #[path = "handler_send_keys_tests/mouse_copy_mode.rs"]
 mod mouse_copy_mode;
 
+#[path = "handler_send_keys_tests/copy_mode_mouse_origin.rs"]
+mod copy_mode_mouse_origin;
+
 #[path = "handler_send_keys_tests/copy_mode_vi.rs"]
 mod copy_mode_vi;
 
@@ -151,7 +154,7 @@ fn quiet_pane_command() -> Vec<String> {
 // Like create_send_keys_test_session but the pane runs an inert, silent command
 // and we block until its terminal has finished starting, so a subsequent
 // transcript write is the only content in the pane.
-async fn create_quiet_mouse_session(handler: &RequestHandler, session: &rmux_proto::SessionName) {
+async fn create_quiet_input_session(handler: &RequestHandler, session: &rmux_proto::SessionName) {
     let created = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session.clone()),

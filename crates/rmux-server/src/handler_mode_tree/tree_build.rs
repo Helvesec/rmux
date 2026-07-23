@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use rmux_core::{formats::FormatContext, Pane, Session, Window};
-use rmux_proto::{RmuxError, SessionName};
+use rmux_proto::{PaneTarget, RmuxError, SessionName};
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_indices::visible_pane_index;
@@ -111,13 +111,15 @@ fn build_tree_session(
                 preview: pane_line.3,
                 no_tag: false,
                 action: ModeTreeAction::pane_tree_target(
-                    session_name.clone(),
+                    PaneTarget::with_window(session_name.clone(), *window_index, pane.index()),
                     session.id(),
-                    *window_index,
                     window.id(),
                     occurrence_id,
-                    pane.index(),
                     pane.id(),
+                    state.pane_output_generation_for_target(
+                        &PaneTarget::with_window(session_name.clone(), *window_index, pane.index()),
+                        pane.id(),
+                    ),
                 ),
             });
         }

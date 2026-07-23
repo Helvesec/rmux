@@ -75,8 +75,10 @@ pub(super) fn clear_deferred_passthroughs_if_target_changed(
     deferred_passthroughs: &mut Vec<TerminalPassthrough>,
 ) {
     if target_changed {
-        deferred_passthroughs
-            .retain(|passthrough| passthrough.kind() == TerminalPassthroughKind::Clipboard);
+        deferred_passthroughs.retain(|passthrough| {
+            passthrough.kind() == TerminalPassthroughKind::Clipboard
+                && passthrough.clipboard_query_metadata().is_none()
+        });
     }
 }
 

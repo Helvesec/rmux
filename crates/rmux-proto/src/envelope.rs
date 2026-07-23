@@ -11,9 +11,9 @@ pub const RMUX_WIRE_VERSION: u32 = 5;
 
 /// Supported detached RPC wire-version range for this build.
 ///
-/// RMUX 0.9.0 uses an exact hard-cut envelope: frames decode only when their
-/// wire version equals [`RMUX_WIRE_VERSION`]. Compatibility ranges in later
-/// handshake DTOs are advisory and only apply after this envelope has decoded.
+/// The RMUX 0.9 release line uses an exact hard-cut envelope: frames decode only
+/// when their wire version equals [`RMUX_WIRE_VERSION`]. Compatibility ranges in
+/// later handshake DTOs are advisory and only apply after this envelope has decoded.
 pub const SUPPORTED_WIRE_VERSION: RangeInclusive<u32> = RMUX_WIRE_VERSION..=RMUX_WIRE_VERSION;
 
 /// Encodes a u32 as unsigned LEB128.

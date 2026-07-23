@@ -249,20 +249,14 @@ impl HandlerState {
         let session_name = target.session_name().clone();
         let window_index = target.window_index();
 
-        let response = self.mutate_session_and_resize_terminals(&session_name, |session| {
+        self.mutate_session_and_resize_window_terminal(&session_name, window_index, |session| {
             if restore_zoom {
                 session.rotate_window_with_zoom(window_index, direction, true)?;
             } else {
                 session.rotate_window(window_index, direction)?;
             }
             Ok(RotateWindowResponse { target })
-        })?;
-        let synchronized =
-            self.synchronize_linked_window_family_from_slot(&session_name, window_index)?;
-        for session_name in synchronized {
-            self.sync_pane_lifecycle_dimensions_for_session(&session_name);
-        }
-        Ok(response)
+        })
     }
 
     fn reindex_windows(

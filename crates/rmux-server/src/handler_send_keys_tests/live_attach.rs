@@ -2886,6 +2886,131 @@ async fn live_attach_forwards_pane_requested_mouse_when_mouse_option_is_off() {
 }
 
 #[tokio::test]
+async fn live_attach_focus_follows_active_pane_motion_when_mouse_option_is_off() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("pane-requested-focus-follows-mouse");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    let selected = handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
+        })))
+        .await;
+    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
+            .expect("pane all-motion mode transcript update");
+    }
+    let enabled = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::FocusFollowsMouse,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(enabled, Response::SetOption(_)), "{enabled:?}");
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach_with_terminal_context(
+            requester_pid,
+            alpha.clone(),
+            control_tx,
+            crate::outer_terminal::OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+        )
+        .await;
+    handler
+        .handle_attached_resize(
+            requester_pid,
+            TerminalSize {
+                cols: 100,
+                rows: 30,
+            },
+        )
+        .await
+        .expect("attached resize succeeds");
+    while control_rx.try_recv().is_ok() {}
+    handler.refresh_attached_session(&alpha).await;
+    let tracking = tokio::time::timeout(Duration::from_secs(2), control_rx.recv())
+        .await
+        .expect("tracking refresh is bounded")
+        .expect("attach control channel remains open");
+    let crate::pane_io::AttachControl::Switch(tracking) = tracking else {
+        panic!("expected tracking switch refresh, got {tracking:?}");
+    };
+    let tracking = tracking.into_target();
+    let tracking_start = tracking.outer_terminal.attach_start_sequence();
+    assert!(
+        tracking_start
+            .windows(b"\x1b[?1003h".len())
+            .any(|window| window == b"\x1b[?1003h"),
+        "the active pane's all-motion request must reach the outer terminal"
+    );
+
+    let mouse_move = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        assert_eq!(session.window().active_pane_index(), 0);
+        let pane = session.window().pane(1).expect("pane 1 exists");
+        let x = pane.geometry().x().saturating_add(1);
+        let y = pane.geometry().y().saturating_add(1);
+        format!("\x1b[<35;{};{}M", x + 1, y + 1)
+    };
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, mouse_move.as_bytes())
+        .await
+        .expect("pane-requested mouse motion succeeds");
+
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .sessions
+                .session(&alpha)
+                .expect("session exists")
+                .window()
+                .active_pane_index(),
+            1
+        );
+    }
+    let switched = tokio::time::timeout(Duration::from_secs(2), control_rx.recv())
+        .await
+        .expect("focus refresh is bounded")
+        .expect("attach control channel remains open");
+    let crate::pane_io::AttachControl::Switch(switched) = switched else {
+        panic!("expected focus switch refresh, got {switched:?}");
+    };
+    let switched = switched.into_target();
+    let transition = switched
+        .outer_terminal
+        .transition_sequence_from(&tracking.outer_terminal);
+    assert!(
+        transition
+            .windows(b"\x1b[?1003l".len())
+            .any(|window| window == b"\x1b[?1003l"),
+        "moving to a pane without all-motion tracking must disable outer 1003"
+    );
+}
+
+#[tokio::test]
 async fn live_attach_ignores_mouse_when_option_and_pane_tracking_are_off() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -2970,6 +3095,175 @@ async fn live_attach_mouse_down_selects_the_clicked_pane() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");
     assert_eq!(session.window().active_pane_index(), 1);
+}
+
+#[tokio::test]
+async fn live_attach_focus_follows_mouse_selects_the_resized_hovered_pane_when_enabled() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("focus-follows-mouse");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    let selected = handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
+        })))
+        .await;
+    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+    enable_mouse(&handler).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    handler
+        .handle_attached_resize(
+            requester_pid,
+            TerminalSize {
+                cols: 100,
+                rows: 30,
+            },
+        )
+        .await
+        .expect("attached resize succeeds");
+
+    let mouse_move = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        let pane = session.window().pane(1).expect("pane 1 exists");
+        let x = pane.geometry().x().saturating_add(1);
+        let y = pane.geometry().y().saturating_add(1);
+        format!("\x1b[<35;{};{}M", x + 1, y + 1)
+    };
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, mouse_move.as_bytes())
+        .await
+        .expect("mouse move with focus disabled");
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .sessions
+                .session(&alpha)
+                .expect("session exists")
+                .window()
+                .active_pane_index(),
+            0
+        );
+    }
+
+    let enabled = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::FocusFollowsMouse,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(enabled, Response::SetOption(_)), "{enabled:?}");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, mouse_move.as_bytes())
+        .await
+        .expect("mouse move with focus enabled");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("session exists")
+            .window()
+            .active_pane_index(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn stale_attached_mouse_focus_cannot_select_after_client_session_replacement() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("stale-mouse-focus-alpha");
+    let beta = session_name("stale-mouse-focus-beta");
+    let requester_pid = u32::MAX - 91;
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    create_send_keys_test_session(&handler, &beta).await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    let selected = handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
+        })))
+        .await;
+    assert!(matches!(selected, Response::SelectPane(_)), "{selected:?}");
+
+    let (alpha_tx, _alpha_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), alpha_tx)
+        .await;
+    let stale_identity = handler.active_attach_identity_for_test(requester_pid).await;
+    let (session_id, window_id, pane_id) = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("alpha exists");
+        (
+            session.id(),
+            session.window().id().as_u32(),
+            session.window().pane(1).expect("pane 1 exists").id(),
+        )
+    };
+
+    let (beta_tx, _beta_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, beta.clone(), beta_tx)
+        .await;
+    handler
+        .select_attached_mouse_focus(stale_identity, &alpha, session_id, window_id, pane_id)
+        .await
+        .expect("stale focus is ignored");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("alpha exists")
+            .window()
+            .active_pane_index(),
+        0
+    );
+    let active_attach = handler.active_attach.lock().await;
+    assert_eq!(
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("replacement attach exists")
+            .session_name,
+        beta
+    );
 }
 
 /// Splits the window, keeps pane 0 active, and returns SGR mouse-down bytes
@@ -3498,9 +3792,39 @@ async fn live_attach_default_wheel_binding_enters_copy_mode() {
         let state = handler.state.lock().await;
         state.pane_copy_mode_summary(&alpha, PaneId::new(0))
     };
+    let summary =
+        summary.expect("default WheelUpPane binding should enter copy-mode when mouse is on");
     assert!(
-        summary.is_some(),
-        "default WheelUpPane binding should enter copy-mode when mouse is on"
+        !summary.line_numbers_enabled,
+        "mouse-triggered copy-mode entry should hide line numbers like tmux"
+    );
+
+    let target = PaneTarget::new(alpha.clone(), 0);
+    assert!(matches!(
+        handler
+            .handle(Request::CopyMode(CopyModeRequest {
+                target: Some(target),
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: false,
+                mouse_drag_start: false,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }))
+            .await,
+        Response::CopyMode(_)
+    ));
+    let summary = {
+        let state = handler.state.lock().await;
+        state
+            .pane_copy_mode_summary(&alpha, PaneId::new(0))
+            .expect("copy mode summary")
+    };
+    assert!(
+        summary.line_numbers_enabled,
+        "a later non-mouse copy-mode invocation should restore line numbers"
     );
 }
 
@@ -3585,29 +3909,478 @@ async fn live_attach_second_click_dispatches_double_click_after_timer() {
     assert_eq!(contents.as_deref(), Some(b"ok".as_slice()));
 }
 
+async fn bind_double_click_timer_buffer(handler: &RequestHandler, buffer_name: &str) {
+    let rebound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "root".to_owned(),
+            key: "DoubleClick1Pane".to_owned(),
+            note: Some(buffer_name.to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "set-buffer".to_owned(),
+                "-b".to_owned(),
+                buffer_name.to_owned(),
+                "ok".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)), "{rebound:?}");
+}
+
+async fn arm_attached_double_click_timer(handler: &RequestHandler, requester_pid: u32) {
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
+        .await
+        .expect("first click");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
+        .await
+        .expect("second click");
+}
+
+async fn buffer_contents(handler: &RequestHandler, buffer_name: &str) -> Option<Vec<u8>> {
+    let state = handler.state.lock().await;
+    state.buffers.get(buffer_name).map(Vec::from)
+}
+
+#[tokio::test]
+async fn normal_shutdown_cancels_pending_attached_mouse_click_timer() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("mouse-timer-shutdown");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha, control_tx)
+        .await;
+    bind_double_click_timer_buffer(&handler, "mouse-timer-shutdown").await;
+    arm_attached_double_click_timer(&handler, requester_pid).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        handler.close_normal_and_drain_lifecycle_producers(),
+    )
+    .await
+    .expect("normal producer drain cancels the pending click timer");
+    sleep(Duration::from_millis(350)).await;
+
+    assert_eq!(
+        buffer_contents(&handler, "mouse-timer-shutdown").await,
+        None,
+        "a click timer cannot dispatch after the normal lane closes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attached_mouse_click_timer_drains_only_its_local_mutation() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("mouse-timer-boundary");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha, control_tx)
+        .await;
+    bind_double_click_timer_buffer(&handler, "mouse-timer-boundary").await;
+    let pause = handler.install_attached_mouse_timer_pause();
+    arm_attached_double_click_timer(&handler, requester_pid).await;
+
+    let reached_pause = pause.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            reached_pause.mutation_reached.wait();
+        }),
+    )
+    .await
+    .expect("click timer reaches its local mutation")
+    .expect("mutation waiter joins");
+
+    let close_handler = handler.clone();
+    let close = tokio::spawn(async move {
+        close_handler
+            .close_normal_and_drain_lifecycle_producers()
+            .await;
+    });
+    handler
+        .wait_until_normal_lifecycle_producers_closing_for_test()
+        .await;
+    assert!(
+        !close.is_finished(),
+        "shutdown must wait while the click timer owns its local mutation"
+    );
+
+    let release_pause = pause.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            release_pause.mutation_release.wait();
+        }),
+    )
+    .await
+    .expect("local click mutation is released")
+    .expect("mutation releaser joins");
+    tokio::time::timeout(Duration::from_secs(2), pause.dispatch_reached.notified())
+        .await
+        .expect("expired click reaches the unguarded dispatch boundary");
+    tokio::time::timeout(Duration::from_secs(2), close)
+        .await
+        .expect("shutdown cancels blocked dispatch without draining it")
+        .expect("normal producer drain task joins");
+
+    assert_eq!(
+        buffer_contents(&handler, "mouse-timer-boundary").await,
+        None,
+        "the cancelled dispatch cannot execute its binding"
+    );
+    pause.dispatch_release.notify_one();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_attached_mouse_click_timer_cannot_mutate_same_pid_replacement() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("mouse-timer-stale-alpha");
+    let beta = session_name("mouse-timer-stale-beta");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    create_send_keys_test_session(&handler, &beta).await;
+    enable_mouse(&handler).await;
+    let (alpha_tx, _alpha_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), alpha_tx)
+        .await;
+    bind_double_click_timer_buffer(&handler, "mouse-timer-stale").await;
+    let pause = handler.install_attached_mouse_timer_pause();
+    arm_attached_double_click_timer(&handler, requester_pid).await;
+
+    let alpha_target = PaneTarget::new(alpha, 0);
+    let clock_mode = handler
+        .handle(Request::ClockMode(rmux_proto::ClockModeRequest {
+            target: Some(alpha_target.clone()),
+        }))
+        .await;
+    assert!(
+        matches!(clock_mode, Response::ClockMode(_)),
+        "{clock_mode:?}"
+    );
+
+    let reached_pause = pause.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            reached_pause.mutation_reached.wait();
+        }),
+    )
+    .await
+    .expect("stale click timer reaches its local mutation")
+    .expect("mutation waiter joins");
+    let release_pause = pause.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            release_pause.mutation_release.wait();
+        }),
+    )
+    .await
+    .expect("stale click mutation is released")
+    .expect("mutation releaser joins");
+    tokio::time::timeout(Duration::from_secs(2), pause.dispatch_reached.notified())
+        .await
+        .expect("stale click reaches dispatch after its local mutation");
+
+    let (beta_tx, _beta_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, beta.clone(), beta_tx)
+        .await;
+    pause.dispatch_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), pause.task_completed.notified())
+        .await
+        .expect("stale click dispatch completes after replacement");
+
+    assert_eq!(
+        buffer_contents(&handler, "mouse-timer-stale").await,
+        None,
+        "the stale timer cannot dispatch against a replacement attach"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .expect("replacement attach remains active");
+    assert_eq!(replacement.session_name, beta);
+    assert_eq!(
+        replacement.mouse.click_deadline(),
+        None,
+        "the stale timer cannot change replacement mouse state"
+    );
+    drop(active_attach);
+    assert!(
+        handler
+            .target_is_in_clock_mode(&alpha_target)
+            .await
+            .expect("original clock-mode target resolves"),
+        "stale mouse dispatch cannot exit clock mode in the original session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attached_mouse_click_timer_follows_same_session_identity_rename() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("mouse-timer-rename-alpha");
+    let renamed = session_name("mouse-timer-rename-beta");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    bind_double_click_timer_buffer(&handler, "mouse-timer-rename").await;
+    let pause = handler.install_attached_mouse_timer_pause();
+    arm_attached_double_click_timer(&handler, requester_pid).await;
+
+    let response = handler
+        .handle(Request::RenameSession(rmux_proto::RenameSessionRequest {
+            target: alpha,
+            new_name: renamed.clone(),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RenameSession(_)),
+        "{response:?}"
+    );
+
+    let reached_pause = pause.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            reached_pause.mutation_reached.wait();
+        }),
+    )
+    .await
+    .expect("renamed click timer reaches its local mutation")
+    .expect("mutation waiter joins");
+    let release_pause = pause.clone();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            release_pause.mutation_release.wait();
+        }),
+    )
+    .await
+    .expect("renamed click mutation is released")
+    .expect("mutation releaser joins");
+    tokio::time::timeout(Duration::from_secs(2), pause.dispatch_reached.notified())
+        .await
+        .expect("renamed click reaches dispatch");
+
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("renamed attach remains active");
+        assert_eq!(active.session_name, renamed);
+        assert_eq!(active.mouse.click_deadline(), None);
+        assert!(!active.mouse.double_click_pending);
+        assert!(!active.mouse.triple_click_pending);
+        assert!(active.mouse.click_event.is_none());
+    }
+
+    pause.dispatch_release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), pause.task_completed.notified())
+        .await
+        .expect("renamed click dispatch completes");
+    assert_eq!(
+        buffer_contents(&handler, "mouse-timer-rename").await,
+        Some(b"ok".to_vec()),
+        "the delayed binding follows the stable session identity through rename"
+    );
+}
+
+#[tokio::test]
+async fn attached_session_switch_resets_click_state_without_clearing_a_new_timer() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("mouse-timer-switch-alpha");
+    let beta = session_name("mouse-timer-switch-beta");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    create_send_keys_test_session(&handler, &beta).await;
+    enable_mouse(&handler).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha, control_tx)
+        .await;
+    let identity = handler.active_attach_identity_for_test(requester_pid).await;
+    arm_attached_double_click_timer(&handler, requester_pid).await;
+    let old_token = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .and_then(|active| active.mouse.click_timer_token())
+            .expect("old session click timer is armed")
+    };
+
+    let response = handler
+        .handle(Request::SwitchClientExt(SwitchClientExtRequest {
+            target: Some(beta.clone()),
+            key_table: None,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("switched attach remains active");
+        assert_eq!(active.session_name, beta);
+        assert_eq!(active.mouse.click_deadline(), None);
+        assert!(!active.mouse.double_click_pending);
+        assert!(!active.mouse.triple_click_pending);
+        assert!(active.mouse.click_event.is_none());
+    }
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
+        .await
+        .expect("new session click arms its own timer");
+    let new_token = {
+        let active_attach = handler.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .and_then(|active| active.mouse.click_timer_token())
+            .expect("new session click timer is armed")
+    };
+    assert_ne!(new_token, old_token);
+
+    handler
+        .dispatch_expired_attached_mouse_click_for_test(identity, old_token)
+        .await
+        .expect("obsolete timer invocation is ignored");
+    {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("switched attach remains active");
+        assert_eq!(active.mouse.click_timer_token(), Some(new_token));
+        assert!(active.mouse.double_click_pending);
+        assert!(!active.mouse.triple_click_pending);
+        assert!(active.mouse.click_event.is_some());
+    }
+
+    handler.close_normal_and_drain_lifecycle_producers().await;
+}
+
+#[cfg(unix)]
+fn mouse_word_pane_command() -> Vec<String> {
+    [
+        "/bin/sh",
+        "-c",
+        "printf 'alpha beta gamma\\n'; exec sleep 60",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[cfg(windows)]
+fn mouse_word_pane_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "echo alpha beta gamma & ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
+}
+
+async fn create_mouse_word_session(handler: &RequestHandler, session: &rmux_proto::SessionName) {
+    let created = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(mouse_word_pane_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
+        .await;
+}
+
+async fn wait_for_pane_text(handler: &RequestHandler, target: &PaneTarget, marker: &str) {
+    let transcript = {
+        let state = handler.state.lock().await;
+        state
+            .transcript_handle(target)
+            .expect("pane transcript exists")
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        last = transcript
+            .lock()
+            .expect("pane transcript mutex is not poisoned")
+            .screen()
+            .render_visible_line_independent(0, rmux_core::GridRenderOptions::default())
+            .unwrap_or_default();
+        if String::from_utf8_lossy(&last).contains(marker) {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "pane output never contained {marker:?}; last={:?}",
+        String::from_utf8_lossy(&last)
+    );
+}
+
 #[tokio::test]
 async fn live_attach_default_double_click_copies_word_from_mouse_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    // Inert, silent pane: the login shell's own prompt must not race the test
-    // content into row 1, or the double-click copies the wrong word ("Users"
-    // from cmd.exe's `C:\Users\...`) instead of "alpha".
-    create_quiet_mouse_session(&handler, &alpha).await;
+    // Source the selectable text from the real pane output stream. In
+    // particular, a Windows ConPTY can publish its initial blank frame after
+    // terminal installation, so direct transcript injection would race it.
+    create_mouse_word_session(&handler, &alpha).await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+    wait_for_pane_text(&handler, &target, "alpha beta gamma").await;
     enable_mouse(&handler).await;
-
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .append_bytes_to_pane_transcript_for_test(
-                &alpha,
-                0,
-                0,
-                b"\x1b[2J\x1b[Halpha beta gamma\n",
-            )
-            .expect("test transcript update");
-    }
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler

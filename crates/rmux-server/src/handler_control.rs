@@ -19,8 +19,11 @@ use crate::handler_support::{ambiguous_attached_client, attached_client_required
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::PaneOutputSender;
 use crate::pane_terminals::HandlerState;
+use crate::server_access::ServerAccessAdmission;
 #[cfg(test)]
-use crate::server_access::current_owner_uid;
+use crate::server_access::{
+    current_owner_uid, pause_before_access_registration, AccessRegistrationKind,
+};
 
 #[path = "handler_control/session_attach.rs"]
 mod session_attach;
@@ -30,6 +33,7 @@ const CONTROL_QUEUE_DRAIN_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlRegistrationError {
     QueueDrainTimedOut { requester_pid: u32 },
+    AccessRevoked,
 }
 
 impl ControlRegistrationError {
@@ -38,6 +42,9 @@ impl ControlRegistrationError {
             Self::QueueDrainTimedOut { requester_pid } => rmux_proto::RmuxError::Server(format!(
                 "timed out waiting for the previous control queue for client {requester_pid} to drain"
             )),
+            Self::AccessRevoked => {
+                rmux_proto::RmuxError::Server("access not allowed".to_owned())
+            }
         }
     }
 }
@@ -62,6 +69,7 @@ pub(super) struct ActiveControl {
     pub(super) terminal_context: OuterTerminalContext,
     event_tx: mpsc::Sender<ControlServerEvent>,
     pub(super) closing: Arc<AtomicBool>,
+    client_detached_prepared: bool,
     queue_draining: bool,
     queue_drain_finished: watch::Sender<bool>,
 }
@@ -90,6 +98,14 @@ pub(super) enum ManagedClient {
 pub(crate) struct ControlClientIdentity {
     requester_pid: u32,
     control_id: u64,
+}
+
+pub(super) struct ControlClientDetachOutcome {
+    pub(in crate::handler) lifecycle_event: Option<QueuedLifecycleEvent>,
+}
+
+pub(super) struct ControlClientsDetachOutcome {
+    pub(in crate::handler) lifecycle_events: Vec<QueuedLifecycleEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +140,23 @@ impl<'a> ControlSessionUpdate<'a> {
         }
     }
 }
+
+struct DestroyControlSwitchCommitOutcome {
+    target_session_name: rmux_proto::SessionName,
+    client_session_changed: QueuedLifecycleEvent,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct ControlSwitchPostCommitPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static CONTROL_SWITCH_POST_COMMIT_PAUSE: std::sync::Mutex<
+    Vec<(u32, Arc<ControlSwitchPostCommitPause>)>,
+> = std::sync::Mutex::new(Vec::new());
 
 impl ControlClientIdentity {
     pub(crate) const fn new(requester_pid: u32, control_id: u64) -> Self {
@@ -273,7 +306,7 @@ impl RequestHandler {
                 event_tx,
                 closing,
                 uid: current_owner_uid(),
-                user: UserIdentity::Uid(current_owner_uid()),
+                user: self.server_owner_identity(),
                 can_write: true,
             },
         )
@@ -281,6 +314,7 @@ impl RequestHandler {
         .expect("test control registration must not outlive the bounded queue drain")
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_control_with_access(
         &self,
         requester_pid: u32,
@@ -291,6 +325,24 @@ impl RequestHandler {
             requester_pid,
             upgrade,
             registration,
+            None,
+            CONTROL_QUEUE_DRAIN_REGISTRATION_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(crate) async fn register_control_with_server_access(
+        &self,
+        requester_pid: u32,
+        upgrade: ControlModeUpgrade,
+        registration: ControlRegistration,
+        admission: ServerAccessAdmission,
+    ) -> Result<u64, ControlRegistrationError> {
+        self.register_control_with_access_timeout(
+            requester_pid,
+            upgrade,
+            registration,
+            Some(admission),
             CONTROL_QUEUE_DRAIN_REGISTRATION_TIMEOUT,
         )
         .await
@@ -308,6 +360,7 @@ impl RequestHandler {
             requester_pid,
             upgrade,
             registration,
+            None,
             drain_timeout,
         )
         .await
@@ -318,10 +371,19 @@ impl RequestHandler {
         requester_pid: u32,
         upgrade: ControlModeUpgrade,
         registration: ControlRegistration,
+        admission: Option<ServerAccessAdmission>,
         drain_timeout: Duration,
     ) -> Result<u64, ControlRegistrationError> {
+        #[cfg(test)]
+        if admission.is_some() {
+            pause_before_access_registration(AccessRegistrationKind::Control, requester_pid).await;
+        }
         let drain_deadline = tokio::time::Instant::now() + drain_timeout;
-        let control_id = loop {
+        let (control_id, replaced_session, detached_event) = loop {
+            // Session lifecycle events and the logical client replacement
+            // share the established state -> active-control lock order. This
+            // keeps the detach ticket at the exact replacement boundary.
+            let mut state = self.state.lock().await;
             let mut active_control = self.active_control.lock().await;
             let drain_finished = active_control
                 .by_pid
@@ -330,6 +392,7 @@ impl RequestHandler {
                 .map(|active| active.queue_drain_finished.subscribe());
             if let Some(mut drain_finished) = drain_finished {
                 drop(active_control);
+                drop(state);
                 if tokio::time::timeout_at(
                     drain_deadline,
                     drain_finished.wait_for(|finished| *finished),
@@ -342,33 +405,85 @@ impl RequestHandler {
                 continue;
             }
 
-            let control_id = active_control.next_id;
-            active_control.next_id += 1;
-            let (queue_drain_finished, _queue_drain_pending) = watch::channel(false);
-            if let Some(previous) = active_control.by_pid.insert(
-                requester_pid,
-                ActiveControl {
-                    id: control_id,
-                    session_name: None,
-                    session_id: None,
-                    last_session: None,
-                    last_session_id: None,
-                    flags: ControlClientFlags::default(),
-                    uid: registration.uid,
-                    user: registration.user,
-                    can_write: registration.can_write,
-                    terminal_context: upgrade.terminal_context,
-                    event_tx: registration.event_tx,
-                    closing: registration.closing,
-                    queue_draining: false,
-                    queue_drain_finished,
-                },
-            ) {
-                previous.closing.store(true, Ordering::SeqCst);
-                let _ = try_send_control_event(&previous, ControlServerEvent::Exit(None));
-            }
-            break control_id;
+            let (control_id, replaced_session, detached_event) = {
+                // Keep the client-state lock across policy revalidation and
+                // publication. ACL mutations commit to the store first, then take
+                // this lock to update or disconnect every published control client.
+                let server_access = admission.as_ref().map(|_| {
+                    self.server_access
+                        .lock()
+                        .expect("server access mutex must not be poisoned")
+                });
+                let can_write = match (server_access.as_ref(), admission.as_ref()) {
+                    (Some(server_access), Some(admission)) => server_access
+                        .revalidate_admission(admission, &registration.user)
+                        .ok_or(ControlRegistrationError::AccessRevoked)?
+                        .can_write(),
+                    (None, None) => registration.can_write,
+                    _ => unreachable!("an admission and its policy guard are created together"),
+                };
+
+                let control_id = active_control.next_id;
+                active_control.next_id += 1;
+                let (queue_drain_finished, _queue_drain_pending) = watch::channel(false);
+                let previous = active_control.by_pid.insert(
+                    requester_pid,
+                    ActiveControl {
+                        id: control_id,
+                        session_name: None,
+                        session_id: None,
+                        last_session: None,
+                        last_session_id: None,
+                        flags: ControlClientFlags::default(),
+                        uid: registration.uid,
+                        user: registration.user,
+                        can_write,
+                        terminal_context: upgrade.terminal_context,
+                        event_tx: registration.event_tx,
+                        closing: registration.closing,
+                        client_detached_prepared: false,
+                        queue_draining: false,
+                        queue_drain_finished,
+                    },
+                );
+                let (replaced_session, detached_event) = if let Some(previous) = previous {
+                    let replaced_session = previous.session_name.clone().zip(previous.session_id);
+                    let detached_event =
+                        replaced_session
+                            .as_ref()
+                            .and_then(|(session_name, session_id)| {
+                                (!previous.client_detached_prepared).then(|| {
+                                    let mut event = super::prepare_lifecycle_event(
+                                        &mut state,
+                                        &LifecycleEvent::ClientDetached {
+                                            session_name: session_name.clone(),
+                                            client_name: Some(requester_pid.to_string()),
+                                        },
+                                    );
+                                    event.control_session_identity = Some(*session_id);
+                                    event
+                                })
+                            });
+                    close_control_with_exit(&previous, None);
+                    (replaced_session, detached_event)
+                } else {
+                    (None, None)
+                };
+                drop(server_access);
+                (control_id, replaced_session, detached_event)
+            };
+            drop(active_control);
+            drop(state);
+            break (control_id, replaced_session, detached_event);
         };
+
+        if let Some(event) = detached_event {
+            self.emit_prepared(event).await;
+        }
+        if let Some(session_identity) = replaced_session {
+            self.destroy_unattached_sessions(vec![session_identity])
+                .await;
+        }
 
         for line in self.take_startup_config_error_notifications().await {
             self.send_control_notification_to(requester_pid, line).await;
@@ -410,23 +525,47 @@ impl RequestHandler {
     }
 
     pub(crate) async fn finish_control(&self, requester_pid: u32, control_id: u64) {
-        let (removed, removed_session) = {
+        let (removed, removed_session, detached_event) = {
+            let mut state = self.state.lock().await;
             let mut active_control = self.active_control.lock().await;
-            if active_control
+            let removed_control = if active_control
                 .by_pid
                 .get(&requester_pid)
                 .is_some_and(|active| active.id == control_id)
             {
-                let removed = active_control
-                    .by_pid
-                    .remove(&requester_pid)
-                    .expect("validated control registration remains present");
-                removed.queue_drain_finished.send_replace(true);
-                (true, removed.session_name.zip(removed.session_id))
+                active_control.by_pid.remove(&requester_pid)
             } else {
-                (false, None)
+                None
+            };
+            match removed_control {
+                Some(removed) => {
+                    removed.queue_drain_finished.send_replace(true);
+                    let prepare_detached = !removed.client_detached_prepared;
+                    let removed_session = removed.session_name.zip(removed.session_id);
+                    let detached_event =
+                        removed_session
+                            .as_ref()
+                            .and_then(|(session_name, session_id)| {
+                                prepare_detached.then(|| {
+                                    let mut event = super::prepare_lifecycle_event(
+                                        &mut state,
+                                        &LifecycleEvent::ClientDetached {
+                                            session_name: session_name.clone(),
+                                            client_name: Some(requester_pid.to_string()),
+                                        },
+                                    );
+                                    event.control_session_identity = Some(*session_id);
+                                    event
+                                })
+                            });
+                    (true, removed_session, detached_event)
+                }
+                None => (false, None, None),
             }
         };
+        if let Some(event) = detached_event {
+            self.emit_prepared(event).await;
+        }
         if let Some(session_identity) = removed_session {
             self.destroy_unattached_sessions(vec![session_identity])
                 .await;
@@ -526,25 +665,22 @@ impl RequestHandler {
         new_name: &rmux_proto::SessionName,
     ) {
         let mut active_control = self.active_control.lock().await;
-        active_control.by_pid.retain(|_, active| {
+        for active in active_control.by_pid.values_mut() {
             if active.session_name.as_ref() == Some(session_name)
                 && active.session_id == Some(session_id)
             {
                 active.session_name = Some(new_name.clone());
-                if !try_send_control_event(
+                let _ = try_send_control_event(
                     active,
                     ControlServerEvent::SessionChanged(Some(new_name.clone())),
-                ) {
-                    return false;
-                }
+                );
             }
             if active.last_session.as_ref() == Some(session_name)
                 && active.last_session_id == Some(session_id)
             {
                 active.last_session = Some(new_name.clone());
             }
-            true
-        });
+        }
     }
 
     pub(super) async fn current_session_candidate(
@@ -793,6 +929,38 @@ impl RequestHandler {
     }
 
     #[cfg(test)]
+    pub(in crate::handler) fn install_control_switch_post_commit_pause(
+        &self,
+        requester_pid: u32,
+    ) -> Arc<ControlSwitchPostCommitPause> {
+        let pause = Arc::new(ControlSwitchPostCommitPause::default());
+        let mut installed = CONTROL_SWITCH_POST_COMMIT_PAUSE
+            .lock()
+            .expect("control switch post-commit pause lock");
+        installed.retain(|(paused_pid, _)| *paused_pid != requester_pid);
+        installed.push((requester_pid, pause.clone()));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_after_control_switch_commit(&self, requester_pid: u32) {
+        let pause = {
+            let mut installed = CONTROL_SWITCH_POST_COMMIT_PAUSE
+                .lock()
+                .expect("control switch post-commit pause lock");
+            installed
+                .iter()
+                .position(|(paused_pid, _)| *paused_pid == requester_pid)
+                .map(|position| installed.swap_remove(position).1)
+        };
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.notify_one();
+        pause.release.notified().await;
+    }
+
+    #[cfg(test)]
     pub(super) async fn set_control_session(
         &self,
         requester_pid: u32,
@@ -861,6 +1029,7 @@ impl RequestHandler {
         .await
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::handler) async fn switch_control_session_after_destroy(
         &self,
         requester_pid: u32,
@@ -868,6 +1037,45 @@ impl RequestHandler {
         expected_current_session_id: SessionId,
         target_session_id: SessionId,
     ) -> Option<rmux_proto::SessionName> {
+        let (target_session_name, client_session_changed) = self
+            .prepare_control_session_switch_after_destroy(
+                requester_pid,
+                expected_control_id,
+                expected_current_session_id,
+                target_session_id,
+            )
+            .await?;
+        self.emit_prepared(client_session_changed).await;
+        Some(target_session_name)
+    }
+
+    pub(in crate::handler) async fn prepare_control_session_switch_after_destroy(
+        &self,
+        requester_pid: u32,
+        expected_control_id: u64,
+        expected_current_session_id: SessionId,
+        target_session_id: SessionId,
+    ) -> Option<(rmux_proto::SessionName, QueuedLifecycleEvent)> {
+        let outcome = self
+            .switch_control_session_after_destroy_inner(
+                requester_pid,
+                expected_control_id,
+                expected_current_session_id,
+                target_session_id,
+            )
+            .await?;
+        #[cfg(test)]
+        self.pause_after_control_switch_commit(requester_pid).await;
+        Some((outcome.target_session_name, outcome.client_session_changed))
+    }
+
+    async fn switch_control_session_after_destroy_inner(
+        &self,
+        requester_pid: u32,
+        expected_control_id: u64,
+        expected_current_session_id: SessionId,
+        target_session_id: SessionId,
+    ) -> Option<DestroyControlSwitchCommitOutcome> {
         let mut state = self.state.lock().await;
         let target_session_name = state
             .sessions
@@ -891,7 +1099,6 @@ impl RequestHandler {
             Some(pane_sequences),
         );
         if !delivered {
-            active_control.by_pid.remove(&requester_pid);
             return None;
         }
         state
@@ -899,7 +1106,18 @@ impl RequestHandler {
             .session_mut(&target_session_name)
             .expect("stable destroy-switch target remains locked")
             .touch_attached();
-        Some(target_session_name)
+        let mut client_session_changed = super::prepare_lifecycle_event(
+            &mut state,
+            &LifecycleEvent::ClientSessionChanged {
+                session_name: target_session_name.clone(),
+                client_name: Some(requester_pid.to_string()),
+            },
+        );
+        client_session_changed.control_session_identity = Some(target_session_id);
+        Some(DestroyControlSwitchCommitOutcome {
+            target_session_name,
+            client_session_changed,
+        })
     }
 
     async fn set_control_session_with_expected_identity(
@@ -981,7 +1199,6 @@ impl RequestHandler {
             pane_sequences,
         );
         if !delivered {
-            active_control.by_pid.remove(&requester_pid);
             return Err(attached_client_required(command_name));
         }
         if let (Some(session_name), Some(client_environment)) =
@@ -989,11 +1206,13 @@ impl RequestHandler {
         {
             update_environment_from_client(&mut state, session_name, client_environment);
         }
-        if let Some(selection) = target_selection.as_ref() {
+        let refresh_sessions = if let Some(selection) = target_selection.as_ref() {
             selection
                 .apply_to_state(&mut state)
-                .expect("prevalidated switch selection remains applicable while locked");
-        }
+                .expect("prevalidated switch selection remains applicable while locked")
+        } else {
+            Vec::new()
+        };
         if touch_attached {
             let session_name = next_session_name
                 .as_ref()
@@ -1004,6 +1223,9 @@ impl RequestHandler {
                 .expect("target session stayed locked across the control update")
                 .touch_attached();
         }
+        drop(active_control);
+        drop(state);
+        self.refresh_linked_window_sessions(refresh_sessions).await;
         Ok(previous)
     }
 
@@ -1094,7 +1316,6 @@ impl RequestHandler {
             .1
         };
         if !delivered {
-            active_control.by_pid.remove(&identity.requester_pid());
             return Err(attached_client_required("control session"));
         }
         state
@@ -1107,12 +1328,12 @@ impl RequestHandler {
 
     pub(super) async fn refresh_control_session(&self, session_name: &rmux_proto::SessionName) {
         let mut active_control = self.active_control.lock().await;
-        active_control.by_pid.retain(|_, active| {
+        for active in active_control.by_pid.values_mut() {
             if active.session_name.as_ref() != Some(session_name) {
-                return true;
+                continue;
             }
-            try_send_control_event(active, ControlServerEvent::Refresh)
-        });
+            let _ = try_send_control_event(active, ControlServerEvent::Refresh);
+        }
     }
 
     pub(in crate::handler) async fn refresh_control_session_for_session_identity(
@@ -1131,14 +1352,14 @@ impl RequestHandler {
             return;
         }
         let mut active_control = self.active_control.lock().await;
-        active_control.by_pid.retain(|_, active| {
+        for active in active_control.by_pid.values_mut() {
             if active.session_name.as_ref() != Some(session_name)
                 || active.session_id != Some(session_id)
             {
-                return true;
+                continue;
             }
-            try_send_control_event(active, ControlServerEvent::Refresh)
-        });
+            let _ = try_send_control_event(active, ControlServerEvent::Refresh);
+        }
     }
 
     pub(super) async fn refresh_control_client_for_identity(
@@ -1156,7 +1377,6 @@ impl RequestHandler {
             return Err(attached_client_required("refresh-client"));
         };
         if !try_send_control_event(active, ControlServerEvent::Refresh) {
-            active_control.by_pid.remove(&identity.requester_pid());
             return Err(attached_client_required("refresh-client"));
         }
         Ok(())
@@ -1169,7 +1389,7 @@ impl RequestHandler {
         reason: Option<String>,
     ) {
         let mut active_control = self.active_control.lock().await;
-        active_control.by_pid.retain(|_, active| {
+        for active in active_control.by_pid.values_mut() {
             if active.last_session.as_ref() == Some(session_name)
                 && active.last_session_id == Some(session_id)
             {
@@ -1179,48 +1399,62 @@ impl RequestHandler {
             if active.session_name.as_ref() != Some(session_name)
                 || active.session_id != Some(session_id)
             {
-                return true;
+                continue;
             }
-            active.closing.store(true, Ordering::SeqCst);
-            try_send_control_event(active, ControlServerEvent::Exit(reason.clone()))
-        });
+            close_control_with_exit(active, reason.clone());
+        }
     }
 
-    pub(super) async fn detach_control_clients_for_session(
+    pub(super) async fn detach_control_clients_for_session_identity(
         &self,
-        session_name: &rmux_proto::SessionName,
+        session_id: SessionId,
+        control_clients: Vec<ControlClientIdentity>,
         reason: Option<String>,
-    ) -> Vec<u32> {
-        let session_id = {
-            let state = self.state.lock().await;
-            let Some(session) = state.sessions.session(session_name) else {
-                return Vec::new();
+    ) -> ControlClientsDetachOutcome {
+        let mut state = self.state.lock().await;
+        let Some(session_name) = state
+            .sessions
+            .session_by_id(session_id)
+            .map(|session| session.name().clone())
+        else {
+            return ControlClientsDetachOutcome {
+                lifecycle_events: Vec::new(),
             };
-            session.id()
         };
         let mut active_control = self.active_control.lock().await;
-        let control_pids = active_control
-            .by_pid
-            .iter()
-            .filter_map(|(&pid, active)| {
-                (active.session_name.as_ref() == Some(session_name)
-                    && active.session_id == Some(session_id))
-                .then_some(pid)
+        let lifecycle_events = control_clients
+            .into_iter()
+            .filter_map(|identity| {
+                let requester_pid = identity.requester_pid();
+                let matches_snapshot =
+                    active_control
+                        .by_pid
+                        .get(&requester_pid)
+                        .is_some_and(|active| {
+                            active.id == identity.control_id()
+                                && active.session_id == Some(session_id)
+                        });
+                if !matches_snapshot {
+                    return None;
+                }
+                let active = active_control.by_pid.remove(&requester_pid)?;
+                let prepare_detached = !active.client_detached_prepared;
+                close_control_with_exit(&active, reason.clone());
+                prepare_detached.then(|| {
+                    let mut event = super::prepare_lifecycle_event(
+                        &mut state,
+                        &LifecycleEvent::ClientDetached {
+                            session_name: session_name.clone(),
+                            client_name: Some(requester_pid.to_string()),
+                        },
+                    );
+                    event.control_session_identity = Some(session_id);
+                    event
+                })
             })
-            .collect::<Vec<_>>();
+            .collect();
 
-        for control_pid in &control_pids {
-            let Some(active) = active_control.by_pid.get(control_pid) else {
-                continue;
-            };
-            active.closing.store(true, Ordering::SeqCst);
-            let _ = try_send_control_event(active, ControlServerEvent::Exit(reason.clone()));
-        }
-        for control_pid in &control_pids {
-            active_control.by_pid.remove(control_pid);
-        }
-
-        control_pids
+        ControlClientsDetachOutcome { lifecycle_events }
     }
 
     pub(super) async fn refresh_all_control_sessions(&self) {
@@ -1362,44 +1596,75 @@ impl RequestHandler {
         }
     }
 
-    pub(super) async fn exit_control_client(
-        &self,
-        requester_pid: u32,
-        reason: Option<String>,
-    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
-        self.exit_control_client_with_expected_id(requester_pid, None, reason)
-            .await
-    }
-
     pub(super) async fn exit_control_client_for_identity(
         &self,
         requester_pid: u32,
         expected_control_id: u64,
         reason: Option<String>,
-    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
-        self.exit_control_client_with_expected_id(requester_pid, Some(expected_control_id), reason)
+    ) -> Result<ControlClientDetachOutcome, rmux_proto::RmuxError> {
+        self.exit_control_client_with_expected_id(requester_pid, expected_control_id, reason, None)
             .await
+    }
+
+    pub(in crate::handler) async fn exit_control_client_for_identity_from_mode_tree(
+        &self,
+        requester: super::mode_tree_support::ModeTreeActionIdentity,
+        requester_pid: u32,
+        expected_control_id: u64,
+        reason: Option<String>,
+    ) -> Result<ControlClientDetachOutcome, rmux_proto::RmuxError> {
+        self.exit_control_client_with_expected_id(
+            requester_pid,
+            expected_control_id,
+            reason,
+            Some(requester),
+        )
+        .await
     }
 
     async fn exit_control_client_with_expected_id(
         &self,
         requester_pid: u32,
-        expected_control_id: Option<u64>,
+        expected_control_id: u64,
         reason: Option<String>,
-    ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
+        mode_tree_requester: Option<super::mode_tree_support::ModeTreeActionIdentity>,
+    ) -> Result<ControlClientDetachOutcome, rmux_proto::RmuxError> {
+        let mut state = self.state.lock().await;
+        let _mode_tree_guard = if let Some(identity) = mode_tree_requester {
+            let active_attach = self.active_attach.lock().await;
+            if !identity.matches_active(&state, &active_attach) {
+                return Err(attached_client_required("detach-client"));
+            }
+            Some(active_attach)
+        } else {
+            None
+        };
         let mut active_control = self.active_control.lock().await;
         let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
             return Err(attached_client_required("detach-client"));
         };
-        if expected_control_id.is_some_and(|expected| active.id != expected) {
+        if active.id != expected_control_id {
             return Err(attached_client_required("detach-client"));
         }
         let session_name = active.session_name.clone();
-        active.closing.store(true, Ordering::SeqCst);
-        if !try_send_control_event(active, ControlServerEvent::Exit(reason)) {
-            active_control.by_pid.remove(&requester_pid);
-        }
-        Ok(session_name)
+        let session_id = active.session_id;
+        let prepare_detached = session_name.is_some() && !active.client_detached_prepared;
+        active.client_detached_prepared |= prepare_detached;
+        close_control_with_exit(active, reason);
+        let lifecycle_event = session_name
+            .filter(|_| prepare_detached)
+            .map(|session_name| {
+                let mut event = super::prepare_lifecycle_event(
+                    &mut state,
+                    &LifecycleEvent::ClientDetached {
+                        session_name,
+                        client_name: Some(requester_pid.to_string()),
+                    },
+                );
+                event.control_session_identity = session_id;
+                event
+            });
+        Ok(ControlClientDetachOutcome { lifecycle_event })
     }
 
     pub(crate) async fn control_client_flags(
@@ -1497,6 +1762,9 @@ fn update_control_session(
     pane_sequences: Option<Vec<(u32, u64)>>,
 ) -> (Option<rmux_proto::SessionName>, bool) {
     let previous = active.session_name.clone();
+    let previous_session_id = active.session_id;
+    let previous_last_session = active.last_session.clone();
+    let previous_last_session_id = active.last_session_id;
     if let (Some(previous_session), Some(previous_session_id), Some(next_session), Some(next_id)) = (
         previous.as_ref(),
         active.session_id,
@@ -1519,6 +1787,12 @@ fn update_control_session(
         (None, Some(_)) => unreachable!("pane cursors require a control session"),
     };
     let delivered = try_send_control_event(active, event);
+    if !delivered {
+        active.session_name = previous.clone();
+        active.session_id = previous_session_id;
+        active.last_session = previous_last_session;
+        active.last_session_id = previous_last_session_id;
+    }
     (previous, delivered)
 }
 
@@ -1545,19 +1819,27 @@ fn deliver_control_notification(
     let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
         return;
     };
-    if !try_send_control_event(active, ControlServerEvent::Notification(line)) {
-        active_control.by_pid.remove(&requester_pid);
-    }
+    let _ = try_send_control_event(active, ControlServerEvent::Notification(line));
 }
 
 fn try_send_control_event(active: &ActiveControl, event: ControlServerEvent) -> bool {
     // Callers hold `active_control`: never await capacity for a client that is not draining.
+    if active.closing.load(Ordering::SeqCst) {
+        return false;
+    }
     if active.event_tx.try_send(event).is_ok() {
         return true;
     }
 
     active.closing.store(true, Ordering::SeqCst);
     false
+}
+
+fn close_control_with_exit(active: &ActiveControl, reason: Option<String>) {
+    if active.closing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = active.event_tx.try_send(ControlServerEvent::Exit(reason));
 }
 
 fn control_clients_snapshot_locked(

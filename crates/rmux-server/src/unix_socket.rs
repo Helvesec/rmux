@@ -7,14 +7,40 @@ use std::path::{Path, PathBuf};
 use rmux_ipc::{LocalEndpoint, LocalListener};
 use tracing::debug;
 
-const BOUND_SOCKET_MODE: u32 = 0o600;
-const UNSAFE_PERMISSION_MASK: u32 = 0o077;
+pub(crate) const OWNER_ONLY_DIRECTORY_MODE: u32 = 0o700;
+pub(crate) const SHARED_DIRECTORY_MODE: u32 = 0o711;
+pub(crate) const OWNER_ONLY_SOCKET_MODE: u32 = 0o600;
+pub(crate) const SHARED_SOCKET_MODE: u32 = 0o666;
 const SOCKET_DIR_PREFIX: &str = "rmux";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnixTransportAccess {
+    OwnerOnly,
+    AllowListed,
+}
+
+impl UnixTransportAccess {
+    #[must_use]
+    pub(crate) const fn directory_mode(self) -> u32 {
+        match self {
+            Self::OwnerOnly => OWNER_ONLY_DIRECTORY_MODE,
+            Self::AllowListed => SHARED_DIRECTORY_MODE,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn socket_mode(self) -> u32 {
+        match self {
+            Self::OwnerOnly => OWNER_ONLY_SOCKET_MODE,
+            Self::AllowListed => SHARED_SOCKET_MODE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SocketFileIdentity {
-    device: u64,
-    inode: u64,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
 }
 
 pub(crate) struct BoundUnixListener {
@@ -26,26 +52,30 @@ pub(crate) fn bind_unix_listener_at(socket_path: &Path) -> io::Result<BoundUnixL
     if socket_path.as_os_str().is_empty() {
         return bind_empty_socket_listener();
     }
-    prepare_socket_path(socket_path)?;
-    bind_prepared_unix_listener(socket_path)
+    prepare_socket_path(socket_path, UnixTransportAccess::OwnerOnly)?;
+    bind_prepared_unix_listener(socket_path, UnixTransportAccess::OwnerOnly)
 }
 
 pub(crate) fn rebind_unix_listener_at(
     socket_path: &Path,
     current_identity: Option<SocketFileIdentity>,
+    access: UnixTransportAccess,
 ) -> io::Result<BoundUnixListener> {
     if socket_path.as_os_str().is_empty() {
         return bind_empty_socket_listener();
     }
-    prepare_socket_parent(socket_path)?;
+    prepare_socket_parent(socket_path, access)?;
     remove_rebindable_socket(socket_path, current_identity)?;
-    bind_prepared_unix_listener(socket_path)
+    bind_prepared_unix_listener(socket_path, access)
 }
 
-fn bind_prepared_unix_listener(socket_path: &Path) -> io::Result<BoundUnixListener> {
+fn bind_prepared_unix_listener(
+    socket_path: &Path,
+    access: UnixTransportAccess,
+) -> io::Result<BoundUnixListener> {
     let endpoint = LocalEndpoint::from_path(socket_path.to_path_buf());
     let listener = LocalListener::bind(&endpoint)?;
-    enforce_bound_socket_permissions(socket_path)?;
+    enforce_bound_socket_permissions(socket_path, access.socket_mode())?;
     let identity = socket_file_identity(socket_path)?;
     Ok(BoundUnixListener {
         listener,
@@ -62,18 +92,26 @@ fn bind_empty_socket_listener() -> io::Result<BoundUnixListener> {
     })
 }
 
-fn prepare_socket_path(socket_path: &Path) -> io::Result<()> {
-    prepare_socket_parent(socket_path)?;
+fn prepare_socket_path(socket_path: &Path, access: UnixTransportAccess) -> io::Result<()> {
+    prepare_socket_parent(socket_path, access)?;
     remove_stale_socket_if_needed(socket_path)
 }
 
-fn prepare_socket_parent(socket_path: &Path) -> io::Result<()> {
-    ensure_parent_directory(socket_parent_or_current(socket_path)?)
+fn prepare_socket_parent(socket_path: &Path, access: UnixTransportAccess) -> io::Result<()> {
+    ensure_parent_directory_for_access(socket_parent_or_current(socket_path)?, access)
 }
 
+#[cfg(test)]
 pub(crate) fn ensure_parent_directory(parent: &Path) -> io::Result<()> {
+    ensure_parent_directory_for_access(parent, UnixTransportAccess::OwnerOnly)
+}
+
+fn ensure_parent_directory_for_access(
+    parent: &Path,
+    access: UnixTransportAccess,
+) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
+    builder.recursive(true).mode(OWNER_ONLY_DIRECTORY_MODE);
     match builder.create(parent) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -88,7 +126,7 @@ pub(crate) fn ensure_parent_directory(parent: &Path) -> io::Result<()> {
     }
 
     if let Some(managed_directory) = managed_rmux_socket_directory(parent)? {
-        ensure_safe_rmux_socket_directory(&managed_directory)?;
+        ensure_safe_rmux_socket_directory(&managed_directory, access)?;
     }
     Ok(())
 }
@@ -104,7 +142,7 @@ fn ensure_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn managed_rmux_socket_directory(path: &Path) -> io::Result<Option<PathBuf>> {
+pub(crate) fn managed_rmux_socket_directory(path: &Path) -> io::Result<Option<PathBuf>> {
     let expected = format!("{SOCKET_DIR_PREFIX}-{}", real_user_id()?);
     for ancestor in path.ancestors() {
         if ancestor.file_name().and_then(|name| name.to_str()) == Some(expected.as_str()) {
@@ -114,7 +152,7 @@ fn managed_rmux_socket_directory(path: &Path) -> io::Result<Option<PathBuf>> {
     Ok(None)
 }
 
-fn ensure_safe_rmux_socket_directory(path: &Path) -> io::Result<()> {
+fn ensure_safe_rmux_socket_directory(path: &Path, access: UnixTransportAccess) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(io::Error::new(
@@ -125,12 +163,12 @@ fn ensure_safe_rmux_socket_directory(path: &Path) -> io::Result<()> {
             ),
         ));
     }
-    let mode = metadata.permissions().mode();
-    if mode & UNSAFE_PERMISSION_MASK != 0 {
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != OWNER_ONLY_DIRECTORY_MODE && mode != SHARED_DIRECTORY_MODE {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "socket directory '{}' must not be accessible by group or others",
+                "socket directory '{}' has unsafe permissions",
                 path.display()
             ),
         ));
@@ -142,16 +180,34 @@ fn ensure_safe_rmux_socket_directory(path: &Path) -> io::Result<()> {
             format!("socket directory '{}' has unsafe ownership", path.display()),
         ));
     }
+    let expected_mode = access.directory_mode();
+    if mode != expected_mode {
+        fs::set_permissions(path, fs::Permissions::from_mode(expected_mode))?;
+        let updated = fs::symlink_metadata(path)?;
+        if updated.file_type().is_symlink()
+            || !updated.is_dir()
+            || updated.uid() != user_id
+            || updated.permissions().mode() & 0o777 != expected_mode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "socket directory '{}' changed while applying permissions",
+                    path.display()
+                ),
+            ));
+        }
+    }
     Ok(())
 }
 
-fn enforce_bound_socket_permissions(socket_path: &Path) -> io::Result<()> {
-    validate_bound_socket(socket_path, false)?;
-    fs::set_permissions(socket_path, fs::Permissions::from_mode(BOUND_SOCKET_MODE))?;
-    validate_bound_socket(socket_path, true)
+fn enforce_bound_socket_permissions(socket_path: &Path, expected_mode: u32) -> io::Result<()> {
+    validate_bound_socket(socket_path, None)?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(expected_mode))?;
+    validate_bound_socket(socket_path, Some(expected_mode))
 }
 
-fn validate_bound_socket(socket_path: &Path, require_owner_only: bool) -> io::Result<()> {
+fn validate_bound_socket(socket_path: &Path, expected_mode: Option<u32>) -> io::Result<()> {
     let metadata = socket_metadata(socket_path, io::ErrorKind::PermissionDenied)?;
     ensure_directory(socket_parent_or_current(socket_path)?)?;
     let user_id = real_user_id()?;
@@ -161,7 +217,7 @@ fn validate_bound_socket(socket_path: &Path, require_owner_only: bool) -> io::Re
             format!("socket {} has unsafe ownership", socket_path.display()),
         ));
     }
-    if require_owner_only && metadata.permissions().mode() & 0o777 != BOUND_SOCKET_MODE {
+    if expected_mode.is_some_and(|mode| metadata.permissions().mode() & 0o777 != mode) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("socket {} has unsafe permissions", socket_path.display()),
@@ -339,10 +395,11 @@ mod tests {
         fs::create_dir_all(parent).expect("create socket parent");
         let foreign = StdUnixListener::bind(&socket_path).expect("bind foreign socket");
 
-        let error = match rebind_unix_listener_at(&socket_path, None) {
-            Ok(_) => panic!("live foreign socket must not be unlinked"),
-            Err(error) => error,
-        };
+        let error =
+            match rebind_unix_listener_at(&socket_path, None, UnixTransportAccess::OwnerOnly) {
+                Ok(_) => panic!("live foreign socket must not be unlinked"),
+                Err(error) => error,
+            };
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         assert!(
@@ -382,7 +439,8 @@ mod tests {
         let bound = bind_unix_listener_at(&socket_path).expect("bind first socket");
 
         let rebound =
-            rebind_unix_listener_at(&socket_path, bound.identity).expect("rebind current socket");
+            rebind_unix_listener_at(&socket_path, bound.identity, UnixTransportAccess::OwnerOnly)
+                .expect("rebind current socket");
 
         assert!(UnixStream::connect(&socket_path).is_ok());
         drop(rebound.listener);

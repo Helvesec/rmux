@@ -114,11 +114,15 @@ async fn new_session_honors_global_base_index_and_default_size() {
 #[tokio::test]
 async fn new_session_uses_default_command_when_request_omits_command() {
     let handler = RequestHandler::new();
+    // Keep the initial pane alive until its lifecycle metadata is inspected.
+    // A short-lived `printf` may exit and remove the detached session first
+    // when the full test suite runs under load.
+    let default_command = if cfg!(windows) { "more" } else { "cat" };
     let response = handler
         .handle(Request::SetOption(SetOptionRequest {
             scope: ScopeSelector::Global,
             option: OptionName::DefaultCommand,
-            value: "printf default-command".to_owned(),
+            value: default_command.to_owned(),
             mode: SetOptionMode::Replace,
         }))
         .await;
@@ -148,7 +152,7 @@ async fn new_session_uses_default_command_when_request_omits_command() {
         .expect("initial pane lifecycle must be recorded");
     assert_eq!(
         lifecycle.command(),
-        Some(["printf default-command".to_owned()].as_slice())
+        Some([default_command.to_owned()].as_slice())
     );
 }
 

@@ -253,6 +253,14 @@ impl ParsedCommand {
         &self.arguments
     }
 
+    /// Returns this command with replacement arguments while preserving its
+    /// source location.
+    #[must_use]
+    pub fn with_arguments(mut self, arguments: Vec<CommandArgument>) -> Self {
+        self.arguments = arguments;
+        self
+    }
+
     /// Returns the one-based input line where this command started.
     #[must_use]
     pub fn line(&self) -> usize {

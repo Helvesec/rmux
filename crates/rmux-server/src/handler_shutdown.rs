@@ -3,11 +3,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use rmux_proto::OptionName;
+use rmux_proto::{OptionName, RmuxError};
+use tokio::sync::watch;
 
 use crate::diagnostic_log::{record_shutdown_queued, record_shutdown_request};
+use crate::server_access::{AccessMode, ServerAccessAdmission};
 
-use super::{DetachedRequesterAccess, PendingShutdownReason, RequestHandler};
+use super::{
+    DetachedRequesterAccess, DetachedRequesterAuthority, PendingShutdownReason, RequestHandler,
+    RequesterOrigin,
+};
 
 const SHUTDOWN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -16,6 +21,49 @@ enum IdleShutdownState {
     StillApplies,
     Stale,
     Unknown,
+}
+
+#[derive(Debug)]
+pub(super) struct NormalRequestAdmission {
+    open: std::sync::atomic::AtomicBool,
+    active: AtomicUsize,
+    active_drain: AtomicUsize,
+    closing: watch::Sender<bool>,
+}
+
+impl NormalRequestAdmission {
+    pub(super) fn new() -> Self {
+        let (closing, _closing_rx) = watch::channel(false);
+        Self {
+            open: std::sync::atomic::AtomicBool::new(true),
+            active: AtomicUsize::new(0),
+            active_drain: AtomicUsize::new(0),
+            closing,
+        }
+    }
+
+    fn try_begin(self: &Arc<Self>, drain: bool) -> Option<NormalRequestGuard> {
+        if !self.open.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.active.fetch_add(1, Ordering::SeqCst);
+        if drain {
+            self.active_drain.fetch_add(1, Ordering::SeqCst);
+        }
+        let guard = NormalRequestGuard {
+            admission: Arc::clone(self),
+            drain,
+        };
+        if self.open.load(Ordering::SeqCst) {
+            Some(guard)
+        } else {
+            // Pair the optimistic pre-check with a post-increment check. This
+            // linearizes admission against `close`: either the request is
+            // counted before close observes the barrier, or it is rejected.
+            drop(guard);
+            None
+        }
+    }
 }
 
 impl PendingShutdownReason {
@@ -29,6 +77,33 @@ impl PendingShutdownReason {
 }
 
 impl RequestHandler {
+    pub(crate) fn try_begin_normal_request(&self, drain: bool) -> Option<NormalRequestGuard> {
+        self.normal_request_admission.try_begin(drain)
+    }
+
+    pub(crate) fn close_normal_request_admission(&self) {
+        self.normal_request_admission
+            .open
+            .store(false, Ordering::SeqCst);
+        self.normal_request_admission.closing.send_replace(true);
+    }
+
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    pub(crate) fn normal_request_shutdown_receiver(&self) -> watch::Receiver<bool> {
+        self.normal_request_admission.closing.subscribe()
+    }
+
+    pub(crate) fn normal_requests_quiesced(&self) -> bool {
+        self.normal_request_admission.active.load(Ordering::SeqCst) == 0
+    }
+
+    pub(crate) fn normal_drain_requests_quiesced(&self) -> bool {
+        self.normal_request_admission
+            .active_drain
+            .load(Ordering::SeqCst)
+            == 0
+    }
+
     pub(crate) fn begin_detached_connection(&self, connection_id: u64) -> DetachedConnectionGuard {
         self.active_detached_connections
             .lock()
@@ -43,21 +118,78 @@ impl RequestHandler {
     pub(crate) fn begin_detached_requester_access(
         &self,
         requester_pid: u32,
-        can_write: bool,
+        admission: ServerAccessAdmission,
+    ) -> DetachedRequesterAccessGuard {
+        self.begin_detached_requester_authority(
+            requester_pid,
+            DetachedRequesterAuthority::Admission(admission),
+        )
+    }
+
+    pub(crate) async fn begin_inherited_detached_requester_access(
+        &self,
+        requester_pid: u32,
+    ) -> DetachedRequesterAccessGuard {
+        let authority = self.requester_detached_authority(requester_pid).await;
+        self.begin_detached_requester_authority(requester_pid, authority)
+    }
+
+    pub(in crate::handler) fn begin_requester_origin_access(
+        &self,
+        origin: &RequesterOrigin,
+    ) -> DetachedRequesterAccessGuard {
+        self.begin_detached_requester_authority(origin.requester_pid, origin.authority.clone())
+    }
+
+    pub(in crate::handler) async fn require_requester_origin_write(
+        &self,
+        origin: &RequesterOrigin,
+    ) -> Result<DetachedRequesterAccessGuard, RmuxError> {
+        let guard = self.begin_requester_origin_access(origin);
+        let can_write = match &origin.authority {
+            DetachedRequesterAuthority::Admission(admission) => self
+                .server_access
+                .lock()
+                .expect("server access mutex must not be poisoned")
+                .revalidate_detached_admission(admission)
+                .is_some_and(AccessMode::can_write),
+            DetachedRequesterAuthority::Denied => false,
+        };
+        if !can_write {
+            return Err(RmuxError::Server("client is read-only".to_owned()));
+        }
+        Ok(guard)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_test_detached_requester_access(
+        &self,
+        requester_pid: u32,
+        mode: AccessMode,
+    ) -> DetachedRequesterAccessGuard {
+        let admission = self
+            .server_access
+            .lock()
+            .expect("server access mutex must not be poisoned")
+            .owner_admission()
+            .with_write_cap(mode.can_write());
+        self.begin_detached_requester_access(requester_pid, admission)
+    }
+
+    fn begin_detached_requester_authority(
+        &self,
+        requester_pid: u32,
+        authority: DetachedRequesterAuthority,
     ) -> DetachedRequesterAccessGuard {
         let mut access = self
             .active_detached_requester_access
             .lock()
             .expect("active detached requester access mutex must not be poisoned");
         let entry = access.entry(requester_pid).or_default();
-        if can_write {
-            entry.write_scopes += 1;
-        } else {
-            entry.read_only_scopes += 1;
-        }
+        entry.scopes.push(authority.clone());
         DetachedRequesterAccessGuard {
             requester_pid,
-            can_write,
+            authority,
             active_detached_requester_access: self.active_detached_requester_access.clone(),
         }
     }
@@ -167,31 +299,65 @@ impl RequestHandler {
     }
 
     fn schedule_shutdown_retry(&self, excluded_connection_id: Option<u64>) {
+        let Some(runtime) = self
+            .server_task_runtime()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+        else {
+            return;
+        };
+        let Ok(registration) = self.reserve_lifecycle_producer_task("rmux-shutdown-retry") else {
+            return;
+        };
+        let Some(handoff) = registration.try_begin_mutation() else {
+            return;
+        };
         if self
             .shutdown_retry_scheduled
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
+            drop(handoff);
             return;
         }
 
-        let Some(runtime) = self
-            .server_task_runtime()
-            .or_else(|| tokio::runtime::Handle::try_current().ok())
-        else {
-            self.shutdown_retry_scheduled.store(false, Ordering::SeqCst);
-            return;
-        };
-
-        let handler = self.clone();
+        let retry_handler = self.downgrade();
+        let cleanup_handler = retry_handler.clone();
         runtime.spawn(async move {
-            tokio::time::sleep(SHUTDOWN_RETRY_DELAY).await;
-            handler
-                .shutdown_retry_scheduled
-                .store(false, Ordering::SeqCst);
-            let _ = handler
-                .request_shutdown_if_pending_excluding_detached_connection(excluded_connection_id);
+            let retry = async move {
+                tokio::time::sleep(SHUTDOWN_RETRY_DELAY).await;
+                let Some(_retry_mutation) =
+                    super::lifecycle_producer_tasks::begin_current_lifecycle_mutation()
+                else {
+                    // Yield back to the registered runner so lane cancellation
+                    // performs the task-owned flag cleanup under its cleanup guard.
+                    std::future::pending::<()>().await;
+                    return;
+                };
+                let Some(handler) = retry_handler.upgrade() else {
+                    return;
+                };
+                handler
+                    .shutdown_retry_scheduled
+                    .store(false, Ordering::SeqCst);
+                let _ = handler.request_shutdown_if_pending_excluding_detached_connection(
+                    excluded_connection_id,
+                );
+            };
+            let cleanup = async move {
+                if let Some(handler) = cleanup_handler.upgrade() {
+                    handler
+                        .shutdown_retry_scheduled
+                        .store(false, Ordering::SeqCst);
+                }
+            };
+            let _ = super::lifecycle_producer_tasks::run_registered_lifecycle_producer_with_cancellation_cleanup(
+                registration,
+                retry,
+                cleanup,
+            )
+            .await;
         });
+        drop(handoff);
     }
 
     pub(in crate::handler) fn queue_shutdown_request(&self, reason: PendingShutdownReason) {
@@ -301,7 +467,7 @@ impl Drop for DetachedConnectionGuard {
 
 pub(crate) struct DetachedRequesterAccessGuard {
     requester_pid: u32,
-    can_write: bool,
+    authority: DetachedRequesterAuthority,
     active_detached_requester_access: Arc<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
 }
 
@@ -314,10 +480,12 @@ impl Drop for DetachedRequesterAccessGuard {
         let Some(entry) = access.get_mut(&self.requester_pid) else {
             return;
         };
-        if self.can_write {
-            entry.write_scopes = entry.write_scopes.saturating_sub(1);
-        } else {
-            entry.read_only_scopes = entry.read_only_scopes.saturating_sub(1);
+        if let Some(position) = entry
+            .scopes
+            .iter()
+            .position(|candidate| candidate == &self.authority)
+        {
+            entry.scopes.swap_remove(position);
         }
         if entry.is_empty() {
             access.remove(&self.requester_pid);
@@ -327,6 +495,21 @@ impl Drop for DetachedRequesterAccessGuard {
 
 pub(crate) struct DetachedRequestGuard {
     active_detached_requests: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+pub(crate) struct NormalRequestGuard {
+    admission: Arc<NormalRequestAdmission>,
+    drain: bool,
+}
+
+impl Drop for NormalRequestGuard {
+    fn drop(&mut self) {
+        if self.drain {
+            self.admission.active_drain.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.admission.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Drop for DetachedRequestGuard {
@@ -349,6 +532,42 @@ impl Drop for AttachForwarderGuard {
 mod tests {
     use super::*;
     use crate::daemon::ShutdownHandle;
+
+    #[test]
+    fn normal_request_close_linearizes_against_drain_admission() {
+        let handler = RequestHandler::new();
+        let admitted = handler
+            .try_begin_normal_request(true)
+            .expect("request is admitted before quiesce");
+
+        handler.close_normal_request_admission();
+
+        assert!(!handler.normal_requests_quiesced());
+        assert!(!handler.normal_drain_requests_quiesced());
+        assert!(
+            handler.try_begin_normal_request(true).is_none(),
+            "requests after the close linearization point are rejected"
+        );
+
+        drop(admitted);
+        assert!(handler.normal_requests_quiesced());
+        assert!(handler.normal_drain_requests_quiesced());
+    }
+
+    #[test]
+    fn cancel_safe_requests_do_not_hold_the_drain_barrier() {
+        let handler = RequestHandler::new();
+        let admitted = handler
+            .try_begin_normal_request(false)
+            .expect("cancel-safe request is admitted before quiesce");
+        handler.close_normal_request_admission();
+
+        assert!(!handler.normal_requests_quiesced());
+        assert!(handler.normal_drain_requests_quiesced());
+
+        drop(admitted);
+        assert!(handler.normal_requests_quiesced());
+    }
 
     #[tokio::test]
     async fn idle_shutdown_retry_preserves_excluded_detached_connection() {
@@ -415,5 +634,34 @@ mod tests {
             .await
             .expect("retry should request shutdown after the attach forwarder drains")
             .expect("shutdown receiver should complete cleanly");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_close_cancels_pending_shutdown_retry_and_cleans_its_flag() {
+        let handler = RequestHandler::new();
+        let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
+        handler.install_shutdown_handle(shutdown_handle);
+        let state = handler.state.lock().await;
+
+        handler.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
+        assert!(
+            !handler.request_shutdown_if_pending(),
+            "the held state lock forces the retry path"
+        );
+        assert!(handler.shutdown_retry_scheduled.load(Ordering::SeqCst));
+
+        handler.close_normal_and_drain_lifecycle_producers().await;
+        assert!(
+            !handler.shutdown_retry_scheduled.load(Ordering::SeqCst),
+            "cancellation cleanup owns the scheduled flag"
+        );
+        drop(state);
+
+        assert!(
+            tokio::time::timeout(SHUTDOWN_RETRY_DELAY * 2, shutdown_rx)
+                .await
+                .is_err(),
+            "a cancelled retry cannot request shutdown after the lane is sealed"
+        );
     }
 }

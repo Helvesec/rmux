@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
 use rmux_core::{
     command_parser::{CommandArgument, ParsedCommand},
@@ -15,8 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::hook_runtime::{
-    hooks_disabled, queue_inline_hook, with_hook_execution, ExactPaneHookTarget, PendingInlineHook,
-    PendingInlineHookFormat,
+    hooks_disabled, lifecycle_hooks_disabled, queue_inline_hook, with_hook_execution,
+    ExactPaneHookTarget, HookExecutionContext, PendingInlineHook, PendingInlineHookFormat,
 };
 
 use super::{
@@ -26,6 +28,13 @@ use super::{
 
 #[path = "handler_lifecycle/ordered_wait.rs"]
 mod ordered_wait;
+#[path = "handler_lifecycle/retained_target.rs"]
+mod retained_target;
+
+pub(crate) use retained_target::RetainedLifecycleTargetRegistry;
+pub(in crate::handler) use retained_target::{LeaseResolution, LifecycleTargetLease};
+
+const LIFECYCLE_DISPATCH_ADMISSION_WAIT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueuedLifecycleEvent {
@@ -36,6 +45,11 @@ pub(crate) struct QueuedLifecycleEvent {
     pub(in crate::handler) formats: Vec<(String, String)>,
     pub(in crate::handler) current_target: Option<Target>,
     stable_current_target_identity: Option<StableLifecycleTargetIdentity>,
+    retained_current_target: Option<Arc<LifecycleTargetLease>>,
+    control_effects_dispatched: bool,
+    commit_order: Option<crate::lifecycle_commit_order::LifecycleCommitTicket>,
+    _unordered_publication: Option<crate::lifecycle_commit_order::LifecyclePublicationGuard>,
+    publication_discarded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +88,7 @@ enum StableWindowLoss {
 enum HookDispatchCurrentTarget {
     Dynamic(Option<Target>),
     Stable(StableLifecycleTargetIdentity),
+    Retainable(Arc<LifecycleTargetLease>),
     ExactPane(ExactPaneHookTarget),
     ExactSession(SessionId),
     MissingStable,
@@ -495,7 +510,29 @@ pub(crate) struct DeferredLifecycleEvent {
     dispatch_identity: Option<HookScopeIdentity>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::handler) struct UnsequencedLifecycleEvent {
+    queued: QueuedLifecycleEvent,
+    ordered: bool,
+}
+
 impl RequestHandler {
+    pub(crate) async fn close_and_wait_for_lifecycle_publications(&self) {
+        let pending = {
+            let state = self.state.lock().await;
+            state.close_lifecycle_commit_order()
+        };
+        pending.wait_until_idle().await;
+    }
+
+    pub(crate) async fn seal_and_wait_for_lifecycle_publications(&self) {
+        let pending = {
+            let state = self.state.lock().await;
+            state.seal_lifecycle_publications()
+        };
+        pending.wait_until_idle().await;
+    }
+
     #[cfg(test)]
     pub(crate) fn subscribe_lifecycle_events(&self) -> broadcast::Receiver<QueuedLifecycleEvent> {
         self.hook_events.subscribe()
@@ -505,6 +542,10 @@ impl RequestHandler {
         &self,
     ) -> Option<mpsc::Receiver<LifecycleDispatchItem>> {
         self.lifecycle_dispatch.activate()
+    }
+
+    pub(crate) fn deactivate_lifecycle_dispatch_for_shutdown(&self) {
+        self.lifecycle_dispatch.deactivate();
     }
 
     pub(crate) async fn consume_lifecycle_hooks(
@@ -539,22 +580,33 @@ impl RequestHandler {
             self.refresh_automatic_window_name_for_pane_target(target)
                 .await;
         }
-        if hooks_disabled() {
-            self.refresh_control_sessions_for_event(&event).await;
-            return;
-        }
         let queued = {
             let mut state = self.state.lock().await;
             prepare_lifecycle_event(&mut state, &event)
         };
         self.emit_prepared(queued).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn emit_lifecycle_event_for_test(&self, event: LifecycleEvent) {
+        self.emit(event).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn prepare_lifecycle_event_for_test(
+        &self,
+        event: LifecycleEvent,
+    ) -> QueuedLifecycleEvent {
+        let mut state = self.state.lock().await;
+        prepare_lifecycle_event(&mut state, &event)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn emit_prepared_lifecycle_event_for_test(&self, event: QueuedLifecycleEvent) {
+        self.emit_prepared(event).await;
     }
 
     pub(in crate::handler) async fn emit_without_attached_refresh(&self, event: LifecycleEvent) {
-        if hooks_disabled() {
-            self.refresh_control_sessions_for_event(&event).await;
-            return;
-        }
         let queued = {
             let mut state = self.state.lock().await;
             prepare_lifecycle_event(&mut state, &event)
@@ -562,11 +614,41 @@ impl RequestHandler {
         self.emit_prepared(queued).await;
     }
 
-    pub(in crate::handler) async fn emit_prepared(&self, event: QueuedLifecycleEvent) {
-        if hooks_disabled() {
-            self.refresh_control_sessions_for_event(&event.event).await;
+    pub(in crate::handler) fn emit_prepared(
+        &self,
+        event: QueuedLifecycleEvent,
+    ) -> impl Future<Output = ()> + Send {
+        super::post_commit_sequencer::release_current_post_commit_turn();
+        let handler = self.clone();
+        let hook_execution = crate::hook_runtime::current_hook_execution();
+        let hook_formats = crate::hook_runtime::current_hook_formats();
+        let publication = tokio::spawn(async move {
+            crate::hook_runtime::with_optional_hook_execution(
+                hook_execution,
+                hook_formats,
+                handler.emit_prepared_inner(event),
+            )
+            .await;
+        });
+        async move {
+            if let Err(error) = publication.await {
+                warn!("durable lifecycle publication task failed: {error}");
+            }
+        }
+    }
+
+    async fn emit_prepared_inner(&self, mut event: QueuedLifecycleEvent) {
+        if event.publication_discarded {
             return;
         }
+        let Some(ticket) = event.commit_order.as_ref() else {
+            self.dispatch_lifecycle_control_effects_once(&mut event)
+                .await;
+            return;
+        };
+        let _commit_turn = ticket.wait_for_turn().await;
+        self.dispatch_lifecycle_control_effects_once(&mut event)
+            .await;
         let _ = self.hook_events.send(event.clone());
         let item = LifecycleDispatchItem {
             event,
@@ -577,23 +659,58 @@ impl RequestHandler {
         }
     }
 
-    pub(in crate::handler) async fn emit_prepared_and_wait(&self, event: QueuedLifecycleEvent) {
-        if hooks_disabled() {
-            self.refresh_control_sessions_for_event(&event.event).await;
+    pub(in crate::handler) fn emit_prepared_and_wait(
+        &self,
+        event: QueuedLifecycleEvent,
+    ) -> impl Future<Output = ()> + Send {
+        super::post_commit_sequencer::release_current_post_commit_turn();
+        let handler = self.clone();
+        let hook_execution = crate::hook_runtime::current_hook_execution();
+        let hook_formats = crate::hook_runtime::current_hook_formats();
+        let publication = tokio::spawn(async move {
+            crate::hook_runtime::with_optional_hook_execution(
+                hook_execution,
+                hook_formats,
+                handler.emit_prepared_and_wait_inner(event),
+            )
+            .await;
+        });
+        async move {
+            if let Err(error) = publication.await {
+                warn!("durable ordered lifecycle publication task failed: {error}");
+            }
+        }
+    }
+
+    async fn emit_prepared_and_wait_inner(&self, mut event: QueuedLifecycleEvent) {
+        if event.publication_discarded {
             return;
         }
+        let Some(ticket) = event.commit_order.as_ref() else {
+            self.dispatch_lifecycle_control_effects_once(&mut event)
+                .await;
+            return;
+        };
+        let commit_turn = ticket.wait_for_turn().await;
+        self.dispatch_lifecycle_control_effects_once(&mut event)
+            .await;
         let _ = self.hook_events.send(event.clone());
         let (completion_tx, completion_rx) = oneshot::channel();
         let item = LifecycleDispatchItem {
             event,
             completion: Some(completion_tx),
         };
-        ordered_wait::dispatch_without_unbounded_caller_wait(
-            self.lifecycle_dispatch.clone(),
-            item,
-            completion_rx,
-        )
-        .await;
+        let admitted = match self.lifecycle_dispatch.send_if_active(item).await {
+            Ok(admitted) => admitted,
+            Err(_) => {
+                warn!("lifecycle dispatch queue closed before ordered hook completed");
+                false
+            }
+        };
+        drop(commit_turn);
+        if admitted {
+            ordered_wait::wait_without_unbounded_caller_delay(completion_rx).await;
+        }
     }
 
     async fn dispatch_lifecycle_item(&self, item: LifecycleDispatchItem) {
@@ -663,11 +780,6 @@ impl RequestHandler {
                 );
                 return;
             };
-            if hooks_disabled() {
-                drop(state);
-                self.refresh_control_sessions_for_event(&event).await;
-                return;
-            }
             let mut queued = prepare_lifecycle_event(&mut state, &event);
             queued.control_session_identity = Some(session_id);
             queued
@@ -675,13 +787,31 @@ impl RequestHandler {
         self.emit_prepared(prepared).await;
     }
 
-    pub(in crate::handler) async fn dispatch_lifecycle_hook(&self, event: QueuedLifecycleEvent) {
-        self.dispatch_lifecycle_control_effects(&event).await;
+    pub(in crate::handler) async fn dispatch_lifecycle_hook(
+        &self,
+        mut event: QueuedLifecycleEvent,
+    ) {
+        self.dispatch_lifecycle_control_effects_once(&mut event)
+            .await;
 
         if event.hooks.is_empty() {
             return;
         }
-        let current_target = if let Some(identity) = event.stable_current_target_identity.clone() {
+        let current_target = if let Some(lease) = event.retained_current_target.clone() {
+            let state = self.state.lock().await;
+            match lease.resolve(&state) {
+                LeaseResolution::Live(_) | LeaseResolution::Retired(_) => {
+                    HookDispatchCurrentTarget::Retainable(lease)
+                }
+                LeaseResolution::Replaced => {
+                    warn!(
+                        hook = ?event.hook_name,
+                        "skipping lifecycle hook dispatch because its retained target was replaced"
+                    );
+                    return;
+                }
+            }
+        } else if let Some(identity) = event.stable_current_target_identity.clone() {
             if self.stable_hook_command_target(&identity).await.is_some() {
                 HookDispatchCurrentTarget::Stable(identity)
             } else if lifecycle_event_allows_missing_stable_target(&event.event, &identity) {
@@ -702,7 +832,7 @@ impl RequestHandler {
             event.hooks,
             current_target,
             event.formats,
-            event.hook_name,
+            HookExecutionContext::lifecycle(event.hook_name),
             "lifecycle",
         )
         .await;
@@ -711,6 +841,14 @@ impl RequestHandler {
     async fn dispatch_lifecycle_control_effects(&self, event: &QueuedLifecycleEvent) {
         self.dispatch_control_notifications(event).await;
         self.refresh_control_sessions_for_event(&event.event).await;
+    }
+
+    async fn dispatch_lifecycle_control_effects_once(&self, event: &mut QueuedLifecycleEvent) {
+        if event.control_effects_dispatched {
+            return;
+        }
+        self.dispatch_lifecycle_control_effects(event).await;
+        event.control_effects_dispatched = true;
     }
 
     pub(in crate::handler) fn queue_inline_hook(
@@ -911,6 +1049,39 @@ impl RequestHandler {
         .await;
     }
 
+    pub(in crate::handler) async fn run_command_success_hook_for_parsed_command(
+        &self,
+        requester_pid: u32,
+        hook: HookName,
+        command: &ParsedCommand,
+        current_target: Option<Target>,
+        attached_session: Option<&rmux_proto::SessionName>,
+    ) {
+        if hooks_disabled() {
+            return;
+        }
+
+        let current_target = if current_target.is_some() {
+            current_target
+        } else {
+            let state = self.state.lock().await;
+            fallback_current_target(&state, attached_session)
+        };
+        let scope = current_target
+            .as_ref()
+            .map(target_to_scope)
+            .unwrap_or(ScopeSelector::Global);
+        self.run_built_in_hook_dispatch(
+            requester_pid,
+            hook,
+            scope,
+            current_target,
+            after_hook_format_values(hook, Some(command)),
+            "after",
+        )
+        .await;
+    }
+
     async fn run_built_in_hook_dispatch(
         &self,
         requester_pid: u32,
@@ -977,7 +1148,7 @@ impl RequestHandler {
             hooks,
             current_target,
             formats,
-            hook_name,
+            HookExecutionContext::command(hook_name),
             source,
         )
         .await;
@@ -989,11 +1160,12 @@ impl RequestHandler {
         hooks: Vec<HookDispatch>,
         current_target: HookDispatchCurrentTarget,
         formats: Vec<(String, String)>,
-        hook_name: HookName,
+        execution: HookExecutionContext,
         source: &'static str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            with_hook_execution(formats, async {
+            let hook_name = execution.hook();
+            with_hook_execution(execution, formats, async {
                 for hook in hooks {
                     let command_current_target = match &current_target {
                         HookDispatchCurrentTarget::Stable(identity) => {
@@ -1007,6 +1179,20 @@ impl RequestHandler {
                                 break;
                             };
                             Some(target)
+                        }
+                        HookDispatchCurrentTarget::Retainable(lease) => {
+                            let state = self.state.lock().await;
+                            match lease.resolve(&state) {
+                                LeaseResolution::Live(_) | LeaseResolution::Retired(_) => None,
+                                LeaseResolution::Replaced => {
+                                    warn!(
+                                        hook = ?hook_name,
+                                        source,
+                                        "stopping lifecycle hook dispatch because its retained target was replaced"
+                                    );
+                                    break;
+                                }
+                            }
                         }
                         HookDispatchCurrentTarget::ExactPane(identity) => {
                             let state = self.state.lock().await;
@@ -1040,11 +1226,16 @@ impl RequestHandler {
                         }
                         HookDispatchCurrentTarget::MissingStable => None,
                     };
+                    let retained_lease = match &current_target {
+                        HookDispatchCurrentTarget::Retainable(lease) => Some(Arc::clone(lease)),
+                        _ => None,
+                    };
                     if let Err(error) = self
-                        .execute_hook_command_with_context(
+                        .execute_hook_command_with_target_binding(
                             requester_pid,
                             hook.command(),
                             command_current_target,
+                            retained_lease,
                         )
                         .await
                     {
@@ -1161,7 +1352,21 @@ pub(in crate::handler) fn prepare_lifecycle_event(
     state: &mut crate::pane_terminals::HandlerState,
     event: &LifecycleEvent,
 ) -> QueuedLifecycleEvent {
+    let event = prepare_unsequenced_lifecycle_event(state, event);
+    sequence_prepared_lifecycle_event(state, event)
+}
+
+pub(in crate::handler) fn prepare_unsequenced_lifecycle_event(
+    state: &mut crate::pane_terminals::HandlerState,
+    event: &LifecycleEvent,
+) -> UnsequencedLifecycleEvent {
     let deferred = defer_lifecycle_event(state, event);
+    if lifecycle_hooks_disabled() {
+        return UnsequencedLifecycleEvent {
+            queued: deferred.queued,
+            ordered: false,
+        };
+    }
     let hooks = match &deferred.dispatch_identity {
         Some(identity) => state.hooks.dispatch_with_identity_or_scope(
             identity,
@@ -1172,16 +1377,29 @@ pub(in crate::handler) fn prepare_lifecycle_event(
             .hooks
             .dispatch(&deferred.dispatch_scope, deferred.queued.hook_name),
     };
-    deferred.with_hooks(hooks)
+    UnsequencedLifecycleEvent {
+        queued: deferred.with_hooks(hooks),
+        ordered: true,
+    }
+}
+
+pub(in crate::handler) fn sequence_prepared_lifecycle_event(
+    state: &mut crate::pane_terminals::HandlerState,
+    mut event: UnsequencedLifecycleEvent,
+) -> QueuedLifecycleEvent {
+    if event.ordered {
+        if let Some(commit_order) = state.reserve_lifecycle_commit_order() {
+            event.queued.commit_order = Some(commit_order);
+            return event.queued;
+        }
+    }
+    track_unordered_lifecycle_publication(state, event.queued)
 }
 
 pub(in crate::handler) fn prepare_lifecycle_event_if_enabled(
     state: &mut crate::pane_terminals::HandlerState,
     event: &LifecycleEvent,
 ) -> Option<QueuedLifecycleEvent> {
-    if hooks_disabled() {
-        return None;
-    }
     Some(prepare_lifecycle_event(state, event))
 }
 
@@ -1203,6 +1421,11 @@ pub(in crate::handler) fn defer_lifecycle_event(
             formats: lifecycle_hook_formats(state, event),
             current_target,
             stable_current_target_identity,
+            retained_current_target: retained_target::capture_for_event(state, event),
+            control_effects_dispatched: false,
+            commit_order: None,
+            _unordered_publication: None,
+            publication_discarded: false,
         },
         dispatch_scope,
         dispatch_identity,
@@ -1215,9 +1438,12 @@ pub(in crate::handler) fn prepare_deferred_lifecycle_event(
     mut deferred: DeferredLifecycleEvent,
 ) -> QueuedLifecycleEvent {
     deferred.refresh_window_unlinked_current_target(state);
-    if hooks_disabled() {
-        return deferred.queued;
+    if lifecycle_hooks_disabled() {
+        return track_unordered_lifecycle_publication(state, deferred.queued);
     }
+    let Some(commit_order) = state.reserve_lifecycle_commit_order() else {
+        return track_unordered_lifecycle_publication(state, deferred.queued);
+    };
     let hooks = match &deferred.dispatch_identity {
         Some(identity) => state.hooks.dispatch_deferred_with_identity_or_scope(
             hook_snapshot,
@@ -1231,7 +1457,20 @@ pub(in crate::handler) fn prepare_deferred_lifecycle_event(
             deferred.queued.hook_name,
         ),
     };
-    deferred.with_hooks(hooks)
+    let mut queued = deferred.with_hooks(hooks);
+    queued.commit_order = Some(commit_order);
+    queued
+}
+
+fn track_unordered_lifecycle_publication(
+    state: &crate::pane_terminals::HandlerState,
+    mut queued: QueuedLifecycleEvent,
+) -> QueuedLifecycleEvent {
+    match state.track_unordered_lifecycle_publication() {
+        Some(publication) => queued._unordered_publication = Some(publication),
+        None => queued.publication_discarded = true,
+    }
+    queued
 }
 
 impl DeferredLifecycleEvent {
@@ -1446,6 +1685,21 @@ fn lifecycle_hook_formats(
             if let Some(pane_id) = event.pane_id() {
                 formats.push(("hook_pane".to_owned(), format!("%{pane_id}")));
             }
+        }
+    }
+    if let LifecycleEvent::PaneModeChanged { target } = event {
+        if let Ok(transcript) = state.transcript_handle(target) {
+            let transcript = transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned");
+            formats.push((
+                "pane_in_mode".to_owned(),
+                u8::from(transcript.pane_in_mode()).to_string(),
+            ));
+            formats.push((
+                "pane_mode".to_owned(),
+                transcript.pane_mode_name().unwrap_or_default().to_owned(),
+            ));
         }
     }
     if matches!(
@@ -1691,6 +1945,59 @@ mod tests {
 
     fn session_name(value: &str) -> rmux_proto::SessionName {
         rmux_proto::SessionName::new(value).expect("valid session name")
+    }
+
+    #[tokio::test]
+    async fn prepared_lifecycle_events_publish_in_commit_order_not_waiter_order() {
+        let handler = std::sync::Arc::new(RequestHandler::new());
+        let first_name = session_name("commit-order-first");
+        let second_name = session_name("commit-order-second");
+        let (first, second) = {
+            let mut state = handler.state.lock().await;
+            (
+                prepare_lifecycle_event(
+                    &mut state,
+                    &LifecycleEvent::SessionCreated {
+                        session_name: first_name.clone(),
+                    },
+                ),
+                prepare_lifecycle_event(
+                    &mut state,
+                    &LifecycleEvent::SessionCreated {
+                        session_name: second_name.clone(),
+                    },
+                ),
+            )
+        };
+        let mut observed = handler.subscribe_lifecycle_events();
+
+        let second_handler = std::sync::Arc::clone(&handler);
+        let second_task = tokio::spawn(async move {
+            second_handler.emit_prepared(second).await;
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), observed.recv(),)
+                .await
+                .is_err(),
+            "a later commit must not publish while its predecessor is paused"
+        );
+
+        let first_handler = std::sync::Arc::clone(&handler);
+        let first_task = tokio::spawn(async move {
+            first_handler.emit_prepared(first).await;
+        });
+        let first_observed = observed.recv().await.expect("first committed event");
+        let second_observed = observed.recv().await.expect("second committed event");
+        assert!(matches!(
+            first_observed.event,
+            LifecycleEvent::SessionCreated { session_name } if session_name == first_name
+        ));
+        assert!(matches!(
+            second_observed.event,
+            LifecycleEvent::SessionCreated { session_name } if session_name == second_name
+        ));
+        first_task.await.expect("first publisher");
+        second_task.await.expect("second publisher");
     }
 
     #[tokio::test]

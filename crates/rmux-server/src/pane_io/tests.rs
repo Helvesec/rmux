@@ -2590,6 +2590,195 @@ async fn forward_attach_exited_control_wins_over_closing_shutdown() {
 }
 
 #[tokio::test]
+async fn admitted_attach_input_batch_drains_after_shutdown_admission_closes() {
+    let handler = Arc::new(RequestHandler::new());
+    let pane_target =
+        create_attach_input_test_session(&handler, "attach-admitted-shutdown-drain").await;
+    let session_name = pane_target.session_name().clone();
+    let attach_pid = 912_051;
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    let live_input =
+        LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
+    let live_input_identity = live_input.identity;
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let attach_task = tokio::spawn(forward_attach(
+        stream,
+        test_attach_target(&session_name, b"BASE-ADMITTED", None),
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+        false,
+    ));
+    let _ = read_attach_data_until(&mut peer, b"BASE-ADMITTED").await;
+    let pause = install_live_attach_input_validation_pause(live_input_identity);
+
+    peer.write_all(
+        &encode_attach_message(&AttachMessage::Data(b"ADMITTED-BEFORE-CLOSE".to_vec()))
+            .expect("encode attach input"),
+    )
+    .await
+    .expect("write admitted attach input");
+    tokio::time::timeout(Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("attach input reaches the post-admission pause");
+    assert!(
+        handler
+            .attached_input_capture_for_test(&pane_target)
+            .await
+            .expect("input capture remains installed")
+            .is_empty(),
+        "the deterministic pause must precede the first attach mutation"
+    );
+
+    handler.close_normal_request_admission();
+    assert!(
+        !handler.normal_drain_requests_quiesced(),
+        "the admitted attach mutation must remain counted while paused"
+    );
+    shutdown_tx.send_replace(());
+    pause.release.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("admitted attach batch drains before shutdown")
+        .expect("attach task join")
+        .expect("attach exits cleanly");
+    assert_eq!(
+        handler
+            .attached_input_capture_for_test(&pane_target)
+            .await
+            .expect("input capture remains installed"),
+        b"ADMITTED-BEFORE-CLOSE",
+        "a batch admitted before the shutdown barrier must drain to completion"
+    );
+    assert!(
+        handler.normal_drain_requests_quiesced(),
+        "the attach Drain admission must release after the batch completes"
+    );
+}
+
+#[tokio::test]
+async fn attach_input_ready_after_shutdown_admission_closes_is_rejected() {
+    let handler = Arc::new(RequestHandler::new());
+    let pane_target =
+        create_attach_input_test_session(&handler, "attach-rejected-after-shutdown").await;
+    let session_name = pane_target.session_name().clone();
+    let attach_pid = 912_052;
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    let live_input =
+        LiveAttachInputContext::current_for_test(Arc::clone(&handler), attach_pid).await;
+    let (stream, _peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    handler.close_normal_request_admission();
+
+    let initial_socket_bytes =
+        encode_attach_message(&AttachMessage::Data(b"REJECTED-AFTER-CLOSE".to_vec()))
+            .expect("encode buffered attach input");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        forward_attach(
+            stream,
+            test_attach_target(&session_name, b"BASE-REJECTED", None),
+            initial_socket_bytes,
+            shutdown_rx,
+            control_rx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            live_input,
+            false,
+        ),
+    )
+    .await
+    .expect("admission-closed attach exits promptly")
+    .expect("attach exits cleanly");
+
+    assert!(
+        handler
+            .attached_input_capture_for_test(&pane_target)
+            .await
+            .expect("input capture remains installed")
+            .is_empty(),
+        "buffered socket input must not begin after shutdown admission closes"
+    );
+}
+
+#[tokio::test]
+async fn closing_shutdown_discards_mutating_controls_but_finishes_terminal_exit() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name =
+        SessionName::new("attach-closing-shutdown-barrier").expect("valid session name");
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+
+    let attach_task = tokio::spawn(forward_attach(
+        stream,
+        test_attach_target(&session_name, b"BASE-CLOSING", None),
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::clone(&closing),
+        Arc::new(AtomicU64::new(0)),
+        LiveAttachInputContext::unregistered_for_test(Arc::clone(&handler), 912_053),
+        false,
+    ));
+    let _ = read_attach_data_until(&mut peer, b"BASE-CLOSING").await;
+
+    closing.store(true, Ordering::SeqCst);
+    handler.close_normal_request_admission();
+    control_tx
+        .send(AttachControl::Suspend)
+        .expect("queue mutating attach control");
+    control_tx
+        .send(AttachControl::Exited)
+        .expect("queue terminal attach control");
+
+    tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("closing attach finishes terminal transport state")
+        .expect("attach task join")
+        .expect("attach exits cleanly");
+
+    let mut wire = Vec::new();
+    peer.read_to_end(&mut wire)
+        .await
+        .expect("read completed attach transport");
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&wire);
+    let mut messages = Vec::new();
+    while let Some(message) = decoder.next_message().expect("decode attach frame") {
+        messages.push(message);
+    }
+    assert!(
+        !messages.contains(&AttachMessage::Suspend),
+        "shutdown must discard a queued mutating attach control"
+    );
+    assert!(
+        messages.iter().any(|message| match message {
+            AttachMessage::Data(bytes) | AttachMessage::Render(bytes) => bytes
+                .windows(b"[exited]\r\n".len())
+                .any(|window| window == b"[exited]\r\n"),
+            _ => false,
+        }),
+        "the non-mutating terminal control must still finish the exit banner"
+    );
+}
+
+#[tokio::test]
 async fn last_session_exit_waits_for_attach_wire_drain_before_daemon_shutdown() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = SessionName::new("attach-drain").expect("valid session name");

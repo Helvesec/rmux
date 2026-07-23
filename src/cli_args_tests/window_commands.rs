@@ -59,8 +59,64 @@ fn new_window_accepts_kill_and_select_existing_flags() {
             assert!(args.select_existing);
             assert_eq!(args.name.as_deref(), Some("logs"));
             assert!(args.command.is_empty());
+            assert!(args.queue_command.starts_with("new-window "));
+            assert!(args.queue_command.contains("-k"));
         }
         _ => panic!("expected NewWindow command"),
+    }
+}
+
+#[test]
+fn new_window_k_queue_command_round_trips_literal_metacharacters() {
+    let cli = parse_args(&[
+        "new-window",
+        "-dkP",
+        "-F",
+        "#{window_index}:#{window_name}",
+        "-t",
+        "alpha:5",
+        "-n",
+        "replacement ; literal",
+        "-e",
+        "RMUX_TEST=value ; literal",
+        "--",
+        "sh",
+        "-c",
+        "printf '%s' \"$1\"",
+        "sh",
+        "argument ; literal",
+    ])
+    .unwrap();
+
+    let super::super::Command::NewWindow(args) = cli.command.expect("new-window command parses")
+    else {
+        panic!("expected NewWindow command");
+    };
+    let parsed = rmux_core::command_parser::CommandParser::new()
+        .parse(&args.queue_command)
+        .expect("canonical new-window command reparses");
+    let [command] = parsed.commands() else {
+        panic!(
+            "literal separators must remain inside one new-window command: {:?}",
+            parsed.commands()
+        );
+    };
+    assert_eq!(command.name(), "new-window");
+    let arguments = command
+        .arguments()
+        .iter()
+        .filter_map(rmux_core::command_parser::CommandArgument::as_string)
+        .collect::<Vec<_>>();
+    for literal in [
+        "replacement ; literal",
+        "RMUX_TEST=value ; literal",
+        "printf '%s' \"$1\"",
+        "argument ; literal",
+    ] {
+        assert!(
+            arguments.contains(&literal),
+            "missing literal {literal:?} in {arguments:?}"
+        );
     }
 }
 

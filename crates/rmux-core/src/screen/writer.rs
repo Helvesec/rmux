@@ -613,6 +613,15 @@ impl ScreenWriter for Screen {
             InputEndType::Bel => sequence.push(b'\x07'),
             InputEndType::St => sequence.extend_from_slice(b"\x1b\\"),
         }
+        if let Some((selection, payload)) = data.split_once(';') {
+            if payload == "?" {
+                self.push_terminal_passthrough(TerminalPassthrough::clipboard_query(
+                    crate::TerminalClipboardQuery::new(selection, end),
+                    sequence,
+                ));
+                return;
+            }
+        }
         self.push_terminal_passthrough(TerminalPassthrough::clipboard(sequence));
     }
     fn osc_reset_palette(&mut self, _data: &str) {}

@@ -7,6 +7,9 @@ use crate::pane_terminals::HandlerState;
 use crate::renderer::{render_menu_overlay, MenuRenderItem, MenuRenderSpec, OverlayRect};
 
 use super::super::prompt_support::PromptInputEvent;
+use super::super::scripting_support::QueueExecutionContext;
+use super::super::RequesterOrigin;
+use super::identity::OverlayIdentity;
 
 pub(super) const MENU_STAYOPEN: u8 = 0x01;
 pub(super) const MENU_NOMOUSE: u8 = 0x02;
@@ -15,7 +18,9 @@ pub(super) const MENU_TAB: u8 = 0x04;
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct MenuOverlayState {
     pub(in crate::handler) id: u64,
-    pub(in crate::handler) requester_pid: u32,
+    pub(in crate::handler) identity: OverlayIdentity,
+    pub(in crate::handler) origin: RequesterOrigin,
+    pub(in crate::handler) command_context: QueueExecutionContext,
     pub(in crate::handler) current_target: Target,
     pub(in crate::handler) rect: OverlayRect,
     pub(in crate::handler) title: String,

@@ -94,8 +94,8 @@ repository metadata. Direct archives and packages are published with SHA256
 checksums. APT and RPM repositories are signed. Homebrew, Scoop, WinGet, and
 Chocolatey metadata pin the published release assets and their checksums.
 
-For RMUX 0.9.0, release artifact smokes run against the final packaged
-artifacts rather than the debug tree. Unix archives are verified by
+For the RMUX 0.9 release line, release artifact smokes run against the final
+packaged artifacts rather than the debug tree. Unix archives are verified by
 `scripts/verify-package.sh` and `scripts/smoke-installed-rmux.sh`; Debian and
 RPM packages are verified by `scripts/verify-debian-package.sh` and
 `scripts/verify-rpm-package.sh`; Windows archives are verified by
@@ -103,8 +103,9 @@ RPM packages are verified by `scripts/verify-debian-package.sh` and
 smoke switches in release CI. Package verification rejects hidden source-tree
 tooling and temporary/socket leftovers inside direct archives.
 
-RMUX 0.9.0 does not publish a standalone SBOM. The release record for this line
-is the tagged source tree, `Cargo.lock`, package-manager metadata, SHA256SUMS,
+The RMUX 0.9 release line does not publish a standalone SBOM. The release
+record for this line is the tagged source tree, `Cargo.lock`, package-manager
+metadata, SHA256SUMS,
 Sigstore bundle, and GitHub build attestations. Revisit standalone SBOM
 generation before distributing into environments that require SPDX or CycloneDX
 artifacts.

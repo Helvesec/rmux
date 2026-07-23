@@ -84,6 +84,20 @@ Common clipboard commands:
 - Linux Wayland: `wl-copy`
 - Linux X11: `xclip -selection clipboard`
 
+`set-clipboard` defaults to `external`, matching tmux. That mode allows
+RMUX-initiated copies, such as `set-buffer -w`, to reach the outer terminal,
+but deliberately ignores OSC 52 clipboard writes emitted by programs running
+inside panes. To let trusted pane applications update the clipboard, opt in
+explicitly:
+
+```tmux
+set -s set-clipboard on
+```
+
+The attached terminal (including a terminal reached over SSH) must also support
+OSC 52. Enabling `on` lets pane output replace the outer clipboard, so keep the
+safer `external` default when that trust is not appropriate.
+
 One practical flow is:
 
 1. `prefix + [` to enter copy-mode

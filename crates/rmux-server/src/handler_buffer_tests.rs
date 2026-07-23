@@ -2,6 +2,7 @@ use super::buffer_support::{install_paste_buffer_identity_pause, OrderedPasteBuf
 use super::RequestHandler;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
+use rmux_core::LifecycleEvent;
 use rmux_proto::{
     DeleteBufferRequest, ErrorResponse, ListBuffersRequest, LoadBufferRequest, NewSessionRequest,
     OptionName, PaneTarget, PasteBufferRequest, Request, RespawnPaneRequest, Response, RmuxError,
@@ -11,6 +12,7 @@ use rmux_proto::{
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Barrier;
 
 fn session_name(value: &str) -> rmux_proto::SessionName {
     rmux_proto::SessionName::new(value).expect("valid session name")
@@ -133,6 +135,64 @@ async fn set_buffer_creates_named_buffer() {
         Response::SetBuffer(r) => assert_eq!(r.buffer_name, "my-buf"),
         other => panic!("unexpected response: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn concurrent_named_buffer_appends_preserve_both_writes() {
+    let handler = Arc::new(RequestHandler::new());
+    let response = handler
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            Some("append-race"),
+            b"base",
+        ))))
+        .await;
+    assert!(matches!(response, Response::SetBuffer(_)));
+
+    let state_guard = handler.state.lock().await;
+    let start = Arc::new(Barrier::new(3));
+    let spawn_append = |requester_pid: u32, connection_id: u64, suffix: &'static [u8]| {
+        let handler = Arc::clone(&handler);
+        let start = Arc::clone(&start);
+        tokio::spawn(async move {
+            let mut request = set_buffer_request(Some("append-race"), suffix);
+            request.append = true;
+            start.wait().await;
+            handler
+                .dispatch_for_connection(
+                    requester_pid,
+                    connection_id,
+                    Request::SetBuffer(Box::new(request)),
+                )
+                .await
+                .response
+        })
+    };
+    let first = spawn_append(10_001, 20_001, b"-first");
+    let second = spawn_append(10_002, 20_002, b"-second");
+    start.wait().await;
+    tokio::task::yield_now().await;
+    drop(state_guard);
+
+    let first_response = first.await.expect("first append task joins");
+    let second_response = second.await.expect("second append task joins");
+    assert!(matches!(first_response, Response::SetBuffer(_)));
+    assert!(matches!(second_response, Response::SetBuffer(_)));
+
+    let show = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("append-race".to_owned()),
+        }))
+        .await;
+    let content = show
+        .command_output()
+        .expect("appended buffer remains readable")
+        .stdout()
+        .to_vec();
+    assert!(
+        content == b"base-first-second" || content == b"base-second-first",
+        "both successful appends must be preserved, got {:?}",
+        String::from_utf8_lossy(&content)
+    );
 }
 
 #[tokio::test]
@@ -583,18 +643,28 @@ async fn paste_buffer_with_delete_keeps_newer_named_replacements() {
         .await
         .expect("paste-buffer should pause before deleting");
 
-    let replace = handler
-        .handle(Request::SetBuffer(Box::new(set_buffer_request(
-            Some("shared"),
-            b"new",
-        ))))
-        .await;
-    assert!(matches!(replace, Response::SetBuffer(_)));
+    let replace_handler = Arc::clone(&handler);
+    let mut replace = tokio::spawn(async move {
+        replace_handler
+            .handle(Request::SetBuffer(Box::new(set_buffer_request(
+                Some("shared"),
+                b"new",
+            ))))
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut replace)
+            .await
+            .is_err(),
+        "a later buffer replacement must wait for the admitted paste-delete turn"
+    );
 
     pause.release.notify_one();
 
     let response = paste.await.expect("paste-buffer task should join");
     assert!(matches!(response, Response::PasteBuffer(_)));
+    let replace = replace.await.expect("replacement task should join");
+    assert!(matches!(replace, Response::SetBuffer(_)));
 
     let show = handler
         .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -606,6 +676,70 @@ async fn paste_buffer_with_delete_keeps_newer_named_replacements() {
             .expect("replacement buffer should survive")
             .stdout(),
         b"new"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_paste_delete_caller_after_write_still_deletes_and_emits() {
+    let handler = Arc::new(RequestHandler::new());
+    create_session(handler.as_ref(), "paste-delete-durable").await;
+    handler
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            Some("durable"),
+            b"written-before-cancel",
+        ))))
+        .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let pause = handler.install_paste_buffer_delete_pause();
+    let paste_handler = Arc::clone(&handler);
+    let paste = tokio::spawn(async move {
+        paste_handler
+            .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
+                Some("durable"),
+                PaneTarget::new(session_name("paste-delete-durable"), 0),
+                true,
+            ))))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("durable paste reaches the post-write delete seam");
+    paste.abort();
+    let _ = paste.await;
+    pause.release.notify_one();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        handler.wait_for_post_commit_operations(),
+    )
+    .await
+    .expect("accepted paste-delete completes after caller cancellation");
+
+    let show = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("durable".to_owned()),
+        }))
+        .await;
+    assert!(matches!(show, Response::Error(_)), "buffer must be deleted");
+    let deleted = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = lifecycle
+                .recv()
+                .await
+                .expect("lifecycle channel remains open");
+            if matches!(
+                event.event,
+                LifecycleEvent::PasteBufferDeleted { ref buffer_name }
+                    if buffer_name == "durable"
+            ) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        deleted.is_ok(),
+        "durable delete must emit its lifecycle event"
     );
 }
 

@@ -74,10 +74,11 @@ struct DestroySwitchPlans {
 pub(in crate::handler) struct PreparedAttachedDestroySwitches {
     source_session_id: SessionId,
     plans: Vec<DestroySwitchPlan>,
+    pub(in crate::handler) control_lifecycle_events: Vec<super::super::QueuedLifecycleEvent>,
 }
 
 impl RequestHandler {
-    pub(in crate::handler) async fn rehome_control_session_identity(
+    pub(in crate::handler) async fn prepare_destroy_session_rehome(
         &self,
         session_name: &SessionName,
         session_id: SessionId,
@@ -86,11 +87,13 @@ impl RequestHandler {
         let switch_plans = self
             .destroy_switch_plans(session_name, session_id, detach_on_destroy)
             .await;
-        self.apply_control_destroy_switch_plans(session_id, switch_plans.control)
+        let control_lifecycle_events = self
+            .prepare_control_destroy_switch_plans(session_id, switch_plans.control)
             .await;
         PreparedAttachedDestroySwitches {
             source_session_id: session_id,
             plans: switch_plans.attached,
+            control_lifecycle_events,
         }
     }
 
@@ -98,23 +101,28 @@ impl RequestHandler {
         &self,
         prepared: PreparedAttachedDestroySwitches,
     ) {
+        debug_assert!(
+            prepared.control_lifecycle_events.is_empty(),
+            "prepared control destroy-switch events must be emitted before attached rehome"
+        );
         self.apply_attached_destroy_switch_plans(prepared.source_session_id, prepared.plans)
             .await;
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::handler) async fn exit_attached_session_identity(
         &self,
         session_name: &SessionName,
         session_id: SessionId,
         detach_on_destroy: SessionDetachOnDestroy,
     ) {
-        let switch_plans = self
-            .destroy_switch_plans(session_name, session_id, detach_on_destroy)
+        let mut prepared = self
+            .prepare_destroy_session_rehome(session_name, session_id, detach_on_destroy)
             .await;
-        self.apply_control_destroy_switch_plans(session_id, switch_plans.control)
-            .await;
-        self.apply_attached_destroy_switch_plans(session_id, switch_plans.attached)
-            .await;
+        for event in prepared.control_lifecycle_events.drain(..) {
+            self.emit_prepared(event).await;
+        }
+        self.exit_prepared_attached_session_identity(prepared).await;
     }
 
     async fn apply_attached_destroy_switch_plans(
@@ -171,14 +179,15 @@ impl RequestHandler {
             .await;
     }
 
-    async fn apply_control_destroy_switch_plans(
+    async fn prepare_control_destroy_switch_plans(
         &self,
         source_session_id: SessionId,
         plans: Vec<DestroyControlSwitchPlan>,
-    ) {
+    ) -> Vec<super::super::QueuedLifecycleEvent> {
+        let mut lifecycle_events = Vec::with_capacity(plans.len());
         for plan in plans {
-            if let Some(target_session_name) = self
-                .switch_control_session_after_destroy(
+            if let Some((_, event)) = self
+                .prepare_control_session_switch_after_destroy(
                     plan.control_pid,
                     plan.control_id,
                     source_session_id,
@@ -186,14 +195,10 @@ impl RequestHandler {
                 )
                 .await
             {
-                self.emit_client_session_changed(
-                    plan.control_pid,
-                    target_session_name,
-                    plan.target_session_id,
-                )
-                .await;
+                lifecycle_events.push(event);
             }
         }
+        lifecycle_events
     }
 
     async fn destroy_switch_plans(

@@ -217,12 +217,21 @@ impl Locator {
         Ok(query::apply_selection(matches, self.selection))
     }
 
-    pub(crate) async fn resolve_strict_with_wait(&self) -> Result<(PaneSnapshot, LocatorMatch)> {
-        let timeout = crate::wait::resolved_wait_timeout_override(
-            self.timeout,
-            self.pane.configured_default_timeout(),
-        );
-        let deadline = crate::wait::wait_deadline(timeout);
+    pub(crate) async fn resolve_strict_with_wait(
+        self,
+    ) -> Result<(Self, PaneSnapshot, LocatorMatch)> {
+        let (locator, timeout, deadline) = self.begin_pinned_operation().await?;
+        let (snapshot, item) = locator
+            .resolve_strict_with_deadline(timeout, deadline)
+            .await?;
+        Ok((locator, snapshot, item))
+    }
+
+    async fn resolve_strict_with_deadline(
+        &self,
+        timeout: Option<Duration>,
+        deadline: Option<Instant>,
+    ) -> Result<(PaneSnapshot, LocatorMatch)> {
         let mut last_snapshot = None;
         loop {
             let snapshot = crate::wait::snapshot_with_wait_deadline(
@@ -262,9 +271,24 @@ impl Locator {
         &self.pane
     }
 
-    pub(crate) fn begin_operation_handle(mut self) -> Self {
-        self.pane = self.pane.begin_operation_handle_with_timeout(self.timeout);
-        self
+    pub(crate) async fn begin_pinned_operation(
+        mut self,
+    ) -> Result<(Self, Option<Duration>, Option<Instant>)> {
+        let timeout = crate::wait::resolved_wait_timeout_override(
+            self.timeout,
+            self.pane.configured_default_timeout(),
+        );
+        let deadline = crate::wait::wait_deadline(timeout);
+        let pane = self.pane.begin_operation_handle_with_timeout(self.timeout);
+        let (pane, _) = crate::wait::with_wait_deadline(
+            "wait for locator snapshot",
+            timeout,
+            deadline,
+            pane.pin_to_current_identity(),
+        )
+        .await?;
+        self.pane = pane;
+        Ok((self, timeout, deadline))
     }
 
     fn combine(self, other: Self, combiner: LocatorCombiner) -> Self {

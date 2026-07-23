@@ -3,7 +3,7 @@ use rmux_proto::{PaneTarget, RmuxError, SessionName, Target};
 use crate::{Pane, SessionStore, Window};
 
 use super::matching::{target_for_type, target_not_found, ResolvedParts};
-use super::{TargetFindContext, TargetFindFlags, TargetFindType};
+use super::{MissingCurrentTargetFallback, TargetFindContext, TargetFindFlags, TargetFindType};
 
 impl SessionStore {
     pub(super) fn current_target_for_type(
@@ -19,10 +19,17 @@ impl SessionStore {
             }
         }
 
-        let current = self.current_parts(context).or_else(|_| {
-            self.default_session_name(flags)
-                .and_then(|session_name| self.parts_for_session_current(&session_name))
-        })?;
+        let current = match self.current_parts(context) {
+            Ok(current) => current,
+            Err(_)
+                if context.missing_current_target_fallback()
+                    == MissingCurrentTargetFallback::AllowDefaultSession =>
+            {
+                self.default_session_name(flags)
+                    .and_then(|session_name| self.parts_for_session_current(&session_name))?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(target_for_type(find_type, current))
     }
 

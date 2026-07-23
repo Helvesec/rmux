@@ -6,7 +6,10 @@ use std::sync::Arc;
 use rmux_core::{AlertFlags, LifecycleEvent, PaneId, WINDOW_ACTIVITY, WINDOW_BELL};
 use rmux_proto::{OptionName, PaneTarget, SessionId, SessionName, WindowId, WindowTarget};
 
-use super::super::{prepare_lifecycle_event, QueuedLifecycleEvent, RequestHandler};
+use super::super::{
+    prepare_unsequenced_lifecycle_event, sequence_prepared_lifecycle_event, RequestHandler,
+    UnsequencedLifecycleEvent,
+};
 use super::pane_alert_coalescer::PANE_ALERT_COALESCE_DELAY;
 use crate::pane_io::{PaneAlertCallback, PaneAlertEvent};
 use crate::pane_state_journal::PaneStateChange;
@@ -24,7 +27,7 @@ pub(in crate::handler) struct PreparedPaneAlertEvent {
     identity: StablePaneAlertIdentity,
     inactive_refresh_sessions: Vec<SessionId>,
     clipboard_writes: Vec<Vec<u8>>,
-    lifecycle_events: Vec<QueuedLifecycleEvent>,
+    lifecycle_events: Vec<UnsequencedLifecycleEvent>,
     alert_flags: Option<AlertFlags>,
 }
 
@@ -73,10 +76,24 @@ impl RequestHandler {
         let handler = self.downgrade();
         let runtime = tokio::runtime::Handle::current();
         let pending_alerts = Arc::clone(&self.pane_alert_coalescer);
-        Arc::new(move |event: PaneAlertEvent| {
+        Arc::new(move |mut event: PaneAlertEvent| {
             let Some(handler) = handler.upgrade() else {
                 return;
             };
+            let clipboard_queries = std::mem::take(&mut event.clipboard_queries);
+            if !clipboard_queries.is_empty()
+                && handler.enqueue_pane_clipboard_queries(
+                    event.session_name.clone(),
+                    event.pane_id,
+                    event.generation,
+                    clipboard_queries,
+                )
+            {
+                let query_handler = handler.clone();
+                runtime.spawn(async move {
+                    query_handler.drain_pane_clipboard_queries().await;
+                });
+            }
             if let Some((old, new)) = event
                 .title_change
                 .clone()
@@ -126,7 +143,17 @@ impl RequestHandler {
     }
 
     #[cfg(test)]
-    pub(in crate::handler) async fn handle_pane_alert_event(&self, event: PaneAlertEvent) {
+    pub(in crate::handler) async fn handle_pane_alert_event(&self, mut event: PaneAlertEvent) {
+        let clipboard_queries = std::mem::take(&mut event.clipboard_queries);
+        if !clipboard_queries.is_empty() {
+            self.handle_pane_clipboard_queries(
+                event.session_name.clone(),
+                event.pane_id,
+                event.generation,
+                clipboard_queries,
+            )
+            .await;
+        }
         for identity in self.try_relay_visible_inactive_pane_clipboard(&event) {
             self.finish_attach(identity.attach_pid(), identity.attach_id())
                 .await;
@@ -268,7 +295,15 @@ impl RequestHandler {
             for content in prepared.clipboard_writes {
                 let _ = self.store_buffer(None, content).await;
             }
+            // Buffer storage publishes its own lifecycle events. Do not reserve
+            // pane-alert positions until those writes finish, otherwise the
+            // buffer publication can wait behind an event this task has not
+            // emitted yet.
             for lifecycle_event in prepared.lifecycle_events {
+                let lifecycle_event = {
+                    let mut state = self.state.lock().await;
+                    sequence_prepared_lifecycle_event(&mut state, lifecycle_event)
+                };
                 if wait_for_lifecycle_hooks {
                     self.emit_prepared_and_wait(lifecycle_event).await;
                 } else {
@@ -412,11 +447,18 @@ impl RequestHandler {
             event.generation,
         )?;
         let window_index = pane_target.window_index();
-        {
-            let session = state.sessions.session_mut(pane_target.session_name())?;
-            let window = session.window_at_mut(window_index)?;
-            let _ = window.touch_activity_for_pane(pane_target.pane_index());
+        if event.alternate_mode_changed {
+            if let Err(error) = state.resize_terminals(pane_target.session_name()) {
+                tracing::warn!(
+                    session = %pane_target.session_name(),
+                    pane_id = event.pane_id.as_u32(),
+                    "failed to reconcile pane geometry after alternate-screen transition: {error}"
+                );
+            }
         }
+        state
+            .touch_linked_window_activity_for_pane(&pane_target, event.pane_id)
+            .then_some(())?;
         let refresh_for_inactive_pane_output = state
             .sessions
             .session(pane_target.session_name())
@@ -428,28 +470,30 @@ impl RequestHandler {
         // clients even when it is the active pane: the refresh rebuilds the
         // outer terminal, whose transition diff emits the outer mouse
         // enable/disable for pane-driven tracking (issue #93).
-        let inactive_refresh_sessions =
-            if refresh_for_inactive_pane_output || event.mouse_mode_changed {
-                state
-                    .window_linked_session_family_list(pane_target.session_name(), window_index)
-                    .into_iter()
-                    .filter_map(|session_name| {
-                        state
-                            .sessions
-                            .session(&session_name)
-                            .map(rmux_core::Session::id)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let inactive_refresh_sessions = if refresh_for_inactive_pane_output
+            || event.mouse_mode_changed
+            || event.alternate_mode_changed
+        {
+            state
+                .window_linked_session_family_list(pane_target.session_name(), window_index)
+                .into_iter()
+                .filter_map(|session_name| {
+                    state
+                        .sessions
+                        .session(&session_name)
+                        .map(rmux_core::Session::id)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let set_clipboard_on = matches!(
             state.options.resolve(None, OptionName::SetClipboard),
             Some("on")
         );
         let mut lifecycle_events = Vec::new();
         if event.title_changed {
-            lifecycle_events.push(prepare_lifecycle_event(
+            lifecycle_events.push(prepare_unsequenced_lifecycle_event(
                 state,
                 &LifecycleEvent::PaneTitleChanged {
                     target: pane_target.clone(),
@@ -457,7 +501,7 @@ impl RequestHandler {
             ));
         }
         if event.clipboard_set && set_clipboard_on {
-            lifecycle_events.push(prepare_lifecycle_event(
+            lifecycle_events.push(prepare_unsequenced_lifecycle_event(
                 state,
                 &LifecycleEvent::PaneSetClipboard {
                     target: pane_target,

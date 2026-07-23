@@ -3,6 +3,8 @@ use std::error::Error;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -89,6 +91,8 @@ impl CliHarness {
         let harness_lock = acquire_cli_harness_lock();
         let tmpdir = unique_tmpdir(label);
         fs::create_dir_all(&tmpdir)?;
+        #[cfg(unix)]
+        fs::set_permissions(&tmpdir, fs::Permissions::from_mode(0o711))?;
         write_test_shell_startup_files(&tmpdir.join("home"))?;
         let socket_path = default_socket_path_in(&tmpdir)?;
         let launcher_path = tmpdir.join("rmux-launcher.sh");

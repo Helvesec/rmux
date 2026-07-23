@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.9.1
+
+### Security
+
+- Revalidate `server-access` authority during attach and control registration
+  and throughout detached prompts, menus, mode trees, display-panes actions,
+  and delayed callbacks. Keep Unix transport permissions synchronized with ACL
+  changes and socket rebinding.
+- Scope OSC 52 query replies to their originating attach generation so a late
+  or timed-out reply cannot satisfy a later clipboard request.
+- Reject Windows batch scripts in structured argv mode, where `cmd.exe` cannot
+  preserve arbitrary argument boundaries.
+
+### SDK
+
+- Pin composite pane operations to stable pane ids across reindexing and moves,
+  and retain in-flight render work across cancelled `next()` calls until the
+  final update is delivered.
+
+### Compatibility
+
+- Route `get-clipboard` queries through eligible attached clients and preserve
+  multiline Windows bracketed-paste framing, including short LF, Tab, and
+  Backspace bursts and batches separated by console key noise.
+- Render pane scrollbars and copy-mode line-number gutters, including their
+  pane geometry, mouse hit-testing, styles, and mode-tree integration.
+- Apply repeated target precedence before lookup, accept repeated idempotent
+  top-level flags, resolve sourced targets against live state, and implement
+  `list-windows -a` across sessions.
+- Correct float comparison precision, focus-follows-mouse, linked-window pane
+  selection and mutation, lifecycle hook dispatch, and final-window removal.
+- Keep keyboard copy-mode selections anchored at the keyboard cursor when
+  mouse mode is enabled; only commands originating from a mouse event consume
+  mouse coordinates.
+- Drop cached mouse coordinates when a background `run-shell` or `if-shell`
+  queue starts instead of reviving the event that launched it.
+- Keep `if-shell -F` synchronous when `-b` is also present, preserving its
+  inline output and command context like tmux 3.7b.
+- Keep detached RPC wire version 5 unchanged across the 0.9 release line.
+
+### Reliability
+
+- Make special-file buffer I/O cancellable, handle empty-writer FIFOs on macOS,
+  and restore private or custom Unix sockets safely at startup and after
+  `SIGUSR1`.
+- Join accepted daemon tasks and tracked status-job process trees during
+  shutdown, including the task-registration race.
+- Fence and reset Windows terminal input around exclusive terminal actions.
+- Pin guarded delayed and interactive actions to the exact client, session,
+  window-link occurrence, pane, or pane-output generation they captured.
+  This covers queued `rename-window` and `kill-pane`, `new-window` placement,
+  mode trees, `display-panes`, menus, and popups. Other queued mutations keep
+  their existing targeting semantics.
+- Preserve command-error hooks and targeted `run-shell` output across queue
+  capture, retain deferred lifecycle targets through normal and special
+  command paths, and keep nested command futures stack-safe.
+- Keep attached lock actions scoped to the intended client and session while
+  allowing the same attach registration to follow an explicit session switch.
+
+### Packaging
+
+- Discover the private helper under `lib/rmux/libexec` for prefix-based Unix
+  layouts (contributed by @BarbUk).
+
+### Remaining boundaries
+
+- Under retention pressure, very large attached input can be split into
+  multiple self-contained bracketed-paste envelopes.
+- Terminal behavior on older ConPTY builds and some SSH hosts remains
+  host-dependent. Descendants that deliberately escape their tracked Unix
+  process group remain outside shutdown containment.
+- The non-advertised 1.0 command surface remains deferred, including floating
+  panes, `new-pane`, the remaining split and `refresh-client` flags, tree-mode
+  preview styling, and the complete Kitty Keyboard Protocol.
+
 ## 0.9.0
 
 ### Security
@@ -48,8 +123,8 @@
 - Make Unix socket startup and cleanup reliable for relative socket paths,
   daemon churn, and exit-empty behavior.
 - Bump the detached RPC frame envelope from wire version 3 to 5. Clients and
-  SDKs must match the 0.9.0 daemon, and an already-running older server must be
-  restarted during upgrade.
+  SDKs throughout the 0.9 release line use wire version 5, and an
+  already-running pre-0.9 server must be restarted during upgrade.
 
 ### Packaging
 

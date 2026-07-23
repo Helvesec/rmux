@@ -1,12 +1,12 @@
 use rmux_core::{AlertFlags, WINDOW_ACTIVITY, WINDOW_BELL, WINDOW_SILENCE, WINLINK_SILENCE};
 use rmux_proto::WindowTarget;
 
-use super::super::prepare_lifecycle_event;
+use super::super::{prepare_unsequenced_lifecycle_event, sequence_prepared_lifecycle_event};
 use super::{
     alert_action, alert_flags_enabled, alert_kind_enabled, monitor_silence_seconds, visual_mode,
     AlertKind, AlertPlan, RequestHandler, VisualMode,
 };
-use crate::hook_runtime::hooks_disabled;
+use crate::hook_runtime::lifecycle_hooks_disabled;
 use crate::pane_terminals::HandlerState;
 
 impl RequestHandler {
@@ -155,9 +155,19 @@ impl RequestHandler {
     }
 
     pub(in crate::handler) async fn execute_alert_plans(&self, plans: Vec<AlertPlan>) {
-        for plan in plans {
-            if let Some(event) = &plan.lifecycle_event {
-                self.emit_prepared(event.clone()).await;
+        // Plans can outlive the state turn that captures their stable hook
+        // identity. Reserve each publication position immediately before that
+        // event is emitted, so neither intervening mutations nor earlier plan
+        // effects can wait on a later, not-yet-emitted plan.
+        for mut plan in plans {
+            let event = {
+                let mut state = self.state.lock().await;
+                plan.lifecycle_event
+                    .take()
+                    .map(|event| sequence_prepared_lifecycle_event(&mut state, event))
+            };
+            if let Some(event) = event {
+                self.emit_prepared(event).await;
             }
             self.pause_after_alert_plan_hook_enqueue().await;
             if plan.send_bell {
@@ -209,10 +219,13 @@ fn build_alert_plan_locked(
         format!("{} in window {}", kind.label(), target.window_index())
     };
 
-    let lifecycle_event = (action_applies && !hooks_disabled()).then(|| {
-        let event = kind.lifecycle_event(target.clone());
-        prepare_lifecycle_event(state, &event)
-    });
+    let lifecycle_event = action_applies
+        .then(|| {
+            let event = kind.lifecycle_event(target.clone());
+            (!lifecycle_hooks_disabled())
+                .then(|| prepare_unsequenced_lifecycle_event(state, &event))
+        })
+        .flatten();
 
     Some(AlertPlan {
         session_id,

@@ -14,7 +14,7 @@ use crate::pane_io::AttachControl;
 use crate::pane_terminals::session_not_found;
 
 use super::{
-    attach_support::ClientFlags,
+    attach_support::{ActiveAttachIdentity, ClientFlags},
     attached_client_matches_target, command_output_from_lines,
     control_support::{current_control_queue_identity, ManagedClient},
     format_client_uid, format_client_user, format_requester_uid, normalize_target_client,
@@ -282,6 +282,47 @@ impl RequestHandler {
         Ok(None)
     }
 
+    pub(in crate::handler) async fn find_target_attach_client_identity(
+        &self,
+        requester_pid: u32,
+        target_client: &str,
+        command_name: &str,
+    ) -> Result<Option<ActiveAttachIdentity>, RmuxError> {
+        let target_client = normalize_target_client(target_client);
+        if target_client == "=" {
+            let attach_pid = self
+                .resolve_target_attach_client_pid(requester_pid, Some(target_client), command_name)
+                .await?;
+            return Ok(self.active_attach_identity(attach_pid).await);
+        }
+
+        {
+            let active_attach = self.active_attach.lock().await;
+            if let Ok(pid) = target_client.parse::<u32>() {
+                if let Some(active) = active_attach.by_pid.get(&pid) {
+                    return Ok(Some(active.identity(pid)));
+                }
+            } else if let Some((&pid, active)) = active_attach
+                .by_pid
+                .iter()
+                .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
+            {
+                return Ok(Some(active.identity(pid)));
+            }
+        }
+
+        let active_control = self.active_control.lock().await;
+        if let Ok(pid) = target_client.parse::<u32>() {
+            if active_control.by_pid.contains_key(&pid) {
+                return Err(RmuxError::Server(format!(
+                    "{command_name} requires an attached client"
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub(in crate::handler) async fn resolve_target_attach_client_pid(
         &self,
         requester_pid: u32,
@@ -299,6 +340,32 @@ impl RequestHandler {
                 "{command_name} requires an attached client"
             ))),
         }
+    }
+
+    pub(in crate::handler) async fn resolve_target_attach_client_identity(
+        &self,
+        requester_pid: u32,
+        target_client: Option<&str>,
+        command_name: &str,
+    ) -> Result<ActiveAttachIdentity, RmuxError> {
+        let (attach_pid, attach_id) = match self
+            .resolve_target_managed_client(requester_pid, target_client, command_name)
+            .await?
+        {
+            ManagedClient::Attach { pid, attach_id } => (pid, attach_id),
+            ManagedClient::Control(_) => {
+                return Err(RmuxError::Server(format!(
+                    "{command_name} requires an attached client"
+                )))
+            }
+        };
+        let active_attach = self.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&attach_pid)
+            .filter(|active| active.id == attach_id && !active.closing.load(Ordering::SeqCst))
+            .map(|active| active.identity(attach_pid))
+            .ok_or_else(|| attached_client_required(command_name))
     }
 
     async fn update_session_cwd_from_template(

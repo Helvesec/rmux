@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::MutexGuard;
 use std::time::Duration;
 
@@ -23,6 +22,9 @@ use crate::pane_terminals::HandlerState;
 
 use super::pane_support::resolve_pane_target_ref;
 use super::RequestHandler;
+
+#[path = "handler_pane_state/foreground_watch.rs"]
+mod foreground_watch;
 
 #[cfg(not(test))]
 const PANE_STATE_WAIT_CAP: Duration = Duration::from_secs(25);
@@ -107,6 +109,17 @@ impl RequestHandler {
             options: request.include_options,
             foreground: request.include_foreground,
         };
+        // Reserve ownership before the subscription becomes observable. The
+        // registration itself keeps shutdown waiting for this hand-off; no
+        // mutation guard is needed (or wanted) while the process probe runs.
+        let mut foreground_watch_registration = if include.foreground {
+            match self.reserve_foreground_watch() {
+                Ok(registration) => Some(registration),
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            }
+        } else {
+            None
+        };
         let (subscription_id, pane_id, mut snapshot, foreground_seed) = {
             let state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
@@ -174,7 +187,11 @@ impl RequestHandler {
             return Response::Error(ErrorResponse { error });
         }
         if include.foreground {
-            self.start_foreground_watch_if_needed();
+            self.start_foreground_watch_if_needed(
+                foreground_watch_registration
+                    .take()
+                    .expect("foreground watcher registration was reserved"),
+            );
         }
         response
     }
@@ -408,67 +425,6 @@ impl RequestHandler {
             );
         }
         self.prune_web_panes(pane_ids);
-    }
-
-    fn start_foreground_watch_if_needed(&self) {
-        if self
-            .foreground_watch_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let handler = self.clone();
-        tokio::spawn(async move {
-            handler.watch_foreground_subscriptions().await;
-        });
-    }
-
-    async fn watch_foreground_subscriptions(&self) {
-        let mut foreground_cursor = 0;
-        loop {
-            let pane_ids = {
-                let journal = self.lock_pane_state_journal();
-                if journal.foreground_subscription_count() == 0 {
-                    self.foreground_watch_started
-                        .store(false, Ordering::Release);
-                    self.clear_foreground_state_cache();
-                    return;
-                }
-                journal.pane_ids_with_foreground_subscriptions()
-            };
-            let poll_batch = foreground_poll_batch(&pane_ids, &mut foreground_cursor);
-
-            for pane_id in poll_batch {
-                let seed = {
-                    let state = self.state.lock().await;
-                    let Some(target) = pane_target_for_pane_id(&state, pane_id) else {
-                        continue;
-                    };
-                    match capture_foreground_probe_seed(&state, &target) {
-                        Ok(seed) => seed,
-                        Err(_) => continue,
-                    }
-                };
-                let next = probe_foreground(&seed);
-                let previous =
-                    self.replace_foreground_state_cache(pane_id, seed.generation(), next.clone());
-                if let Some(previous) =
-                    foreground_change_from_previous(previous, seed.generation(), &next)
-                {
-                    self.record_pane_state_change(
-                        pane_id,
-                        Some(seed.generation()),
-                        PaneStateChange::ForegroundChanged {
-                            old: previous,
-                            new: next,
-                        },
-                    );
-                }
-            }
-
-            tokio::time::sleep(FOREGROUND_POLL_INTERVAL).await;
-        }
     }
 
     pub(in crate::handler) fn record_pane_option_mutation(

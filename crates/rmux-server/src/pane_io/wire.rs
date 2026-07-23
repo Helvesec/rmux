@@ -82,8 +82,6 @@ pub(super) fn open_attach_target(
 #[cfg(unix)]
 pub(super) fn open_pane_writer(pane_master: PtyMaster) -> io::Result<AsyncFd<PtyIo>> {
     let pane_writer = pane_master.into_io();
-    pane_writer.set_nonblocking()?;
-
     AsyncFd::new(pane_writer)
 }
 
@@ -276,7 +274,7 @@ pub(super) async fn read_from_pane(
         readiness.immediate_reads = 0;
 
         let mut ready = pane_reader.readable().await?;
-        match ready.try_io(|inner| inner.get_ref().read(&mut *buffer)) {
+        match ready.try_io(|inner| inner.get_ref().try_read(&mut *buffer)) {
             Ok(Ok(0)) if !readiness.output_established() => match readiness.retry_startup_eio() {
                 StartupEioReadiness::Retry(delay) => {
                     delay_startup_eio_retry(delay).await;
@@ -477,7 +475,7 @@ enum PaneRead {
 
 #[cfg(unix)]
 fn try_read_pane_now(reader: &PtyIo, buffer: &mut [u8]) -> io::Result<PaneRead> {
-    match reader.read(buffer) {
+    match reader.try_read(buffer) {
         Ok(bytes_read) => Ok(PaneRead::Bytes(bytes_read)),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(PaneRead::NotReady),
         Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(PaneRead::NotReady),

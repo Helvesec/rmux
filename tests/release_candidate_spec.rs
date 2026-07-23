@@ -1,5 +1,9 @@
+#[path = "support/python3.rs"]
+mod python3;
+
 use std::fs;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -193,7 +197,10 @@ fn release_review_candidate_mode_only_runs_true_deltas() {
 fn candidate_intent_validator_binds_source_version_and_attempt() {
     let output = temp_path("candidate-intent");
     let sha = "0123456789abcdef0123456789abcdef01234567";
-    let result = Command::new("python3")
+    let version = env!("CARGO_PKG_VERSION");
+    let release_intent_id = format!("shadow:{version}:test");
+    let planned_release_ref = format!("v{version}");
+    let result = python3::command()
         .args([
             "scripts/release/validate-candidate-intent.py",
             "--expected-source-sha",
@@ -203,9 +210,9 @@ fn candidate_intent_validator_binds_source_version_and_attempt() {
             "--fast-run-id",
             "29692655372",
             "--release-intent-id",
-            "shadow:0.9.0:test",
+            release_intent_id.as_str(),
             "--planned-release-ref",
-            "v0.9.0",
+            planned_release_ref.as_str(),
             "--release-kind",
             "shadow",
             "--github-ref",
@@ -224,11 +231,16 @@ fn candidate_intent_validator_binds_source_version_and_attempt() {
     );
     let payload = fs::read_to_string(&output).expect("candidate output");
     assert!(payload.contains("\"source_git_sha\": \"0123456789abcdef"));
-    assert!(payload.contains("\"planned_release_ref\": \"v0.9.0\""));
+    assert!(payload.contains(&format!(
+        "\"planned_release_ref\": \"{planned_release_ref}\""
+    )));
     fs::remove_file(&output).expect("remove candidate output");
 
+    let rc_version = format!("{version}-rc.1");
+    let rc_release_intent_id = format!("release:{rc_version}:test");
+    let rc_planned_release_ref = format!("v{rc_version}");
     let rc_output = temp_path("candidate-rc-intent");
-    let rc = Command::new("python3")
+    let rc = python3::command()
         .args([
             "scripts/release/validate-candidate-intent.py",
             "--expected-source-sha",
@@ -238,9 +250,9 @@ fn candidate_intent_validator_binds_source_version_and_attempt() {
             "--fast-run-id",
             "29692655372",
             "--release-intent-id",
-            "release:0.9.0-rc.1:test",
+            rc_release_intent_id.as_str(),
             "--planned-release-ref",
-            "v0.9.0-rc.1",
+            rc_planned_release_ref.as_str(),
             "--release-kind",
             "rc",
             "--github-ref",
@@ -258,11 +270,11 @@ fn candidate_intent_validator_binds_source_version_and_attempt() {
         String::from_utf8_lossy(&rc.stderr)
     );
     let rc_payload = fs::read_to_string(&rc_output).expect("RC candidate output");
-    assert!(rc_payload.contains("\"release_version\": \"0.9.0-rc.1\""));
-    assert!(rc_payload.contains("\"package_version\": \"0.9.0\""));
+    assert!(rc_payload.contains(&format!("\"release_version\": \"{rc_version}\"")));
+    assert!(rc_payload.contains(&format!("\"package_version\": \"{version}\"")));
     fs::remove_file(&rc_output).expect("remove RC candidate output");
 
-    let rejected = Command::new("python3")
+    let rejected = python3::command()
         .args([
             "scripts/release/validate-candidate-intent.py",
             "--expected-source-sha",
@@ -274,7 +286,7 @@ fn candidate_intent_validator_binds_source_version_and_attempt() {
             "--release-intent-id",
             "shadow:bad-source",
             "--planned-release-ref",
-            "v0.9.0",
+            planned_release_ref.as_str(),
             "--release-kind",
             "shadow",
             "--github-ref",
@@ -291,7 +303,7 @@ fn candidate_intent_validator_binds_source_version_and_attempt() {
 
 #[test]
 fn candidate_manifest_identity_preserves_rc_and_package_versions() {
-    let output = Command::new("python3")
+    let output = python3::command()
         .args([
             "-c",
             r#"
@@ -349,6 +361,9 @@ fn dispatcher_is_dry_run_and_repository_scoped_by_default() {
     // the Linux lane, where this repository's release shell runs.
     #[cfg(unix)]
     {
+        let version = env!("CARGO_PKG_VERSION");
+        let release_intent_id = format!("shadow:{version}:test");
+        let planned_release_ref = format!("v{version}");
         let output = Command::new("bash")
             .args([
                 "scripts/release/dispatch-release-candidate.sh",
@@ -357,9 +372,9 @@ fn dispatcher_is_dry_run_and_repository_scoped_by_default() {
                 "--expected-source-sha",
                 "0123456789abcdef0123456789abcdef01234567",
                 "--release-intent-id",
-                "shadow:0.9.0:test",
+                release_intent_id.as_str(),
                 "--planned-release-ref",
-                "v0.9.0",
+                planned_release_ref.as_str(),
                 "--release-kind",
                 "shadow",
             ])

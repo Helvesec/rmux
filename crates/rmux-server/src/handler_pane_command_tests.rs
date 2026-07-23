@@ -301,16 +301,27 @@ async fn wait_for_file_contents(path: &Path, expected: &str) {
     }
 }
 
-async fn wait_for_pipe_child_count_to_return_to(baseline: usize) {
+async fn pipe_process_group_probe(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+) -> crate::pane_terminals::PipeProcessGroupProbe {
+    handler
+        .state
+        .lock()
+        .await
+        .pane_pipe_process_group_probe_for_test(target)
+        .expect("active pipe process group probe")
+}
+
+async fn wait_for_pipe_child_to_stop(probe: &crate::pane_terminals::PipeProcessGroupProbe) {
     let deadline = tokio::time::Instant::now() + PROCESS_OUTPUT_FILE_TIMEOUT;
     loop {
-        let active = crate::pane_terminals::active_pipe_child_count_for_test();
-        if active <= baseline {
+        if !probe.child_wait_pending() {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting for pipe-pane children to stop; baseline={baseline}, active={active}"
+            "timed out waiting for the pipe-pane child to stop"
         );
         sleep(Duration::from_millis(25)).await;
     }
@@ -2781,11 +2792,11 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, &alpha).await;
-    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
 
     let open = handler
         .handle(Request::PipePane(PipePaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
+            target: target.clone(),
             stdin: false,
             stdout: true,
             once: false,
@@ -2793,10 +2804,11 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
         }))
         .await;
     assert!(matches!(open, rmux_proto::Response::PipePane(_)));
+    let first_pipe = pipe_process_group_probe(&handler, &target).await;
 
     let close = handler
         .handle(Request::PipePane(PipePaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
+            target: target.clone(),
             stdin: false,
             stdout: true,
             once: false,
@@ -2807,13 +2819,13 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
         matches!(close, rmux_proto::Response::PipePane(_)),
         "empty command should close existing pipe, got {close:?}"
     );
-    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
+    wait_for_pipe_child_to_stop(&first_pipe).await;
 
     // Opening a new pipe after an empty-command close should succeed, confirming the previous
     // pipe was cleaned up.
     let reopen = handler
         .handle(Request::PipePane(PipePaneRequest {
-            target: PaneTarget::with_window(alpha.clone(), 0, 0),
+            target: target.clone(),
             stdin: false,
             stdout: true,
             once: true,
@@ -2824,17 +2836,18 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
         matches!(reopen, rmux_proto::Response::PipePane(_)),
         "reopening after close should succeed"
     );
+    let second_pipe = pipe_process_group_probe(&handler, &target).await;
 
     let _ = handler
         .handle(Request::PipePane(PipePaneRequest {
-            target: PaneTarget::with_window(alpha, 0, 0),
+            target,
             stdin: false,
             stdout: true,
             once: false,
             command: None,
         }))
         .await;
-    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
+    wait_for_pipe_child_to_stop(&second_pipe).await;
 }
 
 async fn snapshot_response(

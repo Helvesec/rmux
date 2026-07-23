@@ -227,14 +227,25 @@ fn full_helper_candidates(current_exe: &Path) -> Vec<PathBuf> {
     let Some(parent) = current_exe.parent() else {
         return Vec::new();
     };
-    vec![
+    let candidates = vec![
         parent.join("libexec").join("rmux").join(helper_file_name()),
         parent
             .join("..")
             .join("libexec")
             .join("rmux")
             .join(helper_file_name()),
-    ]
+    ];
+    #[cfg(unix)]
+    let candidates: Vec<PathBuf> = candidates
+        .into_iter()
+        .chain([parent
+            .join("..")
+            .join("lib")
+            .join("rmux")
+            .join("libexec")
+            .join(helper_file_name())])
+        .collect();
+    candidates
 }
 
 #[cfg(not(windows))]
@@ -343,6 +354,56 @@ mod tests {
         assert_eq!(
             helper_from_executable_paths(&alias, Some(&public)),
             Some(links_full)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_helper_supports_prefix_lib_layout() {
+        let root = temp_root("prefix-lib");
+        let bin = root.join("bin");
+        let libexec = root.join("lib").join("rmux").join("libexec");
+        std::fs::create_dir_all(&bin).expect("create bin");
+        std::fs::create_dir_all(&libexec).expect("create prefix libexec");
+
+        let public = bin.join(helper_file_name());
+        let full = libexec.join(helper_file_name());
+        std::fs::write(&public, b"public").expect("write public");
+        std::fs::write(&full, b"full").expect("write full");
+
+        let selected = helper_from_executable_paths(&public, None).expect("helper selected");
+        assert_eq!(
+            std::fs::canonicalize(selected).expect("canonical selected helper"),
+            std::fs::canonicalize(full).expect("canonical expected helper")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_helper_prefers_standard_libexec_over_prefix_lib_layout() {
+        let root = temp_root("prefix-lib-precedence");
+        let bin = root.join("bin");
+        let standard = root.join("libexec").join("rmux");
+        let alternate = root.join("lib").join("rmux").join("libexec");
+        std::fs::create_dir_all(&bin).expect("create bin");
+        std::fs::create_dir_all(&standard).expect("create standard libexec");
+        std::fs::create_dir_all(&alternate).expect("create alternate libexec");
+
+        let public = bin.join(helper_file_name());
+        let standard_full = standard.join(helper_file_name());
+        let alternate_full = alternate.join(helper_file_name());
+        std::fs::write(&public, b"public").expect("write public");
+        std::fs::write(&standard_full, b"standard").expect("write standard helper");
+        std::fs::write(&alternate_full, b"alternate").expect("write alternate helper");
+
+        let selected = helper_from_executable_paths(&public, None).expect("helper selected");
+        assert_eq!(
+            std::fs::canonicalize(selected).expect("canonical selected helper"),
+            std::fs::canonicalize(standard_full).expect("canonical expected helper")
         );
 
         let _ = std::fs::remove_dir_all(&root);

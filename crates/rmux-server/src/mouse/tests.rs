@@ -1,11 +1,16 @@
 use super::{
-    classify_mouse_event, classify_mouse_events, copy_mode_mouse_context, MouseDragHandler,
+    classify_mouse_event, classify_mouse_events, copy_mode_mouse_context,
+    copy_mode_mouse_context_with_line_numbers, layout_for_session, MouseDragHandler,
     MouseForwardEvent, MouseLayout, MouseLocation, PaneBorderStatus, PaneMouseTarget,
     PaneScrollbar, PaneScrollbarsMode, ScrollbarPosition, StatusLineLayout, StatusRange,
     StatusRangeType,
 };
+use crate::copy_mode::CopyModeLineNumberLayout;
+use crate::pane_terminals::HandlerState;
 use rmux_core::{key_string_lookup_string, PaneGeometry, PaneId};
-use rmux_proto::{PaneTarget, SessionName};
+use rmux_proto::{
+    OptionName, PaneTarget, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
+};
 use std::time::Instant;
 
 fn pane_target(index: u32) -> PaneTarget {
@@ -96,6 +101,47 @@ fn status_line_count_accepts_numeric_status_values() {
     assert_eq!(super::status_line_count(Some("on"), 10), 1);
     assert_eq!(super::status_line_count(Some("2"), 10), 2);
     assert_eq!(super::status_line_count(Some("5"), 3), 3);
+}
+
+#[test]
+fn generated_mouse_scrollbar_uses_visible_pane_border_geometry() {
+    let session_name = SessionName::new("mouse-scrollbar").expect("valid session");
+    let mut state = HandlerState::default();
+    state
+        .sessions
+        .create_session(session_name.clone(), TerminalSize { cols: 20, rows: 8 })
+        .expect("session created");
+    let target = WindowTarget::with_window(session_name.clone(), 0);
+    state
+        .options
+        .set(
+            ScopeSelector::Session(session_name.clone()),
+            OptionName::Status,
+            "off".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("status option");
+    for (option, value) in [
+        (OptionName::PaneBorderStatus, "bottom"),
+        (OptionName::PaneScrollbars, "on"),
+    ] {
+        state
+            .options
+            .set(
+                ScopeSelector::Window(target.clone()),
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("mouse geometry option");
+    }
+
+    let layout = layout_for_session(&state, &session_name, 1).expect("mouse layout");
+    let pane = layout.panes.first().expect("pane target");
+    let scrollbar = pane.scrollbar.expect("scrollbar target");
+
+    assert_eq!(pane.geometry, PaneGeometry::new(0, 0, 19, 7));
+    assert_eq!(scrollbar.slider_h, 7);
 }
 
 fn raw(b: u16, x: u16, y: u16) -> MouseForwardEvent {
@@ -701,6 +747,42 @@ fn copy_mode_mouse_context_converts_to_content_coordinates() {
 }
 
 #[test]
+fn copy_mode_mouse_context_unoffsets_the_line_number_gutter() {
+    let mut event = super::AttachedMouseEvent {
+        raw: raw(0, 2, 1),
+        session_id: 1,
+        window_id: Some(5),
+        pane_id: Some(PaneId::new(0)),
+        pane_target: Some(pane_target(0)),
+        location: MouseLocation::Pane,
+        status_at: None,
+        status_lines: 0,
+        ignore: false,
+    };
+    let layout = CopyModeLineNumberLayout::resolve(Some("absolute"), true, 23, 8, 0, 0)
+        .expect("line-number layout");
+
+    let gutter = copy_mode_mouse_context_with_line_numbers(
+        &event,
+        PaneGeometry::new(0, 0, 20, 8),
+        -1,
+        Some(layout),
+    )
+    .expect("gutter context");
+    assert_eq!(gutter.content_x, 0);
+
+    event.raw.x = 10;
+    let content = copy_mode_mouse_context_with_line_numbers(
+        &event,
+        PaneGeometry::new(0, 0, 20, 8),
+        -1,
+        Some(layout),
+    )
+    .expect("content context");
+    assert_eq!(content.content_x, 6);
+}
+
+#[test]
 fn expire_click_timer_is_noop_when_no_deadline_set() {
     let mut state = super::ClientMouseState::default();
     assert!(state.click_deadline.is_none());
@@ -1053,6 +1135,130 @@ fn left_scrollbar_position_hit_detection() {
     let event = classify_mouse_event(&mut state, &layout, raw(0, 0, 2), Instant::now())
         .expect("scrollbar up");
     assert_eq!(event.event.location, MouseLocation::ScrollbarUp);
+}
+
+#[test]
+fn scrollbar_padding_is_a_pane_binding_location_on_both_sides() {
+    // Oracle tmux 3.7b: with width=2,pad=1, MouseDown on the pad emits
+    // MouseDown1Pane while the adjacent track emits a scrollbar event.
+    for (position, geometry, pad_x) in [
+        (
+            ScrollbarPosition::Right,
+            PaneGeometry::new(0, 0, 17, 10),
+            17,
+        ),
+        (ScrollbarPosition::Left, PaneGeometry::new(3, 0, 17, 10), 2),
+    ] {
+        let mut state = super::ClientMouseState::default();
+        let mut layout = layout();
+        layout.panes[0].geometry = geometry;
+        layout.panes[0].scrollbar = Some(PaneScrollbar {
+            position,
+            width: 2,
+            pad: 1,
+            slider_y: 3,
+            slider_h: 4,
+        });
+
+        let event = classify_mouse_event(&mut state, &layout, raw(0, pad_x, 2), Instant::now())
+            .expect("scrollbar padding belongs to the pane binding region");
+
+        assert_eq!(event.event.location, MouseLocation::Pane, "{position:?}");
+        assert_eq!(
+            event.key,
+            key_string_lookup_string("MouseDown1Pane").expect("known mouse key"),
+            "{position:?}"
+        );
+    }
+}
+
+#[test]
+fn left_scrollbar_rightmost_content_remains_pane() {
+    let mut layout = layout();
+    layout.panes[0].geometry = PaneGeometry::new(3, 0, 17, 10);
+    layout.panes[0].scrollbar = Some(PaneScrollbar {
+        position: ScrollbarPosition::Left,
+        width: 2,
+        pad: 1,
+        slider_y: 3,
+        slider_h: 4,
+    });
+
+    // The geometry already excludes the three reserved scrollbar cells, so
+    // every remaining visible content cell must stay mouse-addressable.
+    for x in 17..=19 {
+        let mut state = super::ClientMouseState::default();
+        let event = classify_mouse_event(&mut state, &layout, raw(0, x, 2), Instant::now())
+            .expect("visible content remains mouse-addressable");
+        assert_eq!(event.event.location, MouseLocation::Pane, "x={x}");
+    }
+}
+
+#[test]
+fn pane_border_status_precedes_scrollbar_and_content_hit_regions() {
+    for (position, pane_status, geometry, status_y) in [
+        (
+            ScrollbarPosition::Right,
+            PaneBorderStatus::Top,
+            PaneGeometry::new(0, 1, 17, 7),
+            0,
+        ),
+        (
+            ScrollbarPosition::Left,
+            PaneBorderStatus::Top,
+            PaneGeometry::new(3, 1, 17, 7),
+            0,
+        ),
+        (
+            ScrollbarPosition::Right,
+            PaneBorderStatus::Bottom,
+            PaneGeometry::new(0, 0, 17, 7),
+            7,
+        ),
+        (
+            ScrollbarPosition::Left,
+            PaneBorderStatus::Bottom,
+            PaneGeometry::new(3, 0, 17, 7),
+            7,
+        ),
+    ] {
+        let mut layout = layout();
+        layout.status_at = None;
+        layout.status_lines = 0;
+        layout.pane_border_status = pane_status;
+        layout.panes.truncate(1);
+        layout.panes[0].geometry = geometry;
+        layout.panes[0].scrollbar = Some(PaneScrollbar {
+            position,
+            width: 2,
+            pad: 1,
+            slider_y: 2,
+            slider_h: 3,
+        });
+        layout.panes[0].border_controls = vec![super::BorderControlRange {
+            x: 3..=3,
+            y: status_y,
+            control: 9,
+        }];
+
+        // Oracle tmux 3.7b: the pane-status row remains a border across the
+        // scrollbar track, padding and content; border controls still win.
+        for x in [0, 1, 2, 3, 16, 19] {
+            let mut state = super::ClientMouseState::default();
+            let event =
+                classify_mouse_event(&mut state, &layout, raw(0, x, status_y), Instant::now())
+                    .expect("pane status row remains mouse-addressable");
+            let expected = if x == 3 {
+                MouseLocation::Control(9)
+            } else {
+                MouseLocation::Border
+            };
+            assert_eq!(
+                event.event.location, expected,
+                "{position:?} {pane_status:?} x={x}"
+            );
+        }
+    }
 }
 
 #[test]

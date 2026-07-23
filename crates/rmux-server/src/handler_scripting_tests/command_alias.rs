@@ -110,6 +110,44 @@ async fn internal_canonical_execution_does_not_expand_aliases_again() {
 }
 
 #[tokio::test]
+async fn internal_canonical_execution_accepts_explicit_target_context() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("canonical-target");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let response = handler
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: Some(PaneTarget::with_window(alpha, 0, 0)),
+            caller_cwd: None,
+            stdin: Some("display-message -p '#{session_name}:#{window_index}'".to_owned()),
+        })))
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .expect("canonical target output")
+            .stdout(),
+        b"canonical-target:0\n"
+    );
+}
+
+#[tokio::test]
 async fn internal_canonical_execution_keeps_deferred_branch_aliases_dynamic() {
     let handler = RequestHandler::new();
     set_command_alias(&handler, "inner=display-message -p nested").await;

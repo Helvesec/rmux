@@ -495,8 +495,9 @@ impl Pane {
     /// it does not send text to an interactive shell and it does not append a
     /// newline. A running process is rejected by default; call
     /// [`PaneSpawnBuilder::kill_existing`] when replacement is intentional.
-    /// On Windows, `.bat` and `.cmd` targets inherently run through `cmd.exe`;
-    /// use a native executable when arguments must bypass its expansion.
+    /// On Windows, `.bat` and `.cmd` targets are rejected because `cmd.exe`
+    /// cannot preserve arbitrary argv boundaries; use a native executable or
+    /// [`Self::shell`] when shell interpretation is intentional.
     pub fn spawn<I, S>(&self, command: I) -> PaneSpawnBuilder<'_>
     where
         I: IntoIterator<Item = S>,
@@ -508,8 +509,9 @@ impl Pane {
     /// Starts an explicit shell-command respawn builder for this pane.
     ///
     /// This is the intentional `$SHELL -c` path. Use [`Self::spawn`] when the
-    /// process should be represented as structured argv. On Windows, batch
-    /// targets remain subject to `cmd.exe` expansion.
+    /// process should be represented as structured argv. On Windows, this is
+    /// also the intentional path for `.bat` and `.cmd` targets, with the
+    /// configured shell's interpretation rules.
     pub fn shell(&self, command: impl Into<String>) -> PaneSpawnBuilder<'_> {
         PaneSpawnBuilder::shell(self, command.into())
     }

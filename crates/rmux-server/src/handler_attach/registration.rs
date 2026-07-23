@@ -5,8 +5,6 @@ use std::sync::Arc;
 
 use rmux_core::LifecycleEvent;
 #[cfg(test)]
-use rmux_os::identity::UserIdentity;
-#[cfg(test)]
 use tokio::sync::mpsc;
 
 use crate::handler::RequestHandler;
@@ -14,8 +12,11 @@ use crate::mouse::ClientMouseState;
 #[cfg(test)]
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{AttachControl, AttachControlSender};
+use crate::server_access::ServerAccessAdmission;
 #[cfg(test)]
-use crate::server_access::current_owner_uid;
+use crate::server_access::{
+    current_owner_uid, pause_before_access_registration, AccessRegistrationKind,
+};
 
 use super::state::{ActiveAttach, ActiveAttachIdentity, AttachRegistration};
 
@@ -78,7 +79,7 @@ impl RequestHandler {
                 flags,
                 render_stream: false,
                 uid: current_owner_uid(),
-                user: UserIdentity::Uid(current_owner_uid()),
+                user: self.server_owner_identity(),
                 can_write: true,
                 client_size: None,
             },
@@ -112,6 +113,46 @@ impl RequestHandler {
         expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
     ) -> Option<ActiveAttachIdentity> {
+        self.register_attach_identity(
+            requester_pid,
+            session_name,
+            expected_session_id,
+            registration,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn register_attach_identity_with_server_access(
+        &self,
+        requester_pid: u32,
+        session_name: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
+        registration: AttachRegistration,
+        admission: ServerAccessAdmission,
+    ) -> Option<ActiveAttachIdentity> {
+        self.register_attach_identity(
+            requester_pid,
+            session_name,
+            expected_session_id,
+            registration,
+            Some(admission),
+        )
+        .await
+    }
+
+    async fn register_attach_identity(
+        &self,
+        requester_pid: u32,
+        session_name: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
+        registration: AttachRegistration,
+        admission: Option<ServerAccessAdmission>,
+    ) -> Option<ActiveAttachIdentity> {
+        #[cfg(test)]
+        if admission.is_some() {
+            pause_before_access_registration(AccessRegistrationKind::Attach, requester_pid).await;
+        }
         #[cfg(windows)]
         self.wait_for_windows_deferred_session_panes_ready(&session_name)
             .await;
@@ -128,77 +169,107 @@ impl RequestHandler {
         let client_size = registration
             .client_size
             .unwrap_or_else(|| session.window().size());
-        let mut active_attach = self.active_attach.lock().await;
-        let attach_id = active_attach.next_id;
-        active_attach.next_id += 1;
-        let size_sequence = active_attach.next_size_sequence;
-        active_attach.next_size_sequence = active_attach.next_size_sequence.saturating_add(1);
-        let control_backlog = registration.control_backlog;
-        let control_tx = AttachControlSender::new(
-            registration.control_tx,
-            Arc::clone(&control_backlog),
-            super::ATTACH_CONTROL_BACKLOG_LIMIT,
-            Arc::clone(&registration.closing),
-        );
-        if let Some(mut previous) = active_attach.by_pid.insert(
-            requester_pid,
-            ActiveAttach {
-                id: attach_id,
-                session_name,
-                session_id,
-                last_session: None,
-                last_session_id: None,
-                flags: registration.flags,
-                control_tx,
-                control_backlog,
-                render_stream: registration.render_stream,
-                render_refresh_pending: false,
-                uid: registration.uid,
-                user: registration.user,
-                can_write: registration.can_write,
-                suspended: false,
-                closing: registration.closing,
-                emit_detached_on_finish: false,
-                terminal_context: registration.terminal_context,
-                client_size,
-                client_pixels: None,
-                size_sequence,
-                persistent_overlay_epoch: registration.persistent_overlay_epoch,
-                render_generation: 0,
-                overlay_generation: 0,
-                overlay_state_id: 0,
-                display_panes_state_id: 0,
-                key_table_name: None,
-                key_table_set_at: None,
-                repeat_deadline: None,
-                repeat_active: false,
-                last_key: None,
-                mouse: ClientMouseState {
-                    slider_mpos: -1,
-                    ..ClientMouseState::default()
-                },
-                prompt: None,
-                mode_tree_state_id: 0,
-                mode_tree: None,
-                mode_tree_frame: None,
-                overlay: None,
-                display_panes: None,
-            },
-        ) {
-            active_attach.forget_attached_client_windows(requester_pid);
-            replaced_key_table = previous.key_table_name.clone();
-            replaced_overlay = previous.overlay.take();
-            let _ = previous.control_tx.send(AttachControl::Detach);
-            previous.closing.store(true, Ordering::SeqCst);
-        }
-        if let Some(window_index) = active_window_index {
-            active_attach.seed_active_client_for_window(
-                requester_pid,
-                &attached_session_name,
-                window_index,
+        let attach_id = {
+            let mut active_attach = self.active_attach.lock().await;
+            // Keep the client-state lock across policy revalidation and publication.
+            // ACL mutations commit to the policy store first and only then acquire
+            // this lock to update or disconnect clients, so a later mutation must
+            // observe this registration.
+            let server_access = admission.as_ref().map(|_| {
+                self.server_access
+                    .lock()
+                    .expect("server access mutex must not be poisoned")
+            });
+            let can_write = match (server_access.as_ref(), admission.as_ref()) {
+                (Some(server_access), Some(admission)) => server_access
+                    .revalidate_admission(admission, &registration.user)?
+                    .can_write(),
+                (None, None) => registration.can_write,
+                _ => unreachable!("an admission and its policy guard are created together"),
+            };
+            let flags = if can_write {
+                registration.flags
+            } else {
+                registration.flags.with_read_only()
+            };
+            let attach_id = active_attach.next_id;
+            active_attach.next_id += 1;
+            let size_sequence = active_attach.next_size_sequence;
+            active_attach.next_size_sequence = active_attach.next_size_sequence.saturating_add(1);
+            let activity_sequence = active_attach.next_activity_sequence;
+            active_attach.next_activity_sequence =
+                active_attach.next_activity_sequence.saturating_add(1);
+            let control_backlog = registration.control_backlog;
+            let control_tx = AttachControlSender::new(
+                registration.control_tx,
+                Arc::clone(&control_backlog),
+                super::ATTACH_CONTROL_BACKLOG_LIMIT,
+                Arc::clone(&registration.closing),
             );
-        }
-        drop(active_attach);
+            if let Some(mut previous) = active_attach.by_pid.insert(
+                requester_pid,
+                ActiveAttach {
+                    id: attach_id,
+                    session_name,
+                    session_id,
+                    last_session: None,
+                    last_session_id: None,
+                    flags,
+                    control_tx,
+                    control_backlog,
+                    render_stream: registration.render_stream,
+                    render_refresh_pending: false,
+                    uid: registration.uid,
+                    user: registration.user,
+                    can_write,
+                    clipboard_queries_desynchronized: false,
+                    suspended: false,
+                    closing: registration.closing,
+                    emit_detached_on_finish: false,
+                    terminal_context: registration.terminal_context,
+                    client_size,
+                    client_pixels: None,
+                    size_sequence,
+                    last_activity_sequence: activity_sequence,
+                    persistent_overlay_epoch: registration.persistent_overlay_epoch,
+                    render_generation: 0,
+                    overlay_generation: 0,
+                    overlay_state_id: 0,
+                    display_panes_state_id: 0,
+                    key_table_name: None,
+                    key_table_set_at: None,
+                    key_table_generation: 0,
+                    repeat_deadline: None,
+                    repeat_active: false,
+                    last_key: None,
+                    mouse: ClientMouseState {
+                        slider_mpos: -1,
+                        ..ClientMouseState::default()
+                    },
+                    prompt: None,
+                    mode_tree_state_id: 0,
+                    mode_tree: None,
+                    mode_tree_frame: None,
+                    overlay: None,
+                    display_panes: None,
+                },
+            ) {
+                active_attach.forget_attached_client_windows(requester_pid);
+                replaced_key_table = previous.key_table_name.clone();
+                replaced_overlay = previous.overlay.take();
+                let _ = previous.control_tx.send(AttachControl::Detach);
+                previous.closing.store(true, Ordering::SeqCst);
+            }
+            if let Some(window_index) = active_window_index {
+                active_attach.seed_active_client_for_window(
+                    requester_pid,
+                    &attached_session_name,
+                    window_index,
+                );
+            }
+            drop(server_access);
+            attach_id
+        };
         drop(state);
         self.bump_active_attach_epoch();
         super::terminate_overlay_job(replaced_overlay);

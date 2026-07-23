@@ -204,12 +204,20 @@ impl RequestHandler {
     ) -> HandleOutcome {
         match (request, client_name) {
             (Request::RunShell(request), client_name) => HandleOutcome::response(
-                self.handle_run_shell_with_client_name(requester_pid, *request, client_name)
-                    .await,
+                Box::pin(self.handle_run_shell_with_client_name(
+                    requester_pid,
+                    *request,
+                    client_name,
+                ))
+                .await,
             ),
             (Request::IfShell(request), Some(client_name)) => HandleOutcome::response(
-                self.handle_if_shell_with_client_name(requester_pid, *request, Some(client_name))
-                    .await,
+                Box::pin(self.handle_if_shell_with_client_name(
+                    requester_pid,
+                    *request,
+                    Some(client_name),
+                ))
+                .await,
             ),
             (Request::SetOptionByName(request), Some(client_name)) => HandleOutcome::response(
                 self.handle_set_option_by_name_with_client_name(*request, Some(client_name))
@@ -224,6 +232,25 @@ impl RequestHandler {
 
     #[async_recursion::async_recursion]
     async fn dispatch_request(
+        &self,
+        requester_pid: u32,
+        connection_id: u64,
+        request: Request,
+    ) -> HandleOutcome {
+        match request {
+            Request::RunShell(request) => HandleOutcome::response(
+                Box::pin(self.handle_run_shell(requester_pid, *request)).await,
+            ),
+            Request::IfShell(request) => HandleOutcome::response(
+                Box::pin(self.handle_if_shell(requester_pid, *request)).await,
+            ),
+            request => {
+                Box::pin(self.dispatch_request_inner(requester_pid, connection_id, request)).await
+            }
+        }
+    }
+
+    async fn dispatch_request_inner(
         &self,
         requester_pid: u32,
         connection_id: u64,
@@ -761,7 +788,6 @@ fn request_deferred_wait_target(request: &Request) -> Option<rmux_proto::Target>
         // layer, so keep the conservative wait to stay safe against a
         // still-starting sibling.
         Request::PaneResize(request) => Some(scope_from_ref(&request.target)),
-        Request::PaneSelect(request) => Some(scope_from_ref(&request.target)),
         Request::PipePane(request) => Some(Target::Pane(request.target.clone())),
         Request::PasteBuffer(request) => Some(Target::Pane(request.target.clone())),
         _ => None,
@@ -789,6 +815,7 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::PaneKill(_)
             | Request::RespawnPane(_)
             | Request::PaneRespawn(_)
+            | Request::PaneSelect(_)
             | Request::SelectPane(_)
             | Request::SelectPaneAdjacent(_)
             | Request::SelectPaneMark(_)

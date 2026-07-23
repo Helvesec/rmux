@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use rmux_os::identity::UserIdentity;
 use rmux_proto::{
     CreateWebShareRequest, ErrorResponse, KillSessionRequest, KillWindowRequest, NewWindowRequest,
     OptionName, PaneInputRequest, PaneKillRequest, PaneResizeRequest, PaneSelectRequest,
@@ -20,7 +19,7 @@ use super::attach_support::{
     ClientFlags,
 };
 use super::pane_support::resolve_pane_target_ref;
-use super::RequestHandler;
+use super::{NormalRequestGuard, RequestHandler};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
 use crate::pane_terminal_lookup::pane_id_for_target;
@@ -81,6 +80,20 @@ impl Drop for UndeliveredWebShareGuard {
 }
 
 impl RequestHandler {
+    /// Admit a Web-originated state change into the same shutdown barrier as
+    /// detached and control-mode requests. Snapshot, liveness, scrollback and
+    /// viewer-count paths are observations and intentionally do not call this;
+    /// pane input, attach input and every session/window action are mutations.
+    fn begin_web_mutation(&self) -> Result<NormalRequestGuard, RmuxError> {
+        self.try_begin_normal_request(true)
+            .ok_or_else(|| RmuxError::Server("server is shutting down".to_owned()))
+    }
+
+    fn begin_web_share_forwarder(&self) -> Result<NormalRequestGuard, RmuxError> {
+        self.try_begin_normal_request(false)
+            .ok_or_else(|| RmuxError::Server("server is shutting down".to_owned()))
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_web_authentication_limits(
         max_connections: usize,
@@ -207,7 +220,32 @@ impl RequestHandler {
         pin: Option<&str>,
     ) -> Result<WebShareStream, RmuxError> {
         let access = self.web_shares.connect_token_id(token_id, pin).await?;
-        self.open_web_share_access(access).await
+        self.open_authenticated_web_share(access).await
+    }
+
+    pub(crate) async fn authenticate_web_share_token_id_with_wait(
+        &self,
+        token_id: &str,
+        pin: Option<&str>,
+        auth_wait: &WebShareAuthWaitPermit,
+    ) -> Result<WebShareAccess, RmuxError> {
+        self.web_shares
+            .connect_token_id_with_wait(token_id, pin, auth_wait)
+            .await
+    }
+
+    pub(crate) async fn open_authenticated_web_share(
+        &self,
+        access: WebShareAccess,
+    ) -> Result<WebShareStream, RmuxError> {
+        // Authentication/backoff is cancel-safe. `WebShareAccess` reverses its viewer
+        // registration on drop, so acquire both shutdown guards only at the durable open
+        // boundary. Reserve the forwarder first: once Drain succeeds, no later gate may reject
+        // the already-admitted mutation.
+        let forwarder_admission = self.begin_web_share_forwarder()?;
+        let _open_admission = self.begin_web_mutation()?;
+        self.open_web_share_access(access, forwarder_admission)
+            .await
     }
 
     pub(crate) fn reserve_web_share_authentication(
@@ -216,19 +254,6 @@ impl RequestHandler {
         peer: Option<IpAddr>,
     ) -> Result<WebShareAuthWaitPermit, RmuxError> {
         self.web_shares.reserve_authentication_wait(token_id, peer)
-    }
-
-    pub(crate) async fn open_web_share_token_id_with_wait(
-        &self,
-        token_id: &str,
-        pin: Option<&str>,
-        auth_wait: &WebShareAuthWaitPermit,
-    ) -> Result<WebShareStream, RmuxError> {
-        let access = self
-            .web_shares
-            .connect_token_id_with_wait(token_id, pin, auth_wait)
-            .await?;
-        self.open_web_share_access(access).await
     }
 
     pub(crate) fn web_share_pre_auth_token(
@@ -262,9 +287,11 @@ impl RequestHandler {
     async fn open_web_share_access(
         &self,
         access: WebShareAccess,
+        forwarder_admission: NormalRequestGuard,
     ) -> Result<WebShareStream, RmuxError> {
         match access.target().clone() {
             WebShareTarget::Pane(target) => {
+                drop(forwarder_admission);
                 let session_id = target.session_id();
                 let target = self.stable_web_target(&target).await?;
                 let (snapshot, output) = self.web_resnapshot(&target).await?;
@@ -279,7 +306,9 @@ impl RequestHandler {
                 })))
             }
             WebShareTarget::Session(session_target) => {
-                let stream = self.open_web_session_share(access, session_target).await?;
+                let stream = self
+                    .open_web_session_share(access, session_target, forwarder_admission)
+                    .await?;
                 Ok(WebShareStream::Session(Box::new(stream)))
             }
         }
@@ -289,6 +318,7 @@ impl RequestHandler {
         &self,
         access: WebShareAccess,
         session_target: WebSessionTarget,
+        forwarder_admission: NormalRequestGuard,
     ) -> Result<WebSessionStream, RmuxError> {
         let session_target = self.current_web_session_target(&session_target).await?;
         let (server_transport, client_stream) = pane_io::in_process_attach_pair();
@@ -350,17 +380,25 @@ impl RequestHandler {
                     flags,
                     render_stream: true,
                     uid: current_owner_uid(),
-                    user: UserIdentity::Uid(current_owner_uid()),
+                    user: self.server_owner_identity(),
                     can_write,
                     client_size: None,
                 },
             )
             .await
             .ok_or_else(|| session_not_found_web(session_target.name()))?;
-        let (_shutdown_tx, shutdown_rx) = watch::channel(());
+        let (shutdown_tx, shutdown_rx) = watch::channel(());
+        let mut normal_shutdown = self.normal_request_shutdown_receiver();
         let task_handler = self.clone();
         tokio::spawn(async move {
-            let _keep_shutdown_open = _shutdown_tx;
+            let shutdown_relay = tokio::spawn(async move {
+                while !*normal_shutdown.borrow() {
+                    if normal_shutdown.changed().await.is_err() {
+                        return;
+                    }
+                }
+                shutdown_tx.send_replace(());
+            });
             let result = pane_io::forward_attach(
                 server_transport,
                 target,
@@ -374,10 +412,13 @@ impl RequestHandler {
                 true,
             )
             .await;
+            shutdown_relay.abort();
+            let _ = shutdown_relay.await;
             task_handler
                 .finish_attach(attach_pid, attach_identity.attach_id())
                 .await;
             drop(attach_forwarder_guard);
+            drop(forwarder_admission);
             let _ = task_handler.request_shutdown_if_pending();
             if let Err(error) = result {
                 tracing::debug!(attach_pid, "web session attach ended: {error}");
@@ -564,6 +605,7 @@ impl RequestHandler {
         target: &PaneTargetRef,
         text: String,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let response = self
             .handle_pane_input_ref(PaneInputRequest {
                 target: target.clone(),
@@ -579,6 +621,7 @@ impl RequestHandler {
         target: &PaneTargetRef,
         key: String,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let response = self
             .handle_pane_input_ref(PaneInputRequest {
                 target: target.clone(),
@@ -594,6 +637,7 @@ impl RequestHandler {
         session_target: &WebSessionTarget,
         requester_pid: u32,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
@@ -619,6 +663,7 @@ impl RequestHandler {
         requester_pid: u32,
         pane_id: PaneId,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
@@ -642,6 +687,7 @@ impl RequestHandler {
         pane_id: PaneId,
         adjustment: ResizePaneAdjustment,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
@@ -664,6 +710,7 @@ impl RequestHandler {
         requester_pid: u32,
         direction: SplitDirection,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
@@ -688,6 +735,7 @@ impl RequestHandler {
         session_target: &WebSessionTarget,
         requester_pid: u32,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
@@ -717,6 +765,7 @@ impl RequestHandler {
         session_target: &WebSessionTarget,
         requester_pid: u32,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let (session_target, pane_id) = self
             .web_session_active_pane_identity(session_target)
             .await?;
@@ -742,6 +791,7 @@ impl RequestHandler {
         requester_pid: u32,
         window_index: u32,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let (session_target, window_id) = self
             .current_web_window_identity(session_target, window_index)
             .await?;
@@ -767,6 +817,7 @@ impl RequestHandler {
         attach_pid: u32,
         window_index: u32,
     ) -> Result<bool, RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let session_target = self.current_web_session_target(session_target).await?;
         let (attached_count, terminal_context) = {
             let active_attach = self.active_attach.lock().await;
@@ -837,6 +888,7 @@ impl RequestHandler {
         window_index: u32,
         name: String,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let (session_target, window_id) = self
             .current_web_window_identity(session_target, window_index)
             .await?;
@@ -863,6 +915,7 @@ impl RequestHandler {
         requester_pid: u32,
         window_index: u32,
     ) -> Result<(), RmuxError> {
+        let _admission = self.begin_web_mutation()?;
         let (session_target, window_id) = self
             .current_web_window_identity(session_target, window_index)
             .await?;

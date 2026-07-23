@@ -23,17 +23,26 @@ use super::{
 use crate::keys::{parse_key_code, resolve_hex_key};
 use crate::limits::bounded_repeat_count;
 
+#[path = "send_keys/session_targets.rs"]
+mod session_targets;
+
+#[cfg(windows)]
+use session_targets::console_input_write_sessions;
+use session_targets::input_write_sessions;
+
 impl RequestHandler {
     pub(in crate::handler) async fn handle_send_keys(
         &self,
         request: rmux_proto::SendKeysRequest,
     ) -> Response {
         let key_count = request.keys.len();
-        if key_count == 0 {
+        {
             let state = self.state.lock().await;
             if let Err(error) = pane_id_for_input_target(&state, &request.target) {
                 return Response::Error(ErrorResponse { error });
             }
+        }
+        if key_count == 0 {
             return Response::SendKeys(SendKeysResponse { key_count });
         }
         let keys = if request.keys.is_empty() {
@@ -184,10 +193,18 @@ impl RequestHandler {
         };
         let target = {
             let state = self.state.lock().await;
-            match resolve_input_target(&state, request.target.as_ref(), attached_session.as_ref()) {
+            let target = match resolve_input_target(
+                &state,
+                request.target.as_ref(),
+                attached_session.as_ref(),
+            ) {
                 Ok(target) => target,
                 Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            if let Err(error) = super::super::require_expected_pane_identity(&state, &target) {
+                return Response::Error(ErrorResponse { error });
             }
+            target
         };
 
         let tokens = {
@@ -565,27 +582,4 @@ impl RequestHandler {
         }
         Response::SendKeys(SendKeysResponse { key_count })
     }
-}
-
-fn input_write_sessions(writes: &[PaneInputWrite]) -> Vec<rmux_proto::SessionName> {
-    let mut sessions = Vec::new();
-    for write in writes {
-        let session_name = write.session_name();
-        if !sessions.iter().any(|existing| existing == session_name) {
-            sessions.push(session_name.clone());
-        }
-    }
-    sessions
-}
-
-#[cfg(windows)]
-fn console_input_write_sessions(writes: &[PaneConsoleInputWrite]) -> Vec<rmux_proto::SessionName> {
-    let mut sessions = Vec::new();
-    for write in writes {
-        let session_name = write.session_name();
-        if !sessions.iter().any(|existing| existing == session_name) {
-            sessions.push(session_name.clone());
-        }
-    }
-    sessions
 }

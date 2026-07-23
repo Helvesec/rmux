@@ -4,9 +4,13 @@ mod common;
 
 use std::error::Error;
 use std::io;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{session_name, start_server, ClientConnection, TestHarness, PTY_TEST_LOCK};
+#[cfg(unix)]
+use rmux_proto::KillServerRequest;
 use rmux_proto::{
     AttachMessage, AttachSessionRequest, ListClientsRequest, NewSessionRequest, OptionName,
     Request, Response, ScopeSelector, SetOptionMode, SetOptionRequest, SuspendClientRequest,
@@ -99,6 +103,64 @@ async fn attach_session_status_context_populates_session_attached() -> Result<()
 
     drop(attach_stream);
     handle.shutdown().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn kill_server_reaps_a_running_status_job_descendant() -> Result<(), Box<dyn Error>> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let harness = TestHarness::new("status-job-stop");
+    let socket_path = harness.socket_path().to_path_buf();
+    let probe = StatusJobShutdownProbe::new(&socket_path);
+    let handle = start_server(&harness).await?;
+    let alpha = session_name("alpha");
+
+    let created = common::send_request(
+        &socket_path,
+        &Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 40, rows: 4 }),
+            environment: None,
+        }),
+    )
+    .await?;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    for (option, value) in [
+        (OptionName::StatusLeft, format!("#({})", probe.command())),
+        (OptionName::StatusRight, String::new()),
+    ] {
+        let response = common::send_request(
+            &socket_path,
+            &Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(alpha.clone()),
+                option,
+                value,
+                mode: SetOptionMode::Replace,
+            }),
+        )
+        .await?;
+        assert!(matches!(response, Response::SetOption(_)));
+    }
+
+    let (_response, attach_stream) = ClientConnection::connect(&socket_path)
+        .await?
+        .begin_attach(AttachSessionRequest { target: alpha })
+        .await?;
+    let descendant = probe.wait_for_descendant().await?;
+
+    let killed =
+        common::send_request(&socket_path, &Request::KillServer(KillServerRequest)).await?;
+    assert!(matches!(killed, Response::KillServer(_)));
+    handle.wait().await?;
+
+    assert!(
+        !rmux_os::process::is_live(descendant),
+        "status job descendant {descendant} survived kill-server"
+    );
+    drop(attach_stream);
     Ok(())
 }
 
@@ -394,6 +456,76 @@ async fn read_attach_message(
         ))
         .into()),
     }
+}
+
+#[cfg(unix)]
+struct StatusJobShutdownProbe {
+    process_group: PathBuf,
+    descendant: PathBuf,
+}
+
+#[cfg(unix)]
+impl StatusJobShutdownProbe {
+    fn new(socket_path: &Path) -> Self {
+        let root = socket_path.parent().expect("test socket has a parent");
+        Self {
+            process_group: root.join("status-group.pid"),
+            descendant: root.join("status-descendant.pid"),
+        }
+    }
+
+    fn command(&self) -> String {
+        format!(
+            "printf '%s\\n' \"$$\" > {}; \
+             sh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"$1\"; \
+             while :; do sleep 30; done' sh {} & wait",
+            shell_quote_path(&self.process_group),
+            shell_quote_path(&self.descendant),
+        )
+    }
+
+    async fn wait_for_descendant(&self) -> Result<u32, Box<dyn Error>> {
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        loop {
+            if let Some(pid) = read_pid(&self.descendant) {
+                return Ok(pid);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::other("status job descendant never started").into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StatusJobShutdownProbe {
+    fn drop(&mut self) {
+        use rustix::process::{kill_process, kill_process_group, Pid, Signal};
+
+        if let Some(process_group) = read_pid(&self.process_group)
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(Pid::from_raw)
+        {
+            let _ = kill_process_group(process_group, Signal::KILL);
+        }
+        if let Some(descendant) = read_pid(&self.descendant)
+            .and_then(|pid| i32::try_from(pid).ok())
+            .and_then(Pid::from_raw)
+        {
+            let _ = kill_process(descendant, Signal::KILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[cfg(unix)]
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
 }
 
 fn extract_tick_second(output: &str) -> Option<String> {

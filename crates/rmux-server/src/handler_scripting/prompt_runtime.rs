@@ -15,7 +15,6 @@ use super::format_context::{collect_parse_time_values, format_context_for_target
 use super::parser_context::command_parser_from_state;
 use super::prompt_parse::{ParsedCommandPromptCommand, ParsedConfirmBeforeCommand};
 use super::queue::{prompt_queue_action_from_result, QueueCommandAction, QueueExecutionContext};
-use super::runtime::spawn_background_async;
 use super::targets::active_session_target;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 
@@ -98,6 +97,7 @@ impl RequestHandler {
         command: ParsedCommandPromptCommand,
         context: &QueueExecutionContext,
     ) -> Result<CommandPromptPlan, RmuxError> {
+        let origin = self.capture_requester_origin(requester_pid).await;
         let session_candidate = if context.current_target.is_none() {
             self.current_session_candidate(requester_pid).await
         } else {
@@ -162,9 +162,13 @@ impl RequestHandler {
         };
 
         Ok(CommandPromptPlan {
-            requester_pid,
+            origin,
             target_client: command.target_client.clone(),
-            context: context.clone(),
+            context: if command.background {
+                context.clone().without_mouse_origin()
+            } else {
+                context.clone()
+            },
             fields,
             template,
             flags: command.flags,
@@ -257,7 +261,7 @@ impl RequestHandler {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(task);
         } else {
-            let _ = spawn_background_async("rmux-attached-prompt-finish", move || task);
+            let _ = self.spawn_background_task("rmux-attached-prompt-finish", move || task);
         }
     }
 
@@ -267,6 +271,7 @@ impl RequestHandler {
         command: ParsedConfirmBeforeCommand,
         context: &QueueExecutionContext,
     ) -> Result<ConfirmBeforePlan, RmuxError> {
+        let origin = self.capture_requester_origin(requester_pid).await;
         let session_candidate = if context.current_target.is_none() {
             self.current_session_candidate(requester_pid).await
         } else {
@@ -319,9 +324,13 @@ impl RequestHandler {
         };
 
         Ok(ConfirmBeforePlan {
-            requester_pid,
+            origin,
             target_client: command.target_client.clone(),
-            context: context.clone(),
+            context: if command.background {
+                context.clone().without_mouse_origin()
+            } else {
+                context.clone()
+            },
             prompt,
             template,
             confirm_key: command.confirm_key,
@@ -339,6 +348,10 @@ async fn finish_attached_prompt_binding_task(
     receiver: tokio::sync::oneshot::Receiver<PromptQueueResult>,
 ) {
     let result = receiver.await.unwrap_or_else(|_| PromptQueueResult::noop());
+    let _access = result
+        .origin
+        .as_ref()
+        .map(|origin| handler.begin_requester_origin_access(origin));
     if let Some((commands, context)) = result.inserted {
         match identity {
             Some((identity, session_name, session_id)) => {

@@ -18,8 +18,9 @@ use crate::SessionName;
 pub enum ProcessCommandSpec {
     /// Execute a program directly with structured argv.
     ///
-    /// On Windows, `.bat` and `.cmd` targets run through `cmd.exe`, so its
-    /// percent-variable expansion still applies.
+    /// On Windows, `.bat` and `.cmd` targets are rejected because `cmd.exe`
+    /// cannot preserve arbitrary argv boundaries. Use [`Self::Shell`] when
+    /// shell interpretation is intentional, or target a native executable.
     Argv(Vec<String>),
     /// Execute command text through the configured shell.
     Shell(String),
@@ -67,8 +68,9 @@ pub struct ProcessSpec {
 impl ProcessSpec {
     /// Creates a process spec that executes direct argv.
     ///
-    /// On Windows, use a native executable when arguments must bypass
-    /// `cmd.exe` expansion; batch targets inherently run through `cmd.exe`.
+    /// On Windows, `.bat` and `.cmd` targets are rejected; use a native
+    /// executable for literal argv, or [`Self::shell`] when shell
+    /// interpretation is intentional.
     #[must_use]
     pub fn argv<I, S>(command: I) -> Self
     where

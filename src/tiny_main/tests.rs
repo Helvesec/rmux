@@ -1230,6 +1230,26 @@ fn unsupported_top_level_flags_keep_benchmark_shapes_on_helper_path() {
 }
 
 #[test]
+fn repeated_idempotent_top_level_flags_keep_tiny_on_helper_path() {
+    for args in [
+        ["rmux", "-2", "-2", "list-sessions"].as_slice(),
+        ["rmux", "-22", "--", "list-sessions"].as_slice(),
+        ["rmux", "-D", "-D"].as_slice(),
+        ["rmux", "-DD", "--"].as_slice(),
+        ["rmux", "-l", "-l", "list-sessions"].as_slice(),
+        ["rmux", "-ll", "--", "list-sessions"].as_slice(),
+        ["rmux", "-N", "-N", "list-sessions"].as_slice(),
+        ["rmux", "-NN", "--", "list-sessions"].as_slice(),
+        ["rmux", "-u", "-u", "list-sessions"].as_slice(),
+        ["rmux", "-uu", "--", "list-sessions"].as_slice(),
+        ["rmux", "-u2lN", "-Nlu2", "--", "list-sessions"].as_slice(),
+        ["rmux", "-DD", "-uu", "-22", "-ll", "--"].as_slice(),
+    ] {
+        assert_tiny_fallback(args);
+    }
+}
+
+#[test]
 fn readme_benchmark_shapes_stay_on_tiny_direct_paths() {
     assert_tiny_direct(&["rmux", "start-server"], "start-server");
     assert_tiny_direct(&["rmux", "list-sessions"], "list-sessions");

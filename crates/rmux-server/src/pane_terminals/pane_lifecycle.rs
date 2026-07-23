@@ -75,7 +75,10 @@ impl HandlerState {
             session,
             &self.options,
             window_index,
+            pane.index(),
             pane.geometry(),
+            false,
+            false,
         );
         let mut profile = TerminalProfile::for_session_with_base_environment(
             &self.environment,
@@ -205,7 +208,10 @@ impl HandlerState {
                     session,
                     &self.options,
                     pane.window_index,
+                    pane.index,
                     pane.geometry,
+                    false,
+                    false,
                 ),
             )
         };
@@ -301,16 +307,23 @@ impl HandlerState {
             let pane_geometries = window
                 .panes()
                 .iter()
-                .map(|pane| SessionPane {
-                    id: pane.id(),
-                    window_index,
-                    index: pane.index(),
-                    geometry: pane_terminal_geometry_for_session(
-                        session,
-                        &self.options,
+                .map(|pane| {
+                    let (alternate_on, copy_mode_active) =
+                        self.pane_viewport_state(session_name, window_index, pane.id());
+                    SessionPane {
+                        id: pane.id(),
                         window_index,
-                        pane.geometry(),
-                    ),
+                        index: pane.index(),
+                        geometry: pane_terminal_geometry_for_session(
+                            session,
+                            &self.options,
+                            window_index,
+                            pane.index(),
+                            pane.geometry(),
+                            alternate_on,
+                            copy_mode_active,
+                        ),
+                    }
                 })
                 .collect::<Vec<_>>();
             (runtime_session_name, window.size(), pane_geometries)
@@ -391,7 +404,10 @@ impl HandlerState {
                     session,
                     &self.options,
                     window_index,
+                    pane.index(),
                     pane.geometry(),
+                    false,
+                    false,
                 ),
                 session.cwd().map(Path::to_path_buf),
             )
@@ -841,7 +857,10 @@ impl HandlerState {
                     session,
                     &self.options,
                     window_index,
+                    pane.index(),
                     pane.geometry(),
+                    false,
+                    false,
                 ),
                 session.cwd().map(Path::to_path_buf),
             )

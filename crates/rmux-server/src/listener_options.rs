@@ -3,6 +3,8 @@ use rmux_core::events::SubscriptionLimits;
 use crate::signals::SignalWatcher;
 #[cfg(unix)]
 use crate::unix_socket::SocketFileIdentity;
+#[cfg(unix)]
+use crate::unix_socket_access::UnixSocketAccessController;
 use crate::ConfigLoadOptions;
 
 pub(crate) struct ServeOptions {
@@ -16,6 +18,8 @@ pub(crate) struct ServeOptions {
     pub(crate) web_required: bool,
     #[cfg(unix)]
     pub(crate) socket_identity: Option<SocketFileIdentity>,
+    #[cfg(unix)]
+    pub(crate) socket_access: Option<UnixSocketAccessController>,
 }
 
 impl ServeOptions {
@@ -35,6 +39,8 @@ impl ServeOptions {
             web_required: false,
             #[cfg(unix)]
             socket_identity: None,
+            #[cfg(unix)]
+            socket_access: None,
         }
     }
 
@@ -58,6 +64,12 @@ impl ServeOptions {
         socket_identity: Option<SocketFileIdentity>,
     ) -> Self {
         self.socket_identity = socket_identity;
+        self
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_socket_access(mut self, socket_access: UnixSocketAccessController) -> Self {
+        self.socket_access = Some(socket_access);
         self
     }
 

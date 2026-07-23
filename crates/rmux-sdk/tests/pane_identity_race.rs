@@ -7,17 +7,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse, ListPanesResponse,
-    ListSessionsResponse, ListWindowsResponse, PaneOutputCursor, PaneOutputCursorResponse,
-    PaneOutputEvent, PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneSnapshotCell,
-    PaneSnapshotCursor, PaneSnapshotResponse, PaneStateSnapshot, PaneStateSubscriptionId,
-    PaneTarget, PaneTargetRef, Request, ResizePaneAdjustment, ResizePaneResponse, Response,
-    SubscribePaneOutputResponse, SubscribePaneStateResponse, TerminalSize, WindowListEntry,
-    WindowTarget, CAPABILITY_HANDSHAKE,
+    encode_frame, CommandOutput, ErrorResponse, FrameDecoder, HandshakeResponse, KillPaneResponse,
+    ListPanesResponse, ListSessionsResponse, ListWindowsResponse, PaneOutputCursor,
+    PaneOutputCursorResponse, PaneOutputEvent, PaneOutputSubscriptionId,
+    PaneOutputSubscriptionStart, PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse,
+    PaneStateSnapshot, PaneStateSubscriptionId, PaneTarget, PaneTargetRef, Request,
+    ResizePaneAdjustment, ResizePaneResponse, RespawnPaneResponse, Response, SelectPaneResponse,
+    SendKeysResponse, SubscribePaneOutputResponse, SubscribePaneStateResponse, TerminalSize,
+    WindowListEntry, WindowTarget, CAPABILITY_HANDSHAKE,
 };
 use rmux_sdk::{
-    LayoutName, Pane, PaneId, PaneRef, PaneStateEvent, PaneStateEventsOptions, RmuxBuilder,
-    RmuxError, SessionId, SessionName, TerminalSizeSpec, WindowId,
+    LayoutName, Pane, PaneCloseOutcome, PaneId, PaneRef, PaneStateEvent, PaneStateEventsOptions,
+    RmuxBuilder, RmuxError, SessionId, SessionName, TerminalLoadState, TerminalSizeSpec, WindowId,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -99,6 +100,317 @@ async fn stable_id_render_stream_survives_inter_session_move_overlapping_open() 
     assert_eq!(update.snapshot().revision, 42);
     assert_eq!(update.snapshot().visible_text(), "updated");
     drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_resumes_a_wake_cancelled_during_debounce() -> TestResult {
+    let socket = TestSocket::new("render-cancel-debounce")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (event_sent, mut event_observed) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let subscription_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_snapshot(&mut peer, 41, "base").await?;
+        expect_output_event(&mut peer, subscription_id).await?;
+        let _ = event_sent.send(());
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_snapshot(&mut peer, 42, "updated").await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let mut render = pane
+        .render_stream()
+        .await?
+        .with_debounce(Duration::from_secs(1));
+    let mut interrupted = Box::pin(render.next());
+    tokio::select! {
+        result = &mut interrupted => {
+            return Err(format!("render completed before debounce cancellation: {result:?}").into());
+        }
+        observed = &mut event_observed => observed.map_err(|_| "server dropped event signal")?,
+    }
+    tokio::select! {
+        result = &mut interrupted => {
+            return Err(format!("render completed inside debounce window: {result:?}").into());
+        }
+        () = tokio::time::sleep(Duration::from_millis(250)) => {}
+    }
+    drop(interrupted);
+
+    let debounce_armed = format!("{render:?}").contains("debouncing");
+    assert!(
+        debounce_armed,
+        "the output wake must arm a persistent debounce before cancellation"
+    );
+
+    let update = render
+        .next()
+        .await?
+        .expect("the consumed wake remains pending after cancellation");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "updated");
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_resumes_the_same_snapshot_after_cancellation() -> TestResult {
+    let socket = TestSocket::new("render-cancel-snapshot")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (snapshot_started, snapshot_observed) = tokio::sync::oneshot::channel();
+    let (release_snapshot, release) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let subscription_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_snapshot(&mut peer, 41, "base").await?;
+        expect_output_event(&mut peer, subscription_id).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+
+        let request = peer.expect_request().await?;
+        let Request::PaneSnapshotRef(request) = request else {
+            return Err(format!("expected cancellable pane snapshot, got {request:?}").into());
+        };
+        assert_eq!(request.target, resolved_target());
+        let _ = snapshot_started.send(());
+        release
+            .await
+            .map_err(|_| "snapshot release signal dropped")?;
+        peer.write_response(Response::PaneSnapshot(snapshot_response("updated", 42)))
+            .await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let mut render = pane.render_stream().await?.with_debounce(Duration::ZERO);
+    let mut interrupted = Box::pin(render.next());
+    tokio::select! {
+        result = &mut interrupted => {
+            return Err(format!("render completed before snapshot cancellation: {result:?}").into());
+        }
+        observed = snapshot_observed => observed.map_err(|_| "server dropped snapshot signal")?,
+    }
+    drop(interrupted);
+    release_snapshot
+        .send(())
+        .map_err(|_| "render stream dropped its pending snapshot")?;
+
+    let update = render
+        .next()
+        .await?
+        .expect("the in-flight snapshot remains pending after cancellation");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "updated");
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_stream_resumes_an_output_cursor_cancelled_before_wake() -> TestResult {
+    let socket = TestSocket::new("render-cancel-output")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (cursor_started, cursor_observed) = tokio::sync::oneshot::channel();
+    let (release_cursor, release) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        let subscription_id = expect_output_subscription(&mut peer).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_snapshot(&mut peer, 41, "base").await?;
+
+        let request = peer.expect_request().await?;
+        let Request::PaneOutputCursor(request) = request else {
+            return Err(format!("expected cancellable output cursor, got {request:?}").into());
+        };
+        assert_eq!(request.subscription_id, subscription_id);
+        let _ = cursor_started.send(());
+        release
+            .await
+            .map_err(|_| "output cursor release signal dropped")?;
+        peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
+            subscription_id,
+            cursor: PaneOutputCursor {
+                next_sequence: 2,
+                missed_events: 0,
+            },
+            events: vec![PaneOutputEvent {
+                sequence: 1,
+                bytes: b"updated".to_vec(),
+            }],
+            limited: false,
+        }))
+        .await?;
+
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_snapshot(&mut peer, 42, "updated").await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let mut render = pane.render_stream().await?.with_debounce(Duration::ZERO);
+    let mut interrupted = Box::pin(render.next());
+    tokio::select! {
+        result = &mut interrupted => {
+            return Err(format!("render completed before cursor cancellation: {result:?}").into());
+        }
+        observed = cursor_observed => observed.map_err(|_| "server dropped cursor signal")?,
+    }
+    drop(interrupted);
+    release_cursor
+        .send(())
+        .map_err(|_| "render stream dropped its output cursor")?;
+
+    let update = render
+        .next()
+        .await?
+        .expect("the in-flight output wake remains pending after cancellation");
+    assert_eq!(update.snapshot().revision, 42);
+    assert_eq!(update.snapshot().visible_text(), "updated");
+    drop(render);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stable_id_close_re_resolves_after_an_inter_session_move() -> TestResult {
+    let socket = TestSocket::new("close-post-resolve-move")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_pane_kill_stale(&mut peer, preferred_target()).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_pane_kill_success(&mut peer, resolved_target()).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let outcome = pane.close().await?;
+    assert!(matches!(
+        outcome,
+        PaneCloseOutcome::Closed {
+            window_destroyed: false,
+            ..
+        }
+    ));
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stable_id_close_confirms_global_absence_before_reporting_already_closed() -> TestResult {
+    let socket = TestSocket::new("close-confirm-global-absence")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_pane_kill_stale(&mut peer, preferred_target()).await?;
+        expect_absent_global_resolution(&mut peer).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let outcome = pane.close().await?;
+    assert!(matches!(outcome, PaneCloseOutcome::AlreadyClosed { .. }));
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stable_id_close_does_not_report_success_when_the_retry_target_moves_again() -> TestResult {
+    let socket = TestSocket::new("close-retry-moves-again")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_pane_kill_stale(&mut peer, preferred_target()).await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_pane_kill_stale(&mut peer, resolved_target()).await?;
+        expect_direct_source_resolution(&mut peer).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    let error = pane
+        .close()
+        .await
+        .expect_err("a second move must not succeed");
+    assert!(matches!(
+        error,
+        RmuxError::PaneNotFound {
+            ref session_name,
+            pane_id: missing_id,
+            ..
+        } if session_name == &destination_session() && missing_id == pane_id()
+    ));
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stable_id_set_title_re_resolves_after_an_inter_session_move() -> TestResult {
+    let socket = TestSocket::new("set-title-post-resolve-move")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_by_id_handshake(&mut peer).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_pane_title_set_stale(&mut peer, preferred_target(), "renamed").await?;
+        expect_direct_beta_resolution(&mut peer).await?;
+        expect_pane_title_set_success(&mut peer, resolved_target(), "renamed").await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    pane.set_title("renamed").await?;
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stable_id_title_is_read_from_the_session_that_currently_contains_it() -> TestResult {
+    let socket = TestSocket::new("get-title-post-resolve-move")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_initial_preferred_lookup(&mut peer).await?;
+        expect_pane_title(&mut peer, &preferred_session(), None).await?;
+        expect_session_inventory(&mut peer).await?;
+        expect_pane_title(&mut peer, &destination_session(), Some("%7\tmoved\n")).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_by_id(socket.path()).await?;
+    assert_eq!(pane.title().await?.as_deref(), Some("moved"));
     drop(pane);
     server.await??;
     Ok(())
@@ -433,6 +745,239 @@ async fn slot_wait_exit_finishes_for_original_after_reindex() -> TestResult {
 }
 
 #[tokio::test]
+async fn slot_visible_wait_never_matches_replacement_output() -> TestResult {
+    let socket = TestSocket::new("visible-wait-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(serve_slot_replacement_race(
+        listener,
+        SlotReplacementRace::VisibleWait,
+    ));
+
+    let pane = pane_at_slot_with_timeout(socket.path(), Duration::from_millis(80)).await?;
+    let error = pane
+        .expect_visible_text()
+        .to_contain("READY")
+        .poll_interval(Duration::from_millis(1))
+        .await
+        .expect_err("replacement output must not satisfy the visible wait");
+    assert_wait_deadline(error);
+    drop(pane);
+
+    let observation = server.await??;
+    assert_eq!(observation.slot_lookups, 1);
+    assert_eq!(observation.replacement_snapshots, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn vacant_slot_visible_wait_never_observes_a_later_replacement() -> TestResult {
+    let socket = TestSocket::new("visible-wait-vacant-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_vacant_slot_replacement(listener, done_rx));
+
+    let pane = pane_at_slot(socket.path()).await?;
+    let error = pane
+        .expect_visible_text()
+        .to_contain("READY")
+        .timeout(Duration::from_millis(20))
+        .poll_interval(Duration::from_millis(1))
+        .await
+        .expect_err("a slot vacant at preflight must stay vacant for the wait");
+    assert_wait_deadline(error);
+    let _ = done_tx.send(());
+    drop(pane);
+
+    assert!(!server.await??, "wait targeted the replacement pane");
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_load_state_keeps_the_first_pane_identity() -> TestResult {
+    let socket = TestSocket::new("load-state-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(serve_slot_replacement_race(
+        listener,
+        SlotReplacementRace::LoadState,
+    ));
+
+    let pane = pane_at_slot(socket.path()).await?;
+    let snapshot = pane
+        .wait_for_load_state(TerminalLoadState::Quiet)
+        .stable_for(Duration::from_millis(5))
+        .poll_interval(Duration::from_millis(1))
+        .timeout(Duration::from_millis(100))
+        .await?;
+    assert_eq!(snapshot.visible_text(), "original");
+    drop(pane);
+
+    let observation = server.await??;
+    assert_eq!(observation.slot_lookups, 1);
+    assert_eq!(observation.replacement_snapshots, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn vacant_slot_load_state_never_observes_a_later_replacement() -> TestResult {
+    let socket = TestSocket::new("load-state-vacant-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_vacant_slot_replacement(listener, done_rx));
+
+    let pane = pane_at_slot(socket.path()).await?;
+    let snapshot = pane
+        .wait_for_load_state(TerminalLoadState::Quiet)
+        .stable_for(Duration::from_millis(2))
+        .poll_interval(Duration::from_millis(1))
+        .timeout(Duration::from_millis(20))
+        .await?;
+    assert_eq!(snapshot.revision, 0);
+    let _ = done_tx.send(());
+    drop(pane);
+
+    assert!(!server.await??, "load-state wait read the replacement pane");
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_locator_fill_never_targets_a_replacement() -> TestResult {
+    let socket = TestSocket::new("locator-fill-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(serve_slot_replacement_race(
+        listener,
+        SlotReplacementRace::LocatorFill,
+    ));
+
+    let pane = pane_at_slot(socket.path()).await?;
+    let error = pane
+        .get_by_text("READY")
+        .timeout(Duration::from_millis(80))
+        .poll_interval(Duration::from_millis(1))
+        .fill("PAYLOAD")
+        .await
+        .expect_err("the locator must not follow a replacement pane");
+    assert_wait_deadline(error);
+    drop(pane);
+
+    let observation = server.await??;
+    assert_eq!(observation.slot_lookups, 1);
+    assert_eq!(observation.replacement_snapshots, 0);
+    assert!(observation.input_targets.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn vacant_slot_locator_fill_never_targets_a_later_replacement() -> TestResult {
+    let socket = TestSocket::new("locator-fill-vacant-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_vacant_slot_replacement(listener, done_rx));
+
+    let pane = pane_at_slot(socket.path()).await?;
+    let error = pane
+        .get_by_text("READY")
+        .timeout(Duration::from_millis(20))
+        .poll_interval(Duration::from_millis(1))
+        .fill("PAYLOAD")
+        .await
+        .expect_err("a slot vacant at preflight must stay vacant for the action");
+    assert_wait_deadline(error);
+    let _ = done_tx.send(());
+    drop(pane);
+
+    assert!(
+        !server.await??,
+        "locator action targeted the replacement pane"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_locator_assertion_never_matches_a_replacement() -> TestResult {
+    let socket = TestSocket::new("locator-assert-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(serve_slot_replacement_race(
+        listener,
+        SlotReplacementRace::LocatorAssertion,
+    ));
+
+    let pane = pane_at_slot(socket.path()).await?;
+    let error = pane
+        .get_by_text("READY")
+        .timeout(Duration::from_millis(80))
+        .poll_interval(Duration::from_millis(1))
+        .expect()
+        .to_be_visible()
+        .await
+        .expect_err("the locator assertion must not follow a replacement pane");
+    assert_wait_deadline(error);
+    drop(pane);
+
+    let observation = server.await??;
+    assert_eq!(observation.slot_lookups, 1);
+    assert_eq!(observation.replacement_snapshots, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_mouse_click_keeps_one_identity_for_press_and_release() -> TestResult {
+    let socket = TestSocket::new("mouse-click-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(serve_slot_replacement_race(
+        listener,
+        SlotReplacementRace::MouseClick,
+    ));
+
+    let pane = pane_at_slot(socket.path()).await?;
+    pane.mouse().click(2, 4).await?;
+    drop(pane);
+
+    let observation = server.await??;
+    assert_eq!(observation.slot_lookups, 1);
+    assert_eq!(observation.input_targets, vec![pane_id(), pane_id()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn vacant_slot_mouse_click_never_targets_a_later_replacement() -> TestResult {
+    let socket = TestSocket::new("mouse-click-vacant-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(serve_vacant_slot_replacement(listener, done_rx));
+
+    let pane = pane_at_slot(socket.path()).await?;
+    pane.mouse()
+        .click(2, 4)
+        .await
+        .expect_err("a click must fail when its preflighted slot is vacant");
+    let _ = done_tx.send(());
+    drop(pane);
+
+    assert!(!server.await??, "mouse click targeted the replacement pane");
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_spawn_title_keeps_the_respawned_pane_identity() -> TestResult {
+    let socket = TestSocket::new("spawn-title-slot-reuse")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(serve_slot_replacement_race(
+        listener,
+        SlotReplacementRace::SpawnTitle,
+    ));
+
+    let pane = pane_at_slot(socket.path()).await?;
+    let target = pane.spawn(["echo", "ready"]).title("pinned-title").await?;
+    assert_eq!(target, PaneRef::new(preferred_session(), 0, 1));
+    drop(pane);
+
+    let observation = server.await??;
+    assert_eq!(observation.slot_lookups, 1);
+    assert_eq!(observation.mutation_targets, vec![pane_id(), pane_id()]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn stable_id_state_stream_retries_a_move_after_resolution() -> TestResult {
     let socket = TestSocket::new("state-post-resolve")?;
     let listener = UnixListener::bind(socket.path())?;
@@ -485,6 +1030,195 @@ async fn pane_at_slot_with_timeout(socket_path: &Path, timeout: Duration) -> Tes
         .default_timeout(timeout)
         .build();
     Ok(rmux.pane(PaneRef::new(preferred_session(), 0, 0)).await?)
+}
+
+#[derive(Clone, Copy)]
+enum SlotReplacementRace {
+    VisibleWait,
+    LoadState,
+    LocatorFill,
+    LocatorAssertion,
+    MouseClick,
+    SpawnTitle,
+}
+
+#[derive(Debug, Default)]
+struct SlotReplacementObservation {
+    slot_lookups: usize,
+    replacement_snapshots: usize,
+    input_targets: Vec<PaneId>,
+    mutation_targets: Vec<PaneId>,
+}
+
+async fn serve_slot_replacement_race(
+    listener: UnixListener,
+    race: SlotReplacementRace,
+) -> TestResult<SlotReplacementObservation> {
+    let mut peer = accept_peer(&listener).await?;
+    let mut observation = SlotReplacementObservation::default();
+    while let Some(request) = peer.read_request().await? {
+        match request {
+            Request::ListPanes(request) => {
+                assert_eq!(request.target, preferred_session());
+                assert_eq!(
+                    request.format.as_deref(),
+                    Some("#{window_index}:#{pane_index}:#{pane_id}")
+                );
+                let output = if request.target_window_index == Some(0) {
+                    observation.slot_lookups += 1;
+                    if observation.slot_lookups == 1 {
+                        "0:0:%7\n"
+                    } else {
+                        "0:0:%8\n"
+                    }
+                } else {
+                    assert_eq!(request.target_window_index, None);
+                    "0:0:%8\n0:1:%7\n"
+                };
+                peer.write_response(Response::ListPanes(ListPanesResponse {
+                    output: CommandOutput::from_stdout(output),
+                }))
+                .await?;
+            }
+            Request::Handshake(_) => {
+                peer.write_response(Response::Handshake(HandshakeResponse::current()))
+                    .await?;
+            }
+            Request::PaneSnapshotRef(request) => {
+                let target_id = request
+                    .target
+                    .pane_id()
+                    .expect("snapshot race targets are id-based");
+                let (text, revision) = if target_id == pane_id() {
+                    match race {
+                        SlotReplacementRace::LoadState => ("original", 1),
+                        SlotReplacementRace::VisibleWait
+                        | SlotReplacementRace::LocatorFill
+                        | SlotReplacementRace::LocatorAssertion
+                        | SlotReplacementRace::MouseClick
+                        | SlotReplacementRace::SpawnTitle => ("loading", 1),
+                    }
+                } else {
+                    assert_eq!(target_id, PaneId::new(8));
+                    observation.replacement_snapshots += 1;
+                    match race {
+                        SlotReplacementRace::LoadState => ("replacement", 2),
+                        SlotReplacementRace::VisibleWait
+                        | SlotReplacementRace::LocatorFill
+                        | SlotReplacementRace::LocatorAssertion
+                        | SlotReplacementRace::MouseClick
+                        | SlotReplacementRace::SpawnTitle => ("READY", 2),
+                    }
+                };
+                peer.write_response(Response::PaneSnapshot(snapshot_response(text, revision)))
+                    .await?;
+            }
+            Request::PaneInput(request) => {
+                observation.input_targets.push(
+                    request
+                        .target
+                        .pane_id()
+                        .expect("input race targets are id-based"),
+                );
+                peer.write_response(Response::SendKeys(SendKeysResponse { key_count: 1 }))
+                    .await?;
+            }
+            Request::PaneRespawn(request) => {
+                observation.mutation_targets.push(
+                    request
+                        .target
+                        .pane_id()
+                        .expect("respawn race targets are id-based"),
+                );
+                peer.write_response(Response::RespawnPane(RespawnPaneResponse {
+                    target: preferred_moved_slot(),
+                }))
+                .await?;
+            }
+            Request::PaneSelect(request) => {
+                assert_eq!(request.title.as_deref(), Some("pinned-title"));
+                observation.mutation_targets.push(
+                    request
+                        .target
+                        .pane_id()
+                        .expect("title race targets are id-based"),
+                );
+                peer.write_response(Response::SelectPane(SelectPaneResponse {
+                    target: preferred_moved_slot(),
+                }))
+                .await?;
+            }
+            request => {
+                return Err(format!("unexpected slot replacement request: {request:?}").into())
+            }
+        }
+    }
+    Ok(observation)
+}
+
+async fn serve_vacant_slot_replacement(
+    listener: UnixListener,
+    mut done: tokio::sync::oneshot::Receiver<()>,
+) -> TestResult<bool> {
+    let mut peer = accept_peer(&listener).await?;
+    let Some(Request::ListPanes(request)) = peer.read_request().await? else {
+        return Err("expected initial vacant-slot lookup".into());
+    };
+    assert_eq!(request.target, preferred_session());
+    assert_eq!(request.target_window_index, Some(0));
+    peer.write_response(Response::ListPanes(ListPanesResponse {
+        output: CommandOutput::from_stdout(Vec::new()),
+    }))
+    .await?;
+
+    let mut replacement_targeted = false;
+    loop {
+        let request = tokio::select! {
+            _ = &mut done => return Ok(replacement_targeted),
+            request = peer.read_request() => request?,
+        };
+        let Some(request) = request else {
+            return Ok(replacement_targeted);
+        };
+        match request {
+            Request::ListPanes(request) => {
+                replacement_targeted = true;
+                assert_eq!(request.target, preferred_session());
+                peer.write_response(Response::ListPanes(ListPanesResponse {
+                    output: CommandOutput::from_stdout("0:0:%8\n"),
+                }))
+                .await?;
+            }
+            Request::Handshake(_) => {
+                peer.write_response(Response::Handshake(HandshakeResponse::current()))
+                    .await?;
+            }
+            Request::PaneSnapshotRef(_) => {
+                replacement_targeted = true;
+                peer.write_response(Response::PaneSnapshot(snapshot_response("READY", 2)))
+                    .await?;
+            }
+            Request::PaneInput(_) => {
+                replacement_targeted = true;
+                peer.write_response(Response::SendKeys(SendKeysResponse { key_count: 1 }))
+                    .await?;
+            }
+            request => {
+                return Err(
+                    format!("unexpected vacant-slot replacement request: {request:?}").into(),
+                )
+            }
+        }
+    }
+}
+
+fn assert_wait_deadline(error: RmuxError) {
+    let timed_out = match &error {
+        RmuxError::WaitTimeout { .. } => true,
+        RmuxError::Transport { source, .. } => source.kind() == io::ErrorKind::TimedOut,
+        _ => false,
+    };
+    assert!(timed_out, "expected a typed wait timeout, got {error:?}");
 }
 
 async fn assert_info_retries_after_slot_replacement(stable: bool) -> TestResult {
@@ -625,6 +1359,18 @@ async fn expect_direct_source_resolution(peer: &mut Peer) -> TestResult {
     expect_list_panes(peer, &source_session(), Some("5:3:%7\n")).await
 }
 
+async fn expect_absent_global_resolution(peer: &mut Peer) -> TestResult {
+    expect_list_panes(peer, &preferred_session(), None).await?;
+    expect_session_inventory(peer).await?;
+    expect_list_panes(peer, &destination_session(), None).await?;
+    expect_list_panes(peer, &source_session(), None).await?;
+
+    expect_list_panes(peer, &preferred_session(), None).await?;
+    expect_session_inventory(peer).await?;
+    expect_list_panes(peer, &source_session(), None).await?;
+    expect_list_panes(peer, &destination_session(), None).await
+}
+
 async fn expect_list_panes(
     peer: &mut Peer,
     session_name: &SessionName,
@@ -709,6 +1455,91 @@ async fn expect_resize(peer: &mut Peer, expected: ResizePaneAdjustment) -> TestR
     peer.write_response(Response::ResizePane(ResizePaneResponse {
         target: preferred_moved_slot(),
         adjustment: request.adjustment,
+    }))
+    .await
+}
+
+async fn expect_pane_kill_stale(peer: &mut Peer, expected_target: PaneTargetRef) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::PaneKill(request) = request else {
+        return Err(format!("expected pane kill, got {request:?}").into());
+    };
+    assert_eq!(request.target, expected_target);
+    assert!(!request.kill_all_except);
+    peer.write_response(Response::Error(ErrorResponse {
+        error: rmux_proto::RmuxError::pane_not_found(
+            expected_target.session_name().clone(),
+            pane_id(),
+        ),
+    }))
+    .await
+}
+
+async fn expect_pane_kill_success(peer: &mut Peer, expected_target: PaneTargetRef) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::PaneKill(request) = request else {
+        return Err(format!("expected pane kill retry, got {request:?}").into());
+    };
+    assert_eq!(request.target, expected_target);
+    assert!(!request.kill_all_except);
+    peer.write_response(Response::KillPane(KillPaneResponse {
+        target: resolved_slot(),
+        window_destroyed: false,
+    }))
+    .await
+}
+
+async fn expect_pane_title_set_stale(
+    peer: &mut Peer,
+    expected_target: PaneTargetRef,
+    expected_title: &str,
+) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::PaneSelect(request) = request else {
+        return Err(format!("expected pane title mutation, got {request:?}").into());
+    };
+    assert_eq!(request.target, expected_target);
+    assert_eq!(request.title.as_deref(), Some(expected_title));
+    peer.write_response(Response::Error(ErrorResponse {
+        error: rmux_proto::RmuxError::pane_not_found(
+            expected_target.session_name().clone(),
+            pane_id(),
+        ),
+    }))
+    .await
+}
+
+async fn expect_pane_title_set_success(
+    peer: &mut Peer,
+    expected_target: PaneTargetRef,
+    expected_title: &str,
+) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::PaneSelect(request) = request else {
+        return Err(format!("expected pane title retry, got {request:?}").into());
+    };
+    assert_eq!(request.target, expected_target);
+    assert_eq!(request.title.as_deref(), Some(expected_title));
+    peer.write_response(Response::SelectPane(SelectPaneResponse {
+        target: resolved_slot(),
+    }))
+    .await
+}
+
+async fn expect_pane_title(
+    peer: &mut Peer,
+    session_name: &SessionName,
+    output: Option<&str>,
+) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::ListPanes(request) = request else {
+        return Err(format!("expected pane title list for {session_name}, got {request:?}").into());
+    };
+    assert_eq!(&request.target, session_name);
+    assert_eq!(request.target_window_index, None);
+    assert_eq!(request.format.as_deref(), Some("#{pane_id}\t#{pane_title}"));
+    peer.write_response(Response::ListPanes(ListPanesResponse {
+        output: CommandOutput::from_stdout(output.unwrap_or_default().as_bytes().to_vec()),
     }))
     .await
 }

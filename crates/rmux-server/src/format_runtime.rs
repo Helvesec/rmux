@@ -158,6 +158,10 @@ impl<'a> RuntimeFormatContext<'a> {
         .ok()
     }
 
+    pub(crate) fn status_jobs(&self) -> Option<&crate::status_jobs::StatusJobRuntime> {
+        self.state.map(HandlerState::status_jobs)
+    }
+
     fn option_store(&self) -> Option<&OptionStore> {
         self.options
     }
@@ -400,6 +404,20 @@ impl<'a> RuntimeFormatContext<'a> {
         let pane = self.pane?;
         self.state?
             .pane_copy_mode_summary(session.name(), pane.id())
+    }
+
+    fn copy_mode_position_values(&self) -> Option<(usize, usize)> {
+        let session = self.session?;
+        let pane = self.pane?;
+        let window_index = self.window_index?;
+        let summary = self.pane_copy_mode_summary()?;
+        let option = self.options?.resolve_for_pane(
+            session.name(),
+            window_index,
+            pane.index(),
+            OptionName::CopyModeLineNumbers,
+        );
+        Some(summary.position_for_line_number_option(option))
     }
 
     fn pane_mode_name(&self) -> Option<String> {

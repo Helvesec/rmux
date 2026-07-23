@@ -2,19 +2,27 @@ use rmux_core::{
     command_inventory::RMUX_EXTENSION_COMMANDS, command_parser::SOURCE_FILE_MAX_COMMAND_BYTES,
 };
 use rmux_proto::{
-    decode_internal_runtime_command_arguments, CommandOutput, ErrorResponse, Response, RmuxError,
-    SourceFileRequest, SourceFileResponse, INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH,
+    decode_internal_list_windows_all_arguments, decode_internal_runtime_command_arguments,
+    CommandOutput, ErrorResponse, Response, RmuxError, SourceFileRequest, SourceFileResponse,
+    INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH, INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH,
     INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH, INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
 };
 
 use super::super::RequestHandler;
 use super::parser_context::command_parser_from_state;
 
-const INTERNAL_SOURCE_FILE_PATHS: [&str; 3] = [
+const INTERNAL_SOURCE_FILE_PATHS: [&str; 4] = [
     INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
     INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH,
     INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH,
+    INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH,
 ];
+
+pub(super) enum CanonicalCommandExecution {
+    Disabled,
+    Canonical,
+    ListWindowsAll(Vec<String>),
+}
 
 impl RequestHandler {
     pub(super) async fn handle_internal_source_file_request(
@@ -121,27 +129,38 @@ pub(super) fn validate_internal_source_file_path(
 
 pub(super) fn canonical_command_execution_request(
     request: &SourceFileRequest,
-) -> Result<bool, RmuxError> {
-    if !request
-        .paths
-        .iter()
-        .any(|path| path == INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH)
-    {
-        return Ok(false);
-    }
-    if request.paths.as_slice() != [INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH]
-        || request.quiet
+) -> Result<CanonicalCommandExecution, RmuxError> {
+    let execution = match request.paths.as_slice() {
+        [path] if path == INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH => {
+            CanonicalCommandExecution::Canonical
+        }
+        [path] if path == INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH => {
+            let payload = request.stdin.as_deref().ok_or_else(|| {
+                RmuxError::Server("missing internal list-windows all-session payload".to_owned())
+            })?;
+            let arguments =
+                decode_internal_list_windows_all_arguments(payload).ok_or_else(|| {
+                    RmuxError::Server(
+                        "invalid internal list-windows all-session payload".to_owned(),
+                    )
+                })?;
+            CanonicalCommandExecution::ListWindowsAll(arguments)
+        }
+        _ => return Ok(CanonicalCommandExecution::Disabled),
+    };
+    let target_is_allowed = matches!(execution, CanonicalCommandExecution::Canonical);
+    if request.quiet
         || request.parse_only
         || request.verbose
         || request.expand_paths
-        || request.target.is_some()
+        || (request.target.is_some() && !target_is_allowed)
         || request.stdin.is_none()
     {
         return Err(RmuxError::Server(
             "invalid internal canonical command execution request".to_owned(),
         ));
     }
-    Ok(true)
+    Ok(execution)
 }
 
 fn runtime_command_expansion_payload(request: &SourceFileRequest) -> Result<&str, RmuxError> {

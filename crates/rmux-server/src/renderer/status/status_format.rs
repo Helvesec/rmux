@@ -56,6 +56,7 @@ pub(super) fn render_status_format_line_at(
         &status_runtime,
         status_runtime.profile_for_template(&template),
         ttl,
+        runtime.status_jobs(),
     );
     Some(format_draw_line(&expanded, base_style, width, utf8_config))
 }
@@ -125,6 +126,7 @@ impl<'a, 'runtime> StatusFormatVariables<'a, 'runtime> {
                     self.inner,
                     self.profile_for_template(template),
                     self.ttl,
+                    self.inner.status_jobs(),
                 )
             })
     }

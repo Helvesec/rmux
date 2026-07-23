@@ -14,6 +14,7 @@ use rmux_sdk::{
 };
 
 fn assert_send<T: Send>() {}
+fn assert_send_sync<T: Send + Sync>() {}
 fn assert_static<T: 'static>() {}
 fn assert_debug<T: Debug>() {}
 
@@ -47,7 +48,7 @@ fn pane_output_stream_public_types_are_send_static_and_debuggable() {
     assert_static::<PaneOutputStart>();
     assert_debug::<PaneOutputStart>();
 
-    assert_send::<PaneRenderStream>();
+    assert_send_sync::<PaneRenderStream>();
     assert_static::<PaneRenderStream>();
     assert_debug::<PaneRenderStream>();
 

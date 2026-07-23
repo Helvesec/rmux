@@ -2,6 +2,7 @@ use rmux_proto::RmuxError;
 use tokio::sync::oneshot;
 
 use super::super::scripting_support::QueueExecutionContext;
+use super::super::RequesterOrigin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in super::super) enum PromptType {
@@ -58,7 +59,7 @@ pub(in super::super) struct PromptField {
 
 #[derive(Debug, Clone)]
 pub(in super::super) struct CommandPromptPlan {
-    pub(in super::super) requester_pid: u32,
+    pub(in super::super) origin: RequesterOrigin,
     pub(in super::super) target_client: Option<String>,
     pub(in super::super) context: QueueExecutionContext,
     pub(in super::super) fields: Vec<PromptField>,
@@ -71,7 +72,7 @@ pub(in super::super) struct CommandPromptPlan {
 
 #[derive(Debug, Clone)]
 pub(in super::super) struct ConfirmBeforePlan {
-    pub(in super::super) requester_pid: u32,
+    pub(in super::super) origin: RequesterOrigin,
     pub(in super::super) target_client: Option<String>,
     pub(in super::super) context: QueueExecutionContext,
     pub(in super::super) prompt: String,
@@ -96,6 +97,7 @@ pub(in super::super) struct PromptQueueResult {
     )>,
     pub(in super::super) error: Option<RmuxError>,
     pub(in super::super) responses: Option<Vec<String>>,
+    pub(in super::super) origin: Option<RequesterOrigin>,
 }
 
 impl PromptQueueResult {
@@ -104,6 +106,16 @@ impl PromptQueueResult {
             inserted: None,
             error: None,
             responses: None,
+            origin: None,
+        }
+    }
+
+    pub(in super::super) const fn cancelled(origin: RequesterOrigin) -> Self {
+        Self {
+            inserted: None,
+            error: None,
+            responses: None,
+            origin: Some(origin),
         }
     }
 }

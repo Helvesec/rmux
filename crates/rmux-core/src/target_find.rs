@@ -36,8 +36,8 @@ pub use metadata::command_target_metadata;
 use pane_navigation::{directional_pane, pane_description};
 use syntax::TargetParts;
 pub use types::{
-    CommandTargetMetadata, CommandTargetSpec, TargetFindContext, TargetFindFlags, TargetFindType,
-    UnresolvedTarget,
+    CommandTargetMetadata, CommandTargetSpec, MissingCurrentTargetFallback, TargetFindContext,
+    TargetFindFlags, TargetFindType, UnresolvedTarget,
 };
 
 impl SessionStore {

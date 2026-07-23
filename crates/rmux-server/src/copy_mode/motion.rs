@@ -233,17 +233,34 @@ impl CopyModeState {
         Ok(())
     }
 
-    pub(super) fn cmd_goto_line(&mut self, line: &str) -> Result<(), RmuxError> {
+    pub(super) fn cmd_goto_line(
+        &mut self,
+        line: &str,
+        absolute_line_numbers: bool,
+    ) -> Result<(), RmuxError> {
         let Ok(number) = line.parse::<isize>() else {
             return Ok(());
         };
-        if number < 0 {
+        // tmux accepts -1 as the sentinel for the oldest history line, but
+        // values below -1 fail parsing and leave the viewport unchanged.
+        if number < -1 {
             return Ok(());
         }
         let max_scroll = self.bottom_top_line();
-        let scroll = usize::try_from(number)
-            .unwrap_or(max_scroll)
-            .min(max_scroll);
+        let scroll = if absolute_line_numbers {
+            let line = if number <= 0 {
+                1
+            } else {
+                usize::try_from(number)
+                    .unwrap_or(max_scroll.saturating_add(1))
+                    .min(max_scroll.saturating_add(1))
+            };
+            max_scroll.saturating_sub(line.saturating_sub(1))
+        } else {
+            usize::try_from(number)
+                .unwrap_or(max_scroll)
+                .min(max_scroll)
+        };
         self.top_line = self.bottom_top_line().saturating_sub(scroll);
         let visible_bottom = self.top_line + usize::from(self.rows().max(1));
         self.cursor.y = self
@@ -418,13 +435,17 @@ impl CopyModeState {
         Ok(())
     }
 
-    pub(super) fn move_cursor_to_mouse(&mut self, x: u32, y: u16) {
+    pub(super) fn reposition_cursor_to_mouse(&mut self, x: u32, y: u16) {
         if self.total_lines() == 0 {
             return;
         }
         self.cursor.y = (self.top_line + usize::from(y)).min(self.total_lines().saturating_sub(1));
         self.cursor.x = self.owning_or_zero(self.cursor.y, x.min(self.cols().saturating_sub(1)));
         self.ensure_cursor_visible();
+    }
+
+    pub(super) fn move_cursor_to_mouse(&mut self, x: u32, y: u16) {
+        self.reposition_cursor_to_mouse(x, y);
         self.sync_selection_with_cursor();
     }
 

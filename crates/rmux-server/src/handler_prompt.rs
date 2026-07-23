@@ -1,6 +1,7 @@
 use tokio::sync::oneshot;
 
 use super::scripting_support::QueueExecutionContext;
+use super::RequesterOrigin;
 use crate::renderer::RenderedPrompt;
 
 #[path = "handler_prompt/events.rs"]
@@ -66,7 +67,7 @@ pub(super) struct ClientPromptState {
     pre_history_buffer: Option<String>,
     flags: u8,
     prompt_type: PromptType,
-    requester_pid: u32,
+    origin: RequesterOrigin,
     context: QueueExecutionContext,
     kind: PromptKind,
     completion: PromptCompletion,
@@ -109,7 +110,7 @@ impl ClientPromptState {
             pre_history_buffer: None,
             flags: plan.flags,
             prompt_type: plan.prompt_type,
-            requester_pid: plan.requester_pid,
+            origin: plan.origin,
             context: plan.context,
             kind: PromptKind::Command {
                 template: plan.template,
@@ -136,7 +137,7 @@ impl ClientPromptState {
             pre_history_buffer: None,
             flags: PROMPT_FLAG_SINGLE,
             prompt_type: PromptType::Command,
-            requester_pid: plan.requester_pid,
+            origin: plan.origin,
             context: plan.context,
             kind: PromptKind::Confirm {
                 template: plan.template,
@@ -185,7 +186,7 @@ impl ClientPromptState {
         };
 
         Some(PromptDispatch {
-            requester_pid: self.requester_pid,
+            origin: self.origin.clone(),
             context: self.context.clone(),
             template: template.clone(),
             format_values: format_values.clone(),
@@ -390,7 +391,7 @@ impl ClientPromptState {
         };
 
         FinishedPrompt {
-            requester_pid: self.requester_pid,
+            origin: self.origin,
             context: self.context,
             completion: self.completion,
             kind,
@@ -434,7 +435,7 @@ enum FinishedPromptKind {
 
 #[derive(Debug)]
 struct FinishedPrompt {
-    requester_pid: u32,
+    origin: RequesterOrigin,
     context: QueueExecutionContext,
     completion: PromptCompletion,
     kind: FinishedPromptKind,
@@ -450,7 +451,7 @@ fn prompt_accept_should_dismiss_mode_tree(finished: &FinishedPrompt) -> bool {
 
 #[derive(Debug, Clone)]
 struct PromptDispatch {
-    requester_pid: u32,
+    origin: RequesterOrigin,
     context: QueueExecutionContext,
     template: String,
     format_values: Vec<(String, String)>,

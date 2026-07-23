@@ -8,8 +8,12 @@
 #[cfg_attr(windows, allow(dead_code))]
 mod automatic_rename;
 #[cfg(any(unix, windows))]
+mod buffer_file_io;
+#[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod client_flags;
+#[cfg(any(unix, windows))]
+mod clipboard_protocol;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod clock_mode;
@@ -59,6 +63,8 @@ mod keys;
 #[cfg_attr(windows, allow(dead_code))]
 mod legacy_command;
 #[cfg(any(unix, windows))]
+mod lifecycle_commit_order;
+#[cfg(any(unix, windows))]
 mod limits;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
@@ -85,6 +91,9 @@ mod pane_reader_runtime;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_screen_state;
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
+mod pane_scrollbar;
 #[cfg(any(unix, windows))]
 mod pane_state_journal;
 #[cfg(any(unix, windows))]
@@ -115,6 +124,8 @@ mod signals;
 #[cfg_attr(windows, allow(dead_code))]
 mod socket_cleanup;
 #[cfg(any(unix, windows))]
+mod status_jobs;
+#[cfg(any(unix, windows))]
 mod status_lines;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
@@ -130,6 +141,8 @@ mod test_shell;
 mod tmux_shim;
 #[cfg(unix)]
 mod unix_socket;
+#[cfg(unix)]
+mod unix_socket_access;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod wait_for;
@@ -152,3 +165,19 @@ pub use daemon::{
     default_socket_path, ConfigFileSelection, ConfigLoadOptions, DaemonConfig, ServerDaemon,
     ServerHandle,
 };
+
+/// Runs the private platform FIFO reader helper when its hidden invocation flag is present.
+///
+/// This is an implementation detail shared by the full `rmux` and `rmux-daemon`
+/// entrypoints. Normal invocations return `None`; helper invocations write the
+/// FIFO payload to standard output and return the process exit code. Calling
+/// this function during normal process startup also advertises the current
+/// executable as a helper host for embedded [`ServerDaemon`] instances.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn run_internal_fifo_reader_helper<I>(arguments: I) -> Option<i32>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    buffer_file_io::run_internal_fifo_reader_helper(arguments)
+}

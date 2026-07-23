@@ -1,138 +1,75 @@
-use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 
 use rmux_os::identity::{IdentityResolver, UserIdentity};
 use rmux_proto::request::{AttachSessionExt2Request, AttachSessionExt3Request};
 #[cfg(test)]
 use rmux_proto::INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH;
 use rmux_proto::{
-    AttachSessionExtRequest, CommandOutput, Request, RmuxError, ServerAccessRequest, SessionName,
-    SourceFileRequest, Target, INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
+    decode_internal_list_windows_all_arguments, AttachSessionExtRequest, Request, RmuxError,
+    ServerAccessRequest, SessionName, SourceFileRequest, Target,
+    INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH, INTERNAL_RUNTIME_COMMAND_EXPANSION_PATH,
 };
 
+#[path = "server_access/access_store.rs"]
+mod access_store;
+
+pub(crate) use self::access_store::{
+    AccessMode, ResolvedUser, ServerAccessAdmission, ServerAccessStore,
+};
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AccessMode {
-    ReadOnly,
-    ReadWrite,
+pub(crate) enum AccessRegistrationKind {
+    Attach,
+    Control,
 }
 
-impl AccessMode {
-    #[must_use]
-    pub(crate) const fn can_write(self) -> bool {
-        matches!(self, Self::ReadWrite)
-    }
-
-    #[must_use]
-    pub(crate) const fn display_suffix(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "R",
-            Self::ReadWrite => "W",
-        }
-    }
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct AccessRegistrationPause {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedUser {
-    pub(crate) uid: u32,
-    pub(crate) name: String,
+#[cfg(test)]
+static ACCESS_REGISTRATION_PAUSES: Mutex<
+    Vec<(AccessRegistrationKind, u32, Arc<AccessRegistrationPause>)>,
+> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn install_access_registration_pause(
+    kind: AccessRegistrationKind,
+    requester_pid: u32,
+) -> Arc<AccessRegistrationPause> {
+    let pause = Arc::new(AccessRegistrationPause::default());
+    ACCESS_REGISTRATION_PAUSES
+        .lock()
+        .expect("access registration pause lock")
+        .push((kind, requester_pid, pause.clone()));
+    pause
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ServerAccessStore {
-    owner_uid: u32,
-    owner_identity: UserIdentity,
-    entries: BTreeMap<UserIdentity, AccessMode>,
-}
-
-impl ServerAccessStore {
-    #[must_use]
-    pub(crate) fn new(owner_uid: u32) -> Self {
-        let owner_identity = current_user_identity().unwrap_or(UserIdentity::Uid(owner_uid));
-        Self::new_for_identity(owner_uid, owner_identity)
+#[cfg(test)]
+pub(crate) async fn pause_before_access_registration(
+    kind: AccessRegistrationKind,
+    requester_pid: u32,
+) {
+    let pause = {
+        let mut pauses = ACCESS_REGISTRATION_PAUSES
+            .lock()
+            .expect("access registration pause lock");
+        pauses
+            .iter()
+            .position(|(paused_kind, paused_pid, _)| {
+                *paused_kind == kind && *paused_pid == requester_pid
+            })
+            .map(|position| pauses.swap_remove(position).2)
+    };
+    if let Some(pause) = pause {
+        pause.reached.notify_one();
+        pause.release.notified().await;
     }
-
-    #[must_use]
-    pub(crate) fn new_for_identity(owner_uid: u32, owner_identity: UserIdentity) -> Self {
-        let mut entries = BTreeMap::new();
-        insert_platform_superuser_access(&mut entries);
-        entries.insert(owner_identity.clone(), AccessMode::ReadWrite);
-        Self {
-            owner_uid,
-            owner_identity,
-            entries,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn owner_uid(&self) -> u32 {
-        self.owner_uid
-    }
-
-    #[must_use]
-    pub(crate) fn mode_for_identity(&self, identity: &UserIdentity) -> Option<AccessMode> {
-        self.entries.get(identity).copied()
-    }
-
-    pub(crate) fn set_mode(&mut self, uid: u32, mode: AccessMode) -> Result<(), RmuxError> {
-        let identity = UserIdentity::Uid(uid);
-        self.ensure_mutable_identity(&identity)?;
-        self.entries.insert(identity, mode);
-        Ok(())
-    }
-
-    pub(crate) fn remove_uid(&mut self, uid: u32) -> Result<(), RmuxError> {
-        let identity = UserIdentity::Uid(uid);
-        self.ensure_mutable_identity(&identity)?;
-        self.entries.remove(&identity);
-        Ok(())
-    }
-
-    #[must_use]
-    pub(crate) fn contains_uid(&self, uid: u32) -> bool {
-        self.entries.contains_key(&UserIdentity::Uid(uid))
-    }
-
-    pub(crate) fn render_list(&self) -> CommandOutput {
-        let mut stdout = Vec::new();
-        for (identity, mode) in &self.entries {
-            if is_reserved_superuser_identity(identity) {
-                continue;
-            }
-            let line = format!(
-                "{} ({})\n",
-                user_name_for_identity(identity),
-                mode.display_suffix()
-            );
-            stdout.extend_from_slice(line.as_bytes());
-        }
-        CommandOutput::from_stdout(stdout)
-    }
-
-    fn ensure_mutable_identity(&self, identity: &UserIdentity) -> Result<(), RmuxError> {
-        if is_reserved_superuser_identity(identity) || *identity == self.owner_identity {
-            return Err(RmuxError::Server(
-                "root and the server owner cannot be modified".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn insert_platform_superuser_access(entries: &mut BTreeMap<UserIdentity, AccessMode>) {
-    entries.insert(UserIdentity::Uid(0), AccessMode::ReadWrite);
-}
-
-#[cfg(windows)]
-fn insert_platform_superuser_access(_entries: &mut BTreeMap<UserIdentity, AccessMode>) {}
-
-#[cfg(unix)]
-fn is_reserved_superuser_identity(identity: &UserIdentity) -> bool {
-    *identity == UserIdentity::Uid(0)
-}
-
-#[cfg(windows)]
-fn is_reserved_superuser_identity(_identity: &UserIdentity) -> bool {
-    false
 }
 
 pub(crate) fn current_owner_uid() -> u32 {
@@ -198,14 +135,6 @@ pub(crate) fn user_name_for_uid(uid: u32) -> String {
     #[cfg(windows)]
     {
         uid.to_string()
-    }
-}
-
-#[must_use]
-fn user_name_for_identity(identity: &UserIdentity) -> String {
-    match identity {
-        UserIdentity::Uid(uid) => user_name_for_uid(*uid),
-        UserIdentity::Sid(sid) => sid.to_string(),
     }
 }
 
@@ -296,7 +225,10 @@ fn read_only_request_allowed(request: &Request) -> bool {
         }
         Request::DisplayMessage(request) => display_message_request_is_read_only(request.print),
         Request::DisplayMessageExt(request) => display_message_request_is_read_only(request.print),
-        Request::SourceFile(request) => internal_runtime_command_expansion_is_read_only(request),
+        Request::SourceFile(request) => {
+            internal_runtime_command_expansion_is_read_only(request)
+                || internal_list_windows_all_is_read_only(request)
+        }
         _ => matches!(
             request,
             Request::HasSession(_)
@@ -346,6 +278,20 @@ fn internal_runtime_command_expansion_is_read_only(request: &SourceFileRequest) 
         && !request.expand_paths
         && request.target.is_none()
         && request.stdin.is_some()
+}
+
+fn internal_list_windows_all_is_read_only(request: &SourceFileRequest) -> bool {
+    request.paths.as_slice() == [INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH]
+        && !request.quiet
+        && !request.parse_only
+        && !request.verbose
+        && !request.expand_paths
+        && request.target.is_none()
+        && request
+            .stdin
+            .as_deref()
+            .and_then(decode_internal_list_windows_all_arguments)
+            .is_some()
 }
 
 fn capture_pane_request_is_read_only(print: bool, buffer_name: Option<&str>) -> bool {
@@ -414,10 +360,104 @@ mod tests {
         let owner = UserIdentity::Sid("S-1-5-21-1000".into());
         let store = ServerAccessStore::new_for_identity(0, owner.clone());
 
+        assert_eq!(store.owner_identity(), &owner);
         assert_eq!(store.mode_for_identity(&owner), Some(AccessMode::ReadWrite));
         assert_eq!(
             store.mode_for_identity(&UserIdentity::Sid("S-1-5-21-2000".into())),
             None
+        );
+    }
+
+    #[test]
+    fn access_admission_keeps_identity_epoch_across_mode_changes() {
+        let mut store =
+            ServerAccessStore::new_for_identity(42, UserIdentity::Sid("S-1-5-21-owner".into()));
+        let identity = UserIdentity::Uid(1001);
+        store
+            .set_mode(1001, AccessMode::ReadWrite)
+            .expect("grant access");
+        let admission = store
+            .admission_for_identity(&identity)
+            .expect("admission exists");
+
+        store
+            .set_mode(1001, AccessMode::ReadOnly)
+            .expect("downgrade access");
+        assert_eq!(
+            store.revalidate_admission(&admission, &identity),
+            Some(AccessMode::ReadOnly)
+        );
+
+        store
+            .set_mode(1001, AccessMode::ReadWrite)
+            .expect("restore access");
+        assert_eq!(
+            store.revalidate_admission(&admission, &identity),
+            Some(AccessMode::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn access_admission_is_invalid_after_remove_and_reinsert() {
+        let mut store =
+            ServerAccessStore::new_for_identity(42, UserIdentity::Sid("S-1-5-21-owner".into()));
+        let identity = UserIdentity::Uid(1001);
+        store
+            .set_mode(1001, AccessMode::ReadWrite)
+            .expect("grant access");
+        let stale = store
+            .admission_for_identity(&identity)
+            .expect("admission exists");
+
+        store.remove_uid(1001).expect("revoke access");
+        store
+            .set_mode(1001, AccessMode::ReadWrite)
+            .expect("regrant access");
+
+        assert_eq!(store.revalidate_admission(&stale, &identity), None);
+        assert_eq!(store.revalidate_detached_admission(&stale), None);
+    }
+
+    #[test]
+    fn access_admission_is_not_invalidated_by_another_identity_mutation() {
+        let mut store =
+            ServerAccessStore::new_for_identity(42, UserIdentity::Sid("S-1-5-21-owner".into()));
+        let identity = UserIdentity::Uid(1001);
+        store
+            .set_mode(1001, AccessMode::ReadWrite)
+            .expect("grant first identity");
+        let admission = store
+            .admission_for_identity(&identity)
+            .expect("admission exists");
+
+        store
+            .set_mode(1002, AccessMode::ReadOnly)
+            .expect("grant second identity");
+        store
+            .set_mode(1002, AccessMode::ReadWrite)
+            .expect("change second identity");
+        store.remove_uid(1002).expect("revoke second identity");
+
+        assert_eq!(
+            store.revalidate_admission(&admission, &identity),
+            Some(AccessMode::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn detached_admission_never_widens_its_initial_write_cap() {
+        let mut store =
+            ServerAccessStore::new_for_identity(42, UserIdentity::Sid("S-1-5-21-owner".into()));
+        store
+            .set_mode(1001, AccessMode::ReadWrite)
+            .expect("grant access");
+        let admission = store
+            .admission_for_identity_with_write_cap(&UserIdentity::Uid(1001), false)
+            .expect("admission exists");
+
+        assert_eq!(
+            store.revalidate_detached_admission(&admission),
+            Some(AccessMode::ReadOnly)
         );
     }
 
@@ -507,6 +547,46 @@ mod tests {
             apply_access_policy(expansion.clone(), false).expect("runtime expansion is read-only"),
             expansion
         );
+
+        let list_windows_payload = rmux_proto::encode_internal_runtime_command_arguments(&[
+            "list-windows".to_owned(),
+            "-a".to_owned(),
+            "-F".to_owned(),
+            "#{window_name}".to_owned(),
+        ])
+        .expect("list-windows argv encodes");
+        let list_windows = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some(list_windows_payload),
+        }));
+        assert_eq!(
+            apply_access_policy(list_windows.clone(), false)
+                .expect("validated list-windows -a is read-only"),
+            list_windows
+        );
+
+        let mutating_payload = rmux_proto::encode_internal_runtime_command_arguments(&[
+            "kill-server".to_owned(),
+            "-a".to_owned(),
+        ])
+        .expect("mutating argv encodes");
+        let mutating_list_path = Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec![INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH.to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: None,
+            stdin: Some(mutating_payload),
+        }));
+        assert!(apply_access_policy(mutating_list_path, false).is_err());
 
         let assignments = Request::SourceFile(Box::new(SourceFileRequest {
             paths: vec![rmux_proto::INTERNAL_PARSE_TIME_ASSIGNMENTS_PATH.to_owned()],

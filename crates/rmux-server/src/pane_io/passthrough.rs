@@ -13,6 +13,9 @@ pub(super) fn render_passthroughs(
     let mut frame = Vec::new();
     let mut saved_cursor = false;
     for passthrough in passthroughs {
+        if passthrough.clipboard_query_metadata().is_some() {
+            continue;
+        }
         if !passthrough_enabled(target, passthrough.kind()) {
             continue;
         }
@@ -326,13 +329,16 @@ mod tests {
             frame.is_empty(),
             "empty OSC 52 payload must not be forwarded: {frame:?}"
         );
-        // A pane-side query is still forwarded (documented C-D52 divergence
-        // until get-clipboard support lands).
+        // Typed pane-side queries are consumed by get-clipboard and must not
+        // leak through this generic passthrough renderer.
         let frame = render_passthroughs(
             &target,
-            &[TerminalPassthrough::clipboard(b"\x1b]52;c;?\x07".to_vec())],
+            &[TerminalPassthrough::clipboard_query(
+                rmux_core::TerminalClipboardQuery::new("c", rmux_core::input::InputEndType::Bel),
+                b"\x1b]52;c;?\x07".to_vec(),
+            )],
         );
-        assert_eq!(frame, b"\x1b]52;c;?\x07");
+        assert!(frame.is_empty());
     }
 
     #[test]

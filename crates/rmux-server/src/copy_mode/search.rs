@@ -160,6 +160,7 @@ impl CopyModeState {
                     ModeKeys::Emacs => result.end,
                 };
                 self.ensure_cursor_visible();
+                self.sync_selection_with_cursor();
             }
         }
         Ok(())
@@ -293,6 +294,7 @@ impl CopyModeState {
                     ModeKeys::Emacs => result.end,
                 };
                 self.ensure_cursor_visible();
+                self.sync_selection_with_cursor();
             }
         }
         self.search_highlighted = true;

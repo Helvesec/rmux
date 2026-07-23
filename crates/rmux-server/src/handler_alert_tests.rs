@@ -248,16 +248,18 @@ struct ActivitySnapshot {
     other: i64,
 }
 
-async fn two_pane_activity_snapshot(
+async fn two_pane_activity_snapshot_for_target(
     handler: &RequestHandler,
-    session_name: &SessionName,
+    target: &WindowTarget,
 ) -> ActivitySnapshot {
     let state = handler.state.lock().await;
     let session = state
         .sessions
-        .session(session_name)
+        .session(target.session_name())
         .expect("session exists");
-    let window = session.window_at(0).expect("window exists");
+    let window = session
+        .window_at(target.window_index())
+        .expect("window exists");
     let origin = window.pane(0).expect("origin pane exists");
     let other = window.pane(1).expect("other pane exists");
     ActivitySnapshot {
@@ -272,13 +274,24 @@ async fn wait_for_two_pane_activity_to_settle(
     handler: &RequestHandler,
     session_name: &SessionName,
 ) -> ActivitySnapshot {
+    wait_for_two_pane_activity_to_settle_for_target(
+        handler,
+        &WindowTarget::with_window(session_name.clone(), 0),
+    )
+    .await
+}
+
+async fn wait_for_two_pane_activity_to_settle_for_target(
+    handler: &RequestHandler,
+    target: &WindowTarget,
+) -> ActivitySnapshot {
     let deadline = tokio::time::Instant::now() + ACTIVITY_BASELINE_TIMEOUT;
-    let mut previous = two_pane_activity_snapshot(handler, session_name).await;
+    let mut previous = two_pane_activity_snapshot_for_target(handler, target).await;
     let mut stable_since = tokio::time::Instant::now();
 
     loop {
         tokio::time::sleep(Duration::from_millis(25)).await;
-        let current = two_pane_activity_snapshot(handler, session_name).await;
+        let current = two_pane_activity_snapshot_for_target(handler, target).await;
         let now = tokio::time::Instant::now();
         if current == previous {
             if now.duration_since(stable_since) >= ACTIVITY_BASELINE_SETTLE {
@@ -783,7 +796,9 @@ fn clipboard_alert(session: SessionName, pane_id: PaneId) -> crate::pane_io::Pan
         title_change: None,
         clipboard_set: true,
         clipboard_writes: vec![b"A".to_vec()],
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: None,
     }
@@ -832,7 +847,9 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: true,
         generation: None,
     });
@@ -906,7 +923,9 @@ async fn pane_alert_batch_coalesces_bell_across_two_panes_in_one_window() {
             title_change: None,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: false,
             generation: None,
         });
@@ -970,7 +989,9 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
             title_change: None,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: true,
             generation: None,
         });
@@ -1004,7 +1025,9 @@ async fn pane_title_change_output_emits_lifecycle_hook_event() {
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: None,
     });
@@ -1053,7 +1076,9 @@ async fn pane_state_title_alert_ignores_stale_generation() {
         title_change: Some(("old".to_owned(), "current".to_owned())),
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: Some(generation),
     });
@@ -1113,7 +1138,9 @@ async fn pane_state_title_alert_ignores_stale_generation() {
         title_change: Some(("current".to_owned(), "stale".to_owned())),
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: Some(generation.saturating_add(1)),
     });
@@ -1358,7 +1385,9 @@ async fn pane_output_updates_activity_for_originating_pane_only() {
             title_change: None,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: false,
             generation: None,
         })
@@ -1372,6 +1401,79 @@ async fn pane_output_updates_activity_for_originating_pane_only() {
     assert!(window.activity_at() > before.window);
     assert!(origin.activity_at() > before.origin);
     assert_eq!(other.activity_at(), before.other);
+}
+
+#[tokio::test]
+async fn pane_output_synchronizes_activity_across_linked_and_grouped_aliases() {
+    let handler = RequestHandler::new();
+    let source = create_quiet_session(&handler, "linked-activity-source").await;
+    split_quiet_window(&handler, &source).await;
+    let owner = create_quiet_session(&handler, "linked-activity-owner").await;
+    let peer = create_grouped_session(&handler, "linked-activity-peer", &owner).await;
+    let source_target = WindowTarget::with_window(source.clone(), 0);
+    let owner_target = WindowTarget::with_window(owner, 1);
+    let peer_target = WindowTarget::with_window(peer, 1);
+    let linked = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: source_target.clone(),
+            target: owner_target.clone(),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+
+    let targets = [source_target, owner_target, peer_target];
+    let mut before = Vec::new();
+    for target in &targets {
+        before.push(wait_for_two_pane_activity_to_settle_for_target(&handler, target).await);
+    }
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(targets[0].session_name())
+            .and_then(|session| session.window_at(targets[0].window_index()))
+            .and_then(|window| window.pane(1))
+            .map(rmux_core::Pane::id)
+            .expect("pane 1 exists")
+    };
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(handler
+        .prepare_pane_alert_event(crate::pane_io::PaneAlertEvent {
+            session_name: source,
+            pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            clipboard_set: false,
+            clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: false,
+            generation: None,
+        })
+        .await
+        .is_some());
+
+    let mut after = Vec::new();
+    for target in &targets {
+        after.push(two_pane_activity_snapshot_for_target(&handler, target).await);
+    }
+    for (snapshot, baseline) in after.iter().zip(&before) {
+        assert_eq!(snapshot.window, after[0].window);
+        assert_eq!(snapshot.other, after[0].other);
+        assert_eq!(
+            snapshot.origin, baseline.origin,
+            "unrelated pane activity changed for an alias"
+        );
+    }
+    assert!(after[0].window > before[0].window);
+    assert!(after[0].other > before[0].other);
 }
 
 #[tokio::test]
@@ -1405,7 +1507,9 @@ async fn pane_set_clipboard_output_emits_hook_without_activity() {
             title_change: None,
             clipboard_set: true,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: false,
             generation: None,
         })
@@ -1445,7 +1549,9 @@ async fn pane_set_clipboard_hook_requires_set_clipboard_on() {
             title_change: None,
             clipboard_set: true,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: false,
             generation: None,
         })
@@ -1483,13 +1589,72 @@ async fn inbound_osc52_write_creates_paste_buffer_under_set_clipboard_on() {
             title_change: None,
             clipboard_set: true,
             clipboard_writes: vec![b"hello".to_vec()],
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: false,
             generation: None,
         })
         .await;
 
     wait_for_buffer(&handler, "buffer0", "hello").await;
+}
+
+#[tokio::test]
+async fn osc52_buffer_lifecycle_precedes_the_prepared_pane_alert_batch() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "osc52-lifecycle-order").await;
+    set_server_option_by_name(&handler, "set-clipboard", "on").await;
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("window pane exists")
+    };
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+
+    timeout(
+        Duration::from_secs(2),
+        handler.handle_pane_alert_event(crate::pane_io::PaneAlertEvent {
+            session_name: session,
+            pane_id,
+            bell_count: 0,
+            title_changed: true,
+            title_change: None,
+            clipboard_set: true,
+            clipboard_writes: vec![b"ordered".to_vec()],
+            clipboard_queries: Vec::new(),
+            mouse_mode_changed: false,
+            alternate_mode_changed: false,
+            queue_activity_alert: false,
+            generation: None,
+        }),
+    )
+    .await
+    .expect("OSC 52 storage must not wait on its un-emitted pane-alert batch");
+
+    let mut observed = Vec::new();
+    while observed.len() < 3 {
+        let event = recv_lifecycle(&mut lifecycle).await;
+        if matches!(
+            event.hook_name,
+            HookName::PasteBufferChanged | HookName::PaneTitleChanged | HookName::PaneSetClipboard
+        ) {
+            observed.push(event.hook_name);
+        }
+    }
+    assert_eq!(
+        observed,
+        vec![
+            HookName::PasteBufferChanged,
+            HookName::PaneTitleChanged,
+            HookName::PaneSetClipboard,
+        ],
+        "buffer lifecycle publication must commit before the pane alert batch"
+    );
 }
 
 #[tokio::test]
@@ -1564,7 +1729,9 @@ async fn inbound_osc52_before_last_pane_eof_keeps_buffer_and_hook() {
         title_change: None,
         clipboard_set: true,
         clipboard_writes: vec![b"hello-before-eof".to_vec()],
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: Some(generation),
     });
@@ -1573,7 +1740,10 @@ async fn inbound_osc52_before_last_pane_eof_keeps_buffer_and_hook() {
         .await
         .expect("pane exit commits after pending output is published");
     pause.release.notify_one();
-    exit_task.await.expect("pane exit task joins");
+    timeout(Duration::from_secs(5), exit_task)
+        .await
+        .expect("pane exit must not deadlock behind final OSC 52 lifecycle ordering")
+        .expect("pane exit task joins");
 
     wait_for_buffer(&handler, "buffer0", "hello-before-eof").await;
     wait_for_buffer(&handler, "final-clipboard-hook", "fired").await;
@@ -1617,7 +1787,9 @@ async fn inbound_osc52_write_creates_no_buffer_without_set_clipboard_on() {
             title_change: None,
             clipboard_set: true,
             clipboard_writes: vec![b"hello".to_vec()],
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: false,
             generation: None,
         })
@@ -2247,7 +2419,9 @@ async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
             title_change: None,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: false,
             generation: None,
         });
@@ -2326,7 +2500,9 @@ async fn pane_mouse_mode_alert_refreshes_the_active_attached_pane() {
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: true,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: None,
     });
@@ -2401,7 +2577,9 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: true,
         generation: None,
     });
@@ -2467,7 +2645,9 @@ async fn pane_alert_event_respects_automatic_rename_off() {
             title_change: None,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: true,
             generation: None,
         })
@@ -2536,7 +2716,9 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             title_change: None,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: true,
             generation: None,
         })
@@ -3463,6 +3645,53 @@ async fn link_window_after_moves_silence_expiry_to_new_target_without_delay() {
 }
 
 #[tokio::test]
+async fn deferred_alert_plan_does_not_block_intervening_lifecycle_publication() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "deferred-alert-lifecycle-order").await;
+    let alerted = create_quiet_window(&handler, &session).await;
+    set_option(
+        &handler,
+        ScopeSelector::Window(alerted.clone()),
+        OptionName::MonitorActivity,
+        "on",
+    )
+    .await;
+    set_option(
+        &handler,
+        ScopeSelector::Session(session),
+        OptionName::ActivityAction,
+        "any",
+    )
+    .await;
+    let plans = {
+        let mut state = handler.state.lock().await;
+        handler.alerts_queue_window_locked(&mut state, alerted, WINDOW_ACTIVITY, 0)
+    };
+    assert_eq!(plans.len(), 1, "activity materializes one deferred plan");
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+
+    timeout(
+        Duration::from_secs(2),
+        handler.store_buffer(None, b"intervening".to_vec()),
+    )
+    .await
+    .expect("an intervening lifecycle mutation must not wait on a deferred alert plan")
+    .expect("intervening buffer mutation succeeds");
+    assert_eq!(
+        recv_lifecycle(&mut lifecycle).await.hook_name,
+        HookName::PasteBufferChanged
+    );
+
+    timeout(Duration::from_secs(2), handler.execute_alert_plans(plans))
+        .await
+        .expect("deferred alert plan publishes after the intervening mutation");
+    assert_eq!(
+        recv_lifecycle(&mut lifecycle).await.hook_name,
+        HookName::AlertActivity
+    );
+}
+
+#[tokio::test]
 async fn prepared_alert_hook_follows_reindexed_window_identity() {
     let handler = RequestHandler::new();
     let destination = create_quiet_session(&handler, "alert-hook-reindex-destination").await;
@@ -4012,7 +4241,9 @@ async fn window_alias_activity_resets_silence_timers_for_entire_family() {
             title_change: None,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: true,
             generation: None,
         })

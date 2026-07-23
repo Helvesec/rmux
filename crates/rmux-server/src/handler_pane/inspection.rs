@@ -18,6 +18,7 @@ use super::super::{format_client_uid, format_client_user, ListClientSnapshot, Re
 use super::pane_deferred_wait::format_references_pane_pid;
 use crate::control_notifications::format_control_message_line;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::handler::scripting_support::{queued_display_target_client, QueuedDisplayTargetClient};
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::renderer;
 
@@ -144,22 +145,52 @@ impl RequestHandler {
             empty_target_context,
             route_control_to_target_session,
         } = invocation;
-        let target_attach_pid = match target_client.as_deref() {
-            Some(target_client) => match self
-                .find_target_attach_client_pid(requester_pid, target_client, "display-message")
-                .await
+        let (target_attach_pid, target_attach_identity) = match queued_display_target_client() {
+            Some(QueuedDisplayTargetClient::Attached(identity)) => {
+                (Some(identity.attach_pid()), Some(identity))
+            }
+            Some(QueuedDisplayTargetClient::Missing) if print => (None, None),
+            Some(QueuedDisplayTargetClient::Missing) => {
+                return Response::DisplayMessage(DisplayMessageResponse::no_output());
+            }
+            Some(QueuedDisplayTargetClient::ResolutionError(error))
+                if print && display_message_client_is_control_only(&error) =>
             {
-                Ok(Some(attach_pid)) => Some(attach_pid),
-                Ok(None) if print => None,
-                Ok(None) => {
-                    return Response::DisplayMessage(DisplayMessageResponse::no_output());
-                }
-                Err(error) if print && display_message_client_is_control_only(&error) => None,
+                (None, None)
+            }
+            Some(QueuedDisplayTargetClient::ResolutionError(error)) => {
+                return Response::Error(ErrorResponse { error });
+            }
+            None => match target_client.as_deref() {
+                Some(target_client) => match self
+                    .find_target_attach_client_pid(requester_pid, target_client, "display-message")
+                    .await
+                {
+                    Ok(Some(attach_pid)) => (Some(attach_pid), None),
+                    Ok(None) if print => (None, None),
+                    Ok(None) => {
+                        return Response::DisplayMessage(DisplayMessageResponse::no_output());
+                    }
+                    Err(error) if print && display_message_client_is_control_only(&error) => {
+                        (None, None)
+                    }
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                },
+                None => (None, None),
+            },
+        };
+        let requester_is_control = self.is_control_client(requester_pid).await;
+        let captured_target_client_session = match target_attach_identity {
+            Some(identity) => match self.attached_session_identity_for_identity(identity).await {
+                Ok(session) => Some(session),
                 Err(error) => return Response::Error(ErrorResponse { error }),
             },
             None => None,
         };
-        let requester_is_control = self.is_control_client(requester_pid).await;
+        let exact_target_client_session = target
+            .is_none()
+            .then(|| captured_target_client_session.clone())
+            .flatten();
         let format_client_pid = match target_attach_pid {
             Some(attach_pid) => Some(attach_pid),
             None => self
@@ -189,7 +220,9 @@ impl RequestHandler {
             None
         };
         let session_client_pid = target_attach_pid.unwrap_or(requester_pid);
-        let attached_session_name = if target.is_none() && print {
+        let attached_session_name = if let Some((session_name, _)) = &exact_target_client_session {
+            Some(session_name.clone())
+        } else if target.is_none() && print {
             let active_attach = self.active_attach.lock().await;
             active_attach
                 .session_for_attached_client(session_client_pid, "display-message")
@@ -303,6 +336,36 @@ impl RequestHandler {
 
         let (expanded, overlay_frame, clear_frame, duration) = {
             let mut state = self.state.lock().await;
+            if exact_target_client_session
+                .as_ref()
+                .is_some_and(|(_, expected_id)| {
+                    state
+                        .sessions
+                        .session(&session_name)
+                        .map(|session| session.id())
+                        != Some(*expected_id)
+                })
+            {
+                return Response::Error(ErrorResponse {
+                    error: RmuxError::Server(
+                        "target client session changed before message delivery".to_owned(),
+                    ),
+                });
+            }
+            let target_identity = match &context_target {
+                Target::Session(target) => {
+                    super::super::require_expected_session_identity(&state, target)
+                }
+                Target::Window(target) => {
+                    super::super::require_expected_window_identity(&state, target)
+                }
+                Target::Pane(target) => {
+                    super::super::require_expected_pane_identity(&state, target)
+                }
+            };
+            if let Err(error) = target_identity {
+                return Response::Error(ErrorResponse { error });
+            }
             if expected_pane_id.is_some_and(|pane_id| {
                 !target_resolves_to_pane_id(&state, &context_target, pane_id)
             }) {
@@ -341,11 +404,12 @@ impl RequestHandler {
                 ));
             }
 
-            let mut overlay_frame = renderer::render_display_panes_clear(session, &state.options);
+            let mut overlay_frame =
+                renderer::render_display_panes_clear(session, &state.options, &state);
             overlay_frame.extend_from_slice(
                 renderer::render_status_message(session, &state.options, &expanded).as_slice(),
             );
-            let clear_frame = renderer::render_display_panes_clear(session, &state.options);
+            let clear_frame = renderer::render_display_panes_clear(session, &state.options, &state);
             (
                 expanded,
                 overlay_frame,
@@ -364,6 +428,16 @@ impl RequestHandler {
         }
 
         let delivered = match target_attach_pid {
+            Some(_attach_pid) if target_attach_identity.is_some() => {
+                self.send_attached_overlay_to_client_identity(
+                    target_attach_identity.expect("guarded target client identity"),
+                    exact_target_client_session.as_ref().map(|(_, id)| *id),
+                    overlay_frame,
+                    clear_frame,
+                    duration,
+                )
+                .await
+            }
             Some(attach_pid) => {
                 self.send_attached_overlay_to_client(
                     attach_pid,

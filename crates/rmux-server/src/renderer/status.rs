@@ -215,6 +215,7 @@ pub(super) fn status_bar_lines(
     columns: u16,
     attached_count: usize,
     status_lines: u16,
+    state: Option<&HandlerState>,
 ) -> Vec<FormattedLine> {
     status_bar_lines_with_pane_title(
         session,
@@ -223,6 +224,7 @@ pub(super) fn status_bar_lines(
         status_lines,
         StatusLineContext {
             attached_count,
+            state,
             ..StatusLineContext::default()
         },
     )
@@ -442,7 +444,13 @@ fn render_status_template_jobs(
     } else {
         None
     };
-    render_status_template_jobs_with_profile(template, runtime, profile.as_ref(), cache_ttl)
+    render_status_template_jobs_with_profile(
+        template,
+        runtime,
+        profile.as_ref(),
+        cache_ttl,
+        runtime.status_jobs(),
+    )
 }
 
 pub(super) fn render_status_template_jobs_with_profile<V>(
@@ -450,6 +458,7 @@ pub(super) fn render_status_template_jobs_with_profile<V>(
     variables: &V,
     profile: Option<&crate::terminal::TerminalProfile>,
     cache_ttl: Duration,
+    status_jobs: Option<&crate::status_jobs::StatusJobRuntime>,
 ) -> String
 where
     V: rmux_core::formats::FormatVariables + ?Sized,
@@ -458,6 +467,7 @@ where
         template,
         profile,
         cache_ttl,
+        status_jobs,
         |command| render_runtime_template(command, variables, true),
         |prepared| render_runtime_template_preserving_jobs(prepared, variables, true),
     )

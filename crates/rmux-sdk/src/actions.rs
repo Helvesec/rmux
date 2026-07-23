@@ -107,6 +107,11 @@ impl PaneMouse {
     /// intentionally minimal: terminals have no DOM hit target, so higher-level
     /// semantics belong to the application under test.
     pub async fn click(&self, row: u16, col: u16) -> Result<()> {
+        let (pane, _) = self.pane.begin_pinned_operation_handle().await?;
+        PaneMouse::new(pane).click_pinned(row, col).await
+    }
+
+    async fn click_pinned(&self, row: u16, col: u16) -> Result<()> {
         let pane = self.pane.begin_operation_handle();
         pane.send_text(sgr_mouse_sequence(0, row, col, true))
             .await?;
@@ -129,19 +134,17 @@ pub enum FillStrategy {
 impl Locator {
     /// Clicks the strict visible text match for this locator.
     pub async fn click(self) -> Result<()> {
-        let locator = self.begin_operation_handle();
-        let (_snapshot, item) = locator.resolve_strict_with_wait().await?;
+        let (locator, _snapshot, item) = self.resolve_strict_with_wait().await?;
         locator
             .pane()
             .mouse()
-            .click(item.text_match.start_row, item.text_match.start_col)
+            .click_pinned(item.text_match.start_row, item.text_match.start_col)
             .await
     }
 
     /// Moves the mouse to the strict visible text match for this locator.
     pub async fn hover(self) -> Result<()> {
-        let locator = self.begin_operation_handle();
-        let (_snapshot, item) = locator.resolve_strict_with_wait().await?;
+        let (locator, _snapshot, item) = self.resolve_strict_with_wait().await?;
         locator
             .pane()
             .mouse()
@@ -164,9 +167,8 @@ impl Locator {
     /// This method still types at the terminal cursor. It does not move focus
     /// to the matched text because terminals do not expose DOM-like controls.
     pub async fn fill_with(self, text: impl AsRef<str>, strategy: FillStrategy) -> Result<()> {
-        let locator = self.begin_operation_handle();
+        let (locator, _snapshot, _item) = self.resolve_strict_with_wait().await?;
         let pane = locator.pane().clone();
-        let (_snapshot, _item) = locator.resolve_strict_with_wait().await?;
         let keyboard = pane.keyboard();
         match strategy {
             FillStrategy::ControlU => keyboard.press("C-u").await?,
@@ -295,6 +297,7 @@ mod tests {
             transport,
         );
         let server = tokio::spawn(async move {
+            serve_mouse_lookup(&mut server_stream).await;
             serve_mouse_half(&mut server_stream, true).await;
             serve_mouse_half(&mut server_stream, false).await;
         });
@@ -309,6 +312,17 @@ mod tests {
         assert_eq!(Instant::now() - started, Duration::from_millis(50));
         assert_timed_out(error);
         server.abort();
+    }
+
+    async fn serve_mouse_lookup(stream: &mut tokio::io::DuplexStream) {
+        assert!(matches!(read_request(stream).await, Request::ListPanes(_)));
+        write_response(
+            stream,
+            Response::ListPanes(ListPanesResponse {
+                output: CommandOutput::from_stdout("0:0:%1\n"),
+            }),
+        )
+        .await;
     }
 
     async fn serve_mouse_half(stream: &mut tokio::io::DuplexStream, press: bool) {

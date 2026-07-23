@@ -22,6 +22,34 @@ fn visible_colours(screen: &Screen, cols: usize) -> Vec<(i32, i32)> {
     colours
 }
 
+fn line_number_options(mode: &str) -> OptionStore {
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModeLineNumbers,
+            mode.to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("copy-mode line-number option set succeeds");
+    options
+}
+
+fn line_number_snapshot(
+    screen: Screen,
+    history_size: usize,
+    scroll_position: usize,
+) -> CopyModeRenderSnapshot {
+    CopyModeRenderSnapshot {
+        screen,
+        overlays: CopyModeRenderOverlays::default(),
+        history_size,
+        scroll_position,
+        alternate_on: false,
+        line_numbers_enabled: true,
+    }
+}
+
 #[test]
 fn copy_mode_overlays_follow_tmux_37b_priority_and_mark_the_full_line() {
     let size = TerminalSize { cols: 8, rows: 2 };
@@ -126,6 +154,10 @@ fn rendered_copy_mode_frame_paints_marked_trailing_cells() {
     let pane = session.window().pane(0).expect("pane exists");
     let snapshot = CopyModeRenderSnapshot {
         screen: screen_with(b"x", size),
+        history_size: 0,
+        scroll_position: 0,
+        alternate_on: false,
+        line_numbers_enabled: false,
         overlays: CopyModeRenderOverlays {
             mark: Some(CopyModeOverlayRange {
                 row: 0,
@@ -148,5 +180,82 @@ fn rendered_copy_mode_frame_paints_marked_trailing_cells() {
             .windows(b"x     ".len())
             .any(|window| window == b"x     "),
         "mark rendering must paint trailing cells instead of clearing them: {frame:?}"
+    );
+}
+
+#[test]
+fn copy_mode_line_number_gutter_uses_tmux_default_and_current_styles() {
+    let size = TerminalSize { cols: 20, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane exists");
+    let snapshot = line_number_snapshot(screen_with(b"alpha\r\nbeta", size), 0, 0);
+
+    let frame = String::from_utf8(super::pane_screen::render_copy_mode_pane_screen(
+        &session,
+        &line_number_options("absolute"),
+        pane,
+        &snapshot,
+    ))
+    .expect("copy-mode frame is utf-8");
+
+    assert!(
+        frame.contains("\u{1b}[0;2;37m  1 \u{1b}[0malpha"),
+        "non-current numbers should use fg=white,dim: {frame:?}"
+    );
+    assert!(
+        frame.contains("\u{1b}[33m  2 \u{1b}[0mbeta"),
+        "the cursor row should use fg=yellow: {frame:?}"
+    );
+}
+
+#[test]
+fn copy_mode_line_number_gutter_is_inside_the_scrollbar_content_geometry() {
+    let size = TerminalSize { cols: 20, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane exists");
+    let mut options = line_number_options("absolute");
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::PaneScrollbars,
+            "on".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("pane scrollbar option set succeeds");
+    let snapshot = line_number_snapshot(screen_with(b"content", size), 23, 23);
+
+    let frame = String::from_utf8(super::pane_screen::render_copy_mode_pane_screen(
+        &session, &options, pane, &snapshot,
+    ))
+    .expect("copy-mode frame is utf-8");
+
+    assert!(
+        frame.contains("\u{1b}[33m  1 \u{1b}[0mcontent"),
+        "the gutter should precede pane content: {frame:?}"
+    );
+    assert!(
+        frame.contains("\u{1b}[1;20H"),
+        "the right scrollbar should remain in physical column 20: {frame:?}"
+    );
+}
+
+#[test]
+fn copy_mode_line_number_gutter_marks_a_cursor_beyond_reduced_content() {
+    let size = TerminalSize { cols: 8, rows: 2 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane exists");
+    let snapshot = line_number_snapshot(screen_with(b"\x1b[1;8H", size), 0, 0);
+
+    let frame = String::from_utf8(super::pane_screen::render_copy_mode_pane_screen(
+        &session,
+        &line_number_options("absolute"),
+        pane,
+        &snapshot,
+    ))
+    .expect("copy-mode frame is utf-8");
+
+    assert!(
+        frame.contains("\u{1b}[1;8H\u{1b}[0m$\u{1b}[0m"),
+        "tmux marks a cursor clipped by the gutter with '$': {frame:?}"
     );
 }

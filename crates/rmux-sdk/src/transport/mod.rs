@@ -111,24 +111,22 @@ impl TransportClient {
         }
 
         let (reply, response) = oneshot::channel();
-        let mut cancellation = OrderedResponseGuard::new(self);
-        let result = self
-            .run_with_deadline(&operation, async {
-                self.commands
-                    .send(ActorMessage::Request {
-                        request,
-                        operation: operation.clone(),
-                        reply,
-                    })
-                    .await
-                    .map_err(|_| self.closed_error(&operation))?;
-                cancellation.arm();
+        self.run_with_deadline(&operation, async {
+            self.commands
+                .send(ActorMessage::Request {
+                    request,
+                    operation: operation.clone(),
+                    reply,
+                })
+                .await
+                .map_err(|_| self.closed_error(&operation))?;
 
-                response.await.map_err(|_| self.closed_error(&operation))?
-            })
-            .await;
-        cancellation.disarm();
-        result
+            // Once queued, the actor owns this FIFO exchange. If the
+            // caller drops its future, the actor must still consume and
+            // validate the response so later requests remain aligned.
+            response.await.map_err(|_| self.closed_error(&operation))?
+        })
+        .await
     }
 
     pub(crate) async fn armed_request(&self, request: Request) -> Result<PendingResponse> {

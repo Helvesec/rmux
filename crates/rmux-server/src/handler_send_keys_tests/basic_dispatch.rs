@@ -754,22 +754,26 @@ async fn send_keys_k_binding_task_preserves_disabled_hook_context() {
         .await;
     assert!(matches!(bound, Response::BindKey(_)));
 
-    let dispatched = crate::hook_runtime::with_hook_execution(Vec::new(), async {
-        handler
-            .handle(Request::SendKeysExt(SendKeysExtRequest {
-                target: Some(PaneTarget::new(alpha.clone(), 0)),
-                keys: vec!["C-b".to_owned(), "x".to_owned()],
-                expand_formats: false,
-                hex: false,
-                literal: false,
-                dispatch_key_table: true,
-                copy_mode_command: false,
-                forward_mouse_event: false,
-                reset_terminal: false,
-                repeat_count: None,
-            }))
-            .await
-    })
+    let dispatched = crate::hook_runtime::with_hook_execution(
+        crate::hook_runtime::HookExecutionContext::command(HookName::AfterNewWindow),
+        Vec::new(),
+        async {
+            handler
+                .handle(Request::SendKeysExt(SendKeysExtRequest {
+                    target: Some(PaneTarget::new(alpha.clone(), 0)),
+                    keys: vec!["C-b".to_owned(), "x".to_owned()],
+                    expand_formats: false,
+                    hex: false,
+                    literal: false,
+                    dispatch_key_table: true,
+                    copy_mode_command: false,
+                    forward_mouse_event: false,
+                    reset_terminal: false,
+                    repeat_count: None,
+                }))
+                .await
+        },
+    )
     .await;
     assert_eq!(
         dispatched,

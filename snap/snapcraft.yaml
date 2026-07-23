@@ -1,6 +1,6 @@
 name: rmux
 title: RMUX
-version: "0.9.0"
+version: "0.9.1"
 summary: Rust terminal multiplexer with tmux-style commands
 description: |
   RMUX is a terminal multiplexer with a tmux-style command line, daemon-backed

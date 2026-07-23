@@ -127,6 +127,10 @@ pub struct LayoutPaneBuilder<'a> {
 
 impl<'a> LayoutPaneBuilder<'a> {
     /// Runs the pane process directly as structured argv.
+    ///
+    /// On Windows, `.bat` and `.cmd` targets are rejected; use a native
+    /// executable for literal argv, or [`Self::shell`] when shell
+    /// interpretation is intentional.
     #[must_use]
     pub fn spawn<I, S>(mut self, command: I) -> Self
     where

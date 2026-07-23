@@ -86,6 +86,96 @@ impl HandlerState {
     where
         F: FnOnce(&mut Session) -> Result<T, RmuxError>,
     {
+        self.mutate_session_and_resize_window_terminal_with_family(
+            session_name,
+            window_index,
+            mutate,
+        )
+        .map(|(result, _)| result)
+    }
+
+    pub(crate) fn mutate_session_and_resize_window_terminal_with_family<T, F>(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        mutate: F,
+    ) -> Result<(T, Vec<SessionName>), RmuxError>
+    where
+        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+    {
+        self.mutate_session_and_resize_window_terminal_with_family_if(
+            session_name,
+            window_index,
+            mutate,
+            |_| true,
+        )
+    }
+
+    pub(crate) fn mutate_session_and_resize_window_terminal_with_family_if<T, F, P>(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        mutate: F,
+        should_resize: P,
+    ) -> Result<(T, Vec<SessionName>), RmuxError>
+    where
+        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+        P: FnOnce(&T) -> bool,
+    {
+        let (result, synchronized_sessions, snapshot) = self
+            .mutate_session_and_synchronize_window_family_with_snapshot(
+                session_name,
+                window_index,
+                mutate,
+            )?;
+
+        if !should_resize(&result) {
+            return Ok((result, synchronized_sessions));
+        }
+
+        if let Err(error) = self.resize_window_terminal_runtime(session_name, window_index) {
+            snapshot.restore(self);
+            self.resize_window_terminal_runtime(session_name, window_index)
+                .map_err(|rollback_error| {
+                    RmuxError::Server(format!(
+                        "failed to roll back window runtime for {session_name}:{window_index} after {error}: {rollback_error}"
+                    ))
+                })?;
+            return Err(error);
+        }
+
+        for synchronized_session in &synchronized_sessions {
+            self.sync_pane_lifecycle_dimensions_for_session(synchronized_session);
+        }
+        Ok((result, synchronized_sessions))
+    }
+
+    pub(crate) fn mutate_session_and_synchronize_window_family<T, F>(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        mutate: F,
+    ) -> Result<(T, Vec<SessionName>), RmuxError>
+    where
+        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+    {
+        self.mutate_session_and_synchronize_window_family_with_snapshot(
+            session_name,
+            window_index,
+            mutate,
+        )
+        .map(|(result, synchronized_sessions, _)| (result, synchronized_sessions))
+    }
+
+    fn mutate_session_and_synchronize_window_family_with_snapshot<T, F>(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        mutate: F,
+    ) -> Result<(T, Vec<SessionName>, SessionTransferSnapshot), RmuxError>
+    where
+        F: FnOnce(&mut Session) -> Result<T, RmuxError>,
+    {
         let snapshot = SessionTransferSnapshot::capture(self);
         let result = {
             let session = self
@@ -109,24 +199,10 @@ impl HandlerState {
                     return Err(error);
                 }
             };
-
-        if let Err(error) = self.resize_window_terminal_runtime(session_name, window_index) {
-            snapshot.restore(self);
-            self.resize_window_terminal_runtime(session_name, window_index)
-                .map_err(|rollback_error| {
-                    RmuxError::Server(format!(
-                        "failed to roll back window runtime for {session_name}:{window_index} after {error}: {rollback_error}"
-                    ))
-                })?;
-            return Err(error);
-        }
-
-        for synchronized_session in synchronized_sessions {
-            self.sync_pane_lifecycle_dimensions_for_session(&synchronized_session);
-        }
-        Ok(result)
+        Ok((result, synchronized_sessions, snapshot))
     }
 
+    #[cfg(test)]
     pub(crate) fn mutate_session_and_resize_terminals<T, F>(
         &mut self,
         session_name: &SessionName,

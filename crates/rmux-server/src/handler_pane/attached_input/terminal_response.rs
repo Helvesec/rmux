@@ -1,6 +1,6 @@
 use rmux_core::TerminalPaletteIndex;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TerminalResponseDecode {
     NotResponse,
     Partial,
@@ -10,6 +10,11 @@ pub(super) enum TerminalResponseDecode {
     PaletteResponse {
         size: usize,
         index: TerminalPaletteIndex,
+    },
+    ClipboardResponse {
+        size: usize,
+        selection: Option<u8>,
+        content: Vec<u8>,
     },
     Matched {
         size: usize,
@@ -179,6 +184,18 @@ fn decode_complete_osc_sequence(
     if input.starts_with(b"\x1b]4;") {
         if let Some(index) = decode_palette_response_body(&input[b"\x1b]4;".len()..body_end]) {
             return TerminalResponseDecode::PaletteResponse { size, index };
+        }
+    }
+    if let Some(body) = input
+        .strip_prefix(b"\x1b]52;")
+        .and_then(|body| body.get(..body_end.saturating_sub(b"\x1b]52;".len())))
+    {
+        if let Some(response) = crate::clipboard_protocol::decode_clipboard_response_body(body) {
+            return TerminalResponseDecode::ClipboardResponse {
+                size,
+                selection: response.selection,
+                content: response.content,
+            };
         }
     }
     matched(size, None)
@@ -353,16 +370,18 @@ mod tests {
     fn attached_terminal_control_consumes_osc_sequences() {
         assert_eq!(
             decode_attached_terminal_control(b"\x1b]52;c;AAAA\x07tail", false),
-            TerminalResponseDecode::Matched {
+            TerminalResponseDecode::ClipboardResponse {
                 size: 12,
-                event: None
+                selection: Some(b'c'),
+                content: vec![0, 0, 0],
             }
         );
         assert_eq!(
             decode_attached_terminal_control(b"\x1b]52;c;AAAA\x1b\\tail", false),
-            TerminalResponseDecode::Matched {
+            TerminalResponseDecode::ClipboardResponse {
                 size: 13,
-                event: None
+                selection: Some(b'c'),
+                content: vec![0, 0, 0],
             }
         );
         assert_eq!(
@@ -431,9 +450,10 @@ mod tests {
         let bell_at = b"\x1b]52;c;AAAA".len();
         assert_eq!(
             decode_attached_terminal_control_after_append(bell_terminated, false, bell_at),
-            TerminalResponseDecode::Matched {
+            TerminalResponseDecode::ClipboardResponse {
                 size: bell_at + 1,
-                event: None,
+                selection: Some(b'c'),
+                content: vec![0, 0, 0],
             }
         );
 
@@ -445,9 +465,10 @@ mod tests {
                 false,
                 terminator_at + 1,
             ),
-            TerminalResponseDecode::Matched {
+            TerminalResponseDecode::ClipboardResponse {
                 size: terminator_at + 2,
-                event: None,
+                selection: Some(b'c'),
+                content: vec![0, 0, 0],
             }
         );
     }

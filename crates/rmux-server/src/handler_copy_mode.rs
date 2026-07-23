@@ -3,11 +3,13 @@ use super::pane_support::resolve_input_target;
 use super::prompt_support::PromptInputEvent;
 use super::RequestHandler;
 use crate::copy_mode::{
-    run_pipe_command, CopyBufferTarget, CopyModeCommandContext, CopyModePipeCommand, CopyModeState,
-    CopyModeTransfer, ModeKeys,
+    CopyBufferTarget, CopyModeCommandContext, CopyModePipeCommand, CopyModePrefixBehavior,
+    CopyModeState, CopyModeTransfer, ModeKeys,
 };
 use crate::limits::bounded_repeat_count;
-use crate::mouse::{copy_mode_mouse_context, copy_mode_mouse_drag_start_context};
+use crate::mouse::{
+    copy_mode_mouse_context, copy_mode_mouse_drag_start_context, AttachedMouseEvent,
+};
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::HandlerState;
@@ -21,6 +23,10 @@ use rmux_proto::{
 mod input;
 #[path = "handler_copy_mode/key_binding.rs"]
 pub(in crate::handler) mod key_binding;
+#[path = "handler_copy_mode/origin.rs"]
+mod origin;
+#[path = "handler_copy_mode/pipe_command.rs"]
+mod pipe_command;
 #[path = "handler_copy_mode/refresh_fanout.rs"]
 mod refresh_fanout;
 #[path = "handler_copy_mode/search.rs"]
@@ -30,6 +36,8 @@ mod search;
 pub(in crate::handler) use refresh_fanout::install_copy_mode_mutation_pause;
 
 use input::{attached_copy_mode_input_action, AttachedCopyModeInputAction};
+use origin::{CopyModeCommandInvocation, CopyModeCommandOrigin, CopyModeMouseContextKind};
+use pipe_command::run_pipe_command;
 
 impl RequestHandler {
     pub(super) async fn handle_copy_mode(
@@ -76,6 +84,14 @@ impl RequestHandler {
                 .expect("pane transcript mutex must not be poisoned")
                 .clear_copy_mode();
             if cleared {
+                if let Err(error) = self
+                    .state
+                    .lock()
+                    .await
+                    .resize_terminals(target.session_name())
+                {
+                    return Response::Error(ErrorResponse { error });
+                }
                 let identities = match self
                     .prepare_copy_mode_refresh_fanout(&target, target_session_id, true)
                     .await
@@ -93,6 +109,9 @@ impl RequestHandler {
         }
 
         let source_target = request.source.clone().unwrap_or_else(|| target.clone());
+        let line_numbers_enabled = !super::scripting_support::queued_command_has_mouse_origin()
+            && !request.mouse_drag_start
+            && !request.scrollbar_scroll;
         let attached_mouse = if request.mouse_drag_start || request.scrollbar_scroll {
             let attach_pid = match self
                 .resolve_attached_client_pid(requester_pid, "copy-mode")
@@ -141,7 +160,19 @@ impl RequestHandler {
                         .session(target.session_name())
                         .and_then(|session| session.window_at(target.window_index()))
                         .and_then(|window| window.pane(target.pane_index()))
-                        .and_then(|pane| mouse_context(event, pane.geometry(), *slider_mpos))
+                        .and_then(|pane| {
+                            let geometry =
+                                crate::mouse::layout_for_session(&state, target.session_name(), 1)
+                                    .and_then(|layout| {
+                                        layout
+                                            .panes
+                                            .into_iter()
+                                            .find(|candidate| candidate.pane_id == pane.id())
+                                            .map(|candidate| candidate.geometry)
+                                    })
+                                    .unwrap_or_else(|| pane.geometry());
+                            mouse_context(event, geometry, *slider_mpos)
+                        })
                 }),
             );
             (target_transcript, source_screen, context)
@@ -154,24 +185,14 @@ impl RequestHandler {
             if let Some(mode) = transcript.copy_mode_state_mut() {
                 mode.set_source_target(Some(source_target.clone()));
                 mode.set_show_position(!request.hide_position);
+                mode.set_line_numbers_enabled(line_numbers_enabled);
                 if request.exit_on_scroll {
                     mode.set_exit_on_scroll(true);
                 }
                 if request.source.is_some() {
                     mode.refresh_from_screen(source_screen);
                 }
-                if request.page_up {
-                    let _ = mode.execute_command("page-up", &[], &context);
-                }
-                if request.page_down {
-                    let _ = mode.execute_command("page-down", &[], &context);
-                }
-                if request.mouse_drag_start {
-                    let _ = mode.execute_command("begin-selection", &[], &context);
-                }
-                if request.scrollbar_scroll {
-                    let _ = mode.execute_command("scroll-to-mouse", &[], &context);
-                }
+                execute_copy_mode_entry_actions(mode, &request, &context);
                 (mode.view_mode(), false)
             } else {
                 let mut mode = CopyModeState::new(
@@ -182,23 +203,29 @@ impl RequestHandler {
                     request.exit_on_scroll,
                     !request.hide_position,
                 );
-                if request.page_up {
-                    let _ = mode.execute_command("page-up", &[], &context);
-                }
-                if request.page_down {
-                    let _ = mode.execute_command("page-down", &[], &context);
-                }
-                if request.mouse_drag_start {
-                    let _ = mode.execute_command("begin-selection", &[], &context);
-                }
-                if request.scrollbar_scroll {
-                    let _ = mode.execute_command("scroll-to-mouse", &[], &context);
-                }
+                mode.set_line_numbers_enabled(line_numbers_enabled);
                 let view_mode = mode.view_mode();
                 transcript.set_copy_mode_state(Some(mode));
                 (view_mode, true)
             }
         };
+
+        if mode_changed {
+            if let Err(error) = self
+                .state
+                .lock()
+                .await
+                .resize_terminals(target.session_name())
+            {
+                return Response::Error(ErrorResponse { error });
+            }
+            let mut transcript = target_transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned");
+            if let Some(mode) = transcript.copy_mode_state_mut() {
+                execute_copy_mode_entry_actions(mode, &request, &context);
+            }
+        }
 
         let identities = match self
             .prepare_copy_mode_refresh_fanout(&target, target_session_id, mode_changed)
@@ -339,13 +366,40 @@ impl RequestHandler {
         args: &[String],
         repeat_count: usize,
     ) -> Result<(), RmuxError> {
+        let mouse_event = super::scripting_support::queued_command_mouse_event();
         self.execute_copy_mode_command_with_identity(
             requester_pid,
             None,
-            target,
-            command,
-            args,
-            repeat_count,
+            CopyModeCommandInvocation {
+                target,
+                command,
+                args,
+                repeat_count,
+                origin: mouse_event.into(),
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn execute_copy_mode_command_with_mouse_event(
+        &self,
+        requester_pid: u32,
+        target: PaneTarget,
+        command: &str,
+        args: &[String],
+        repeat_count: usize,
+        mouse_event: AttachedMouseEvent,
+    ) -> Result<(), RmuxError> {
+        self.execute_copy_mode_command_with_identity(
+            requester_pid,
+            None,
+            CopyModeCommandInvocation {
+                target,
+                command,
+                args,
+                repeat_count,
+                origin: CopyModeCommandOrigin::Mouse(mouse_event),
+            },
         )
         .await
     }
@@ -358,13 +412,40 @@ impl RequestHandler {
         args: &[String],
         repeat_count: usize,
     ) -> Result<(), RmuxError> {
+        let mouse_event = super::scripting_support::queued_command_mouse_event();
         self.execute_copy_mode_command_with_identity(
             identity.attach_pid(),
             Some(identity),
-            target,
-            command,
-            args,
-            repeat_count,
+            CopyModeCommandInvocation {
+                target,
+                command,
+                args,
+                repeat_count,
+                origin: mouse_event.into(),
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn execute_copy_mode_command_for_identity_with_mouse_event(
+        &self,
+        identity: ActiveAttachIdentity,
+        target: PaneTarget,
+        command: &str,
+        args: &[String],
+        repeat_count: usize,
+        mouse_event: AttachedMouseEvent,
+    ) -> Result<(), RmuxError> {
+        self.execute_copy_mode_command_with_identity(
+            identity.attach_pid(),
+            Some(identity),
+            CopyModeCommandInvocation {
+                target,
+                command,
+                args,
+                repeat_count,
+                origin: CopyModeCommandOrigin::Mouse(mouse_event),
+            },
         )
         .await
     }
@@ -373,11 +454,15 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         identity: Option<ActiveAttachIdentity>,
-        target: PaneTarget,
-        command: &str,
-        args: &[String],
-        repeat_count: usize,
+        invocation: CopyModeCommandInvocation<'_>,
     ) -> Result<(), RmuxError> {
+        let CopyModeCommandInvocation {
+            target,
+            command,
+            args,
+            repeat_count,
+            origin,
+        } = invocation;
         let expected_session_id = match identity {
             Some(identity) => {
                 let (session_name, session_id) = self
@@ -432,23 +517,49 @@ impl RequestHandler {
             None
         };
 
-        let attached_mouse = if matches!(
-            command,
-            "begin-selection" | "scroll-to-mouse" | "select-line" | "select-word"
-        ) {
-            attached_mouse_context(self, requester_pid, identity, &target).await
-        } else {
-            None
+        let attached_mouse = match (origin, command) {
+            (CopyModeCommandOrigin::Mouse(event), "begin-selection") => {
+                origin::mouse_context_for_origin(
+                    self,
+                    requester_pid,
+                    identity,
+                    &target,
+                    &event,
+                    CopyModeMouseContextKind::DragSelectionStart,
+                )
+                .await
+            }
+            (CopyModeCommandOrigin::Mouse(event), _) => {
+                origin::mouse_context_for_origin(
+                    self,
+                    requester_pid,
+                    identity,
+                    &target,
+                    &event,
+                    CopyModeMouseContextKind::Position,
+                )
+                .await
+            }
+            (CopyModeCommandOrigin::NonMouse, _) => None,
         };
-        let context = {
+        let mut context = {
             let state = self.state.lock().await;
             ensure_copy_mode_session_identity(&state, &target, Some(expected_session_id))?;
             copy_mode_context(&state, &target, refresh_screen, attached_mouse)
         };
 
         let repeat_count = crate::limits::clamp_repeat_count(repeat_count);
+        let prefix_behavior = CopyModeState::prefix_behavior(command);
+        let execution_count = match prefix_behavior {
+            CopyModePrefixBehavior::Repeat => repeat_count,
+            CopyModePrefixBehavior::Count => 1,
+        };
+        let command_prefix = match prefix_behavior {
+            CopyModePrefixBehavior::Repeat => 1,
+            CopyModePrefixBehavior::Count => repeat_count,
+        };
         let mut mode_changed = false;
-        for _ in 0..repeat_count {
+        for _ in 0..execution_count {
             let search_off_lock = if CopyModeState::command_runs_search(command) {
                 let transcript = target_transcript
                     .lock()
@@ -473,7 +584,7 @@ impl RequestHandler {
                 let Some(mode) = transcript.copy_mode_state_mut() else {
                     return Err(RmuxError::Server("pane is not in copy mode".to_owned()));
                 };
-                match mode.execute_command(command, args, &context) {
+                match mode.execute_command_with_prefix(command, args, &context, command_prefix) {
                     Ok(outcome) => {
                         if outcome.cancel && transcript.clear_copy_mode() {
                             mode_changed = true;
@@ -483,6 +594,9 @@ impl RequestHandler {
                     Err(error) => return Err(error),
                 }
             };
+            if let Some(mouse) = context.mouse.as_mut() {
+                mouse.move_cursor_before_command = false;
+            }
             if let Some(transfer) = outcome.transfer {
                 self.apply_copy_mode_transfer(requester_pid, identity, &context, transfer)
                     .await?;
@@ -494,6 +608,12 @@ impl RequestHandler {
 
         #[cfg(test)]
         refresh_fanout::pause_after_copy_mode_mutation(requester_pid).await;
+
+        if mode_changed {
+            let mut state = self.state.lock().await;
+            ensure_copy_mode_session_identity(&state, &target, Some(expected_session_id))?;
+            state.resize_terminals(target.session_name())?;
+        }
 
         let refresh_identities = self
             .prepare_copy_mode_refresh_fanout(&target, expected_session_id, mode_changed)
@@ -536,6 +656,7 @@ impl RequestHandler {
             .await
         {
             run_pipe_command(
+                self,
                 &context.default_shell,
                 &command,
                 context.working_directory.as_ref(),
@@ -677,42 +798,23 @@ impl RequestHandler {
     }
 }
 
-async fn attached_mouse_context(
-    handler: &RequestHandler,
-    requester_pid: u32,
-    identity: Option<ActiveAttachIdentity>,
-    target: &PaneTarget,
-) -> Option<crate::copy_mode::CopyModeMouseContext> {
-    let attach_pid = match identity {
-        Some(identity) => identity.attach_pid(),
-        None => handler
-            .resolve_attached_client_pid(requester_pid, "send-keys")
-            .await
-            .ok()?,
-    };
-    let (event, slider_mpos, expected_session_id) = {
-        let active_attach = handler.active_attach.lock().await;
-        let active = active_attach.by_pid.get(&attach_pid).filter(|active| {
-            identity.is_none_or(|identity| {
-                identity.matches_active(active)
-                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-            })
-        })?;
-        let event = active.mouse.current_event.as_ref()?.clone();
-        (
-            event,
-            active.mouse.slider_mpos,
-            identity.map(|_| active.session_id),
-        )
-    };
-    let state = handler.state.lock().await;
-    ensure_copy_mode_session_identity(&state, target, expected_session_id).ok()?;
-    state
-        .sessions
-        .session(target.session_name())
-        .and_then(|session| session.window_at(target.window_index()))
-        .and_then(|window| window.pane(target.pane_index()))
-        .and_then(|pane| copy_mode_mouse_context(&event, pane.geometry(), slider_mpos))
+fn execute_copy_mode_entry_actions(
+    mode: &mut CopyModeState,
+    request: &CopyModeRequest,
+    context: &CopyModeCommandContext,
+) {
+    if request.page_up {
+        let _ = mode.execute_command("page-up", &[], context);
+    }
+    if request.page_down {
+        let _ = mode.execute_command("page-down", &[], context);
+    }
+    if request.mouse_drag_start {
+        let _ = mode.execute_command("begin-selection", &[], context);
+    }
+    if request.scrollbar_scroll {
+        let _ = mode.execute_command("scroll-to-mouse", &[], context);
+    }
 }
 
 fn clone_screen_for_target(
@@ -806,6 +908,14 @@ fn copy_mode_context(
             target.pane_index(),
             OptionName::ModeKeys,
         )),
+        line_number_mode: crate::copy_mode::CopyModeLineNumberMode::parse(
+            state.options.resolve_for_pane(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+                OptionName::CopyModeLineNumbers,
+            ),
+        ),
         wrap_search: state.options.resolve_for_pane(
             target.session_name(),
             target.window_index(),

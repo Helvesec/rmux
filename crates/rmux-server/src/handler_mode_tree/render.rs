@@ -1,6 +1,6 @@
 use rmux_core::{
     formats::FormatContext, text_width as tmux_text_width,
-    truncate_to_width as tmux_truncate_to_width, Style, Utf8Config,
+    truncate_to_width as tmux_truncate_to_width, PaneGeometry, Style, Utf8Config,
 };
 use rmux_proto::OptionName;
 
@@ -19,11 +19,14 @@ pub(super) fn render_mode_tree_overlay(
     let Some(session) = state.sessions.session(&mode.session_name) else {
         return Vec::new();
     };
-    let size = session.window().size();
-    let geometry = crate::renderer::StatusGeometry::for_session(session, &state.options);
-    let usable_rows = geometry.content_rows();
-    let content_y_offset = geometry.content_y_offset();
-    if usable_rows == 0 || size.cols == 0 {
+    let Ok(geometry) = super::mode_tree_geometry::content_geometry(state, mode) else {
+        return Vec::new();
+    };
+    let usable_rows = geometry.rows();
+    let content_x_offset = geometry.x();
+    let content_y_offset = geometry.y();
+    let cols = geometry.cols();
+    if usable_rows == 0 || cols == 0 {
         return Vec::new();
     }
 
@@ -69,8 +72,9 @@ pub(super) fn render_mode_tree_overlay(
             .is_some_and(|id| mode.selected_id.as_ref() == Some(id));
         render_overlay_line(
             &mut frame,
+            content_x_offset,
             content_y_offset.saturating_add(row),
-            size.cols,
+            cols,
             &text,
             if selected {
                 &selected_style
@@ -85,8 +89,9 @@ pub(super) fn render_mode_tree_overlay(
     while row < list_rows {
         render_overlay_line(
             &mut frame,
+            content_x_offset,
             content_y_offset.saturating_add(row),
-            size.cols,
+            cols,
             "",
             &default_style,
             &utf8,
@@ -99,9 +104,12 @@ pub(super) fn render_mode_tree_overlay(
         let title = mode_tree_preview_title(mode, build);
         render_mode_tree_box(
             &mut frame,
-            content_y_offset.saturating_add(list_rows),
-            preview_height,
-            size.cols,
+            PaneGeometry::new(
+                content_x_offset,
+                content_y_offset.saturating_add(list_rows),
+                cols,
+                preview_height,
+            ),
             &title,
             &default_style,
             &utf8,
@@ -115,7 +123,7 @@ pub(super) fn render_mode_tree_overlay(
                     state,
                     mode,
                     item,
-                    usize::from(size.cols.saturating_sub(4)),
+                    usize::from(cols.saturating_sub(4)),
                     usize::from(preview_height.saturating_sub(2)),
                     &utf8,
                 )
@@ -128,12 +136,12 @@ pub(super) fn render_mode_tree_overlay(
                 .unwrap_or_default();
             render_overlay_formatted_line(
                 &mut frame,
-                2,
+                content_x_offset.saturating_add(2),
                 content_y_offset
                     .saturating_add(list_rows)
                     .saturating_add(1)
                     .saturating_add(u16::try_from(index).unwrap_or(u16::MAX)),
-                size.cols.saturating_sub(4),
+                cols.saturating_sub(4),
                 &line,
                 &default_style,
                 &utf8,
@@ -143,8 +151,9 @@ pub(super) fn render_mode_tree_overlay(
         while row < usable_rows {
             render_overlay_line(
                 &mut frame,
+                content_x_offset,
                 content_y_offset.saturating_add(row),
-                size.cols,
+                cols,
                 "",
                 &default_style,
                 &utf8,
@@ -185,7 +194,7 @@ pub(super) fn render_visible_item(
 
     text.push_str(mode_tree_branch_marker(mode, build, item));
     text.push_str(&item.line);
-    sanitize_overlay_text(&tmux_truncate_to_width(&text, usize::MAX, utf8))
+    tmux_truncate_to_width(&sanitize_overlay_text(&text), usize::MAX, utf8)
 }
 
 fn mode_tree_is_flat_sibling_list(build: &ModeTreeBuild, item: &ModeTreeItem) -> bool {
@@ -236,6 +245,7 @@ fn mode_tree_branch_marker(
 
 fn render_overlay_line(
     frame: &mut Vec<u8>,
+    x: u16,
     row: u16,
     cols: u16,
     text: &str,
@@ -243,20 +253,33 @@ fn render_overlay_line(
     utf8: &Utf8Config,
 ) {
     let width = usize::from(cols);
-    let text = sanitize_overlay_text(&tmux_truncate_to_width(text, width, utf8));
+    let text = tmux_truncate_to_width(&sanitize_overlay_text(text), width, utf8);
     if !text.contains("#[") {
-        render_plain_overlay_line(frame, row, &text, base_style);
+        render_plain_overlay_line(frame, x, row, cols, &text, base_style, utf8);
         return;
     }
     let line = crate::renderer::format_draw_line(&text, base_style, width, utf8);
-    crate::renderer::render_formatted_line(frame, 0, row, &line);
+    crate::renderer::render_formatted_line(frame, x, row, &line);
 }
 
-fn render_plain_overlay_line(frame: &mut Vec<u8>, row: u16, text: &str, style: &Style) {
-    frame.extend_from_slice(format!("\x1b[{};1H", row.saturating_add(1)).as_bytes());
+fn render_plain_overlay_line(
+    frame: &mut Vec<u8>,
+    x: u16,
+    row: u16,
+    cols: u16,
+    text: &str,
+    style: &Style,
+    utf8: &Utf8Config,
+) {
+    frame.extend_from_slice(
+        format!("\x1b[{};{}H", row.saturating_add(1), x.saturating_add(1)).as_bytes(),
+    );
     frame.extend_from_slice(crate::renderer::style_sgr_bytes(style, true).as_slice());
     frame.extend_from_slice(text.as_bytes());
-    frame.extend_from_slice(b"\x1b[K");
+    let remaining = usize::from(cols).saturating_sub(tmux_text_width(text, utf8));
+    if remaining != 0 {
+        frame.extend_from_slice(format!("\x1b[{remaining}X").as_bytes());
+    }
 }
 
 pub(super) fn render_overlay_formatted_line(
@@ -268,20 +291,19 @@ pub(super) fn render_overlay_formatted_line(
     base_style: &Style,
     utf8: &Utf8Config,
 ) {
-    let line = crate::renderer::format_draw_line(text, base_style, usize::from(cols), utf8);
+    let line = crate::renderer::format_draw_line(
+        &sanitize_overlay_text(text),
+        base_style,
+        usize::from(cols),
+        utf8,
+    );
     crate::renderer::render_formatted_line(frame, x, row, &line);
 }
 
 pub(super) fn sanitize_overlay_text(value: &str) -> String {
     value
         .chars()
-        .map(|ch| {
-            if ch.is_control() && ch != '\t' {
-                ' '
-            } else {
-                ch
-            }
-        })
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect()
 }
 
@@ -433,30 +455,51 @@ fn mode_tree_preview_title(mode: &ModeTreeClientState, build: &ModeTreeBuild) ->
 
 fn render_mode_tree_box(
     frame: &mut Vec<u8>,
-    start_row: u16,
-    height: u16,
-    cols: u16,
+    geometry: PaneGeometry,
     title: &str,
     style: &Style,
     utf8: &Utf8Config,
 ) {
-    if height < 2 || cols < 2 {
+    if geometry.rows() < 2 || geometry.cols() < 2 {
         return;
     }
 
-    let inner = usize::from(cols.saturating_sub(2));
+    let inner = usize::from(geometry.cols().saturating_sub(2));
     let top = format!("┌{}┐", pad_box_title(title, inner, utf8));
     let middle = format!("│{}│", " ".repeat(inner));
     let bottom = format!("└{}┘", "─".repeat(inner));
 
-    render_overlay_line(frame, start_row, cols, &top, style, utf8);
-    for row in start_row.saturating_add(1)..start_row.saturating_add(height.saturating_sub(1)) {
-        render_overlay_line(frame, row, cols, &middle, style, utf8);
+    render_overlay_line(
+        frame,
+        geometry.x(),
+        geometry.y(),
+        geometry.cols(),
+        &top,
+        style,
+        utf8,
+    );
+    for row in geometry.y().saturating_add(1)
+        ..geometry
+            .y()
+            .saturating_add(geometry.rows().saturating_sub(1))
+    {
+        render_overlay_line(
+            frame,
+            geometry.x(),
+            row,
+            geometry.cols(),
+            &middle,
+            style,
+            utf8,
+        );
     }
     render_overlay_line(
         frame,
-        start_row.saturating_add(height.saturating_sub(1)),
-        cols,
+        geometry.x(),
+        geometry
+            .y()
+            .saturating_add(geometry.rows().saturating_sub(1)),
+        geometry.cols(),
         &bottom,
         style,
         utf8,

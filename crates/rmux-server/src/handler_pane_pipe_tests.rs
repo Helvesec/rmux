@@ -150,16 +150,27 @@ async fn wait_for_file_contains(path: &Path, expected: &str) {
     }
 }
 
-async fn wait_for_pipe_child_count_to_return_to(baseline: usize) {
+async fn pipe_process_group_probe(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+) -> crate::pane_terminals::PipeProcessGroupProbe {
+    handler
+        .state
+        .lock()
+        .await
+        .pane_pipe_process_group_probe_for_test(target)
+        .expect("active pipe process group probe")
+}
+
+async fn wait_for_pipe_child_to_stop(probe: &crate::pane_terminals::PipeProcessGroupProbe) {
     let deadline = tokio::time::Instant::now() + PANE_PIPE_TEST_TIMEOUT;
     loop {
-        let active = crate::pane_terminals::active_pipe_child_count_for_test();
-        if active <= baseline {
+        if !probe.child_wait_pending() {
             return;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting for pipe-pane children to stop; baseline={baseline}, active={active}"
+            "timed out waiting for the pipe-pane child to stop"
         );
         sleep(Duration::from_millis(25)).await;
     }
@@ -263,7 +274,6 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
     let first_output = unique_temp_path("once-first");
     let second_output = unique_temp_path("once-second");
-    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
     create_session(&handler, "alpha").await;
     wait_for_pane_process(&handler, target.clone()).await;
 
@@ -274,6 +284,7 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
         Some(pipe_to_file_command(&first_output)),
     )
     .await;
+    let first_pipe = pipe_process_group_probe(&handler, &target).await;
     let sent = handler
         .handle(Request::SendKeys(SendKeysRequest {
             target: target.clone(),
@@ -297,7 +308,16 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
         }))
         .await;
     assert!(matches!(sent, Response::SendKeys(_)));
-    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
+    assert!(
+        handler
+            .state
+            .lock()
+            .await
+            .pane_pipe_process_group_probe_for_test(&target)
+            .is_none(),
+        "pipe-pane -o must close the existing pipe without opening a replacement"
+    );
+    wait_for_pipe_child_to_stop(&first_pipe).await;
 
     let first_contents = fs::read_to_string(&first_output).expect("first pipe output exists");
     assert!(first_contents.contains("pipe-one"));
@@ -308,13 +328,36 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
     let _ = fs::remove_file(second_output);
 }
 
+#[tokio::test]
+async fn pipe_child_cleanup_probe_is_scoped_to_its_pipe() {
+    let handler = RequestHandler::new();
+    let alpha = PaneTarget::with_window(session_name("pipe-probe-alpha"), 0, 0);
+    let beta = PaneTarget::with_window(session_name("pipe-probe-beta"), 0, 0);
+    create_session(&handler, "pipe-probe-alpha").await;
+    create_session(&handler, "pipe-probe-beta").await;
+
+    pipe_pane(&handler, alpha.clone(), false, Some(pipe_discard_command())).await;
+    let alpha_probe = pipe_process_group_probe(&handler, &alpha).await;
+    pipe_pane(&handler, beta.clone(), false, Some(pipe_discard_command())).await;
+    let beta_probe = pipe_process_group_probe(&handler, &beta).await;
+
+    pipe_pane(&handler, alpha, false, None).await;
+    wait_for_pipe_child_to_stop(&alpha_probe).await;
+    assert!(
+        beta_probe.child_wait_pending(),
+        "stopping one pipe must not report another pipe's child as stopped"
+    );
+
+    pipe_pane(&handler, beta, false, None).await;
+    wait_for_pipe_child_to_stop(&beta_probe).await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn stopping_pipe_pane_terminates_descendants_after_the_shell_exits() {
     let handler = RequestHandler::new();
     let target = PaneTarget::with_window(session_name("pipe-process-group"), 0, 0);
     let pid_file = unique_temp_path("descendant-pid");
-    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
     create_session(&handler, "pipe-process-group").await;
     let command = format!(
         "sleep 60 & child=$!; printf '%s\\n' \"$child\" > {}",
@@ -331,9 +374,10 @@ async fn stopping_pipe_pane_terminates_descendants_after_the_shell_exits() {
         }))
         .await;
     assert!(matches!(response, Response::PipePane(_)));
+    let pipe = pipe_process_group_probe(&handler, &target).await;
     let descendant = wait_for_pipe_descendant_pid(&pid_file).await;
     let mut cleanup = PipeDescendantCleanup(Some(descendant));
-    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
+    wait_for_pipe_child_to_stop(&pipe).await;
 
     pipe_pane(&handler, target, false, None).await;
     wait_for_process_to_exit(descendant).await;
@@ -347,7 +391,6 @@ async fn stopping_pipe_pane_terminates_fast_descendants_after_the_shell_exits() 
     let handler = RequestHandler::new();
     let target = PaneTarget::with_window(session_name("pipe-windows-job"), 0, 0);
     let pid_file = unique_temp_path("windows-descendant-pid");
-    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
     create_session(&handler, "pipe-windows-job").await;
     let command = crate::test_shell::powershell_encoded_command(&format!(
         "$child=Start-Process -FilePath ($PSHOME + '\\powershell.exe') -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru; [System.IO.File]::WriteAllText({}, [string]$child.Id)",
@@ -364,9 +407,10 @@ async fn stopping_pipe_pane_terminates_fast_descendants_after_the_shell_exits() 
         }))
         .await;
     assert!(matches!(response, Response::PipePane(_)));
+    let pipe = pipe_process_group_probe(&handler, &target).await;
     let descendant = wait_for_windows_pipe_descendant_pid(&pid_file).await;
     let mut cleanup = WindowsPipeDescendantCleanup(Some(descendant));
-    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
+    wait_for_pipe_child_to_stop(&pipe).await;
 
     pipe_pane(&handler, target, false, None).await;
     wait_for_windows_process_to_exit(descendant).await;
@@ -421,7 +465,6 @@ async fn pane_pipe_format_reports_active_pipe_state() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let target = PaneTarget::with_window(alpha.clone(), 0, 0);
-    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
     create_session(&handler, "alpha").await;
 
     assert_eq!(
@@ -435,6 +478,7 @@ async fn pane_pipe_format_reports_active_pipe_state() {
         Some(pipe_discard_command()),
     )
     .await;
+    let pipe = pipe_process_group_probe(&handler, &target).await;
     assert_eq!(
         display_pane_format(&handler, target.clone(), "#{pane_pipe}").await,
         "1"
@@ -444,5 +488,5 @@ async fn pane_pipe_format_reports_active_pipe_state() {
         display_pane_format(&handler, target, "#{pane_pipe}").await,
         "0"
     );
-    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
+    wait_for_pipe_child_to_stop(&pipe).await;
 }

@@ -75,60 +75,67 @@ impl RequestHandler {
             (desired, inherited_from)
         };
 
-        let mut configure_fresh = Vec::new();
-        {
-            let mut timers = self
-                .silence_timers
-                .lock()
-                .expect("silence timer mutex must not be poisoned");
-            for (desired, inheritance) in desired.into_iter().zip(inherited_from) {
-                let next_generation = timers
-                    .get(&desired.target)
-                    .map_or(1, |timer| timer.generation.saturating_add(1));
-                if let Some(previous) = timers.remove(&desired.target) {
-                    previous.task.abort();
-                }
-                if desired.seconds == 0 {
-                    continue;
-                }
-                let Some((source_target, source_was_monitored)) = inheritance else {
-                    configure_fresh.push(desired);
-                    continue;
-                };
-                if !source_was_monitored {
-                    configure_fresh.push(desired);
-                    continue;
-                }
-                let inherited_deadline = timers.get(&source_target).and_then(|source| {
-                    (source.window_id == desired.window_id).then_some(source.deadline)
-                });
-                let Some(deadline) = inherited_deadline else {
-                    // The matching family timer already expired. A new grouped
-                    // alias inherits that expired state and must not rearm it.
-                    continue;
-                };
-                let task = self.spawn_silence_timer_task(
-                    desired.target.clone(),
-                    desired.session_id,
-                    desired.window_id,
-                    next_generation,
-                    deadline,
-                );
-                timers.insert(
-                    desired.target,
-                    SilenceTimerState {
-                        session_id: desired.session_id,
-                        window_id: desired.window_id,
-                        generation: next_generation,
-                        deadline,
-                        task,
-                    },
-                );
+        let admission_count = desired
+            .iter()
+            .filter(|desired| desired.seconds != 0)
+            .count();
+        let Some(mut timer_reservations) = self.reserve_silence_timer_tasks(admission_count) else {
+            return;
+        };
+        let mut timers = self
+            .silence_timers
+            .lock()
+            .expect("silence timer mutex must not be poisoned");
+        for (desired, inheritance) in desired.into_iter().zip(inherited_from) {
+            let next_generation = timers
+                .get(&desired.target)
+                .map_or(1, |timer| timer.generation.saturating_add(1));
+            if let Some(previous) = timers.remove(&desired.target) {
+                previous.task.abort();
             }
+            if desired.seconds == 0 {
+                continue;
+            }
+            let (generation, deadline) = match inheritance {
+                Some((source_target, true)) => {
+                    let inherited_deadline = timers.get(&source_target).and_then(|source| {
+                        (source.window_id == desired.window_id).then_some(source.deadline)
+                    });
+                    let Some(deadline) = inherited_deadline else {
+                        // The matching family timer already expired. A new grouped
+                        // alias inherits that expired state and must not rearm it.
+                        continue;
+                    };
+                    (next_generation, deadline)
+                }
+                // `configure_silence_timer` previously ran after the stale target entry was
+                // removed, so fresh targets restart at generation one.
+                Some((_, false)) | None => (
+                    1,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(desired.seconds),
+                ),
+            };
+            let task = self.spawn_silence_timer_task(
+                desired.target.clone(),
+                desired.session_id,
+                desired.window_id,
+                generation,
+                deadline,
+                timer_reservations.take(),
+            );
+            timers.insert(
+                desired.target,
+                SilenceTimerState {
+                    session_id: desired.session_id,
+                    window_id: desired.window_id,
+                    generation,
+                    deadline,
+                    task,
+                },
+            );
         }
-        for desired in configure_fresh {
-            self.configure_silence_timer(desired);
-        }
+        drop(timers);
+        drop(timer_reservations);
         drop(state);
     }
 }

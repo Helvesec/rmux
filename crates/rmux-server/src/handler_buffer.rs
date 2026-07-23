@@ -1,5 +1,3 @@
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use rmux_core::{encode_paste_bytes, LifecycleEvent, ScreenCaptureRange};
@@ -12,6 +10,7 @@ use rmux_proto::{
 use super::mode_tree_support::ModeTreeActionIdentity;
 use super::pane_support::{prepare_pane_input_write, write_bytes_to_target_io, PaneInputLiveness};
 use super::RequestHandler;
+use crate::buffer_file_io;
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::{session_not_found, PaneCaptureRequest};
@@ -23,8 +22,10 @@ mod capture_format;
 mod identity_test_pause;
 #[path = "handler_buffer/list.rs"]
 mod list;
+#[path = "handler_buffer/store.rs"]
+mod store;
 
-use capture_format::{apply_capture_format_flags, capture_render_options, parse_buffer_limit};
+use capture_format::{apply_capture_format_flags, capture_render_options};
 #[cfg(test)]
 pub(super) use identity_test_pause::{
     install_paste_buffer_identity_pause, pause_after_paste_buffer_identity_capture,
@@ -64,31 +65,21 @@ impl RequestHandler {
             });
         }
 
-        let content = if request.append {
-            self.append_buffer_content(request.name.as_deref(), request.content)
-                .await
-        } else {
-            Ok(request.content)
-        };
-
-        match content {
-            Ok(content) => {
-                let clipboard_bytes = request.set_clipboard.then_some(content.clone());
-                match self.store_buffer(request.name, content).await {
-                    Ok(buffer_name) => {
-                        if let Some(bytes) = clipboard_bytes.as_deref() {
-                            self.copy_bytes_to_attached_clipboard(
-                                requester_pid,
-                                "set-buffer",
-                                bytes,
-                                target_client.as_deref(),
-                            )
-                            .await;
-                        }
-                        Response::SetBuffer(SetBufferResponse { buffer_name })
-                    }
-                    Err(error) => Response::Error(ErrorResponse { error }),
+        match self
+            .store_buffer_with_append(request.name, request.content, request.append)
+            .await
+        {
+            Ok((buffer_name, stored_content)) => {
+                if request.set_clipboard {
+                    self.copy_bytes_to_attached_clipboard(
+                        requester_pid,
+                        "set-buffer",
+                        &stored_content,
+                        target_client.as_deref(),
+                    )
+                    .await;
                 }
+                Response::SetBuffer(SetBufferResponse { buffer_name })
             }
             Err(error) => Response::Error(ErrorResponse { error }),
         }
@@ -221,8 +212,93 @@ impl RequestHandler {
         #[cfg(test)]
         pause_after_paste_buffer_identity_capture(&session_name).await;
 
+        let delete_post_commit = if request.delete_after {
+            let capacity = match self.pane_mode_post_commit.acquire_capacity().await {
+                Ok(capacity) => capacity,
+                Err(error) => {
+                    return OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
+                        error,
+                    }))
+                }
+            };
+            Some(capacity.sequence())
+        } else {
+            None
+        };
+
         let payload = render_paste_payload(&content, &request);
         let payload = bracketed_paste_payload(payload, bracketed_mode);
+
+        if let Some(post_commit) = delete_post_commit {
+            let handler = self.clone();
+            let target = request.target.clone();
+            return match post_commit
+                .run_durable(async move {
+                    if let Err(result) = handler
+                        .write_ordered_paste_payload(&target, pane_id, expected_requester, payload)
+                        .await
+                    {
+                        return result;
+                    }
+                    handler.pause_before_paste_buffer_delete().await;
+                    let transaction = handler.pane_mode_transaction.clone().lock_owned().await;
+                    let event = {
+                        let mut state = handler.state.lock().await;
+                        // The requester and stable pane were validated at the write
+                        // linearization point. Once the bytes are observable, caller
+                        // cancellation or attach replacement cannot roll that write
+                        // back and therefore must not cancel its requested deletion.
+                        state
+                            .buffers
+                            .delete_if_order_matches(&buffer_name, buffer_order)
+                            .then(|| {
+                                super::prepare_lifecycle_event(
+                                    &mut state,
+                                    &LifecycleEvent::PasteBufferDeleted {
+                                        buffer_name: buffer_name.clone(),
+                                    },
+                                )
+                            })
+                    };
+                    drop(transaction);
+                    if let Some(event) = event {
+                        handler.emit_prepared(event).await;
+                    }
+                    OrderedPasteBufferResult::Completed(Response::PasteBuffer(
+                        PasteBufferResponse { buffer_name },
+                    ))
+                })
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse { error }))
+                }
+            };
+        }
+
+        if let Err(result) = self
+            .write_ordered_paste_payload(&request.target, pane_id, expected_requester, payload)
+            .await
+        {
+            return result;
+        }
+
+        OrderedPasteBufferResult::Completed(Response::PasteBuffer(PasteBufferResponse {
+            buffer_name,
+        }))
+    }
+
+    async fn write_ordered_paste_payload(
+        &self,
+        target: &rmux_proto::PaneTarget,
+        pane_id: rmux_proto::PaneId,
+        expected_requester: Option<ModeTreeActionIdentity>,
+        payload: Vec<u8>,
+    ) -> Result<(), OrderedPasteBufferResult> {
+        let session_name = target.session_name().clone();
+        let window_index = target.window_index();
+        let pane_index = target.pane_index();
         let write = {
             let mut state = self.state.lock().await;
             // The state lock is acquired before the attach lock, matching
@@ -242,7 +318,7 @@ impl RequestHandler {
                                 && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
                         });
                     if !requester_is_current {
-                        return OrderedPasteBufferResult::StaleRequesterIdentity;
+                        return Err(OrderedPasteBufferResult::StaleRequesterIdentity);
                     }
                     Some(active_attach)
                 }
@@ -258,74 +334,30 @@ impl RequestHandler {
                 .and_then(|window| window.pane(pane_index))
                 .is_some_and(|pane| pane.id() == pane_id);
             if !pane_identity_matches {
-                return OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
-                    error: RmuxError::invalid_target(
-                        request.target.to_string(),
-                        "pane identity changed before paste-buffer write",
-                    ),
-                }));
+                return Err(OrderedPasteBufferResult::Completed(Response::Error(
+                    ErrorResponse {
+                        error: RmuxError::invalid_target(
+                            target.to_string(),
+                            "pane identity changed before paste-buffer write",
+                        ),
+                    },
+                )));
             }
-            match prepare_pane_input_write(
-                &mut state,
-                &request.target,
-                &payload,
-                PaneInputLiveness::RejectDead,
-            ) {
-                Ok(write) => write,
-                Err(error) => {
-                    return OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
-                        error,
-                    }))
-                }
-            }
+            prepare_pane_input_write(&mut state, target, &payload, PaneInputLiveness::RejectDead)
+                .map_err(|error| {
+                    OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse { error }))
+                })?
         };
-        if let Err(error) = write_bytes_to_target_io(write, payload).await {
-            return OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
-                error: RmuxError::Server(format!(
-                    "failed to write buffer to pane {}:{}.{}: {}",
-                    session_name, window_index, pane_index, error
-                )),
-            }));
-        }
-
-        if request.delete_after {
-            self.pause_before_paste_buffer_delete().await;
-            let mut state = self.state.lock().await;
-            let _active_attach = match expected_requester {
-                Some(expected) => {
-                    let active_attach = self.active_attach.lock().await;
-                    let requester_is_current = active_attach
-                        .by_pid
-                        .get(&expected.attach_pid())
-                        .is_some_and(|active| {
-                            active.id == expected.attach_id()
-                                && active.mode_tree_state_id == expected.state_id()
-                                && active.mode_tree.is_some()
-                                && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-                        });
-                    if !requester_is_current {
-                        return OrderedPasteBufferResult::StaleRequesterIdentity;
-                    }
-                    Some(active_attach)
-                }
-                None => None,
-            };
-            let deleted = state
-                .buffers
-                .delete_if_order_matches(&buffer_name, buffer_order);
-            drop(state);
-            drop(_active_attach);
-            if deleted {
-                self.emit(LifecycleEvent::PasteBufferDeleted {
-                    buffer_name: buffer_name.clone(),
-                })
-                .await;
-            }
-        }
-
-        OrderedPasteBufferResult::Completed(Response::PasteBuffer(PasteBufferResponse {
-            buffer_name,
-        }))
+        write_bytes_to_target_io(write, payload)
+            .await
+            .map_err(|error| {
+                OrderedPasteBufferResult::Completed(Response::Error(ErrorResponse {
+                    error: RmuxError::Server(format!(
+                        "failed to write buffer to pane {}:{}.{}: {}",
+                        session_name, window_index, pane_index, error
+                    )),
+                }))
+            })
     }
 
     pub(super) async fn handle_list_buffers(
@@ -363,18 +395,34 @@ impl RequestHandler {
         &self,
         request: rmux_proto::DeleteBufferRequest,
     ) -> Response {
-        let mut state = self.state.lock().await;
-
-        match state.buffers.delete(request.name.as_deref()) {
-            Ok(buffer_name) => {
-                drop(state);
-                self.emit(LifecycleEvent::PasteBufferDeleted {
-                    buffer_name: buffer_name.clone(),
-                })
-                .await;
-                Response::DeleteBuffer(DeleteBufferResponse { buffer_name })
-            }
-            Err(error) => Response::Error(ErrorResponse { error }),
+        let capacity = match self.pane_mode_post_commit.acquire_capacity().await {
+            Ok(capacity) => capacity,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
+        let post_commit = capacity.sequence();
+        let handler = self.clone();
+        match post_commit
+            .run_durable(async move {
+                let transaction = handler.pane_mode_transaction.clone().lock_owned().await;
+                let (buffer_name, event) = {
+                    let mut state = handler.state.lock().await;
+                    let buffer_name = state.buffers.delete(request.name.as_deref())?;
+                    let event = super::prepare_lifecycle_event(
+                        &mut state,
+                        &LifecycleEvent::PasteBufferDeleted {
+                            buffer_name: buffer_name.clone(),
+                        },
+                    );
+                    (buffer_name, event)
+                };
+                drop(transaction);
+                handler.emit_prepared(event).await;
+                Ok::<_, RmuxError>(buffer_name)
+            })
+            .await
+        {
+            Ok(Ok(buffer_name)) => Response::DeleteBuffer(DeleteBufferResponse { buffer_name }),
+            Ok(Err(error)) | Err(error) => Response::Error(ErrorResponse { error }),
         }
     }
 
@@ -385,7 +433,7 @@ impl RequestHandler {
     ) -> Response {
         let target_client = request.target_client.clone();
         let resolved_path = resolve_buffer_path(&request.path, request.cwd.as_deref());
-        let content = match read_buffer_file(resolved_path).await {
+        let content = match buffer_file_io::read(resolved_path).await {
             Ok(content) => content,
             Err(error) => {
                 return Response::Error(ErrorResponse {
@@ -433,7 +481,7 @@ impl RequestHandler {
         };
 
         let resolved_path = resolve_buffer_path(&request.path, request.cwd.as_deref());
-        let save_result = write_buffer_file(resolved_path, content, request.append).await;
+        let save_result = buffer_file_io::write(resolved_path, content, request.append).await;
         match save_result {
             Ok(()) => Response::SaveBuffer(SaveBufferResponse { buffer_name }),
             Err(error) => Response::Error(ErrorResponse {
@@ -451,6 +499,9 @@ impl RequestHandler {
     ) -> Response {
         let (mut content, line_flags) = {
             let mut state = self.state.lock().await;
+            if let Err(error) = super::require_expected_pane_identity(&state, &request.target) {
+                return Response::Error(ErrorResponse { error });
+            }
             let range = ScreenCaptureRange {
                 start: request.start,
                 end: request.end,
@@ -511,77 +562,47 @@ impl RequestHandler {
         }
     }
 
-    async fn append_buffer_content(
-        &self,
-        name: Option<&str>,
-        mut content: Vec<u8>,
-    ) -> Result<Vec<u8>, RmuxError> {
-        let state = self.state.lock().await;
-        if let Some(name) = name {
-            if let Some(existing) = state.buffers.get(name) {
-                let mut combined = Vec::with_capacity(existing.len() + content.len());
-                combined.extend_from_slice(existing);
-                combined.append(&mut content);
-                return Ok(combined);
-            }
-        }
-        Ok(content)
-    }
-
     async fn rename_buffer(
         &self,
         old_name: Option<String>,
         new_name: String,
     ) -> Result<String, RmuxError> {
-        let mut state = self.state.lock().await;
-        let outcome = state.buffers.rename(old_name.as_deref(), &new_name)?;
-        drop(state);
-
-        if outcome.changed() {
-            if outcome.replaced() {
-                self.emit(LifecycleEvent::PasteBufferDeleted {
-                    buffer_name: outcome.new_name().to_owned(),
-                })
-                .await;
-            }
-            self.emit(LifecycleEvent::PasteBufferDeleted {
-                buffer_name: outcome.old_name().to_owned(),
+        let capacity = self.pane_mode_post_commit.acquire_capacity().await?;
+        let post_commit = capacity.sequence();
+        let handler = self.clone();
+        post_commit
+            .run_durable(async move {
+                let transaction = handler.pane_mode_transaction.clone().lock_owned().await;
+                let (buffer_name, events) = {
+                    let mut state = handler.state.lock().await;
+                    let outcome = state.buffers.rename(old_name.as_deref(), &new_name)?;
+                    let mut lifecycle_events = Vec::new();
+                    if outcome.changed() {
+                        if outcome.replaced() {
+                            lifecycle_events.push(LifecycleEvent::PasteBufferDeleted {
+                                buffer_name: outcome.new_name().to_owned(),
+                            });
+                        }
+                        lifecycle_events.push(LifecycleEvent::PasteBufferDeleted {
+                            buffer_name: outcome.old_name().to_owned(),
+                        });
+                        lifecycle_events.push(LifecycleEvent::PasteBufferChanged {
+                            buffer_name: outcome.new_name().to_owned(),
+                        });
+                    }
+                    let events = lifecycle_events
+                        .iter()
+                        .map(|event| super::prepare_lifecycle_event(&mut state, event))
+                        .collect::<Vec<_>>();
+                    (outcome.new_name().to_owned(), events)
+                };
+                drop(transaction);
+                for event in events {
+                    handler.emit_prepared(event).await;
+                }
+                Ok::<_, RmuxError>(buffer_name)
             })
-            .await;
-            self.emit(LifecycleEvent::PasteBufferChanged {
-                buffer_name: outcome.new_name().to_owned(),
-            })
-            .await;
-        }
-
-        Ok(outcome.new_name().to_owned())
-    }
-
-    pub(in crate::handler) async fn store_buffer(
-        &self,
-        name: Option<String>,
-        content: Vec<u8>,
-    ) -> Result<String, RmuxError> {
-        let mut state = self.state.lock().await;
-        let buffer_limit = parse_buffer_limit(&state);
-        let outcome = state.buffers.set(name.as_deref(), content, buffer_limit)?;
-        let buffer_name = outcome.buffer_name().map(str::to_owned).unwrap_or_default();
-        drop(state);
-
-        for evicted in outcome.evicted() {
-            self.emit(LifecycleEvent::PasteBufferDeleted {
-                buffer_name: evicted.clone(),
-            })
-            .await;
-        }
-        if !buffer_name.is_empty() {
-            self.emit(LifecycleEvent::PasteBufferChanged {
-                buffer_name: buffer_name.clone(),
-            })
-            .await;
-        }
-
-        Ok(buffer_name)
+            .await?
     }
 
     async fn copy_bytes_to_attached_clipboard(
@@ -625,24 +646,6 @@ impl RequestHandler {
     }
 }
 
-async fn read_buffer_file(path: PathBuf) -> io::Result<Vec<u8>> {
-    tokio::task::spawn_blocking(move || fs::read(path))
-        .await
-        .map_err(|error| io::Error::other(format!("buffer file reader failed: {error}")))?
-}
-
-async fn write_buffer_file(path: PathBuf, content: Vec<u8>, append: bool) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || {
-        if append {
-            append_buffer_to_path(&path, &content)
-        } else {
-            save_buffer_to_path(&path, &content)
-        }
-    })
-    .await
-    .map_err(|error| io::Error::other(format!("buffer file writer failed: {error}")))?
-}
-
 fn resolve_buffer_path(path: &str, cwd: Option<&Path>) -> PathBuf {
     let candidate = Path::new(path);
     if candidate.is_absolute() {
@@ -652,23 +655,6 @@ fn resolve_buffer_path(path: &str, cwd: Option<&Path>) -> PathBuf {
     } else {
         candidate.to_path_buf()
     }
-}
-
-fn save_buffer_to_path(destination: &Path, content: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(destination)?;
-    file.write_all(content)
-}
-
-fn append_buffer_to_path(destination: &Path, content: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(destination)?;
-    file.write_all(content)
 }
 
 fn render_paste_payload(content: &[u8], request: &rmux_proto::PasteBufferRequest) -> Vec<u8> {

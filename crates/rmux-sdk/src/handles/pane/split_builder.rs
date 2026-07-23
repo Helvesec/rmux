@@ -31,6 +31,10 @@ impl<'a> PaneSplitBuilder<'a> {
     }
 
     /// Spawns the new pane with the supplied argv.
+    ///
+    /// On Windows, `.bat` and `.cmd` targets are rejected; use a native
+    /// executable for literal argv, or [`Self::shell`] when shell
+    /// interpretation is intentional.
     #[must_use]
     pub fn spawn<I, S>(mut self, command: I) -> Self
     where

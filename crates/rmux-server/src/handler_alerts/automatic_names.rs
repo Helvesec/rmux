@@ -86,7 +86,7 @@ impl RequestHandler {
         Self::sync_automatic_window_name_for_window_target_locked(&mut state, target, window_id)
     }
 
-    pub(super) fn sync_automatic_window_name_for_window_target_locked(
+    pub(in crate::handler) fn sync_automatic_window_name_for_window_target_locked(
         state: &mut HandlerState,
         target: &WindowTarget,
         expected_window_id: WindowId,

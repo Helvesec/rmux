@@ -478,7 +478,12 @@ impl Harness {
     }
 
     async fn finish(self) -> TestResult {
-        let shutdown = self.rmux().shutdown().await;
+        let shutdown = RmuxBuilder::new()
+            .unix_socket(&self.socket_path)
+            .default_timeout(Duration::from_secs(30))
+            .build()
+            .shutdown()
+            .await;
         wait_for_child_exit(self, "server did not exit during cleanup").await?;
         if let Err(error) = shutdown {
             let rendered = error.to_string();

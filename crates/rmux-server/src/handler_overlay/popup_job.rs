@@ -509,7 +509,7 @@ fn spawn_popup_reader_task(
 async fn read_async_fd(fd: &AsyncFd<PtyIo>, buffer: &mut [u8]) -> io::Result<usize> {
     loop {
         let mut ready = fd.readable().await?;
-        match ready.try_io(|inner| inner.get_ref().read(&mut *buffer)) {
+        match ready.try_io(|inner| inner.get_ref().try_read(&mut *buffer)) {
             Ok(result) => return result,
             Err(_would_block) => continue,
         }

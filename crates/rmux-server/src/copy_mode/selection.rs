@@ -128,11 +128,7 @@ impl CopyModeState {
     }
 
     pub(super) fn selection_snapshot(&self) -> Option<SelectionState> {
-        let mut selection = self.selection.clone()?;
-        if selection.active {
-            selection.end = self.cursor;
-        }
-        Some(selection)
+        self.selection.clone()
     }
 
     pub(super) fn sync_selection_with_cursor(&mut self) {

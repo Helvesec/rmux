@@ -47,8 +47,15 @@ fn temp_dir(label: &str) -> PathBuf {
 fn changelog_checker_rejects_unversioned_tmux_claim_without_test_link() {
     let root = temp_dir("changelog-tmux-claim");
     let changelog = root.join("CHANGELOG.md");
-    let required_sections = "## 0.9.0\n\n- Matches tmux queued attach sequencing.\n\n## 0.8.0\n\n## 0.7.1\n\n## 0.7.0\n";
-    fs::write(&changelog, required_sections).expect("write changelog fixture");
+    let current_version = env!("CARGO_PKG_VERSION");
+    let mut required_sections =
+        format!("## {current_version}\n\n- Matches tmux queued attach sequencing.\n\n");
+    for historical in ["0.9.0", "0.8.0", "0.7.1", "0.7.0"] {
+        if historical != current_version {
+            required_sections.push_str(&format!("## {historical}\n\n"));
+        }
+    }
+    fs::write(&changelog, &required_sections).expect("write changelog fixture");
     let changelog_arg = changelog.to_string_lossy().into_owned();
 
     let rejected = run("scripts/check-changelog-release.py", &[&changelog_arg]);
@@ -71,18 +78,76 @@ fn changelog_checker_rejects_unversioned_tmux_claim_without_test_link() {
 }
 
 #[test]
+#[cfg(unix)]
+fn changelog_checker_requires_the_workspace_release_section() {
+    let root = temp_dir("changelog-current-release");
+    let changelog = root.join("CHANGELOG.md");
+    let current_version = env!("CARGO_PKG_VERSION");
+    let mut historical_only = String::new();
+    for historical in ["0.9.0", "0.8.0", "0.7.1", "0.7.0"] {
+        if historical != current_version {
+            historical_only.push_str(&format!("## {historical}\n\n"));
+        }
+    }
+    fs::write(&changelog, &historical_only).expect("write changelog fixture");
+    let changelog_arg = changelog.to_string_lossy().into_owned();
+
+    let rejected = run("scripts/check-changelog-release.py", &[&changelog_arg]);
+    assert!(!rejected.status.success(), "{}", stdout(&rejected));
+    assert!(
+        stderr(&rejected).contains(&format!(
+            "first release section must be ## {current_version}"
+        )),
+        "{}",
+        stderr(&rejected)
+    );
+
+    let wrong_prefix = format!("## {current_version}0\n\n{historical_only}");
+    fs::write(&changelog, wrong_prefix).expect("write wrong-prefix changelog fixture");
+    let rejected = run("scripts/check-changelog-release.py", &[&changelog_arg]);
+    assert!(!rejected.status.success(), "{}", stdout(&rejected));
+    assert!(
+        stderr(&rejected).contains(&format!(
+            "first release section must be ## {current_version}"
+        )),
+        "{}",
+        stderr(&rejected)
+    );
+
+    let out_of_order = format!("{historical_only}## {current_version}\n\n");
+    fs::write(&changelog, out_of_order).expect("write out-of-order changelog fixture");
+    let rejected = run("scripts/check-changelog-release.py", &[&changelog_arg]);
+    assert!(!rejected.status.success(), "{}", stdout(&rejected));
+    assert!(
+        stderr(&rejected).contains(&format!(
+            "first release section must be ## {current_version}"
+        )),
+        "{}",
+        stderr(&rejected)
+    );
+
+    let duplicate = format!("## {current_version}\n\n## {current_version}\n\n{historical_only}");
+    fs::write(&changelog, duplicate).expect("write duplicate changelog fixture");
+    let rejected = run("scripts/check-changelog-release.py", &[&changelog_arg]);
+    assert!(!rejected.status.success(), "{}", stdout(&rejected));
+    assert!(
+        stderr(&rejected).contains(&format!("duplicate changelog section ## {current_version}")),
+        "{}",
+        stderr(&rejected)
+    );
+
+    fs::remove_dir_all(root).expect("remove changelog fixture");
+}
+
+#[test]
 fn tmux_ledger_gate_reads_authoritative_inventories_and_named_divergence_tests() {
     let checker = include_str!("../scripts/check-tmux-release-ledger.py");
 
-    for authoritative_path in [
-        "crates/rmux-core/src/command_inventory/signatures.rs",
-        "crates/rmux-core/src/options/table.rs",
-    ] {
-        assert!(
-            checker.contains(authoritative_path),
-            "tmux ledger gate lost authoritative inventory {authoritative_path}"
-        );
-    }
+    let authoritative_path = "crates/rmux-core/src/command_inventory/signatures.rs";
+    assert!(
+        checker.contains(authoritative_path),
+        "tmux ledger gate lost authoritative inventory {authoritative_path}"
+    );
     for stale_facade in [
         "COMMAND_INVENTORY = Path(\"src/cli/command_inventory.rs\")",
         "OPTIONS_REGISTRY = Path(\"crates/rmux-core/src/options/registry.rs\")",
@@ -123,17 +188,14 @@ fn winget_portable_archive_preserves_the_private_runtime_layout() {
 }
 
 #[test]
-fn current_changelog_records_the_exact_detached_wire_version() {
+fn release_line_changelog_records_the_exact_detached_wire_version() {
     let changelog = include_str!("../CHANGELOG.md");
-    let current_release = changelog
-        .split("\n## 0.8.0\n")
-        .next()
-        .expect("0.9.0 changelog section");
+    let wire_cut_release = changelog_release_section(changelog, "0.9.0");
     let expected = format!(
         "detached RPC frame envelope from wire version 3 to {}",
         rmux_proto::RMUX_WIRE_VERSION
     );
-    let normalized = current_release
+    let normalized = wire_cut_release
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
@@ -143,9 +205,34 @@ fn current_changelog_records_the_exact_detached_wire_version() {
         "0.9.0 changelog must record the current detached wire version: {expected}"
     );
     assert!(
-        normalized.contains("already-running older server must be restarted"),
+        normalized.contains("already-running pre-0.9 server must be restarted"),
         "0.9.0 changelog must tell operators that this hard wire cut requires a server restart"
     );
+
+    let current_version = env!("CARGO_PKG_VERSION");
+    if current_version != "0.9.0" {
+        let current_release = changelog_release_section(changelog, current_version)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            current_release.contains(&format!(
+                "wire version {} unchanged",
+                rmux_proto::RMUX_WIRE_VERSION
+            )),
+            "{current_version} changelog must record the unchanged detached wire version"
+        );
+    }
+}
+
+fn changelog_release_section<'a>(changelog: &'a str, version: &str) -> &'a str {
+    let heading = format!("## {version}\n");
+    let start = changelog
+        .find(&heading)
+        .unwrap_or_else(|| panic!("missing {version} changelog section"));
+    let body = &changelog[start + heading.len()..];
+    let end = body.find("\n## ").unwrap_or(body.len());
+    &body[..end]
 }
 
 #[test]
@@ -295,22 +382,31 @@ esac
 #[test]
 #[cfg(unix)]
 fn release_identity_separates_rc_tag_from_cargo_package_version() {
-    let stable = run("scripts/release-identity.sh", &["v0.9.0"]);
+    let package_version = env!("CARGO_PKG_VERSION");
+    let stable_tag = format!("v{package_version}");
+    let stable = run("scripts/release-identity.sh", &[&stable_tag]);
     assert!(stable.status.success(), "{}", stderr(&stable));
     let stable_text = stdout(&stable);
-    assert!(stable_text.contains("RELEASE_VERSION=0.9.0\n"));
-    assert!(stable_text.contains("PACKAGE_VERSION=0.9.0\n"));
+    assert!(stable_text.contains(&format!("RELEASE_VERSION={package_version}\n")));
+    assert!(stable_text.contains(&format!("PACKAGE_VERSION={package_version}\n")));
     assert!(stable_text.contains("IS_PRERELEASE=false\n"));
 
-    let rc = run("scripts/release-identity.sh", &["v0.9.0-rc.1"]);
+    let rc_tag = format!("v{package_version}-rc.1");
+    let rc = run("scripts/release-identity.sh", &[&rc_tag]);
     assert!(rc.status.success(), "{}", stderr(&rc));
     let rc_text = stdout(&rc);
-    assert!(rc_text.contains("RELEASE_VERSION=0.9.0-rc.1\n"));
-    assert!(rc_text.contains("PACKAGE_VERSION=0.9.0\n"));
+    assert!(rc_text.contains(&format!("RELEASE_VERSION={package_version}-rc.1\n")));
+    assert!(rc_text.contains(&format!("PACKAGE_VERSION={package_version}\n")));
     assert!(rc_text.contains("IS_PRERELEASE=true\n"));
 
-    for invalid in ["v0.9.1-rc.1", "v0.9.0-rc.0", "v0.9.0-rc.01", "0.9.0"] {
-        let output = run("scripts/release-identity.sh", &[invalid]);
+    let invalid = [
+        "v0.0.0-rc.1".to_owned(),
+        format!("v{package_version}-rc.0"),
+        format!("v{package_version}-rc.01"),
+        package_version.to_owned(),
+    ];
+    for invalid in &invalid {
+        let output = run("scripts/release-identity.sh", &[invalid.as_str()]);
         assert!(
             !output.status.success(),
             "invalid release identity passed: {invalid}"

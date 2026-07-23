@@ -6,6 +6,18 @@ use super::support::{find_session_name_by_id, find_window_target_by_id};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 
 impl RequestHandler {
+    #[cfg(test)]
+    pub(in crate::handler) async fn resolve_overlay_client(
+        &self,
+        requester_pid: u32,
+        target_client: Option<&str>,
+        command_name: &str,
+    ) -> Result<u32, RmuxError> {
+        self.resolve_target_attach_client_pid(requester_pid, target_client, command_name)
+            .await
+            .map_err(|error| overlay_client_error(error, command_name))
+    }
+
     pub(in crate::handler) async fn attached_mouse_target_for_session_identity(
         &self,
         identity: ActiveAttachIdentity,
@@ -30,20 +42,20 @@ impl RequestHandler {
             .await
     }
 
-    pub(in crate::handler) async fn resolve_overlay_client(
+    pub(in crate::handler) async fn resolve_overlay_client_identity(
         &self,
         requester_pid: u32,
         target_client: Option<&str>,
         command_name: &str,
-    ) -> Result<u32, RmuxError> {
-        self.resolve_target_attach_client_pid(requester_pid, target_client, command_name)
+    ) -> Result<ActiveAttachIdentity, RmuxError> {
+        self.resolve_target_attach_client_identity(requester_pid, target_client, command_name)
             .await
             .map_err(|error| overlay_client_error(error, command_name))
     }
 
-    pub(super) async fn resolve_overlay_target(
+    pub(super) async fn resolve_overlay_target_for_identity(
         &self,
-        attach_pid: u32,
+        identity: ActiveAttachIdentity,
         explicit_pane: Option<PaneTarget>,
         current_target: Option<Target>,
     ) -> Result<Target, RmuxError> {
@@ -54,21 +66,26 @@ impl RequestHandler {
             return Ok(target);
         }
 
-        let session_name = self.attached_session_name(attach_pid).await?;
+        let (session_name, session_id) = self
+            .attached_session_identity_for_identity(identity)
+            .await?;
         let mouse_event = {
             let active_attach = self.active_attach.lock().await;
             active_attach
                 .by_pid
-                .get(&attach_pid)
+                .get(&identity.attach_pid())
+                .filter(|active| identity.matches_active_session(active, &session_name, session_id))
                 .and_then(|active| active.mouse.current_event.clone())
         };
         if let Some(target) = self
-            .overlay_target_from_mouse(session_name.clone(), None, mouse_event.as_ref())
+            .overlay_target_from_mouse(session_name, Some(session_id), mouse_event.as_ref())
             .await?
         {
             return Ok(target);
         }
-        Ok(Target::Pane(self.attached_input_target(attach_pid).await?))
+        self.attached_input_target_identity(identity)
+            .await
+            .map(|(target, _)| Target::Pane(target))
     }
 
     async fn overlay_target_from_mouse(

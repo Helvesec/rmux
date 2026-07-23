@@ -28,6 +28,8 @@ mod input;
 mod metrics;
 #[path = "attach_windows/output.rs"]
 mod output;
+#[path = "attach_windows/output_worker.rs"]
+mod output_worker;
 #[path = "attach/screen.rs"]
 mod screen;
 #[path = "attach_windows/shell_command.rs"]
@@ -78,13 +80,14 @@ pub fn attach_terminal_with_initial_bytes_and_windows_console_key(
     let raw_terminal = RawTerminal::enter().map_err(ClientError::from)?;
     let output = output::AttachStdout::for_managed_terminal(io::stdout());
 
-    attach_with_stdio_and_raw_terminal(
+    attach_with_stdio_and_raw_terminal_with_output_fence(
         stream,
         initial_bytes,
         raw_terminal,
         input,
         output,
         windows_console_key_enabled,
+        output::AttachStdout::flush_output_fence,
     )
 }
 
@@ -139,6 +142,31 @@ where
     Input: Read + AsRawHandle + Send + 'static,
     Output: Write + Send + 'static,
 {
+    attach_with_stdio_and_raw_terminal_with_output_fence(
+        stream,
+        initial_bytes,
+        raw_terminal,
+        input,
+        output,
+        windows_console_key_enabled,
+        Write::flush,
+    )
+}
+
+fn attach_with_stdio_and_raw_terminal_with_output_fence<Input, Output, FenceFlush>(
+    stream: BlockingLocalStream,
+    initial_bytes: Vec<u8>,
+    raw_terminal: RawTerminal,
+    input: Input,
+    output: Output,
+    windows_console_key_enabled: bool,
+    output_fence_flush: FenceFlush,
+) -> std::result::Result<(), ClientError>
+where
+    Input: Read + AsRawHandle + Send + 'static,
+    Output: Write + Send + 'static,
+    FenceFlush: FnMut(&mut Output) -> io::Result<()> + Send + 'static,
+{
     let _ = raw_terminal.flush_pending_input();
     let screen_tracker = AttachScreenTracker::default();
     drive_attach_stream_with_terminal_state(
@@ -147,24 +175,37 @@ where
         raw_terminal,
         &screen_tracker,
         input,
-        output,
+        AttachOutputTarget {
+            output,
+            fence_flush: output_fence_flush,
+        },
         windows_console_key_enabled,
     )
 }
 
-fn drive_attach_stream_with_terminal_state<Input, Output>(
+struct AttachOutputTarget<Output, FenceFlush> {
+    output: Output,
+    fence_flush: FenceFlush,
+}
+
+fn drive_attach_stream_with_terminal_state<Input, Output, FenceFlush>(
     mut stream: BlockingLocalStream,
     initial_bytes: Vec<u8>,
     raw_terminal: RawTerminal,
     screen_tracker: &AttachScreenTracker,
     input: Input,
-    output: Output,
+    output_target: AttachOutputTarget<Output, FenceFlush>,
     windows_console_key_enabled: bool,
 ) -> std::result::Result<(), ClientError>
 where
     Input: Read + AsRawHandle + Send + 'static,
     Output: Write + Send + 'static,
+    FenceFlush: FnMut(&mut Output) -> io::Result<()> + Send + 'static,
 {
+    let AttachOutputTarget {
+        output,
+        fence_flush: output_fence_flush,
+    } = output_target;
     let initial_size = terminal::current_size();
     if let Some(size) = initial_size {
         write_attach_message(&mut stream, AttachMessage::Resize(size))?;
@@ -186,6 +227,7 @@ where
                 &std::env::var("TERM").unwrap_or_default(),
             )),
         },
+        output_fence_flush,
     )
 }
 
@@ -211,6 +253,7 @@ where
             windows_console_key_enabled: false,
             error_cleanup: None,
         },
+        Write::flush,
     )
 }
 
@@ -221,18 +264,20 @@ struct AttachLoopInputs<Actions> {
     error_cleanup: Option<Vec<u8>>,
 }
 
-fn drive_attach_stream_inner<Input, Output, Actions>(
+fn drive_attach_stream_inner<Input, Output, Actions, FenceFlush>(
     stream: BlockingLocalStream,
     initial_bytes: Vec<u8>,
     screen_tracker: AttachScreenTracker,
     input: Input,
     output: Output,
     loop_inputs: AttachLoopInputs<Actions>,
+    output_fence_flush: FenceFlush,
 ) -> std::result::Result<(), ClientError>
 where
     Input: Read + AsRawHandle + Send + 'static,
     Output: Write + Send + 'static,
     Actions: action::AttachActionExecutor + Send + 'static,
+    FenceFlush: FnMut(&mut Output) -> io::Result<()> + Send + 'static,
 {
     let AttachLoopInputs {
         resize_rx,
@@ -254,7 +299,7 @@ where
     let (pipe, runtime) = stream.into_async_parts();
     let output_result = runtime.block_on(async {
         let (reader, writer) = tokio::io::split(pipe);
-        stream::drive_async_attach(
+        stream::drive_async_attach_with_output_fence(
             reader,
             writer,
             initial_bytes,
@@ -270,6 +315,7 @@ where
             )
             .with_input_completion(input_completion_rx)
             .with_error_cleanup(error_cleanup),
+            output_fence_flush,
         )
         .await
     });
@@ -388,10 +434,18 @@ where
         return Ok(());
     }
     let mut console_input = input::ConsoleInputReader::from_handle(input_handle);
+    let mut exclusive_input_generation = lock_state.exclusive_input_generation();
 
     loop {
         if lock_state.is_closed() || input_tx.is_closed() {
             return Ok(());
+        }
+        let current_generation = lock_state.exclusive_input_generation();
+        if current_generation != exclusive_input_generation {
+            if let Some(console_input) = console_input.as_mut() {
+                console_input.reset_after_exclusive_action();
+            }
+            exclusive_input_generation = current_generation;
         }
         if lock_state.is_locked() {
             lock_state.wait_while_locked();

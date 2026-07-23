@@ -2,6 +2,7 @@ use super::{
     border_cells, parse_standalone_style, render, status_bar_runs, style_sgr_bytes, BorderStyle,
 };
 use crate::copy_mode::CopyModeSummary;
+use crate::pane_terminals::HandlerState;
 use rmux_core::{
     input::{mode, InputParser},
     OptionStore, Screen, Session, Style, Utf8Config,
@@ -40,9 +41,19 @@ fn visible_line_text(screen: &Screen, row: usize, cols: usize) -> String {
 }
 
 fn render_until_contains(session: &Session, options: &OptionStore, needle: &str) -> String {
+    let state = HandlerState::default();
     let deadline = std::time::Instant::now() + status_job_test_deadline();
     loop {
-        let frame = String::from_utf8(render(session, options)).expect("frame is utf-8");
+        let frame = String::from_utf8(super::render_with_attached_count_prompt_and_pane_title(
+            session,
+            options,
+            0,
+            super::StatusRenderContext {
+                state: Some(&state),
+                ..super::StatusRenderContext::default()
+            },
+        ))
+        .expect("frame is utf-8");
         assert!(!frame.contains("#("), "{frame}");
         if frame.contains(needle) {
             return frame;
@@ -66,6 +77,10 @@ fn status_job_test_deadline() -> std::time::Duration {
 fn copy_mode_summary_with_time(top_line_time: i64) -> CopyModeSummary {
     CopyModeSummary {
         view_mode: false,
+        line_numbers_enabled: false,
+        show_position: true,
+        history_size: 1,
+        backing_rows: 4,
         scroll_position: 0,
         rectangle_toggle: false,
         cursor_x: 0,
@@ -186,6 +201,7 @@ fn copy_mode_position_truncation_does_not_style_separator_before_bracket() {
         pane,
         &copy_mode_summary_with_time(1),
         1,
+        false,
     ))
     .expect("copy-mode position frame is utf-8");
 
@@ -210,6 +226,7 @@ fn copy_mode_position_without_time_does_not_style_separator_before_bracket() {
         pane,
         &copy_mode_summary_with_time(0),
         1,
+        false,
     ))
     .expect("copy-mode position frame is utf-8");
 
@@ -220,6 +237,116 @@ fn copy_mode_position_without_time_does_not_style_separator_before_bracket() {
     assert!(
         !frame.contains("\u{1b}[0;30;43m [0/1]") && !frame.contains("\u{1b}[30;43m [0/1]"),
         "copy-mode badge must not paint a leading separator when no time is shown: {frame:?}"
+    );
+}
+
+#[test]
+fn copy_mode_position_badge_stays_out_of_the_line_number_gutter() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 6, rows: 4 });
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModeLineNumbers,
+            "absolute".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("copy-mode line numbers option set succeeds");
+    let mut summary = copy_mode_summary_with_time(0);
+    summary.line_numbers_enabled = true;
+    summary.history_size = 0;
+    summary.backing_rows = 4;
+    let frame = String::from_utf8(super::render_copy_mode_position(
+        &session, &options, 0, pane, &summary, 0, false,
+    ))
+    .expect("copy-mode position frame is utf-8");
+
+    assert!(
+        frame.contains("\u{1b}[1;5H"),
+        "the two-column badge must start after the four-column gutter: {frame:?}"
+    );
+}
+
+#[test]
+fn copy_mode_position_uses_tmux_absolute_line_number_formats() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 10 });
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModeLineNumbers,
+            "absolute".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("copy-mode line numbers option set succeeds");
+    let mut summary = copy_mode_summary_with_time(0);
+    summary.line_numbers_enabled = true;
+    summary.history_size = 31;
+    summary.backing_rows = 10;
+    summary.scroll_position = 31;
+
+    let absolute = String::from_utf8(super::render_copy_mode_position(
+        &session, &options, 0, pane, &summary, 31, false,
+    ))
+    .expect("copy-mode position frame is utf-8");
+    assert!(absolute.contains("[1/41]"), "absolute format: {absolute:?}");
+
+    summary.line_numbers_enabled = false;
+    let mouse_origin = String::from_utf8(super::render_copy_mode_position(
+        &session, &options, 0, pane, &summary, 31, false,
+    ))
+    .expect("copy-mode position frame is utf-8");
+    assert!(
+        mouse_origin.contains("[31/31]"),
+        "mouse-origin format: {mouse_origin:?}"
+    );
+}
+
+#[test]
+fn hidden_copy_mode_position_emits_no_badge() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let mut summary = copy_mode_summary_with_time(0);
+    summary.show_position = false;
+
+    assert!(super::render_copy_mode_position(
+        &session,
+        &OptionStore::new(),
+        0,
+        pane,
+        &summary,
+        1,
+        false,
+    )
+    .is_empty());
+}
+
+#[test]
+fn clipped_cursor_marker_is_repainted_after_position_badge() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModeLineNumbers,
+            "absolute".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("copy-mode line numbers option set succeeds");
+    let mut summary = copy_mode_summary_with_time(0);
+    summary.line_numbers_enabled = true;
+    summary.cursor_x = 7;
+
+    let frame = String::from_utf8(super::render_copy_mode_position(
+        &session, &options, 0, pane, &summary, 1, false,
+    ))
+    .expect("copy-mode position frame is utf-8");
+    assert!(
+        frame.ends_with("\u{1b}[1;8H\u{1b}[0m$\u{1b}[0m"),
+        "tmux paints '$' after the top-row badge: {frame:?}"
     );
 }
 

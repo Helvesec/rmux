@@ -16,6 +16,11 @@ use crate::pane_io::{AttachControl, OverlayFrame};
 
 #[path = "handler_overlay/commands.rs"]
 mod commands;
+#[path = "handler_overlay/identity.rs"]
+mod identity;
+#[cfg(test)]
+#[path = "handler_overlay/identity_tests.rs"]
+mod identity_tests;
 #[path = "handler_overlay/interactions.rs"]
 mod interactions;
 #[path = "handler_overlay/interactions_popup_menu.rs"]
@@ -1004,6 +1009,13 @@ impl RequestHandler {
         identity: ActiveAttachIdentity,
         popup_id: u64,
     ) -> Result<(), RmuxError> {
+        if !self
+            .overlay_action_is_current(identity.attach_pid(), Some(identity))
+            .await?
+            .is_current()
+        {
+            return Ok(());
+        }
         self.refresh_popup_overlay_for_identity(identity, popup_id)
             .await
     }
@@ -1014,6 +1026,13 @@ impl RequestHandler {
         popup_id: u64,
         status: i32,
     ) -> Result<(), RmuxError> {
+        if !self
+            .overlay_action_is_current(identity.attach_pid(), Some(identity))
+            .await?
+            .is_current()
+        {
+            return Ok(());
+        }
         let clear = {
             let mut active_attach = self.active_attach.lock().await;
             let Some(active) = active_attach.by_pid.get_mut(&identity.attach_pid()) else {

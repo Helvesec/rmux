@@ -1,18 +1,20 @@
 use std::collections::{HashMap, HashSet};
 
-use rmux_core::LifecycleEvent;
+use rmux_core::{LifecycleEvent, PaneId};
 use rmux_proto::{
-    ErrorResponse, HookName, PaneTarget, Response, ScopeSelector, SessionName, Target, WindowTarget,
+    ErrorResponse, HookName, MoveWindowRequest, MoveWindowResponse, PaneTarget, Response,
+    RmuxError, ScopeSelector, SessionName, Target, WindowTarget,
 };
 
 #[cfg(windows)]
 use super::pane_support::format_references_pane_pid;
 use super::{
-    attach_support::surviving_attached_resize_targets, client_environment_snapshot,
-    client_spawn_environment, scripting_support::render_start_directory_template,
+    attach_support::{surviving_attached_resize_targets, SessionDetachOnDestroy},
+    client_environment_snapshot, client_spawn_environment,
+    scripting_support::render_start_directory_template,
     PaneOutputSubscriptionKeySnapshot, RequestHandler,
 };
-use crate::hook_runtime::{hooks_disabled, PendingInlineHookFormat};
+use crate::hook_runtime::{lifecycle_hooks_disabled, PendingInlineHookFormat};
 use crate::pane_terminals::{
     resolve_new_pane_process_command, HandlerState, ListWindowsSelection, NewWindowOptions,
     RespawnWindowOptions, WindowSpawnOptions,
@@ -25,12 +27,31 @@ mod request_identity;
 #[path = "handler_window/timer_mutations.rs"]
 mod timer_mutations;
 
-use move_window_effects::MoveWindowEffects;
+use move_window_effects::{MoveWindowEffects, PreparedMoveWindowEffects};
 use request_identity::{
     require_expected_link_window_identity, require_expected_move_window_identity,
     require_expected_swap_window_identity,
 };
 use timer_mutations::{move_window_timer_target_overrides, swap_window_timer_target_overrides};
+
+pub(in crate::handler) struct CommittedMoveWindow {
+    response: MoveWindowResponse,
+    removed_destination_pane_ids: Vec<PaneId>,
+    effects: PreparedMoveWindowEffects,
+    subscriptions_removed: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct KillWindowCommitPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static KILL_WINDOW_COMMIT_PAUSES: std::sync::Mutex<
+    Vec<(WindowTarget, std::sync::Arc<KillWindowCommitPause>)>,
+> = std::sync::Mutex::new(Vec::new());
 
 fn linked_resize_sessions_for_window_change(
     state: &HandlerState,
@@ -84,6 +105,41 @@ fn changed_active_window_ids(
 }
 
 impl RequestHandler {
+    #[cfg(test)]
+    pub(in crate::handler) fn install_kill_window_commit_pause(
+        &self,
+        target: WindowTarget,
+    ) -> std::sync::Arc<KillWindowCommitPause> {
+        let pause = std::sync::Arc::new(KillWindowCommitPause::default());
+        let mut pauses = KILL_WINDOW_COMMIT_PAUSES
+            .lock()
+            .expect("kill-window commit pause lock");
+        pauses.retain(|(paused_target, _)| paused_target != &target);
+        pauses.push((target, pause.clone()));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_kill_window_commit(&self, target: &WindowTarget) {
+        let pause = KILL_WINDOW_COMMIT_PAUSES
+            .lock()
+            .expect("kill-window commit pause lock")
+            .iter()
+            .find(|(paused_target, _)| paused_target == target)
+            .map(|(_, pause)| pause.clone());
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.notify_one();
+        pause.release.notified().await;
+        KILL_WINDOW_COMMIT_PAUSES
+            .lock()
+            .expect("kill-window commit pause lock")
+            .retain(|(paused_target, current)| {
+                paused_target != target || !std::sync::Arc::ptr_eq(current, &pause)
+            });
+    }
+
     async fn reconcile_and_refresh_attached_sessions(&self, sessions: Vec<SessionName>) {
         for session_name in sessions {
             let _ = self
@@ -238,6 +294,8 @@ impl RequestHandler {
             response,
             removed_windows,
             removed_pane_ids,
+            destroyed_sessions,
+            destroyed_attached_sessions,
             lifecycle_events,
             resize_window_ids,
             subscriptions_removed,
@@ -246,11 +304,29 @@ impl RequestHandler {
             if let Err(error) = super::require_expected_window_identity(&state, &request.target) {
                 return Response::Error(ErrorResponse { error });
             }
+            #[cfg(test)]
+            self.pause_before_kill_window_commit(&request.target).await;
+            let mut affected_session_candidates = state.window_linked_session_family_list(
+                request.target.session_name(),
+                request.target.window_index(),
+            );
+            if !affected_session_candidates.contains(&session_name) {
+                affected_session_candidates.push(session_name.clone());
+            }
+            affected_session_candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            affected_session_candidates.dedup();
             let subscription_keys = PaneOutputSubscriptionKeySnapshot::capture_related(
                 &state,
-                std::slice::from_ref(&session_name),
+                &affected_session_candidates,
             );
             let active_window_ids_before = active_window_ids_by_session(&state);
+            let grouped_peer_sessions = state
+                .sessions
+                .session_group_members(&session_name)
+                .into_iter()
+                .filter(|candidate| candidate != &session_name)
+                .collect::<HashSet<_>>();
+            let detach_on_destroy = SessionDetachOnDestroy::capture_all(&state);
             let timer_sessions = state
                 .sessions
                 .iter()
@@ -260,6 +336,7 @@ impl RequestHandler {
                 self.plan_window_mutation_silence_timers_locked(&state, timer_sessions);
             match state.kill_window(request.target, request.kill_all_others) {
                 Ok(result) => {
+                    state.retire_removed_lifecycle_targets();
                     self.record_panes_closed_as_killed(&result.removed_pane_ids);
                     let removed_timer_targets = result
                         .removed_windows
@@ -273,30 +350,81 @@ impl RequestHandler {
                         &result.reindexed_windows,
                         Vec::new(),
                     );
-                    let lifecycle_events = if hooks_disabled() {
+                    let lifecycle_events = if lifecycle_hooks_disabled() {
                         Vec::new()
                     } else {
-                        result
-                            .removed_windows
+                        let destroyed_session_ids = result
+                            .destroyed_sessions
                             .iter()
-                            .map(|removed_window| {
-                                super::prepare_lifecycle_event(
-                                    &mut state,
-                                    &LifecycleEvent::WindowUnlinked {
-                                        session_name: removed_window.target.session_name().clone(),
-                                        target: Some(removed_window.target.clone()),
-                                        window_id: Some(removed_window.window_id),
-                                        window_name: Some(removed_window.window_name.clone()),
-                                    },
-                                )
-                            })
-                            .collect()
+                            .cloned()
+                            .collect::<HashMap<_, _>>();
+                        let mut events = Vec::new();
+                        let mut ordered_windows = result.removed_windows.iter().collect::<Vec<_>>();
+                        ordered_windows.sort_by(|left, right| {
+                            (left.target.session_name() != &session_name)
+                                .cmp(&(right.target.session_name() != &session_name))
+                                .then_with(|| {
+                                    left.target
+                                        .session_name()
+                                        .as_str()
+                                        .cmp(right.target.session_name().as_str())
+                                })
+                                .then_with(|| {
+                                    left.target.window_index().cmp(&right.target.window_index())
+                                })
+                        });
+                        for removed_window in ordered_windows {
+                            let removed_session = removed_window.target.session_name();
+                            let destroyed_session_id =
+                                destroyed_session_ids.get(removed_session).copied();
+                            if grouped_peer_sessions.contains(removed_session) {
+                                if let Some(session_id) = destroyed_session_id {
+                                    events.push(super::prepare_lifecycle_event(
+                                        &mut state,
+                                        &LifecycleEvent::SessionClosed {
+                                            session_name: removed_session.clone(),
+                                            session_id: Some(session_id.as_u32()),
+                                        },
+                                    ));
+                                }
+                            }
+                            events.push(super::prepare_lifecycle_event(
+                                &mut state,
+                                &LifecycleEvent::WindowUnlinked {
+                                    session_name: removed_session.clone(),
+                                    target: Some(removed_window.target.clone()),
+                                    window_id: Some(removed_window.window_id),
+                                    window_name: Some(removed_window.window_name.clone()),
+                                },
+                            ));
+                            if !grouped_peer_sessions.contains(removed_session) {
+                                if let Some(session_id) = destroyed_session_id {
+                                    events.push(super::prepare_lifecycle_event(
+                                        &mut state,
+                                        &LifecycleEvent::SessionClosed {
+                                            session_name: removed_session.clone(),
+                                            session_id: Some(session_id.as_u32()),
+                                        },
+                                    ));
+                                }
+                            }
+                        }
+                        events
                     };
-                    let mut resize_window_ids = result
-                        .removed_windows
+                    for (destroyed_session, _) in &result.destroyed_sessions {
+                        let _ = state.hooks.remove_session(destroyed_session);
+                    }
+                    let destroyed_attached_sessions = result
+                        .destroyed_sessions
                         .iter()
-                        .map(|removed_window| rmux_proto::WindowId::new(removed_window.window_id))
+                        .filter_map(|(destroyed_session, session_id)| {
+                            detach_on_destroy
+                                .get(session_id)
+                                .copied()
+                                .map(|detach| (destroyed_session.clone(), *session_id, detach))
+                        })
                         .collect::<Vec<_>>();
+                    let mut resize_window_ids = result.removed_window_ids;
                     resize_window_ids
                         .extend(changed_active_window_ids(&active_window_ids_before, &state));
                     resize_window_ids.sort_by_key(|window_id| window_id.as_u32());
@@ -308,6 +436,8 @@ impl RequestHandler {
                         Response::KillWindow(result.response),
                         result.removed_windows,
                         result.removed_pane_ids,
+                        result.destroyed_sessions,
+                        destroyed_attached_sessions,
                         lifecycle_events,
                         resize_window_ids,
                         subscriptions_removed,
@@ -315,6 +445,8 @@ impl RequestHandler {
                 }
                 Err(error) => (
                     Response::Error(ErrorResponse { error }),
+                    Vec::new(),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -329,6 +461,38 @@ impl RequestHandler {
         }
 
         if matches!(response, Response::KillWindow(_)) {
+            let mut prepared_rehomes = Vec::with_capacity(destroyed_attached_sessions.len());
+            for (destroyed_session, session_id, detach_on_destroy) in destroyed_attached_sessions {
+                prepared_rehomes.push(
+                    self.prepare_destroy_session_rehome(
+                        &destroyed_session,
+                        session_id,
+                        detach_on_destroy,
+                    )
+                    .await,
+                );
+            }
+
+            // Teardown tickets were reserved before the prepared control
+            // switches. Publish them first, then ClientSessionChanged, then
+            // apply interactive attach switches.
+            for lifecycle_event in lifecycle_events {
+                self.emit_prepared(lifecycle_event).await;
+            }
+            for prepared in &mut prepared_rehomes {
+                for event in prepared.control_lifecycle_events.drain(..) {
+                    self.emit_prepared(event).await;
+                }
+            }
+            for prepared in prepared_rehomes {
+                self.exit_prepared_attached_session_identity(prepared).await;
+            }
+            #[cfg(all(any(unix, windows), feature = "web"))]
+            {
+                self.web_shares.remove_targets_for_panes(&removed_pane_ids);
+                self.web_shares
+                    .remove_targets_for_sessions(&destroyed_sessions);
+            }
             self.pause_before_window_lifecycle_emit().await;
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
             let mut affected_sessions = removed_windows
@@ -343,8 +507,9 @@ impl RequestHandler {
                 }
             }
             self.bump_active_attach_epoch();
-            for lifecycle_event in lifecycle_events {
-                self.emit_prepared(lifecycle_event).await;
+            self.remove_session_leases(&destroyed_sessions);
+            for (destroyed_session, _) in &destroyed_sessions {
+                self.cancel_session_silence_timers(destroyed_session).await;
             }
             let resize_targets = {
                 let state = self.state.lock().await;
@@ -367,6 +532,7 @@ impl RequestHandler {
             for affected_session in affected_sessions {
                 self.refresh_attached_session(&affected_session).await;
             }
+            let _ = self.queue_shutdown_if_server_empty().await;
         }
 
         response
@@ -737,6 +903,7 @@ impl RequestHandler {
                 self.plan_silence_timer_deadline_fanout_locked(&state, &request.source);
             match state.link_window(request.clone()) {
                 Ok(result) => {
+                    state.retire_removed_lifecycle_targets();
                     resize_window_ids
                         .extend(changed_active_window_ids(&active_window_ids_before, &state));
                     resize_window_ids.sort_by_key(|window_id| window_id.as_u32());
@@ -842,88 +1009,92 @@ impl RequestHandler {
         response
     }
 
-    pub(super) async fn handle_move_window(
-        &self,
-        request: rmux_proto::MoveWindowRequest,
-    ) -> Response {
+    pub(super) async fn handle_move_window(&self, request: MoveWindowRequest) -> Response {
         self.pause_before_window_lifecycle_mutation().await;
-        let (response, removed_destination_pane_ids, effects, subscriptions_removed) = {
+        let committed = {
             let mut state = self.state.lock().await;
-            if let Err(error) = require_expected_move_window_identity(&state, &request) {
-                return Response::Error(ErrorResponse { error });
-            }
-            let mut subscription_roots = request
-                .source
-                .as_ref()
-                .map(|source| vec![source.session_name().clone()])
-                .unwrap_or_default();
-            match &request.target {
-                rmux_proto::MoveWindowTarget::Session(session_name) => {
-                    subscription_roots.push(session_name.clone());
-                }
-                rmux_proto::MoveWindowTarget::Window(target) => {
-                    subscription_roots.push(target.session_name().clone());
-                }
-            }
-            let subscription_keys =
-                PaneOutputSubscriptionKeySnapshot::capture_related(&state, &subscription_roots);
-            let effects = MoveWindowEffects::capture(&state, &request);
-            let timer_overrides = move_window_timer_target_overrides(&state, &request);
-            let mut timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
-            for (source, destination) in timer_overrides {
-                match destination {
-                    Some(destination) => timer_mutation.map_target(source, destination),
-                    None => timer_mutation.remove_target(source),
-                }
-            }
-            match state.move_window(request.clone()) {
-                Ok(result) => {
-                    self.record_panes_closed_as_killed(&result.removed_pane_ids);
-                    if let (Some(source), Some(destination)) =
-                        (request.source.clone(), result.response.target.as_ref())
-                    {
-                        timer_mutation.fanout_target_to_destination_group_locked(
-                            &state,
-                            source,
-                            destination,
-                        );
-                    }
-                    self.apply_window_mutation_silence_timers_and_arm_all_locked(
-                        &state,
-                        timer_mutation,
-                        Vec::new(),
-                        &[],
-                    );
-                    let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
-                        subscription_keys.reconcile_after(&state),
-                    );
-                    let effects = effects.prepare_success(&mut state, &result.response);
-                    (
-                        Response::MoveWindow(result.response),
-                        result.removed_pane_ids,
-                        Some(effects),
-                        subscriptions_removed,
-                    )
-                }
-                Err(error) => (
-                    Response::Error(ErrorResponse { error }),
-                    Vec::new(),
-                    None,
-                    false,
-                ),
-            }
+            self.commit_move_window_locked(&mut state, &request)
         };
+        match committed {
+            Ok(committed) => self.finish_committed_move_window(committed).await,
+            Err(error) => Response::Error(ErrorResponse { error }),
+        }
+    }
 
-        if subscriptions_removed {
+    fn commit_move_window_locked(
+        &self,
+        state: &mut HandlerState,
+        request: &MoveWindowRequest,
+    ) -> Result<CommittedMoveWindow, RmuxError> {
+        require_expected_move_window_identity(state, request)?;
+        self.commit_prevalidated_move_window_locked(state, request)
+    }
+
+    pub(in crate::handler) fn commit_prevalidated_move_window_locked(
+        &self,
+        state: &mut HandlerState,
+        request: &MoveWindowRequest,
+    ) -> Result<CommittedMoveWindow, RmuxError> {
+        let mut subscription_roots = request
+            .source
+            .as_ref()
+            .map(|source| vec![source.session_name().clone()])
+            .unwrap_or_default();
+        match &request.target {
+            rmux_proto::MoveWindowTarget::Session(session_name) => {
+                subscription_roots.push(session_name.clone());
+            }
+            rmux_proto::MoveWindowTarget::Window(target) => {
+                subscription_roots.push(target.session_name().clone());
+            }
+        }
+        let subscription_keys =
+            PaneOutputSubscriptionKeySnapshot::capture_related(state, &subscription_roots);
+        let effects = MoveWindowEffects::capture(state, request);
+        let timer_overrides = move_window_timer_target_overrides(state, request);
+        let mut timer_mutation = self.plan_all_window_mutation_silence_timers_locked(state);
+        for (source, destination) in timer_overrides {
+            match destination {
+                Some(destination) => timer_mutation.map_target(source, destination),
+                None => timer_mutation.remove_target(source),
+            }
+        }
+        let result = state.move_window(request.clone())?;
+        state.retire_removed_lifecycle_targets();
+        self.record_panes_closed_as_killed(&result.removed_pane_ids);
+        if let (Some(source), Some(destination)) =
+            (request.source.clone(), result.response.target.as_ref())
+        {
+            timer_mutation.fanout_target_to_destination_group_locked(state, source, destination);
+        }
+        self.apply_window_mutation_silence_timers_and_arm_all_locked(
+            state,
+            timer_mutation,
+            Vec::new(),
+            &[],
+        );
+        let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
+            subscription_keys.reconcile_after(state),
+        );
+        let effects = effects.prepare_success(state, &result.response);
+        Ok(CommittedMoveWindow {
+            response: result.response,
+            removed_destination_pane_ids: result.removed_pane_ids,
+            effects,
+            subscriptions_removed,
+        })
+    }
+
+    pub(in crate::handler) async fn finish_committed_move_window(
+        &self,
+        committed: CommittedMoveWindow,
+    ) -> Response {
+        if committed.subscriptions_removed {
             let _ = self.request_shutdown_if_pending();
         }
-
-        if let Some(effects) = effects {
-            self.forget_pane_snapshot_coalescers(&removed_destination_pane_ids);
-            self.finish_move_window_effects(effects).await;
-        }
-
-        response
+        self.forget_pane_snapshot_coalescers(&committed.removed_destination_pane_ids);
+        self.finish_move_window_effects(committed.effects).await;
+        Response::MoveWindow(committed.response)
     }
 
     pub(super) async fn handle_unlink_window(
@@ -968,6 +1139,7 @@ impl RequestHandler {
                 self.plan_window_mutation_silence_timers_locked(&state, timer_sessions);
             match state.unlink_window(request.target, request.kill_if_last) {
                 Ok(result) => {
+                    state.retire_removed_lifecycle_targets();
                     state.expand_with_active_window_linked_session_families(&mut refresh_sessions);
                     let resize_targets = removed_window_id
                         .and_then(|window_id| {
@@ -989,7 +1161,7 @@ impl RequestHandler {
                         &result.reindexed_windows,
                         Vec::new(),
                     );
-                    let lifecycle_event = if hooks_disabled() {
+                    let lifecycle_event = if lifecycle_hooks_disabled() {
                         None
                     } else {
                         Some(super::prepare_lifecycle_event(
@@ -1292,6 +1464,9 @@ impl RequestHandler {
                 Ok(result) => {
                     self.record_panes_closed_as_killed(&result.removed_pane_ids);
                     self.record_pane_respawn_boundary(result.retained_pane_id);
+                    let mut respawned_pane_ids = result.removed_pane_ids.clone();
+                    respawned_pane_ids.push(result.retained_pane_id);
+                    state.retire_respawned_lifecycle_panes(&respawned_pane_ids);
                     let subscriptions_removed = self.apply_pane_output_subscription_reconciliation(
                         subscription_keys.reconcile_after(&state),
                     );

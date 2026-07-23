@@ -173,7 +173,8 @@ async fn background_run_shell_commands_keep_detached_write_access_after_response
         .expect("background run-shell command parses");
 
     {
-        let _access = handler.begin_detached_requester_access(requester_pid, true);
+        let _access =
+            handler.begin_test_detached_requester_access(requester_pid, AccessMode::ReadWrite);
         let output = handler
             .execute_parsed_commands_for_test(requester_pid, parsed)
             .await
@@ -663,6 +664,163 @@ async fn queued_run_shell_command_mode_ignores_positional_arguments_like_tmux() 
     );
 }
 
+const RUN_SHELL_NESTING_SUBPROCESS: &str = "RMUX_TEST_RUN_SHELL_NESTING_SUBPROCESS";
+const RUN_SHELL_NESTING_HELPER: &str =
+    "handler::scripting_tests::run_shell::run_shell_command_nesting_subprocess_helper";
+
+#[test]
+fn run_shell_command_nesting_is_stack_safe_in_subprocess() {
+    let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .args([
+            "--exact",
+            RUN_SHELL_NESTING_HELPER,
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(RUN_SHELL_NESTING_SUBPROCESS, "1")
+        .output()
+        .expect("spawn run-shell nesting subprocess");
+
+    assert!(
+        output.status.success(),
+        "run-shell nesting subprocess failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn run_shell_command_nesting_subprocess_helper() {
+    if std::env::var_os(RUN_SHELL_NESTING_SUBPROCESS).is_none() {
+        return;
+    }
+
+    let handler = RequestHandler::new();
+    // Measured against tmux 3.7b on 2026-07-22: all three foreground depths
+    // complete successfully, including the former stack-overflow case at 160.
+    for depth in [2, 10, 160] {
+        let buffer = format!("nested-foreground-{depth}");
+        let command = seed_nested_run_shell_chain(&handler, &buffer, depth).await;
+        let response = run_nested_commands(&handler, command, false, None).await;
+        assert!(!matches!(response, Response::Error(_)), "{response:?}");
+        assert_named_buffer(&handler, &buffer, Some(b"ok")).await;
+    }
+
+    let background_buffer = "nested-background-160";
+    let background = seed_nested_run_shell_chain(&handler, background_buffer, 160).await;
+    let response = run_nested_commands(&handler, background, true, None).await;
+    assert_eq!(response, Response::RunShell(RunShellResponse::background()));
+    wait_for_detached_request_count(&handler, 0).await;
+    assert_named_buffer(&handler, background_buffer, Some(b"ok")).await;
+
+    let left = seed_nested_run_shell_chain(&handler, "nested-concurrent-left", 10).await;
+    let right = seed_nested_run_shell_chain(&handler, "nested-concurrent-right", 10).await;
+    let delay = Some(RunShellDelaySeconds(0.05));
+    let (left_response, right_response) = tokio::join!(
+        run_nested_commands(&handler, left, false, delay),
+        run_nested_commands(&handler, right, false, delay),
+    );
+    assert!(
+        !matches!(left_response, Response::Error(_)),
+        "{left_response:?}"
+    );
+    assert!(
+        !matches!(right_response, Response::Error(_)),
+        "{right_response:?}"
+    );
+    assert_named_buffer(&handler, "nested-concurrent-left", Some(b"ok")).await;
+    assert_named_buffer(&handler, "nested-concurrent-right", Some(b"ok")).await;
+
+    let rejected_buffer = "nested-over-budget";
+    let over_budget = seed_nested_run_shell_chain(
+        &handler,
+        rejected_buffer,
+        crate::handler::scripting_support::RUN_SHELL_COMMAND_NESTING_LIMIT + 1,
+    )
+    .await;
+    let response = run_nested_commands(&handler, over_budget, false, None).await;
+    assert!(
+        matches!(
+            response,
+            Response::Error(ErrorResponse {
+                error: RmuxError::Server(ref message)
+            }) if message.contains("run-shell -C nesting exceeds safe runtime limit")
+        ),
+        "{response:?}"
+    );
+    assert_named_buffer(&handler, rejected_buffer, None).await;
+
+    execute_test_command(&handler, "set-buffer -b server-still-alive yes").await;
+    assert_named_buffer(&handler, "server-still-alive", Some(b"yes")).await;
+}
+
+async fn run_nested_commands(
+    handler: &RequestHandler,
+    command: String,
+    background: bool,
+    delay_seconds: Option<RunShellDelaySeconds>,
+) -> Response {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        handler.handle(Request::RunShell(Box::new(RunShellRequest {
+            command,
+            arguments: Vec::new(),
+            background,
+            as_commands: true,
+            show_stderr: false,
+            delay_seconds,
+            start_directory: None,
+            target: None,
+            source_depth: None,
+        }))),
+    )
+    .await
+    .expect("nested run-shell command completes within its liveness budget")
+}
+
+async fn seed_nested_run_shell_chain(
+    handler: &RequestHandler,
+    prefix: &str,
+    invocation_count: usize,
+) -> String {
+    assert!(invocation_count > 0);
+    for depth in 0..invocation_count {
+        let value = if depth == 0 {
+            format!("set-buffer -b {prefix} ok")
+        } else {
+            format!("run-shell -C '#{{@{prefix}-{}}}'", depth - 1)
+        };
+        let response = handler
+            .handle_set_option_by_name(rmux_proto::SetOptionByNameRequest {
+                scope: OptionScopeSelector::SessionGlobal,
+                name: format!("@{prefix}-{depth}"),
+                value: Some(value),
+                mode: SetOptionMode::Replace,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                format: false,
+                format_target: None,
+            })
+            .await;
+        assert!(
+            matches!(response, Response::SetOptionByName(_)),
+            "{response:?}"
+        );
+    }
+    format!("#{{@{prefix}-{}}}", invocation_count - 1)
+}
+
+async fn assert_named_buffer(handler: &RequestHandler, name: &str, expected: Option<&[u8]>) {
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.buffers.get(name),
+        expected,
+        "unexpected buffer {name:?}"
+    );
+}
+
 #[tokio::test]
 async fn run_shell_command_mode_attach_session_requires_terminal_like_tmux() {
     let handler = RequestHandler::new();
@@ -783,6 +941,7 @@ async fn run_shell_missing_explicit_target_is_nonfatal() {
 #[tokio::test]
 async fn background_if_shell_still_emits_after_hooks_outside_hook_context() {
     let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
     create_named_session(&handler, "if-shell-after-hooks").await;
     execute_test_command(
         &handler,
@@ -790,7 +949,14 @@ async fn background_if_shell_still_emits_after_hooks_outside_hook_context() {
     )
     .await;
 
-    execute_test_command(&handler, "if-shell -b -F '1' 'new-window -d -n ifbg'").await;
+    execute_test_command(
+        &handler,
+        &format!(
+            "if-shell -b {} 'new-window -d -n ifbg'",
+            command_quote(&delayed_true_shell_condition())
+        ),
+    )
+    .await;
 
     wait_for_named_buffer(&handler, "after-if-shell", b"yes").await;
 }
@@ -798,11 +964,18 @@ async fn background_if_shell_still_emits_after_hooks_outside_hook_context() {
 #[tokio::test]
 async fn queued_background_if_shell_preserves_hook_formats_after_hook_scope_exits() {
     let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+    let branch = r#"if-shell -F '#{==:#{hook_pane},%1}' 'set-buffer -b bg-hook-if ok'"#;
     let parsed = CommandParser::new()
-        .parse(r#"if-shell -b -F '#{==:#{hook_pane},%1}' 'run-shell -C "set-buffer -b bg-hook-if ok"'"#)
+        .parse(&format!(
+            "if-shell -b {} {}",
+            command_quote(&delayed_true_shell_condition()),
+            command_quote(branch)
+        ))
         .expect("background queued if-shell command parses");
 
     let output = crate::hook_runtime::with_hook_execution(
+        crate::hook_runtime::HookExecutionContext::command(HookName::AfterNewWindow),
         vec![("hook_pane".to_owned(), "%1".to_owned())],
         async {
             handler
@@ -827,6 +1000,7 @@ async fn background_run_shell_preserves_hook_formats_after_hook_scope_exits() {
     let command = write_literal_format_command(&output_path, "#{hook_pane}");
 
     let response = crate::hook_runtime::with_hook_execution(
+        crate::hook_runtime::HookExecutionContext::command(HookName::AfterNewWindow),
         vec![("hook_pane".to_owned(), "%1".to_owned())],
         async {
             handler

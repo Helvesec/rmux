@@ -3,6 +3,7 @@
 mod common;
 
 use std::error::Error;
+use std::fs;
 use std::time::{Duration, Instant};
 
 use common::{assert_success, stderr, stdout, terminate_child, CliHarness};
@@ -262,6 +263,60 @@ fn paste_buffer_with_delete_flag() -> Result<(), Box<dyn Error>> {
     let show = harness.run(&["show-buffer"])?;
     assert_eq!(show.status.code(), Some(1));
     assert!(stderr(&show).contains("no buffers"));
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn paste_buffer_allows_slow_continuous_pty_progress() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("buf-paste-slow-progress")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let received_path = harness.tmpdir().join("received");
+    let ready_path = harness.tmpdir().join("ready");
+    let command = format!(
+        "stty raw -echo; : > '{received}'; : > '{ready}'; \
+         while :; do dd bs=1024 count=1 2>/dev/null >> '{received}'; sleep 0.05; done",
+        received = received_path.display(),
+        ready = ready_path.display(),
+    );
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "slow", "sh", "-c", &command])?);
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !ready_path.exists() && Instant::now() < ready_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready_path.exists(), "slow PTY reader did not become ready");
+
+    let payload = "x".repeat(64 * 1024);
+    let payload_path = harness.tmpdir().join("payload");
+    fs::write(&payload_path, &payload)?;
+    assert_success(
+        &harness.run(&[
+            "load-buffer",
+            "-b",
+            "slow-payload",
+            payload_path
+                .to_str()
+                .ok_or("payload path is not valid UTF-8")?,
+        ])?,
+    );
+    let started = Instant::now();
+    assert_success(&harness.run(&["paste-buffer", "-b", "slow-payload", "-t", "slow:0.0"])?);
+    assert!(
+        started.elapsed() > Duration::from_secs(2),
+        "regression probe must outlive the inactivity timeout"
+    );
+
+    let receive_deadline = Instant::now() + Duration::from_secs(10);
+    while fs::metadata(&received_path)
+        .map(|metadata| metadata.len() < payload.len() as u64)
+        .unwrap_or(true)
+        && Instant::now() < receive_deadline
+    {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(fs::read(&received_path)?, payload.as_bytes());
 
     terminate_child(daemon.child_mut())?;
     Ok(())

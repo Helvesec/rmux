@@ -43,7 +43,11 @@ impl PaneAlertCoalescer {
                 pending
                     .clipboard_writes
                     .extend(event.clipboard_writes.iter().cloned());
+                pending
+                    .clipboard_queries
+                    .extend(event.clipboard_queries.iter().copied());
                 pending.mouse_mode_changed |= event.mouse_mode_changed;
+                pending.alternate_mode_changed |= event.alternate_mode_changed;
                 pending.queue_activity_alert |= event.queue_activity_alert;
             })
             .or_insert(event);
@@ -85,7 +89,9 @@ mod tests {
             title_change: None,
             clipboard_set: false,
             clipboard_writes: Vec::new(),
+            clipboard_queries: Vec::new(),
             mouse_mode_changed: false,
+            alternate_mode_changed: false,
             queue_activity_alert: true,
             generation,
         }
@@ -111,6 +117,14 @@ mod tests {
     fn mouse_mode_event(pane_id: u32, generation: Option<u64>) -> PaneAlertEvent {
         PaneAlertEvent {
             mouse_mode_changed: true,
+            queue_activity_alert: false,
+            ..alert_event(pane_id, generation, 0)
+        }
+    }
+
+    fn alternate_mode_event(pane_id: u32, generation: Option<u64>) -> PaneAlertEvent {
+        PaneAlertEvent {
+            alternate_mode_changed: true,
             queue_activity_alert: false,
             ..alert_event(pane_id, generation, 0)
         }
@@ -185,6 +199,22 @@ mod tests {
             .find(|event| event.pane_id == PaneId::new(1))
             .expect("first pane event");
         assert!(first.mouse_mode_changed);
+        assert!(first.queue_activity_alert);
+    }
+
+    #[test]
+    fn pane_alert_callback_state_preserves_coalesced_alternate_mode_changes() {
+        let mut state = PaneAlertCoalescer::default();
+
+        assert!(state.push(alert_event(1, Some(7), 0)));
+        assert!(!state.push(alternate_mode_event(1, Some(7))));
+
+        let events = state.take_pending();
+        let first = events
+            .iter()
+            .find(|event| event.pane_id == PaneId::new(1))
+            .expect("first pane event");
+        assert!(first.alternate_mode_changed);
         assert!(first.queue_activity_alert);
     }
 

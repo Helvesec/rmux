@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use rmux_core::{
+    command_inventory::RMUX_EXTENSION_COMMANDS,
     command_parser::{
         CommandArgument, CommandParseErrorKind, CommandParser, EnvironmentAssignment,
         ParsedCommand, ParsedCommands, SOURCE_FILE_MAX_COMMAND_BYTES,
@@ -28,6 +29,7 @@ use super::format_context::{
 };
 use super::parser_context::command_parser_from_state;
 use super::queue::{QueueCommandAction, QueueExecutionContext, QueueInvocation, QueueMode};
+use super::queue_special_target::QueueSpecialTargetBinding;
 use super::request_parse::parse_queue_invocation;
 use super::source_files::{
     default_config_paths, default_tmux_fallback_paths, source_inputs_for_path_with_diagnostics,
@@ -36,6 +38,7 @@ use super::source_files::{
 };
 use super::source_internal::{
     canonical_command_execution_request, validate_internal_source_file_path,
+    CanonicalCommandExecution,
 };
 use super::targets::{
     active_session_target, queue_target_find_context, QueueTargetFindContextInput,
@@ -81,6 +84,7 @@ impl RequestHandler {
             verbose: false,
             expand_paths: false,
             target: None,
+            target_missing_canfail: false,
             caller_cwd: config_load.cwd().map(Path::to_path_buf),
             stdin: None,
             current_file: None,
@@ -162,13 +166,48 @@ impl RequestHandler {
     pub(in crate::handler) async fn handle_source_file(
         &self,
         requester_pid: u32,
-        request: SourceFileRequest,
+        mut request: SourceFileRequest,
     ) -> Response {
         if let Err(error) = validate_internal_source_file_path(&request) {
             return Response::Error(ErrorResponse { error });
         }
         let canonical_execution = match canonical_command_execution_request(&request) {
-            Ok(canonical_execution) => canonical_execution,
+            Ok(CanonicalCommandExecution::Disabled) => false,
+            Ok(CanonicalCommandExecution::Canonical) => true,
+            Ok(CanonicalCommandExecution::ListWindowsAll(arguments)) => {
+                let canonical = {
+                    let state = self.state.lock().await;
+                    let parser = command_parser_from_state(&state)
+                        .with_command_aliases(std::iter::empty::<String>())
+                        .with_exact_commands(RMUX_EXTENSION_COMMANDS)
+                        .with_max_command_bytes(SOURCE_FILE_MAX_COMMAND_BYTES);
+                    match parser.parse_arguments_with_assignments(&arguments) {
+                        Ok(parsed)
+                            if parsed.assignments().is_empty()
+                                && matches!(
+                                    parsed.commands(),
+                                    [command] if command.name() == "list-windows"
+                                ) =>
+                        {
+                            parsed.to_tmux_reparse_string()
+                        }
+                        Ok(_) => {
+                            return Response::Error(ErrorResponse {
+                                error: RmuxError::Server(
+                                    "invalid internal list-windows command expansion".to_owned(),
+                                ),
+                            });
+                        }
+                        Err(error) => {
+                            return Response::Error(ErrorResponse {
+                                error: RmuxError::Server(error.message().to_owned()),
+                            });
+                        }
+                    }
+                };
+                request.stdin = Some(canonical);
+                true
+            }
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
         if let Some(response) = self
@@ -340,11 +379,19 @@ impl RequestHandler {
         requester_pid: u32,
         mut command: ParsedSourceFileCommand,
         context: &QueueExecutionContext,
+        target_binding: Option<&QueueSpecialTargetBinding>,
     ) -> Result<QueueCommandAction, RmuxError> {
+        if let Some(target_binding) = target_binding {
+            target_binding.require_live_for(self).await?;
+        }
         let depth = context.source_file_depth.saturating_add(1);
         command.current_file = context.current_file.clone();
-        let explicit_target = command.target.is_some();
-        if command.target.is_none() {
+        let explicit_target = target_binding
+            .map(QueueSpecialTargetBinding::is_explicit)
+            .unwrap_or(command.target.is_some() || command.target_missing_canfail);
+        if command.target_missing_canfail {
+            command.target = self.implicit_source_file_target(requester_pid).await;
+        } else if command.target.is_none() {
             if let Some(Target::Pane(target)) = context.current_target() {
                 command.target = Some(target.clone());
             }
@@ -353,17 +400,29 @@ impl RequestHandler {
         let mut loaded = self
             .load_nested_source_file_command(&command, depth, explicit_target)
             .await?;
+        if let Some(target_binding) = target_binding {
+            target_binding.require_live_for(self).await?;
+        }
         let mut source_file_errors = Vec::new();
         let mut execution_errors = Vec::new();
         let load_error = loaded.take_error();
 
         let mut batches = Vec::new();
         for batch in loaded.commands {
-            let mut batch_context = context.for_sourced_commands(depth, batch.current_file);
-            if explicit_target {
-                if let Some(target) = sourced_target.clone() {
-                    batch_context = batch_context.with_current_target(Some(target));
-                }
+            let batch_context = if command.target_missing_canfail {
+                target_binding
+                    .map(|binding| binding.child_context(context))
+                    .unwrap_or_else(|| context.clone())
+                    .with_implicit_current_target(sourced_target.clone())
+                    .without_retained_lifecycle_target()
+            } else {
+                target_binding
+                    .map(|binding| binding.child_context(context))
+                    .unwrap_or_else(|| context.clone())
+            };
+            let mut batch_context = batch_context.for_sourced_commands(depth, batch.current_file);
+            if target_binding.is_none() && !command.target_missing_canfail && explicit_target {
+                batch_context = batch_context.with_current_target(sourced_target.clone());
             }
             match self
                 .validate_sourced_command_syntax(
@@ -836,6 +895,7 @@ impl RequestHandler {
                     requester_pane_id,
                     attached_session: attached_session.as_ref(),
                     current_target: context.current_target.as_ref(),
+                    missing_current_target_fallback: context.missing_current_target_fallback(),
                     mouse_target: context.mouse_target.as_ref(),
                     marked_target: marked_target.as_ref(),
                 });
@@ -960,22 +1020,31 @@ impl RequestHandler {
             return;
         }
         command.current_file = context.current_file.clone();
-        if command.target.is_none() {
+        if command.target_missing_canfail {
+            command.target = self.implicit_source_file_target(requester_pid).await;
+        } else if command.target.is_none() {
             if let Some(Target::Pane(target)) = context.current_target() {
                 command.target = Some(target.clone());
             }
         }
         let depth = context.source_file_depth.saturating_add(1);
+        let explicit_target = command.target.is_some() || command.target_missing_canfail;
         match self
-            .load_nested_source_file_command(&command, depth, command.target.is_some())
+            .load_nested_source_file_command(&command, depth, explicit_target)
             .await
         {
             Ok(mut loaded) => {
                 if let Some(error) = loaded.take_error() {
                     errors.push(error);
                 }
-                let nested_context =
+                let mut nested_context =
                     context.for_sourced_commands(depth, context.current_file.clone());
+                if command.target_missing_canfail {
+                    nested_context = nested_context
+                        .with_implicit_current_target(command.target.clone().map(Target::Pane));
+                } else if let Some(target) = command.target.clone().map(Target::Pane) {
+                    nested_context = nested_context.with_current_target(Some(target));
+                }
                 if let Some(error) = self
                     .validate_loaded_source_file(requester_pid, &loaded, &nested_context, depth)
                     .await
@@ -1769,6 +1838,7 @@ mod tests {
                     verbose: false,
                     expand_paths: false,
                     target: None,
+                    target_missing_canfail: false,
                     caller_cwd: Some(root.clone()),
                     stdin: None,
                     current_file: None,

@@ -5,7 +5,7 @@ use rmux_proto::{
 };
 
 use super::super::RequestHandler;
-use crate::pane_terminals::HandlerState;
+use crate::pane_terminals::{session_not_found, HandlerState};
 
 impl RequestHandler {
     pub(in crate::handler) async fn handle_select_layout(
@@ -17,43 +17,39 @@ impl RequestHandler {
             rmux_proto::SelectLayoutTarget::Session(session_name) => session_name.clone(),
             rmux_proto::SelectLayoutTarget::Window(target) => target.session_name().clone(),
         };
-        let response = {
+        let (response, target, refresh_sessions) = {
             let mut state = self.state.lock().await;
             let option_size = layout_main_pane_size_for_select_target(&state, &request.target);
-            match state.mutate_session_and_resize_terminals(&session_name, |session| {
-                let window_index = layout_window_index(session, &request.target);
-                session.save_old_layout_in_window(window_index)?;
-                session.select_layout_in_window_with_main_pane_size(
-                    window_index,
-                    layout,
-                    option_size.width,
-                    option_size.height,
-                )?;
-                Ok(SelectLayoutResponse { layout })
-            }) {
-                Ok(response) => Response::SelectLayout(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+            let window_index = match layout_window_index_for_state(&state, &request.target) {
+                Ok(window_index) => window_index,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let target = WindowTarget::with_window(session_name.clone(), window_index);
+            match state.mutate_session_and_resize_window_terminal_with_family(
+                &session_name,
+                window_index,
+                |session| {
+                    session.save_old_layout_in_window(window_index)?;
+                    session.select_layout_in_window_with_main_pane_size(
+                        window_index,
+                        layout,
+                        option_size.width,
+                        option_size.height,
+                    )?;
+                    Ok(SelectLayoutResponse { layout })
+                },
+            ) {
+                Ok((response, refresh_sessions)) => {
+                    (Response::SelectLayout(response), target, refresh_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), target, Vec::new()),
             }
         };
 
         if matches!(response, Response::SelectLayout(_)) {
-            let target = match &request.target {
-                rmux_proto::SelectLayoutTarget::Session(session_name) => {
-                    let state = self.state.lock().await;
-                    state.sessions.session(session_name).map(|session| {
-                        WindowTarget::with_window(
-                            session_name.clone(),
-                            session.active_window_index(),
-                        )
-                    })
-                }
-                rmux_proto::SelectLayoutTarget::Window(target) => Some(target.clone()),
-            };
-            if let Some(target) = target {
-                self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                    .await;
-            }
-            self.refresh_attached_session(&session_name).await;
+            self.emit(LifecycleEvent::WindowLayoutChanged { target })
+                .await;
+            self.refresh_linked_window_sessions(refresh_sessions).await;
         }
 
         response
@@ -67,31 +63,37 @@ impl RequestHandler {
             rmux_proto::SelectLayoutTarget::Session(session_name) => session_name.clone(),
             rmux_proto::SelectLayoutTarget::Window(target) => target.session_name().clone(),
         };
-        let response = {
+        let (response, target, refresh_sessions) = {
             let mut state = self.state.lock().await;
-            match state.mutate_session_and_resize_terminals(&session_name, |session| {
-                let window_index = layout_window_index(session, &request.target);
-                session.save_old_layout_in_window(window_index)?;
-                session.select_custom_layout_in_window(window_index, &request.layout)?;
-                let layout = session
-                    .window_at(window_index)
-                    .expect("selected layout window exists")
-                    .layout();
-                Ok(SelectLayoutResponse { layout })
-            }) {
-                Ok(response) => Response::SelectLayout(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+            let window_index = match layout_window_index_for_state(&state, &request.target) {
+                Ok(window_index) => window_index,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let target = WindowTarget::with_window(session_name.clone(), window_index);
+            match state.mutate_session_and_resize_window_terminal_with_family(
+                &session_name,
+                window_index,
+                |session| {
+                    session.save_old_layout_in_window(window_index)?;
+                    session.select_custom_layout_in_window(window_index, &request.layout)?;
+                    let layout = session
+                        .window_at(window_index)
+                        .expect("selected layout window exists")
+                        .layout();
+                    Ok(SelectLayoutResponse { layout })
+                },
+            ) {
+                Ok((response, refresh_sessions)) => {
+                    (Response::SelectLayout(response), target, refresh_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), target, Vec::new()),
             }
         };
 
         if matches!(response, Response::SelectLayout(_)) {
-            if let Some(target) =
-                layout_change_target_from_select_target(self, &request.target).await
-            {
-                self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                    .await;
-            }
-            self.refresh_attached_session(&session_name).await;
+            self.emit(LifecycleEvent::WindowLayoutChanged { target })
+                .await;
+            self.refresh_linked_window_sessions(refresh_sessions).await;
         }
 
         response
@@ -105,30 +107,36 @@ impl RequestHandler {
             rmux_proto::SelectLayoutTarget::Session(session_name) => session_name.clone(),
             rmux_proto::SelectLayoutTarget::Window(target) => target.session_name().clone(),
         };
-        let response = {
+        let (response, target, refresh_sessions) = {
             let mut state = self.state.lock().await;
-            match state.mutate_session_and_resize_terminals(&session_name, |session| {
-                let window_index = layout_window_index(session, &request.target);
-                let _ = session.reapply_old_layout_in_window(window_index)?;
-                let layout = session
-                    .window_at(window_index)
-                    .expect("selected layout window exists")
-                    .layout();
-                Ok(SelectLayoutResponse { layout })
-            }) {
-                Ok(response) => Response::SelectLayout(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+            let window_index = match layout_window_index_for_state(&state, &request.target) {
+                Ok(window_index) => window_index,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let target = WindowTarget::with_window(session_name.clone(), window_index);
+            match state.mutate_session_and_resize_window_terminal_with_family(
+                &session_name,
+                window_index,
+                |session| {
+                    let _ = session.reapply_old_layout_in_window(window_index)?;
+                    let layout = session
+                        .window_at(window_index)
+                        .expect("selected layout window exists")
+                        .layout();
+                    Ok(SelectLayoutResponse { layout })
+                },
+            ) {
+                Ok((response, refresh_sessions)) => {
+                    (Response::SelectLayout(response), target, refresh_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), target, Vec::new()),
             }
         };
 
         if matches!(response, Response::SelectLayout(_)) {
-            if let Some(target) =
-                layout_change_target_from_select_target(self, &request.target).await
-            {
-                self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                    .await;
-            }
-            self.refresh_attached_session(&session_name).await;
+            self.emit(LifecycleEvent::WindowLayoutChanged { target })
+                .await;
+            self.refresh_linked_window_sessions(refresh_sessions).await;
         }
 
         response
@@ -142,31 +150,37 @@ impl RequestHandler {
             rmux_proto::SelectLayoutTarget::Session(session_name) => session_name.clone(),
             rmux_proto::SelectLayoutTarget::Window(target) => target.session_name().clone(),
         };
-        let response = {
+        let (response, target, refresh_sessions) = {
             let mut state = self.state.lock().await;
-            match state.mutate_session_and_resize_terminals(&session_name, |session| {
-                let window_index = layout_window_index(session, &request.target);
-                session.save_old_layout_in_window(window_index)?;
-                let _ = session.spread_layout_in_window(window_index)?;
-                let layout = session
-                    .window_at(window_index)
-                    .expect("selected layout window exists")
-                    .layout();
-                Ok(SelectLayoutResponse { layout })
-            }) {
-                Ok(response) => Response::SelectLayout(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+            let window_index = match layout_window_index_for_state(&state, &request.target) {
+                Ok(window_index) => window_index,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let target = WindowTarget::with_window(session_name.clone(), window_index);
+            match state.mutate_session_and_resize_window_terminal_with_family(
+                &session_name,
+                window_index,
+                |session| {
+                    session.save_old_layout_in_window(window_index)?;
+                    let _ = session.spread_layout_in_window(window_index)?;
+                    let layout = session
+                        .window_at(window_index)
+                        .expect("selected layout window exists")
+                        .layout();
+                    Ok(SelectLayoutResponse { layout })
+                },
+            ) {
+                Ok((response, refresh_sessions)) => {
+                    (Response::SelectLayout(response), target, refresh_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), target, Vec::new()),
             }
         };
 
         if matches!(response, Response::SelectLayout(_)) {
-            if let Some(target) =
-                layout_change_target_from_select_target(self, &request.target).await
-            {
-                self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                    .await;
-            }
-            self.refresh_attached_session(&session_name).await;
+            self.emit(LifecycleEvent::WindowLayoutChanged { target })
+                .await;
+            self.refresh_linked_window_sessions(refresh_sessions).await;
         }
 
         response
@@ -177,20 +191,27 @@ impl RequestHandler {
         request: rmux_proto::NextLayoutRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
-        let response = {
+        let window_index = request.target.window_index();
+        let (response, refresh_sessions) = {
             let mut state = self.state.lock().await;
             let option_size = layout_main_pane_size_for_window_target(&state, &request.target);
-            match state.mutate_session_and_resize_terminals(&session_name, |session| {
-                session.save_old_layout_in_window(request.target.window_index())?;
-                let layout = session.next_layout_in_window_with_main_pane_size(
-                    request.target.window_index(),
-                    option_size.width,
-                    option_size.height,
-                )?;
-                Ok(NextLayoutResponse { layout })
-            }) {
-                Ok(response) => Response::NextLayout(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+            match state.mutate_session_and_resize_window_terminal_with_family(
+                &session_name,
+                window_index,
+                |session| {
+                    session.save_old_layout_in_window(window_index)?;
+                    let layout = session.next_layout_in_window_with_main_pane_size(
+                        window_index,
+                        option_size.width,
+                        option_size.height,
+                    )?;
+                    Ok(NextLayoutResponse { layout })
+                },
+            ) {
+                Ok((response, refresh_sessions)) => {
+                    (Response::NextLayout(response), refresh_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
@@ -199,7 +220,7 @@ impl RequestHandler {
                 target: request.target,
             })
             .await;
-            self.refresh_attached_session(&session_name).await;
+            self.refresh_linked_window_sessions(refresh_sessions).await;
         }
 
         response
@@ -210,20 +231,27 @@ impl RequestHandler {
         request: rmux_proto::PreviousLayoutRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
-        let response = {
+        let window_index = request.target.window_index();
+        let (response, refresh_sessions) = {
             let mut state = self.state.lock().await;
             let option_size = layout_main_pane_size_for_window_target(&state, &request.target);
-            match state.mutate_session_and_resize_terminals(&session_name, |session| {
-                session.save_old_layout_in_window(request.target.window_index())?;
-                let layout = session.previous_layout_in_window_with_main_pane_size(
-                    request.target.window_index(),
-                    option_size.width,
-                    option_size.height,
-                )?;
-                Ok(PreviousLayoutResponse { layout })
-            }) {
-                Ok(response) => Response::PreviousLayout(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+            match state.mutate_session_and_resize_window_terminal_with_family(
+                &session_name,
+                window_index,
+                |session| {
+                    session.save_old_layout_in_window(window_index)?;
+                    let layout = session.previous_layout_in_window_with_main_pane_size(
+                        window_index,
+                        option_size.width,
+                        option_size.height,
+                    )?;
+                    Ok(PreviousLayoutResponse { layout })
+                },
+            ) {
+                Ok((response, refresh_sessions)) => {
+                    (Response::PreviousLayout(response), refresh_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
@@ -232,7 +260,7 @@ impl RequestHandler {
                 target: request.target,
             })
             .await;
-            self.refresh_attached_session(&session_name).await;
+            self.refresh_linked_window_sessions(refresh_sessions).await;
         }
 
         response
@@ -248,28 +276,35 @@ impl RequestHandler {
         let adjustment = request.adjustment;
         let response_target =
             PaneTarget::with_window(session_name.clone(), window_index, pane_index);
-        let response = {
+        let (response, refresh_sessions) = {
             let mut state = self.state.lock().await;
             match adjustment {
                 ResizePaneAdjustment::TrimBelow => {
-                    match state.trim_pane_below_cursor(&response_target) {
+                    let response = match state.trim_pane_below_cursor(&response_target) {
                         Ok(()) => Response::ResizePane(ResizePaneResponse {
                             target: response_target,
                             adjustment,
                         }),
                         Err(error) => Response::Error(ErrorResponse { error }),
-                    }
+                    };
+                    (response, Vec::new())
                 }
-                _ => match state.mutate_session_and_resize_terminals(&session_name, |session| {
-                    session.resize_pane_in_window(window_index, pane_index, adjustment)?;
+                _ => match state.mutate_session_and_resize_window_terminal_with_family(
+                    &session_name,
+                    window_index,
+                    |session| {
+                        session.resize_pane_in_window(window_index, pane_index, adjustment)?;
 
-                    Ok(ResizePaneResponse {
-                        target: response_target,
-                        adjustment,
-                    })
-                }) {
-                    Ok(response) => Response::ResizePane(response),
-                    Err(error) => Response::Error(ErrorResponse { error }),
+                        Ok(ResizePaneResponse {
+                            target: response_target,
+                            adjustment,
+                        })
+                    },
+                ) {
+                    Ok((response, refresh_sessions)) => {
+                        (Response::ResizePane(response), refresh_sessions)
+                    }
+                    Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
                 },
             }
         };
@@ -283,8 +318,12 @@ impl RequestHandler {
             .await;
             // See handle_select_pane: skip the refresh (and its deferred-pane
             // wait on Windows) when nothing is attached to the session.
-            if self.attached_count(&session_name).await > 0 {
-                self.refresh_attached_session(&session_name).await;
+            if refresh_sessions.is_empty() {
+                if self.attached_count(&session_name).await > 0 {
+                    self.refresh_attached_session(&session_name).await;
+                }
+            } else {
+                self.refresh_linked_window_sessions(refresh_sessions).await;
             }
         }
 
@@ -300,6 +339,21 @@ fn layout_window_index(
         rmux_proto::SelectLayoutTarget::Session(_) => session.active_window_index(),
         rmux_proto::SelectLayoutTarget::Window(target) => target.window_index(),
     }
+}
+
+fn layout_window_index_for_state(
+    state: &HandlerState,
+    target: &rmux_proto::SelectLayoutTarget,
+) -> Result<u32, rmux_proto::RmuxError> {
+    let session_name = match target {
+        rmux_proto::SelectLayoutTarget::Session(session_name) => session_name,
+        rmux_proto::SelectLayoutTarget::Window(target) => target.session_name(),
+    };
+    let session = state
+        .sessions
+        .session(session_name)
+        .ok_or_else(|| session_not_found(session_name))?;
+    Ok(layout_window_index(session, target))
 }
 
 #[derive(Clone, Copy, Default)]
@@ -353,19 +407,4 @@ fn layout_main_pane_size_for_window(
 
 fn option_dimension(value: Option<&str>) -> Option<u16> {
     value.and_then(|value| value.parse::<u16>().ok())
-}
-
-async fn layout_change_target_from_select_target(
-    handler: &RequestHandler,
-    target: &rmux_proto::SelectLayoutTarget,
-) -> Option<WindowTarget> {
-    match target {
-        rmux_proto::SelectLayoutTarget::Session(session_name) => {
-            let state = handler.state.lock().await;
-            state.sessions.session(session_name).map(|session| {
-                WindowTarget::with_window(session_name.clone(), session.active_window_index())
-            })
-        }
-        rmux_proto::SelectLayoutTarget::Window(target) => Some(target.clone()),
-    }
 }

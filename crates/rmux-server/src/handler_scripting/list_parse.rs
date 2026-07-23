@@ -216,6 +216,74 @@ pub(in crate::handler) struct ParsedListPanesAllCommand {
     pub(in crate::handler) reversed: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(in crate::handler) struct ParsedListWindowsAllCommand {
+    pub(in crate::handler) hook_target: Option<SessionName>,
+    pub(in crate::handler) format: Option<String>,
+    pub(in crate::handler) filter: Option<String>,
+    pub(in crate::handler) sort_order: Option<String>,
+    pub(in crate::handler) reversed: bool,
+}
+
+pub(super) fn parse_queued_list_windows_all(
+    mut args: CommandTokens,
+) -> Result<Option<ParsedListWindowsAllCommand>, RmuxError> {
+    let mut all_sessions = false;
+    let mut hook_target = None;
+    let mut format = None;
+    let mut filter = None;
+    let mut sort_order = None;
+    let mut reversed = false;
+
+    while let Some(token) = args.optional() {
+        match token.as_str() {
+            "-a" => all_sessions = true,
+            "-F" => format = Some(args.required("-F format")?),
+            "-f" => filter = Some(args.required("-f filter")?),
+            "-O" => sort_order = Some(args.required("-O order")?),
+            "-r" => reversed = true,
+            "-t" => {
+                hook_target = Some(parse_session_name(args.required("-t target")?)?);
+            }
+            flag if flag.starts_with('-') => {
+                let Some(flags) = parse_compact_flag_cluster(flag, "ar", "FfOt") else {
+                    return Ok(None);
+                };
+                for flag in flags {
+                    match flag {
+                        CompactFlag::Bare('a') => all_sessions = true,
+                        CompactFlag::Bare('r') => reversed = true,
+                        value @ CompactFlag::Value { flag: 'F', .. } => {
+                            format = Some(value.value_or_next(&mut args, "-F format")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'f', .. } => {
+                            filter = Some(value.value_or_next(&mut args, "-f filter")?)
+                        }
+                        value @ CompactFlag::Value { flag: 'O', .. } => {
+                            sort_order = Some(value.value_or_next(&mut args, "-O order")?)
+                        }
+                        value @ CompactFlag::Value { flag: 't', .. } => {
+                            hook_target = Some(parse_session_name(
+                                value.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(all_sessions.then_some(ParsedListWindowsAllCommand {
+        hook_target,
+        format,
+        filter,
+        sort_order,
+        reversed,
+    }))
+}
+
 pub(super) fn parse_queued_list_panes_all(
     mut args: CommandTokens,
 ) -> Result<Option<ParsedListPanesAllCommand>, RmuxError> {

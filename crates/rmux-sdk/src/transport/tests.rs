@@ -281,7 +281,7 @@ async fn dropping_request_before_send_succeeds_keeps_transport_usable() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn dropping_sent_request_invalidates_the_ordered_transport() {
+async fn dropping_sent_request_drains_its_response_and_keeps_transport_usable() {
     let (client_stream, mut server_stream) = tokio::io::duplex(4096);
     let client = TransportClient::spawn(client_stream);
     let request = spawn_request(&client, has_session_request());
@@ -299,7 +299,19 @@ async fn dropping_sent_request_invalidates_the_ordered_transport() {
         "request task must report external cancellation"
     );
 
-    assert_cancelled_transport_rejects_follow_up(&client).await;
+    let follow_up = spawn_request(&client, list_sessions_request());
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        list_sessions_request()
+    );
+    write_response(&mut server_stream, &has_session_response(false)).await;
+    write_response(&mut server_stream, &list_sessions_response(b"alpha\n")).await;
+
+    assert_eq!(
+        join_request(follow_up).await.expect("follow-up succeeds"),
+        list_sessions_response(b"alpha\n")
+    );
+    assert!(client.state.terminal_failure().is_none());
 }
 
 #[tokio::test(start_paused = true)]

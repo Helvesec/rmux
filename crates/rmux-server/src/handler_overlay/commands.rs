@@ -6,7 +6,8 @@ use rmux_proto::{OptionName, RmuxError, Target};
 use super::super::scripting_support::{
     format_context_for_target, QueueCommandAction, QueueExecutionContext,
 };
-use super::super::RequestHandler;
+use super::super::{RequestHandler, RequesterOrigin};
+use super::identity::OverlayIdentity;
 use super::layout::{
     menu_styles_for_target, menu_width, overlay_position_context, popup_content_size,
     popup_styles_for_target, resolve_popup_size,
@@ -18,11 +19,13 @@ use super::parse::{parse_menu_shortcut, ParsedDisplayMenuCommand, ParsedDisplayP
 use super::popup_job::{spawn_popup_job, PopupDragMode, PopupSurface};
 use super::state::{ClientOverlayState, PopupOverlayState};
 use super::support::popup_shell_command;
-use crate::copy_mode::{CopyModeCommandContext, CopyModeState, ModeKeys};
+use crate::copy_mode::{CopyModeCommandContext, CopyModeLineNumberLayout, CopyModeState, ModeKeys};
 use crate::format_runtime::render_runtime_template;
 use crate::format_runtime::RuntimeFormatContext;
 use crate::handler_support::attached_client_required;
-use crate::mouse::{copy_mode_mouse_context, AttachedMouseEvent};
+use crate::mouse::{
+    copy_mode_mouse_context_with_line_numbers, layout_for_session, AttachedMouseEvent,
+};
 use crate::pane_terminals::HandlerState;
 use crate::renderer::resolve_overlay_rect;
 use crate::terminal::TerminalProfile;
@@ -34,86 +37,81 @@ impl RequestHandler {
         command: ParsedDisplayMenuCommand,
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
-        let attach_pid = self
-            .resolve_overlay_client(
+        let origin = self.capture_requester_origin(requester_pid).await;
+        let attach_identity = self
+            .resolve_overlay_client_identity(
                 requester_pid,
                 command.target_client.as_deref(),
                 "display-menu",
             )
             .await?;
-        if self.mode_tree_active(attach_pid).await {
-            return Ok(QueueCommandAction::Normal {
-                output: None,
-                error: None,
-                source_file_error: None,
-                exit_status: None,
-            });
+        let attach_pid = attach_identity.attach_pid();
+        if self.mode_tree_active_for_identity(attach_identity).await {
+            return Ok(normal_action());
         }
 
-        let current_overlay = {
-            let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .get(&attach_pid)
-                .and_then(|active| active.overlay.clone())
-        };
-
         let target = self
-            .resolve_overlay_target(
-                attach_pid,
+            .resolve_overlay_target_for_identity(
+                attach_identity,
                 command.target_pane.clone(),
                 context.current_target().cloned(),
             )
             .await?;
+        let overlay_identity = {
+            let mut state = self.state.lock().await;
+            OverlayIdentity::capture(&mut state, attach_identity, target.clone())?
+        };
         let built = self
-            .build_display_menu_state(attach_pid, requester_pid, command, target)
+            .build_display_menu_state(
+                attach_pid,
+                origin,
+                command,
+                target,
+                context.clone(),
+                overlay_identity,
+            )
             .await?;
 
-        {
+        let attached_session_name = {
+            let state = self.state.lock().await;
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| {
+                    built
+                        .identity
+                        .matches(&state, active, &built.current_target)
+                })
                 .ok_or_else(|| attached_client_required("display-menu"))?;
             active.overlay_state_id = active.overlay_state_id.saturating_add(1);
             let overlay_id = active.overlay_state_id;
             let mut built = built;
             built.id = overlay_id;
-            match current_overlay {
-                Some(ClientOverlayState::Popup(mut popup)) => {
+            match active.overlay.as_mut() {
+                Some(ClientOverlayState::Popup(popup)) => {
                     if popup.nested_menu.is_some() {
-                        return Ok(QueueCommandAction::Normal {
-                            output: None,
-                            error: None,
-                            source_file_error: None,
-                            exit_status: None,
-                        });
+                        return Ok(normal_action());
                     }
                     popup.nested_menu = Some(built);
-                    active.overlay = Some(ClientOverlayState::Popup(popup));
                 }
                 Some(ClientOverlayState::Menu(_)) => {
-                    return Ok(QueueCommandAction::Normal {
-                        output: None,
-                        error: None,
-                        source_file_error: None,
-                        exit_status: None,
-                    });
+                    return Ok(normal_action());
                 }
                 None => {
                     active.overlay = Some(ClientOverlayState::Menu(Box::new(built)));
                 }
             }
-        }
+            active.session_name.clone()
+        };
 
-        self.refresh_interactive_overlay_if_active(attach_pid)
-            .await?;
-        Ok(QueueCommandAction::Normal {
-            output: None,
-            error: None,
-            source_file_error: None,
-            exit_status: None,
-        })
+        self.refresh_interactive_overlay_for_session_identity(
+            attach_identity,
+            &attached_session_name,
+            attach_identity.session_id(),
+        )
+        .await?;
+        Ok(normal_action())
     }
 
     pub(super) async fn execute_queued_display_popup(
@@ -123,51 +121,48 @@ impl RequestHandler {
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
         if command.close_existing {
-            if let Ok(attach_pid) = self
-                .resolve_overlay_client(
+            if let Ok(identity) = self
+                .resolve_overlay_client_identity(
                     requester_pid,
                     command.target_client.as_deref(),
                     "display-popup",
                 )
                 .await
             {
-                let _ = self.clear_interactive_overlay(attach_pid, true).await;
+                let _ = self
+                    .clear_interactive_overlay_for_identity(identity, true)
+                    .await;
             }
-            return Ok(QueueCommandAction::Normal {
-                output: None,
-                error: None,
-                source_file_error: None,
-                exit_status: None,
-            });
+            return Ok(normal_action());
         }
 
-        let attach_pid = match self
-            .resolve_overlay_client(
+        let attach_identity = match self
+            .resolve_overlay_client_identity(
                 requester_pid,
                 command.target_client.as_deref(),
                 "display-popup",
             )
             .await
         {
-            Ok(attach_pid) => attach_pid,
+            Ok(identity) => identity,
             Err(error) => return Err(error),
         };
-        if self.mode_tree_active(attach_pid).await {
-            return Ok(QueueCommandAction::Normal {
-                output: None,
-                error: None,
-                source_file_error: None,
-                exit_status: None,
-            });
+        let attach_pid = attach_identity.attach_pid();
+        if self.mode_tree_active_for_identity(attach_identity).await {
+            return Ok(normal_action());
         }
 
         let target = self
-            .resolve_overlay_target(
-                attach_pid,
+            .resolve_overlay_target_for_identity(
+                attach_identity,
                 command.target_pane.clone(),
                 context.current_target().cloned(),
             )
             .await?;
+        let overlay_identity = {
+            let mut state = self.state.lock().await;
+            OverlayIdentity::capture(&mut state, attach_identity, target.clone())?
+        };
 
         let existing_overlay_is_menu = {
             let active_attach = self.active_attach.lock().await;
@@ -175,39 +170,50 @@ impl RequestHandler {
                 active_attach
                     .by_pid
                     .get(&attach_pid)
+                    .filter(|active| attach_identity.matches_active(active))
                     .and_then(|active| active.overlay.as_ref()),
                 Some(ClientOverlayState::Menu(_))
             )
         };
         if existing_overlay_is_menu {
-            return Ok(QueueCommandAction::Normal {
-                output: None,
-                error: None,
-                source_file_error: None,
-                exit_status: None,
-            });
+            return Ok(normal_action());
         }
 
         let mut popup = self
-            .build_display_popup_state(attach_pid, requester_pid, command, target)
+            .build_display_popup_state(attach_pid, command, target, overlay_identity)
             .await?;
 
-        let (popup_identity, replaced_popup_job) = {
+        let installation = {
+            let state = self.state.lock().await;
             let mut active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get_mut(&attach_pid)
-                .ok_or_else(|| attached_client_required("display-popup"))?;
-            active.overlay_state_id = active.overlay_state_id.saturating_add(1);
-            popup.id = active.overlay_state_id;
-            let replaced_popup_job = match active
-                .overlay
-                .replace(ClientOverlayState::Popup(Box::new(popup.clone())))
-            {
-                Some(ClientOverlayState::Popup(replaced)) => replaced.job,
-                Some(ClientOverlayState::Menu(_)) | None => None,
-            };
-            (active.identity(attach_pid), replaced_popup_job)
+            if let Some(active) = active_attach.by_pid.get_mut(&attach_pid).filter(|active| {
+                popup
+                    .identity
+                    .matches(&state, active, &popup.current_target)
+            }) {
+                active.overlay_state_id = active.overlay_state_id.saturating_add(1);
+                popup.id = active.overlay_state_id;
+                let replaced_popup_job = match active
+                    .overlay
+                    .replace(ClientOverlayState::Popup(Box::new(popup.clone())))
+                {
+                    Some(ClientOverlayState::Popup(replaced)) => replaced.job,
+                    Some(ClientOverlayState::Menu(_)) | None => None,
+                };
+                Some((
+                    active.identity(attach_pid),
+                    active.session_name.clone(),
+                    replaced_popup_job,
+                ))
+            } else {
+                None
+            }
+        };
+        let Some((popup_identity, attached_session_name, replaced_popup_job)) = installation else {
+            if let Some(job) = popup.job {
+                job.terminate();
+            }
+            return Err(attached_client_required("display-popup"));
         };
 
         // Termination may touch a PTY or schedule ConPTY teardown, so keep it
@@ -230,22 +236,23 @@ impl RequestHandler {
             }
         }
 
-        self.refresh_interactive_overlay_if_active(attach_pid)
-            .await?;
-        Ok(QueueCommandAction::Normal {
-            output: None,
-            error: None,
-            source_file_error: None,
-            exit_status: None,
-        })
+        self.refresh_interactive_overlay_for_session_identity(
+            popup_identity,
+            &attached_session_name,
+            popup_identity.session_id(),
+        )
+        .await?;
+        Ok(normal_action())
     }
 
     async fn build_display_menu_state(
         &self,
         attach_pid: u32,
-        requester_pid: u32,
+        origin: RequesterOrigin,
         command: ParsedDisplayMenuCommand,
         target: Target,
+        command_context: QueueExecutionContext,
+        identity: OverlayIdentity,
     ) -> Result<MenuOverlayState, RmuxError> {
         let attached_count = self.attached_count(target.session_name()).await;
         let (client_size, mouse, session_name) = {
@@ -299,11 +306,11 @@ impl RequestHandler {
             .unwrap_or(u16::MAX)
             .saturating_add(2)
             .max(2);
-        let context =
+        let position_context =
             overlay_position_context(&state, &session_name, &target, client_size, mouse.as_ref());
         let rect = resolve_overlay_rect(
             runtime,
-            context,
+            position_context,
             command.x.as_deref(),
             command.y.as_deref(),
             width.min(client_size.cols.max(1)),
@@ -323,7 +330,9 @@ impl RequestHandler {
 
         Ok(MenuOverlayState {
             id: 0,
-            requester_pid,
+            command_context: identity.command_context(command_context, target.clone()),
+            identity,
+            origin,
             current_target: target,
             rect,
             title,
@@ -340,9 +349,9 @@ impl RequestHandler {
     pub(super) async fn build_display_popup_state(
         &self,
         attach_pid: u32,
-        requester_pid: u32,
         command: ParsedDisplayPopupCommand,
         target: Target,
+        identity: OverlayIdentity,
     ) -> Result<PopupOverlayState, RmuxError> {
         let attached_count = self.attached_count(target.session_name()).await;
         let (client_size, mouse, session_name) = {
@@ -396,7 +405,7 @@ impl RequestHandler {
 
         let mut popup = PopupOverlayState {
             id: 0,
-            requester_pid,
+            identity,
             current_target: target.clone(),
             rect,
             preferred_width: width,
@@ -451,6 +460,15 @@ impl RequestHandler {
     }
 }
 
+fn normal_action() -> QueueCommandAction {
+    QueueCommandAction::Normal {
+        output: None,
+        error: None,
+        source_file_error: None,
+        exit_status: None,
+    }
+}
+
 fn runtime_with_mouse_values<'a>(
     mut runtime: RuntimeFormatContext<'a>,
     state: &'a HandlerState,
@@ -476,16 +494,44 @@ fn runtime_with_mouse_values<'a>(
     let Some(pane) = window.pane(pane_target.pane_index()) else {
         return runtime;
     };
-    let Some(mouse_context) = copy_mode_mouse_context(mouse, pane.geometry(), -1) else {
-        return runtime;
-    };
     let Ok(transcript) = state.transcript_handle(pane_target) else {
         return runtime;
     };
-    let screen = transcript
-        .lock()
-        .expect("pane transcript mutex must not be poisoned")
-        .clone_screen();
+    let (screen, copy_summary) = {
+        let transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        (transcript.clone_screen(), transcript.copy_mode_summary())
+    };
+    let line_numbers = copy_summary.as_ref().and_then(|summary| {
+        CopyModeLineNumberLayout::resolve(
+            state.options.resolve_for_pane(
+                pane_target.session_name(),
+                pane_target.window_index(),
+                pane_target.pane_index(),
+                OptionName::CopyModeLineNumbers,
+            ),
+            summary.line_numbers_enabled,
+            summary.history_size,
+            summary.backing_rows,
+            summary.scroll_position,
+            summary.cursor_y,
+        )
+    });
+    let pane_geometry = layout_for_session(state, pane_target.session_name(), 1)
+        .and_then(|layout| {
+            layout
+                .panes
+                .into_iter()
+                .find(|candidate| candidate.pane_id == pane.id())
+                .map(|candidate| candidate.geometry)
+        })
+        .unwrap_or_else(|| pane.geometry());
+    let Some(mouse_context) =
+        copy_mode_mouse_context_with_line_numbers(mouse, pane_geometry, -1, line_numbers)
+    else {
+        return runtime;
+    };
     let word_separators = state
         .options
         .resolve(Some(pane_target.session_name()), OptionName::WordSeparators)
@@ -499,6 +545,14 @@ fn runtime_with_mouse_values<'a>(
             pane_target.pane_index(),
             OptionName::ModeKeys,
         )),
+        line_number_mode: crate::copy_mode::CopyModeLineNumberMode::parse(
+            state.options.resolve_for_pane(
+                pane_target.session_name(),
+                pane_target.window_index(),
+                pane_target.pane_index(),
+                OptionName::CopyModeLineNumbers,
+            ),
+        ),
         wrap_search: state.options.resolve_for_pane(
             pane_target.session_name(),
             pane_target.window_index(),

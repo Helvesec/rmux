@@ -184,6 +184,8 @@ impl HandlerState {
                 .entry(runtime_session_name)
                 .or_insert_with(Vec::new);
             panes.extend(window.panes().iter().map(|pane| {
+                let (alternate_on, copy_mode_active) =
+                    self.pane_viewport_state(session_name, *window_index, pane.id());
                 crate::pane_terminal_lookup::SessionPane {
                     id: pane.id(),
                     window_index: *window_index,
@@ -192,13 +194,39 @@ impl HandlerState {
                         session,
                         &self.options,
                         *window_index,
+                        pane.index(),
                         pane.geometry(),
+                        alternate_on,
+                        copy_mode_active,
                     ),
                 }
             }));
         }
 
         Ok(panes_by_runtime)
+    }
+
+    pub(in crate::pane_terminals) fn pane_viewport_state(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_id: PaneId,
+    ) -> (bool, bool) {
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        let Some(transcript) = self
+            .transcripts
+            .get(&runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+        else {
+            return (false, false);
+        };
+        let transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        (
+            transcript.is_alternate(),
+            transcript.copy_mode_state().is_some(),
+        )
     }
 
     pub(crate) fn ensure_panes_exist(

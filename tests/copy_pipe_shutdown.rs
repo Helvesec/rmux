@@ -34,11 +34,7 @@ fn kill_server_terminates_long_copy_pipe_helper_and_allows_restart() -> Result<(
         "copy-pipe-and-cancel",
         &normal_helper_command,
     ])?);
-    let copied = fs::read_to_string(&normal_output_path)?;
-    assert!(
-        copied.contains(normal_needle),
-        "normal copy-pipe helper did not receive the selected line: {copied:?}"
-    );
+    wait_for_file_contains(&normal_output_path, normal_needle, WAIT_TIMEOUT)?;
 
     let blocked_needle = "needle-copy-pipe-blocked";
     let blocked_target =
@@ -206,6 +202,35 @@ fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
         std::thread::sleep(Duration::from_millis(20));
     }
     Ok(())
+}
+
+fn wait_for_file_contains(
+    path: &Path,
+    needle: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last = String::new();
+    loop {
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                last = contents;
+                if last.contains(needle) {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for {} to contain {needle:?}; last output: {last:?}",
+                path.display()
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn read_pid(path: &Path) -> Result<u32, Box<dyn Error>> {

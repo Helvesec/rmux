@@ -1,4 +1,6 @@
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -9,8 +11,11 @@ use rmux_proto::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Pipes::CreatePipe;
 
 use super::super::action::{run_attach_action, AttachActionExecutor};
+use super::super::output_worker::AttachOutputWorker;
 use super::super::terminal_cleanup::fallback_attach_stop_sequence;
 use super::*;
 use crate::attach_lock_state::AttachLockState;
@@ -325,6 +330,201 @@ async fn detach_exec_shell_runs_action_before_exit() -> Result<(), Box<dyn std::
     scenario.join().await?;
 
     assert_eq!(actions.calls(), vec!["detach-exec:echo bye"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_exclusive_terminal_action_waits_for_prior_output(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        (
+            AttachMessage::Lock("legacy-lock".to_owned()),
+            "lock:legacy-lock",
+            true,
+        ),
+        (
+            AttachMessage::LockShellCommand(AttachShellCommand::new(
+                "structured-lock".to_owned(),
+                "pwsh.exe".to_owned(),
+                r"C:\work".to_owned(),
+            )),
+            "lock:structured-lock",
+            true,
+        ),
+        (AttachMessage::Suspend, "suspend", true),
+        (AttachMessage::DetachKill, "detach-kill", false),
+        (
+            AttachMessage::DetachExec("legacy-detach".to_owned()),
+            "detach-exec:legacy-detach",
+            false,
+        ),
+        (
+            AttachMessage::DetachExecShellCommand(AttachShellCommand::new(
+                "structured-detach".to_owned(),
+                "pwsh.exe".to_owned(),
+                r"C:\work".to_owned(),
+            )),
+            "detach-exec:structured-detach",
+            false,
+        ),
+    ];
+
+    for (message, expected_call, resumable) in cases {
+        assert_exclusive_action_waits_for_output(message, expected_call, resumable).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn buffered_vt_tail_is_flushed_before_exclusive_action(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(8);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let actions = RecordingActions::default();
+    let client_actions = actions.clone();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let action_worker: std::thread::JoinHandle<std::result::Result<(), crate::ClientError>> =
+        std::thread::spawn(move || {
+            let mut actions = client_actions;
+            while let Ok(action) = action_rx.recv() {
+                if completion_tx
+                    .send(run_attach_action(&mut actions, action))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        });
+    let (output, captured, fence_flushed) = BufferedVtTailOutput::new();
+    let client = tokio::spawn(async move {
+        drive_async_attach_with_output_fence(
+            reader,
+            writer,
+            Vec::new(),
+            output,
+            AttachScreenTracker::default(),
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+            BufferedVtTailOutput::flush_output_fence,
+        )
+        .await
+    });
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(b"visible-before-tail\x1b[?".to_vec()),
+    )
+    .await?;
+    write_server_message(&mut server, AttachMessage::Lock("barrier".to_owned())).await?;
+
+    actions
+        .wait_for_call("lock:barrier", Duration::from_secs(1))
+        .await?;
+    assert!(fence_flushed.load(Ordering::SeqCst));
+    assert_eq!(
+        *captured.lock().expect("captured output mutex poisoned"),
+        b"visible-before-tail\x1b[?",
+        "the action fence must finalize the VT scanner's pending tail"
+    );
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Unlock
+    );
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    timeout(client).await???;
+    action_worker
+        .join()
+        .map_err(|_| io::Error::other("action worker panicked"))??;
+    Ok(())
+}
+
+async fn assert_exclusive_action_waits_for_output(
+    message: AttachMessage,
+    expected_call: &str,
+    resumable: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(8);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let client_locked = Arc::clone(&locked);
+    let actions = RecordingActions::default();
+    let client_actions = actions.clone();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let action_worker: std::thread::JoinHandle<std::result::Result<(), crate::ClientError>> =
+        std::thread::spawn(move || {
+            let mut actions = client_actions;
+            while let Ok(action) = action_rx.recv() {
+                if completion_tx
+                    .send(run_attach_action(&mut actions, action))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        });
+    let (output, write_started_rx, release_tx) = BlockingOutput::new();
+    let captured = Arc::clone(&output.bytes);
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            output,
+            AttachScreenTracker::default(),
+            AttachAsyncChannels::new(
+                input_rx,
+                resize_rx,
+                action_tx,
+                completion_rx,
+                client_locked,
+                true,
+            ),
+        )
+        .await
+    });
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(b"output-before-action".to_vec()),
+    )
+    .await?;
+    wait_for_blocking_output_start(write_started_rx).await?;
+    write_server_message(&mut server, message).await?;
+    wait_for_attach_lock(&locked).await?;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        actions.calls().is_empty(),
+        "{expected_call} overtook output blocked in the writer"
+    );
+
+    release_tx.send(()).expect("release blocked output");
+    actions
+        .wait_for_call(expected_call, Duration::from_secs(1))
+        .await?;
+    assert_eq!(
+        *captured.lock().expect("output mutex poisoned"),
+        b"output-before-action"
+    );
+
+    if resumable {
+        assert_eq!(
+            read_client_message(&mut server).await?,
+            AttachMessage::Unlock
+        );
+        write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    }
+    timeout(client).await???;
+    action_worker
+        .join()
+        .map_err(|_| io::Error::other("action worker panicked"))??;
     Ok(())
 }
 
@@ -674,6 +874,7 @@ async fn blocked_console_output_does_not_block_input_forwarding(
     let (input_tx, input_rx) = mpsc::channel(8);
     let (resize_tx, resize_rx) = mpsc::unbounded_channel();
     let locked = Arc::new(AttachLockState::default());
+    let client_locked = Arc::clone(&locked);
     let actions = RecordingActions::default();
     let client_actions = actions.clone();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
@@ -699,7 +900,14 @@ async fn blocked_console_output_does_not_block_input_forwarding(
             Vec::new(),
             output,
             AttachScreenTracker::default(),
-            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+            AttachAsyncChannels::new(
+                input_rx,
+                resize_rx,
+                action_tx,
+                completion_rx,
+                client_locked,
+                true,
+            ),
         )
         .await
     });
@@ -727,11 +935,28 @@ async fn blocked_console_output_does_not_block_input_forwarding(
     );
 
     write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    wait_for_attach_lock(&locked).await?;
+    input_tx
+        .send(super::super::input::AttachInput::bytes(
+            b"locked-before-fence".to_vec(),
+        ))
+        .await
+        .expect("send input after exclusive action request");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), read_client_message(&mut server))
+            .await
+            .is_err(),
+        "exclusive action must lock input before waiting for output"
+    );
+    assert!(
+        actions.calls().is_empty(),
+        "detach-kill must wait for earlier console output"
+    );
+
+    release_tx.send(()).expect("release blocked output");
     actions
         .wait_for_call("detach-kill", Duration::from_secs(1))
         .await?;
-
-    release_tx.send(()).expect("release blocked output");
     timeout(client).await???;
     action_worker
         .join()
@@ -748,6 +973,7 @@ async fn output_backpressure_keeps_local_input_and_resize_live(
     let (input_tx, input_rx) = mpsc::channel(8);
     let (resize_tx, resize_rx) = mpsc::unbounded_channel();
     let locked = Arc::new(AttachLockState::default());
+    let client_locked = Arc::clone(&locked);
     let actions = RecordingActions::default();
     let client_actions = actions.clone();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
@@ -774,7 +1000,14 @@ async fn output_backpressure_keeps_local_input_and_resize_live(
             Vec::new(),
             output,
             AttachScreenTracker::default(),
-            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+            AttachAsyncChannels::new(
+                input_rx,
+                resize_rx,
+                action_tx,
+                completion_rx,
+                client_locked,
+                true,
+            ),
         )
         .await
     });
@@ -809,11 +1042,17 @@ async fn output_backpressure_keeps_local_input_and_resize_live(
     );
 
     write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    wait_for_attach_lock(&locked).await?;
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        actions.calls().is_empty(),
+        "detach-kill must not overtake backpressured output"
+    );
+
+    release_tx.send(()).expect("release blocked output");
     actions
         .wait_for_call("detach-kill", Duration::from_secs(1))
         .await?;
-
-    release_tx.send(()).expect("release blocked output");
     timeout(client).await???;
     action_worker
         .join()
@@ -839,6 +1078,7 @@ async fn backpressured_render_frames_replace_stale_pending_render(
     let (_input_tx, input_rx) = mpsc::channel(8);
     let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
     let locked = Arc::new(AttachLockState::default());
+    let client_locked = Arc::clone(&locked);
     let actions = RecordingActions::default();
     let client_actions = actions.clone();
     let (action_tx, action_rx) = std::sync::mpsc::channel();
@@ -865,7 +1105,14 @@ async fn backpressured_render_frames_replace_stale_pending_render(
             Vec::new(),
             output,
             AttachScreenTracker::default(),
-            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+            AttachAsyncChannels::new(
+                input_rx,
+                resize_rx,
+                action_tx,
+                completion_rx,
+                client_locked,
+                true,
+            ),
         )
         .await
     });
@@ -880,16 +1127,23 @@ async fn backpressured_render_frames_replace_stale_pending_render(
         .await?;
     }
     write_server_message(&mut server, AttachMessage::Render(b"latest\n".to_vec())).await?;
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    wait_for_attach_lock(&locked).await?;
+    assert!(
+        actions.calls().is_empty(),
+        "detach-kill must wait for the latest coalesced render"
+    );
 
     release_tx.send(()).expect("release blocked output");
     wait_for_output_contains(&captured, b"latest\n", Duration::from_secs(1)).await?;
+    actions
+        .wait_for_call("detach-kill", Duration::from_secs(1))
+        .await?;
     let output = captured.lock().expect("output mutex poisoned").clone();
     assert!(
         !String::from_utf8_lossy(&output).contains("stale-"),
         "stale render frames should be replaced under backpressure, got {output:?}"
     );
-
-    write_server_message(&mut server, AttachMessage::DetachKill).await?;
     timeout(client).await???;
     action_worker
         .join()
@@ -1245,6 +1499,97 @@ async fn output_writer_failure_wakes_attach_loop_while_server_is_idle(
         other => panic!("expected BrokenPipe output error, got {other:?}"),
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_fence_timeout_cancels_and_joins_blocked_writer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(2 * 1024 * 1024);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(8);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (_completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let (output, blocked_output_reader, write_started_rx) = SignaledPipeOutput::new()?;
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            output,
+            AttachScreenTracker::default(),
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true)
+                .with_output_fence_timeout(Duration::from_millis(50)),
+        )
+        .await
+    });
+
+    write_server_message(&mut server, AttachMessage::Data(vec![b'x'; 1024 * 1024])).await?;
+    wait_for_blocking_output_start(write_started_rx).await?;
+    write_server_message(&mut server, AttachMessage::Lock("must-not-run".to_owned())).await?;
+
+    let error = timeout(client)
+        .await??
+        .expect_err("a blocked output fence must time out");
+    assert!(
+        matches!(
+            error,
+            ClientError::Io(ref error)
+                if error.kind() == io::ErrorKind::TimedOut
+                    && error.to_string().contains("exclusive terminal action")
+        ),
+        "unexpected output fence timeout: {error}"
+    );
+    assert!(
+        action_rx.try_recv().is_err(),
+        "the terminal action must not run without an acknowledged fence"
+    );
+
+    let drained = tokio::task::spawn_blocking(move || {
+        let mut reader = blocked_output_reader;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Ok::<_, io::Error>(bytes)
+    });
+    let _bytes = timeout(drained).await???;
+    // `read_to_end` can only return after the output worker has dropped the
+    // pipe's sole write handle. The write-start signal above establishes that
+    // cancellation interrupted an entered WriteFile call rather than a worker
+    // that had not started yet.
+    Ok(())
+}
+
+#[test]
+fn cancellation_remains_active_while_output_drop_blocks() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (output, mut blocked_output_reader, drop_started_rx) = DropBlockingPipeOutput::new()?;
+    let mut worker = AttachOutputWorker::spawn(output);
+    let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+    let cancel_thread = std::thread::spawn(move || {
+        let _ = joined_tx.send(worker.cancel_and_join());
+    });
+
+    drop_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|_| io::Error::other("output Drop did not start"))?;
+    let joined = match joined_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(joined) => joined,
+        Err(_) => {
+            drop(blocked_output_reader);
+            cancel_thread
+                .join()
+                .map_err(|_| io::Error::other("output cancellation thread panicked"))?;
+            return Err(io::Error::other("output cancellation did not join a blocked Drop").into());
+        }
+    };
+    joined?;
+    let mut bytes = Vec::new();
+    blocked_output_reader.read_to_end(&mut bytes)?;
+    cancel_thread
+        .join()
+        .map_err(|_| io::Error::other("output cancellation thread panicked"))?;
     Ok(())
 }
 
@@ -1895,6 +2240,155 @@ impl Write for BlockingOutput {
 }
 
 #[derive(Debug)]
+struct SignaledPipeOutput {
+    writer: File,
+    write_started_tx: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl SignaledPipeOutput {
+    fn new() -> io::Result<(Self, File, std::sync::mpsc::Receiver<()>)> {
+        let mut read_handle: HANDLE = std::ptr::null_mut();
+        let mut write_handle: HANDLE = std::ptr::null_mut();
+        let created = unsafe {
+            // SAFETY: both handle pointers refer to writable local slots. The
+            // default security descriptor is sufficient for this process-local
+            // cancellation test, and ownership transfers to File below.
+            CreatePipe(
+                &mut read_handle,
+                &mut write_handle,
+                std::ptr::null_mut(),
+                4096,
+            )
+        };
+        if created == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let reader = unsafe {
+            // SAFETY: a successful CreatePipe call returned a new owned read
+            // handle, transferred exactly once into File.
+            File::from_raw_handle(read_handle)
+        };
+        let writer = unsafe {
+            // SAFETY: a successful CreatePipe call returned a new owned write
+            // handle, transferred exactly once into File.
+            File::from_raw_handle(write_handle)
+        };
+        let (write_started_tx, write_started_rx) = std::sync::mpsc::channel();
+        Ok((
+            Self {
+                writer,
+                write_started_tx: Some(write_started_tx),
+            },
+            reader,
+            write_started_rx,
+        ))
+    }
+}
+
+impl Write for SignaledPipeOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if let Some(write_started_tx) = self.write_started_tx.take() {
+            let _ = write_started_tx.send(());
+        }
+        self.writer.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+#[derive(Debug)]
+struct DropBlockingPipeOutput {
+    writer: File,
+    drop_started_tx: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl DropBlockingPipeOutput {
+    fn new() -> io::Result<(Self, File, std::sync::mpsc::Receiver<()>)> {
+        let (writer, reader, drop_started_rx) = SignaledPipeOutput::new()?;
+        Ok((
+            Self {
+                writer: writer.writer,
+                drop_started_tx: writer.write_started_tx,
+            },
+            reader,
+            drop_started_rx,
+        ))
+    }
+}
+
+impl Write for DropBlockingPipeOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for DropBlockingPipeOutput {
+    fn drop(&mut self) {
+        if let Some(drop_started_tx) = self.drop_started_tx.take() {
+            let _ = drop_started_tx.send(());
+        }
+        let _ = self.writer.write_all(&vec![b'd'; 1024 * 1024]);
+    }
+}
+
+#[derive(Debug)]
+struct BufferedVtTailOutput {
+    captured: Arc<Mutex<Vec<u8>>>,
+    pending_tail: Vec<u8>,
+    fence_flushed: Arc<AtomicBool>,
+}
+
+impl BufferedVtTailOutput {
+    fn new() -> (Self, Arc<Mutex<Vec<u8>>>, Arc<AtomicBool>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let fence_flushed = Arc::new(AtomicBool::new(false));
+        (
+            Self {
+                captured: Arc::clone(&captured),
+                pending_tail: Vec::new(),
+                fence_flushed: Arc::clone(&fence_flushed),
+            },
+            captured,
+            fence_flushed,
+        )
+    }
+
+    fn flush_output_fence(&mut self) -> io::Result<()> {
+        self.captured
+            .lock()
+            .map_err(|_| io::Error::other("captured output mutex poisoned"))?
+            .append(&mut self.pending_tail);
+        self.fence_flushed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl Write for BufferedVtTailOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let split_at = buffer.iter().position(|byte| *byte == b'\x1b');
+        let (visible, pending) = split_at
+            .map(|split_at| buffer.split_at(split_at))
+            .unwrap_or((buffer, &[]));
+        self.captured
+            .lock()
+            .map_err(|_| io::Error::other("captured output mutex poisoned"))?
+            .extend_from_slice(visible);
+        self.pending_tail.extend_from_slice(pending);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 struct FailingOutput;
 
 impl Write for FailingOutput {
@@ -2126,6 +2620,17 @@ async fn wait_for_blocking_output_start(
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
+}
+
+async fn wait_for_attach_lock(locked: &AttachLockState) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while !locked.is_locked() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("timed out waiting for exclusive attach input lock".into());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    Ok(())
 }
 
 async fn wait_for_output_contains(

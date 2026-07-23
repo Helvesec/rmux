@@ -11,9 +11,8 @@ use super::super::{
         attach_target_for_session, ActiveAttachIdentity, DisplayPanesClientState, DisplayPanesLabel,
     },
     prompt_support::{substitute_prompt_template, PromptInputEvent},
-    scripting_support::command_parser_from_state,
-    scripting_support::QueueExecutionContext,
-    RequestHandler,
+    scripting_support::{command_parser_from_state, queued_command_context, QueueExecutionContext},
+    with_expected_stable_target_identities, RequestHandler, RequesterOrigin, StableTargetIdentity,
 };
 use super::{
     decode_prompt_input_event, io_other, retain_partial_attached_escape_input,
@@ -36,12 +35,14 @@ const DEFAULT_DISPLAY_PANES_TEMPLATE: &str = "select-pane -t '%%'";
 
 struct DisplayPanesArmRequest<'a> {
     attach_pid: u32,
+    origin: RequesterOrigin,
     identity: Option<ActiveAttachIdentity>,
     session_name: &'a rmux_proto::SessionName,
     window: WindowTarget,
     clear_frame: Vec<u8>,
     no_command: bool,
     template: Option<String>,
+    command_context: QueueExecutionContext,
 }
 
 impl RequestHandler {
@@ -70,6 +71,7 @@ impl RequestHandler {
         identity: Option<ActiveAttachIdentity>,
         request: rmux_proto::DisplayPanesRequest,
     ) -> Response {
+        let origin = self.capture_requester_origin(requester_pid).await;
         let attach_pid = match identity {
             Some(identity) => identity.attach_pid(),
             None => match self
@@ -109,7 +111,8 @@ impl RequestHandler {
                 Some(session) => {
                     let overlay_frame =
                         renderer::render_display_panes_overlay(session, &state.options);
-                    let clear_frame = renderer::render_display_panes_clear(session, &state.options);
+                    let clear_frame =
+                        renderer::render_display_panes_clear(session, &state.options, &state);
                     (
                         Response::DisplayPanes(DisplayPanesResponse {
                             target: WindowTarget::with_window(
@@ -137,17 +140,33 @@ impl RequestHandler {
             }
         };
 
+        let command_context =
+            queued_command_context().unwrap_or_else(QueueExecutionContext::without_caller_cwd);
+        let command_context = if request.non_blocking {
+            command_context
+                .with_mouse_target(None)
+                .without_mouse_event()
+        } else {
+            command_context
+        };
         let armed_state = if let Response::DisplayPanes(success) = &response {
-            self.arm_display_panes_state(DisplayPanesArmRequest {
-                attach_pid,
-                identity,
-                session_name: &session_name,
-                window: success.target.clone(),
-                clear_frame: clear_frame.clone(),
-                no_command: request.no_command,
-                template: request.template.clone(),
-            })
-            .await
+            match self
+                .arm_display_panes_state(DisplayPanesArmRequest {
+                    attach_pid,
+                    origin,
+                    identity,
+                    session_name: &session_name,
+                    window: success.target.clone(),
+                    clear_frame: clear_frame.clone(),
+                    no_command: request.no_command,
+                    template: request.template.clone(),
+                    command_context,
+                })
+                .await
+            {
+                Ok(armed) => armed,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            }
         } else {
             None
         };
@@ -211,23 +230,40 @@ impl RequestHandler {
     async fn arm_display_panes_state(
         &self,
         request: DisplayPanesArmRequest<'_>,
-    ) -> Option<(ActiveAttachIdentity, u64)> {
+    ) -> Result<Option<(ActiveAttachIdentity, u64)>, RmuxError> {
         let DisplayPanesArmRequest {
             attach_pid,
+            origin,
             identity,
             session_name,
             window,
             clear_frame,
             no_command,
             template,
+            command_context,
         } = request;
         let labels = {
-            let state = self.state.lock().await;
-            state
+            let mut state = self.state.lock().await;
+            let rendered = state
                 .sessions
                 .session(session_name)
                 .map(|session| renderer::display_pane_targets(session, &state.options))
-                .unwrap_or_default()
+                .unwrap_or_default();
+            rendered
+                .into_iter()
+                .map(|label| {
+                    let target_identity = StableTargetIdentity::capture(
+                        &mut state,
+                        Target::Pane(label.target.clone()),
+                    )?;
+                    Ok(DisplayPanesLabel {
+                        label: label.label,
+                        target: label.target,
+                        target_string: label.target_string,
+                        target_identity,
+                    })
+                })
+                .collect::<Result<Vec<_>, RmuxError>>()?
         };
         let template = if no_command {
             None
@@ -238,28 +274,26 @@ impl RequestHandler {
         let active = active_attach
             .by_pid
             .get_mut(&attach_pid)
-            .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))?;
+            .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)));
+        let Some(active) = active else {
+            return Ok(None);
+        };
         if active.session_name != *session_name || active.suspended {
-            return None;
+            return Ok(None);
         }
         active.display_panes_state_id = active.display_panes_state_id.saturating_add(1);
         let id = active.display_panes_state_id;
         active.display_panes = Some(DisplayPanesClientState {
             id,
+            origin,
+            command_context,
             window,
-            labels: labels
-                .iter()
-                .map(|label| DisplayPanesLabel {
-                    label: label.label.clone(),
-                    target: label.target.clone(),
-                    target_string: label.target_string.clone(),
-                })
-                .collect(),
+            labels,
             input: String::new(),
             template,
             clear_frame,
         });
-        Some((active.identity(attach_pid), id))
+        Ok(Some((active.identity(attach_pid), id)))
     }
 
     async fn send_attached_display_panes_overlay_now(
@@ -377,7 +411,7 @@ impl RequestHandler {
             }
             (
                 renderer::render_display_panes_overlay(session, &state.options),
-                renderer::render_display_panes_clear(session, &state.options),
+                renderer::render_display_panes_clear(session, &state.options, &state),
             )
         };
 
@@ -791,12 +825,15 @@ impl RequestHandler {
                         active.overlay_generation = active.overlay_generation.saturating_add(1);
                         Some(DisplayPanesAction::Execute {
                             attach_pid,
+                            origin: state.origin,
+                            command_context: Box::new(state.command_context),
                             control_tx: active.control_tx.clone(),
                             render_generation: active.render_generation,
                             overlay_generation: active.overlay_generation,
                             fallback_clear_frame: state.clear_frame,
                             target: label.target,
                             target_string: label.target_string,
+                            target_identity: Box::new(label.target_identity),
                             template: state.template,
                         })
                     }
@@ -829,26 +866,48 @@ impl RequestHandler {
             }
             Some(DisplayPanesAction::Execute {
                 attach_pid,
+                origin,
+                command_context,
                 control_tx,
                 render_generation,
                 overlay_generation,
                 fallback_clear_frame,
                 target,
                 target_string,
+                target_identity,
                 template,
             }) => {
+                let requester_pid = origin.requester_pid();
+                let stable_target = Target::Pane(target.clone());
+                let validation = {
+                    let state = self.state.lock().await;
+                    command_context
+                        .require_live_retained_lifecycle_target(&state, "display-panes selection")
+                        .and_then(|()| {
+                            target_identity.require(
+                                &state,
+                                &stable_target,
+                                "display-panes selection",
+                            )
+                        })
+                };
+                let _access = self.require_requester_origin_write(&origin).await?;
                 let clear_frame = self
                     .render_attached_display_panes_clear_frame(attach_pid)
                     .await
                     .unwrap_or(fallback_clear_frame);
                 let overlay = OverlayFrame::new(clear_frame, render_generation, overlay_generation);
                 let _ = control_tx.send(AttachControl::Overlay(overlay));
+                validation?;
                 if let Some(template) = template {
                     if template == DEFAULT_DISPLAY_PANES_TEMPLATE {
-                        let outcome = self
-                            .dispatch_for_connection(
-                                attach_pid,
-                                u64::from(attach_pid),
+                        let outcome = with_expected_stable_target_identities(
+                            vec![*target_identity],
+                            None,
+                            None,
+                            self.dispatch_for_connection(
+                                requester_pid,
+                                u64::from(requester_pid),
                                 Request::SelectPane(Box::new(SelectPaneRequest {
                                     target,
                                     title: None,
@@ -856,8 +915,9 @@ impl RequestHandler {
                                     input_disabled: None,
                                     preserve_zoom: false,
                                 })),
-                            )
-                            .await;
+                            ),
+                        )
+                        .await;
                         match outcome.response {
                             Response::SelectPane(_) => return Ok(()),
                             Response::Error(ErrorResponse { error }) => return Err(error),
@@ -880,10 +940,11 @@ impl RequestHandler {
                             error.message()
                         ))
                     })?;
-                    let context = QueueExecutionContext::without_caller_cwd()
-                        .with_current_target(Some(Target::Pane(target)));
+                    let context = (*command_context)
+                        .with_current_target(Some(stable_target))
+                        .with_pinned_current_target_identity(Some(*target_identity));
                     let _ = self
-                        .execute_parsed_commands(attach_pid, parsed, context)
+                        .execute_parsed_commands(requester_pid, parsed, context)
                         .await?;
                 }
             }
@@ -912,12 +973,15 @@ enum DisplayPanesAction {
     },
     Execute {
         attach_pid: u32,
+        origin: RequesterOrigin,
+        command_context: Box<QueueExecutionContext>,
         control_tx: AttachControlSender,
         render_generation: u64,
         overlay_generation: u64,
         fallback_clear_frame: Vec<u8>,
         target: PaneTarget,
         target_string: String,
+        target_identity: Box<StableTargetIdentity>,
         template: Option<String>,
     },
 }

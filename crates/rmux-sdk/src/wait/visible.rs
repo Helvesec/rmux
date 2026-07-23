@@ -175,10 +175,23 @@ impl<'a> VisibleTextWait<'a> {
         deadline: Option<Instant>,
     ) -> Result<PaneSnapshot> {
         let matcher = self.matcher.compile()?;
+        let pane = self.pane.begin_operation_handle_with_timeout(self.timeout);
+        let pane = if pane.is_stable_id() {
+            pane
+        } else {
+            super::with_wait_deadline(
+                WAIT_FOR_TEXT_OPERATION,
+                timeout,
+                deadline,
+                pane.pin_to_current_identity(),
+            )
+            .await?
+            .0
+        };
         let mut last_snapshot = None;
         loop {
             let snapshot = snapshot_with_wait_deadline(
-                self.pane,
+                &pane,
                 WAIT_FOR_TEXT_OPERATION,
                 timeout,
                 deadline,

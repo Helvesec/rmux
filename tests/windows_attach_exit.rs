@@ -33,6 +33,20 @@ const EXIT_LATENCY_BUDGET: Duration = Duration::from_millis(250);
 const EXIT_LATENCY_REGRESSION_BUDGET: Duration = Duration::from_millis(1_500);
 const EXIT_LATENCY_REGRESSION_REPETITIONS: usize = 3;
 const WINDOWS_CONSOLE_TEST_LOCK_TIMEOUT_MS: u32 = 300_000;
+const WINDOWS_BATCH_ARGV_UNSUPPORTED_MESSAGE: &str =
+    "process command argv cannot target Windows .cmd or .bat scripts; use shell command mode";
+const WINDOWS_BATCH_ARGV_SPECIALS: [&str; 10] = [
+    "two words",
+    "quote\"value",
+    "%RMUX_SENTINEL%",
+    "bang!value",
+    "amp&value",
+    "pipe|value",
+    "less<value",
+    "greater>value",
+    "caret^value",
+    "",
+];
 
 static WINDOWS_CONSOLE_TEST_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_LABEL_ID: AtomicUsize = AtomicUsize::new(0);
@@ -95,6 +109,28 @@ fn unique_label(prefix: &str) -> String {
         .expect("system time after epoch")
         .as_nanos();
     format!("{prefix}-{}-{now}-{sequence}", std::process::id())
+}
+
+fn batch_test_path(case_dir: &Path) -> String {
+    format!(
+        "{};{}",
+        case_dir.display(),
+        std::env::var_os("PATH")
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    )
+}
+
+fn assert_batch_argv_rejected(output: &std::process::Output, context: &str) {
+    assert!(
+        !output.status.success(),
+        "{context} must reject structured batch argv"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(WINDOWS_BATCH_ARGV_UNSUPPORTED_MESSAGE),
+        "unexpected rejection for {context}: {}",
+        escaped_output(&output.stderr)
+    );
 }
 
 #[derive(Debug)]
@@ -216,55 +252,226 @@ fn windows_full_helper_client_shell_handoff_starts_power_shell_pane_when_availab
 }
 
 #[test]
-fn windows_explicit_cmd_shim_pane_command_runs_through_cmd_wrapper() -> Result<(), Box<dyn Error>> {
+fn windows_batch_argv_is_rejected_before_session_creation() -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
-    let label = unique_label("win-cmd-shim-pane-command");
+    let label = unique_label("win-batch-argv-rejected");
     let case_dir = std::env::temp_dir().join(&label);
-    fs::create_dir_all(&case_dir)?;
-    let script = case_dir.join("opencode.cmd");
-    fs::write(
-        &script,
-        "@echo off\r\n\
-         echo RMUX_CMD_SHIM_READY\r\n\
-         echo RMUX_CMD_SHIM_ARG1:%~1\r\n\
-         echo RMUX_CMD_SHIM_ARG2:%~2\r\n\
-         ping -n 30 127.0.0.1 >NUL\r\n",
-    )?;
+    let bin = case_dir.join("bin");
+    fs::create_dir_all(&bin)?;
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
-    let status = Command::new(&binary)
-        .arg("-L")
-        .arg(&label)
-        .args(["new-session", "-d", "-s", "cmdshim"])
-        .arg(&script)
-        .args(["--pure", "RMUX_ARG_OK"])
-        .status()?;
+    let marker = case_dir.join("batch-executed.txt");
+    let script_contents = format!("@echo off\r\necho EXECUTED>\"{}\"\r\n", marker.display());
+    let bare = case_dir.join("opencode.cmd");
+    let absolute = case_dir.join("absolute-shim.cmd");
+    let relative = bin.join("relative-shim.bat");
+    let direct_cmd = case_dir.join("direct probe.cmd");
+    let direct_bat = case_dir.join("direct probe.bat");
+    for script in [&bare, &absolute, &relative, &direct_cmd, &direct_bat] {
+        fs::write(script, &script_contents)?;
+    }
+    let cwd = case_dir.to_string_lossy().into_owned();
+    let path = batch_test_path(&case_dir);
+    let targets = [
+        ("bare-path", "opencode".to_owned()),
+        (
+            "absolute-no-extension",
+            case_dir
+                .join("absolute-shim")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "relative-no-extension",
+            PathBuf::from("bin")
+                .join("relative-shim")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("direct-cmd", direct_cmd.to_string_lossy().into_owned()),
+        ("direct-bat", direct_bat.to_string_lossy().into_owned()),
+    ];
+
+    for (shape, program) in targets {
+        let session = format!("batch-{shape}");
+        let output = Command::new(&binary)
+            .arg("-L")
+            .arg(&label)
+            .args(["new-session", "-d", "-s", &session, "-c", &cwd])
+            .arg(&program)
+            .args(WINDOWS_BATCH_ARGV_SPECIALS)
+            .env("PATH", &path)
+            .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+            .output()?;
+        assert_batch_argv_rejected(&output, &format!("new-session {shape}"));
+        let has_session = Command::new(&binary)
+            .arg("-L")
+            .arg(&label)
+            .args(["has-session", "-t", &session])
+            .output()?;
+        assert!(
+            !has_session.status.success(),
+            "rejected {shape} argv must not leave session {session} behind"
+        );
+    }
     assert!(
-        status.success(),
-        "new-session should spawn a .cmd shim pane command through cmd.exe, got {status}"
+        !marker.exists(),
+        "rejected new-session batch targets must never execute"
     );
 
-    wait_for_capture_contains(
-        &binary,
-        &label,
-        "cmdshim:0.0",
-        b"RMUX_CMD_SHIM_READY",
-        SETUP_TIMEOUT,
-    )?;
-    let output = wait_for_capture_contains(
-        &binary,
-        &label,
-        "cmdshim:0.0",
-        b"RMUX_CMD_SHIM_ARG2:RMUX_ARG_OK",
-        SETUP_TIMEOUT,
-    )?;
+    let _ = fs::remove_dir_all(case_dir);
+    Ok(())
+}
+
+#[test]
+fn windows_batch_argv_rejection_covers_window_split_and_respawn_entries(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-batch-argv-lifecycle");
+    let case_dir = std::env::temp_dir().join(&label);
+    let bin = case_dir.join("bin");
+    fs::create_dir_all(&bin)?;
+    let marker = case_dir.join("batch-executed.txt");
+    let script_contents = format!("@echo off\r\necho EXECUTED>\"{}\"\r\n", marker.display());
+    let bare = case_dir.join("opencode.cmd");
+    let absolute = case_dir.join("absolute-shim.cmd");
+    let relative = bin.join("relative-shim.bat");
+    let direct = case_dir.join("lifecycle probe.cmd");
+    for script in [&bare, &absolute, &relative, &direct] {
+        fs::write(script, &script_contents)?;
+    }
+    let cwd = case_dir.to_string_lossy().into_owned();
+    let path = batch_test_path(&case_dir);
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    let anchor = Command::new(&binary)
+        .arg("-L")
+        .arg(&label)
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-c",
+            &cwd,
+            "cmd.exe",
+            "/D",
+            "/Q",
+            "/K",
+        ])
+        .env("PATH", &path)
+        .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        .output()?;
     assert!(
-        output_contains(&output, b"RMUX_CMD_SHIM_ARG1:--pure")
-            && output_contains(&output, b"RMUX_CMD_SHIM_ARG2:RMUX_ARG_OK"),
-        ".cmd shim arguments were not forwarded correctly; observed output: {}",
-        escaped_output(&output)
+        anchor.status.success(),
+        "failed to create lifecycle anchor: {}",
+        escaped_output(&anchor.stderr)
     );
+    let original = run_rmux_output(
+        &binary,
+        &label,
+        [
+            "display-message",
+            "-p",
+            "-t",
+            "alpha:0.0",
+            "#{pane_id}:#{pane_pid}",
+        ],
+    )?;
+    let original = String::from_utf8(original.stdout)?;
+    let targets = [
+        ("bare-path", "opencode".to_owned()),
+        (
+            "absolute-no-extension",
+            case_dir
+                .join("absolute-shim")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "relative-no-extension",
+            PathBuf::from("bin")
+                .join("relative-shim")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        ("direct-cmd", direct.to_string_lossy().into_owned()),
+    ];
+    for (shape, program) in targets {
+        let commands = [
+            vec!["new-window", "-d", "-c", &cwd, "-t", "alpha", &program],
+            vec![
+                "split-window",
+                "-d",
+                "-c",
+                &cwd,
+                "-t",
+                "alpha:0.0",
+                &program,
+            ],
+            vec![
+                "respawn-pane",
+                "-k",
+                "-c",
+                &cwd,
+                "-t",
+                "alpha:0.0",
+                &program,
+            ],
+            vec![
+                "respawn-window",
+                "-k",
+                "-c",
+                &cwd,
+                "-t",
+                "alpha:0",
+                &program,
+            ],
+        ];
+        for args in commands {
+            let entry = args[0];
+            let output = Command::new(&binary)
+                .arg("-L")
+                .arg(&label)
+                .args(&args)
+                .args(WINDOWS_BATCH_ARGV_SPECIALS)
+                .env("PATH", &path)
+                .env("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+                .output()?;
+            assert_batch_argv_rejected(&output, &format!("{entry} {shape}"));
+        }
+    }
+
+    assert!(
+        !marker.exists(),
+        "rejected lifecycle requests must never execute the batch target"
+    );
+    let windows = run_rmux_output(
+        &binary,
+        &label,
+        ["list-windows", "-t", "alpha", "-F", "#{window_id}"],
+    )?;
+    assert_eq!(String::from_utf8(windows.stdout)?.lines().count(), 1);
+    let panes = run_rmux_output(
+        &binary,
+        &label,
+        ["list-panes", "-t", "alpha:0", "-F", "#{pane_id}"],
+    )?;
+    assert_eq!(String::from_utf8(panes.stdout)?.lines().count(), 1);
+    let current = run_rmux_output(
+        &binary,
+        &label,
+        [
+            "display-message",
+            "-p",
+            "-t",
+            "alpha:0.0",
+            "#{pane_id}:#{pane_pid}",
+        ],
+    )?;
+    assert_eq!(String::from_utf8(current.stdout)?, original);
 
     let _ = fs::remove_dir_all(case_dir);
     Ok(())

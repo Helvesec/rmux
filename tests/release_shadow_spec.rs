@@ -710,6 +710,18 @@ fn local_actions_are_confined_to_the_policy_directory() {
 
     fs::remove_file(root.join("tools/release-action/action.yml"))
         .expect("remove foreign action manifest");
+    let removed = Command::new("git")
+        .args([
+            "rm",
+            "--cached",
+            "-f",
+            "--",
+            "tools/release-action/action.yml",
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("remove lowercase action manifest from fixture index");
+    assert!(removed.status.success());
     fs::write(
         root.join("tools/release-action/Action.yml"),
         "name: wrong-case\nruns:\n  using: composite\n  steps: []\n",

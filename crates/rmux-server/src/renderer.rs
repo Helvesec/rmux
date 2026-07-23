@@ -3,13 +3,9 @@ use rmux_core::input::{
     COLOUR_TERMINAL,
 };
 use rmux_core::style::{parse_colour, Style};
-use rmux_core::{
-    formats::FormatContext, text_width as tmux_text_width, OptionStore, Pane, PaneGeometry, Screen,
-    Session, Utf8Config,
-};
-use rmux_proto::OptionName;
+use rmux_core::{text_width as tmux_text_width, OptionStore, Pane, PaneGeometry, Screen, Session};
 
-use crate::copy_mode::CopyModeSummary;
+use crate::copy_mode::CopyModeRenderSnapshot;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
 use crate::pane_visible_geometry::visible_pane_content_geometry;
@@ -17,6 +13,10 @@ use crate::pane_visible_geometry::visible_pane_content_geometry;
 mod borders;
 #[path = "renderer/clock_mode.rs"]
 mod clock_mode;
+#[path = "renderer/copy_mode_line_numbers.rs"]
+mod copy_mode_line_numbers;
+#[path = "renderer/copy_mode_position.rs"]
+mod copy_mode_position;
 #[cfg(test)]
 #[path = "renderer/copy_mode_tests.rs"]
 mod copy_mode_tests;
@@ -30,6 +30,8 @@ mod overlay;
 mod pane_delta;
 #[path = "renderer/pane_screen.rs"]
 mod pane_screen;
+#[path = "renderer/pane_scrollbar.rs"]
+mod pane_scrollbar;
 #[path = "renderer/status.rs"]
 mod status;
 #[cfg(test)]
@@ -39,8 +41,9 @@ use borders::{
 };
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use clock_mode::{
-    render_clock_overlay, render_clock_restore_frame, ClockPaneRestoreData,
+    render_clock_overlay, render_clock_restore_frame, ClockPaneRenderData, ClockPaneRestoreData,
 };
+pub(crate) use copy_mode_position::render_copy_mode_position;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use display_panes::{
     display_pane_targets, display_panes_label_count, render_display_panes_clear,
@@ -77,6 +80,7 @@ pub(crate) struct RenderedPrompt {
     pub(crate) command_prompt: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn render(session: &Session, options: &OptionStore) -> Vec<u8> {
     render_with_attached_count_and_prompt(session, options, 0, None)
 }
@@ -170,18 +174,67 @@ pub(crate) fn render_pane_cursor(
     pane: &Pane,
     screen: &Screen,
 ) -> Vec<u8> {
+    render_pane_cursor_for_view(
+        session,
+        options,
+        pane,
+        screen,
+        false,
+        screen.is_alternate(),
+        None,
+    )
+}
+
+pub(crate) fn render_copy_mode_pane_cursor(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+    snapshot: &CopyModeRenderSnapshot,
+) -> Vec<u8> {
+    let line_numbers =
+        copy_mode_line_numbers::layout_for_snapshot(session, options, pane, snapshot);
+    render_pane_cursor_for_view(
+        session,
+        options,
+        pane,
+        &snapshot.screen,
+        true,
+        snapshot.alternate_on,
+        line_numbers,
+    )
+}
+
+fn render_pane_cursor_for_view(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+    screen: &Screen,
+    copy_mode_active: bool,
+    alternate_on: bool,
+    line_numbers: Option<crate::copy_mode::CopyModeLineNumberLayout>,
+) -> Vec<u8> {
     let geometry = StatusGeometry::for_session(session, options);
-    let Some(pane_geometry) = visible_pane_geometry(session, options, pane, geometry.content_rows)
+    let Some(raw_pane_geometry) =
+        visible_pane_geometry(session, options, pane, geometry.content_rows)
     else {
         return Vec::new();
     };
+    let pane_geometry = crate::pane_scrollbar::PaneScrollbarConfig::resolve(
+        options,
+        session.name(),
+        session.active_window_index(),
+        pane.index(),
+    )
+    .content_geometry(raw_pane_geometry, alternate_on, copy_mode_active);
     if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
         return Vec::new();
     }
     let (cursor_x, cursor_y) = screen.cursor_position();
-    let x = pane_geometry
-        .x()
-        .saturating_add(cursor_x.min(u32::from(pane_geometry.cols().saturating_sub(1))) as u16);
+    let cursor_x = line_numbers.map_or_else(
+        || cursor_x.min(u32::from(pane_geometry.cols().saturating_sub(1))) as u16,
+        |layout| layout.cursor_x(pane_geometry.cols(), cursor_x),
+    );
+    let x = pane_geometry.x().saturating_add(cursor_x);
     let y = pane_geometry
         .y()
         .saturating_add(geometry.content_y_offset)
@@ -199,9 +252,18 @@ pub(crate) fn visible_pane_terminal_geometry(
     session: &Session,
     options: &OptionStore,
     pane: &Pane,
+    alternate_on: bool,
+    copy_mode_active: bool,
 ) -> Option<PaneGeometry> {
     let geometry = StatusGeometry::for_session(session, options);
     visible_pane_geometry(session, options, pane, geometry.content_rows).map(|pane_geometry| {
+        let pane_geometry = crate::pane_scrollbar::PaneScrollbarConfig::resolve(
+            options,
+            session.name(),
+            session.active_window_index(),
+            pane.index(),
+        )
+        .content_geometry(pane_geometry, alternate_on, copy_mode_active);
         PaneGeometry::new(
             pane_geometry.x(),
             pane_geometry.y().saturating_add(geometry.content_y_offset),
@@ -209,82 +271,6 @@ pub(crate) fn visible_pane_terminal_geometry(
             pane_geometry.rows(),
         )
     })
-}
-
-pub(crate) fn render_copy_mode_position(
-    session: &Session,
-    options: &OptionStore,
-    window_index: u32,
-    pane: &Pane,
-    summary: &CopyModeSummary,
-    history_size: usize,
-) -> Vec<u8> {
-    let geometry = StatusGeometry::for_session(session, options);
-    let Some(pane_geometry) = visible_pane_geometry(session, options, pane, geometry.content_rows)
-    else {
-        return Vec::new();
-    };
-    if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
-        return Vec::new();
-    }
-
-    let context = FormatContext::from_session(session)
-        .with_window(session.active_window_index(), session.window(), true, false)
-        .with_window_pane(session.window(), pane)
-        .with_named_value("scroll_position", summary.scroll_position.to_string())
-        .with_named_value("history_size", history_size.to_string())
-        .with_named_value("search_timed_out", bool_text(summary.search_timed_out))
-        .with_named_value("search_count", summary.search_count.to_string())
-        .with_named_value(
-            "search_count_partial",
-            bool_text(summary.search_count_partial),
-        )
-        .with_named_value("top_line_time", summary.top_line_time.to_string());
-    let runtime = RuntimeFormatContext::new(context)
-        .with_options(options)
-        .with_session(session)
-        .with_window(session.active_window_index(), session.window())
-        .with_pane(pane);
-    let template = options
-        .resolve_for_pane(
-            session.name(),
-            window_index,
-            pane.index(),
-            OptionName::CopyModePositionFormat,
-        )
-        .unwrap_or("[#{scroll_position}/#{history_size}]");
-    let style = apply_runtime_style_overlay(
-        &Style::default(),
-        options.resolve_for_window(
-            session.name(),
-            window_index,
-            OptionName::CopyModePositionStyle,
-        ),
-        &runtime,
-    );
-    let expanded = format!(
-        "#[align=right {}]{}",
-        rmux_core::style_tostring(&style),
-        render_runtime_template(template, &runtime, true)
-    );
-    let utf8 = Utf8Config::from_options(options);
-    let content_width = format_draw_content_width(&expanded, &Style::default(), &utf8);
-    let width = content_width.min(usize::from(pane_geometry.cols()));
-    if width == 0 {
-        return Vec::new();
-    }
-    let line =
-        format_draw_line(&expanded, &Style::default(), width, &utf8).trim_leading_ascii_space();
-    let mut frame = Vec::new();
-    render_formatted_line(
-        &mut frame,
-        pane_geometry
-            .x()
-            .saturating_add(pane_geometry.cols().saturating_sub(line.width() as u16)),
-        pane_geometry.y().saturating_add(geometry.content_y_offset),
-        &line,
-    );
-    frame
 }
 
 fn visible_pane_geometry(
@@ -310,14 +296,6 @@ fn visible_pane_geometry(
         geometry,
         content_rows,
     ))
-}
-
-fn bool_text(value: bool) -> &'static str {
-    if value {
-        "1"
-    } else {
-        "0"
-    }
 }
 
 pub(crate) fn render_status_only_with_attached_count_and_prompt(

@@ -38,6 +38,8 @@ use crate::unix_socket::real_user_id;
 use crate::unix_socket::{
     ensure_parent_directory, indicates_stale_socket, remove_stale_socket_if_needed,
 };
+#[cfg(unix)]
+use crate::unix_socket_access::UnixSocketAccessController;
 
 #[cfg(all(test, unix))]
 const FALLBACK_SOCKET_ROOT: &str = "/tmp";
@@ -319,6 +321,10 @@ impl ServerDaemon {
         #[cfg(unix)]
         {
             let bound_listener = bind_unix_listener_at(self.config.socket_path())?;
+            let socket_access = UnixSocketAccessController::new(
+                self.config.socket_path(),
+                bound_listener.identity,
+            )?;
             let (shutdown_handle, shutdown_receiver) = ShutdownHandle::new();
             let signal_watcher = crate::signals::SignalWatcher::install()?;
             let socket_path = self.config.socket_path().to_path_buf();
@@ -335,6 +341,7 @@ impl ServerDaemon {
                 self.config.web_port_explicit(),
             )
             .with_socket_identity(bound_listener.identity)
+            .with_socket_access(socket_access)
             .with_server_signals(signal_watcher);
 
             let task = tokio::spawn(listener::serve(
