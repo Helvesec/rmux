@@ -1295,6 +1295,12 @@ fn unix_full_helper_candidates(public: &Path) -> Vec<PathBuf> {
             .join("libexec")
             .join("rmux")
             .join(rmux_file_name()),
+        parent
+            .join("..")
+            .join("lib")
+            .join("rmux")
+            .join("libexec")
+            .join(rmux_file_name()),
     ]
 }
 
@@ -1687,6 +1693,54 @@ mod tests {
             fs::canonicalize(super::private_tmux_shim_target_for_public_binary(&public))
                 .expect("canonical target"),
             fs::canonicalize(helper).expect("canonical helper")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_private_tmux_shim_supports_prefix_lib_full_helper() {
+        let root = unique_test_dir("unix-prefix-lib-helper");
+        let bin = root.join("bin");
+        let libexec = root.join("lib").join("rmux").join("libexec");
+        fs::create_dir_all(&bin).expect("bin dir");
+        fs::create_dir_all(&libexec).expect("prefix libexec dir");
+        let public = bin.join("rmux");
+        let helper = libexec.join("rmux");
+        fs::write(&public, b"tiny").expect("public rmux");
+        fs::write(&helper, b"full").expect("full helper");
+
+        assert_eq!(
+            fs::canonicalize(super::private_tmux_shim_target_for_public_binary(&public))
+                .expect("canonical target"),
+            fs::canonicalize(helper).expect("canonical helper")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_private_tmux_shim_prefers_standard_libexec_layout() {
+        let root = unique_test_dir("unix-helper-precedence");
+        let bin = root.join("bin");
+        let standard = root.join("libexec").join("rmux");
+        let alternate = root.join("lib").join("rmux").join("libexec");
+        fs::create_dir_all(&bin).expect("bin dir");
+        fs::create_dir_all(&standard).expect("standard libexec dir");
+        fs::create_dir_all(&alternate).expect("alternate libexec dir");
+        let public = bin.join("rmux");
+        let standard_helper = standard.join("rmux");
+        let alternate_helper = alternate.join("rmux");
+        fs::write(&public, b"tiny").expect("public rmux");
+        fs::write(&standard_helper, b"standard").expect("standard helper");
+        fs::write(&alternate_helper, b"alternate").expect("alternate helper");
+
+        assert_eq!(
+            fs::canonicalize(super::private_tmux_shim_target_for_public_binary(&public))
+                .expect("canonical target"),
+            fs::canonicalize(standard_helper).expect("canonical helper")
         );
 
         let _ = fs::remove_dir_all(root);
