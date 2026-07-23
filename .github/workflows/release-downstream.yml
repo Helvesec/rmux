@@ -1,4 +1,4 @@
-name: Disarmed downstream release channels
+name: Downstream release channels
 
 on:
   workflow_call:

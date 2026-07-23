@@ -13,6 +13,9 @@ const PUBLICATION_INPUTS: &str =
     include_str!("../.github/actions/release-publication-inputs/action.yml");
 const CANDIDATE_STAGING: &str = include_str!("../scripts/release/stage-candidate-release.py");
 const PROMOTION_SIMULATION: &str = include_str!("../scripts/release/promotion-simulation.py");
+const CI: &str = include_str!("../.github/workflows/ci.yml");
+const LEGACY_RELEASE: &str = include_str!("../.github/workflows/release.yml");
+const LEGACY_CHOCOLATEY: &str = include_str!("../.github/workflows/publish-chocolatey.yml");
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -96,7 +99,7 @@ fn assert_workflow_dispatch_only(workflow: &str) {
 }
 
 #[test]
-fn promoter_workflows_have_exact_triggers_and_remain_disarmed() {
+fn promoter_workflows_have_exact_dispatch_only_triggers_and_are_active() {
     for workflow in [TAG, PROMOTE] {
         assert_workflow_dispatch_only(workflow);
     }
@@ -104,20 +107,20 @@ fn promoter_workflows_have_exact_triggers_and_remain_disarmed() {
     for workflow in [GITHUB_PUBLISH, RECEIPT_DISPATCH] {
         assert_workflow_call_only(workflow);
     }
-    assert_eq!(TAG.matches("if: ${{ false }}").count(), 1);
-    assert_eq!(PROMOTE.matches("if: ${{ false }}").count(), 5);
-    assert_eq!(RECEIPT.matches("if: ${{ false }}").count(), 2);
+    assert_eq!(TAG.matches("if: ${{ false }}").count(), 0);
+    assert_eq!(PROMOTE.matches("if: ${{ false }}").count(), 0);
+    assert_eq!(RECEIPT.matches("if: ${{ false }}").count(), 0);
 
     let activation: serde_json::Value =
         serde_json::from_str(include_str!("../.github/release/release-activation.json"))
             .expect("activation ledger");
-    assert_eq!(activation["status"], "disarmed");
+    assert_eq!(activation["status"], "active");
     assert_eq!(activation["runtime_override_allowed"], false);
     assert!(activation["capabilities"]
         .as_object()
         .expect("capability object")
         .values()
-        .all(|value| value == false));
+        .all(|value| value == true));
 
     let workflows = repo_root().join(".github/workflows");
     let new_names = [
@@ -134,7 +137,7 @@ fn promoter_workflows_have_exact_triggers_and_remain_disarmed() {
         for name in new_names {
             assert!(
                 !text.contains(&format!("uses: ./.github/workflows/{name}")),
-                "existing workflow {} calls disarmed {name}",
+                "existing workflow {} unexpectedly calls {name}",
                 path.display()
             );
         }
@@ -142,9 +145,31 @@ fn promoter_workflows_have_exact_triggers_and_remain_disarmed() {
 }
 
 #[test]
+fn legacy_tag_and_chocolatey_publishers_are_inert_after_cutover() {
+    assert!(!CI
+        .split("\npermissions:")
+        .next()
+        .expect("CI header")
+        .contains("\n    tags:"));
+    assert!(!LEGACY_RELEASE.contains("\n  push:"));
+    for (job_id, next_job) in [
+        ("source-gates", "build"),
+        (
+            "validate-external-configuration",
+            "package-repository-snapshot",
+        ),
+    ] {
+        let block = job(LEGACY_RELEASE, job_id, Some(next_job));
+        assert!(block.contains("if: ${{ false }}"), "{job_id}");
+    }
+    let chocolatey = job(LEGACY_CHOCOLATEY, "publish", None);
+    assert!(chocolatey.contains("if: ${{ false }}"));
+}
+
+#[test]
 fn signed_tag_gate_preserves_dedicated_ssh_signature_and_app_boundary() {
     let create = job(TAG, "create-signed-tag", Some("dispatch-promoter"));
-    assert!(create.contains("if: ${{ false }}"));
+    assert!(!create.contains("if: ${{ false }}"));
     assert!(create.contains("environment: release-tagging"));
     assert!(create.contains("assert-release-capability.py signed_tag_creation"));
     assert!(create.contains("RMUX_RELEASE_SSH_SIGNING_KEY"));
@@ -178,9 +203,9 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
     assert_eq!(PROMOTE.matches("merge-multiple: true").count(), 4);
     assert!(authorize.contains("rmux-authorization/verified"));
     assert!(authorize.contains("rmux-authorization/policy"));
-    assert!(prepare.contains("if: ${{ false }}"));
+    assert!(!prepare.contains("if: ${{ false }}"));
     assert!(prepare.contains("uses: ./.github/workflows/release-policy-audit.yml"));
-    assert!(audit.contains("if: ${{ false }}"));
+    assert!(!audit.contains("if: ${{ false }}"));
     assert!(audit.contains("environment: release-policy-audit"));
     assert!(audit.contains("uses: ./.github/actions/release-policy-audit"));
     assert!(audit.contains("audit-workflow-id: 316435346"));
@@ -220,7 +245,7 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
 #[test]
 fn receipt_is_separate_receipt_only_and_never_writes_contents() {
     let receipt = job(RECEIPT, "receipt-only", Some("downstream"));
-    assert!(receipt.contains("if: ${{ false }}"));
+    assert!(!receipt.contains("if: ${{ false }}"));
     assert!(RECEIPT.contains("on:\n  workflow_dispatch:"));
     assert!(!RECEIPT.contains("\n  workflow_call:"));
     assert!(receipt.contains("test \"$GITHUB_RUN_ATTEMPT\" = 1"));
@@ -304,7 +329,7 @@ fn only_promoter_and_nonpublishing_simulation_call_policy_audit() {
         ]
     );
     let audit = job(PROMOTE, "policy-audit", Some("authorize-promotion"));
-    assert!(audit.contains("if: ${{ false }}"));
+    assert!(!audit.contains("if: ${{ false }}"));
 }
 
 #[test]

@@ -70,7 +70,7 @@ fn assert_workflow_call_only(workflow: &str) {
     }
 }
 
-fn calls_disarmed_workflow(line: &str, workflow_name: &str) -> bool {
+fn calls_downstream_workflow(line: &str, workflow_name: &str) -> bool {
     let normalized = line.trim().strip_prefix("- ").unwrap_or(line.trim()).trim();
     let Some(target) = normalized.strip_prefix("uses:") else {
         return false;
@@ -86,7 +86,7 @@ fn calls_disarmed_workflow(line: &str, workflow_name: &str) -> bool {
 }
 
 #[test]
-fn downstream_workflow_is_uncalled_read_only_and_disarmed() {
+fn downstream_workflow_is_receipt_gated_read_only_and_active() {
     assert_workflow_call_only(DOWNSTREAM);
     assert_eq!(DOWNSTREAM.matches("if: ${{ false }}").count(), 0);
     assert!(!DOWNSTREAM.contains("contents: write"));
@@ -98,11 +98,11 @@ fn downstream_workflow_is_uncalled_read_only_and_disarmed() {
     let activation: serde_json::Value =
         serde_json::from_str(include_str!("../.github/release/release-activation.json"))
             .expect("activation ledger");
-    assert_eq!(activation["status"], "disarmed");
+    assert_eq!(activation["status"], "active");
     assert_eq!(activation["runtime_override_allowed"], false);
-    assert_eq!(activation["capabilities"]["downstream_channels"], false);
+    assert_eq!(activation["capabilities"]["downstream_channels"], true);
     let caller = job(RECEIPT, "downstream", None);
-    assert!(caller.contains("if: ${{ false }}"));
+    assert!(!caller.contains("if: ${{ false }}"));
     assert!(caller.contains("uses: ./.github/workflows/release-downstream.yml"));
 
     let workflows = repo_root().join(".github/workflows");
@@ -111,18 +111,18 @@ fn downstream_workflow_is_uncalled_read_only_and_disarmed() {
         let text = fs::read_to_string(&path).expect("read workflow");
         let calls_downstream = text
             .lines()
-            .any(|line| calls_disarmed_workflow(line, "release-downstream.yml"));
+            .any(|line| calls_downstream_workflow(line, "release-downstream.yml"));
         if path.ends_with("release-receipt.yml") {
             assert!(
                 calls_downstream,
                 "receipt must retain the guarded downstream call"
             );
-            assert!(text.contains("if: ${{ false }}"));
+            assert!(!text.contains("if: ${{ false }}"));
             continue;
         }
         assert!(
             !calls_downstream,
-            "existing workflow {} calls the disarmed downstream workflow",
+            "existing workflow {} calls the downstream workflow",
             path.display()
         );
     }
@@ -135,9 +135,9 @@ fn downstream_caller_guard_rejects_relative_and_absolute_targets() {
         "    uses: Helvesec/rmux/.github/workflows/release-downstream.yml@0123456789012345678901234567890123456789",
         "    uses: 'helvesec/RMUX/.github/workflows/release-downstream.yml@main'",
     ] {
-        assert!(calls_disarmed_workflow(line, "release-downstream.yml"));
+        assert!(calls_downstream_workflow(line, "release-downstream.yml"));
     }
-    assert!(!calls_disarmed_workflow(
+    assert!(!calls_downstream_workflow(
         "    uses: Other/repo/.github/workflows/release-downstream.yml@main",
         "release-downstream.yml"
     ));
@@ -503,11 +503,11 @@ fn all_eleven_channels_are_default_denied_and_rmux_io_is_last() {
     assert!(DOWNSTREAM.contains("test \"$GITHUB_REPOSITORY\" = \"Helvesec/rmux\""));
     assert!(DOWNSTREAM.contains("test \"$GITHUB_REPOSITORY_ID\" = \"1239918790\""));
     assert_eq!(DOWNSTREAM.matches("channel-summary.py create").count(), 0);
-    assert!(RECEIPT.contains("if: ${{ false }}"));
+    assert!(!RECEIPT.contains("if: ${{ false }}"));
 }
 
 #[test]
-fn public_owned_downstream_protection_layers_are_recorded_but_disarmed() {
+fn public_owned_downstream_protection_layers_are_recorded_and_active() {
     let registry: serde_json::Value = serde_json::from_str(include_str!(
         "../.github/release/downstream-repositories.json"
     ))
@@ -678,7 +678,7 @@ fn downstream_repository_verifier_accepts_github_ruleset_arrays() {
 }
 
 #[test]
-fn disarmed_workflow_has_no_store_or_repository_mutation_primitive() {
+fn downstream_orchestrator_has_no_direct_mutation_primitive() {
     for forbidden in [
         "cargo publish",
         "choco push",
@@ -696,7 +696,7 @@ fn disarmed_workflow_has_no_store_or_repository_mutation_primitive() {
     ] {
         assert!(
             !DOWNSTREAM.contains(forbidden),
-            "disarmed workflow contains mutation primitive {forbidden}"
+            "downstream orchestrator contains mutation primitive {forbidden}"
         );
     }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create or verify disarmed promotion authorization predicates and envelopes."""
+"""Create or verify promotion authorization predicates and envelopes."""
 
 from __future__ import annotations
 

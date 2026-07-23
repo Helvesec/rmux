@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the disarmed policy-audit configuration and its schemas."""
+"""Validate the authority-gated policy-audit configuration and its schemas."""
 
 from __future__ import annotations
 
@@ -132,10 +132,10 @@ def _positive(value: Any, label: str) -> None:
         raise ValueError(f"{label} must be a positive integer")
 
 
-def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
+def validate_contract(value: dict[str, Any], *, require_configured: bool) -> None:
     if (
         value.get("schema_version") != 1
-        or value.get("status") != "review-only-disarmed"
+        or value.get("status") != "active-authority-gated"
         or value.get("repository")
         != {
             "id": REPOSITORY_ID,
@@ -148,7 +148,7 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
     if value.get("activation") != {
         "ledger": ".github/release/release-activation.json",
         "capability": "policy_audit",
-        "required_value": False,
+        "required_value": True,
         "runtime_override_allowed": False,
     }:
         raise ValueError("policy audit activation binding changed")
@@ -161,7 +161,7 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
         "preparer_job": "prepare-policy-audit",
         "privileged_action": PRIVILEGED_ACTION_PATH,
         "privileged_job": "policy-audit",
-        "privileged_job_condition": "disabled-in-promoter",
+        "privileged_job_condition": "release-activation-ledger",
         "environment": "release-policy-audit",
         "runner_image": "ubuntu-22.04",
         "workflow_id": 316425885,
@@ -191,7 +191,7 @@ def validate_contract(value: dict[str, Any], *, require_disarmed: bool) -> None:
             raise ValueError("policy audit App slug is invalid")
     elif identity != (None, None, None):
         raise ValueError("unconfigured policy audit App cannot carry an identity")
-    if require_disarmed and configured is not True:
+    if require_configured and configured is not True:
         raise ValueError("repository contract must bind the installed audit App")
     lifecycle = value.get("token_lifecycle")
     if not isinstance(lifecycle, dict) or lifecycle.get("collector_methods") != ["GET"]:
@@ -317,19 +317,19 @@ def validate_repository_contracts(root: Path) -> None:
     activation = read_object(release / "release-activation.json", "activation ledger")
     contract = read_object(release / "policy-audit-contract.json", "audit contract")
     validate_activation(activation)
-    validate_contract(contract, require_disarmed=True)
+    validate_contract(contract, require_configured=True)
     candidate_workflow = read_object(
         release / "candidate-workflow-contract.json", "candidate workflow contract"
     )
     if candidate_workflow.get("policy_audit") != {
         "activation_ledger": ".github/release/release-activation.json",
-        "capability_enabled": False,
+        "capability_enabled": True,
         "contract": ".github/release/policy-audit-contract.json",
         "audit_app_configured": True,
         "preparer_workflow": PREPARER_WORKFLOW_PATH,
         "preparer_callers": 2,
         "privileged_action": PRIVILEGED_ACTION_PATH,
-        "privileged_job_condition": "disabled-in-promoter",
+        "privileged_job_condition": "release-activation-ledger",
         "pat_fallback": False,
         "authorizes_publication": False,
     }:
@@ -453,11 +453,10 @@ def validate_repository_contracts(root: Path) -> None:
             raise ValueError(
                 f"policy audit secret inheritance appeared in {caller_name}"
             )
-    if (
-        "if: ${{ false }}" not in promote_prepare
-        or "if: ${{ false }}" not in promote_audit
-    ):
-        raise ValueError("release promoter policy audit must remain disabled")
+    if "if: ${{ false }}" in promote_prepare or "if: ${{ false }}" in promote_audit:
+        raise ValueError(
+            "release promoter policy audit remains disabled after cut-over"
+        )
     if (
         "on:\n  workflow_dispatch:" not in simulation
         or "\n  workflow_call:" in simulation
@@ -491,8 +490,9 @@ def validate_repository_contracts(root: Path) -> None:
     ):
         schema = read_object(release / "schemas" / name, name)
         if (
-            schema.get("x-rmux-status") != "disarmed-non-authoritative"
+            schema.get("x-rmux-status") != "policy-audit-non-authoritative"
             or schema.get("additionalProperties") is not False
-            or "MUST NOT authorize publication" not in schema.get("description", "")
+            or "does not authorize publication by itself"
+            not in schema.get("description", "")
         ):
-            raise ValueError(f"{name} is not explicitly disarmed")
+            raise ValueError(f"{name} lost its non-authoritative boundary")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed primitives for disarmed downstream release evidence."""
+"""Fail-closed primitives for downstream release evidence."""
 
 from __future__ import annotations
 

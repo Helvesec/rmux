@@ -1,9 +1,6 @@
-name: Release
+name: Legacy Release (disabled)
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       ref:
@@ -31,6 +28,7 @@ env:
 jobs:
   source-gates:
     name: Release source gates
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
     outputs:
@@ -577,6 +575,7 @@ jobs:
 
   validate-external-configuration:
     name: Validate external rollout configuration
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: release

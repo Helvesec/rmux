@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the disarmed tag, promotion, and receipt contracts."""
+"""Validate the active tag, promotion, and receipt contracts."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ ROOT = Path(__file__).resolve().parents[2]
 ATOMIC_SCHEMA_STATUS = "atomic-authority-bound"
 
 EXPECTED_PUBLICATION = {
-    "enabled": False,
+    "enabled": True,
     "promoter_concurrency": "rmux-release-promote-${release_ref}",
     "promoter_trigger": "workflow_dispatch",
     "promoter_workflow": ".github/workflows/release-promote.yml",
     "public_triggers": False,
-    "publication_permissions": False,
-    "publication_secrets": False,
+    "publication_permissions": True,
+    "publication_secrets": True,
     "receipt_concurrency": "rmux-release-receipt-${release_ref}",
     "receipt_required_run_attempt": 1,
     "receipt_trigger": "workflow_dispatch",
@@ -105,9 +105,9 @@ def _required_strings(value: Any, label: str) -> set[str]:
 
 
 def validate_candidate_policy(value: Any) -> None:
-    """Bind the disabled publication policy to its exact workflows."""
+    """Bind the active publication policy to its exact workflows."""
     if value != EXPECTED_PUBLICATION:
-        raise ValueError("candidate delta acquired publication authority")
+        raise ValueError("candidate publication authority changed")
     for label, (path, trigger, concurrency_group) in RELEASE_WORKFLOWS.items():
         text = (ROOT / path).read_text(encoding="utf-8")
         if f"on:\n  {trigger}:" not in text:
@@ -125,6 +125,30 @@ def validate_candidate_policy(value: Any) -> None:
     )
     if 'test "$GITHUB_RUN_ATTEMPT" = 1' not in receipt:
         raise ValueError("release receipt must reject every rerun")
+
+    ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    legacy_release = (ROOT / ".github/workflows/release.yml").read_text(
+        encoding="utf-8"
+    )
+    legacy_chocolatey = (ROOT / ".github/workflows/publish-chocolatey.yml").read_text(
+        encoding="utf-8"
+    )
+    if "\n    tags:" in ci.split("\npermissions:", 1)[0]:
+        raise ValueError("CI still reacts to release tags after cut-over")
+    if "\n  push:" in legacy_release:
+        raise ValueError("legacy Release still reacts to release tags")
+    for job, next_job in (
+        ("source-gates", "build"),
+        ("validate-external-configuration", "package-repository-snapshot"),
+    ):
+        block = legacy_release.split(f"\n  {job}:\n", 1)[1].split(
+            f"\n  {next_job}:\n", 1
+        )[0]
+        if "if: ${{ false }}" not in block:
+            raise ValueError(f"legacy Release job {job} is not inert")
+    legacy_publish = legacy_chocolatey.split("\n  publish:\n", 1)[1]
+    if "if: ${{ false }}" not in legacy_publish:
+        raise ValueError("legacy Chocolatey publisher is not inert")
 
 
 def validate_schemas(schema_dir: Path) -> None:

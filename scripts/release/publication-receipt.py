@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create or verify disarmed publication receipt predicates and envelopes."""
+"""Create or verify publication receipt predicates and envelopes."""
 
 from __future__ import annotations
 import argparse

@@ -90,7 +90,7 @@ def _validate_callers(root: Path, downstream_paths: tuple[Path, Path, Path]) -> 
             ):
                 caller = text.split("\n  downstream:\n", 1)[1]
                 if (
-                    "if: ${{ false }}" in caller
+                    "if: ${{ false }}" not in caller
                     and caller.count("./.github/workflows/release-downstream.yml") == 1
                 ):
                     continue
@@ -101,7 +101,9 @@ def _validate_callers(root: Path, downstream_paths: tuple[Path, Path, Path]) -> 
                 and text.count(f"./.github/workflows/{downstream.name}") == 1
             ):
                 continue
-            raise ValueError(f"{path.name} calls disarmed {downstream.name}")
+            raise ValueError(
+                f"{path.name} has an unauthorized call to {downstream.name}"
+            )
 
 
 def _validate_receipt_origin(main: str) -> None:

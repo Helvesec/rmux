@@ -44,7 +44,7 @@ fn workflow_calls(text: &str, name: &str) -> usize {
 }
 
 #[test]
-fn retry_entry_point_is_dispatch_only_and_ledger_disarmed() {
+fn retry_entry_point_is_dispatch_only_and_ledger_gated() {
     assert!(DISPATCH.contains("on:\n  workflow_dispatch:"));
     assert!(!DISPATCH.contains("\n  workflow_call:"));
     assert!(!DISPATCH.contains("\n  push:"));
@@ -57,8 +57,8 @@ fn retry_entry_point_is_dispatch_only_and_ledger_disarmed() {
 
     let activation: serde_json::Value =
         serde_json::from_str(ACTIVATION).expect("activation ledger");
-    assert_eq!(activation["status"], "disarmed");
-    assert_eq!(activation["capabilities"]["downstream_channels"], false);
+    assert_eq!(activation["status"], "active");
+    assert_eq!(activation["capabilities"]["downstream_channels"], true);
 
     let contract: serde_json::Value = serde_json::from_str(include_str!(
         "../.github/release/downstream-channel-contract.json"

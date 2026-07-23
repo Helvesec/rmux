@@ -35,7 +35,7 @@ fn release_tag_surface_has_a_dedicated_signer_and_is_create_only() {
     let activation: serde_json::Value =
         serde_json::from_str(include_str!("../.github/release/release-activation.json"))
             .expect("parse activation ledger");
-    assert_eq!(activation["capabilities"]["signed_tag_creation"], false);
+    assert_eq!(activation["capabilities"]["signed_tag_creation"], true);
 
     let driver = include_str!("../scripts/release/sign-and-push-release-tag.sh");
     assert!(driver.contains("RMUX_RELEASE_APP_ID:-} == 4339867"));

@@ -89,9 +89,9 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
         .as_object()
         .expect("activation capabilities");
     assert_eq!(capabilities.len(), 6);
-    assert!(capabilities.values().all(|value| value == false));
+    assert!(capabilities.values().all(|value| value == true));
     assert_eq!(activation["runtime_override_allowed"], false);
-    assert_eq!(activation["status"], "disarmed");
+    assert_eq!(activation["status"], "active");
     assert_eq!(contract["audit_app"]["configured"], true);
     assert_eq!(contract["audit_app"]["app_id"], 4344532);
     assert_eq!(contract["audit_app"]["installation_id"], 147749910);
@@ -104,7 +104,7 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
     assert_eq!(contract["workflow"]["caller_count"], 2);
     assert_eq!(
         contract["workflow"]["privileged_job_condition"],
-        "disabled-in-promoter"
+        "release-activation-ledger"
     );
     assert_eq!(contract["token_lifecycle"]["collector_methods"][0], "GET");
     let required_checks = contract["expected_state"]["main"]["required_checks"]
@@ -152,7 +152,7 @@ fn policy_audit_simulation_is_nonpublishing_with_two_exact_callers() {
         .nth(1)
         .and_then(|tail| tail.split("\n  authorize-promotion:\n").next())
         .expect("isolated policy audit caller job");
-    assert!(audit_job.contains("if: ${{ false }}"));
+    assert!(!audit_job.contains("if: ${{ false }}"));
     let simulation = fs::read_to_string(&callers[1]).expect("read simulation workflow");
     assert!(simulation.contains("on:\n  workflow_dispatch:"));
     assert!(simulation.contains("simulation: true"));
@@ -205,8 +205,26 @@ fn run_python(script: &str, root: &PathBuf) -> Output {
 
 #[test]
 #[cfg(unix)]
-fn every_release_capability_fails_closed() {
+fn every_release_capability_requires_the_atomic_active_ledger() {
     let guard = repo_root().join("scripts/release/assert-release-capability.py");
+    let root = temp_dir("capability");
+    let ledger = root.join("release-activation.json");
+    let mut disarmed: serde_json::Value =
+        serde_json::from_str(include_str!("../.github/release/release-activation.json"))
+            .expect("parse activation ledger");
+    disarmed["status"] = serde_json::json!("disarmed");
+    for enabled in disarmed["capabilities"]
+        .as_object_mut()
+        .expect("capability object")
+        .values_mut()
+    {
+        *enabled = serde_json::json!(false);
+    }
+    fs::write(
+        &ledger,
+        serde_json::to_vec_pretty(&disarmed).expect("encode disarmed ledger"),
+    )
+    .expect("write disarmed ledger");
     for capability in [
         "downstream_channels",
         "github_release_publication",
@@ -219,13 +237,25 @@ fn every_release_capability_fails_closed() {
             .arg(capability)
             .current_dir(repo_root())
             .output()
-            .expect("run capability guard");
+            .expect("run active capability guard");
         assert!(
-            !output.status.success(),
-            "{capability} unexpectedly enabled"
+            output.status.success(),
+            "{capability} rejected active ledger: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stderr).contains("disabled until reviewed PR8"));
+        let rejected = Command::new(&guard)
+            .arg(capability)
+            .args(["--ledger", ledger.to_str().expect("UTF-8 ledger path")])
+            .current_dir(repo_root())
+            .output()
+            .expect("run disarmed capability guard");
+        assert!(
+            !rejected.status.success(),
+            "{capability} accepted disarmed ledger"
+        );
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("disabled until reviewed PR8"));
     }
+    fs::remove_dir_all(root).expect("remove capability fixture");
 }
 
 #[test]

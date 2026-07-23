@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "status": "review-only-disarmed",
+  "status": "active-authority-gated",
   "repository": {
     "id": 1239918790,
     "full_name": "Helvesec/rmux",
@@ -10,7 +10,7 @@
   "activation": {
     "ledger": ".github/release/release-activation.json",
     "capability": "policy_audit",
-    "required_value": false,
+    "required_value": true,
     "runtime_override_allowed": false
   },
   "workflow": {
@@ -21,7 +21,7 @@
     "preparer_job": "prepare-policy-audit",
     "privileged_action": ".github/actions/release-policy-audit/action.yml",
     "privileged_job": "policy-audit",
-    "privileged_job_condition": "disabled-in-promoter",
+    "privileged_job_condition": "release-activation-ledger",
     "environment": "release-policy-audit",
     "runner_image": "ubuntu-22.04",
     "workflow_id": 316425885,

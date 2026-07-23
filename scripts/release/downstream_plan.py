@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic validation for disarmed downstream channel plans."""
+"""Deterministic validation for downstream channel plans."""
 
 from __future__ import annotations
 

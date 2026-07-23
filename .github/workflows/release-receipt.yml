@@ -1,4 +1,4 @@
-name: Disarmed immutable GitHub Release receipt
+name: Immutable GitHub Release receipt
 
 on:
   workflow_dispatch:
@@ -30,8 +30,7 @@ permissions: {}
 
 jobs:
   receipt-only:
-    name: Disabled receipt-only immutable Release verification
-    if: ${{ false }}
+    name: Verify immutable Release and create receipt
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
@@ -401,9 +400,8 @@ jobs:
           PY
 
   downstream:
-    name: Disabled receipt-gated downstream publication
+    name: Receipt-gated downstream publication
     needs: receipt-only
-    if: ${{ false }}
     uses: ./.github/workflows/release-downstream.yml
     permissions:
       actions: read

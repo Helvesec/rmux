@@ -1,4 +1,4 @@
-name: Disarmed downstream channel retry
+name: Downstream channel retry
 
 on:
   workflow_dispatch:

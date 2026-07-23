@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "status": "review-only-disarmed",
-  "description": "Observed downstream repository identities and fail-closed activation blockers. This file grants no write authority.",
+  "status": "active-authority-gated",
+  "description": "Observed downstream repository identities and fail-closed activation boundaries. Write authority still requires the activation ledger, receipt, environment, and scoped App.",
   "observed_at": "2026-07-21T06:33:50Z",
   "writer_app": {
     "configured": true,

@@ -1,4 +1,4 @@
-name: Disarmed release policy input preparer
+name: Release policy input preparer
 
 on:
   workflow_call:
@@ -61,7 +61,7 @@ permissions: {}
 
 jobs:
   prepare-policy-audit:
-    name: Refuse policy audit until explicit PR8 activation
+    name: Prepare exact policy audit inputs
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     permissions:

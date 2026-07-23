@@ -350,8 +350,10 @@ def validate_candidate_workflow() -> None:
     contract = load(CONTRACT_DIR / "candidate-workflow-contract.json")
     if contract.get("schema_version") != 1:
         raise ValueError("candidate workflow contract schema_version must be 1")
-    if contract.get("status") != "review-only-not-authoritative":
-        raise ValueError("candidate workflow must remain review-only before cut-over")
+    if contract.get("status") != "active-candidate-first":
+        raise ValueError(
+            "candidate workflow must remain candidate-first after cut-over"
+        )
     workflow = contract.get("workflow")
     if workflow != {
         "id": 277622540,
