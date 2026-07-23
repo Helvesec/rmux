@@ -21,12 +21,24 @@ Verify an asset attestation with:
 gh attestation verify <asset> --repo Helvesec/rmux
 ```
 
-Verify the signed checksums with:
+For `v0.9.1` and later, verify that an asset is covered by the signed release
+authorization bundle:
+
+```sh
+cosign verify-blob-attestation \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/Helvesec/rmux/\.github/workflows/release-promote\.yml@refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --type https://rmux.io/attestations/release-promotion-authorization/v1 \
+  <asset>
+```
+
+For releases from `v0.6.5` through `v0.9.0`, verify the signed checksums with:
 
 ```sh
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/Helvesec/rmux/.github/workflows/release.yml@refs/tags/v0\.(6|7|8|9)\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+  --certificate-identity-regexp '^https://github.com/Helvesec/rmux/\.github/workflows/release\.yml@refs/tags/(v0\.[678]\.[0-9]+(-[0-9A-Za-z.-]+)?|v0\.9\.0)$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 ```

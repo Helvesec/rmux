@@ -16,6 +16,7 @@ const PROMOTION_SIMULATION: &str = include_str!("../scripts/release/promotion-si
 const CI: &str = include_str!("../.github/workflows/ci.yml");
 const LEGACY_RELEASE: &str = include_str!("../.github/workflows/release.yml");
 const LEGACY_CHOCOLATEY: &str = include_str!("../.github/workflows/publish-chocolatey.yml");
+const SECURITY: &str = include_str!("../SECURITY.md");
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -302,6 +303,10 @@ fn receipt_is_separate_receipt_only_and_never_writes_contents() {
     assert!(RECEIPT.contains("\"run_attempt\": 1"));
     assert!(RECEIPT.contains("live immutable Release identity differs"));
     assert!(RECEIPT.contains("live annotated tag signature or target differs"));
+    assert!(RECEIPT.contains("not isinstance(target, dict)"));
+    assert!(RECEIPT.contains("target.get(\"type\") != \"commit\""));
+    assert!(RECEIPT.contains("target.get(\"sha\") != os.environ[\"RMUX_EXPECTED_SOURCE_SHA\"]"));
+    assert!(!RECEIPT.contains("target != {\"type\": \"commit\""));
     assert!(RECEIPT.contains("Accept: application/octet-stream"));
     assert!(RECEIPT.contains("attestation verify"));
     assert!(RECEIPT.contains(
@@ -311,6 +316,19 @@ fn receipt_is_separate_receipt_only_and_never_writes_contents() {
     assert!(RECEIPT.contains("signed authorization predicate differs"));
     assert!(RECEIPT.contains("${{ runner.temp }}/rmux-receipt/release-state.json"));
     assert!(!RECEIPT.contains("release_state_artifact_id"));
+}
+
+#[test]
+fn release_verification_docs_match_current_and_legacy_bundle_types() {
+    assert!(SECURITY.contains("For `v0.9.1` and later"));
+    assert!(SECURITY.contains("cosign verify-blob-attestation"));
+    assert!(SECURITY.contains("release-promote\\.yml@refs/tags/"));
+    assert!(
+        SECURITY.contains("--type https://rmux.io/attestations/release-promotion-authorization/v1")
+    );
+    assert!(SECURITY.contains("For releases from `v0.6.5` through `v0.9.0`"));
+    assert!(SECURITY.contains("cosign verify-blob \\"));
+    assert!(SECURITY.contains("release\\.yml@refs/tags/"));
 }
 
 #[test]
