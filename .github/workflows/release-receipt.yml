@@ -186,7 +186,15 @@ jobs:
           if ref.get("ref") != f"refs/tags/{os.environ['RMUX_RELEASE_REF']}" or ref_object.get("type") != "tag" or ref_object.get("sha") != predicate.get("signed_tag", {}).get("tag_object_sha"):
               raise SystemExit("live release ref differs from authorized tag object")
           verification, target = tag.get("verification", {}), tag.get("object", {})
-          if tag.get("sha") != ref_object.get("sha") or tag.get("tag") != os.environ["RMUX_RELEASE_REF"] or target != {"type": "commit", "sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"]} or verification.get("verified") is not True or verification.get("reason") != "valid":
+          if (
+              tag.get("sha") != ref_object.get("sha")
+              or tag.get("tag") != os.environ["RMUX_RELEASE_REF"]
+              or not isinstance(target, dict)
+              or target.get("type") != "commit"
+              or target.get("sha") != os.environ["RMUX_EXPECTED_SOURCE_SHA"]
+              or verification.get("verified") is not True
+              or verification.get("reason") != "valid"
+          ):
               raise SystemExit("live annotated tag signature or target differs")
           rendered_assets = sorted(
               ({"id": item.get("id"), "name": item.get("name"), "size": item.get("size"), "digest": item.get("digest")} for item in assets),
