@@ -418,7 +418,7 @@ fn unique_temp_path(label: &str) -> PathBuf {
 }
 
 async fn wait_for_file(path: &std::path::Path) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

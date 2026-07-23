@@ -438,6 +438,10 @@ def validate_repository_contracts(root: Path) -> None:
     for caller_name, prepare, audit, workflow_id, caller_path in caller_contracts:
         if prepare.count("uses: ./.github/workflows/release-policy-audit.yml") != 1:
             raise ValueError(f"policy preparer call changed in {caller_name}")
+        if "      contents: read" not in prepare:
+            raise ValueError(
+                f"policy preparer caller lacks contents read in {caller_name}"
+            )
         required_audit = (
             "environment: release-policy-audit",
             "runs-on: ubuntu-22.04",

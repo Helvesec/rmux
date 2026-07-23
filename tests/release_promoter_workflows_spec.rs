@@ -214,6 +214,7 @@ fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
     assert!(authorize.contains("rmux-authorization/verified"));
     assert!(authorize.contains("rmux-authorization/policy"));
     assert!(!prepare.contains("if: ${{ false }}"));
+    assert!(prepare.contains("permissions:\n      contents: read"));
     assert!(prepare.contains("uses: ./.github/workflows/release-policy-audit.yml"));
     assert!(!audit.contains("if: ${{ false }}"));
     assert!(audit.contains("environment: release-policy-audit"));
