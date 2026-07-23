@@ -87,6 +87,18 @@ fn release_candidate_gate_runner_contract_matches_workflow() {
 }
 
 #[test]
+fn linux_quality_audit_does_not_depend_on_network_tooling() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let quality = job_block(ci, "linux-quality", "linux-build");
+    assert!(!quality.contains("apt-get"));
+
+    let audit = include_str!("../scripts/audit-await-holding-lock.sh");
+    assert!(!audit.contains("command -v rg"));
+    assert!(!audit.contains("rg -n"));
+    assert!(audit.contains("grep -R -n -E 'DashMap|parking_lot::'"));
+}
+
+#[test]
 fn candidate_mode_does_not_replay_fast_jobs() {
     let ci = include_str!("../.github/workflows/ci.yml");
     let fast_jobs = [
