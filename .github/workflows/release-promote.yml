@@ -309,6 +309,8 @@ jobs:
   prepare-policy-audit:
     name: Prepare exact policy audit inputs
     needs: verify-candidate
+    permissions:
+      contents: read
     uses: ./.github/workflows/release-policy-audit.yml
     with:
       candidate_run_id: ${{ inputs.candidate_run_id }}
