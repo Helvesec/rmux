@@ -18,6 +18,7 @@ pub mod auto_start;
 pub(crate) mod commands;
 pub mod connection;
 pub mod control;
+mod endpoint_cleanup;
 pub mod nested;
 pub(crate) mod shell_quote;
 pub(crate) mod upgrade;
@@ -43,6 +44,7 @@ pub use connection::{
     AttachTransition, ConnectResult, Connection, ControlModeUpgrade, ControlTransition,
 };
 pub use control::{drive_control_mode, drive_control_mode_with_stdio};
+pub use endpoint_cleanup::wait_for_server_endpoint_cleanup;
 pub use nested::{
     detect_context, detect_parent, ensure_nested_context, require_nested_context, ClientContext,
     ClientContextParent, NestedContextError,

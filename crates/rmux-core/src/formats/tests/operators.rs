@@ -173,17 +173,102 @@ fn expression_double_percent_is_a_modulo_alias_like_linux_tmux() {
 }
 
 #[test]
-fn float_comparisons_render_integer_booleans_product_divergence() {
-    for expression in [
-        "#{e|==|f:5,5}",
-        "#{e|!=|f:5,6}",
-        "#{e|<|f:5,6}",
-        "#{e|<=|f:5,5}",
-        "#{e|>|f:6,5}",
-        "#{e|>=|f:5,5}",
-    ] {
-        assert_eq!(render_template(expression, &StaticWindowValues), "1");
+fn float_comparisons_apply_requested_precision_like_tmux_3_7b() {
+    let comparisons = [
+        ("==", "5,5", "5,6"),
+        ("!=", "5,6", "5,5"),
+        ("<", "5,6", "6,5"),
+        ("<=", "5,5", "6,5"),
+        (">", "6,5", "5,6"),
+        (">=", "5,5", "5,6"),
+    ];
+    let precisions = [("f", "1.00", "0.00"), ("f|4", "1.0000", "0.0000")];
+
+    for (operator, true_operands, false_operands) in comparisons {
+        for (float_options, expected_true, expected_false) in precisions {
+            assert_eq!(
+                render_template(
+                    &format!("#{{e|{operator}|{float_options}:{true_operands}}}"),
+                    &StaticWindowValues,
+                ),
+                expected_true,
+                "{operator} true with {float_options}",
+            );
+            assert_eq!(
+                render_template(
+                    &format!("#{{e|{operator}|{float_options}:{false_operands}}}"),
+                    &StaticWindowValues,
+                ),
+                expected_false,
+                "{operator} false with {float_options}",
+            );
+        }
     }
+}
+
+#[test]
+fn float_comparisons_use_untruncated_operands_like_tmux_3_7b() {
+    let cases = [
+        ("==", "1.5,1.5", "1.5,1.6"),
+        ("!=", "1.5,1.6", "1.5,1.5"),
+        ("<", "1.5,1.6", "1.6,1.5"),
+        ("<=", "1.5,1.6", "1.6,1.5"),
+        (">", "1.6,1.5", "1.5,1.6"),
+        (">=", "1.6,1.5", "1.5,1.6"),
+    ];
+
+    for (operator, true_operands, false_operands) in cases {
+        assert_eq!(
+            render_template(
+                &format!("#{{e|{operator}|f:{true_operands}}}"),
+                &StaticWindowValues,
+            ),
+            "1.00",
+            "{operator} true with decimal operands",
+        );
+        assert_eq!(
+            render_template(
+                &format!("#{{e|{operator}|f:{false_operands}}}"),
+                &StaticWindowValues,
+            ),
+            "0.00",
+            "{operator} false with decimal operands",
+        );
+    }
+}
+
+#[test]
+fn float_equality_uses_tmux_3_7b_epsilon_and_non_finite_semantics() {
+    assert_eq!(
+        render_template("#{e|==|f:1.0000000005,1}", &StaticWindowValues),
+        "1.00"
+    );
+    assert_eq!(
+        render_template("#{e|!=|f:1.0000000005,1}", &StaticWindowValues),
+        "0.00"
+    );
+    assert_eq!(
+        render_template("#{e|==|f:inf,inf}", &StaticWindowValues),
+        "0.00"
+    );
+    assert_eq!(
+        render_template("#{e|!=|f:nan,nan}", &StaticWindowValues),
+        "0.00"
+    );
+}
+
+#[test]
+fn nested_float_comparison_uses_rendered_boolean_like_tmux_3_7b() {
+    // tmux only treats the exact string "0" as false. Requested floating-point
+    // rendering therefore makes the false comparison result "0.00" truthy.
+    assert_eq!(
+        render_template("#{?#{e|==|f:5,6},then,else}", &StaticWindowValues),
+        "then"
+    );
+    assert_eq!(
+        render_template("#{?#{e|==|f|4:5,6},then,else}", &StaticWindowValues),
+        "then"
+    );
 }
 
 #[test]

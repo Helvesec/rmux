@@ -397,6 +397,64 @@ fn repeated_target_flags_use_the_last_tmux_target() -> Result<(), Box<dyn Error>
     assert_eq!(created.status.code(), Some(0));
     assert_eq!(stdout(&created), "beta:chosen\n");
     assert!(stderr(&created).is_empty());
+
+    let malformed_first = harness.run(&[
+        "new-window",
+        "-d",
+        "-t",
+        "bad:xyz.???",
+        "-t",
+        &alpha_target,
+        "-n",
+        "separated-recovered",
+        "-P",
+        "-F",
+        "#{session_name}:#{window_name}",
+    ])?;
+    assert_eq!(malformed_first.status.code(), Some(0));
+    assert_eq!(stdout(&malformed_first), "alpha:separated-recovered\n");
+    assert!(stderr(&malformed_first).is_empty());
+
+    let compact_invalid = "-tbad:xyz.???";
+    let compact_beta = format!("-t{beta_target}");
+    let compact_first = harness.run(&[
+        "new-window",
+        "-d",
+        compact_invalid,
+        &compact_beta,
+        "-n",
+        "compact-recovered",
+        "-P",
+        "-F",
+        "#{session_name}:#{window_name}",
+    ])?;
+    assert_eq!(compact_first.status.code(), Some(0));
+    assert_eq!(stdout(&compact_first), "beta:compact-recovered\n");
+    assert!(stderr(&compact_first).is_empty());
+
+    let malformed_last = harness.run(&[
+        "new-window",
+        "-d",
+        "-t",
+        &alpha_target,
+        "-t",
+        "bad:xyz.???",
+        "-n",
+        "must-not-exist",
+    ])?;
+    assert_eq!(malformed_last.status.code(), Some(1));
+    assert!(stdout(&malformed_last).is_empty());
+    assert!(!stderr(&malformed_last).is_empty());
+
+    assert_success(&harness.run(&[
+        "swap-window",
+        "-s",
+        "bad:xyz.???",
+        "-s",
+        "alpha:0",
+        "-t",
+        "beta:0",
+    ])?);
     Ok(())
 }
 

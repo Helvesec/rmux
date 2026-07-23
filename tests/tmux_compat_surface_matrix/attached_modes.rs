@@ -563,31 +563,56 @@ fn choose_tree_window_matches_attached_client_surface_when_frozen_tmux_is_availa
     let mut rmux_attach = spawn_rmux_attached_input_client(&harness, "alpha")?;
     let mut tmux_attach = spawn_tmux_attached_input_client(&harness, &tmux_binary, "alpha")?;
     wait_for_attached_clients(&harness, &tmux_binary, config.clone(), &deadline)?;
+    let _ = drain_pty(&mut rmux_attach)?;
+    let _ = drain_pty(&mut tmux_attach)?;
 
     let choose_tree =
         harness.run_pair_with(&tmux_binary, &["choose-tree", "-Zw"], config.clone())?;
     assert_quiet_success(&choose_tree);
-    std::thread::sleep(Duration::from_millis(150));
-    let tree_capture = attached_capture_pair(
+    let mode = wait_for_attached_pair(
         &harness,
         &tmux_binary,
-        "alpha:0.0",
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "alpha:0.0",
+            "#{pane_in_mode}|#{pane_mode}",
+        ],
         config.clone(),
         &deadline,
+        |run| {
+            run.rmux.stdout_string() == "1|tree-mode\n"
+                && run.tmux.stdout_string() == "1|tree-mode\n"
+        },
     )?;
+    assert_eq!(mode.rmux.stdout_string(), "1|tree-mode\n");
+    assert_eq!(mode.tmux.stdout_string(), "1|tree-mode\n");
+    let mut rmux_tree_render = Vec::new();
+    let mut tmux_tree_render = Vec::new();
+    loop {
+        rmux_tree_render.extend(drain_pty(&mut rmux_attach)?);
+        tmux_tree_render.extend(drain_pty(&mut tmux_attach)?);
+        if String::from_utf8_lossy(&rmux_tree_render).contains("2 windows")
+            && String::from_utf8_lossy(&tmux_tree_render).contains("2 windows")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25).min(deadline.remaining()?));
+    }
     write_attached_keys(&mut rmux_attach, b"\x0e\r", &deadline)?;
     write_attached_keys(&mut tmux_attach, b"\x0e\r", &deadline)?;
 
-    std::thread::sleep(Duration::from_millis(300));
-    deadline.check()?;
-    let active_window = harness.run_pair_with(
+    let active_window = wait_for_attached_pair(
+        &harness,
         &tmux_binary,
         &["display-message", "-p", "#{window_index}:#{window_name}"],
         config,
+        &deadline,
+        |run| run.rmux.stdout_string() == "1:w1\n" && run.tmux.stdout_string() == "1:w1\n",
     )?;
     rmux_attach.assert_running("rmux")?;
     tmux_attach.assert_running("tmux")?;
-    assert!(tree_capture.rmux.status_code == Some(0) && tree_capture.tmux.status_code == Some(0));
     assert_eq!(active_window.rmux.stdout_string(), "1:w1\n");
     assert_eq!(active_window.tmux.stdout_string(), "1:w1\n");
 

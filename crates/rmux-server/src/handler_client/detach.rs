@@ -4,7 +4,10 @@ use rmux_proto::{DetachClientResponse, ErrorResponse, Response, RmuxError, Sessi
 
 use crate::pane_io::AttachControl;
 
-use super::super::{control_support::ManagedClient, RequestHandler};
+use super::super::{
+    control_support::{ControlClientIdentity, ManagedClient},
+    RequestHandler,
+};
 
 impl RequestHandler {
     async fn detach_attach_client_with_mode(
@@ -220,7 +223,7 @@ impl RequestHandler {
         }
 
         if let Some(session_name) = request.target_session.as_ref() {
-            let (session_id, attach_clients) = {
+            let (session_id, attach_clients, control_clients) = {
                 let state = self.state.lock().await;
                 let Some(session_id) = state
                     .sessions
@@ -236,7 +239,16 @@ impl RequestHandler {
                     .filter(|(_, active)| active.session_id == session_id)
                     .map(|(&pid, active)| (pid, active.id))
                     .collect::<Vec<_>>();
-                (session_id, clients)
+                let active_control = self.active_control.lock().await;
+                let control_clients = active_control
+                    .by_pid
+                    .iter()
+                    .filter_map(|(&pid, active)| {
+                        (active.session_id == Some(session_id))
+                            .then_some(ControlClientIdentity::new(pid, active.id))
+                    })
+                    .collect::<Vec<_>>();
+                (session_id, clients, control_clients)
             };
             for (attach_pid, attach_id) in attach_clients {
                 if let Ok(detached_session) = self
@@ -261,15 +273,11 @@ impl RequestHandler {
                     .await;
                 }
             }
-            let control_pids = self
-                .detach_control_clients_for_session(session_name, None)
+            let outcome = self
+                .detach_control_clients_for_session_identity(session_id, control_clients, None)
                 .await;
-            for control_pid in control_pids {
-                self.emit(LifecycleEvent::ClientDetached {
-                    session_name: session_name.clone(),
-                    client_name: Some(control_pid.to_string()),
-                })
-                .await;
+            for event in outcome.lifecycle_events {
+                self.emit_prepared(event).await;
             }
             return Response::DetachClient(DetachClientResponse);
         }
@@ -361,15 +369,12 @@ impl RequestHandler {
                     .exit_control_client_for_identity(control_pid, identity.control_id(), None)
                     .await
                 {
-                    Ok(Some(session_name)) => {
-                        self.emit(LifecycleEvent::ClientDetached {
-                            session_name,
-                            client_name: Some(control_pid.to_string()),
-                        })
-                        .await;
+                    Ok(outcome) => {
+                        if let Some(event) = outcome.lifecycle_event {
+                            self.emit_prepared(event).await;
+                        }
                         Response::DetachClient(DetachClientResponse)
                     }
-                    Ok(None) => Response::DetachClient(DetachClientResponse),
                     Err(error) => Response::Error(ErrorResponse { error }),
                 }
             }

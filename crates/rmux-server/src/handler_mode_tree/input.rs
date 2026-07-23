@@ -61,17 +61,23 @@ impl RequestHandler {
                 ModeTreeActionIdentity::new(attach_pid, active.id, active.mode_tree_state_id),
             )
         };
+        if matches!(
+            event,
+            PromptInputEvent::Escape | PromptInputEvent::Char('q')
+        ) {
+            self.dismiss_mode_tree_with_refresh_for_action_identity(action_identity)
+                .await?;
+            return Ok(true);
+        }
         let had_tagged_items_before_rebuild = !mode.tagged.is_empty();
         let selected_id_before_rebuild = mode.selected_id.clone();
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
+        #[cfg(test)]
+        super::mode_tree_test_support::pause_mode_tree_identity(
+            super::mode_tree_test_support::ModeTreeIdentityPausePoint::Store(attach_pid),
+        )
+        .await;
         if build.visible.is_empty() {
-            if matches!(
-                event,
-                PromptInputEvent::Escape | PromptInputEvent::Char('q')
-            ) {
-                self.dismiss_mode_tree_with_refresh(attach_pid).await?;
-                return Ok(true);
-            }
             return Ok(false);
         }
         let all_tagged_items_disappeared =
@@ -88,8 +94,11 @@ impl RequestHandler {
             || (current_selection_disappeared && event_uses_current_selection))
             && event_uses_tagged_or_current_selection(&event, mode.kind)
         {
-            self.store_mode_tree_state(attach_pid, mode).await?;
-            self.refresh_mode_tree_overlay_if_active(attach_pid).await?;
+            let action_identity = self
+                .store_mode_tree_state_for_action_identity(action_identity, mode)
+                .await?;
+            self.refresh_mode_tree_overlay_for_action_identity(action_identity)
+                .await?;
             return Ok(true);
         }
 
@@ -111,29 +120,35 @@ impl RequestHandler {
             PromptInputEvent::Left => collapse_or_parent(&mut mode, &build),
             PromptInputEvent::Right => expand_or_child(&mut mode, &build),
             PromptInputEvent::Enter => {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.accept_mode_tree_selection(attach_pid).await?;
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.accept_mode_tree_selection_for_action_identity(action_identity)
+                    .await?;
                 return Ok(true);
             }
             PromptInputEvent::Escape | PromptInputEvent::Char('q') => {
-                self.dismiss_mode_tree_with_refresh(attach_pid).await?;
-                return Ok(true);
+                unreachable!("mode-tree dismissal is handled before rebuild")
             }
             PromptInputEvent::Char('t') => toggle_tag(&mut mode, &build),
             PromptInputEvent::Ctrl('t') => tag_all(&mut mode, &build),
             PromptInputEvent::Ctrl('s') => {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.start_mode_tree_prompt(
-                    attach_pid,
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.start_mode_tree_prompt_for_action_identity(
+                    action_identity,
                     ModeTreePromptCallback::Search(SearchDirection::Forward),
                 )
                 .await?;
                 return Ok(true);
             }
             PromptInputEvent::Ctrl('r') => {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.start_mode_tree_prompt(
-                    attach_pid,
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.start_mode_tree_prompt_for_action_identity(
+                    action_identity,
                     ModeTreePromptCallback::Search(SearchDirection::Backward),
                 )
                 .await?;
@@ -142,9 +157,14 @@ impl RequestHandler {
             PromptInputEvent::Char('n') => repeat_search(&mut mode, &build, false),
             PromptInputEvent::Char('N') => repeat_search(&mut mode, &build, true),
             PromptInputEvent::Char('f') => {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.start_mode_tree_prompt(attach_pid, ModeTreePromptCallback::Filter)
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
                     .await?;
+                self.start_mode_tree_prompt_for_action_identity(
+                    action_identity,
+                    ModeTreePromptCallback::Filter,
+                )
+                .await?;
                 return Ok(true);
             }
             PromptInputEvent::Char('o') | PromptInputEvent::Char('O') => cycle_sort(&mut mode),
@@ -154,9 +174,14 @@ impl RequestHandler {
                 mode.preview_scroll = 0;
             }
             PromptInputEvent::Char(':') => {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.start_mode_tree_prompt(attach_pid, ModeTreePromptCallback::Command)
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
                     .await?;
+                self.start_mode_tree_prompt_for_action_identity(
+                    action_identity,
+                    ModeTreePromptCallback::Command,
+                )
+                .await?;
                 return Ok(true);
             }
             PromptInputEvent::Char('p') | PromptInputEvent::Char('P')
@@ -183,8 +208,11 @@ impl RequestHandler {
             PromptInputEvent::Char('d') | PromptInputEvent::Char('D')
                 if matches!(mode.kind, ModeTreeKind::Client) =>
             {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.perform_client_detach(attach_pid).await?;
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.perform_client_detach_for_identity(action_identity)
+                    .await?;
                 return Ok(true);
             }
             PromptInputEvent::Char('x') | PromptInputEvent::Char('X')
@@ -212,8 +240,10 @@ impl RequestHandler {
                     }
                     _ => unreachable!("tree kill prompt only binds x/X"),
                 };
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.confirm_mode_tree_action(attach_pid, prompt, action)
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.confirm_mode_tree_action_for_identity(action_identity, prompt, action)
                     .await?;
                 return Ok(true);
             }
@@ -221,9 +251,11 @@ impl RequestHandler {
                 if matches!(mode.kind, ModeTreeKind::Buffer) =>
             {
                 let targets = selected_mode_tree_actions(&mode, &build);
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.confirm_mode_tree_action(
-                    attach_pid,
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.confirm_mode_tree_action_for_identity(
+                    action_identity,
                     "delete selected buffers?".to_owned(),
                     ModeTreeDeferredAction::DeleteBuffers { targets },
                 )
@@ -234,9 +266,11 @@ impl RequestHandler {
                 if matches!(mode.kind, ModeTreeKind::Client) =>
             {
                 let targets = selected_mode_tree_actions(&mode, &build);
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.confirm_mode_tree_action(
-                    attach_pid,
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.confirm_mode_tree_action_for_identity(
+                    action_identity,
                     "detach selected clients?".to_owned(),
                     ModeTreeDeferredAction::DetachClients { targets },
                 )
@@ -244,18 +278,27 @@ impl RequestHandler {
                 return Ok(true);
             }
             PromptInputEvent::Char('s') if matches!(mode.kind, ModeTreeKind::Customize) => {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.start_customize_set_prompt(attach_pid).await?;
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.start_customize_set_prompt_for_identity(action_identity)
+                    .await?;
                 return Ok(true);
             }
             PromptInputEvent::Char('u') if matches!(mode.kind, ModeTreeKind::Customize) => {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.perform_customize_unset(attach_pid).await?;
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.perform_customize_unset_for_identity(action_identity)
+                    .await?;
                 return Ok(true);
             }
             PromptInputEvent::Ctrl('x') if matches!(mode.kind, ModeTreeKind::Customize) => {
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.perform_customize_reset(attach_pid).await?;
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.perform_customize_reset_for_identity(action_identity)
+                    .await?;
                 return Ok(true);
             }
             PromptInputEvent::KeyName(name) if name == "F1" => {
@@ -271,24 +314,31 @@ impl RequestHandler {
                 // (matching tmux's mode_tree_key dispatch order).
                 if let Some(shortcut_id) = shortcut_match(&mode, &build, &event) {
                     mode.selected_id = Some(shortcut_id);
-                    self.store_mode_tree_state(attach_pid, mode).await?;
-                    self.accept_mode_tree_selection(attach_pid).await?;
+                    let action_identity = self
+                        .store_mode_tree_state_for_action_identity(action_identity, mode)
+                        .await?;
+                    self.accept_mode_tree_selection_for_action_identity(action_identity)
+                        .await?;
                     return Ok(true);
                 }
                 return Ok(false);
             }
         }
 
-        self.store_mode_tree_state(attach_pid, mode).await?;
-        self.refresh_mode_tree_overlay_if_active(attach_pid).await?;
+        let action_identity = self
+            .store_mode_tree_state_for_action_identity(action_identity, mode)
+            .await?;
+        self.refresh_mode_tree_overlay_for_action_identity(action_identity)
+            .await?;
         Ok(true)
     }
 
-    async fn store_mode_tree_state_for_action_identity(
+    pub(super) async fn store_mode_tree_state_for_action_identity(
         &self,
         identity: ModeTreeActionIdentity,
         mode: ModeTreeClientState,
     ) -> Result<ModeTreeActionIdentity, RmuxError> {
+        let state = self.state.lock().await;
         let mut active_attach = self.active_attach.lock().await;
         let requester_is_current = active_attach
             .by_pid
@@ -298,7 +348,9 @@ impl RequestHandler {
                     && active.mode_tree_state_id == identity.state_id()
                     && active.mode_tree.is_some()
                     && active.session_name == mode.session_name
+                    && active.session_id == mode.session_id
                     && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                    && super::mode_tree_runtime_identity::mode_tree_host_is_current(&state, &mode)
             });
         if !requester_is_current {
             return Err(crate::handler_support::attached_client_required(
@@ -308,7 +360,10 @@ impl RequestHandler {
 
         let mut requester_state_id = None;
         for (attach_pid, active) in &mut active_attach.by_pid {
-            if active.session_name != mode.session_name || active.mode_tree.is_none() {
+            if active.session_name != mode.session_name
+                || active.session_id != mode.session_id
+                || active.mode_tree.is_none()
+            {
                 continue;
             }
             active.mode_tree_state_id = active.mode_tree_state_id.saturating_add(1);
@@ -360,7 +415,7 @@ impl RequestHandler {
         identity: Option<super::super::attach_support::ActiveAttachIdentity>,
         event: MouseForwardEvent,
     ) -> Result<bool, RmuxError> {
-        let mut mode = {
+        let (mut mode, action_identity) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -370,19 +425,31 @@ impl RequestHandler {
             let Some(mode) = active.mode_tree.clone() else {
                 return Ok(false);
             };
-            mode
+            (
+                mode,
+                ModeTreeActionIdentity::new(attach_pid, active.id, active.mode_tree_state_id),
+            )
         };
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
+        #[cfg(test)]
+        super::mode_tree_test_support::pause_mode_tree_identity(
+            super::mode_tree_test_support::ModeTreeIdentityPausePoint::Store(attach_pid),
+        )
+        .await;
         if build.visible.is_empty() {
             return Ok(false);
         }
 
-        let geometry = self.mode_tree_status_geometry(&mode).await?;
-        let rows = geometry.content_rows();
+        let geometry = self.mode_tree_content_geometry(&mode).await?;
+        let rows = geometry.rows();
+        let cols = geometry.cols();
         let list_rows = mode_tree_list_rows(rows, build.visible.len(), mode.preview_mode);
+        if event.x < geometry.x() || event.x >= geometry.x().saturating_add(cols) || cols == 0 {
+            return Ok(false);
+        }
         let Some(content_y) = event
             .y
-            .checked_sub(geometry.content_y_offset())
+            .checked_sub(geometry.y())
             .filter(|content_y| *content_y < rows)
         else {
             return Ok(false);
@@ -396,8 +463,11 @@ impl RequestHandler {
                 if changed {
                     mode.preview_scroll = 0;
                 }
-                self.store_mode_tree_state(attach_pid, mode).await?;
-                self.refresh_mode_tree_overlay_if_active(attach_pid).await?;
+                let action_identity = self
+                    .store_mode_tree_state_for_action_identity(action_identity, mode)
+                    .await?;
+                self.refresh_mode_tree_overlay_for_action_identity(action_identity)
+                    .await?;
                 return Ok(true);
             }
         }

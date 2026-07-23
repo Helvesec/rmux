@@ -386,6 +386,42 @@ fn connect_or_absent_preserves_timeout_errors() {
 }
 
 #[test]
+fn completed_response_survives_darwin_timeout_restore_einval() {
+    let response = Response::HasSession(HasSessionResponse { exists: false });
+    let result = super::finish_unbounded_roundtrip(
+        Ok(response.clone()),
+        Err(ClientError::Io(io::Error::from(
+            io::ErrorKind::InvalidInput,
+        ))),
+    );
+
+    if cfg!(target_os = "macos") {
+        assert_eq!(result.expect("completed response remains valid"), response);
+    } else {
+        assert!(matches!(
+            result,
+            Err(ClientError::Io(error)) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+    }
+}
+
+#[test]
+fn completed_response_does_not_hide_other_timeout_restore_errors() {
+    let result = super::finish_unbounded_roundtrip(
+        Ok(Response::HasSession(HasSessionResponse { exists: false })),
+        Err(ClientError::Io(io::Error::from(
+            io::ErrorKind::PermissionDenied,
+        ))),
+    )
+    .expect_err("other restore errors must remain visible");
+
+    assert!(matches!(
+        result,
+        ClientError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied
+    ));
+}
+
+#[test]
 fn roundtrip_reads_partial_response_frames() {
     let request = Request::HasSession(HasSessionRequest {
         target: rmux_proto::SessionName::new("alpha").expect("valid session"),

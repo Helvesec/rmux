@@ -319,6 +319,54 @@ fn osc4_palette_queries_are_bounded_split_and_canonicalized() {
 }
 
 #[test]
+fn osc52_queries_are_typed_and_preserve_selector_and_terminator() {
+    for (sequence, selection, terminator) in [
+        (
+            b"\x1b]52;zzpc;?\x07".as_slice(),
+            Some(b'p'),
+            crate::input::InputEndType::Bel,
+        ),
+        (
+            b"\x1b]52;0c;?\x1b\\".as_slice(),
+            Some(b'0'),
+            crate::input::InputEndType::St,
+        ),
+        (
+            b"\x1b]52;invalid;?\x07".as_slice(),
+            None,
+            crate::input::InputEndType::Bel,
+        ),
+    ] {
+        let mut screen = new_screen(10, 2, 10);
+        let mut parser = InputParser::new();
+        parser.parse(sequence, &mut screen);
+
+        let events = screen.take_terminal_passthrough();
+        assert_eq!(events.len(), 1, "sequence={sequence:?}");
+        let query = events[0]
+            .clipboard_query_metadata()
+            .expect("OSC 52 query remains typed");
+        assert_eq!(query.selection(), selection);
+        assert_eq!(query.terminator(), terminator);
+        assert_eq!(events[0].payload(), sequence);
+        assert!(events[0].render_sequence().is_empty());
+    }
+}
+
+#[test]
+fn osc52_writes_remain_distinct_from_typed_queries() {
+    let mut screen = new_screen(10, 2, 10);
+    let mut parser = InputParser::new();
+    parser.parse(b"\x1b]52;c;YQ==\x07", &mut screen);
+
+    let events = screen.take_terminal_passthrough();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind(), crate::TerminalPassthroughKind::Clipboard);
+    assert_eq!(events[0].payload(), b"\x1b]52;c;YQ==\x07");
+    assert_eq!(events[0].clipboard_query_metadata(), None);
+}
+
+#[test]
 fn osc4_bel_and_st_queries_survive_every_fragmentation_boundary() {
     for sequence in [b"\x1b]4;7;?\x07".as_slice(), b"\x1b]4;7;?\x1b\\".as_slice()] {
         for split in 0..=sequence.len() {

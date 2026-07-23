@@ -1,17 +1,10 @@
-use std::cmp::Ordering;
-use std::collections::HashSet;
-use std::path::Path;
-
-use rmux_core::{
-    formats::{is_truthy, render_list_windows_line, FormatContext},
-    OptionStore, Session,
-};
+use rmux_core::{OptionStore, Session};
 use rmux_proto::{
-    CommandOutput, KillWindowResponse, LastWindowResponse, ListWindowsResponse, NewWindowResponse,
-    NextWindowResponse, OptionName, PaneId, PreviousWindowResponse, RenameWindowResponse,
-    RmuxError, ScopeSelector, SelectWindowResponse, SessionName, SetOptionMode, WindowListEntry,
-    WindowTarget,
+    KillWindowResponse, LastWindowResponse, NewWindowResponse, NextWindowResponse, OptionName,
+    PaneId, PreviousWindowResponse, RenameWindowResponse, RmuxError, ScopeSelector,
+    SelectWindowResponse, SessionName, SetOptionMode, WindowTarget,
 };
+use std::collections::HashSet;
 
 #[path = "pane_terminals/window_link_commands.rs"]
 mod window_link_commands;
@@ -22,21 +15,10 @@ use super::{
     session_not_found, HandlerState, KilledWindowResult, NewWindowOptions, PreparedWindowTerminal,
     RemovedWindowHookContext, RespawnWindowOptions, SessionTransferSnapshot, WindowSpawnOptions,
 };
-use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::terminal::validate_process_command;
 
 #[path = "pane_terminals/window_removal.rs"]
 mod window_removal;
-
-pub(crate) struct ListWindowsSelection<'a> {
-    pub(crate) session_name: &'a SessionName,
-    pub(crate) socket_path: &'a Path,
-    pub(crate) format: Option<&'a str>,
-    pub(crate) attached_count: usize,
-    pub(crate) filter: Option<&'a str>,
-    pub(crate) sort_order: Option<&'a str>,
-    pub(crate) reversed: bool,
-}
 
 use window_removal::build_window_removal_plan;
 pub(super) use window_removal::window_pane_ids;
@@ -199,6 +181,31 @@ impl HandlerState {
             .flat_map(|planned_window| planned_window.pane_ids.iter().copied())
             .collect::<Vec<_>>();
 
+        let mut removals_by_session = std::collections::HashMap::<SessionName, usize>::new();
+        for planned_window in &removal_plan {
+            *removals_by_session
+                .entry(planned_window.session_name.clone())
+                .or_default() += 1;
+        }
+        let mut destroyed_session_names = removal_plan
+            .iter()
+            .filter_map(|planned_window| {
+                let session_name = &planned_window.session_name;
+                let removed_count = removals_by_session.get(session_name).copied()?;
+                self.sessions
+                    .session(session_name)
+                    .is_some_and(|session| session.windows().len() == removed_count)
+                    .then(|| session_name.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut seen_destroyed_sessions = HashSet::new();
+        destroyed_session_names
+            .retain(|session_name| seen_destroyed_sessions.insert(session_name.clone()));
+        let removed_window_ids = removed_windows
+            .iter()
+            .map(|removed_window| rmux_proto::WindowId::new(removed_window.window_id))
+            .collect::<Vec<_>>();
+
         let sessions_to_synchronize = removal_plan
             .iter()
             .map(|planned_window| planned_window.session_name.clone())
@@ -213,7 +220,7 @@ impl HandlerState {
                 .sessions
                 .session_mut(&planned_window.session_name)
                 .ok_or_else(|| session_not_found(&planned_window.session_name))?
-                .remove_window(planned_window.window_index)?;
+                .remove_window_allowing_empty(planned_window.window_index)?;
             let _ = self.options.remove_window(&planned_target);
             let _ = self.hooks.remove_window(&planned_target);
             self.clear_auto_named_window(&planned_window.session_name, planned_window.window_index);
@@ -238,8 +245,42 @@ impl HandlerState {
             }
         }
 
+        let mut destroyed_sessions = Vec::new();
+        let mut session_removal_order = destroyed_session_names.clone();
+        session_removal_order.sort_by(|left, right| {
+            let left_is_owner = self.sessions.runtime_owner(left).as_ref() == Some(left);
+            let right_is_owner = self.sessions.runtime_owner(right).as_ref() == Some(right);
+            left_is_owner
+                .cmp(&right_is_owner)
+                .then_with(|| left.as_str().cmp(right.as_str()))
+        });
+        for destroyed_session_name in session_removal_order {
+            let current_runtime_owner = self.sessions.runtime_owner(&destroyed_session_name);
+            let next_runtime_owner = self
+                .sessions
+                .runtime_owner_transfer_target(&destroyed_session_name);
+            let removed_session = self.sessions.remove_session(&destroyed_session_name)?;
+            destroyed_sessions.push((destroyed_session_name.clone(), removed_session.id()));
+            let _ = self.options.remove_session(&destroyed_session_name);
+            let _ = self.environment.remove_session(&destroyed_session_name);
+            self.remove_session_terminals(
+                &destroyed_session_name,
+                current_runtime_owner.as_ref(),
+                next_runtime_owner.as_ref(),
+            )?;
+        }
+        destroyed_sessions.sort_by_key(|(destroyed_session_name, _)| {
+            destroyed_session_names
+                .iter()
+                .position(|candidate| candidate == destroyed_session_name)
+                .unwrap_or(usize::MAX)
+        });
+
         let mut reindexed_windows = Vec::new();
         for synchronized_session in &sessions_to_synchronize {
+            if destroyed_session_names.contains(synchronized_session) {
+                continue;
+            }
             let index_map = self.renumber_windows_if_enabled(synchronized_session)?;
             if !index_map.is_empty() {
                 reindexed_windows.push((synchronized_session.clone(), index_map));
@@ -248,9 +289,11 @@ impl HandlerState {
         let active_window = self
             .sessions
             .session(&session_name)
-            .ok_or_else(|| session_not_found(&session_name))?
-            .active_window_index();
+            .map_or(target_index, Session::active_window_index);
         for synchronized_session in sessions_to_synchronize {
+            if destroyed_session_names.contains(&synchronized_session) {
+                continue;
+            }
             self.synchronize_session_group_from(&synchronized_session)?;
         }
         let removed_pane_ids = self.pane_ids_no_longer_referenced(removed_pane_ids);
@@ -261,6 +304,8 @@ impl HandlerState {
             },
             removed_windows,
             removed_pane_ids,
+            destroyed_sessions,
+            removed_window_ids,
             reindexed_windows,
         })
     }
@@ -380,7 +425,7 @@ impl HandlerState {
         let session_name = request.target.session_name().clone();
         let window_index = request.target.window_index();
 
-        let response = self.mutate_session_and_resize_terminals(&session_name, |session| {
+        self.mutate_session_and_resize_window_terminal(&session_name, window_index, |session| {
             let current_size = session
                 .window_at(window_index)
                 .ok_or_else(|| {
@@ -432,11 +477,7 @@ impl HandlerState {
             Ok(rmux_proto::ResizeWindowResponse {
                 target: request.target.clone(),
             })
-        })?;
-
-        self.synchronize_linked_window_family_from_slot(&session_name, window_index)?;
-
-        Ok(response)
+        })
     }
 
     pub(crate) fn respawn_window(
@@ -626,48 +667,6 @@ impl HandlerState {
             refresh_sessions: synchronized_sessions,
         })
     }
-
-    pub(crate) fn list_windows(
-        &self,
-        selection: ListWindowsSelection<'_>,
-    ) -> Result<ListWindowsResponse, RmuxError> {
-        let ListWindowsSelection {
-            session_name,
-            socket_path,
-            format,
-            attached_count,
-            filter,
-            sort_order,
-            reversed,
-        } = selection;
-        let session = self
-            .sessions
-            .session(session_name)
-            .ok_or_else(|| session_not_found(session_name))?;
-        let sort_order = match WindowListSortOrder::parse(sort_order) {
-            Some(sort_order) => sort_order,
-            None if sort_order.is_some() => {
-                return Err(RmuxError::Message(rmux_core::INVALID_SORT_ORDER.to_owned()));
-            }
-            None => WindowListSortOrder::Index,
-        };
-        let mut rows = collect_window_entries(
-            self,
-            session,
-            session_name,
-            socket_path,
-            format,
-            attached_count,
-            filter,
-        );
-        if sort_order != WindowListSortOrder::Index || reversed && sort_order.is_explicit() {
-            sort_window_entries(&mut rows, sort_order, reversed);
-        }
-        let windows = rows.into_iter().map(|row| row.entry).collect::<Vec<_>>();
-        let output = build_command_output(&windows);
-
-        Ok(ListWindowsResponse { windows, output })
-    }
 }
 
 fn apply_prepared_automatic_window_name(
@@ -698,163 +697,6 @@ fn apply_prepared_automatic_window_name(
             .set_automatic_name(name.to_owned());
     }
     should_apply
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindowListSortOrder {
-    Index,
-    Name,
-    Size,
-    Activity,
-    Creation,
-    ExplicitIndex,
-}
-
-impl WindowListSortOrder {
-    fn parse(value: Option<&str>) -> Option<Self> {
-        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-            None | Some("") => Some(Self::Index),
-            Some("index" | "order") => Some(Self::ExplicitIndex),
-            Some("name" | "title") => Some(Self::Name),
-            Some("size") => Some(Self::Size),
-            Some("activity") => Some(Self::Activity),
-            Some("creation") => Some(Self::Creation),
-            Some(_) => None,
-        }
-    }
-
-    const fn is_explicit(self) -> bool {
-        !matches!(self, Self::Index)
-    }
-}
-
-struct WindowListRow {
-    entry: WindowListEntry,
-    created_at: i64,
-    activity_at: i64,
-}
-
-fn collect_window_entries(
-    state: &HandlerState,
-    session: &Session,
-    session_name: &SessionName,
-    socket_path: &Path,
-    format: Option<&str>,
-    attached_count: usize,
-    filter: Option<&str>,
-) -> Vec<WindowListRow> {
-    let active_window = session.active_window_index();
-    let last_window = session.last_window_index();
-    let session_context =
-        FormatContext::from_session(session).with_session_attached(attached_count);
-
-    session
-        .windows()
-        .iter()
-        .filter_map(|(window_index, window)| {
-            let active = *window_index == active_window;
-            let last = Some(*window_index) == last_window;
-            let mut context =
-                session_context
-                    .clone()
-                    .with_window(*window_index, window, active, last);
-            if let Some(pane) = window.active_pane() {
-                context = context.with_window_pane(window, pane);
-            }
-            let mut runtime = RuntimeFormatContext::new(context)
-                .with_state(state)
-                .with_socket_path(socket_path)
-                .with_session(session)
-                .with_window(*window_index, window);
-            if let Some(pane) = window.active_pane() {
-                runtime = runtime.with_pane(pane);
-            }
-            if attached_count == 0 {
-                runtime = runtime.with_unclipped_geometry();
-            }
-            if let Some(filter) = filter {
-                let expanded = render_runtime_template(filter, &runtime, false);
-                if !is_truthy(&expanded) {
-                    return None;
-                }
-            }
-            let rendered_name = render_runtime_template("#{window_name}", &runtime, false);
-            let rendered = render_list_windows_line(&runtime, format);
-
-            Some(WindowListRow {
-                entry: WindowListEntry {
-                    target: WindowTarget::with_window(session_name.clone(), *window_index),
-                    window_id: window.id().to_string(),
-                    name: (!rendered_name.is_empty()).then_some(rendered_name),
-                    pane_count: u32::try_from(window.pane_count()).expect("pane count fits in u32"),
-                    size: window.size(),
-                    layout: window.layout(),
-                    active,
-                    last,
-                    rendered,
-                },
-                created_at: window.created_at(),
-                activity_at: window.activity_at(),
-            })
-        })
-        .collect()
-}
-
-fn sort_window_entries(
-    entries: &mut [WindowListRow],
-    sort_order: WindowListSortOrder,
-    reversed: bool,
-) {
-    entries.sort_by(|left, right| {
-        let primary = match sort_order {
-            WindowListSortOrder::Index | WindowListSortOrder::ExplicitIndex => left
-                .entry
-                .target
-                .window_index()
-                .cmp(&right.entry.target.window_index()),
-            WindowListSortOrder::Name => left.entry.name.cmp(&right.entry.name),
-            WindowListSortOrder::Size => {
-                terminal_area(left.entry.size).cmp(&terminal_area(right.entry.size))
-            }
-            WindowListSortOrder::Activity => right.activity_at.cmp(&left.activity_at),
-            WindowListSortOrder::Creation => left.created_at.cmp(&right.created_at),
-        };
-        let primary = if reversed { primary.reverse() } else { primary };
-        if matches!(sort_order, WindowListSortOrder::Size) {
-            return primary;
-        }
-        primary
-            .then_with(|| stable_window_name_cmp(left, right))
-            .then_with(|| {
-                left.entry
-                    .target
-                    .window_index()
-                    .cmp(&right.entry.target.window_index())
-            })
-    });
-}
-
-fn terminal_area(size: rmux_proto::TerminalSize) -> u64 {
-    u64::from(size.cols) * u64::from(size.rows)
-}
-
-fn stable_window_name_cmp(left: &WindowListRow, right: &WindowListRow) -> Ordering {
-    left.entry.name.cmp(&right.entry.name)
-}
-
-fn build_command_output(windows: &[WindowListEntry]) -> CommandOutput {
-    let stdout = windows
-        .iter()
-        .map(|window| window.rendered.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let stdout = if stdout.is_empty() {
-        Vec::new()
-    } else {
-        format!("{stdout}\n").into_bytes()
-    };
-
-    CommandOutput::from_stdout(stdout)
 }
 
 fn link_window_destination_index(
@@ -909,63 +751,4 @@ fn ensure_session_panes_exist(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rmux_proto::{LayoutName, TerminalSize};
-
-    fn window_list_row(window_index: u32, name: &str, cols: u16, rows: u16) -> WindowListRow {
-        WindowListRow {
-            entry: WindowListEntry {
-                target: WindowTarget::with_window(
-                    SessionName::new("sort-area").expect("valid session name"),
-                    window_index,
-                ),
-                window_id: format!("@{window_index}"),
-                name: Some(name.to_owned()),
-                pane_count: 1,
-                size: TerminalSize { cols, rows },
-                layout: LayoutName::Tiled,
-                active: false,
-                last: false,
-                rendered: window_index.to_string(),
-            },
-            created_at: 0,
-            activity_at: 0,
-        }
-    }
-
-    #[test]
-    fn window_size_sort_uses_area_and_preserves_equal_area_order() {
-        let rows = || {
-            vec![
-                window_list_row(9, "z", 21, 10),
-                window_list_row(1, "a", 10, 21),
-                window_list_row(7, "middle", 59, 5),
-                window_list_row(3, "large", 20, 24),
-            ]
-        };
-
-        let mut ascending = rows();
-        sort_window_entries(&mut ascending, WindowListSortOrder::Size, false);
-        assert_eq!(
-            ascending
-                .iter()
-                .map(|row| row.entry.target.window_index())
-                .collect::<Vec<_>>(),
-            [9, 1, 7, 3]
-        );
-
-        let mut descending = rows();
-        sort_window_entries(&mut descending, WindowListSortOrder::Size, true);
-        assert_eq!(
-            descending
-                .iter()
-                .map(|row| row.entry.target.window_index())
-                .collect::<Vec<_>>(),
-            [3, 7, 9, 1]
-        );
-    }
 }

@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use rmux_client::{connect, ClientError, Connection};
 use rmux_proto::{
-    CommandOutput, PaneTarget, ResolveTargetType, Response, RmuxError, Target,
-    CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION, INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH,
+    encode_internal_runtime_command_arguments, CommandOutput, PaneTarget, ResolveTargetType,
+    Response, RmuxError, Target, CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION,
+    INTERNAL_CANONICAL_COMMAND_EXECUTION_PATH, INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH,
 };
 
 use crate::cli_response::{expect_command_output, expect_command_success, response_name};
@@ -126,7 +127,7 @@ pub(super) fn run_queued_server_command(
     queue_command: String,
 ) -> Result<i32, ExitFailure> {
     let response = with_command_connection(socket_path, |connection| {
-        queued_server_command_response(connection, queue_command)
+        queued_server_command_response(connection, queue_command, None)
     })?;
     finish_queued_server_command(command_name, response)
 }
@@ -137,13 +138,72 @@ pub(super) fn run_queued_server_command_with_connection(
     command_name: &'static str,
     queue_command: String,
 ) -> Result<i32, ExitFailure> {
-    let response = queued_server_command_response(connection, queue_command)?;
+    let response = queued_server_command_response(connection, queue_command, None)?;
     finish_queued_server_command(command_name, response)
+}
+
+pub(super) fn run_queued_server_command_at_target_with_connection(
+    connection: &mut Connection,
+    command_name: &'static str,
+    queue_command: String,
+    target: PaneTarget,
+) -> Result<i32, ExitFailure> {
+    let response = queued_server_command_response(connection, queue_command, Some(target))?;
+    finish_queued_server_command(command_name, response)
+}
+
+pub(super) fn run_list_windows_all_server_command_with_connection(
+    connection: &mut Connection,
+    arguments: &[String],
+) -> Result<i32, ExitFailure> {
+    let response = list_windows_all_server_command_response(connection, arguments)?;
+    finish_queued_server_command("list-windows", response)
+}
+
+pub(super) fn capture_list_windows_all_server_command_with_connection(
+    connection: &mut Connection,
+    arguments: &[String],
+) -> Result<(i32, CommandOutput), ExitFailure> {
+    let response = list_windows_all_server_command_response(connection, arguments)?;
+    let output = response
+        .command_output()
+        .cloned()
+        .unwrap_or_else(|| CommandOutput::from_stdout(Vec::new()));
+    if let Some(exit_status) = queued_server_command_nonzero_exit("list-windows", &response)? {
+        return Ok((exit_status, output));
+    }
+    expect_command_success(response, "list-windows")
+        .map_err(|error| normalize_queued_direct_error("list-windows", error))?;
+    Ok((0, output))
+}
+
+fn list_windows_all_server_command_response(
+    connection: &mut Connection,
+    arguments: &[String],
+) -> Result<Response, ExitFailure> {
+    let payload = encode_internal_runtime_command_arguments(arguments).map_err(|error| {
+        ExitFailure::new(
+            1,
+            format!("failed to encode internal list-windows arguments: {error}"),
+        )
+    })?;
+    connection
+        .source_file(
+            vec![INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH.to_owned()],
+            false,
+            false,
+            false,
+            false,
+            None,
+            Some(payload),
+        )
+        .map_err(ExitFailure::from_client)
 }
 
 fn queued_server_command_response(
     connection: &mut Connection,
     queue_command: String,
+    target: Option<PaneTarget>,
 ) -> Result<Response, ExitFailure> {
     let source_path = if connection
         .supports_capability(CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION)
@@ -160,7 +220,7 @@ fn queued_server_command_response(
             false,
             false,
             false,
-            None,
+            target,
             Some(queue_command),
         )
         .map_err(ExitFailure::from_client)
@@ -170,6 +230,17 @@ fn finish_queued_server_command(
     command_name: &'static str,
     response: Response,
 ) -> Result<i32, ExitFailure> {
+    if let Some(exit_status) = queued_server_command_nonzero_exit(command_name, &response)? {
+        return Ok(exit_status);
+    }
+    finish_command_success(response, command_name)
+        .map_err(|error| normalize_queued_direct_error(command_name, error))
+}
+
+fn queued_server_command_nonzero_exit(
+    command_name: &'static str,
+    response: &Response,
+) -> Result<Option<i32>, ExitFailure> {
     if let Response::SourceFile(source) = &response {
         if source.exit_status().unwrap_or(0) != 0 && !source.stderr().is_empty() {
             if let Some(output) = source.command_output() {
@@ -182,7 +253,7 @@ fn finish_queued_server_command(
         }
     }
     let source_stdout_may_be_diagnostic = match &response {
-        Response::SourceFile(source) if command_name == "if-shell" => {
+        Response::SourceFile(source) if matches!(command_name, "if-shell" | "list-windows") => {
             source.exit_status().is_some_and(|status| status != 0)
         }
         _ => true,
@@ -208,11 +279,10 @@ fn finish_queued_server_command(
             if let Some(output) = source.command_output() {
                 write_command_output(output)?;
             }
-            return Ok(exit_status);
+            return Ok(Some(exit_status));
         }
     }
-    finish_command_success(response, command_name)
-        .map_err(|error| normalize_queued_direct_error(command_name, error))
+    Ok(None)
 }
 
 fn with_command_connection<F, R>(socket_path: &Path, run: F) -> Result<R, ExitFailure>

@@ -15,14 +15,16 @@ use tokio::runtime::Handle;
 mod shell_resolver;
 mod shell_spec;
 
-#[cfg(windows)]
-use shell_resolver::cmd_shell_path;
 #[cfg(unix)]
 pub(crate) use shell_resolver::is_suitable_shell;
 #[cfg(windows)]
 use shell_resolver::CLIENT_SHELL_ENV;
 use shell_resolver::{resolve_program_path_from, resolve_shell_path};
 use shell_spec::ShellSpec;
+
+#[cfg(windows)]
+const WINDOWS_BATCH_ARGV_UNSUPPORTED_MESSAGE: &str =
+    "process command argv cannot target Windows .cmd or .bat scripts; use shell command mode";
 
 /// Immutable pane-spawn metadata captured when a pane terminal is created.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -662,7 +664,7 @@ pub(crate) fn spawn_pane_process(
     command: Option<&ProcessCommand>,
 ) -> Result<(PtyMaster, PtyChild), RmuxError> {
     validate_process_command(command)?;
-    let mut command = spawn_command(profile, command)
+    let mut command = spawn_command(profile, command)?
         .size(size)
         .allow_explicit_job_breakaway()
         .clear_env()
@@ -690,57 +692,52 @@ pub(crate) fn validate_process_command(command: Option<&ProcessCommand>) -> Resu
     if empty_argv {
         return Err(RmuxError::empty_process_command());
     }
+    #[cfg(windows)]
+    if let Some(ProcessCommand::Argv(argv)) = command {
+        if let Some(program) = argv.first() {
+            reject_windows_batch_argv(Path::new(program))?;
+        }
+    }
     Ok(())
 }
 
-fn spawn_command(profile: &TerminalProfile, command: Option<&ProcessCommand>) -> ChildCommand {
-    match command {
+#[cfg(windows)]
+pub(crate) fn validate_windows_process_command_for_profile(
+    profile: &TerminalProfile,
+    command: Option<&ProcessCommand>,
+) -> Result<(), RmuxError> {
+    validate_process_command(command)?;
+    let _ = spawn_command(profile, command)?;
+    Ok(())
+}
+
+fn spawn_command(
+    profile: &TerminalProfile,
+    command: Option<&ProcessCommand>,
+) -> Result<ChildCommand, RmuxError> {
+    let command = match command {
         Some(ProcessCommand::Shell(command)) => profile.shell_child_command(command),
         Some(ProcessCommand::Argv(argv)) if !argv.is_empty() => {
             let environment = profile.environment_map();
             let program =
                 resolve_program_path_from(Path::new(&argv[0]), &environment, profile.cwd());
             #[cfg(windows)]
-            if let Some(command) = windows_batch_child_command(&program, &argv[1..], &environment) {
-                return command;
-            }
+            reject_windows_batch_argv(&program)?;
             ChildCommand::new(program).args(&argv[1..])
         }
         Some(ProcessCommand::Argv(_)) | Some(_) | None => profile.interactive_child_command(),
+    };
+    Ok(command)
+}
+
+#[cfg(windows)]
+fn reject_windows_batch_argv(program: &Path) -> Result<(), RmuxError> {
+    if is_windows_batch_script(program) {
+        return Err(RmuxError::spawn_failed(
+            WINDOWS_BATCH_ARGV_UNSUPPORTED_MESSAGE,
+        ));
     }
-}
-
-#[cfg(windows)]
-fn windows_batch_child_command(
-    program: &Path,
-    args: &[String],
-    environment: &HashMap<String, String>,
-) -> Option<ChildCommand> {
-    if !is_windows_batch_script(program) {
-        return None;
-    }
-
-    let shell = cmd_shell_path(environment).unwrap_or_else(|| PathBuf::from("cmd.exe"));
-    Some(
-        ChildCommand::new(shell)
-            .arg("/D")
-            .arg("/S")
-            .arg("/C")
-            .windows_verbatim_args(windows_batch_cmd_tail(program, args)),
-    )
-}
-
-#[cfg(windows)]
-fn windows_batch_cmd_tail(program: &Path, args: &[String]) -> OsString {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(cmd_double_quoted(&program.to_string_lossy()));
-    parts.extend(args.iter().map(|arg| cmd_double_quoted(arg)));
-    format!("\"{}\"", parts.join(" ")).into()
-}
-
-#[cfg(windows)]
-fn cmd_double_quoted(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
+    Ok(())
 }
 
 #[cfg(windows)]

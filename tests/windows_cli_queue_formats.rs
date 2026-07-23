@@ -185,6 +185,55 @@ fn deferred_pane_pid_is_ready_before_list_filters() -> Result<(), Box<dyn Error>
 }
 
 #[test]
+fn deferred_pane_pid_is_ready_before_all_session_window_filter() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("windows-deferred-pane-pid-list-windows-all")?;
+
+    let windows = harness.stdout([
+        "new-session",
+        "-d",
+        "-s",
+        "window-all-filter-race",
+        ";",
+        "list-windows",
+        "-a",
+        "-f",
+        "#{pane_pid}",
+        "-F",
+        "#{pane_pid}",
+    ])?;
+    let pane_pid = windows
+        .trim()
+        .parse::<u32>()
+        .expect("list-windows -a must render a numeric pane PID");
+    assert_ne!(
+        pane_pid, 0,
+        "list-windows -a observed the deferred pane before PID publication"
+    );
+    Ok(())
+}
+
+#[test]
+fn direct_all_session_window_filter_waits_for_deferred_pane_pid() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("windows-direct-list-windows-all-pane-pid")?;
+    harness.success(["new-session", "-d", "-s", "direct-window-all-race"])?;
+
+    let windows = harness.stdout([
+        "list-windows",
+        "-a",
+        "-f",
+        "#{pane_pid}",
+        "-F",
+        "#{pane_pid}",
+    ])?;
+    let pane_pid = windows
+        .trim()
+        .parse::<u32>()
+        .expect("direct list-windows -a must render a numeric pane PID");
+    assert_ne!(pane_pid, 0);
+    Ok(())
+}
+
+#[test]
 fn rejected_respawn_preserves_deferred_pane_queued_input() -> Result<(), Box<dyn Error>> {
     let harness = CrossPlatformHarness::new("windows-respawn-deferred-input-rollback")?;
     let marker = "RMUX_RESPAWN_REJECTED_QUEUED_INPUT_SURVIVES";

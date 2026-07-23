@@ -5,7 +5,7 @@ use rmux_core::{
     command_parser::{CommandArgument, ParsedCommand},
     SessionStore, TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget,
 };
-use rmux_proto::{RmuxError, SessionName, Target, WindowTarget};
+use rmux_proto::{PaneTarget, RmuxError, SessionName, Target, WindowTarget};
 
 use super::command_args::{
     command_argument_for_error, pop_command_list_argument, pop_string_argument, CommandListArgument,
@@ -15,7 +15,7 @@ use super::source_files::SourceSyntax;
 use super::targets::{
     implicit_session_name, implicit_window_target, parse_pane_target,
     parse_queued_new_window_target_argument, parse_target_arg, resolve_queue_target_argument,
-    NewWindowTargetIndex,
+    resolve_queue_target_argument_typed, NewWindowTargetIndex, QueueTargetArgumentResolution,
 };
 use super::tokens::{parse_compact_flag_cluster, CompactFlag};
 use super::values::{missing_argument, reject_unknown_option_before_positional, unsupported_flag};
@@ -28,6 +28,8 @@ pub(super) struct ParsedNewWindowCommand {
     pub(super) target: SessionName,
     pub(super) target_window_index: Option<NewWindowTargetIndex>,
     pub(super) insert_at_target: bool,
+    pub(super) placement: Option<NewWindowPlacement>,
+    pub(super) target_witness: Option<Box<super::new_window_runtime::QueuedNewWindowTargetWitness>>,
     pub(super) name: Option<String>,
     pub(super) detached: bool,
     pub(super) print_target: bool,
@@ -37,6 +39,12 @@ pub(super) struct ParsedNewWindowCommand {
     pub(super) start_directory: Option<PathBuf>,
     pub(super) environment: Option<Vec<String>>,
     pub(super) command: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NewWindowPlacement {
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +265,14 @@ pub(super) fn parse_queued_new_window(
         target: target.unwrap_or(implicit_session_name(sessions, find_context, "new-window")?),
         target_window_index,
         insert_at_target,
+        placement: if before {
+            Some(NewWindowPlacement::Before)
+        } else if after {
+            Some(NewWindowPlacement::After)
+        } else {
+            None
+        },
+        target_witness: None,
         name,
         detached,
         print_target,
@@ -446,6 +462,7 @@ pub(super) fn parse_queued_source_file(
     let mut verbose = false;
     let mut expand_paths = false;
     let mut target = None;
+    let mut target_missing_canfail = false;
 
     while let Some(token) = args.front().and_then(CommandArgument::as_string) {
         match token {
@@ -472,11 +489,13 @@ pub(super) fn parse_queued_source_file(
             }
             "-t" => {
                 let _ = args.pop_front();
-                target = Some(parse_queued_source_file_target(
+                let resolved = parse_queued_source_file_target(
                     pop_string_argument(&mut args, "-t target")?,
                     sessions,
                     find_context,
-                )?);
+                )?;
+                target = resolved.target;
+                target_missing_canfail = resolved.missing_canfail;
             }
             token if token.starts_with('-') => {
                 let Some(cluster) = parse_compact_flag_cluster(token, "Fnqv", "t") else {
@@ -495,11 +514,10 @@ pub(super) fn parse_queued_source_file(
                         CompactFlag::Value { flag: 't', value } => {
                             let value =
                                 compact_value_or_next_argument(&mut args, value, "-t target")?;
-                            target = Some(parse_queued_source_file_target(
-                                value,
-                                sessions,
-                                find_context,
-                            )?);
+                            let resolved =
+                                parse_queued_source_file_target(value, sessions, find_context)?;
+                            target = resolved.target;
+                            target_missing_canfail = resolved.missing_canfail;
                         }
                         CompactFlag::Value { flag, .. } => {
                             return Err(unsupported_flag("source-file", &format!("-{flag}")));
@@ -533,6 +551,7 @@ pub(super) fn parse_queued_source_file(
         verbose,
         expand_paths,
         target,
+        target_missing_canfail,
         caller_cwd: caller_cwd.map(Path::to_path_buf),
         stdin: None,
         current_file: None,
@@ -544,10 +563,32 @@ fn parse_queued_source_file_target(
     value: String,
     sessions: &SessionStore,
     find_context: &TargetFindContext,
-) -> Result<rmux_proto::PaneTarget, RmuxError> {
-    parse_pane_target("source-file", value.clone()).or_else(|_| {
-        let resolved =
-            resolve_queue_target_argument("source-file", 't', value, sessions, find_context)?;
-        parse_pane_target("source-file", resolved)
-    })
+) -> Result<ParsedSourceFileTarget, RmuxError> {
+    match resolve_queue_target_argument_typed("source-file", 't', value, sessions, find_context)? {
+        QueueTargetArgumentResolution::Resolved(value) => {
+            parse_pane_target("source-file", value).map(ParsedSourceFileTarget::resolved)
+        }
+        QueueTargetArgumentResolution::CanFail => Ok(ParsedSourceFileTarget::missing_canfail()),
+    }
+}
+
+struct ParsedSourceFileTarget {
+    target: Option<PaneTarget>,
+    missing_canfail: bool,
+}
+
+impl ParsedSourceFileTarget {
+    fn resolved(target: PaneTarget) -> Self {
+        Self {
+            target: Some(target),
+            missing_canfail: false,
+        }
+    }
+
+    fn missing_canfail() -> Self {
+        Self {
+            target: None,
+            missing_canfail: true,
+        }
+    }
 }

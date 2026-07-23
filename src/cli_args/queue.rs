@@ -151,7 +151,8 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "lock-server" => parse_no_args("lock-server", arguments).map(|()| Command::LockServer),
         "lock-session" => parse_command_args("lock-session", arguments).map(Command::LockSession),
         "lock-client" => parse_command_args("lock-client", arguments).map(Command::LockClient),
-        "new-window" => parse_command_args("new-window", arguments).map(Command::NewWindow),
+        "new-window" => parse_command_args("new-window", arguments)
+            .map(|args| Command::NewWindow(with_queue_command(args, queue_command))),
         "kill-window" => parse_command_args("kill-window", arguments).map(Command::KillWindow),
         "select-window" => parse_select_window_args(arguments).map(Command::SelectWindow),
         "rename-window" => parse_rename_window_args(arguments).map(Command::RenameWindow),

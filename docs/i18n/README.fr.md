@@ -34,7 +34,7 @@
   <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
   <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.9.0"><img src="https://img.shields.io/badge/rmux-0.9.0-informational.svg" alt="rmux 0.9.0"></a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.9.1"><img src="https://img.shields.io/badge/rmux-0.9.1-informational.svg" alt="rmux 0.9.1"></a>
 </p>
 
 </div>
@@ -125,7 +125,7 @@ Quelques exemples courts de ce que RMUX permet de faire.
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/rust.svg"><img src="../install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
 
-Les téléchargements directs (`.tar.gz`, `.deb`, `.rpm`, `.zip`) sont disponibles dans la [GitHub Release v0.9.0](https://github.com/Helvesec/rmux/releases/tag/v0.9.0).
+Les téléchargements directs (`.tar.gz`, `.deb`, `.rpm`, `.zip`) sont disponibles dans la [GitHub Release v0.9.1](https://github.com/Helvesec/rmux/releases/tag/v0.9.1).
 
 Les gestionnaires de paquets peuvent avoir du retard pendant la revue des registres ; utilisez le téléchargement versionné de la GitHub Release tant qu'un gestionnaire n'est pas à jour.
 
@@ -286,9 +286,9 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.9.0-web-share">
-  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.9.0-web-share">
-  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.9.0-web-share" alt="Architecture runtime RMUX" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.9.1-web-share">
+  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.9.1-web-share">
+  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.9.1-web-share" alt="Architecture runtime RMUX" width="800">
 </picture>
 
 </div>

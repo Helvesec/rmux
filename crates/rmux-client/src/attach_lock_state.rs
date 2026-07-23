@@ -10,6 +10,7 @@ impl AttachLockState {
     pub(crate) fn lock(&self) {
         let mut state = self.inner.lock().expect("attach lock state poisoned");
         state.locked = true;
+        state.exclusive_input_generation = state.exclusive_input_generation.wrapping_add(1);
         self.changed.notify_all();
     }
 
@@ -30,6 +31,14 @@ impl AttachLockState {
             .lock()
             .expect("attach lock state poisoned")
             .locked
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn exclusive_input_generation(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("attach lock state poisoned")
+            .exclusive_input_generation
     }
 
     #[cfg(windows)]
@@ -93,6 +102,7 @@ struct State {
     locked: bool,
     closed: bool,
     input_read_active: bool,
+    exclusive_input_generation: u64,
 }
 
 #[cfg(test)]
@@ -128,5 +138,18 @@ mod tests {
         state.unlock();
         assert!(state.begin_input_read());
         state.finish_input_read();
+    }
+
+    #[test]
+    fn exclusive_input_generation_changes_when_an_action_starts() {
+        let state = AttachLockState::default();
+        let initial = state.exclusive_input_generation();
+
+        state.lock();
+        let after_lock = state.exclusive_input_generation();
+        state.unlock();
+
+        assert_ne!(after_lock, initial);
+        assert_eq!(state.exclusive_input_generation(), after_lock);
     }
 }

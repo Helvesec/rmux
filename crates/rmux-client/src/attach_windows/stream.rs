@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, OnceLock};
-use std::thread;
 use std::time::Duration;
 
 use rmux_proto::{
@@ -30,21 +29,36 @@ use crate::ClientError;
 
 use super::action::{AttachAction, AttachActionOutcome};
 use super::metrics::AttachMetricsRecorder;
+#[cfg(test)]
+use super::output_worker::ATTACH_OUTPUT_QUEUE_CAPACITY;
+use super::output_worker::{AttachOutputTrySendError, AttachOutputWorker};
 use super::screen::{AttachScreenTracker, AttachStopDetector, AttachStopGeneration};
 #[cfg(test)]
 use super::screen::{ALT_SCREEN_EXIT_FALLBACK, DETACHED_BANNER_PREFIX, EXITED_BANNER};
 use super::terminal;
 use crate::attach_lock_state::AttachLockState;
 
-const ATTACH_OUTPUT_QUEUE_CAPACITY: usize = 64;
+#[path = "stream/exclusive_actions.rs"]
+mod exclusive_actions;
+
+use exclusive_actions::{wait_for_output_fence_deadline, PendingAttachActions};
+
 const ATTACH_OUTPUT_PENDING_MAX_BYTES: usize = 4 * 1024 * 1024;
 const ATTACH_OUTPUT_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const ATTACH_OUTPUT_SPOOL_PREFIX: &str = "rmux-attach-output-";
 const ATTACH_OUTPUT_SPOOL_SUFFIX: &str = ".spool";
 const ATTACH_OUTPUT_BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
-const ATTACH_OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 const ATTACH_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const ATTACH_OUTPUT_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_RENDER_MAX_PENDING: Duration = Duration::from_millis(8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AttachOutputFence(u64);
+
+struct AttachOutputTarget<Output, FenceFlush> {
+    output: Output,
+    fence_flush: FenceFlush,
+}
 
 struct PendingRepeatedAttachInput {
     input: super::input::AttachInput,
@@ -64,6 +78,7 @@ impl PendingRepeatedAttachInput {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn drive_async_attach<Reader, Writer, Output>(
     reader: Reader,
     writer: Writer,
@@ -77,12 +92,42 @@ where
     Writer: tokio::io::AsyncWrite + Unpin,
     Output: Write + Send + 'static,
 {
+    drive_async_attach_with_output_fence(
+        reader,
+        writer,
+        initial_bytes,
+        output,
+        screen_tracker,
+        channels,
+        Write::flush,
+    )
+    .await
+}
+
+pub(super) async fn drive_async_attach_with_output_fence<Reader, Writer, Output, FenceFlush>(
+    reader: Reader,
+    writer: Writer,
+    initial_bytes: Vec<u8>,
+    output: Output,
+    screen_tracker: AttachScreenTracker,
+    channels: AttachAsyncChannels,
+    output_fence_flush: FenceFlush,
+) -> std::result::Result<(), ClientError>
+where
+    Reader: tokio::io::AsyncRead + Unpin,
+    Writer: tokio::io::AsyncWrite + Unpin,
+    Output: Write + Send + 'static,
+    FenceFlush: FnMut(&mut Output) -> io::Result<()> + Send + 'static,
+{
     let mut metrics = AttachMetricsRecorder::from_env();
     let result = drive_async_attach_loop(
         reader,
         writer,
         initial_bytes,
-        output,
+        AttachOutputTarget {
+            output,
+            fence_flush: output_fence_flush,
+        },
         screen_tracker,
         channels,
         &mut metrics,
@@ -92,11 +137,11 @@ where
     result
 }
 
-async fn drive_async_attach_loop<Reader, Writer, Output>(
+async fn drive_async_attach_loop<Reader, Writer, Output, FenceFlush>(
     mut reader: Reader,
     mut writer: Writer,
     initial_bytes: Vec<u8>,
-    output: Output,
+    output_target: AttachOutputTarget<Output, FenceFlush>,
     screen_tracker: AttachScreenTracker,
     channels: AttachAsyncChannels,
     metrics: &mut AttachMetricsRecorder,
@@ -105,7 +150,12 @@ where
     Reader: tokio::io::AsyncRead + Unpin,
     Writer: tokio::io::AsyncWrite + Unpin,
     Output: Write + Send + 'static,
+    FenceFlush: FnMut(&mut Output) -> io::Result<()> + Send + 'static,
 {
+    let AttachOutputTarget {
+        output,
+        fence_flush: output_fence_flush,
+    } = output_target;
     let AttachAsyncChannels {
         mut input_rx,
         mut input_completion_rx,
@@ -115,6 +165,7 @@ where
         locked,
         windows_console_key_enabled,
         error_cleanup,
+        output_fence_timeout,
     } = channels;
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&initial_bytes);
@@ -122,12 +173,14 @@ where
     let mut stop_detector = AttachStopDetector::new(screen_tracker.clone());
     let mut mouse_tracker = WindowsConsoleMouseTracker::default();
     let mut pending_actions = 0_usize;
+    let mut pending_attach_actions = PendingAttachActions::default();
     let mut pending_resume_generations = VecDeque::new();
     let mut input_open = true;
     let mut resize_open = true;
     let mut pending_repeated_input: Option<PendingRepeatedAttachInput> = None;
-    let mut output = AttachOutputQueue::spawn(output);
+    let mut output = AttachOutputQueue::spawn_with_fence_flush(output, output_fence_flush);
     let mut output_failure_rx = output.take_failure_notifications();
+    let mut output_fence_rx = output.take_fence_notifications();
 
     let attach_result = async {
         loop {
@@ -139,23 +192,38 @@ where
             completion?;
         }
         output.flush_pending()?;
+        pending_attach_actions.dispatch_ready(&action_tx)?;
         drain_attach_messages(
             &mut decoder,
             &mut output,
             DrainContext {
                 stop_detector: &mut stop_detector,
                 mouse_tracker: &mut mouse_tracker,
-                action_tx: &action_tx,
                 locked: &locked,
                 pending_actions: &mut pending_actions,
+                pending_attach_actions: &mut pending_attach_actions,
                 pending_resume_generations: &mut pending_resume_generations,
+                output_fence_timeout,
                 metrics,
             },
         )?;
+        pending_attach_actions.dispatch_ready(&action_tx)?;
         output.check_failure()?;
         let retry_output_delay = output.backpressure_retry_delay();
+        let output_fence_deadline = pending_attach_actions.next_fence_deadline();
 
         tokio::select! {
+            _ = wait_for_output_fence_deadline(output_fence_deadline) => {
+                if let Ok(fence) = output_fence_rx.try_recv() {
+                    pending_attach_actions.complete_fence(fence);
+                    continue;
+                }
+                output.cancel_and_join()?;
+                return Err(ClientError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out draining attach output before an exclusive terminal action",
+                )));
+            }
             _ = tokio::time::sleep(retry_output_delay.unwrap_or(ATTACH_OUTPUT_BACKPRESSURE_RETRY)), if retry_output_delay.is_some() => {}
             failure = output_failure_rx.recv() => {
                 if failure.is_none() {
@@ -165,6 +233,16 @@ where
                     )));
                 }
                 output.check_failure()?;
+            }
+            fence = output_fence_rx.recv(), if output_fence_deadline.is_some() => {
+                let Some(fence) = fence else {
+                    output.check_failure()?;
+                    return Err(ClientError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "attach output writer stopped before acknowledging an output fence",
+                    )));
+                };
+                pending_attach_actions.complete_fence(fence);
             }
             _ = std::future::ready(()), if pending_repeated_input.is_some() => {
                 if let Some(completion) = take_ready_input_worker_completion(&mut input_completion_rx) {
@@ -331,14 +409,15 @@ where
     }
     .await;
 
-    let cleanup_result = if attach_result.is_err() && !screen_tracker.was_stopped() {
-        match error_cleanup {
-            Some(bytes) => output.write_frame(bytes),
-            None => Ok(()),
-        }
-    } else {
-        Ok(())
-    };
+    let cleanup_result =
+        if attach_result.is_err() && !screen_tracker.was_stopped() && !output.is_stopped() {
+            match error_cleanup {
+                Some(bytes) => output.write_frame(bytes),
+                None => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
     let drain_result = finish_attach_output(output).await;
     match (attach_result, cleanup_result, drain_result) {
         (_, _, Err(error)) | (_, Err(error), Ok(())) => Err(error),
@@ -431,10 +510,11 @@ fn drain_attach_messages(
     let DrainContext {
         stop_detector,
         mouse_tracker,
-        action_tx,
         locked,
         pending_actions,
+        pending_attach_actions,
         pending_resume_generations,
+        output_fence_timeout,
         metrics,
     } = context;
     while let Some(message) = decoder.next_message().map_err(ClientError::from)? {
@@ -443,7 +523,8 @@ fn drain_attach_messages(
                 metrics.observe_data_frame(&bytes);
                 stop_detector.observe(&bytes);
                 if let Some(enabled) = mouse_tracker.observe(&bytes) {
-                    send_attach_action(action_tx, AttachAction::MouseInputEnabled(enabled))?;
+                    pending_attach_actions
+                        .queue_immediate(AttachAction::MouseInputEnabled(enabled));
                 }
                 if locked.is_locked() {
                     continue;
@@ -454,7 +535,8 @@ fn drain_attach_messages(
                 metrics.observe_data_frame(&bytes);
                 stop_detector.observe(&bytes);
                 if let Some(enabled) = mouse_tracker.observe(&bytes) {
-                    send_attach_action(action_tx, AttachAction::MouseInputEnabled(enabled))?;
+                    pending_attach_actions
+                        .queue_immediate(AttachAction::MouseInputEnabled(enabled));
                 }
                 if locked.is_locked() {
                     continue;
@@ -463,58 +545,64 @@ fn drain_attach_messages(
             }
             AttachMessage::KeyDispatched(_) => {}
             AttachMessage::DetachKill => {
-                send_exclusive_attach_action(
-                    action_tx,
+                pending_attach_actions.queue_exclusive(
+                    output,
                     locked,
                     pending_actions,
+                    output_fence_timeout,
                     AttachAction::DetachKill,
                 )?;
             }
             AttachMessage::DetachExec(command) => {
-                send_exclusive_attach_action(
-                    action_tx,
+                pending_attach_actions.queue_exclusive(
+                    output,
                     locked,
                     pending_actions,
+                    output_fence_timeout,
                     AttachAction::LegacyDetachExec(command),
                 )?;
             }
             AttachMessage::DetachExecShellCommand(command) => {
-                send_exclusive_attach_action(
-                    action_tx,
+                pending_attach_actions.queue_exclusive(
+                    output,
                     locked,
                     pending_actions,
+                    output_fence_timeout,
                     AttachAction::DetachExec(command),
                 )?;
             }
             AttachMessage::Lock(command) => {
-                send_resumable_attach_action(
-                    action_tx,
+                let stop_generation = stop_detector.current_stop_generation();
+                pending_attach_actions.queue_exclusive(
+                    output,
                     locked,
                     pending_actions,
-                    pending_resume_generations,
-                    stop_detector.current_stop_generation(),
+                    output_fence_timeout,
                     AttachAction::LegacyLock(command),
                 )?;
+                pending_resume_generations.push_back(stop_generation);
             }
             AttachMessage::LockShellCommand(command) => {
-                send_resumable_attach_action(
-                    action_tx,
+                let stop_generation = stop_detector.current_stop_generation();
+                pending_attach_actions.queue_exclusive(
+                    output,
                     locked,
                     pending_actions,
-                    pending_resume_generations,
-                    stop_detector.current_stop_generation(),
+                    output_fence_timeout,
                     AttachAction::Lock(command),
                 )?;
+                pending_resume_generations.push_back(stop_generation);
             }
             AttachMessage::Suspend => {
-                send_resumable_attach_action(
-                    action_tx,
+                let stop_generation = stop_detector.current_stop_generation();
+                pending_attach_actions.queue_exclusive(
+                    output,
                     locked,
                     pending_actions,
-                    pending_resume_generations,
-                    stop_detector.current_stop_generation(),
+                    output_fence_timeout,
                     AttachAction::Suspend,
                 )?;
+                pending_resume_generations.push_back(stop_generation);
             }
             AttachMessage::Resize(_) | AttachMessage::ResizeGeometry(_) => {
                 return Err(ClientError::Protocol(RmuxError::Decode(
@@ -538,54 +626,42 @@ fn drain_attach_messages(
 }
 
 struct AttachOutputQueue {
-    command_tx: Option<std_mpsc::SyncSender<Vec<u8>>>,
-    completed_rx: std_mpsc::Receiver<()>,
-    failure_rx: std_mpsc::Receiver<io::Error>,
-    failure_wake_rx: Option<mpsc::UnboundedReceiver<()>>,
-    done_rx: std_mpsc::Receiver<()>,
-    worker: Option<thread::JoinHandle<()>>,
+    worker: AttachOutputWorker,
     pending: VecDeque<AttachOutputFrame>,
     pending_bytes: usize,
     spool: AttachOutputSpool,
+    pending_fences: VecDeque<AttachOutputFence>,
+    next_fence_sequence: u64,
     queued_frames: usize,
     pending_render_started_at: Option<std::time::Instant>,
     painted_frame: bool,
 }
 
 impl AttachOutputQueue {
-    fn spawn<Output>(mut output: Output) -> Self
+    #[cfg(test)]
+    fn spawn<Output>(output: Output) -> Self
     where
         Output: Write + Send + 'static,
     {
-        cleanup_orphaned_attach_output_spools();
-        let (command_tx, command_rx) =
-            std_mpsc::sync_channel::<Vec<u8>>(ATTACH_OUTPUT_QUEUE_CAPACITY);
-        let (completed_tx, completed_rx) = std_mpsc::channel();
-        let (failure_tx, failure_rx) = std_mpsc::channel();
-        let (failure_wake_tx, failure_wake_rx) = mpsc::unbounded_channel();
-        let (done_tx, done_rx) = std_mpsc::channel();
-        let worker = thread::spawn(move || {
-            while let Ok(bytes) = command_rx.recv() {
-                if let Err(error) = output.write_all(&bytes).and_then(|()| output.flush()) {
-                    let _ = failure_tx.send(error);
-                    let _ = failure_wake_tx.send(());
-                    break;
-                }
-                let _ = completed_tx.send(());
-            }
-            let _ = done_tx.send(());
-        });
+        Self::spawn_with_fence_flush(output, Write::flush)
+    }
 
+    fn spawn_with_fence_flush<Output, FenceFlush>(
+        output: Output,
+        output_fence_flush: FenceFlush,
+    ) -> Self
+    where
+        Output: Write + Send + 'static,
+        FenceFlush: FnMut(&mut Output) -> io::Result<()> + Send + 'static,
+    {
+        cleanup_orphaned_attach_output_spools();
         Self {
-            command_tx: Some(command_tx),
-            completed_rx,
-            failure_rx,
-            failure_wake_rx: Some(failure_wake_rx),
-            done_rx,
-            worker: Some(worker),
+            worker: AttachOutputWorker::spawn_with_fence_flush(output, output_fence_flush),
             pending: VecDeque::new(),
             pending_bytes: 0,
             spool: AttachOutputSpool::default(),
+            pending_fences: VecDeque::new(),
+            next_fence_sequence: 0,
             queued_frames: 0,
             pending_render_started_at: None,
             painted_frame: false,
@@ -598,6 +674,16 @@ impl AttachOutputQueue {
 
     fn write_render(&mut self, bytes: Vec<u8>) -> std::result::Result<(), ClientError> {
         self.write_output_frame(AttachOutputFrame::render(bytes))
+    }
+
+    fn request_fence(&mut self) -> std::result::Result<AttachOutputFence, ClientError> {
+        let fence = AttachOutputFence(self.next_fence_sequence);
+        self.next_fence_sequence = self.next_fence_sequence.checked_add(1).ok_or_else(|| {
+            ClientError::Io(io::Error::other("attach output fence sequence overflowed"))
+        })?;
+        self.pending_fences.push_back(fence);
+        self.flush_pending()?;
+        Ok(fence)
     }
 
     fn write_output_frame(
@@ -669,19 +755,14 @@ impl AttachOutputQueue {
     fn flush_pending(&mut self) -> std::result::Result<(), ClientError> {
         self.drain_completed_writes();
         self.check_failure()?;
-        let Some(command_tx) = self.command_tx.as_ref().cloned() else {
-            return Err(ClientError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "attach output writer stopped",
-            )));
-        };
 
         loop {
             self.refill_pending_from_spool()?;
             let Some(frame) = self.pending.pop_front() else {
                 break;
             };
-            let strict_waiting = self.pending_has_waiting_strict();
+            let strict_waiting =
+                self.pending_has_waiting_strict() || !self.pending_fences.is_empty();
             if frame.kind == AttachOutputFrameKind::Render
                 && ((self.queued_frames != 0 && !strict_waiting)
                     || self.should_coalesce_front_render())
@@ -692,7 +773,7 @@ impl AttachOutputQueue {
 
             let len = frame.len();
             let kind = frame.kind;
-            match command_tx.try_send(frame.bytes) {
+            match self.worker.try_send_frame(frame.bytes) {
                 Ok(()) => {
                     self.queued_frames = self.queued_frames.saturating_add(1);
                     self.pending_bytes = self.pending_bytes.saturating_sub(len);
@@ -702,15 +783,33 @@ impl AttachOutputQueue {
                         self.rearm_pending_render_timer();
                     }
                 }
-                Err(std_mpsc::TrySendError::Full(bytes)) => {
+                Err(AttachOutputTrySendError::Full(bytes)) => {
                     self.pending.push_front(AttachOutputFrame::new(kind, bytes));
                     break;
                 }
-                Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                Err(AttachOutputTrySendError::Closed(_)) => {
                     return Err(ClientError::Io(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "attach output writer stopped",
                     )));
+                }
+            }
+        }
+
+        if self.pending.is_empty() && self.spool.is_empty() {
+            while let Some(fence) = self.pending_fences.pop_front() {
+                match self.worker.try_send_fence(fence) {
+                    Ok(()) => {}
+                    Err(AttachOutputTrySendError::Full(fence)) => {
+                        self.pending_fences.push_front(fence);
+                        break;
+                    }
+                    Err(AttachOutputTrySendError::Closed(_)) => {
+                        return Err(ClientError::Io(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "attach output writer stopped",
+                        )));
+                    }
                 }
             }
         }
@@ -730,7 +829,10 @@ impl AttachOutputQueue {
     }
 
     fn should_coalesce_front_render(&self) -> bool {
-        self.painted_frame && !self.pending_render_expired() && !self.pending_has_waiting_strict()
+        self.painted_frame
+            && !self.pending_render_expired()
+            && !self.pending_has_waiting_strict()
+            && self.pending_fences.is_empty()
     }
 
     fn rearm_pending_render_timer(&mut self) {
@@ -752,13 +854,13 @@ impl AttachOutputQueue {
     }
 
     fn drain_completed_writes(&mut self) {
-        while self.completed_rx.try_recv().is_ok() {
+        for _ in 0..self.worker.drain_completed_frames() {
             self.queued_frames = self.queued_frames.saturating_sub(1);
         }
     }
 
     fn is_backpressured(&self) -> bool {
-        !self.pending.is_empty() || !self.spool.is_empty()
+        !self.pending.is_empty() || !self.spool.is_empty() || !self.pending_fences.is_empty()
     }
 
     #[cfg(test)]
@@ -770,7 +872,7 @@ impl AttachOutputQueue {
         if !self.is_backpressured() {
             return None;
         }
-        if self.pending_has_waiting_strict() {
+        if self.pending_has_waiting_strict() || !self.pending_fences.is_empty() {
             return Some(ATTACH_OUTPUT_BACKPRESSURE_RETRY);
         }
         let Some(started_at) = self.pending_render_started_at else {
@@ -784,20 +886,35 @@ impl AttachOutputQueue {
     }
 
     fn check_failure(&mut self) -> std::result::Result<(), ClientError> {
-        match self.failure_rx.try_recv() {
-            Ok(error) => Err(ClientError::Io(error)),
-            Err(std_mpsc::TryRecvError::Empty) => Ok(()),
-            Err(std_mpsc::TryRecvError::Disconnected) => Ok(()),
-        }
+        self.worker.check_failure().map_err(ClientError::Io)
     }
 
     fn take_failure_notifications(&mut self) -> mpsc::UnboundedReceiver<()> {
-        self.failure_wake_rx
-            .take()
-            .expect("attach output failure notifications should only be taken once")
+        self.worker.take_failure_notifications()
+    }
+
+    fn take_fence_notifications(&mut self) -> mpsc::UnboundedReceiver<AttachOutputFence> {
+        self.worker.take_fence_notifications()
+    }
+
+    fn cancel_and_join(&mut self) -> std::result::Result<(), ClientError> {
+        self.pending.clear();
+        self.pending_bytes = 0;
+        self.pending_fences.clear();
+        let worker_result = self.worker.cancel_and_join().map_err(ClientError::Io);
+        let spool_result = self.spool.cleanup().map_err(spool_error);
+        worker_result?;
+        spool_result
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.worker.is_stopped()
     }
 
     fn finish(&mut self) -> std::result::Result<(), ClientError> {
+        if self.is_stopped() {
+            return Ok(());
+        }
         self.finish_with_timeout(ATTACH_OUTPUT_DRAIN_TIMEOUT)
     }
 
@@ -810,19 +927,25 @@ impl AttachOutputQueue {
             self.flush_pending()?;
             self.drain_completed_writes();
             self.check_failure()?;
-            if self.pending.is_empty() && self.spool.is_empty() && self.queued_frames == 0 {
-                return Ok(());
+            if self.pending.is_empty()
+                && self.spool.is_empty()
+                && self.pending_fences.is_empty()
+                && self.queued_frames == 0
+            {
+                return self.worker.join_after_drain().map_err(ClientError::Io);
             }
 
             let now = std::time::Instant::now();
             if now >= deadline {
-                return Err(ClientError::Io(io::Error::new(
+                let timeout_error = ClientError::Io(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "timed out draining strict attach output before shutdown",
-                )));
+                ));
+                self.cancel_and_join()?;
+                return Err(timeout_error);
             }
             let wait = (deadline - now).min(ATTACH_OUTPUT_BACKPRESSURE_RETRY);
-            match self.completed_rx.recv_timeout(wait) {
+            match self.worker.recv_completed_frame_timeout(wait) {
                 Ok(()) => {
                     self.queued_frames = self.queued_frames.saturating_sub(1);
                 }
@@ -1218,21 +1341,6 @@ fn spool_error(error: io::Error) -> ClientError {
     ))
 }
 
-impl Drop for AttachOutputQueue {
-    fn drop(&mut self) {
-        drop(self.command_tx.take());
-        if self
-            .done_rx
-            .recv_timeout(ATTACH_OUTPUT_SHUTDOWN_TIMEOUT)
-            .is_ok()
-        {
-            if let Some(worker) = self.worker.take() {
-                let _ = worker.join();
-            }
-        }
-    }
-}
-
 pub(super) struct AttachAsyncChannels {
     input_rx: mpsc::Receiver<super::input::AttachInput>,
     input_completion_rx: Option<oneshot::Receiver<std::result::Result<(), ClientError>>>,
@@ -1243,6 +1351,7 @@ pub(super) struct AttachAsyncChannels {
     locked: Arc<AttachLockState>,
     windows_console_key_enabled: bool,
     error_cleanup: Option<Vec<u8>>,
+    output_fence_timeout: Duration,
 }
 
 impl AttachAsyncChannels {
@@ -1265,6 +1374,7 @@ impl AttachAsyncChannels {
             locked,
             windows_console_key_enabled,
             error_cleanup: None,
+            output_fence_timeout: ATTACH_OUTPUT_FENCE_TIMEOUT,
         }
     }
 
@@ -1280,15 +1390,22 @@ impl AttachAsyncChannels {
         self.error_cleanup = error_cleanup;
         self
     }
+
+    #[cfg(test)]
+    pub(super) fn with_output_fence_timeout(mut self, timeout: Duration) -> Self {
+        self.output_fence_timeout = timeout;
+        self
+    }
 }
 
 struct DrainContext<'context> {
     stop_detector: &'context mut AttachStopDetector,
     mouse_tracker: &'context mut WindowsConsoleMouseTracker,
-    action_tx: &'context std_mpsc::Sender<AttachAction>,
     locked: &'context Arc<AttachLockState>,
     pending_actions: &'context mut usize,
+    pending_attach_actions: &'context mut PendingAttachActions,
     pending_resume_generations: &'context mut VecDeque<Option<AttachStopGeneration>>,
+    output_fence_timeout: Duration,
     metrics: &'context mut AttachMetricsRecorder,
 }
 
@@ -1356,45 +1473,6 @@ impl WindowsConsoleMouseTracker {
     const fn mouse_input_enabled(&self) -> bool {
         self.normal_tracking || self.button_tracking || self.any_tracking
     }
-}
-
-fn send_attach_action(
-    action_tx: &std_mpsc::Sender<AttachAction>,
-    action: AttachAction,
-) -> std::result::Result<(), ClientError> {
-    action_tx
-        .send(action)
-        .map_err(|_| ClientError::Io(io::Error::other("attach action worker stopped")))
-}
-
-fn send_exclusive_attach_action(
-    action_tx: &std_mpsc::Sender<AttachAction>,
-    locked: &Arc<AttachLockState>,
-    pending_actions: &mut usize,
-    action: AttachAction,
-) -> std::result::Result<(), ClientError> {
-    // Suppression is process-wide because Win32 console-control callbacks are
-    // process-wide. It is armed before the attach input lock; any callback
-    // racing this transition is either consumed by an already-active input
-    // read or discarded, never retained across the lock boundary.
-    terminal::suppress_ctrl_c_input();
-    locked.lock();
-    send_attach_action(action_tx, action)?;
-    *pending_actions += 1;
-    Ok(())
-}
-
-fn send_resumable_attach_action(
-    action_tx: &std_mpsc::Sender<AttachAction>,
-    locked: &Arc<AttachLockState>,
-    pending_actions: &mut usize,
-    pending_resume_generations: &mut VecDeque<Option<AttachStopGeneration>>,
-    stop_generation: Option<AttachStopGeneration>,
-    action: AttachAction,
-) -> std::result::Result<(), ClientError> {
-    send_exclusive_attach_action(action_tx, locked, pending_actions, action)?;
-    pending_resume_generations.push_back(stop_generation);
-    Ok(())
 }
 
 async fn write_async_attach_message<Writer>(

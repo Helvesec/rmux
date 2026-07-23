@@ -13,6 +13,7 @@ fn build_screen(cols: u16, rows: u16, content: &str) -> Screen {
 fn test_context() -> CopyModeCommandContext {
     CopyModeCommandContext {
         mode_keys: ModeKeys::Emacs,
+        line_number_mode: CopyModeLineNumberMode::Off,
         wrap_search: true,
         word_separators: " -_@".to_owned(),
         default_shell: "/bin/sh".to_owned(),
@@ -49,6 +50,7 @@ fn summary_top_line_time_is_preserved_for_history_lines() {
 fn vi_context() -> CopyModeCommandContext {
     CopyModeCommandContext {
         mode_keys: ModeKeys::Vi,
+        line_number_mode: CopyModeLineNumberMode::Off,
         wrap_search: true,
         word_separators: " -_@".to_owned(),
         default_shell: "/bin/sh".to_owned(),
@@ -73,6 +75,7 @@ fn mouse_context(x: u32, y: u16) -> CopyModeCommandContext {
             selection_anchor: None,
             scroll_y: y,
             slider_mpos: -1,
+            move_cursor_before_command: true,
         }),
         ..test_context()
     }
@@ -192,6 +195,27 @@ fn search_again_advances_to_next_match() {
         first,
         second,
     );
+}
+
+#[test]
+fn search_updates_an_active_selection_endpoint() {
+    let screen = build_screen(20, 3, "alpha beta gamma");
+    let mut state = CopyModeState::for_test(screen);
+    let context = test_context();
+
+    state.execute_command("history-top", &[], &context).unwrap();
+    state
+        .execute_command("begin-selection", &[], &context)
+        .unwrap();
+    state
+        .execute_command(
+            "search-forward",
+            &["--".to_owned(), "beta".to_owned()],
+            &context,
+        )
+        .unwrap();
+
+    assert_eq!(state.summary().selection_end, Some(state.cursor));
 }
 
 #[test]
@@ -757,6 +781,42 @@ fn goto_line_scrolls_from_bottom_like_tmux() {
 }
 
 #[test]
+fn goto_line_uses_top_relative_positions_for_absolute_line_numbers() {
+    let screen = build_screen(
+        30,
+        4,
+        "L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9\r\nL10\r\nPROMPT",
+    );
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = CopyModeCommandContext {
+        line_number_mode: CopyModeLineNumberMode::Absolute,
+        ..test_context()
+    };
+
+    // Measured against tmux 3.7b: with hsize=7, absolute goto-line 1
+    // selects the oldest history viewport, while hsize+1 selects the bottom.
+    let _ = state.execute_command("goto-line", &["1".to_owned()], &ctx);
+    assert_eq!(state.summary().scroll_position, 7);
+
+    let _ = state.execute_command("goto-line", &["8".to_owned()], &ctx);
+    assert_eq!(state.summary().scroll_position, 0);
+
+    let _ = state.execute_command("goto-line", &["0".to_owned()], &ctx);
+    assert_eq!(state.summary().scroll_position, 7);
+
+    let _ = state.execute_command("goto-line", &["-1".to_owned()], &ctx);
+    assert_eq!(state.summary().scroll_position, 7);
+
+    state.set_line_numbers_enabled(false);
+    let _ = state.execute_command("goto-line", &["1".to_owned()], &ctx);
+    assert_eq!(
+        state.summary().scroll_position,
+        1,
+        "a mouse-origin copy-mode entry keeps tmux's bottom-relative semantics"
+    );
+}
+
+#[test]
 fn line_selection_omits_trailing_newline() {
     let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
     let mut state = CopyModeState::for_test(screen);
@@ -780,10 +840,12 @@ fn line_selection_uses_mouse_position_when_available() {
     let mut state = CopyModeState::for_test(screen);
     let ctx = mouse_context(6, 1);
 
-    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("history-top", &[], &test_context());
     let _ = state.execute_command("select-line", &[], &ctx);
 
-    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
+    let outcome = state
+        .execute_command("copy-selection", &[], &test_context())
+        .unwrap();
     assert_eq!(outcome.transfer.unwrap().data, b"gamma delta");
 }
 
@@ -793,11 +855,34 @@ fn word_selection_uses_mouse_position_when_available() {
     let mut state = CopyModeState::for_test(screen);
     let ctx = mouse_context(6, 1);
 
-    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("history-top", &[], &test_context());
     let _ = state.execute_command("select-word", &[], &ctx);
 
-    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
+    let outcome = state
+        .execute_command("copy-selection", &[], &test_context())
+        .unwrap();
     assert_eq!(outcome.transfer.unwrap().data, b"delta");
+}
+
+#[test]
+fn generic_mouse_reposition_preserves_the_active_selection_endpoint() {
+    let screen = build_screen(20, 3, "alpha beta\r\ngamma delta\r\n");
+    let mut state = CopyModeState::for_test(screen);
+
+    state
+        .execute_command("history-top", &[], &test_context())
+        .unwrap();
+    state
+        .execute_command("select-word", &[], &test_context())
+        .unwrap();
+    let outcome = state
+        .execute_command("copy-selection", &[], &mouse_context(1, 1))
+        .unwrap();
+
+    // tmux 3.7b moves the cursor for mouse-origin send -X without changing
+    // the selection endpoints recorded by select-word.
+    assert_eq!(state.cursor, CopyPosition { x: 1, y: 1 });
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
 }
 
 #[test]
@@ -886,7 +971,186 @@ fn copy_line_omits_trailing_newline() {
 }
 
 #[test]
-fn vi_copy_line_includes_trailing_newline() {
+fn counted_line_transfers_preserve_wrapped_rows_and_line_boundaries() {
+    // Oracle tmux 3.7b: at width 10, -N3 counts the two physical rows of
+    // ABCDEFGHIJKLMNO plus the following row, while -N4 also includes "two".
+    let screen = build_screen(10, 8, "ABCDEFGHIJKLMNO\r\none  \r\ntwo\r\n");
+    let context = test_context();
+
+    for (command, count, cursor_x, expected) in [
+        ("copy-line", 1, 0, b"ABCDEFGHIJKLMNO".as_slice()),
+        ("copy-line", 3, 0, b"ABCDEFGHIJKLMNO\none".as_slice()),
+        ("copy-line", 4, 0, b"ABCDEFGHIJKLMNO\none\ntwo".as_slice()),
+        ("copy-end-of-line", 1, 2, b"CDEFGHIJKLMNO".as_slice()),
+        ("copy-end-of-line", 3, 2, b"CDEFGHIJKLMNO\none".as_slice()),
+        (
+            "copy-end-of-line",
+            4,
+            2,
+            b"CDEFGHIJKLMNO\none\ntwo".as_slice(),
+        ),
+    ] {
+        let mut state = CopyModeState::for_test(screen.clone());
+        state.execute_command("history-top", &[], &context).unwrap();
+        for _ in 0..cursor_x {
+            state
+                .execute_command("cursor-right", &[], &context)
+                .unwrap();
+        }
+
+        let outcome = state
+            .execute_command_with_prefix(command, &[], &context, count)
+            .unwrap();
+
+        assert_eq!(
+            outcome.transfer.unwrap().data,
+            expected,
+            "{command} -N{count}"
+        );
+    }
+}
+
+#[test]
+fn counted_line_transfers_distinguish_wrapped_logical_and_physical_starts() {
+    // Oracle tmux 3.7b from the second physical row of ABCDEFGHIJKLMNO:
+    // copy-line restarts at the logical beginning, while copy-end-of-line
+    // counts from the physical row containing the cursor.
+    let screen = build_screen(10, 8, "ABCDEFGHIJKLMNO\r\none  \r\ntwo\r\n");
+    let context = test_context();
+
+    for (command, count, expected) in [
+        ("copy-line", 1, b"ABCDEFGHIJKLMNO".as_slice()),
+        ("copy-line", 2, b"ABCDEFGHIJKLMNO".as_slice()),
+        ("copy-line", 3, b"ABCDEFGHIJKLMNO\none".as_slice()),
+        ("copy-end-of-line", 1, b"KLMNO".as_slice()),
+        ("copy-end-of-line", 2, b"KLMNO\none".as_slice()),
+        ("copy-end-of-line", 3, b"KLMNO\none\ntwo".as_slice()),
+    ] {
+        let mut state = CopyModeState::for_test(screen.clone());
+        state.execute_command("history-top", &[], &context).unwrap();
+        state.cursor = CopyPosition { x: 0, y: 1 };
+
+        let outcome = state
+            .execute_command_with_prefix(command, &[], &context, count)
+            .unwrap();
+
+        assert_eq!(
+            outcome.transfer.unwrap().data,
+            expected,
+            "{command} -N{count}"
+        );
+    }
+}
+
+#[test]
+fn line_transfer_family_consumes_prefix_as_one_counted_command() {
+    // Oracle tmux 3.7b: every command below consumes -N3 as one counted
+    // transfer. Pipe variants launch once; and-cancel variants then exit mode.
+    let screen = build_screen(10, 8, "ABCDEFGHIJKLMNO\r\none  \r\ntwo\r\n");
+    let context = test_context();
+
+    for (command, pipe, cancel, end_of_line) in [
+        ("copy-line", false, false, false),
+        ("copy-line-and-cancel", false, true, false),
+        ("copy-pipe-line", true, false, false),
+        ("copy-pipe-line-and-cancel", true, true, false),
+        ("copy-end-of-line", false, false, true),
+        ("copy-end-of-line-and-cancel", false, true, true),
+        ("copy-pipe-end-of-line", true, false, true),
+        ("copy-pipe-end-of-line-and-cancel", true, true, true),
+    ] {
+        assert_eq!(
+            CopyModeState::prefix_behavior(command),
+            CopyModePrefixBehavior::Count
+        );
+        let mut state = CopyModeState::for_test(screen.clone());
+        state.execute_command("history-top", &[], &context).unwrap();
+        let cursor_x = if end_of_line { 2 } else { 0 };
+        for _ in 0..cursor_x {
+            state
+                .execute_command("cursor-right", &[], &context)
+                .unwrap();
+        }
+        let args = if pipe {
+            vec!["cat".to_owned()]
+        } else {
+            Vec::new()
+        };
+
+        let outcome = state
+            .execute_command_with_prefix(command, &args, &context, 3)
+            .unwrap();
+        let transfer = outcome.transfer.expect("line transfer is produced");
+        let expected = if end_of_line {
+            b"CDEFGHIJKLMNO\none".as_slice()
+        } else {
+            b"ABCDEFGHIJKLMNO\none".as_slice()
+        };
+
+        assert_eq!(transfer.data, expected, "{command}");
+        assert_eq!(transfer.pipe_command.is_some(), pipe, "{command}");
+        assert_eq!(outcome.cancel, cancel, "{command}");
+    }
+
+    // Oracle tmux 3.7b: cursor-right -N3 reaches x=3, so ordinary motion
+    // remains repeat-based when counted line transfers move to one execution.
+    assert_eq!(
+        CopyModeState::prefix_behavior("cursor-right"),
+        CopyModePrefixBehavior::Repeat
+    );
+}
+
+#[test]
+fn counted_vi_line_transfers_do_not_use_the_selection_newline() {
+    // Oracle tmux 3.7b: counted direct transfers have the same bytes in vi and
+    // emacs modes; only an explicit vi line selection gains a trailing LF.
+    let screen = build_screen(10, 8, "ABCDEFGHIJKLMNO\r\none  \r\ntwo\r\n");
+    let context = vi_context();
+
+    for (command, pipe, cancel, end_of_line) in [
+        ("copy-line", false, false, false),
+        ("copy-line-and-cancel", false, true, false),
+        ("copy-pipe-line", true, false, false),
+        ("copy-pipe-line-and-cancel", true, true, false),
+        ("copy-end-of-line", false, false, true),
+        ("copy-end-of-line-and-cancel", false, true, true),
+        ("copy-pipe-end-of-line", true, false, true),
+        ("copy-pipe-end-of-line-and-cancel", true, true, true),
+    ] {
+        let mut state = CopyModeState::for_test(screen.clone());
+        state.execute_command("history-top", &[], &context).unwrap();
+        if end_of_line {
+            state
+                .execute_command("cursor-right", &[], &context)
+                .unwrap();
+            state
+                .execute_command("cursor-right", &[], &context)
+                .unwrap();
+        }
+        let args = if pipe {
+            vec!["cat".to_owned()]
+        } else {
+            Vec::new()
+        };
+
+        let outcome = state
+            .execute_command_with_prefix(command, &args, &context, 3)
+            .unwrap();
+        let transfer = outcome.transfer.expect("counted vi line transfer");
+        let expected = if end_of_line {
+            b"CDEFGHIJKLMNO\none".as_slice()
+        } else {
+            b"ABCDEFGHIJKLMNO\none".as_slice()
+        };
+
+        assert_eq!(transfer.data, expected, "{command}");
+        assert_eq!(transfer.pipe_command.is_some(), pipe, "{command}");
+        assert_eq!(outcome.cancel, cancel, "{command}");
+    }
+}
+
+#[test]
+fn vi_copy_line_omits_trailing_newline() {
     let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
     let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
     let ctx = vi_context();
@@ -894,7 +1158,7 @@ fn vi_copy_line_includes_trailing_newline() {
     let _ = state.execute_command("history-top", &[], &ctx);
 
     let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"alpha\n");
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
 }
 
 #[test]
@@ -910,7 +1174,7 @@ fn copy_line_on_empty_line_yields_empty_data() {
 }
 
 #[test]
-fn vi_copy_line_on_empty_line_yields_newline() {
+fn vi_copy_line_on_empty_line_yields_empty_data() {
     let screen = build_screen(20, 3, "\r\n");
     let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
     let ctx = vi_context();
@@ -918,7 +1182,7 @@ fn vi_copy_line_on_empty_line_yields_newline() {
     let _ = state.execute_command("history-top", &[], &ctx);
 
     let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"\n");
+    assert_eq!(outcome.transfer.unwrap().data, b"");
 }
 
 #[test]
@@ -936,7 +1200,7 @@ fn copy_end_of_line_omits_trailing_newline() {
 }
 
 #[test]
-fn vi_copy_end_of_line_includes_trailing_newline() {
+fn vi_copy_end_of_line_omits_trailing_newline() {
     let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
     let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
     let ctx = vi_context();
@@ -946,7 +1210,40 @@ fn vi_copy_end_of_line_includes_trailing_newline() {
     let outcome = state
         .execute_command("copy-end-of-line", &[], &ctx)
         .unwrap();
-    assert_eq!(outcome.transfer.unwrap().data, b"alpha\n");
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+}
+
+#[test]
+fn vi_direct_line_transfer_family_keeps_selection_newlines_out_of_payloads() {
+    // Oracle tmux 3.7b: vi line selections retain a trailing newline, but the
+    // eight direct line-transfer commands do not add one of their own.
+    for (command, pipe, cancel) in [
+        ("copy-line", false, false),
+        ("copy-line-and-cancel", false, true),
+        ("copy-pipe-line", true, false),
+        ("copy-pipe-line-and-cancel", true, true),
+        ("copy-end-of-line", false, false),
+        ("copy-end-of-line-and-cancel", false, true),
+        ("copy-pipe-end-of-line", true, false),
+        ("copy-pipe-end-of-line-and-cancel", true, true),
+    ] {
+        let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
+        let context = vi_context();
+        let mut state = CopyModeState::new(screen, None, false, &context, false, true);
+        state.execute_command("history-top", &[], &context).unwrap();
+        let args = if pipe {
+            vec!["cat".to_owned()]
+        } else {
+            Vec::new()
+        };
+
+        let outcome = state.execute_command(command, &args, &context).unwrap();
+        let transfer = outcome.transfer.expect("direct line transfer");
+
+        assert_eq!(transfer.data, b"alpha", "{command}");
+        assert_eq!(transfer.pipe_command.is_some(), pipe, "{command}");
+        assert_eq!(outcome.cancel, cancel, "{command}");
+    }
 }
 
 #[test]

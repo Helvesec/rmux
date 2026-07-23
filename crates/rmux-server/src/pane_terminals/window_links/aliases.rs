@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use rmux_core::Session;
-use rmux_proto::{RmuxError, SessionName, WindowTarget};
+use rmux_proto::{PaneTarget, RmuxError, SessionName, WindowTarget};
 
 use super::super::session_not_found;
 use super::{HandlerState, WindowLinkSlot};
@@ -137,6 +137,48 @@ impl HandlerState {
                 .then_with(|| left.window_index().cmp(&right.window_index()))
         });
         targets
+    }
+
+    pub(crate) fn touch_linked_window_activity_for_pane(
+        &mut self,
+        target: &PaneTarget,
+        pane_id: rmux_core::PaneId,
+    ) -> bool {
+        let targets =
+            self.window_linked_window_targets(target.session_name(), target.window_index());
+        let family_is_complete = targets.iter().all(|window_target| {
+            self.sessions
+                .session(window_target.session_name())
+                .and_then(|session| session.window_at(window_target.window_index()))
+                .is_some_and(|window| window.panes().iter().any(|pane| pane.id() == pane_id))
+        });
+        if !family_is_complete {
+            return false;
+        }
+
+        let activity = {
+            let Some(window) = self
+                .sessions
+                .session_mut(target.session_name())
+                .and_then(|session| session.window_at_mut(target.window_index()))
+            else {
+                return false;
+            };
+            if !window.touch_activity_for_pane(target.pane_index()) {
+                return false;
+            }
+            let Some(activity) = window.pane_activity_snapshot(pane_id) else {
+                return false;
+            };
+            activity
+        };
+
+        targets.into_iter().all(|window_target| {
+            self.sessions
+                .session_mut(window_target.session_name())
+                .and_then(|session| session.window_at_mut(window_target.window_index()))
+                .is_some_and(|window| window.apply_pane_activity_snapshot(activity))
+        })
     }
 
     pub(crate) fn runtime_session_name_for_window(

@@ -13,6 +13,32 @@ use rmux_os::identity::UserIdentity;
 use rmux_proto::{HookLifecycle, SetBufferRequest, SetHookRequest};
 use tokio::sync::mpsc;
 
+async fn wait_for_queued_window_presence(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+    window_index: u32,
+    present: bool,
+) -> Option<rmux_core::WindowId> {
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let window_id = handler
+                .state
+                .lock()
+                .await
+                .sessions
+                .session(session_name)
+                .and_then(|session| session.window_at(window_index))
+                .map(|window| window.id());
+            if window_id.is_some() == present {
+                return window_id;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("follow-on queued window mutation becomes observable")
+}
+
 #[tokio::test]
 async fn parsed_queue_assignments_apply_before_following_commands() {
     let handler = RequestHandler::new();
@@ -183,7 +209,8 @@ async fn unknown_requester_rejects_special_queue_invocations() {
 async fn detached_write_requester_allows_mutating_queue_commands() {
     let handler = RequestHandler::new();
     let requester_pid = 424_003;
-    let _access = handler.begin_detached_requester_access(requester_pid, true);
+    let _access =
+        handler.begin_test_detached_requester_access(requester_pid, AccessMode::ReadWrite);
     let parsed = CommandParser::new()
         .parse("set-buffer -b repro-buffer hello ; show-buffer -b repro-buffer")
         .expect("commands parse");
@@ -200,7 +227,7 @@ async fn detached_write_requester_allows_mutating_queue_commands() {
 async fn detached_read_only_requester_rejects_mutating_queue_commands() {
     let handler = RequestHandler::new();
     let requester_pid = 424_004;
-    let _access = handler.begin_detached_requester_access(requester_pid, false);
+    let _access = handler.begin_test_detached_requester_access(requester_pid, AccessMode::ReadOnly);
     let parsed = CommandParser::new()
         .parse("set-buffer -b repro-buffer hello ; show-buffer -b repro-buffer")
         .expect("commands parse");
@@ -291,6 +318,34 @@ async fn read_only_control_allows_list_panes_all_observation() {
         .await;
 
     assert_eq!(result.error, None);
+}
+
+#[tokio::test]
+async fn read_only_control_allows_list_windows_all_observation() {
+    let handler = RequestHandler::new();
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name("read-only-windows"),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let requester_pid = 42_104;
+    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
+    let parsed = CommandParser::new()
+        .parse("list-windows -a -F '#{session_name}:#{window_index}'")
+        .expect("commands parse");
+
+    let result = handler
+        .execute_control_commands(requester_pid, parsed)
+        .await;
+
+    assert_eq!(result.error, None);
+    assert_eq!(result.stdout, b"read-only-windows:0\n");
 }
 
 #[tokio::test]
@@ -744,48 +799,58 @@ async fn parsed_queue_new_window_prepares_linked_identity_before_same_slot_reuse
         .await
         .expect("queued new-window reaches post-commit lifecycle pause");
 
-    let removed = handler
-        .handle_kill_window(KillWindowRequest {
-            target: WindowTarget::with_window(alpha.clone(), 1),
-            kill_all_others: false,
-        })
-        .await;
-    assert!(matches!(removed, Response::KillWindow(_)), "{removed:?}");
-    let replacement = handler
-        .handle_new_window(
-            std::process::id(),
-            NewWindowRequest {
-                target: alpha.clone(),
-                name: None,
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: Some(1),
-                insert_at_target: false,
-            },
-        )
-        .await;
+    let remove_handler = Arc::clone(&handler);
+    let remove_alpha = alpha.clone();
+    let removing = tokio::spawn(async move {
+        remove_handler
+            .handle_kill_window(KillWindowRequest {
+                target: WindowTarget::with_window(remove_alpha, 1),
+                kill_all_others: false,
+            })
+            .await
+    });
     assert!(
-        matches!(replacement, Response::NewWindow(_)),
-        "{replacement:?}"
+        wait_for_queued_window_presence(&handler, &alpha, 1, false)
+            .await
+            .is_none(),
+        "original queued window is removed"
     );
-    let replacement_id = handler
-        .state
-        .lock()
+    let replacement_handler = Arc::clone(&handler);
+    let replacement_alpha = alpha.clone();
+    let replacing = tokio::spawn(async move {
+        replacement_handler
+            .handle_new_window(
+                std::process::id(),
+                NewWindowRequest {
+                    target: replacement_alpha,
+                    name: None,
+                    detached: true,
+                    start_directory: None,
+                    environment: None,
+                    command: None,
+                    process_command: None,
+                    target_window_index: Some(1),
+                    insert_at_target: false,
+                },
+            )
+            .await
+    });
+    let replacement_id = wait_for_queued_window_presence(&handler, &alpha, 1, true)
         .await
-        .sessions
-        .session(&alpha)
-        .and_then(|session| session.window_at(1))
-        .expect("replacement window exists")
-        .id();
+        .expect("replacement window exists");
     while events.try_recv().is_ok() {}
     pause.release.notify_one();
     creating
         .await
         .expect("queued new-window task joins")
         .expect("queue succeeds");
+    let removed = removing.await.expect("kill-window task joins");
+    assert!(matches!(removed, Response::KillWindow(_)), "{removed:?}");
+    let replacement = replacing.await.expect("replacement new-window task joins");
+    assert!(
+        matches!(replacement, Response::NewWindow(_)),
+        "{replacement:?}"
+    );
 
     let event = loop {
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
@@ -987,6 +1052,49 @@ async fn parsed_queue_new_window_k_validates_environment_before_replacing_target
         .expect("invalid replacement must preserve the target window");
     assert_eq!(protected.id(), protected_window_id);
     assert_eq!(protected.name(), Some("protected"));
+}
+
+#[tokio::test]
+async fn parsed_queue_new_window_k_replaces_the_only_window_without_destroying_session() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("queued-new-window-k-only");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let previous_window_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.window_at(0))
+        .expect("initial window exists")
+        .id();
+
+    let replace = CommandParser::new()
+        .parse("new-window -d -k -t queued-new-window-k-only:0 -n replacement")
+        .expect("queued replacement parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), replace)
+        .await
+        .expect("queued replacement succeeds");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session survives");
+    assert_eq!(session.windows().len(), 1);
+    let replacement = session
+        .window_at(0)
+        .expect("replacement keeps target index");
+    assert_ne!(replacement.id(), previous_window_id);
+    assert_eq!(replacement.name(), Some("replacement"));
 }
 
 #[tokio::test]

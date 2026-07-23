@@ -22,25 +22,26 @@ impl HandlerState {
         target: WindowTarget,
         preserve_zoom: bool,
         input_disabled: Option<bool>,
-    ) -> Result<LastPaneResponse, RmuxError> {
-        let session = self
-            .sessions
-            .session_mut(target.session_name())
-            .ok_or_else(|| session_not_found(target.session_name()))?;
-        let pane_index =
-            session.last_pane_in_window_with_zoom(target.window_index(), preserve_zoom)?;
-        let response_target = PaneTarget::with_window(
-            target.session_name().clone(),
-            target.window_index(),
-            pane_index,
-        );
+    ) -> Result<(LastPaneResponse, Vec<rmux_proto::SessionName>), RmuxError> {
+        let session_name = target.session_name().clone();
+        let window_index = target.window_index();
+        let (pane_index, synchronized_sessions) = self
+            .mutate_session_and_resize_window_terminal_with_family(
+                &session_name,
+                window_index,
+                |session| session.last_pane_in_window_with_zoom(window_index, preserve_zoom),
+            )?;
+        let response_target = PaneTarget::with_window(session_name, window_index, pane_index);
         if let Some(disabled) = input_disabled {
             self.set_pane_input_disabled(&response_target, disabled)?;
         }
 
-        Ok(LastPaneResponse {
-            target: response_target,
-        })
+        Ok((
+            LastPaneResponse {
+                target: response_target,
+            },
+            synchronized_sessions,
+        ))
     }
 
     pub(crate) fn swap_pane(

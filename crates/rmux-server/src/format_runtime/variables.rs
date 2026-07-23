@@ -403,6 +403,12 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "scroll_position" => self
                 .pane_copy_mode_summary()
                 .map(|summary| summary.scroll_position.to_string()),
+            "copy_position" => self
+                .copy_mode_position_values()
+                .map(|(position, _)| position.to_string()),
+            "copy_position_limit" => self
+                .copy_mode_position_values()
+                .map(|(_, limit)| limit.to_string()),
             "rectangle_toggle" => self
                 .pane_copy_mode_summary()
                 .map(|summary| bool_string(summary.rectangle_toggle)),

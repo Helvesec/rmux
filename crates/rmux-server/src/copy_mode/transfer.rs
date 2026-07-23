@@ -1,11 +1,3 @@
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-
-use crate::terminal::shell_std_command;
-use rmux_os::process_tree::{ConsoleWindowBehavior, ProcessTreeChild, ProcessTreeController};
 use rmux_proto::RmuxError;
 
 use super::args::{
@@ -146,10 +138,11 @@ impl CopyModeState {
         args: &[String],
         pipe: bool,
         cancel: bool,
+        count: usize,
     ) -> Result<CopyModeCommandOutcome, RmuxError> {
         let parsed = parse_flagged_args(args, "CP")?;
         ensure_max_positional("copy-line", &parsed.positionals, if pipe { 2 } else { 1 })?;
-        let data = self.current_line_transfer_bytes();
+        let data = self.current_line_transfer_bytes(count);
         let buffer_target = if pipe {
             if parsed.flags.contains(&'P') {
                 None
@@ -192,6 +185,7 @@ impl CopyModeState {
         args: &[String],
         pipe: bool,
         cancel: bool,
+        count: usize,
     ) -> Result<CopyModeCommandOutcome, RmuxError> {
         let parsed = parse_flagged_args(args, "CP")?;
         ensure_max_positional(
@@ -199,7 +193,7 @@ impl CopyModeState {
             &parsed.positionals,
             if pipe { 2 } else { 1 },
         )?;
-        let data = self.current_end_of_line_transfer_bytes();
+        let data = self.current_end_of_line_transfer_bytes(count);
         let buffer_target = if pipe {
             if parsed.flags.contains(&'P') {
                 None
@@ -243,13 +237,14 @@ impl CopyModeState {
             .unwrap_or_default()
     }
 
-    fn current_line_transfer_bytes(&self) -> Vec<u8> {
-        self.line_transfer_text(self.logical_line_text(self.cursor.y, true))
-            .into_bytes()
+    fn current_line_transfer_bytes(&self, count: usize) -> Vec<u8> {
+        let start_y = self.logical_line_start_y(self.cursor.y);
+        let end_y = self.counted_physical_line_end_y(start_y, count);
+        self.extract_line_span(start_y, end_y).into_bytes()
     }
 
-    fn current_end_of_line_transfer_bytes(&self) -> Vec<u8> {
-        let end_y = self.logical_line_end_y(self.cursor.y);
+    fn current_end_of_line_transfer_bytes(&self, count: usize) -> Vec<u8> {
+        let end_y = self.counted_physical_line_end_y(self.cursor.y, count);
         let mut text = String::new();
         for y in self.cursor.y..=end_y {
             let line = self.line(y);
@@ -259,10 +254,20 @@ impl CopyModeState {
                 0
             };
             let end = self.line_end_x(y);
-            text.push_str(&self.extract_line_range(&line, start, end, y == end_y));
+            let trim_spaces = !line.wrapped() || y == end_y;
+            text.push_str(&self.extract_line_range(&line, start, end, trim_spaces));
+            if y < end_y && !line.wrapped() {
+                text.push('\n');
+            }
         }
-        text = self.line_transfer_text(text);
         text.into_bytes()
+    }
+
+    fn counted_physical_line_end_y(&self, y: usize, count: usize) -> usize {
+        let stepped_y = y
+            .saturating_add(count.saturating_sub(1))
+            .min(self.total_lines().saturating_sub(1));
+        self.logical_line_end_y(stepped_y)
     }
 
     fn extract_selection(&self) -> Option<String> {
@@ -308,6 +313,10 @@ impl CopyModeState {
     }
 
     fn extract_line_selection(&self, start_y: usize, end_y: usize) -> String {
+        self.line_selection_text(self.extract_line_span(start_y, end_y))
+    }
+
+    fn extract_line_span(&self, start_y: usize, end_y: usize) -> String {
         let mut lines = Vec::new();
         let mut y = start_y;
         while y <= end_y {
@@ -315,10 +324,10 @@ impl CopyModeState {
             lines.push(self.logical_line_text_range(y, span_end, true));
             y = span_end.saturating_add(1);
         }
-        self.line_transfer_text(lines.join("\n"))
+        lines.join("\n")
     }
 
-    fn line_transfer_text(&self, mut text: String) -> String {
+    fn line_selection_text(&self, mut text: String) -> String {
         if self.mode_keys == ModeKeys::Vi {
             text.push('\n');
         }
@@ -400,190 +409,4 @@ fn explicit_pipe_command(positionals: &[String]) -> Option<CopyModePipeCommand> 
         .cloned()
         .filter(|value| !value.is_empty())
         .map(CopyModePipeCommand::Explicit)
-}
-
-pub(crate) async fn run_pipe_command(
-    shell: &str,
-    command: &str,
-    working_directory: Option<&PathBuf>,
-    data: &[u8],
-) -> Result<(), RmuxError> {
-    if command.is_empty() {
-        return Ok(());
-    }
-
-    let shell = PathBuf::from(shell);
-    let command = command.to_owned();
-    let cwd = working_directory
-        .cloned()
-        .unwrap_or_else(|| PathBuf::from("."));
-    let data = data.to_vec();
-    let guard = PipeCommandGuard::new();
-    let guard_state = guard.state();
-    let result = tokio::task::spawn_blocking(move || {
-        run_pipe_command_blocking(shell, command, cwd, data, guard_state)
-    })
-    .await
-    .map_err(|error| RmuxError::Server(format!("pipe command task failed: {error}")))?;
-    guard.disarm();
-    result
-}
-
-fn run_pipe_command_blocking(
-    shell: PathBuf,
-    command: String,
-    working_directory: PathBuf,
-    data: Vec<u8>,
-    guard_state: Arc<PipeCommandGuardState>,
-) -> Result<(), RmuxError> {
-    let mut child = shell_std_command(&shell, &working_directory, &command);
-    child.stdin(Stdio::piped());
-    child.current_dir(&working_directory);
-    let mut child =
-        ProcessTreeChild::spawn_with_console_window(&mut child, ConsoleWindowBehavior::Suppress)
-            .map_err(|error| {
-                RmuxError::Server(format!("failed to spawn pipe command '{command}': {error}"))
-            })?;
-    let controller = child.controller();
-    if let Err(controller) = guard_state.handoff(controller) {
-        let _ = controller.terminate();
-        let _ = child.wait();
-        return Err(RmuxError::Server(format!(
-            "pipe command '{command}' was cancelled before wait started"
-        )));
-    }
-    if let Some(mut stdin) = child.child_mut().stdin.take() {
-        stdin.write_all(&data).map_err(|error| {
-            RmuxError::Server(format!("failed to write selection to '{command}': {error}"))
-        })?;
-    }
-    let status = child.wait().map_err(|error| {
-        RmuxError::Server(format!(
-            "failed to wait for pipe command '{command}': {error}"
-        ))
-    })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(RmuxError::Server(format!(
-            "pipe command '{command}' exited with status {status}"
-        )))
-    }
-}
-
-struct PipeCommandGuard {
-    state: Arc<PipeCommandGuardState>,
-}
-
-impl PipeCommandGuard {
-    fn new() -> Self {
-        Self {
-            state: Arc::new(PipeCommandGuardState::new()),
-        }
-    }
-
-    fn state(&self) -> Arc<PipeCommandGuardState> {
-        Arc::clone(&self.state)
-    }
-
-    fn disarm(self) {
-        self.state.disarm();
-    }
-}
-
-impl Drop for PipeCommandGuard {
-    fn drop(&mut self) {
-        self.state.terminate();
-    }
-}
-
-struct PipeCommandGuardState {
-    armed: AtomicBool,
-    controller: Mutex<Option<ProcessTreeController>>,
-}
-
-impl PipeCommandGuardState {
-    fn new() -> Self {
-        Self {
-            armed: AtomicBool::new(true),
-            controller: Mutex::new(None),
-        }
-    }
-
-    fn handoff(&self, controller: ProcessTreeController) -> Result<(), ProcessTreeController> {
-        if !self.armed.load(Ordering::SeqCst) {
-            return Err(controller);
-        }
-
-        let mut slot = self
-            .controller
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !self.armed.load(Ordering::SeqCst) {
-            return Err(controller);
-        }
-
-        *slot = Some(controller);
-        Ok(())
-    }
-
-    fn terminate(&self) {
-        if !self.armed.swap(false, Ordering::SeqCst) {
-            return;
-        }
-
-        if let Some(controller) = self.take_controller() {
-            let _ = controller.terminate();
-        }
-    }
-
-    fn disarm(&self) {
-        self.armed.store(false, Ordering::SeqCst);
-        let _ = self.take_controller();
-    }
-
-    fn take_controller(&self) -> Option<ProcessTreeController> {
-        self.controller
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::run_pipe_command;
-    use std::time::{Duration, Instant};
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn pipe_command_wait_does_not_block_the_runtime() {
-        let (shell, command) = slow_shell_command();
-        let start = Instant::now();
-        let pipe = run_pipe_command(&shell, command, None, b"");
-        tokio::pin!(pipe);
-
-        tokio::select! {
-            result = &mut pipe => panic!("pipe command completed before the runtime liveness probe: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-
-        assert!(
-            start.elapsed() < Duration::from_millis(250),
-            "Tokio timer was starved while waiting for copy-pipe helper"
-        );
-        pipe.await.expect("slow pipe command should finish");
-    }
-
-    #[cfg(windows)]
-    fn slow_shell_command() -> (String, &'static str) {
-        (
-            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned()),
-            "ping -n 2 127.0.0.1 >NUL",
-        )
-    }
-
-    #[cfg(unix)]
-    fn slow_shell_command() -> (String, &'static str) {
-        ("/bin/sh".to_owned(), "sleep 0.3")
-    }
 }

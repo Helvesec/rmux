@@ -13,6 +13,13 @@ impl RequestHandler {
         identity: Option<ActiveAttachIdentity>,
         action: PopupMenuAction,
     ) -> Result<(), RmuxError> {
+        if !self
+            .overlay_action_is_current(attach_pid, identity)
+            .await?
+            .is_current()
+        {
+            return Ok(());
+        }
         match action {
             PopupMenuAction::Close => {
                 self.clear_interactive_overlay_for_optional_identity(attach_pid, identity, true)

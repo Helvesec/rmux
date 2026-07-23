@@ -45,6 +45,7 @@ struct ExpectedWindowIdentity {
     index: u32,
     id: WindowId,
     occurrence_id: Option<WindowLinkOccurrenceId>,
+    pane_output_generation: Option<(PaneId, u64)>,
 }
 
 #[derive(Clone)]
@@ -54,6 +55,7 @@ pub(in crate::handler) struct ExpectedWindowOccurrenceIdentity {
     window_index: u32,
     window_id: WindowId,
     occurrence_id: WindowLinkOccurrenceId,
+    pane_output_generation: Option<(PaneId, u64)>,
 }
 
 impl ExpectedWindowOccurrenceIdentity {
@@ -70,7 +72,17 @@ impl ExpectedWindowOccurrenceIdentity {
             window_index,
             window_id,
             occurrence_id,
+            pane_output_generation: None,
         }
+    }
+
+    pub(in crate::handler) fn with_pane_output_generation(
+        mut self,
+        pane_id: PaneId,
+        output_generation: u64,
+    ) -> Self {
+        self.pane_output_generation = Some((pane_id, output_generation));
+        self
     }
 }
 
@@ -357,8 +369,16 @@ pub(in crate::handler) async fn with_expected_window_identity<T, F>(
 where
     F: Future<Output = T>,
 {
-    with_expected_window_identity_inner(name, session_id, window_index, window_id, None, future)
-        .await
+    with_expected_window_identity_inner(
+        name,
+        session_id,
+        window_index,
+        window_id,
+        None,
+        None,
+        future,
+    )
+    .await
 }
 
 async fn with_expected_window_occurrence_identity<T, F>(
@@ -367,6 +387,7 @@ async fn with_expected_window_occurrence_identity<T, F>(
     window_index: u32,
     window_id: WindowId,
     occurrence_id: WindowLinkOccurrenceId,
+    pane_output_generation: Option<(PaneId, u64)>,
     future: F,
 ) -> T
 where
@@ -378,6 +399,7 @@ where
         window_index,
         window_id,
         Some(occurrence_id),
+        pane_output_generation,
         future,
     )
     .await
@@ -389,6 +411,7 @@ async fn with_expected_window_identity_inner<T, F>(
     window_index: u32,
     window_id: WindowId,
     occurrence_id: Option<WindowLinkOccurrenceId>,
+    pane_output_generation: Option<(PaneId, u64)>,
     future: F,
 ) -> T
 where
@@ -401,6 +424,7 @@ where
             index: window_index,
             id: window_id,
             occurrence_id,
+            pane_output_generation,
         }),
         ExpectedSessionPolicy::CapturedOnly,
         future,
@@ -495,6 +519,7 @@ pub(in crate::handler) async fn dispatch_with_expected_window_occurrence_identit
         window_index,
         window_id,
         occurrence_id,
+        pane_output_generation,
     } = identity;
     let (outcome, inline_hooks) = with_expected_window_occurrence_identity(
         name,
@@ -502,6 +527,7 @@ pub(in crate::handler) async fn dispatch_with_expected_window_occurrence_identit
         window_index,
         window_id,
         occurrence_id,
+        pane_output_generation,
         handler.dispatch_captured(requester_pid, u64::from(requester_pid), request),
     )
     .await;
@@ -545,6 +571,7 @@ pub(in crate::handler) fn require_expected_window_identity(
     state: &HandlerState,
     target: &WindowTarget,
 ) -> Result<(), RmuxError> {
+    super::require_expected_stable_window_identity(state, target)?;
     require_expected_session_identity(state, target.session_name())?;
     let expected_window = EXPECTED_SESSION_IDENTITY
         .try_with(|expected| expected.window)
@@ -573,6 +600,17 @@ pub(in crate::handler) fn require_expected_window_identity(
     }
 }
 
+pub(in crate::handler) fn require_expected_pane_identity(
+    state: &HandlerState,
+    target: &PaneTarget,
+) -> Result<(), RmuxError> {
+    super::require_expected_stable_pane_identity(state, target)?;
+    require_expected_window_identity(
+        state,
+        &WindowTarget::with_window(target.session_name().clone(), target.window_index()),
+    )
+}
+
 pub(in crate::handler) fn resolve_expected_window_pane_target(
     state: &HandlerState,
     session_name: &SessionName,
@@ -598,17 +636,25 @@ pub(in crate::handler) fn resolve_expected_window_pane_target(
         .find(|pane| pane.id() == pane_id)
         .map(rmux_core::Pane::index)
         .ok_or_else(|| RmuxError::pane_not_found(session_name.clone(), pane_id))?;
-    Ok(Some(PaneTarget::with_window(
-        session_name.clone(),
-        expected_window.index,
-        pane_index,
-    )))
+    let target = PaneTarget::with_window(session_name.clone(), expected_window.index, pane_index);
+    if let Some((expected_pane_id, expected_generation)) = expected_window.pane_output_generation {
+        let generation_matches = expected_pane_id == pane_id
+            && state.pane_output_generation_for_target(&target, pane_id) == expected_generation;
+        if !generation_matches {
+            return Err(RmuxError::invalid_target(
+                target.to_string(),
+                "pane output generation changed before mutation",
+            ));
+        }
+    }
+    Ok(Some(target))
 }
 
 pub(in crate::handler) fn require_expected_session_identity(
     state: &HandlerState,
     session_name: &SessionName,
 ) -> Result<(), RmuxError> {
+    super::require_expected_stable_session_identity(state, session_name)?;
     let expected = EXPECTED_SESSION_IDENTITY
         .try_with(|expected| (expected.cursor.borrow().clone(), expected.policy))
         .ok();

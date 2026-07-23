@@ -1,10 +1,22 @@
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, HANDLE};
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, ReadFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_INBOUND,
+};
+use windows_sys::Win32::System::Pipes::{
+    CreateNamedPipeW, CreatePipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+    PIPE_WAIT,
+};
+use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+static NEXT_CONPTY_PIPE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct PipePair {
     pub(crate) read: OwnedHandle,
@@ -26,6 +38,64 @@ pub(crate) fn create_pipe(buffer_size: u32) -> io::Result<PipePair> {
     // function and are transferred exactly once into `OwnedHandle`.
     let read = unsafe { OwnedHandle::from_raw_handle(read as _) };
     let write = unsafe { OwnedHandle::from_raw_handle(write as _) };
+    Ok(PipePair { read, write })
+}
+
+pub(crate) fn create_conpty_input_pipe(buffer_size: u32) -> io::Result<PipePair> {
+    let pipe_id = NEXT_CONPTY_PIPE_ID.fetch_add(1, Ordering::Relaxed);
+    let process_id = unsafe {
+        // SAFETY: `GetCurrentProcessId` has no preconditions.
+        GetCurrentProcessId()
+    };
+    let mut name = format!(r"\\.\pipe\rmux-conpty-input-{process_id}-{pipe_id}")
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    name.push(0);
+
+    // ConPTY requires a synchronous pipe handle. The inbound server end is
+    // therefore synchronous, while RMUX's client writer is opened for
+    // overlapped I/O so a pending write can be cancelled on timeout.
+    let read = unsafe {
+        // SAFETY: `name` is NUL-terminated and all optional security
+        // attributes are intentionally omitted. The returned server handle is
+        // uniquely owned on success.
+        CreateNamedPipeW(
+            name.as_ptr(),
+            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1,
+            0,
+            buffer_size,
+            0,
+            null(),
+        )
+    };
+    if read == INVALID_HANDLE_VALUE {
+        return Err(last_os_error());
+    }
+    // SAFETY: `CreateNamedPipeW` returned a uniquely owned live handle.
+    let read = unsafe { OwnedHandle::from_raw_handle(read as _) };
+
+    let write = unsafe {
+        // SAFETY: `name` remains NUL-terminated for the call. The server
+        // instance above already exists, and this handle is opened only for
+        // local overlapped writes.
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+            std::ptr::null_mut(),
+        )
+    };
+    if write == INVALID_HANDLE_VALUE {
+        return Err(last_os_error());
+    }
+    // SAFETY: `CreateFileW` returned a uniquely owned live handle.
+    let write = unsafe { OwnedHandle::from_raw_handle(write as _) };
+
     Ok(PipePair { read, write })
 }
 
@@ -60,33 +130,6 @@ pub(crate) fn read(handle: &OwnedHandle, buffer: &mut [u8]) -> io::Result<usize>
         return Err(io::Error::from_raw_os_error(error as i32));
     }
     Ok(bytes_read as usize)
-}
-
-pub(crate) fn write_all(handle: &OwnedHandle, mut buffer: &[u8]) -> io::Result<()> {
-    while !buffer.is_empty() {
-        let len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
-        let mut bytes_written = 0_u32;
-        // SAFETY: `handle` is a live owned Windows handle, `buffer` is readable
-        // for `len` bytes, and the synchronous call writes the byte count to a
-        // valid stack pointer.
-        let ok = unsafe {
-            WriteFile(
-                handle.as_raw_handle() as HANDLE,
-                buffer.as_ptr().cast(),
-                len,
-                &mut bytes_written,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return Err(last_os_error());
-        }
-        if bytes_written == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"));
-        }
-        buffer = &buffer[bytes_written as usize..];
-    }
-    Ok(())
 }
 
 fn last_os_error() -> io::Error {

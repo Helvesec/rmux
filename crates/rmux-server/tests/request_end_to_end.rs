@@ -20,6 +20,10 @@ use rmux_proto::{
 use tokio::time::sleep;
 
 const COMMAND_SURFACE_COUNT: usize = 79;
+const HANDLER_DISPATCH_ANCHORS: [&str; 2] = [
+    "async fn dispatch_request(",
+    "async fn dispatch_request_inner(",
+];
 const INTERNAL_REQUEST_COMMANDS: [&str; 50] = [
     "attach-session-ext",
     "attach-session-ext2",
@@ -168,7 +172,7 @@ fn request_command_surface_matches_handler_dispatch() -> Result<(), Box<dyn Erro
     )?;
     let handler_commands = extract_match_variant_commands(
         &repo_root.join("crates/rmux-server/src/handler_dispatch.rs"),
-        "match request",
+        &HANDLER_DISPATCH_ANCHORS,
         "Request::",
     )?;
 
@@ -176,6 +180,41 @@ fn request_command_surface_matches_handler_dispatch() -> Result<(), Box<dyn Erro
     assert_eq!(filter_internal_commands(request_enum_commands), expected);
     assert_eq!(filter_internal_commands(request_name_commands), expected);
     assert_eq!(filter_internal_commands(handler_commands), expected);
+    Ok(())
+}
+
+#[test]
+fn split_handler_dispatch_surface_still_detects_a_missing_command() -> Result<(), Box<dyn Error>> {
+    let dispatcher = r#"
+        async fn dispatch_request() {
+            match request {
+                Request::RunShell(request) => dispatch(request),
+                request => dispatch_request_inner(request),
+            }
+        }
+
+        async fn dispatch_request_inner() {
+            match request {
+                Request::ShowBuffer(request) => dispatch(request),
+            }
+        }
+    "#;
+    let actual = extract_match_variant_commands_from_contents(
+        dispatcher,
+        &HANDLER_DISPATCH_ANCHORS,
+        "Request::",
+    )?;
+    let expected = ["if-shell", "run-shell", "show-buffer"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let missing = expected
+        .difference(&actual)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(missing, BTreeSet::from(["if-shell".to_owned()]));
+    assert_ne!(actual, expected);
     Ok(())
 }
 
@@ -839,21 +878,31 @@ fn extract_request_command_names(
 
 fn extract_match_variant_commands(
     path: &Path,
-    anchor: &str,
+    anchors: &[&str],
     prefix: &str,
 ) -> Result<BTreeSet<String>, Box<dyn Error>> {
     let contents = fs::read_to_string(path)?;
-    let block = extract_braced_block(&contents, anchor)?;
+    extract_match_variant_commands_from_contents(&contents, anchors, prefix)
+}
+
+fn extract_match_variant_commands_from_contents(
+    contents: &str,
+    anchors: &[&str],
+    prefix: &str,
+) -> Result<BTreeSet<String>, Box<dyn Error>> {
     let mut commands = BTreeSet::new();
 
-    for line in block.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with(prefix) {
-            continue;
-        }
+    for anchor in anchors {
+        let block = extract_braced_block(contents, anchor)?;
+        for line in block.lines() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with(prefix) {
+                continue;
+            }
 
-        if let Some(variant) = extract_prefixed_variant_name(trimmed, prefix) {
-            commands.insert(camel_case_to_kebab(&variant));
+            if let Some(variant) = extract_prefixed_variant_name(trimmed, prefix) {
+                commands.insert(camel_case_to_kebab(&variant));
+            }
         }
     }
 

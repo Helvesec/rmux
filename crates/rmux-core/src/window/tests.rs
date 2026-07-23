@@ -25,6 +25,41 @@ fn new_window_starts_with_a_single_full_size_pane() {
 }
 
 #[test]
+fn pane_activity_snapshot_updates_only_shared_activity_fields() {
+    let mut source = Window::new(TerminalSize { cols: 80, rows: 24 });
+    source.split_after_position(0);
+    let pane_id = source.pane(1).expect("pane 1 exists").id();
+    let mut linked = source.clone();
+    let other_activity = linked.pane(0).expect("pane 0 exists").activity_at();
+    linked.activity_at = 1;
+    linked
+        .pane_mut(1)
+        .expect("pane 1 exists")
+        .set_activity_at(2);
+    linked.queue_alerts(WINDOW_BELL);
+    linked.set_alerts_queued(true);
+
+    assert!(source.touch_activity_for_pane(1));
+    let activity = source
+        .pane_activity_snapshot(pane_id)
+        .expect("source activity exists");
+    assert!(linked.apply_pane_activity_snapshot(activity));
+
+    assert_eq!(linked.activity_at(), source.activity_at());
+    assert_eq!(
+        linked.pane(1).expect("linked pane 1 exists").activity_at(),
+        source.pane(1).expect("source pane 1 exists").activity_at()
+    );
+    assert_eq!(
+        linked.pane(0).expect("linked pane 0 exists").activity_at(),
+        other_activity,
+        "an unrelated pane's activity must remain local"
+    );
+    assert_eq!(linked.alert_flags(), WINDOW_BELL);
+    assert!(linked.alerts_queued());
+}
+
+#[test]
 fn split_after_position_inserts_after_the_target_and_uses_next_index() {
     let mut window = Window::new(TerminalSize {
         cols: 120,

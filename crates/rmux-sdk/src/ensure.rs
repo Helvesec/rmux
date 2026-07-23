@@ -171,6 +171,10 @@ impl EnsureSession {
     }
 
     /// Records direct process argv for the initial pane.
+    ///
+    /// On Windows, `.bat` and `.cmd` targets are rejected; use a native
+    /// executable for literal argv, or [`Self::shell`] when shell
+    /// interpretation is intentional.
     #[must_use]
     pub fn argv<I, S>(mut self, command: I) -> Self
     where

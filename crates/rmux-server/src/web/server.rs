@@ -1,9 +1,9 @@
-use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
@@ -12,6 +12,7 @@ mod keepalive;
 mod pre_auth;
 mod rate_limit;
 mod streams;
+mod write_timeout;
 
 use super::outbound::WebSocketOutbound;
 use super::protocol::{
@@ -20,15 +21,15 @@ use super::protocol::{
 };
 use super::websocket::{valid_client_key, WebSocket};
 use super::{crypto, crypto::EncryptedWebSocketReader};
-use crate::handler::{RequestHandler, WebShareStream};
+use crate::handler::{NormalRequestGuard, RequestHandler, WebShareStream};
 use http::{read_http_request, write_response, HttpRequest};
 use pre_auth::{PreAuthAdmission, PreAuthGuard, PreAuthQueue};
 use streams::{serve_pane_loop, serve_session_loop};
+use write_timeout::write_with_timeout;
 
 const PRE_AUTH_SLOTS: usize = 64;
 const PRE_AUTH_SLOTS_PER_IP: usize = 4;
 const PRE_READY_TIMEOUT: Duration = Duration::from_secs(8);
-const WEB_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const FD_EXHAUSTION_ACCEPT_BACKOFF: Duration = Duration::from_millis(250);
 
 struct EstablishedWebShare {
@@ -51,6 +52,13 @@ struct PreReadyWebShare {
 }
 
 pub(crate) async fn spawn(handler: Arc<RequestHandler>) -> io::Result<()> {
+    let listener_admission = handler.try_begin_normal_request(false).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Interrupted,
+            "web-share listener cannot start while the server is shutting down",
+        )
+    })?;
+    let shutdown = handler.normal_request_shutdown_receiver();
     let settings = handler.web_settings();
     let bind_addr = format!("{}:{}", settings.host, settings.port);
     let (listener, bind_addr) = match TcpListener::bind(&bind_addr).await {
@@ -82,7 +90,8 @@ pub(crate) async fn spawn(handler: Arc<RequestHandler>) -> io::Result<()> {
     handler.mark_web_listener_available();
     let task_handler = Arc::clone(&handler);
     tokio::spawn(async move {
-        if let Err(error) = serve(handler, listener, bind_addr).await {
+        if let Err(error) = serve(handler, listener, bind_addr, shutdown, listener_admission).await
+        {
             task_handler.mark_web_listener_unavailable(error.to_string());
             warn!("web-share listener stopped: {error}");
         }
@@ -94,11 +103,18 @@ async fn serve(
     handler: Arc<RequestHandler>,
     listener: TcpListener,
     bind_addr: String,
+    mut shutdown: watch::Receiver<bool>,
+    _listener_admission: NormalRequestGuard,
 ) -> io::Result<()> {
     let pre_auth = PreAuthQueue::with_per_ip_capacity(PRE_AUTH_SLOTS, PRE_AUTH_SLOTS_PER_IP);
     debug!("web-share listener bound to {bind_addr}");
     loop {
-        let (stream, peer_addr) = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            () = wait_for_normal_shutdown(&mut shutdown) => return Ok(()),
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer_addr) = match accepted {
             Ok(accepted) => accepted,
             Err(error) if is_fd_exhaustion(&error) => {
                 warn!(
@@ -118,7 +134,15 @@ async fn serve(
         if let Err(error) = stream.set_nodelay(true) {
             warn!(%peer_addr, ?error, "failed to enable TCP_NODELAY for web-share client");
         }
-        let Some(pre_auth_admission) = pre_auth.admit_peer(peer_addr.ip()).await else {
+        let Some(connection_admission) = handler.try_begin_normal_request(false) else {
+            return Ok(());
+        };
+        let pre_auth_admission = tokio::select! {
+            biased;
+            () = wait_for_normal_shutdown(&mut shutdown) => return Ok(()),
+            admission = pre_auth.admit_peer(peer_addr.ip()) => admission,
+        };
+        let Some(pre_auth_admission) = pre_auth_admission else {
             debug!(
                 %peer_addr,
                 "web-share pre-auth capacity reached; closing pending connection"
@@ -126,8 +150,16 @@ async fn serve(
             continue;
         };
         let handler = Arc::clone(&handler);
+        let connection_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_admitted_connection(stream, handler, pre_auth_admission).await
+            if let Err(error) = serve_admitted_connection(
+                stream,
+                handler,
+                pre_auth_admission,
+                connection_shutdown,
+                connection_admission,
+            )
+            .await
             {
                 debug!("web-share connection ended: {error}");
             }
@@ -139,6 +171,8 @@ async fn serve_admitted_connection(
     stream: TcpStream,
     handler: Arc<RequestHandler>,
     admission: PreAuthAdmission,
+    shutdown: watch::Receiver<bool>,
+    _connection_admission: NormalRequestGuard,
 ) -> io::Result<()> {
     let (guard, cancellation) = admission.into_parts();
     tokio::select! {
@@ -149,7 +183,7 @@ async fn serve_admitted_connection(
             sleep(UNIFORM_AUTH_DELAY).await;
             Ok(())
         },
-        result = serve_connection(stream, handler, guard) => result,
+        result = serve_connection(stream, handler, guard, shutdown) => result,
     }
 }
 
@@ -157,8 +191,14 @@ async fn serve_connection(
     mut stream: TcpStream,
     handler: Arc<RequestHandler>,
     pre_auth_guard: PreAuthGuard,
+    mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
-    let request = match timeout(PRE_AUTH_TIMEOUT, read_http_request(&mut stream)).await {
+    let request_result = tokio::select! {
+        biased;
+        () = wait_for_normal_shutdown(&mut shutdown) => return Ok(()),
+        result = timeout(PRE_AUTH_TIMEOUT, read_http_request(&mut stream)) => result,
+    };
+    let request = match request_result {
         Ok(Ok(request)) => request,
         Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
             return write_response(
@@ -184,7 +224,7 @@ async fn serve_connection(
         .await;
     }
     if request.method == "GET" && request.path == "/share" && request.is_websocket_upgrade() {
-        return serve_websocket(stream, request, handler, pre_auth_guard).await;
+        return serve_websocket(stream, request, handler, pre_auth_guard, shutdown).await;
     }
     write_response(
         &mut stream,
@@ -201,6 +241,7 @@ async fn serve_websocket(
     request: HttpRequest,
     handler: Arc<RequestHandler>,
     pre_auth_guard: PreAuthGuard,
+    mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let Some(key) = request.headers.get("sec-websocket-key") else {
         return write_response(
@@ -237,13 +278,20 @@ async fn serve_websocket(
         .await;
     }
     let key = key.to_owned();
-    let established =
-        match establish_web_share(stream, request, key, Arc::clone(&handler), pre_auth_guard).await
-        {
-            Ok(Some(established)) => established,
-            Ok(None) => return Ok(()),
-            Err(error) => return Err(error),
-        };
+    let established = match establish_web_share(
+        stream,
+        request,
+        key,
+        Arc::clone(&handler),
+        pre_auth_guard,
+        &mut shutdown,
+    )
+    .await
+    {
+        Ok(Some(established)) => established,
+        Ok(None) => return Ok(()),
+        Err(error) => return Err(error),
+    };
     match established.share {
         WebShareStream::Pane(pane) => {
             serve_pane_loop(
@@ -252,6 +300,7 @@ async fn serve_websocket(
                 established.outbound,
                 established.share_id,
                 *pane,
+                shutdown,
             )
             .await
         }
@@ -263,6 +312,7 @@ async fn serve_websocket(
                 established.share_id,
                 *session,
                 established.supports_session_pane_frame,
+                shutdown,
             )
             .await
         }
@@ -275,14 +325,18 @@ async fn establish_web_share(
     key: String,
     handler: Arc<RequestHandler>,
     pre_auth_guard: PreAuthGuard,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> io::Result<Option<EstablishedWebShare>> {
     let peer_ip = stream.peer_addr().ok().map(|address| address.ip());
-    let pre_ready = match timeout(
-        PRE_READY_TIMEOUT,
-        complete_pre_ready_handshake(stream, request, key, Arc::clone(&handler), pre_auth_guard),
-    )
-    .await
-    {
+    let pre_ready_result = tokio::select! {
+        biased;
+        () = wait_for_normal_shutdown(shutdown) => return Ok(None),
+        result = timeout(
+            PRE_READY_TIMEOUT,
+            complete_pre_ready_handshake(stream, request, key, Arc::clone(&handler), pre_auth_guard),
+        ) => result,
+    };
+    let pre_ready = match pre_ready_result {
         Ok(Ok(Some(pre_ready))) => pre_ready,
         Ok(Ok(None)) => return Ok(None),
         Ok(Err(error)) => return Err(error),
@@ -320,11 +374,19 @@ async fn establish_web_share(
             return Ok(None);
         }
     };
-    let share = match handler
-        .open_web_share_token_id_with_wait(&token_id, auth_pin.as_deref(), &auth_wait)
-        .await
-    {
-        Ok(pane) => pane,
+    // Authentication and its bounded backoff are cancellation-safe. The returned access owns
+    // reversible viewer leases, so dropping it when shutdown wins leaves no committed mutation.
+    let access = tokio::select! {
+        biased;
+        () = wait_for_normal_shutdown(shutdown) => return Ok(None),
+        result = handler.authenticate_web_share_token_id_with_wait(
+            &token_id,
+            auth_pin.as_deref(),
+            &auth_wait,
+        ) => result,
+    };
+    let access = match access {
+        Ok(access) => access,
         Err(error) => {
             let message = error.to_string();
             // A valid token that omitted the pairing code: signal it distinctly
@@ -338,6 +400,23 @@ async fn establish_web_share(
                 let _ = write_with_timeout(socket.write_close_code(4008, "pin_required")).await;
                 return Ok(None);
             }
+            let close = close_for_auth_error(&message);
+            reject_handshake_with_close(&mut socket, close.reason, close.wire_close).await?;
+            return Ok(None);
+        }
+    };
+    if *shutdown.borrow() {
+        return Ok(None);
+    }
+    // Opening a share can now register an in-process attached client. Do not wrap this await in
+    // a cancelling select: once its Drain guard succeeds it must reach the cleanup boundary.
+    let share = match handler.open_authenticated_web_share(access).await {
+        Ok(pane) => pane,
+        Err(error) => {
+            if *shutdown.borrow() {
+                return Ok(None);
+            }
+            let message = error.to_string();
             let close = close_for_auth_error(&message);
             reject_handshake_with_close(&mut socket, close.reason, close.wire_close).await?;
             return Ok(None);
@@ -483,6 +562,14 @@ fn is_fd_exhaustion(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(23 | 24 | 10024))
 }
 
+async fn wait_for_normal_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Rejects a pre-ready handshake with the collapsed close pair.
 ///
 /// Logs the PRECISE internal reason server-side, waits the uniform auth delay
@@ -502,19 +589,6 @@ async fn reject_handshake_with_close(
     info!(close_code = code, reason, "web_share_handshake_rejected");
     let _ = write_with_timeout(socket.write_close_code(code, wire_reason)).await;
     Ok(())
-}
-
-async fn write_with_timeout<F>(operation: F) -> io::Result<()>
-where
-    F: Future<Output = io::Result<()>>,
-{
-    match timeout(WEB_WRITE_TIMEOUT, operation).await {
-        Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "web-share client write timed out",
-        )),
-    }
 }
 
 #[cfg(test)]

@@ -35,12 +35,20 @@ pub(super) enum ModalPaletteInputSegment {
         index: TerminalPaletteIndex,
         bytes: Vec<u8>,
     },
+    ClipboardResponse {
+        selection: Option<u8>,
+        content: Vec<u8>,
+        bytes: Vec<u8>,
+    },
 }
 
 impl ModalPaletteInputSegment {
     pub(super) fn into_bytes(self) -> Vec<u8> {
         match self {
-            Self::Input(bytes) | Self::PaneBound(bytes) | Self::Response { bytes, .. } => bytes,
+            Self::Input(bytes)
+            | Self::PaneBound(bytes)
+            | Self::Response { bytes, .. }
+            | Self::ClipboardResponse { bytes, .. } => bytes,
         }
     }
 }
@@ -101,6 +109,26 @@ impl RequestHandler {
                         }
                         segments.push(ModalPaletteInputSegment::Response {
                             index,
+                            bytes: candidate[..size].to_vec(),
+                        });
+                        offset += size;
+                        copy_from = offset;
+                        changed = true;
+                        continue;
+                    }
+                    TerminalResponseDecode::ClipboardResponse {
+                        size,
+                        selection,
+                        content,
+                    } => {
+                        if copy_from < offset {
+                            segments.push(ModalPaletteInputSegment::Input(
+                                input[copy_from..offset].to_vec(),
+                            ));
+                        }
+                        segments.push(ModalPaletteInputSegment::ClipboardResponse {
+                            selection,
+                            content,
                             bytes: candidate[..size].to_vec(),
                         });
                         offset += size;
@@ -391,5 +419,28 @@ mod tests {
             .expect("consumed outer-terminal response is removed before modal decoding");
         assert!(split.segments.is_empty());
         assert!(split.retained.is_empty());
+    }
+
+    #[test]
+    fn modal_palette_splitter_types_clipboard_responses_before_key_decoding() {
+        let handler = RequestHandler::new();
+        let response = b"\x1b]52;p;bW9kYWw=\x1b\\";
+        let split = handler
+            .split_attached_modal_palette_input(&[], response)
+            .expect("clipboard response is separated from modal keys");
+        assert!(split.retained.is_empty());
+        assert_eq!(split.segments.len(), 1);
+        match &split.segments[0] {
+            ModalPaletteInputSegment::ClipboardResponse {
+                selection,
+                content,
+                bytes,
+            } => {
+                assert_eq!(*selection, Some(b'p'));
+                assert_eq!(content, b"modal");
+                assert_eq!(bytes, response);
+            }
+            _ => panic!("clipboard response must remain one typed segment"),
+        }
     }
 }

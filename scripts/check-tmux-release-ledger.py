@@ -12,7 +12,6 @@ from pathlib import Path
 
 LEDGER = Path("tests/reference/tmux_compat/divergences.toml")
 COMMAND_INVENTORY = Path("crates/rmux-core/src/command_inventory/signatures.rs")
-OPTIONS_REGISTRY = Path("crates/rmux-core/src/options/table.rs")
 PRODUCT_DIVERGENCE_TEST = re.compile(
     r"(?m)^\s*(?:async\s+)?fn\s+([A-Za-z][A-Za-z0-9_]*_product_divergence)\s*\("
 )
@@ -33,12 +32,15 @@ def fail(message: str) -> int:
 
 
 def git_tracks(path: Path) -> bool:
-    return subprocess.run(
-        ["git", "ls-files", "--error-unmatch", "--", str(path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    ).returncode == 0
+    return (
+        subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 def tracked_rust_sources() -> list[Path]:
@@ -68,7 +70,9 @@ def product_divergence_tests() -> dict[str, Path]:
 def require_string_list(entry: dict[str, object], field: str) -> list[str]:
     value = entry.get(field, [])
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError(f"{entry.get('id', '<unknown>')}: {field} must be a string list")
+        raise ValueError(
+            f"{entry.get('id', '<unknown>')}: {field} must be a string list"
+        )
     return value
 
 
@@ -111,9 +115,13 @@ def load_entries() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
         if inventory not in {"none", "bounded", "deferred"}:
             raise ValueError(f"{entry_id}: invalid inventory value {inventory!r}")
 
-        references = require_string_list(raw, "evidence") + require_string_list(raw, "tests")
+        references = require_string_list(raw, "evidence") + require_string_list(
+            raw, "tests"
+        )
         if not references:
-            raise ValueError(f"{entry_id}: at least one evidence or test reference is required")
+            raise ValueError(
+                f"{entry_id}: at least one evidence or test reference is required"
+            )
         for reference in references:
             validate_reference(reference)
         entries[entry_id] = raw
@@ -121,7 +129,9 @@ def load_entries() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
     return payload, entries
 
 
-def validate_product_tests(entries: dict[str, dict[str, object]]) -> tuple[int, str | None]:
+def validate_product_tests(
+    entries: dict[str, dict[str, object]],
+) -> tuple[int, str | None]:
     try:
         discovered = product_divergence_tests()
     except (OSError, subprocess.CalledProcessError, ValueError) as error:
@@ -141,10 +151,16 @@ def validate_product_tests(entries: dict[str, dict[str, object]]) -> tuple[int, 
             return 0, f"{LEDGER}: tracked test {path}::{name} has no allowlist entry"
         if len(matches) != 1:
             ids = ", ".join(entry_id for entry_id, _ in matches)
-            return 0, f"{LEDGER}: tracked test {name} is cited by multiple entries: {ids}"
+            return (
+                0,
+                f"{LEDGER}: tracked test {name} is cited by multiple entries: {ids}",
+            )
         entry_id, cited_path = matches[0]
         if cited_path != path:
-            return 0, f"{LEDGER}: {entry_id} cites {name} from {cited_path}, expected {path}"
+            return (
+                0,
+                f"{LEDGER}: {entry_id} cites {name} from {cited_path}, expected {path}",
+            )
 
     stale = sorted(set(references).difference(discovered))
     if stale:
@@ -171,21 +187,11 @@ def main() -> int:
         return fail(error)
 
     inventory = COMMAND_INVENTORY.read_text(encoding="utf-8")
-    options = OPTIONS_REGISTRY.read_text(encoding="utf-8")
     deferred = require_string_list(entries.get("C-D32", {}), "deferred")
     if not {"floating-pane", "new-pane"}.issubset(deferred):
         return fail(f"{LEDGER}: C-D32 must defer floating-pane and new-pane")
     if re.search(r'"new-pane"', inventory) is not None or "floating" in inventory:
         return fail(f"{COMMAND_INVENTORY}: deferred pane commands are advertised")
-
-    copy_entry = entries.get("C-D34", {})
-    accepted_options = require_string_list(copy_entry, "accepted_options")
-    limitations = require_string_list(copy_entry, "limitations")
-    if "copy-mode-line-numbers" in options:
-        if "copy-mode-line-numbers" not in accepted_options:
-            return fail(f"{LEDGER}: C-D34 must cover copy-mode-line-numbers")
-        if "line-number-gutter-rendering" not in limitations:
-            return fail(f"{LEDGER}: C-D34 must bound line-number gutter rendering")
 
     print(
         "tmux-release-ledger=ok "

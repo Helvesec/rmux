@@ -21,7 +21,11 @@ fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
 
-async fn create_session(handler: &RequestHandler, name: &str, size: TerminalSize) -> PaneTarget {
+pub(super) async fn create_session(
+    handler: &RequestHandler,
+    name: &str,
+    size: TerminalSize,
+) -> PaneTarget {
     let session_name = session_name(name);
     let ready_marker = "RCREADY";
     let response = handler
@@ -610,7 +614,10 @@ async fn clock_mode_fires_hooks_and_control_notifications_on_entry_and_exit() {
     let pane_id = pane_id(&handler, &target).await;
     assert_eq!(
         drain_control_notifications(&mut notifications),
-        vec![format!("%pane-mode-changed %{pane_id}")]
+        vec![
+            format!("%pane-mode-changed %{pane_id}"),
+            "%paste-buffer-changed pane-mode-hook".to_owned(),
+        ]
     );
 
     let shown = handler
@@ -632,6 +639,9 @@ async fn clock_mode_fires_hooks_and_control_notifications_on_entry_and_exit() {
 
     assert_eq!(
         drain_control_notifications(&mut notifications),
-        vec![format!("%pane-mode-changed %{pane_id}")]
+        vec![
+            format!("%pane-mode-changed %{pane_id}"),
+            "%paste-buffer-changed pane-mode-hook".to_owned(),
+        ]
     );
 }

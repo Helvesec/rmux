@@ -14,8 +14,176 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout, Duration, Instant};
 
 #[tokio::test]
+async fn shutdown_rejects_web_pane_text_key_and_session_mutations() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-shutdown-rejected").await;
+    let session_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session_name)
+            .expect("session exists")
+            .id()
+    };
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(
+            PaneTarget::new(session_name.clone(), 0).into(),
+        )),
+    )
+    .await;
+    let open_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let pane_target = PaneTargetRef::by_id(session_name.clone(), PaneId::new(1));
+    let session_target = crate::web::WebSessionTarget::new(session_name, session_id);
+    let requester_pid = std::process::id();
+    handler.close_normal_request_admission();
+
+    let mut results = Vec::new();
+    results.push(handler.open_web_share(&open_token, None).await.map(drop));
+    results.push(
+        handler
+            .web_send_text(&pane_target, "blocked-text".to_owned())
+            .await,
+    );
+    results.push(handler.web_send_key(&pane_target, "Enter".to_owned()).await);
+    results.push(
+        handler
+            .web_session_logout(&session_target, requester_pid)
+            .await,
+    );
+    results.push(
+        handler
+            .web_session_select_pane(&session_target, requester_pid, PaneId::new(1))
+            .await,
+    );
+    results.push(
+        handler
+            .web_session_resize_pane(
+                &session_target,
+                requester_pid,
+                PaneId::new(1),
+                rmux_proto::ResizePaneAdjustment::NoOp,
+            )
+            .await,
+    );
+    results.push(
+        handler
+            .web_session_split_pane(&session_target, requester_pid, SplitDirection::Horizontal)
+            .await,
+    );
+    results.push(
+        handler
+            .web_session_new_window(&session_target, requester_pid)
+            .await,
+    );
+    results.push(
+        handler
+            .web_session_kill_active_pane(&session_target, requester_pid)
+            .await,
+    );
+    results.push(
+        handler
+            .web_session_select_window(&session_target, requester_pid, 0)
+            .await,
+    );
+    results.push(
+        handler
+            .web_session_select_window_for_view(&session_target, requester_pid, 0)
+            .await
+            .map(drop),
+    );
+    results.push(
+        handler
+            .web_session_rename_window(&session_target, requester_pid, 0, "blocked-name".to_owned())
+            .await,
+    );
+    results.push(
+        handler
+            .web_session_kill_window(&session_target, requester_pid, 0)
+            .await,
+    );
+
+    assert_eq!(
+        results.len(),
+        13,
+        "all Web mutation entry points are covered"
+    );
+    for result in results {
+        let error = result.expect_err("Web mutation must be rejected after quiesce closes");
+        assert!(
+            error.to_string().contains("server is shutting down"),
+            "unexpected rejection: {error}"
+        );
+    }
+
+    assert!(handler.normal_drain_requests_quiesced());
+}
+
+#[tokio::test]
+async fn shutdown_drains_a_web_session_mutation_admitted_before_close() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-shutdown-drain").await;
+    let session_target = {
+        let state = handler.state.lock().await;
+        let session = state
+            .sessions
+            .session(&session_name)
+            .expect("session exists");
+        crate::web::WebSessionTarget::new(session_name.clone(), session.id())
+    };
+
+    // Hold the first state lock needed by the operation. Admission happens
+    // before that lock, making the close-vs-mutation ordering deterministic.
+    let state = handler.state.lock().await;
+    let mutation_handler = handler.clone();
+    let mutation = tokio::spawn(async move {
+        mutation_handler
+            .web_session_new_window(&session_target, std::process::id())
+            .await
+    });
+    timeout(Duration::from_secs(1), async {
+        while handler.normal_drain_requests_quiesced() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Web mutation acquires Drain admission before its first state lock");
+
+    handler.close_normal_request_admission();
+    assert!(
+        !handler.normal_drain_requests_quiesced(),
+        "an admitted Web mutation must retain the shutdown barrier"
+    );
+    drop(state);
+
+    mutation
+        .await
+        .expect("Web mutation task joins")
+        .expect("the already-admitted Web mutation completes");
+    timeout(Duration::from_secs(1), async {
+        while !handler.normal_drain_requests_quiesced() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed Web mutation releases the Drain barrier");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&session_name)
+            .expect("session survives")
+            .windows()
+            .len(),
+        2,
+        "the admitted session mutation commits before shutdown can seal"
+    );
+}
+
+#[tokio::test]
 async fn web_share_create_starts_lazy_listener() {
-    let handler = handler_with_web_port(unused_web_port());
+    let handler = handler_with_automatic_web_port();
     let session_name = new_session(&handler, "lazy-start").await;
 
     let response = handler
@@ -33,8 +201,7 @@ async fn web_share_create_starts_lazy_listener() {
 
 #[tokio::test]
 async fn web_share_config_starts_lazy_listener() {
-    let port = unused_web_port();
-    let handler = handler_with_web_port(port);
+    let handler = handler_with_automatic_web_port();
 
     let response = handler
         .handle(Request::WebShare(Box::new(WebShareRequest::Config(
@@ -48,7 +215,7 @@ async fn web_share_config_starts_lazy_listener() {
     let rmux_proto::WebShareResponse::Config(config) = *response else {
         panic!("expected web-share config response");
     };
-    assert_eq!(config.listener.port, port);
+    assert_eq!(config.listener, handler.web_settings().listener());
 }
 
 #[tokio::test]
@@ -78,7 +245,7 @@ async fn implicit_web_share_port_falls_back_when_default_is_busy() {
 
 #[tokio::test]
 async fn concurrent_web_share_create_waits_for_lazy_listener_start() {
-    let handler = handler_with_web_port(unused_web_port());
+    let handler = handler_with_automatic_web_port();
     let alpha = new_session(&handler, "lazy-alpha").await;
     let beta = new_session(&handler, "lazy-beta").await;
 
@@ -573,30 +740,52 @@ async fn kill_session_pane_prune_preserves_recreated_name_share() {
             }))
             .await
     });
-    pause.reached.notified().await;
+    timeout(Duration::from_secs(5), pause.reached.notified())
+        .await
+        .expect("kill-session reaches the Web prune pause");
 
-    let _ = new_session(&handler, session_name.as_str()).await;
-    let (replacement_session_id, replacement_pane_id) = {
-        let state = handler.state.lock().await;
-        let session = state
-            .sessions
-            .session(&session_name)
-            .expect("replacement session exists");
-        (
-            session.id(),
-            session.active_pane_id().expect("replacement pane exists"),
-        )
-    };
+    let recreate_handler = handler.clone();
+    let recreate_session_name = session_name.clone();
+    let recreate = tokio::spawn(async move {
+        new_session(&recreate_handler, recreate_session_name.as_str()).await
+    });
+    let (replacement_session_id, replacement_pane_id) = timeout(Duration::from_secs(5), async {
+        loop {
+            let replacement = {
+                let state = handler.state.lock().await;
+                state
+                    .sessions
+                    .session(&session_name)
+                    .filter(|session| session.id() != original_session_id)
+                    .map(|session| {
+                        (
+                            session.id(),
+                            session.active_pane_id().expect("replacement pane exists"),
+                        )
+                    })
+            };
+            if let Some(replacement) = replacement {
+                break replacement;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replacement session becomes visible before lifecycle publication");
     assert_ne!(replacement_session_id, original_session_id);
     assert_ne!(replacement_pane_id, original_pane_id);
-    let replacement = create_share(
-        &handler,
-        share_request(WebShareScope::Pane(PaneTargetRef::by_id(
-            session_name.clone(),
-            replacement_pane_id,
-        ))),
+    let replacement = timeout(
+        Duration::from_secs(5),
+        create_share(
+            &handler,
+            share_request(WebShareScope::Pane(PaneTargetRef::by_id(
+                session_name.clone(),
+                replacement_pane_id,
+            ))),
+        ),
     )
-    .await;
+    .await
+    .expect("replacement share is created before stale cleanup resumes");
     let replacement_token = token_from_url(
         replacement
             .spectator_url
@@ -606,9 +795,19 @@ async fn kill_session_pane_prune_preserves_recreated_name_share() {
 
     pause.release.notify_one();
     assert!(matches!(
-        kill.await.expect("kill-session task completes"),
+        timeout(Duration::from_secs(5), kill)
+            .await
+            .expect("kill-session completes after Web prune resumes")
+            .expect("kill-session task completes"),
         Response::KillSession(_)
     ));
+    assert_eq!(
+        timeout(Duration::from_secs(5), recreate)
+            .await
+            .expect("replacement lifecycle publication completes")
+            .expect("replacement session task completes"),
+        session_name
+    );
     assert!(handler.open_web_share(&original_token, None).await.is_err());
     let replacement_stream = handler
         .open_web_share(&replacement_token, None)
@@ -1253,6 +1452,17 @@ fn share_request(scope: WebShareScope) -> CreateWebShareRequest {
 fn handler_with_web_port(port: u16) -> RequestHandler {
     handler_with_web_settings(
         crate::web::WebShareSettings::from_options(port, None).expect("web settings"),
+    )
+}
+
+fn handler_with_automatic_web_port() -> RequestHandler {
+    handler_with_web_settings(
+        crate::web::WebShareSettings::from_options_with_port_explicit(
+            unused_web_port(),
+            None,
+            false,
+        )
+        .expect("web settings"),
     )
 }
 

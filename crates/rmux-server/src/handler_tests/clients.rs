@@ -1,5 +1,6 @@
 use super::*;
 use crate::control::{ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use rmux_core::LifecycleEvent;
 
 #[tokio::test]
 async fn attached_client_flags_keep_tmux_order_for_extended_flag_sets() {
@@ -396,6 +397,260 @@ async fn detach_client_target_session_preserves_reregistered_attached_client() {
     assert!(!replacement
         .closing
         .load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn detach_client_target_session_preserves_control_registered_after_snapshot() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("detach-target-late-control-alpha");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+
+    let attach_pid = 91_349;
+    let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(attach_pid, alpha.clone(), attach_tx)
+        .await;
+    let pause = super::super::attach_support::install_attach_control_identity_pause(attach_pid);
+    let detach_handler = handler.clone();
+    let detach_alpha = alpha.clone();
+    let detach = tokio::spawn(async move {
+        detach_handler
+            .handle(Request::DetachClientExt(
+                rmux_proto::DetachClientExtRequest {
+                    target_client: None,
+                    all_other_clients: false,
+                    target_session: Some(detach_alpha),
+                    kill_on_detach: false,
+                    exec_command: None,
+                },
+            ))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("detach reaches the attach identity check");
+    let control_pid = 91_350;
+    let (control_id, mut control_rx) =
+        register_control_test_client(&handler, control_pid, &alpha).await;
+    pause.release.notify_one();
+
+    assert_eq!(
+        detach.await.expect("detach task joins"),
+        Response::DetachClient(rmux_proto::DetachClientResponse)
+    );
+    assert!(
+        std::iter::from_fn(|| control_rx.try_recv().ok())
+            .all(|event| !matches!(event, ControlServerEvent::Exit(_))),
+        "control registered after the snapshot must not receive Exit"
+    );
+    let active_control = handler.active_control.lock().await;
+    let control = active_control
+        .by_pid
+        .get(&control_pid)
+        .expect("control registered after the snapshot survives");
+    assert_eq!(control.id, control_id);
+    assert_eq!(control.session_name.as_ref(), Some(&alpha));
+    assert!(!control.closing.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn detach_client_target_session_preserves_control_on_recreated_session() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("detach-target-recreated-control-alpha");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let old_session_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .expect("old session exists")
+        .id();
+
+    let attach_pid = 91_351;
+    let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(attach_pid, alpha.clone(), attach_tx)
+        .await;
+    let old_control_pid = 91_352;
+    let (_old_control_id, _old_control_rx) =
+        register_control_test_client(&handler, old_control_pid, &alpha).await;
+    let pause = super::super::attach_support::install_attach_control_identity_pause(attach_pid);
+    let detach_handler = handler.clone();
+    let detach_alpha = alpha.clone();
+    let detach = tokio::spawn(async move {
+        detach_handler
+            .handle(Request::DetachClientExt(
+                rmux_proto::DetachClientExtRequest {
+                    target_client: None,
+                    all_other_clients: false,
+                    target_session: Some(detach_alpha),
+                    kill_on_detach: false,
+                    exec_command: None,
+                },
+            ))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("detach reaches the attach identity check");
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: alpha.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    let recreated = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(
+        matches!(recreated, Response::NewSession(_)),
+        "{recreated:?}"
+    );
+    let new_session_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .expect("recreated session exists")
+        .id();
+    assert_ne!(new_session_id, old_session_id);
+    let new_control_pid = 91_353;
+    let (new_control_id, mut new_control_rx) =
+        register_control_test_client(&handler, new_control_pid, &alpha).await;
+    pause.release.notify_one();
+
+    assert_eq!(
+        detach.await.expect("detach task joins"),
+        Response::DetachClient(rmux_proto::DetachClientResponse)
+    );
+    assert!(
+        std::iter::from_fn(|| new_control_rx.try_recv().ok())
+            .all(|event| !matches!(event, ControlServerEvent::Exit(_))),
+        "control on the recreated session must not receive Exit"
+    );
+    let active_control = handler.active_control.lock().await;
+    let new_control = active_control
+        .by_pid
+        .get(&new_control_pid)
+        .expect("control on the recreated session survives");
+    assert_eq!(new_control.id, new_control_id);
+    assert_eq!(new_control.session_id, Some(new_session_id));
+    assert!(!new_control
+        .closing
+        .load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn detach_client_target_session_tracks_a_renamed_session_identity() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("detach-target-rename-alpha");
+    let beta = session_name("detach-target-rename-beta");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let session_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .expect("session exists")
+        .id();
+
+    let attach_pid = 91_354;
+    let (attach_tx, _attach_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(attach_pid, alpha.clone(), attach_tx)
+        .await;
+    let control_pid = 91_355;
+    let (control_id, mut control_rx) =
+        register_control_test_client(&handler, control_pid, &alpha).await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let pause = super::super::attach_support::install_attach_control_identity_pause(attach_pid);
+    let detach_handler = handler.clone();
+    let detach_alpha = alpha.clone();
+    let detach = tokio::spawn(async move {
+        detach_handler
+            .handle(Request::DetachClientExt(
+                rmux_proto::DetachClientExtRequest {
+                    target_client: None,
+                    all_other_clients: false,
+                    target_session: Some(detach_alpha),
+                    kill_on_detach: false,
+                    exec_command: None,
+                },
+            ))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("detach reaches the attach identity check");
+    let renamed = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: alpha,
+            new_name: beta.clone(),
+        }))
+        .await;
+    assert!(matches!(renamed, Response::RenameSession(_)), "{renamed:?}");
+    pause.release.notify_one();
+
+    assert_eq!(
+        detach.await.expect("detach task joins"),
+        Response::DetachClient(rmux_proto::DetachClientResponse)
+    );
+    assert!(std::iter::from_fn(|| control_rx.try_recv().ok())
+        .any(|event| matches!(event, ControlServerEvent::Exit(None))));
+    let active_control = handler.active_control.lock().await;
+    assert!(!active_control.by_pid.contains_key(&control_pid));
+    drop(active_control);
+    let detached = std::iter::from_fn(|| lifecycle.try_recv().ok())
+        .find(|event| {
+            matches!(
+                &event.event,
+                LifecycleEvent::ClientDetached {
+                    session_name,
+                    client_name: Some(client_name),
+                } if session_name == &beta && client_name == &control_pid.to_string()
+            )
+        })
+        .expect("renamed control publishes client-detached");
+    assert_eq!(detached.control_session_identity, Some(session_id));
+    handler.finish_control(control_pid, control_id).await;
 }
 
 #[tokio::test]

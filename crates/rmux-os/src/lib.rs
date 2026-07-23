@@ -12,6 +12,8 @@ pub mod host;
 pub mod identity;
 pub mod memory;
 pub mod path;
+#[cfg(windows)]
+pub mod pipe;
 pub mod process;
 pub mod process_tree;
 #[cfg(windows)]

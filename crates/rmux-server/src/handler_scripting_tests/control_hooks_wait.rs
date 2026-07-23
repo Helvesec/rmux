@@ -277,14 +277,18 @@ async fn parsed_queue_set_environment_uses_current_session_by_default() {
 async fn hook_string_mode_newlines_share_one_abort_group() {
     let handler = RequestHandler::new();
 
-    let result = with_hook_execution(Vec::new(), async {
-        handler
-            .execute_hook_command(
-                std::process::id(),
-                "show-buffer -b missing\nset-buffer -b skipped no",
-            )
-            .await
-    })
+    let result = with_hook_execution(
+        crate::hook_runtime::HookExecutionContext::command(HookName::AfterShowOptions),
+        Vec::new(),
+        async {
+            handler
+                .execute_hook_command(
+                    std::process::id(),
+                    "show-buffer -b missing\nset-buffer -b skipped no",
+                )
+                .await
+        },
+    )
     .await;
 
     assert!(result.is_err());
@@ -302,11 +306,15 @@ async fn hook_string_mode_newlines_share_one_abort_group() {
 async fn compact_short_options_execute_through_builtin_alias_in_hook() {
     let handler = RequestHandler::new();
 
-    let result = with_hook_execution(Vec::new(), async {
-        handler
-            .execute_hook_command(std::process::id(), "server-info")
-            .await
-    })
+    let result = with_hook_execution(
+        crate::hook_runtime::HookExecutionContext::command(HookName::AfterShowOptions),
+        Vec::new(),
+        async {
+            handler
+                .execute_hook_command(std::process::id(), "server-info")
+                .await
+        },
+    )
     .await;
 
     assert!(

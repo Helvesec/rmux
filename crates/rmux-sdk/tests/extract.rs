@@ -182,7 +182,7 @@ async fn collect_output_until_exit_caps_raw_bytes_and_records_lag() -> TestResul
         }))
         .await?;
 
-        expect_info_probe(&mut peer, running_details_line()).await?;
+        expect_stable_info_probe(&mut peer, running_details_line()).await?;
 
         expect_cursor(&mut peer, subscription_id).await?;
         peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
@@ -205,7 +205,7 @@ async fn collect_output_until_exit_caps_raw_bytes_and_records_lag() -> TestResul
         }))
         .await?;
 
-        expect_info_probe(&mut peer, running_details_line()).await?;
+        expect_stable_info_probe(&mut peer, running_details_line()).await?;
 
         expect_cursor(&mut peer, subscription_id).await?;
         peer.write_response(Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
@@ -228,7 +228,7 @@ async fn collect_output_until_exit_caps_raw_bytes_and_records_lag() -> TestResul
         })))
         .await?;
 
-        expect_info_probe(&mut peer, running_details_line()).await?;
+        expect_stable_info_probe(&mut peer, running_details_line()).await?;
 
         expect_cursor(&mut peer, subscription_id).await?;
         peer.write_response(Response::Error(ErrorResponse {
@@ -236,7 +236,7 @@ async fn collect_output_until_exit_caps_raw_bytes_and_records_lag() -> TestResul
         }))
         .await?;
 
-        expect_info_probe(&mut peer, exited_details_line(0)).await?;
+        expect_stable_info_probe(&mut peer, exited_details_line(0)).await?;
         TestResult::Ok(())
     });
 
@@ -272,7 +272,7 @@ async fn collect_output_until_exit_observes_exit_with_empty_live_subscription() 
         }))
         .await?;
 
-        expect_info_probe(&mut peer, running_details_line()).await?;
+        expect_stable_info_probe(&mut peer, running_details_line()).await?;
 
         expect_cursor(&mut peer, subscription_id).await?;
         peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
@@ -289,7 +289,7 @@ async fn collect_output_until_exit_observes_exit_with_empty_live_subscription() 
         }))
         .await?;
 
-        expect_info_probe(&mut peer, exited_details_line(4)).await?;
+        expect_stable_info_probe(&mut peer, exited_details_line(4)).await?;
 
         TestResult::Ok(())
     });
@@ -324,7 +324,7 @@ async fn collect_output_until_exit_returns_after_post_subscribe_exit_observation
         }))
         .await?;
 
-        expect_info_probe(&mut peer, exited_details_line(9)).await?;
+        expect_stable_info_probe(&mut peer, exited_details_line(9)).await?;
         expect_cursor(&mut peer, subscription_id).await?;
         peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
             subscription_id,
@@ -371,7 +371,7 @@ async fn collect_output_until_exit_drains_final_output_after_exit_observation() 
         }))
         .await?;
 
-        expect_info_probe(&mut peer, running_details_line()).await?;
+        expect_stable_info_probe(&mut peer, running_details_line()).await?;
         expect_cursor(&mut peer, subscription_id).await?;
         peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
             subscription_id,
@@ -384,7 +384,7 @@ async fn collect_output_until_exit_drains_final_output_after_exit_observation() 
         }))
         .await?;
 
-        expect_info_probe(&mut peer, exited_details_line(7)).await?;
+        expect_stable_info_probe(&mut peer, exited_details_line(7)).await?;
         expect_cursor(&mut peer, subscription_id).await?;
         peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
             subscription_id,
@@ -415,6 +415,101 @@ async fn collect_output_until_exit_drains_final_output_after_exit_observation() 
     assert!(output.contains("line-0300"));
     assert!(output.contains("RMUX_BURST_END"));
     assert_eq!(collected.exit_state.and_then(|exit| exit.code), Some(7));
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn collect_output_and_exit_state_stay_on_the_preflighted_pane() -> TestResult {
+    let socket = TestSocket::new("collect-slot-replacement")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+
+        // The slot starts on %1, then %2 replaces it while %1 moves to pane 1.
+        expect_list_panes(&mut peer).await?;
+        expect_identity_listing(&mut peer, None, "0:0:%2\n0:1:%1\n").await?;
+
+        let request = peer.expect_request().await?;
+        assert!(matches!(request, Request::Handshake(_)));
+        peer.write_response(Response::Handshake(HandshakeResponse::current()))
+            .await?;
+
+        let request = peer.expect_request().await?;
+        let Request::SubscribePaneOutputRef(request) = request else {
+            panic!("collection must subscribe by stable id, got {request:?}");
+        };
+        assert_eq!(
+            request.target,
+            PaneTargetRef::by_id(session_name(), PaneId::new(1))
+        );
+        let subscription_id = PaneOutputSubscriptionId::new(31);
+        peer.write_response(Response::SubscribePaneOutput(SubscribePaneOutputResponse {
+            subscription_id,
+            target: PaneRef::new(session_name(), 0, 1).to_proto(),
+            pane_id: PaneId::new(1),
+            cursor: PaneOutputCursor {
+                next_sequence: 1,
+                missed_events: 0,
+            },
+        }))
+        .await?;
+
+        // The replacement is already exited with code 42, while the original
+        // pane exited with code 7. The collector must pair %1 output with 7.
+        expect_mixed_stable_info_probe(&mut peer).await?;
+        expect_cursor(&mut peer, subscription_id).await?;
+        peer.write_response(Response::PaneOutputCursor(PaneOutputCursorResponse {
+            subscription_id,
+            cursor: PaneOutputCursor {
+                next_sequence: 3,
+                missed_events: 0,
+            },
+            events: vec![
+                PaneOutputEvent {
+                    sequence: 1,
+                    bytes: b"original-output".to_vec(),
+                },
+                PaneOutputEvent {
+                    sequence: 2,
+                    bytes: Vec::new(),
+                },
+            ],
+            limited: false,
+        }))
+        .await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let collected = pane.collect_output_until_exit(64).await?;
+    assert_eq!(collected.bytes, b"original-output");
+    assert_eq!(collected.exit_state.and_then(|exit| exit.code), Some(7));
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn collection_keeps_a_vacant_preflight_vacant_after_slot_reuse() -> TestResult {
+    let socket = TestSocket::new("collect-vacant-slot-replacement")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+
+        // Race B: the slot is vacant at the operation preflight. A later
+        // occupant must never be considered by subscription or exit probes.
+        expect_identity_listing(&mut peer, Some(0), "").await?;
+        expect_list_sessions(&mut peer).await?;
+        expect_list_windows(&mut peer).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let collected = pane.collect_output_until_exit(64).await?;
+    assert!(collected.bytes.is_empty());
+    assert_eq!(collected.exit_state, None);
     drop(pane);
     server.await??;
     Ok(())
@@ -523,7 +618,10 @@ async fn expect_output_subscription(
     peer: &mut Peer,
     expected_start: PaneOutputSubscriptionStart,
 ) -> TestResult {
+    // Composite collection pins the mutable slot before opening its output
+    // cursor, then resolves only that stable identity for the subscription.
     expect_list_panes(peer).await?;
+    expect_stable_pane_resolution(peer).await?;
 
     let request = peer.expect_request().await?;
     let Request::Handshake(_) = request else {
@@ -544,6 +642,73 @@ async fn expect_output_subscription(
     Ok(())
 }
 
+async fn expect_stable_pane_resolution(peer: &mut Peer) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::ListPanes(request) = request else {
+        panic!("stable collection target must list panes by id, got {request:?}");
+    };
+    assert_eq!(request.target, session_name());
+    assert_eq!(request.target_window_index, None);
+    assert_eq!(
+        request.format.as_deref(),
+        Some("#{window_index}:#{pane_index}:#{pane_id}")
+    );
+    peer.write_response(Response::ListPanes(ListPanesResponse {
+        output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
+    }))
+    .await
+}
+
+async fn expect_identity_listing(
+    peer: &mut Peer,
+    target_window_index: Option<u32>,
+    output: &str,
+) -> TestResult {
+    let request = peer.expect_request().await?;
+    let Request::ListPanes(request) = request else {
+        panic!("stable identity lookup must list panes, got {request:?}");
+    };
+    assert_eq!(request.target, session_name());
+    assert_eq!(request.target_window_index, target_window_index);
+    assert_eq!(
+        request.format.as_deref(),
+        Some("#{window_index}:#{pane_index}:#{pane_id}")
+    );
+    peer.write_response(Response::ListPanes(ListPanesResponse {
+        output: CommandOutput::from_stdout(output.as_bytes().to_vec()),
+    }))
+    .await
+}
+
+async fn expect_mixed_stable_info_probe(peer: &mut Peer) -> TestResult {
+    let locations = "0\t0\t%2\t$1\t@1\n0\t1\t%1\t$1\t@1\n";
+    let listing = "0:0:%2\n0:1:%1\n";
+    expect_info_location(peer, None, locations).await?;
+    expect_list_sessions(peer).await?;
+    expect_list_windows(peer).await?;
+    expect_identity_listing(peer, Some(0), listing).await?;
+
+    let request = peer.expect_request().await?;
+    let Request::ListPanes(request) = request else {
+        panic!("exit probe must read pane details, got {request:?}");
+    };
+    assert_eq!(request.target, session_name());
+    assert_eq!(request.target_window_index, None);
+    let details = format!(
+        "{}{}",
+        exited_details_line_for(PaneId::new(2), 42),
+        exited_details_line_for(PaneId::new(1), 7)
+    );
+    peer.write_response(Response::ListPanes(ListPanesResponse {
+        output: CommandOutput::from_stdout(details),
+    }))
+    .await?;
+
+    expect_list_sessions(peer).await?;
+    expect_list_windows(peer).await?;
+    expect_identity_listing(peer, Some(0), listing).await
+}
+
 async fn expect_list_panes(peer: &mut Peer) -> TestResult {
     let request = peer.expect_request().await?;
     let Request::ListPanes(request) = request else {
@@ -555,12 +720,6 @@ async fn expect_list_panes(peer: &mut Peer) -> TestResult {
         output: CommandOutput::from_stdout(b"0:0:%1\n".to_vec()),
     }))
     .await
-}
-
-async fn expect_info_probe(peer: &mut Peer, details_line: String) -> TestResult {
-    expect_info_location(peer, Some(0), "0\t0\t%1\t$1\t@1\n").await?;
-    expect_info_location(peer, None, "0\t0\t%1\t$1\t@1\n").await?;
-    expect_info_body(peer, details_line).await
 }
 
 async fn expect_stable_info_probe(peer: &mut Peer, details_line: String) -> TestResult {
@@ -599,26 +758,29 @@ async fn expect_info_body(peer: &mut Peer, details_line: String) -> TestResult {
 }
 
 async fn expect_empty_session_probe(peer: &mut Peer) -> TestResult {
-    let request = peer.expect_request().await?;
-    let Request::ListPanes(request) = request else {
-        panic!("stale exit probe must preflight the pane slot, got {request:?}");
-    };
-    assert_eq!(request.target, session_name());
-    assert_eq!(request.target_window_index, Some(0));
-    peer.write_response(Response::ListPanes(ListPanesResponse {
-        output: CommandOutput::from_stdout(Vec::new()),
-    }))
-    .await?;
+    for _ in 0..2 {
+        let request = peer.expect_request().await?;
+        let Request::ListPanes(request) = request else {
+            panic!("stale stable-id probe must list panes, got {request:?}");
+        };
+        assert_eq!(request.target, session_name());
+        assert_eq!(request.target_window_index, None);
+        peer.write_response(Response::ListPanes(ListPanesResponse {
+            output: CommandOutput::from_stdout(Vec::new()),
+        }))
+        .await?;
 
-    let request = peer.expect_request().await?;
-    let Request::ListSessions(request) = request else {
-        panic!("stale exit probe must list sessions, got {request:?}");
-    };
-    assert_list_sessions_request(&request);
-    peer.write_response(Response::ListSessions(ListSessionsResponse {
-        output: CommandOutput::from_stdout(Vec::new()),
-    }))
-    .await
+        let request = peer.expect_request().await?;
+        let Request::ListSessions(request) = request else {
+            panic!("stale stable-id probe must list sessions, got {request:?}");
+        };
+        assert_list_sessions_request(&request);
+        peer.write_response(Response::ListSessions(ListSessionsResponse {
+            output: CommandOutput::from_stdout(Vec::new()),
+        }))
+        .await?;
+    }
+    Ok(())
 }
 
 async fn expect_list_sessions(peer: &mut Peer) -> TestResult {
@@ -685,7 +847,11 @@ async fn expect_info_location(
 }
 
 fn exited_details_line(code: i32) -> String {
-    format!("%1\t\t1\t{code}\t0\t80\t24\t0\t0\t1\t0\t0\t0\t\t1\t2\t3\t/tmp\n")
+    exited_details_line_for(PaneId::new(1), code)
+}
+
+fn exited_details_line_for(pane_id: PaneId, code: i32) -> String {
+    format!("{pane_id}\t\t1\t{code}\t0\t80\t24\t0\t0\t1\t0\t0\t0\t\t1\t2\t3\t/tmp\n")
 }
 
 fn running_details_line() -> String {

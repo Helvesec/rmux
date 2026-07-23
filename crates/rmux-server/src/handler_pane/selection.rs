@@ -1,29 +1,112 @@
+use std::io;
+
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
     types::OptionScopeSelector, ErrorResponse, HookName, OptionName, PaneTarget, Response,
-    RmuxError, ScopeSelector, SelectPaneResponse, SetOptionMode, Target, WindowTarget,
+    RmuxError, ScopeSelector, SelectPaneResponse, SessionName, SetOptionMode, Target, WindowTarget,
 };
 
 use super::super::RequestHandler;
+use super::io_other;
+use crate::handler::attach_support::ActiveAttachIdentity;
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_state_journal::PaneStateChange;
 use crate::pane_terminals::session_not_found;
 
 impl RequestHandler {
+    pub(in crate::handler) async fn select_attached_mouse_focus(
+        &self,
+        identity: ActiveAttachIdentity,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
+        expected_window_id: u32,
+        pane_id: rmux_core::PaneId,
+    ) -> io::Result<()> {
+        let selected_window = self
+            .with_live_input_session_state(identity, session_name, session_id, |state| {
+                let (window_index, pane_index) = {
+                    let session = state
+                        .sessions
+                        .session(session_name)
+                        .ok_or_else(|| io_other("attached session disappeared"))?;
+                    let window_index = session.active_window_index();
+                    let window = session.window();
+                    if window.id().as_u32() != expected_window_id {
+                        return Ok(None);
+                    }
+                    let Some(pane_index) = window
+                        .panes()
+                        .iter()
+                        .find(|pane| pane.id() == pane_id)
+                        .map(|pane| pane.index())
+                    else {
+                        return Ok(None);
+                    };
+                    if window.active_pane_index() == pane_index {
+                        return Ok(None);
+                    }
+                    (window_index, pane_index)
+                };
+                let (_, refresh_sessions) = state
+                    .mutate_session_and_resize_window_terminal_with_family(
+                        session_name,
+                        window_index,
+                        |session| {
+                            session.select_pane_in_window(window_index, pane_index)?;
+                            Ok(())
+                        },
+                    )
+                    .map_err(io_other)?;
+                Ok(Some((window_index, refresh_sessions)))
+            })
+            .await?
+            .flatten();
+
+        let Some((window_index, refresh_sessions)) = selected_window else {
+            return Ok(());
+        };
+        self.emit(LifecycleEvent::WindowPaneChanged {
+            target: WindowTarget::with_window(session_name.clone(), window_index),
+        })
+        .await;
+        self.refresh_attached_session_for_session_identity(session_name, session_id)
+            .await;
+        self.refresh_linked_window_sessions(
+            refresh_sessions
+                .into_iter()
+                .filter(|candidate| candidate != session_name),
+        )
+        .await;
+        Ok(())
+    }
+
+    pub(in crate::handler) async fn refresh_linked_window_sessions(
+        &self,
+        sessions: impl IntoIterator<Item = SessionName>,
+    ) {
+        for session_name in sessions {
+            if self.attached_count(&session_name).await > 0 {
+                self.refresh_attached_session(&session_name).await;
+            }
+        }
+    }
+
     pub(in crate::handler) async fn handle_last_pane(
         &self,
         request: rmux_proto::LastPaneRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
-        let response = {
+        let (response, refresh_sessions) = {
             let mut state = self.state.lock().await;
             match state.last_pane(
                 request.target,
                 request.preserve_zoom,
                 request.input_disabled,
             ) {
-                Ok(response) => Response::LastPane(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok((response, refresh_sessions)) => {
+                    (Response::LastPane(response), refresh_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
@@ -36,19 +119,11 @@ impl RequestHandler {
                     ),
                 })
                 .await;
-                self.queue_inline_hook(
-                    HookName::AfterSelectPane,
-                    ScopeSelector::Session(session_name.clone()),
-                    Some(Target::Pane(success.target.clone())),
-                    PendingInlineHookFormat::AfterCommand,
-                );
             }
             // See handle_select_pane below: skip refresh on a session with no
             // attached/control client so an unrelated deferred pane wait cannot
             // stall a detached select.
-            if self.attached_count(&session_name).await > 0 {
-                self.refresh_attached_session(&session_name).await;
-            }
+            self.refresh_linked_window_sessions(refresh_sessions).await;
         }
 
         response
@@ -64,7 +139,7 @@ impl RequestHandler {
         let title = request.title.clone();
         let style = request.style.clone();
         let input_disabled = request.input_disabled;
-        let (response, pane_changed, title_changed_target) = {
+        let (response, pane_changed, title_changed_target, refresh_sessions) = {
             let mut state = self.state.lock().await;
             let pane_changed = title.is_none()
                 && input_disabled.is_none()
@@ -76,7 +151,9 @@ impl RequestHandler {
             let mut title_changed_target = None;
             let mut title_state_event = None;
             let mut pane_option_event = None;
+            let mut refresh_sessions = Vec::new();
             match (|| -> Result<SelectPaneResponse, RmuxError> {
+                super::super::require_expected_pane_identity(&state, &request.target)?;
                 if let Some(style) = style.as_deref() {
                     let scope = OptionScopeSelector::Pane(request.target.clone());
                     rmux_core::validate_option_name_mutation(
@@ -101,19 +178,34 @@ impl RequestHandler {
                     state.set_pane_input_disabled(&request.target, disabled)?;
                     request.target.clone()
                 } else {
-                    let session = state
-                        .sessions
-                        .session_mut(&session_name)
-                        .ok_or_else(|| session_not_found(&session_name))?;
-                    session.select_pane_in_window_with_zoom(
-                        window_index,
-                        pane_index,
-                        request.preserve_zoom,
-                    )?;
-                    let active_pane_index = session
-                        .window_at(window_index)
-                        .expect("selected pane window must exist")
-                        .active_pane_index();
+                    let select_target = |session: &mut rmux_core::Session| {
+                        session.select_pane_in_window_with_zoom(
+                            window_index,
+                            pane_index,
+                            request.preserve_zoom,
+                        )?;
+                        Ok(session
+                            .window_at(window_index)
+                            .expect("selected pane window must exist")
+                            .active_pane_index())
+                    };
+                    let (active_pane_index, synchronized_sessions) = if pane_changed {
+                        state.mutate_session_and_resize_window_terminal_with_family(
+                            &session_name,
+                            window_index,
+                            select_target,
+                        )
+                    } else {
+                        // Re-selecting the active pane only updates its activity.
+                        // Its active identity, zoom state, and geometry stay unchanged,
+                        // so synchronize aliases without requiring a live terminal.
+                        state.mutate_session_and_synchronize_window_family(
+                            &session_name,
+                            window_index,
+                            select_target,
+                        )
+                    }?;
+                    refresh_sessions = synchronized_sessions;
                     PaneTarget::with_window(session_name.clone(), window_index, active_pane_index)
                 };
                 if let Some(style) = style {
@@ -162,9 +254,15 @@ impl RequestHandler {
                         Response::SelectPane(response),
                         pane_changed,
                         title_changed_target,
+                        refresh_sessions,
                     )
                 }
-                Err(error) => (Response::Error(ErrorResponse { error }), false, None),
+                Err(error) => (
+                    Response::Error(ErrorResponse { error }),
+                    false,
+                    None,
+                    Vec::new(),
+                ),
             }
         };
 
@@ -178,11 +276,19 @@ impl RequestHandler {
             if let Some(target) = title_changed_target {
                 self.emit(LifecycleEvent::PaneTitleChanged { target }).await;
             }
-            if let Response::SelectPane(success) = &response {
+            if pane_changed {
+                let Response::SelectPane(success) = &response else {
+                    unreachable!("successful select-pane response was checked above");
+                };
                 self.queue_inline_hook(
                     HookName::AfterSelectPane,
                     ScopeSelector::Session(session_name.clone()),
                     Some(Target::Pane(success.target.clone())),
+                    PendingInlineHookFormat::AfterCommand,
+                );
+            } else {
+                self.queue_suppressed_inline_hook(
+                    HookName::AfterSelectPane,
                     PendingInlineHookFormat::AfterCommand,
                 );
             }
@@ -191,8 +297,12 @@ impl RequestHandler {
             // deferred-pane wait — instead of stalling ~2s on the session's own
             // just-spawned pane while it is still starting
             // (unrelated_starting_pane_does_not_block_a_stable_session_refresh).
-            if self.attached_count(&session_name).await > 0 {
-                self.refresh_attached_session(&session_name).await;
+            if refresh_sessions.is_empty() {
+                if self.attached_count(&session_name).await > 0 {
+                    self.refresh_attached_session(&session_name).await;
+                }
+            } else {
+                self.refresh_linked_window_sessions(refresh_sessions).await;
             }
         }
 
@@ -206,38 +316,49 @@ impl RequestHandler {
         let session_name = request.target.session_name().clone();
         let window_index = request.target.window_index();
         let anchor_pane_index = request.target.pane_index();
-        let (response, pane_changed) = {
+        let (response, pane_changed, refresh_sessions) = {
             let mut state = self.state.lock().await;
             let active_before = state
                 .sessions
                 .session(&session_name)
                 .and_then(|session| session.window_at(window_index))
                 .map(|window| window.active_pane_index());
-            match (|| -> Result<SelectPaneResponse, RmuxError> {
-                let session = state
-                    .sessions
-                    .session_mut(&session_name)
-                    .ok_or_else(|| session_not_found(&session_name))?;
-                let active_pane_index = session.select_adjacent_pane_in_window_with_zoom(
-                    window_index,
-                    anchor_pane_index,
-                    request.direction,
-                    request.preserve_zoom,
-                )?;
-                Ok(SelectPaneResponse {
-                    target: PaneTarget::with_window(
-                        session_name.clone(),
+            match (|| -> Result<(SelectPaneResponse, bool, Vec<SessionName>), RmuxError> {
+                let (active_pane_index, refresh_sessions) = state
+                    .mutate_session_and_resize_window_terminal_with_family_if(
+                        &session_name,
                         window_index,
-                        active_pane_index,
-                    ),
-                })
+                        |session| {
+                            session.select_adjacent_pane_in_window_with_zoom(
+                                window_index,
+                                anchor_pane_index,
+                                request.direction,
+                                request.preserve_zoom,
+                            )
+                        },
+                        |active_pane_index| {
+                            active_before.is_some_and(|before| before != *active_pane_index)
+                        },
+                    )?;
+                let pane_changed = active_before.is_some_and(|before| before != active_pane_index);
+                Ok((
+                    SelectPaneResponse {
+                        target: PaneTarget::with_window(
+                            session_name.clone(),
+                            window_index,
+                            active_pane_index,
+                        ),
+                    },
+                    pane_changed,
+                    refresh_sessions,
+                ))
             })() {
-                Ok(response) => {
-                    let pane_changed =
-                        active_before.is_some_and(|before| before != response.target.pane_index());
-                    (Response::SelectPane(response), pane_changed)
-                }
-                Err(error) => (Response::Error(ErrorResponse { error }), false),
+                Ok((response, pane_changed, refresh_sessions)) => (
+                    Response::SelectPane(response),
+                    pane_changed,
+                    refresh_sessions,
+                ),
+                Err(error) => (Response::Error(ErrorResponse { error }), false, Vec::new()),
             }
         };
 
@@ -247,9 +368,27 @@ impl RequestHandler {
                     target: WindowTarget::with_window(session_name.clone(), window_index),
                 })
                 .await;
+                let Response::SelectPane(success) = &response else {
+                    unreachable!("successful adjacent select-pane response was checked above");
+                };
+                self.queue_inline_hook(
+                    HookName::AfterSelectPane,
+                    ScopeSelector::Session(session_name.clone()),
+                    Some(Target::Pane(success.target.clone())),
+                    PendingInlineHookFormat::AfterCommand,
+                );
+            } else {
+                self.queue_suppressed_inline_hook(
+                    HookName::AfterSelectPane,
+                    PendingInlineHookFormat::AfterCommand,
+                );
             }
-            if self.attached_count(&session_name).await > 0 {
-                self.refresh_attached_session(&session_name).await;
+            if refresh_sessions.is_empty() {
+                if self.attached_count(&session_name).await > 0 {
+                    self.refresh_attached_session(&session_name).await;
+                }
+            } else {
+                self.refresh_linked_window_sessions(refresh_sessions).await;
             }
         }
 

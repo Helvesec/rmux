@@ -44,7 +44,9 @@ impl<'a> NewWindowBuilder<'a> {
     /// Spawns the new window with the supplied argv.
     ///
     /// This is direct argv execution, including one-element argv. Use
-    /// [`Self::shell`] when shell execution is intentional.
+    /// [`Self::shell`] when shell execution is intentional. On Windows,
+    /// `.bat` and `.cmd` targets are rejected; use a native executable for
+    /// literal argv.
     #[must_use]
     pub fn spawn<I, S>(mut self, command: I) -> Self
     where

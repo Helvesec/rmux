@@ -100,7 +100,7 @@ fn wasm_payload_is_deterministic_and_rejects_mutated_source_bytes() {
 }
 
 #[test]
-fn crate_payload_orders_dependencies_and_rejects_byte_substitution() {
+fn crate_payload_packages_workspace_orders_dependencies_and_rejects_substitution() {
     let root = temp_dir("crates");
     let fixture = root.join("fixture.py");
     fs::write(
@@ -117,6 +117,22 @@ spec = importlib.util.spec_from_file_location("canonical_crate_set", path)
 module = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 spec.loader.exec_module(module)
+
+calls = []
+class Completed:
+    returncode = 0
+    stderr = ""
+def record_run(command, **kwargs):
+    calls.append(command)
+    return Completed()
+module.subprocess.run = record_run
+module.run_cargo_package(["crate-a", "crate-b"], root / "absent-target")
+assert calls == [[
+    "cargo", "package",
+    "--package", "crate-a",
+    "--package", "crate-b",
+    "--locked", "--no-verify",
+]], calls
 
 def package(name, identifier, dependencies):
     return {

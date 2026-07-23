@@ -46,7 +46,6 @@ pub(super) fn build_window_removal_plan(
             }
         }
     }
-    ensure_window_removal_leaves_survivors(state, &removal_plan)?;
     ensure_window_removal_terminals_exist(state, &removal_plan)?;
     Ok(removal_plan)
 }
@@ -109,32 +108,6 @@ fn build_window_slot_removal_plan(
         session_name: slot.session_name,
         window_index: slot.window_index,
     })
-}
-
-fn ensure_window_removal_leaves_survivors(
-    state: &HandlerState,
-    removal_plan: &[WindowRemovalPlan],
-) -> Result<(), RmuxError> {
-    let mut removals_by_session = HashMap::<SessionName, usize>::new();
-    for planned_window in removal_plan {
-        *removals_by_session
-            .entry(planned_window.session_name.clone())
-            .or_default() += 1;
-    }
-
-    for (session_name, removed_count) in removals_by_session {
-        let session = state
-            .sessions
-            .session(&session_name)
-            .ok_or_else(|| session_not_found(&session_name))?;
-        if session.windows().len() <= removed_count {
-            return Err(RmuxError::Server(format!(
-                "cannot kill the only window in session {session_name}"
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 fn ensure_window_removal_terminals_exist(

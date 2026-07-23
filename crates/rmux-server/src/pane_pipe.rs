@@ -18,9 +18,7 @@ use tokio::sync::{mpsc, watch};
 
 #[path = "pane_pipe/process_group.rs"]
 mod process_group;
-#[cfg(test)]
-pub(crate) use process_group::active_pipe_child_count_for_test;
-use process_group::{mark_pipe_child_started_for_test, wait_for_pipe_child, PipeChildProcessGroup};
+use process_group::{wait_for_pipe_child, PipeChildProcessGroup};
 
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
 use crate::terminal::TerminalProfile;
@@ -37,6 +35,10 @@ impl PipeProcessGroupProbe {
 
     pub(crate) fn termination_count(&self) -> usize {
         self.0.termination_count_for_test()
+    }
+
+    pub(crate) fn child_wait_pending(&self) -> bool {
+        self.0.child_wait_pending_for_test()
     }
 }
 
@@ -294,7 +296,6 @@ impl ActivePanePipe {
         })?;
         let process_group = Arc::new(PipeChildProcessGroup::from_controller(child.controller()));
         let pipe_process_group = Arc::clone(&process_group);
-        mark_pipe_child_started_for_test();
         let stdin = child.child_mut().stdin.take();
         let stdout = child.child_mut().stdout.take();
         let stderr = child.child_mut().stderr.take();

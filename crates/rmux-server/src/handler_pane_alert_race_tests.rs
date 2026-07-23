@@ -8,7 +8,7 @@ use rmux_proto::{
     NewWindowRequest, OptionName, OptionScopeSelector, PaneTarget, Request, Response,
     ScopeSelector, SessionName, SetHookMutationRequest, SetOptionByNameRequest, SetOptionMode,
     SetOptionRequest, SplitDirection, SplitWindowExtRequest, SplitWindowTarget, TerminalSize,
-    WindowId, WindowTarget,
+    WaitForMode, WaitForRequest, WindowId, WindowTarget,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration, Instant};
@@ -227,7 +227,9 @@ fn pane_event(
         title_change: None,
         clipboard_set: true,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: true,
         generation,
     }
@@ -334,7 +336,9 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: hooked_generation,
     });
@@ -355,7 +359,9 @@ async fn queued_pane_hook_does_not_block_an_unrelated_pane_alert() {
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: live_generation,
     });
@@ -419,7 +425,9 @@ async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: exiting_generation,
     });
@@ -448,7 +456,9 @@ async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: false,
         generation: live_generation,
     });
@@ -496,6 +506,132 @@ async fn exiting_pane_hook_wait_does_not_block_unrelated_pane_alert_flush() {
             buffer_text(&state, "exit-title-hook").as_deref(),
             Some("fired"),
             "ordered hook completes before the exit flush returns"
+        );
+    }
+    let _ = hook_shutdown.send(());
+    timeout(Duration::from_secs(2), hook_task)
+        .await
+        .expect("lifecycle hook consumer stops")
+        .expect("lifecycle hook consumer joins");
+}
+
+#[tokio::test]
+async fn pane_alert_reserves_each_lifecycle_position_immediately_before_emission() {
+    const WAIT_CHANNEL: &str = "pane-alert-per-event-sequencing";
+
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-alert-per-event-sequencing").await;
+    enable_clipboard_hooks(&handler).await;
+    set_global_hook(
+        &handler,
+        HookName::PaneTitleChanged,
+        format!("wait-for {WAIT_CHANNEL}"),
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::PaneSetClipboard,
+        "set-buffer -b second-pane-hook finished".to_owned(),
+    )
+    .await;
+    let target = WindowTarget::with_window(session.clone(), 0);
+    let (pane_id, generation, _) = pane_identity(&handler, &target).await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .expect("test owns the lifecycle dispatch receiver");
+    let (hook_shutdown, hook_shutdown_rx) = tokio::sync::oneshot::channel();
+    let hook_handler = handler.clone();
+    let hook_task = tokio::spawn(async move {
+        hook_handler
+            .consume_lifecycle_hooks(lifecycle_events, hook_shutdown_rx)
+            .await;
+    });
+
+    handler.pane_alert_callback()(PaneAlertEvent {
+        session_name: session,
+        pane_id,
+        bell_count: 0,
+        title_changed: true,
+        title_change: None,
+        clipboard_set: true,
+        clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
+        mouse_mode_changed: false,
+        alternate_mode_changed: false,
+        queue_activity_alert: false,
+        generation,
+    });
+    let flush_handler = handler.clone();
+    let mut flush = tokio::spawn(async move {
+        flush_handler
+            .flush_pending_pane_alert_for_exit(pane_id, generation)
+            .await;
+    });
+
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let waiting = handler
+                .wait_for
+                .lock()
+                .expect("wait-for store remains available")
+                .waiter_counts(WAIT_CHANNEL)
+                .0;
+            if waiting == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first pane hook reaches its deterministic wait seam");
+
+    timeout(
+        Duration::from_millis(250),
+        handler.store_buffer(None, b"nested-between-pane-events".to_vec()),
+    )
+    .await
+    .expect("the next pane event must not reserve ahead of an intervening publication")
+    .expect("intervening buffer publication succeeds");
+
+    let response = handler
+        .handle(Request::WaitFor(WaitForRequest {
+            channel: WAIT_CHANNEL.to_owned(),
+            mode: WaitForMode::Signal,
+        }))
+        .await;
+    assert!(matches!(response, Response::WaitFor(_)), "{response:?}");
+    timeout(Duration::from_secs(2), &mut flush)
+        .await
+        .expect("pane alert flush completes without a lifecycle ticket cycle")
+        .expect("pane alert flush task joins");
+
+    let mut observed = Vec::new();
+    while observed.len() < 3 {
+        let event = timeout(Duration::from_secs(2), lifecycle.recv())
+            .await
+            .expect("ordered lifecycle event arrives")
+            .expect("lifecycle channel remains open");
+        if matches!(
+            event.hook_name,
+            HookName::PaneTitleChanged | HookName::PasteBufferChanged | HookName::PaneSetClipboard
+        ) {
+            observed.push(event.hook_name);
+        }
+    }
+    assert_eq!(
+        observed,
+        vec![
+            HookName::PaneTitleChanged,
+            HookName::PasteBufferChanged,
+            HookName::PaneSetClipboard,
+        ]
+    );
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(
+            buffer_text(&state, "second-pane-hook").as_deref(),
+            Some("finished")
         );
     }
     let _ = hook_shutdown.send(());
@@ -579,7 +715,9 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: true,
         generation: exiting_generation,
     });
@@ -613,7 +751,9 @@ async fn exiting_pane_activity_cannot_rearm_silence_after_newer_same_window_acti
         title_change: None,
         clipboard_set: false,
         clipboard_writes: Vec::new(),
+        clipboard_queries: Vec::new(),
         mouse_mode_changed: false,
+        alternate_mode_changed: false,
         queue_activity_alert: true,
         generation: live_generation,
     });

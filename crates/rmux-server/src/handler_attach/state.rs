@@ -11,7 +11,10 @@ use tokio::sync::mpsc;
 use super::super::mode_tree_support::ModeTreeClientState;
 use super::super::overlay_support::ClientOverlayState;
 use super::super::prompt_support::ClientPromptState;
-use super::super::scripting_support::{rename_pane_target_session, rename_window_target_session};
+use super::super::scripting_support::{
+    rename_pane_target_session, rename_window_target_session, QueueExecutionContext,
+};
+use super::super::{RequesterOrigin, StableTargetIdentity};
 use crate::client_flags::ClientFlags;
 use crate::handler_support::{ambiguous_attached_client, attached_client_required};
 use crate::mouse::ClientMouseState;
@@ -22,6 +25,7 @@ use crate::pane_io::{AttachControl, AttachControlSender};
 pub(in crate::handler) struct ActiveAttachState {
     pub(in crate::handler) next_id: u64,
     pub(in crate::handler) next_size_sequence: u64,
+    pub(in crate::handler) next_activity_sequence: u64,
     pub(in crate::handler) by_pid: HashMap<u32, ActiveAttach>,
     pub(in crate::handler) active_client_by_window:
         HashMap<rmux_proto::SessionName, HashMap<u32, u32>>,
@@ -42,6 +46,9 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) uid: u32,
     pub(in crate::handler) user: UserIdentity,
     pub(in crate::handler) can_write: bool,
+    /// A timed-out OSC 52 request makes subsequent untagged responses
+    /// impossible to correlate safely for this attach generation.
+    pub(in crate::handler) clipboard_queries_desynchronized: bool,
     pub(in crate::handler) suspended: bool,
     pub(in crate::handler) closing: Arc<AtomicBool>,
     /// The server initiated this close without first emitting `client-detached`.
@@ -50,6 +57,8 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) client_size: TerminalSize,
     pub(in crate::handler) client_pixels: Option<TerminalPixels>,
     pub(in crate::handler) size_sequence: u64,
+    /// Server-monotonic ordering of the client's latest accepted live input.
+    pub(in crate::handler) last_activity_sequence: u64,
     pub(in crate::handler) persistent_overlay_epoch: Arc<AtomicU64>,
     pub(in crate::handler) render_generation: u64,
     pub(in crate::handler) overlay_generation: u64,
@@ -57,6 +66,7 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) display_panes_state_id: u64,
     pub(in crate::handler) key_table_name: Option<String>,
     pub(in crate::handler) key_table_set_at: Option<Instant>,
+    pub(in crate::handler) key_table_generation: u64,
     pub(in crate::handler) repeat_deadline: Option<Instant>,
     pub(in crate::handler) repeat_active: bool,
     pub(in crate::handler) last_key: Option<KeyCode>,
@@ -137,6 +147,8 @@ impl ActiveAttach {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::handler) struct DisplayPanesClientState {
     pub(in crate::handler) id: u64,
+    pub(in crate::handler) origin: RequesterOrigin,
+    pub(in crate::handler) command_context: QueueExecutionContext,
     pub(in crate::handler) window: WindowTarget,
     pub(in crate::handler) labels: Vec<DisplayPanesLabel>,
     pub(in crate::handler) input: String,
@@ -149,6 +161,7 @@ pub(in crate::handler) struct DisplayPanesLabel {
     pub(in crate::handler) label: String,
     pub(in crate::handler) target: PaneTarget,
     pub(in crate::handler) target_string: String,
+    pub(in crate::handler) target_identity: StableTargetIdentity,
 }
 
 #[derive(Debug)]
@@ -172,6 +185,9 @@ fn rename_display_panes_state(
     new_name: &rmux_proto::SessionName,
 ) -> bool {
     let mut renamed = state.clone();
+    renamed
+        .command_context
+        .rename_session_targets(old_name, new_name);
     rename_window_target_session(&mut renamed.window, old_name, new_name);
     let old_prefix = format!("={old_name}:");
     for label in &mut renamed.labels {
@@ -183,12 +199,23 @@ fn rename_display_panes_state(
         };
         rename_pane_target_session(&mut label.target, old_name, new_name);
         label.target_string = format!("={new_name}:{suffix}");
+        label.target_identity.rename_session(old_name, new_name);
     }
     *state = renamed;
     true
 }
 
 impl ActiveAttachState {
+    pub(in crate::handler) fn record_client_activity(&mut self, attach_pid: u32) -> bool {
+        let Some(active) = self.by_pid.get_mut(&attach_pid) else {
+            return false;
+        };
+        let sequence = self.next_activity_sequence;
+        self.next_activity_sequence = self.next_activity_sequence.saturating_add(1);
+        active.last_activity_sequence = sequence;
+        true
+    }
+
     pub(in crate::handler) fn attached_count(
         &self,
         session_name: &rmux_proto::SessionName,
@@ -211,12 +238,12 @@ impl ActiveAttachState {
                 if let Some(mode_tree) = active.mode_tree.as_mut() {
                     mode_tree.rename_session(session_name, new_name);
                 }
-                if active.display_panes.as_mut().is_some_and(|display_panes| {
-                    !rename_display_panes_state(display_panes, session_name, new_name)
-                }) {
-                    active.display_panes = None;
-                    active.display_panes_state_id = active.display_panes_state_id.saturating_add(1);
-                }
+            }
+            if active.display_panes.as_mut().is_some_and(|display_panes| {
+                !rename_display_panes_state(display_panes, session_name, new_name)
+            }) {
+                active.display_panes = None;
+                active.display_panes_state_id = active.display_panes_state_id.saturating_add(1);
             }
             if active.last_session.as_ref() == Some(session_name)
                 && active.last_session_id == Some(session_id)

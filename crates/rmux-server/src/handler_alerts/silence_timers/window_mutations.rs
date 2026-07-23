@@ -1,14 +1,13 @@
 //! Silence-timer plans for structural window mutations.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Duration;
 
 use rmux_core::WINLINK_SILENCE;
 use rmux_proto::{SessionId, SessionName, WindowId, WindowTarget};
 
 use super::super::super::RequestHandler;
 use super::super::SilenceTimerState;
-use super::{desired_silence_timers, monitor_silence_seconds, DesiredSilenceTimer};
+use super::{desired_silence_timers, monitor_silence_seconds};
 use crate::pane_terminals::HandlerState;
 
 #[path = "window_mutations/fanout.rs"]
@@ -268,6 +267,21 @@ impl RequestHandler {
             })
             .collect::<Vec<_>>();
 
+        let admission_count = resolved
+            .iter()
+            .fold(0_usize, |count, (_, destinations)| {
+                count.saturating_add(destinations.len())
+            })
+            .saturating_add(
+                desired_arm_targets
+                    .iter()
+                    .filter(|desired| desired.seconds != 0)
+                    .count(),
+            );
+        let Some(mut timer_reservations) = self.reserve_silence_timer_tasks(admission_count) else {
+            return;
+        };
+
         #[cfg(test)]
         self.pause_before_silence_timer_apply();
 
@@ -342,6 +356,7 @@ impl RequestHandler {
                     planned.window_id,
                     generation,
                     deadline,
+                    timer_reservations.take(),
                 );
                 let previous = timers.insert(
                     destination.target,
@@ -364,8 +379,15 @@ impl RequestHandler {
         // Existing timers keep their absolute deadlines; explicit SetOption
         // synchronization deliberately takes the normal rearm path.
         for desired in desired_arm_targets {
-            arm_missing_timer(self, &mut timers, &original_generations, desired);
+            self.arm_missing_silence_timer(
+                &mut timers,
+                &original_generations,
+                desired,
+                &mut timer_reservations,
+            );
         }
+        drop(timers);
+        drop(timer_reservations);
     }
 
     #[cfg(test)]
@@ -374,6 +396,9 @@ impl RequestHandler {
         target: &WindowTarget,
         deadline: tokio::time::Instant,
     ) {
+        let mut timer_reservations = self
+            .reserve_silence_timer_tasks(1)
+            .expect("test silence timer admission remains open");
         let mut timers = self
             .silence_timers
             .lock()
@@ -389,6 +414,7 @@ impl RequestHandler {
             previous.window_id,
             generation,
             deadline,
+            timer_reservations.take(),
         );
         timers.insert(
             target.clone(),
@@ -400,56 +426,9 @@ impl RequestHandler {
                 task,
             },
         );
+        drop(timers);
+        drop(timer_reservations);
     }
-}
-
-fn arm_missing_timer(
-    handler: &RequestHandler,
-    timers: &mut HashMap<WindowTarget, SilenceTimerState>,
-    original_generations: &HashMap<WindowTarget, u64>,
-    desired: DesiredSilenceTimer,
-) {
-    let target = desired.target;
-    if desired.seconds == 0 {
-        if let Some(previous) = timers.remove(&target) {
-            previous.task.abort();
-        }
-        return;
-    }
-    let existing_matches = timers.get(&target).is_some_and(|timer| {
-        timer.session_id == desired.session_id && timer.window_id == desired.window_id
-    });
-    if existing_matches {
-        return;
-    }
-    let previous_generation = timers
-        .remove(&target)
-        .map(|previous| {
-            let generation = previous.generation;
-            previous.task.abort();
-            generation
-        })
-        .unwrap_or(0)
-        .max(original_generations.get(&target).copied().unwrap_or(0));
-    let generation = previous_generation.saturating_add(1).max(1);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(desired.seconds);
-    let task = handler.spawn_silence_timer_task(
-        target.clone(),
-        desired.session_id,
-        desired.window_id,
-        generation,
-        deadline,
-    );
-    timers.insert(
-        target,
-        SilenceTimerState {
-            session_id: desired.session_id,
-            window_id: desired.window_id,
-            generation,
-            deadline,
-            task,
-        },
-    );
 }
 
 fn stable_window_occurrence(

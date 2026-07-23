@@ -179,7 +179,7 @@ pub(super) fn overlay_position_context(
         .unwrap_or_else(|| session.window());
     let pane = pane_geometry_for_target(session, target)
         .or_else(|| window.active_pane().map(|pane| pane.geometry()));
-    let status_layout = status_line_layout(session, &state.options, 0, None);
+    let status_layout = status_line_layout(session, &state.options, 0, None, Some(state));
     OverlayPositionContext {
         client_size,
         pane,

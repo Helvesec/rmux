@@ -17,6 +17,7 @@ impl RequestHandler {
         request: rmux_proto::PaneOptionSetRequest,
     ) -> Response {
         let mut refresh_session = None;
+        let mut linked_geometry_refreshes = Vec::new();
         let mut alert_scope = None;
         let mut alerts_changed = false;
         let response = {
@@ -78,10 +79,9 @@ impl RequestHandler {
                         if option == OptionName::MessageLimit {
                             state.trim_message_log();
                         }
-                        if let Err(error) =
-                            resize_terminals_for_named_option_change(&mut state, option, &scope)
-                        {
-                            resize_error = Some(error);
+                        match resize_terminals_for_named_option_change(&mut state, option, &scope) {
+                            Ok(refreshes) => linked_geometry_refreshes = refreshes,
+                            Err(error) => resize_error = Some(error),
                         }
                     }
                     let response = if let Some(error) = resize_error {
@@ -104,6 +104,9 @@ impl RequestHandler {
         if matches!(response, Response::PaneOptionSet(_)) {
             if let Some(session_name) = refresh_session.as_ref() {
                 self.refresh_attached_session(session_name).await;
+            }
+            for session_name in linked_geometry_refreshes {
+                self.refresh_attached_session(&session_name).await;
             }
             if alerts_changed {
                 if let Some(scope) = alert_scope.as_ref() {

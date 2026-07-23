@@ -98,11 +98,19 @@ pub enum ConnectResult {
 /// exit code `0` for an absent server. Returns an error only for unexpected
 /// transport failures.
 pub fn connect_or_absent(socket_path: &Path) -> Result<ConnectResult, ClientError> {
-    connect_or_absent_with_timeout_using(
-        socket_path,
-        SOCKET_CONNECT_TIMEOUT,
-        connect_stream_with_timeout,
-    )
+    connect_or_absent_with_timeout(socket_path, SOCKET_CONNECT_TIMEOUT)
+}
+
+/// Attempts to connect to the RMUX server within a caller-provided timeout,
+/// distinguishing an absent server from other transport failures.
+///
+/// This is intended for bounded lifecycle probes. Ordinary detached clients
+/// should use [`connect_or_absent`], which applies the standard connect timeout.
+pub(crate) fn connect_or_absent_with_timeout(
+    socket_path: &Path,
+    timeout: Duration,
+) -> Result<ConnectResult, ClientError> {
+    connect_or_absent_with_timeout_using(socket_path, timeout, connect_stream_with_timeout)
 }
 
 /// Connects to the RMUX server, returning an error if the server is absent.
@@ -270,12 +278,7 @@ impl Connection {
         let result = self.roundtrip(request);
         let restore_result =
             set_read_timeout(&self.stream, previous_timeout).map_err(ClientError::Io);
-
-        match (result, restore_result) {
-            (Err(error), _) => Err(error),
-            (Ok(response), Ok(())) => Ok(response),
-            (Ok(_), Err(error)) => Err(error),
-        }
+        finish_unbounded_roundtrip(result, restore_result)
     }
 
     /// Reads the next detached response without a response read timeout.
@@ -383,6 +386,29 @@ impl Connection {
             stream: self.stream,
         })
     }
+}
+
+fn finish_unbounded_roundtrip(
+    result: Result<Response, ClientError>,
+    restore_result: Result<(), ClientError>,
+) -> Result<Response, ClientError> {
+    match (result, restore_result) {
+        (Err(error), _) => Err(error),
+        (Ok(response), Ok(())) => Ok(response),
+        (Ok(response), Err(ClientError::Io(error)))
+            if completed_response_survives_timeout_restore_error(&error) =>
+        {
+            Ok(response)
+        }
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn completed_response_survives_timeout_restore_error(error: &io::Error) -> bool {
+    // Darwin returns EINVAL when SO_RCVTIMEO is restored after the peer has
+    // closed. The complete framed response remains valid; the socket is not
+    // reusable and the next operation will observe the disconnect normally.
+    cfg!(target_os = "macos") && error.kind() == io::ErrorKind::InvalidInput
 }
 
 fn encode_legacy_wire_frame(request: &Request, wire_version: u32) -> Result<Vec<u8>, ClientError> {

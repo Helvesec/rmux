@@ -86,7 +86,6 @@ async fn show_help_directly(handler: &RequestHandler, attach_pid: u32) -> bool {
         .show_attached_key_help_popup(
             crate::handler::overlay_support::AttachedHelpContext {
                 attach_pid,
-                requester_pid: attach_pid,
                 expected_identity: Some(identity),
                 expected_session_name: &session_name,
                 expected_session_id: session_id,

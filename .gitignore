@@ -24,6 +24,8 @@ SDK demo/playwright-report/
 /rmux-release.sh
 /.release-deployment/
 /.rmux-audit/
+# Private compatibility ledger retained locally for future development.
+/docs/compat/tmux-3.7-divergences.md
 /scripts/bench/README.md
 /.claude/settings.local.json
 /AGENTS.md

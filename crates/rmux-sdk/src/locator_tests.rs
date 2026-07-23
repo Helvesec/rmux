@@ -30,6 +30,7 @@ async fn locator_click_shares_resolution_and_action_deadline() {
     );
     let server = tokio::spawn(async move {
         serve_delayed_pane_lookup(&mut server_stream).await;
+        serve_pane_lookup(&mut server_stream).await;
         assert!(matches!(
             read_request(&mut server_stream).await,
             Request::PaneSnapshotRef(_)
@@ -53,6 +54,17 @@ async fn locator_click_shares_resolution_and_action_deadline() {
     assert_eq!(Instant::now() - started, Duration::from_millis(50));
     assert_timed_out(error);
     server.abort();
+}
+
+async fn serve_pane_lookup(stream: &mut tokio::io::DuplexStream) {
+    assert!(matches!(read_request(stream).await, Request::ListPanes(_)));
+    write_response(
+        stream,
+        Response::ListPanes(ListPanesResponse {
+            output: CommandOutput::from_stdout("0:0:%1\n"),
+        }),
+    )
+    .await;
 }
 
 async fn serve_delayed_pane_lookup(stream: &mut tokio::io::DuplexStream) {

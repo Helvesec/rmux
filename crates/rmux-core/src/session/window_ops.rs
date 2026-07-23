@@ -197,10 +197,10 @@ impl Session {
         self.remove_window_allowing_empty(window_index)
     }
 
-    pub(crate) fn remove_window_allowing_empty(
-        &mut self,
-        window_index: u32,
-    ) -> Result<Window, RmuxError> {
+    /// Removes a window even when it is the final window in the session.
+    ///
+    /// Callers must destroy the now-empty session in the same transaction.
+    pub fn remove_window_allowing_empty(&mut self, window_index: u32) -> Result<Window, RmuxError> {
         if !self.windows.contains_key(&window_index) {
             return Err(invalid_window_target(&self.name, window_index));
         }

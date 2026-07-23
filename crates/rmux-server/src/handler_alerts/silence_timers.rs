@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
-use rmux_core::WINDOW_SILENCE;
 use rmux_proto::{types::OptionScopeSelector, SessionId, SessionName, WindowId, WindowTarget};
 
 use super::super::RequestHandler;
@@ -12,6 +11,8 @@ use crate::pane_terminals::HandlerState;
 
 #[path = "silence_timers/deadline_fanout.rs"]
 mod deadline_fanout;
+#[path = "silence_timers/lifecycle.rs"]
+mod lifecycle;
 #[path = "silence_timers/new_session.rs"]
 mod new_session;
 #[path = "silence_timers/window_mutations.rs"]
@@ -239,6 +240,15 @@ impl RequestHandler {
         desired_destinations: Vec<DesiredSilenceTimer>,
         deadline_fanout: Option<SilenceTimerDeadlineFanout>,
     ) {
+        let admission_count = reindexed_targets.len().saturating_add(
+            desired_destinations
+                .iter()
+                .filter(|desired| desired.seconds != 0)
+                .count(),
+        );
+        let Some(mut timer_reservations) = self.reserve_silence_timer_tasks(admission_count) else {
+            return;
+        };
         let mut touched_targets = removed_targets.into_iter().collect::<HashSet<_>>();
         touched_targets.extend(
             desired_destinations
@@ -297,6 +307,7 @@ impl RequestHandler {
                 window_id,
                 generation,
                 deadline,
+                timer_reservations.take(),
             );
             moved_timers.push((
                 destination,
@@ -340,6 +351,7 @@ impl RequestHandler {
                 desired.window_id,
                 generation,
                 deadline,
+                timer_reservations.take(),
             );
             if let Some(previous) = timers.insert(
                 target,
@@ -358,6 +370,8 @@ impl RequestHandler {
                 );
             }
         }
+        drop(timers);
+        drop(timer_reservations);
     }
 
     pub(super) fn configure_silence_timer_locked(
@@ -375,6 +389,13 @@ impl RequestHandler {
 
     fn configure_silence_timer(&self, desired: DesiredSilenceTimer) {
         let target = desired.target;
+        if desired.seconds == 0 {
+            self.remove_silence_timer(&target);
+            return;
+        }
+        let Some(mut timer_reservations) = self.reserve_silence_timer_tasks(1) else {
+            return;
+        };
         let mut timers = self
             .silence_timers
             .lock()
@@ -385,9 +406,6 @@ impl RequestHandler {
         if let Some(previous) = timers.remove(&target) {
             previous.task.abort();
         }
-        if desired.seconds == 0 {
-            return;
-        }
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(desired.seconds);
         let task = self.spawn_silence_timer_task(
@@ -396,6 +414,7 @@ impl RequestHandler {
             desired.window_id,
             generation,
             deadline,
+            timer_reservations.take(),
         );
         timers.insert(
             target,
@@ -407,6 +426,8 @@ impl RequestHandler {
                 task,
             },
         );
+        drop(timers);
+        drop(timer_reservations);
     }
 
     #[cfg(test)]
@@ -455,78 +476,6 @@ impl RequestHandler {
     ) {
         self.handle_silence_timer_expired(target, session_id, window_id, generation)
             .await;
-    }
-
-    fn spawn_silence_timer_task(
-        &self,
-        target: WindowTarget,
-        session_id: SessionId,
-        window_id: WindowId,
-        generation: u64,
-        deadline: tokio::time::Instant,
-    ) -> tokio::task::JoinHandle<()> {
-        let handler = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep_until(deadline).await;
-            handler
-                .handle_silence_timer_expired(target, session_id, window_id, generation)
-                .await;
-        })
-    }
-
-    fn remove_silence_timer(&self, target: &WindowTarget) {
-        let mut timers = self
-            .silence_timers
-            .lock()
-            .expect("silence timer mutex must not be poisoned");
-        if let Some(previous) = timers.remove(target) {
-            previous.task.abort();
-        }
-    }
-
-    async fn handle_silence_timer_expired(
-        &self,
-        target: WindowTarget,
-        session_id: SessionId,
-        window_id: WindowId,
-        generation: u64,
-    ) {
-        let attached_count = self.attached_count(target.session_name()).await;
-        let plans = {
-            let mut state = self.state.lock().await;
-            #[cfg(test)]
-            self.pause_before_silence_timer_apply();
-            let target_identity_matches = state
-                .sessions
-                .session(target.session_name())
-                .filter(|session| session.id() == session_id)
-                .and_then(|session| session.window_at(target.window_index()))
-                .is_some_and(|window| window.id() == window_id);
-            let should_fire = target_identity_matches && {
-                let mut timers = self
-                    .silence_timers
-                    .lock()
-                    .expect("silence timer mutex must not be poisoned");
-                match timers.get(&target) {
-                    Some(timer)
-                        if timer.session_id == session_id
-                            && timer.window_id == window_id
-                            && timer.generation == generation =>
-                    {
-                        // Remove without aborting — we are inside the expired task itself.
-                        timers.remove(&target);
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if should_fire {
-                self.alerts_queue_window_locked(&mut state, target, WINDOW_SILENCE, attached_count)
-            } else {
-                Vec::new()
-            }
-        };
-        self.execute_alert_plans(plans).await;
     }
 
     fn reconcile_silence_timers_for_session(

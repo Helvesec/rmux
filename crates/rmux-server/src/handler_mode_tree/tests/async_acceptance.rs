@@ -1,6 +1,8 @@
 use super::*;
 
-use super::super::mode_tree_model::{ChooseTreeTarget, ModeTreeActionIdentity};
+use super::super::mode_tree_model::{
+    ChooseTreeTarget, ModeTreeActionIdentity, ModeTreeDeferredAction,
+};
 use crate::handler::prompt_support::PromptInputEvent;
 
 async fn choose_buffer_action_fixture(
@@ -58,6 +60,83 @@ async fn open_choose_buffer(handler: &RequestHandler, attach_pid: u32) {
         .expect("choose-buffer opens");
 }
 
+async fn open_customize_mode(handler: &RequestHandler, attach_pid: u32) {
+    let parsed = CommandParser::new()
+        .parse_arguments(["customize-mode"])
+        .expect("customize-mode parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            attach_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("customize-mode opens");
+}
+
+async fn zoomed_choose_tree_fixture(
+    label: &str,
+    attach_pid_offset: u32,
+) -> (
+    RequestHandler,
+    SessionName,
+    u32,
+    mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+) {
+    let handler = RequestHandler::new();
+    let session_name = SessionName::new(label).expect("valid session");
+    create_mode_tree_test_session(&handler, &session_name).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(
+                    session_name.clone(),
+                    0,
+                    0,
+                )),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    let attach_pid = std::process::id().saturating_add(attach_pid_offset);
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree", "-Z"])
+        .expect("choose-tree -Z parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            attach_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("zoomed choose-tree opens");
+    assert!(
+        handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&session_name)
+            .and_then(|session| session.window_at(0))
+            .is_some_and(rmux_core::Window::is_zoomed),
+        "choose-tree -Z zooms the host window"
+    );
+    (handler, session_name, attach_pid, control_rx)
+}
+
 async fn set_global_option(handler: &RequestHandler, option: OptionName, value: &str) {
     assert!(matches!(
         handler
@@ -80,17 +159,107 @@ fn frame_visits_row(frame: &[u8], row: u16) -> bool {
 }
 
 fn mouse_event_at_row(y: u16) -> crate::input_keys::MouseForwardEvent {
+    mouse_event_at(0, y)
+}
+
+fn mouse_event_at(x: u16, y: u16) -> crate::input_keys::MouseForwardEvent {
     crate::input_keys::MouseForwardEvent {
         b: 0,
         lb: 0,
-        x: 0,
+        x,
         y,
-        lx: 0,
+        lx: x,
         ly: y,
         sgr_b: 0,
         sgr_type: 'M',
         ignore: false,
     }
+}
+
+#[tokio::test]
+async fn mode_tree_build_and_mouse_use_the_host_split_geometry() {
+    let label = "choose-buffer-split-geometry";
+    let session_name = SessionName::new(label).expect("valid session");
+    let (handler, attach_pid, _control_rx) = choose_buffer_action_fixture(label, 81).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(
+                    session_name.clone(),
+                    0,
+                    0,
+                )),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(
+                    session_name.clone(),
+                    0,
+                    0,
+                )),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let mut mode = handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get(&attach_pid)
+        .and_then(|active| active.mode_tree.clone())
+        .expect("choose-buffer remains active");
+    mode.preview_mode = PreviewMode::Off;
+    mode.scroll = 0;
+    mode.selected_id = None;
+    let build = handler
+        .build_mode_tree(&mut mode, attach_pid)
+        .await
+        .expect("choose-buffer rebuild succeeds");
+    let geometry = handler
+        .mode_tree_content_geometry(&mode)
+        .await
+        .expect("host geometry resolves");
+    assert!(geometry.cols() < 80, "the host must remain split");
+    assert!(geometry.rows() < 23, "the host height must remain split");
+    assert_eq!(mode.last_list_rows, usize::from(geometry.rows()));
+    let first = build.visible.first().cloned().expect("first content row");
+    handler
+        .store_mode_tree_state(attach_pid, mode)
+        .await
+        .expect("mode-tree state stores");
+
+    let outside_x = geometry.x().saturating_add(geometry.cols());
+    assert!(!handler
+        .handle_mode_tree_mouse_event(attach_pid, mouse_event_at(outside_x, geometry.y()))
+        .await
+        .expect("adjacent-pane click is ignored"));
+    assert!(handler
+        .handle_mode_tree_mouse_event(attach_pid, mouse_event_at(geometry.x(), geometry.y()),)
+        .await
+        .expect("host-pane click succeeds"));
+    assert_eq!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&attach_pid)
+            .and_then(|active| active.mode_tree.as_ref())
+            .and_then(|mode| mode.selected_id.clone()),
+        Some(first)
+    );
 }
 
 #[tokio::test]
@@ -799,7 +968,7 @@ async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
             .await,
         Response::SetHook(_)
     ));
-    let (session_id, window_id, window_occurrence_id, pane_id) = {
+    let (session_id, window_id, window_occurrence_id, pane_id, pane_output_generation) = {
         let mut state = handler.state.lock().await;
         state.ensure_live_window_link_occurrences();
         let session = state.sessions.session(&alpha).expect("session exists");
@@ -812,6 +981,10 @@ async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
                 .window_link_occurrence_id(&alpha, 0)
                 .expect("window occurrence exists"),
             pane.id(),
+            state.pane_output_generation_for_target(
+                &rmux_proto::PaneTarget::with_window(alpha.clone(), 0, pane.index()),
+                pane.id(),
+            ),
         )
     };
 
@@ -819,13 +992,12 @@ async fn choose_tree_kill_pane_drains_after_kill_pane_inline_hook() {
         .perform_tree_kill_actions(
             std::process::id(),
             vec![ModeTreeAction::pane_tree_target(
-                alpha,
+                rmux_proto::PaneTarget::with_window(alpha, 0, 1),
                 session_id,
-                0,
                 window_id,
                 window_occurrence_id,
-                1,
                 pane_id,
+                pane_output_generation,
             )],
         )
         .await
@@ -862,9 +1034,18 @@ async fn choose_tree_tagged_pane_kills_follow_stable_ids_after_renumbering() {
         let mut panes = window
             .panes()
             .iter()
-            .map(|pane| (pane.index(), pane.id()))
+            .map(|pane| {
+                (
+                    pane.index(),
+                    pane.id(),
+                    state.pane_output_generation_for_target(
+                        &rmux_proto::PaneTarget::with_window(alpha.clone(), 0, pane.index()),
+                        pane.id(),
+                    ),
+                )
+            })
             .collect::<Vec<_>>();
-        panes.sort_by_key(|(pane_index, _)| *pane_index);
+        panes.sort_by_key(|(pane_index, _, _)| *pane_index);
         assert_eq!(panes.len(), 3);
         (
             session.id(),
@@ -878,15 +1059,14 @@ async fn choose_tree_tagged_pane_kills_follow_stable_ids_after_renumbering() {
     };
     let actions = pane_targets
         .into_iter()
-        .map(|(pane_index, pane_id)| {
+        .map(|(pane_index, pane_id, pane_output_generation)| {
             ModeTreeAction::pane_tree_target(
-                alpha.clone(),
+                rmux_proto::PaneTarget::with_window(alpha.clone(), 0, pane_index),
                 session_id,
-                0,
                 window_id,
                 window_occurrence_id,
-                pane_index,
                 pane_id,
+                pane_output_generation,
             )
         })
         .collect();
@@ -1288,6 +1468,16 @@ async fn create_mode_tree_test_session(handler: &RequestHandler, session_name: &
     ));
 }
 
+async fn mode_tree_test_pane_cols(handler: &RequestHandler, session_name: &SessionName) -> u16 {
+    let mut state = handler.state.lock().await;
+    state
+        .clone_pane_master_if_alive(session_name, 0, 0)
+        .expect("pane runtime")
+        .size()
+        .expect("pane size")
+        .cols
+}
+
 async fn create_mode_tree_test_window(
     handler: &RequestHandler,
     session_name: &SessionName,
@@ -1559,6 +1749,7 @@ async fn choose_tree_identity_guard_fixture(
             window_occurrence_id: Some(window_occurrence_id),
             pane_index: None,
             pane_id: None,
+            pane_output_generation: None,
         },
         control_rx,
     )
@@ -1630,6 +1821,7 @@ async fn choose_tree_session_switch_resizes_the_target_for_the_attached_client()
                 window_occurrence_id: None,
                 pane_index: None,
                 pane_id: None,
+                pane_output_generation: None,
             },
         )
         .await
@@ -1811,6 +2003,7 @@ async fn choose_tree_default_switch_rejects_a_reconnected_host_at_the_commit_loc
                     window_occurrence_id: None,
                     pane_index: None,
                     pane_id: None,
+                    pane_output_generation: None,
                 },
             )
             .await
@@ -2058,6 +2251,200 @@ async fn mode_tree_commands_without_attached_client_mark_target_pane_mode() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn queued_mode_tree_waits_for_deferred_windows_session_terminals() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build isolated deferred-pane runtime");
+
+    runtime.block_on(async {
+        let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
+        let (blocker_release_tx, blocker_release_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = blocker_started_tx.send(());
+            blocker_release_rx
+                .recv()
+                .expect("release deferred-pane blocking worker");
+        });
+        blocker_started_rx
+            .await
+            .expect("blocking worker reports that it is occupied");
+
+        let handler = RequestHandler::new();
+        let alpha = SessionName::new("alpha").expect("valid session");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: alpha.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+
+        let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+        {
+            let state = handler.state.lock().await;
+            assert!(state.pane_is_starting_in_window(&alpha, 0, 0));
+            assert!(state.pane_pid_in_window(&alpha, 0, 0).is_err());
+        }
+
+        let commands = CommandParser::new()
+            .parse("choose-tree -t alpha:0.0")
+            .expect("mode-tree queue parses");
+        let queue_handler = handler.clone();
+        let queue = queue_handler.execute_parsed_commands_for_test(std::process::id(), commands);
+        tokio::pin!(queue);
+        let initial_result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), queue.as_mut()).await;
+        blocker_release_tx
+            .send(())
+            .expect("release deferred-pane blocking worker");
+        blocker.await.expect("blocking worker joins");
+        let (waited_for_terminal, result) = match initial_result {
+            Ok(result) => (false, result),
+            Err(_) => (
+                true,
+                tokio::time::timeout(std::time::Duration::from_secs(10), queue.as_mut())
+                    .await
+                    .expect("mode-tree queue completes after deferred terminal opens"),
+            ),
+        };
+
+        assert!(
+            waited_for_terminal,
+            "mode-tree queue must wait while the target session terminal is deferred"
+        );
+        result.expect("mode-tree queue succeeds after deferred terminal opens");
+
+        handler
+            .wait_for_pane_startup_to_finish_for_test(&target)
+            .await;
+        let state = handler.state.lock().await;
+        let transcript = state.transcript_handle(&target).expect("target transcript");
+        assert_eq!(
+            transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned")
+                .pane_mode_name(),
+            Some("tree-mode")
+        );
+    });
+}
+
+#[tokio::test]
+async fn mode_tree_temporarily_hides_modal_scrollbar_and_restores_copy_mode_geometry() {
+    let handler = RequestHandler::new();
+    let alpha = SessionName::new("mode-tree-modal-stack").expect("valid session");
+    let target = rmux_proto::PaneTarget::with_window(alpha.clone(), 0, 0);
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 20, rows: 8 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    for (scope, option, value) in [
+        (
+            ScopeSelector::Session(alpha.clone()),
+            OptionName::Status,
+            "off",
+        ),
+        (
+            ScopeSelector::Window(rmux_proto::WindowTarget::with_window(alpha.clone(), 0)),
+            OptionName::PaneScrollbars,
+            "modal",
+        ),
+        (
+            ScopeSelector::Window(rmux_proto::WindowTarget::with_window(alpha.clone(), 0)),
+            OptionName::PaneScrollbarsStyle,
+            "width=2,pad=1",
+        ),
+    ] {
+        assert!(matches!(
+            handler
+                .handle(Request::SetOption(SetOptionRequest {
+                    scope,
+                    option,
+                    value: value.to_owned(),
+                    mode: SetOptionMode::Replace,
+                }))
+                .await,
+            Response::SetOption(_)
+        ));
+    }
+    assert!(matches!(
+        handler
+            .handle(Request::CopyMode(rmux_proto::CopyModeRequest {
+                target: Some(target.clone()),
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: false,
+                mouse_drag_start: false,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }))
+            .await,
+        Response::CopyMode(_)
+    ));
+
+    assert_eq!(mode_tree_test_pane_cols(&handler, &alpha).await, 17);
+
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree", "-t", "mode-tree-modal-stack:0.0"])
+        .expect("choose-tree parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            std::process::id().saturating_add(11),
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("detached choose-tree opens");
+
+    // Oracle tmux 3.7b: mode-tree becomes the top mode, hides the modal
+    // scrollbar and expands the PTY; dismissing it restores copy-mode and the
+    // scrollbar reservation.
+    assert_eq!(mode_tree_test_pane_cols(&handler, &alpha).await, 20);
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .transcript_handle(&target)
+            .expect("target transcript")
+            .lock()
+            .expect("pane transcript mutex")
+            .pane_mode_name(),
+        Some("tree-mode")
+    );
+
+    assert!(handler
+        .clear_mode_tree_for_target(&target)
+        .await
+        .expect("mode-tree clears"));
+    assert_eq!(mode_tree_test_pane_cols(&handler, &alpha).await, 17);
+    let state = handler.state.lock().await;
+    assert!(state
+        .pane_copy_mode_summary(&alpha, rmux_core::PaneId::new(0))
+        .is_some());
+}
+
 #[tokio::test]
 async fn choose_tree_zw_defers_parse_errors_until_accept() {
     let handler = RequestHandler::new();
@@ -2103,4 +2490,760 @@ async fn choose_tree_zw_defers_parse_errors_until_accept() {
         panic!("expected server parse error");
     };
     assert!(message.starts_with("mode-tree command parse failed:"));
+}
+
+#[tokio::test]
+async fn mode_tree_navigation_rejects_a_same_pid_replacement_tree() {
+    use super::super::mode_tree_test_support::{
+        install_mode_tree_identity_pause, ModeTreeIdentityPausePoint,
+    };
+
+    let label = "mode-tree-navigation-attach-identity";
+    let session_name = SessionName::new(label).expect("valid session");
+    let (handler, attach_pid, _old_rx) = choose_buffer_action_fixture(label, 901).await;
+    let pause = install_mode_tree_identity_pause(ModeTreeIdentityPausePoint::Store(attach_pid));
+    let input_handler = handler.clone();
+    let input = tokio::spawn(async move {
+        input_handler
+            .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Char('j'))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("navigation reaches its identity commit");
+
+    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+    let replacement_attach_id = handler
+        .register_attach(attach_pid, session_name, replacement_tx)
+        .await;
+    open_choose_buffer(&handler, attach_pid).await;
+    let (replacement_state_id, replacement_selection) = {
+        let active_attach = handler.active_attach.lock().await;
+        let replacement = &active_attach.by_pid[&attach_pid];
+        (
+            replacement.mode_tree_state_id,
+            replacement
+                .mode_tree
+                .as_ref()
+                .and_then(|mode| mode.selected_id.clone()),
+        )
+    };
+    pause.release.notify_one();
+
+    assert!(
+        input.await.expect("navigation task joins").is_err(),
+        "the stale navigation must fail closed"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = &active_attach.by_pid[&attach_pid];
+    assert_eq!(replacement.id, replacement_attach_id);
+    assert_eq!(replacement.mode_tree_state_id, replacement_state_id);
+    assert_eq!(
+        replacement
+            .mode_tree
+            .as_ref()
+            .and_then(|mode| mode.selected_id.clone()),
+        replacement_selection
+    );
+}
+
+#[tokio::test]
+async fn mode_tree_prompt_callback_rejects_a_same_pid_replacement_tree() {
+    let label = "mode-tree-prompt-attach-identity";
+    let session_name = SessionName::new(label).expect("valid session");
+    let (handler, attach_pid, _old_rx) = choose_buffer_action_fixture(label, 902).await;
+    let stale_identity = handler
+        .current_mode_tree_action_identity(attach_pid)
+        .await
+        .expect("original tree identity");
+
+    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+    let replacement_attach_id = handler
+        .register_attach(attach_pid, session_name, replacement_tx)
+        .await;
+    open_choose_buffer(&handler, attach_pid).await;
+    let replacement_state_id =
+        handler.active_attach.lock().await.by_pid[&attach_pid].mode_tree_state_id;
+
+    assert!(
+        handler
+            .apply_mode_tree_filter(stale_identity, "must-not-apply".to_owned())
+            .await
+            .is_err(),
+        "the stale prompt callback must fail closed"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = &active_attach.by_pid[&attach_pid];
+    assert_eq!(replacement.id, replacement_attach_id);
+    assert_eq!(replacement.mode_tree_state_id, replacement_state_id);
+    assert_eq!(
+        replacement
+            .mode_tree
+            .as_ref()
+            .and_then(|mode| mode.filter_text.as_deref()),
+        None
+    );
+}
+
+#[tokio::test]
+async fn customize_unset_revalidates_requester_at_option_mutation_lock() {
+    use super::super::mode_tree_test_support::{
+        install_mode_tree_identity_pause, ModeTreeIdentityPausePoint,
+    };
+
+    let handler = RequestHandler::new();
+    let session_name = SessionName::new("customize-option-requester-aba").expect("valid session");
+    create_mode_tree_test_session(&handler, &session_name).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(session_name.clone()),
+                option: OptionName::Status,
+                value: "off".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    let attach_pid = std::process::id().saturating_add(907);
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    open_customize_mode(&handler, attach_pid).await;
+    let identity = handler
+        .current_mode_tree_action_identity(attach_pid)
+        .await
+        .expect("original customize identity");
+    let selected_id = {
+        let mut mode = handler
+            .mode_tree_for_action_identity(identity)
+            .await
+            .expect("customize tree remains active");
+        handler
+            .build_mode_tree(&mut mode, attach_pid)
+            .await
+            .expect("customize tree builds")
+            .items
+            .values()
+            .find(|item| {
+                matches!(
+                    &item.action,
+                    ModeTreeAction::CustomizeOption {
+                        scope: rmux_proto::types::OptionScopeSelector::Session(name),
+                        name: option_name,
+                    } if name == &session_name && option_name == "status"
+                )
+            })
+            .map(|item| item.id.clone())
+            .expect("session status option is listed")
+    };
+    handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get_mut(&attach_pid)
+        .and_then(|active| active.mode_tree.as_mut())
+        .expect("customize tree remains active")
+        .selected_id = Some(selected_id);
+
+    let pause = install_mode_tree_identity_pause(ModeTreeIdentityPausePoint::Mutation(attach_pid));
+    let action_handler = handler.clone();
+    let action = tokio::spawn(async move {
+        action_handler
+            .perform_customize_unset_for_identity(identity)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("customize unset reaches its final identity check");
+
+    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name.clone(), replacement_tx)
+        .await;
+    open_customize_mode(&handler, attach_pid).await;
+    pause.release.notify_one();
+
+    assert!(
+        action.await.expect("customize task joins").is_err(),
+        "the stale requester must fail closed"
+    );
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .options
+            .session_value(&session_name, OptionName::Status),
+        Some("off"),
+        "the stale customize action must not unset the option"
+    );
+}
+
+#[tokio::test]
+async fn customize_key_mutations_reject_a_replaced_requester() {
+    let handler = RequestHandler::new();
+    let session_name = SessionName::new("customize-key-requester-aba").expect("valid session");
+    create_mode_tree_test_session(&handler, &session_name).await;
+    let attach_pid = std::process::id().saturating_add(908);
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name.clone(), control_tx)
+        .await;
+    open_customize_mode(&handler, attach_pid).await;
+    let stale_identity = handler
+        .current_mode_tree_action_identity(attach_pid)
+        .await
+        .expect("original customize identity");
+
+    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name, replacement_tx)
+        .await;
+    open_customize_mode(&handler, attach_pid).await;
+
+    let bind = handler
+        .handle_bind_key_for_mode_tree(
+            rmux_proto::BindKeyRequest {
+                table_name: "root".to_owned(),
+                key: "x".to_owned(),
+                note: None,
+                repeat: false,
+                command: Some(vec!["display-message no".to_owned()]),
+            },
+            stale_identity,
+        )
+        .await;
+    assert!(matches!(bind, Response::Error(_)));
+
+    let unbind = handler
+        .handle_unbind_key_for_mode_tree(
+            rmux_proto::UnbindKeyRequest {
+                table_name: "root".to_owned(),
+                all: false,
+                key: Some("x".to_owned()),
+                quiet: true,
+            },
+            stale_identity,
+        )
+        .await;
+    assert!(matches!(unbind, Response::Error(_)));
+
+    let key = rmux_core::key_string_lookup_string("x").expect("valid key");
+    assert!(handler
+        .reset_key_binding_for_mode_tree("root", key, stale_identity)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn confirmed_mode_tree_action_rejects_a_same_pid_replacement() {
+    use super::super::mode_tree_test_support::{
+        install_mode_tree_identity_pause, ModeTreeIdentityPausePoint,
+    };
+
+    let label = "mode-tree-confirm-attach-identity";
+    let session_name = SessionName::new(label).expect("valid session");
+    let (handler, attach_pid, _old_rx) = choose_buffer_action_fixture(label, 903).await;
+    let (identity, origin, action) = {
+        let mut mode = handler
+            .mode_tree_for_action_identity(
+                handler
+                    .current_mode_tree_action_identity(attach_pid)
+                    .await
+                    .expect("original tree identity"),
+            )
+            .await
+            .expect("original tree state");
+        let identity = handler
+            .current_mode_tree_action_identity(attach_pid)
+            .await
+            .expect("original tree identity");
+        let action = handler
+            .build_mode_tree(&mut mode, attach_pid)
+            .await
+            .expect("buffer tree builds")
+            .items
+            .values()
+            .find(|item| {
+                matches!(&item.action, ModeTreeAction::Buffer { name, .. } if name == "keep")
+            })
+            .map(|item| item.action.clone())
+            .expect("keep buffer action exists");
+        (identity, mode.origin.clone(), action)
+    };
+    let pause =
+        install_mode_tree_identity_pause(ModeTreeIdentityPausePoint::DeferredAction(attach_pid));
+    let action_handler = handler.clone();
+    let action_task = tokio::spawn(async move {
+        action_handler
+            .execute_mode_tree_deferred_action(
+                identity,
+                &origin,
+                ModeTreeDeferredAction::DeleteBuffers {
+                    targets: vec![action],
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("deferred action reaches its identity commit");
+
+    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name, replacement_tx)
+        .await;
+    open_choose_buffer(&handler, attach_pid).await;
+    pause.release.notify_one();
+
+    assert!(
+        action_task
+            .await
+            .expect("deferred action task joins")
+            .is_err(),
+        "the stale confirmed action must fail closed"
+    );
+    assert_eq!(
+        handler.state.lock().await.buffers.get("keep"),
+        Some(&b"safe"[..])
+    );
+}
+
+#[tokio::test]
+async fn mode_tree_dismisses_after_host_respawn_and_restores_zoom() {
+    let label = "mode-tree-respawned-host-identity";
+    let (handler, session_name, attach_pid, _control_rx) =
+        zoomed_choose_tree_fixture(label, 904).await;
+    let target = PaneTarget::with_window(session_name.clone(), 0, 1);
+
+    let response = handler
+        .handle(Request::RespawnPane(Box::new(
+            rmux_proto::RespawnPaneRequest {
+                target,
+                kill: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+            },
+        )))
+        .await;
+    assert!(matches!(response, Response::RespawnPane(_)), "{response:?}");
+
+    assert!(handler
+        .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Char('q'))
+        .await
+        .expect("q dismisses a tree whose host output was respawned"));
+    let state = handler.state.lock().await;
+    let session = state
+        .sessions
+        .session(&session_name)
+        .expect("session survives");
+    assert!(!session.window_at(0).expect("window survives").is_zoomed());
+    assert_eq!(
+        state
+            .transcript_handle(&PaneTarget::with_window(session_name.clone(), 0, 1))
+            .expect("respawned transcript exists")
+            .lock()
+            .expect("pane transcript mutex")
+            .pane_mode_name(),
+        None
+    );
+    drop(state);
+    assert!(handler.active_attach.lock().await.by_pid[&attach_pid]
+        .mode_tree
+        .is_none());
+}
+
+#[tokio::test]
+async fn mode_tree_dismisses_after_host_relink_and_restores_zoom() {
+    let label = "mode-tree-relinked-host-occurrence";
+    let (handler, session_name, attach_pid, _control_rx) =
+        zoomed_choose_tree_fixture(label, 906).await;
+    let original_window_id = {
+        let mut state = handler.state.lock().await;
+        let window_id = state
+            .sessions
+            .session(&session_name)
+            .and_then(|session| session.window_at(0))
+            .expect("host window exists")
+            .id();
+        state
+            .link_window(rmux_proto::LinkWindowRequest {
+                source: rmux_proto::WindowTarget::with_window(session_name.clone(), 0),
+                target: rmux_proto::WindowTarget::with_window(session_name.clone(), 2),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: true,
+            })
+            .expect("host window links");
+        state
+            .unlink_window(
+                rmux_proto::WindowTarget::with_window(session_name.clone(), 0),
+                false,
+            )
+            .expect("old host occurrence unlinks");
+        state
+            .link_window(rmux_proto::LinkWindowRequest {
+                source: rmux_proto::WindowTarget::with_window(session_name.clone(), 2),
+                target: rmux_proto::WindowTarget::with_window(session_name.clone(), 0),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: true,
+            })
+            .expect("replacement host occurrence links");
+        window_id
+    };
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&session_name)
+            .and_then(|session| session.window_at(0))
+            .map(rmux_core::Window::id),
+        Some(original_window_id),
+        "the slot reuses the same window and pane identities"
+    );
+
+    assert!(handler
+        .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Char('q'))
+        .await
+        .expect("q dismisses a tree whose host occurrence was relinked"));
+    let state = handler.state.lock().await;
+    let session = state
+        .sessions
+        .session(&session_name)
+        .expect("session survives");
+    assert!(
+        [0, 2].into_iter().all(|index| session
+            .window_at(index)
+            .is_some_and(|window| !window.is_zoomed())),
+        "dismissal restores zoom across linked aliases"
+    );
+    assert_eq!(
+        state
+            .transcript_handle(&PaneTarget::with_window(session_name.clone(), 0, 1))
+            .expect("relinked host transcript exists")
+            .lock()
+            .expect("pane transcript mutex")
+            .pane_mode_name(),
+        None
+    );
+    drop(state);
+    assert!(handler.active_attach.lock().await.by_pid[&attach_pid]
+        .mode_tree
+        .is_none());
+}
+
+struct MovedModeTreeHostFixture {
+    handler: RequestHandler,
+    source: SessionName,
+    destination: SessionName,
+    attach_pid: u32,
+    moved_target: PaneTarget,
+    moved_window_id: rmux_proto::WindowId,
+    control_rx: mpsc::UnboundedReceiver<crate::pane_io::AttachControl>,
+}
+
+fn drain_moved_mode_tree_controls(fixture: &mut MovedModeTreeHostFixture) {
+    while fixture.control_rx.try_recv().is_ok() {}
+}
+
+async fn moved_mode_tree_host_fixture(
+    label: &str,
+    attach_pid_offset: u32,
+) -> MovedModeTreeHostFixture {
+    let (handler, source, attach_pid, mut control_rx) =
+        zoomed_choose_tree_fixture(label, attach_pid_offset).await;
+    let destination = SessionName::new(format!("{label}-destination")).expect("valid session");
+    create_mode_tree_test_window(&handler, &source, 1).await;
+    create_mode_tree_test_session(&handler, &destination).await;
+    let (moved_window_id, moved_pane_id) = {
+        let state = handler.state.lock().await;
+        let window = state
+            .sessions
+            .session(&source)
+            .and_then(|session| session.window_at(0))
+            .expect("zoomed host window exists");
+        (
+            window.id(),
+            window.active_pane().expect("host pane exists").id(),
+        )
+    };
+
+    let response = handler
+        .handle(Request::MoveWindow(rmux_proto::MoveWindowRequest {
+            source: Some(rmux_proto::WindowTarget::with_window(source.clone(), 0)),
+            target: rmux_proto::MoveWindowTarget::Window(rmux_proto::WindowTarget::with_window(
+                destination.clone(),
+                1,
+            )),
+            renumber: false,
+            kill_destination: false,
+            detached: true,
+            after: false,
+            before: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
+    let moved_target = {
+        let state = handler.state.lock().await;
+        let window = state
+            .sessions
+            .session(&destination)
+            .and_then(|session| session.window_at(1))
+            .filter(|window| window.id() == moved_window_id)
+            .expect("the exact host window moved between sessions");
+        let pane = window
+            .panes()
+            .iter()
+            .find(|pane| pane.id() == moved_pane_id)
+            .expect("the exact host pane moved with its window");
+        assert!(
+            window.is_zoomed(),
+            "the moved host remains zoomed before dismissal"
+        );
+        PaneTarget::with_window(destination.clone(), 1, pane.index())
+    };
+    while control_rx.try_recv().is_ok() {}
+
+    MovedModeTreeHostFixture {
+        handler,
+        source,
+        destination,
+        attach_pid,
+        moved_target,
+        moved_window_id,
+        control_rx,
+    }
+}
+
+#[tokio::test]
+async fn mode_tree_dismisses_after_host_window_moves_between_sessions() {
+    let fixture = moved_mode_tree_host_fixture("mode-tree-moved-host", 908).await;
+
+    assert!(fixture
+        .handler
+        .handle_mode_tree_key_event(fixture.attach_pid, PromptInputEvent::Char('q'))
+        .await
+        .expect("q dismisses after the host moves between sessions"));
+
+    let state = fixture.handler.state.lock().await;
+    let moved_window = state
+        .sessions
+        .session(&fixture.destination)
+        .and_then(|session| session.window_at(fixture.moved_target.window_index()))
+        .filter(|window| window.id() == fixture.moved_window_id)
+        .expect("the exact moved window survives");
+    assert!(
+        !moved_window.is_zoomed(),
+        "dismissal restores the moved window zoom"
+    );
+    assert_eq!(
+        state
+            .transcript_handle(&fixture.moved_target)
+            .expect("moved host transcript exists")
+            .lock()
+            .expect("pane transcript mutex")
+            .pane_mode_name(),
+        None
+    );
+    drop(state);
+    assert!(
+        fixture.handler.active_attach.lock().await.by_pid[&fixture.attach_pid]
+            .mode_tree
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn mode_tree_moved_host_cleanup_does_not_mutate_a_recreated_source_slot() {
+    let mut fixture = moved_mode_tree_host_fixture("mode-tree-moved-host-aba", 909).await;
+    create_mode_tree_test_window(&fixture.handler, &fixture.source, 0).await;
+    drain_moved_mode_tree_controls(&mut fixture);
+    assert!(matches!(
+        fixture
+            .handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(
+                    fixture.source.clone(),
+                    0,
+                    0,
+                )),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    drain_moved_mode_tree_controls(&mut fixture);
+    let replacement_target = PaneTarget::with_window(fixture.source.clone(), 0, 1);
+    let replacement_window_id = fixture
+        .handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&fixture.source)
+        .and_then(|session| session.window_at(0))
+        .expect("replacement source window exists")
+        .id();
+    assert_ne!(replacement_window_id, fixture.moved_window_id);
+    assert!(matches!(
+        fixture
+            .handler
+            .handle(Request::ResizePane(rmux_proto::ResizePaneRequest {
+                target: replacement_target,
+                adjustment: rmux_proto::ResizePaneAdjustment::Zoom,
+            }))
+            .await,
+        Response::ResizePane(_)
+    ));
+    drain_moved_mode_tree_controls(&mut fixture);
+
+    assert!(fixture
+        .handler
+        .handle_mode_tree_key_event(fixture.attach_pid, PromptInputEvent::Escape)
+        .await
+        .expect("Escape dismisses after source-slot recreation"));
+
+    let state = fixture.handler.state.lock().await;
+    let moved_window = state
+        .sessions
+        .session(&fixture.destination)
+        .and_then(|session| session.window_at(fixture.moved_target.window_index()))
+        .filter(|window| window.id() == fixture.moved_window_id)
+        .expect("the exact moved window survives");
+    assert!(
+        !moved_window.is_zoomed(),
+        "the exact moved window is restored"
+    );
+    let replacement_window = state
+        .sessions
+        .session(&fixture.source)
+        .and_then(|session| session.window_at(0))
+        .filter(|window| window.id() == replacement_window_id)
+        .expect("the recreated source slot survives");
+    assert!(
+        replacement_window.is_zoomed(),
+        "cleanup must not fall back to the recreated source slot"
+    );
+}
+
+#[tokio::test]
+async fn mode_tree_dismisses_after_host_pane_renumber_without_rezooming() {
+    let label = "mode-tree-renumbered-host-pane";
+    let (handler, session_name, attach_pid, _control_rx) =
+        zoomed_choose_tree_fixture(label, 907).await;
+    let response = handler
+        .handle(Request::RotateWindow(rmux_proto::RotateWindowRequest {
+            target: rmux_proto::WindowTarget::with_window(session_name.clone(), 0),
+            direction: rmux_proto::RotateWindowDirection::Down,
+            restore_zoom: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::RotateWindow(_)),
+        "{response:?}"
+    );
+
+    assert!(handler
+        .handle_mode_tree_key_event(attach_pid, PromptInputEvent::Escape)
+        .await
+        .expect("Escape dismisses after the host pane is renumbered"));
+    let state = handler.state.lock().await;
+    let session = state
+        .sessions
+        .session(&session_name)
+        .expect("session survives");
+    assert!(!session.window_at(0).expect("window survives").is_zoomed());
+    assert_eq!(
+        state
+            .transcript_handle(&PaneTarget::with_window(session_name.clone(), 0, 0))
+            .expect("renumbered host transcript exists")
+            .lock()
+            .expect("pane transcript mutex")
+            .pane_mode_name(),
+        None
+    );
+    drop(state);
+    assert!(handler.active_attach.lock().await.by_pid[&attach_pid]
+        .mode_tree
+        .is_none());
+}
+
+#[tokio::test]
+async fn mode_tree_activation_rejects_a_same_pid_replacement_without_zoom_leak() {
+    use super::super::mode_tree_test_support::{
+        install_mode_tree_identity_pause, ModeTreeIdentityPausePoint,
+    };
+
+    let handler = RequestHandler::new();
+    let session_name =
+        SessionName::new("mode-tree-activation-attach-identity").expect("valid session");
+    create_mode_tree_test_session(&handler, &session_name).await;
+    let attach_pid = std::process::id().saturating_add(905);
+    let (old_tx, _old_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, session_name.clone(), old_tx)
+        .await;
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-tree", "-Z"])
+        .expect("choose-tree -Z parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    let pause =
+        install_mode_tree_identity_pause(ModeTreeIdentityPausePoint::Activation(attach_pid));
+    let opening_handler = handler.clone();
+    let opening = tokio::spawn(async move {
+        opening_handler
+            .execute_queued_mode_tree(
+                attach_pid,
+                command,
+                &QueueExecutionContext::without_caller_cwd(),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("activation reaches its identity commit");
+
+    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+    let replacement_attach_id = handler
+        .register_attach(attach_pid, session_name.clone(), replacement_tx)
+        .await;
+    pause.release.notify_one();
+
+    assert!(
+        opening
+            .await
+            .expect("mode-tree activation task joins")
+            .is_err(),
+        "the stale activation must fail closed"
+    );
+    let state = handler.state.lock().await;
+    let session = state
+        .sessions
+        .session(&session_name)
+        .expect("session survives");
+    assert!(
+        session
+            .window_at(session.active_window_index())
+            .is_some_and(|window| !window.is_zoomed()),
+        "rejected activation must not leak zoom"
+    );
+    drop(state);
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = &active_attach.by_pid[&attach_pid];
+    assert_eq!(replacement.id, replacement_attach_id);
+    assert!(replacement.mode_tree.is_none());
 }

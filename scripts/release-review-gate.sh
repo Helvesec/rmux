@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/release-review-gate.sh [options]
 
-Run the review-derived release gate for RMUX 0.9.0. This intentionally targets
+Run the review-derived release gate for the RMUX 0.9 release line. This targets
 the bug classes that manual reviews kept finding: tiny CLI fallback boundaries,
 tmux authority cases, package layout, version drift, platform-neutrality budget,
 and mutating target-action retry safety.

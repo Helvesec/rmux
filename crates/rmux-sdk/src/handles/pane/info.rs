@@ -550,3 +550,29 @@ pub(super) async fn pane_title_for_id(
     }
     Ok(None)
 }
+
+pub(super) async fn current_pane_title_for_id(
+    client: &TransportClient,
+    preferred_session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
+) -> Result<Option<String>> {
+    for sweep in 0..PANE_ID_RESOLUTION_SWEEPS {
+        if let Some(title) = pane_title_for_id(client, preferred_session_name, pane_id).await? {
+            return Ok(Some(title));
+        }
+
+        let mut sessions = list_session_entries(client).await?;
+        if sweep > 0 {
+            sessions.reverse();
+        }
+        for session in sessions {
+            if &session.name == preferred_session_name {
+                continue;
+            }
+            if let Some(title) = pane_title_for_id(client, &session.name, pane_id).await? {
+                return Ok(Some(title));
+            }
+        }
+    }
+    Ok(None)
+}

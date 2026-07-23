@@ -6,10 +6,30 @@ use crate::pane_visible_geometry::visible_pane_content_geometry;
 
 use crate::clock_mode::format_clock_time;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClockPaneRenderData {
+    pub(crate) pane_index: u32,
+    pub(crate) history_size: usize,
+    pub(crate) alternate_on: bool,
+}
+
+impl ClockPaneRenderData {
+    #[cfg(test)]
+    const fn new(pane_index: u32) -> Self {
+        Self {
+            pane_index,
+            history_size: 0,
+            alternate_on: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClockPaneRestoreData {
     pub(crate) pane_index: u32,
     pub(crate) lines: Vec<String>,
+    pub(crate) history_size: usize,
+    pub(crate) alternate_on: bool,
 }
 
 const CLOCK_GLYPHS: [[[u8; 5]; 5]; 14] = [
@@ -116,20 +136,26 @@ const CLOCK_GLYPHS: [[[u8; 5]; 5]; 14] = [
 pub(crate) fn render_clock_overlay(
     session: &Session,
     options: &OptionStore,
-    pane_indexes: &[u32],
+    panes: &[ClockPaneRenderData],
     now: DateTime<Local>,
 ) -> Vec<u8> {
-    if pane_indexes.is_empty() {
+    if panes.is_empty() {
         return Vec::new();
     }
 
     let mut frame = Vec::new();
     frame.extend_from_slice(b"\x1b[s\x1b[?25l");
-    for pane_index in pane_indexes {
-        let Some(pane) = session.window().pane(*pane_index) else {
+    for pane_data in panes {
+        let Some(pane) = session.window().pane(pane_data.pane_index) else {
             continue;
         };
-        let Some(geometry) = visible_pane_geometry(session, options, pane) else {
+        let Some((geometry, scrollbar)) = visible_pane_geometry(
+            session,
+            options,
+            pane,
+            pane_data.history_size,
+            pane_data.alternate_on,
+        ) else {
             continue;
         };
         if geometry.cols() == 0 || geometry.rows() == 0 {
@@ -154,6 +180,9 @@ pub(crate) fn render_clock_overlay(
             ),
             now,
         );
+        if let Some(scrollbar) = scrollbar {
+            frame.extend_from_slice(scrollbar.frame().as_slice());
+        }
     }
     frame.extend_from_slice(b"\x1b[0m\x1b[u");
     frame
@@ -175,7 +204,13 @@ pub(crate) fn render_clock_restore_frame(
         let Some(pane) = session.window().pane(pane_data.pane_index) else {
             continue;
         };
-        let Some(geometry) = visible_pane_geometry(session, options, pane) else {
+        let Some((geometry, scrollbar)) = visible_pane_geometry(
+            session,
+            options,
+            pane,
+            pane_data.history_size,
+            pane_data.alternate_on,
+        ) else {
             continue;
         };
         for (row, line) in pane_data
@@ -193,6 +228,9 @@ pub(crate) fn render_clock_restore_frame(
             );
             frame.extend_from_slice(b"\x1b[0m");
             frame.extend_from_slice(line.as_bytes());
+        }
+        if let Some(scrollbar) = scrollbar {
+            frame.extend_from_slice(scrollbar.frame().as_slice());
         }
     }
     frame.extend_from_slice(b"\x1b[0m");
@@ -305,40 +343,54 @@ fn visible_pane_geometry(
     session: &Session,
     options: &OptionStore,
     pane: &Pane,
-) -> Option<PaneGeometry> {
+    history_size: usize,
+    alternate_on: bool,
+) -> Option<(
+    PaneGeometry,
+    Option<super::pane_scrollbar::RenderedPaneScrollbar>,
+)> {
     let geometry = super::StatusGeometry::for_session(session, options);
-    if session.window().is_zoomed() {
+    let raw_pane = if session.window().is_zoomed() {
         if session.window().active_pane_index() != pane.index() {
             return None;
         }
         let size = geometry.content_size();
-        let pane = visible_pane_content_geometry(
+        visible_pane_content_geometry(
             options,
             session.name(),
             session.active_window_index(),
             PaneGeometry::new(0, 0, size.cols, size.rows),
             geometry.content_rows,
-        );
-        return Some(PaneGeometry::new(
+        )
+    } else {
+        visible_pane_content_geometry(
+            options,
+            session.name(),
+            session.active_window_index(),
+            pane.geometry(),
+            geometry.content_rows,
+        )
+    };
+    let (pane, scrollbar) = super::pane_scrollbar::resolve_pane_scrollbar(
+        session,
+        options,
+        pane,
+        super::pane_scrollbar::PaneScrollbarRenderContext {
+            geometry: raw_pane,
+            history_size,
+            alternate_on,
+            copy_mode_scroll_position: None,
+            content_y_offset: geometry.content_y_offset,
+        },
+    );
+    Some((
+        PaneGeometry::new(
             pane.x(),
             pane.y().saturating_add(geometry.content_y_offset),
             pane.cols(),
             pane.rows(),
-        ));
-    }
-
-    let pane = visible_pane_content_geometry(
-        options,
-        session.name(),
-        session.active_window_index(),
-        pane.geometry(),
-        geometry.content_rows,
-    );
-    Some(PaneGeometry::new(
-        pane.x(),
-        pane.y().saturating_add(geometry.content_y_offset),
-        pane.cols(),
-        pane.rows(),
+        ),
+        scrollbar,
     ))
 }
 
@@ -355,7 +407,9 @@ fn glyph_index(ch: char) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_clock_overlay, render_clock_restore_frame, ClockPaneRestoreData};
+    use super::{
+        render_clock_overlay, render_clock_restore_frame, ClockPaneRenderData, ClockPaneRestoreData,
+    };
     use chrono::{Local, TimeZone};
     use rmux_core::{OptionStore, Session};
     use rmux_proto::{
@@ -376,8 +430,13 @@ mod tests {
             .single()
             .expect("valid local time");
 
-        let frame = String::from_utf8(render_clock_overlay(&session, &options, &[0], now))
-            .expect("overlay is utf-8");
+        let frame = String::from_utf8(render_clock_overlay(
+            &session,
+            &options,
+            &[ClockPaneRenderData::new(0)],
+            now,
+        ))
+        .expect("overlay is utf-8");
 
         assert!(frame.contains("\u{1b}[?25l"));
         assert!(frame.contains("\u{1b}[49m"));
@@ -394,10 +453,95 @@ mod tests {
             .single()
             .expect("valid local time");
 
-        let frame = String::from_utf8(render_clock_overlay(&session, &options, &[0], now))
-            .expect("overlay is utf-8");
+        let frame = String::from_utf8(render_clock_overlay(
+            &session,
+            &options,
+            &[ClockPaneRenderData::new(0)],
+            now,
+        ))
+        .expect("overlay is utf-8");
 
         assert!(frame.contains("13:02"));
+    }
+
+    #[test]
+    fn clock_overlay_obeys_always_modal_and_alternate_scrollbar_rules() {
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 8 });
+        let target = WindowTarget::with_window(session.name().clone(), 0);
+        let now = Local
+            .with_ymd_and_hms(2026, 4, 15, 13, 2, 3)
+            .single()
+            .expect("valid local time");
+        let mut options = OptionStore::new();
+        options
+            .set(
+                ScopeSelector::Session(session.name().clone()),
+                OptionName::Status,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status disabled for the oracle geometry");
+        options
+            .set(
+                ScopeSelector::Window(target.clone()),
+                OptionName::PaneScrollbars,
+                "on".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("always-on scrollbars");
+
+        let always = String::from_utf8(render_clock_overlay(
+            &session,
+            &options,
+            &[ClockPaneRenderData::new(0)],
+            now,
+        ))
+        .expect("overlay is utf-8");
+        assert!(always.contains("\u{1b}[5;8H"));
+        assert!(always.contains("13:02"));
+        assert!(always.contains("\u{1b}[1;20H\u{1b}[0;30;47m "));
+
+        options
+            .set(
+                ScopeSelector::Window(target),
+                OptionName::PaneScrollbars,
+                "modal".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("modal scrollbars");
+        let modal = String::from_utf8(render_clock_overlay(
+            &session,
+            &options,
+            &[ClockPaneRenderData::new(0)],
+            now,
+        ))
+        .expect("overlay is utf-8");
+        assert!(modal.contains("\u{1b}[5;9H"));
+        assert!(modal.contains("13:02"));
+        assert!(!modal.contains("\u{1b}[1;20H"));
+
+        options
+            .set(
+                ScopeSelector::Window(WindowTarget::with_window(session.name().clone(), 0)),
+                OptionName::PaneScrollbars,
+                "on".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("always-on scrollbars");
+        let alternate = String::from_utf8(render_clock_overlay(
+            &session,
+            &options,
+            &[ClockPaneRenderData {
+                pane_index: 0,
+                history_size: 0,
+                alternate_on: true,
+            }],
+            now,
+        ))
+        .expect("overlay is utf-8");
+        assert!(alternate.contains("\u{1b}[5;9H"));
+        assert!(alternate.contains("13:02"));
+        assert!(!alternate.contains("\u{1b}[1;20H"));
     }
 
     #[test]
@@ -413,8 +557,13 @@ mod tests {
             .single()
             .expect("valid local time");
 
-        let frame = String::from_utf8(render_clock_overlay(&session, &options, &[0], now))
-            .expect("overlay is utf-8");
+        let frame = String::from_utf8(render_clock_overlay(
+            &session,
+            &options,
+            &[ClockPaneRenderData::new(0)],
+            now,
+        ))
+        .expect("overlay is utf-8");
 
         assert!(!frame.contains("\u{1b}[2;1H"));
     }
@@ -430,6 +579,8 @@ mod tests {
             &[ClockPaneRestoreData {
                 pane_index: 0,
                 lines: vec!["line one".to_owned(), "line two".to_owned()],
+                history_size: 0,
+                alternate_on: false,
             }],
             false,
         ))
@@ -459,8 +610,13 @@ mod tests {
             .single()
             .expect("valid local time");
 
-        let frame = String::from_utf8(render_clock_overlay(&session, &options, &[0], now))
-            .expect("overlay is utf-8");
+        let frame = String::from_utf8(render_clock_overlay(
+            &session,
+            &options,
+            &[ClockPaneRenderData::new(0)],
+            now,
+        ))
+        .expect("overlay is utf-8");
 
         assert!(frame.contains("\u{1b}[48;2;18;52;86m"));
     }

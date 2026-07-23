@@ -107,8 +107,16 @@ async fn wait_until_quiet(wait: TerminalLoadStateWait) -> Result<PaneSnapshot> {
         wait.pane.configured_default_timeout(),
     );
     let deadline = crate::wait::wait_deadline(timeout);
+    let pane = wait.pane.begin_operation_handle_with_timeout(wait.timeout);
+    let (pane, _) = crate::wait::with_wait_deadline(
+        "wait for terminal load-state snapshot",
+        timeout,
+        deadline,
+        pane.pin_to_current_identity(),
+    )
+    .await?;
     let mut last = crate::wait::snapshot_with_wait_deadline(
-        &wait.pane,
+        &pane,
         "wait for terminal load-state snapshot",
         timeout,
         deadline,
@@ -139,7 +147,7 @@ async fn wait_until_quiet(wait: TerminalLoadStateWait) -> Result<PaneSnapshot> {
         }
         sleep_until_next_poll(deadline, wait.poll_interval).await;
         let snapshot = crate::wait::snapshot_with_wait_deadline(
-            &wait.pane,
+            &pane,
             "wait for terminal load-state snapshot",
             timeout,
             deadline,

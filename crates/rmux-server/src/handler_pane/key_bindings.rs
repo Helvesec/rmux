@@ -20,6 +20,22 @@ impl RequestHandler {
         &self,
         request: rmux_proto::BindKeyRequest,
     ) -> Response {
+        self.handle_bind_key_inner(request, None).await
+    }
+
+    pub(in crate::handler) async fn handle_bind_key_for_mode_tree(
+        &self,
+        request: rmux_proto::BindKeyRequest,
+        identity: super::super::mode_tree_support::ModeTreeActionIdentity,
+    ) -> Response {
+        self.handle_bind_key_inner(request, Some(identity)).await
+    }
+
+    async fn handle_bind_key_inner(
+        &self,
+        request: rmux_proto::BindKeyRequest,
+        mode_tree_identity: Option<super::super::mode_tree_support::ModeTreeActionIdentity>,
+    ) -> Response {
         let key = match key_string_lookup_string(&request.key) {
             Some(key) if key != KEYC_NONE && key != KEYC_UNKNOWN => key,
             _ => {
@@ -29,6 +45,17 @@ impl RequestHandler {
             }
         };
         let mut state = self.state.lock().await;
+        let _mode_tree_guard = if let Some(identity) = mode_tree_identity {
+            let active_attach = self.active_attach.lock().await;
+            if !identity.matches_active(&state, &active_attach) {
+                return Response::Error(ErrorResponse {
+                    error: RmuxError::Server("mode-tree is not active".to_owned()),
+                });
+            }
+            Some(active_attach)
+        } else {
+            None
+        };
         let commands = match request.command.as_ref() {
             Some(tokens) => match parse_binding_command_tokens_with_parser(
                 &command_parser_from_state(&state),
@@ -67,6 +94,22 @@ impl RequestHandler {
         &self,
         request: rmux_proto::UnbindKeyRequest,
     ) -> Response {
+        self.handle_unbind_key_inner(request, None).await
+    }
+
+    pub(in crate::handler) async fn handle_unbind_key_for_mode_tree(
+        &self,
+        request: rmux_proto::UnbindKeyRequest,
+        identity: super::super::mode_tree_support::ModeTreeActionIdentity,
+    ) -> Response {
+        self.handle_unbind_key_inner(request, Some(identity)).await
+    }
+
+    async fn handle_unbind_key_inner(
+        &self,
+        request: rmux_proto::UnbindKeyRequest,
+        mode_tree_identity: Option<super::super::mode_tree_support::ModeTreeActionIdentity>,
+    ) -> Response {
         if request.all && request.key.is_some() {
             return unbind_quiet_response_or_error(&request, "key given with -a");
         }
@@ -75,6 +118,17 @@ impl RequestHandler {
         }
 
         let mut state = self.state.lock().await;
+        let _mode_tree_guard = if let Some(identity) = mode_tree_identity {
+            let active_attach = self.active_attach.lock().await;
+            if !identity.matches_active(&state, &active_attach) {
+                return Response::Error(ErrorResponse {
+                    error: RmuxError::Server("mode-tree is not active".to_owned()),
+                });
+            }
+            Some(active_attach)
+        } else {
+            None
+        };
         if state.key_bindings.table(&request.table_name).is_none() {
             return unbind_quiet_response_or_error(
                 &request,
@@ -113,6 +167,21 @@ impl RequestHandler {
             removed,
             all: false,
         })
+    }
+
+    pub(in crate::handler) async fn reset_key_binding_for_mode_tree(
+        &self,
+        table_name: &str,
+        key: rmux_core::KeyCode,
+        identity: super::super::mode_tree_support::ModeTreeActionIdentity,
+    ) -> Result<(), RmuxError> {
+        let mut state = self.state.lock().await;
+        let active_attach = self.active_attach.lock().await;
+        if !identity.matches_active(&state, &active_attach) {
+            return Err(RmuxError::Server("mode-tree is not active".to_owned()));
+        }
+        state.key_bindings.reset_binding(table_name, key);
+        Ok(())
     }
 
     pub(in crate::handler) async fn handle_list_keys(

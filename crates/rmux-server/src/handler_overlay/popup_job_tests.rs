@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -5,13 +7,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use rmux_core::{EnvironmentStore, OptionStore};
 use rmux_proto::TerminalSize;
 #[cfg(unix)]
-use rmux_pty::Signal;
+use rmux_pty::{PtyPair, Signal};
 
 #[cfg(unix)]
 use crate::terminal::TerminalProfile;
 
 #[cfg(unix)]
-use super::spawn_popup_job;
+use super::{read_async_fd, spawn_popup_job};
 use super::{PopupIoOperation, PopupIoQueue, POPUP_IO_QUEUE_CAPACITY};
 
 fn release_blocked_io(release: &Arc<(Mutex<bool>, Condvar)>) {
@@ -26,6 +28,63 @@ fn arm_blocked_io_watchdog(release: &Arc<(Mutex<bool>, Condvar)>) {
         std::thread::sleep(std::time::Duration::from_secs(3));
         release_blocked_io(&release);
     });
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn popup_async_reader_yields_after_stale_readiness() {
+    use std::io::Write;
+
+    let pair = PtyPair::open().expect("pty pair");
+    let (master, slave) = pair.into_split();
+    let reader = tokio::io::unix::AsyncFd::new(master.into_io()).expect("async pty reader");
+    let mut writer = std::fs::File::from(slave.into_owned_fd());
+    writer.write_all(b"a").expect("seed popup output");
+
+    let stale_ready = tokio::time::timeout(std::time::Duration::from_secs(1), reader.readable())
+        .await
+        .expect("seed output should become readable")
+        .expect("popup readiness");
+    let mut seed = [0_u8; 1];
+    assert_eq!(
+        reader
+            .get_ref()
+            .try_read(&mut seed)
+            .expect("consume seed outside readiness guard"),
+        1
+    );
+    drop(stale_ready);
+
+    let heartbeat_ran = Arc::new(AtomicBool::new(false));
+    let heartbeat_task = {
+        let heartbeat_ran = Arc::clone(&heartbeat_ran);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            heartbeat_ran.store(true, Ordering::SeqCst);
+        })
+    };
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        writer.write_all(b"b").expect("write fresh popup output");
+    });
+
+    let mut fresh = [0_u8; 1];
+    let bytes_read = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_async_fd(&reader, &mut fresh),
+    )
+    .await
+    .expect("popup read should remain cancellable")
+    .expect("fresh popup read");
+
+    assert_eq!(bytes_read, 1);
+    assert_eq!(fresh, *b"b");
+    assert!(
+        heartbeat_ran.load(Ordering::SeqCst),
+        "stale readiness must not block the current-thread runtime"
+    );
+    heartbeat_task.await.expect("heartbeat task");
+    writer.join().expect("popup writer thread");
 }
 
 #[cfg(unix)]

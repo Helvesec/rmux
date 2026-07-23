@@ -15,6 +15,8 @@ const QUEUED_SOURCE_FILE_SUCCESS_COMMANDS: &[&str] = &[
     "display-menu",
     "display-popup",
     "if-shell",
+    "list-windows",
+    "new-window",
     "clear-prompt-history",
     "show-prompt-history",
 ];

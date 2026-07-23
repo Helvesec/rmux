@@ -126,6 +126,7 @@ impl RequestHandler {
                 .clone()
                 .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
         };
+        let _access = self.require_requester_origin_write(&mode.origin).await?;
         let had_tagged_items_before_rebuild = !mode.tagged.is_empty();
         let selected_id_before_rebuild = mode.selected_id.clone();
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
@@ -228,6 +229,7 @@ impl RequestHandler {
                 .clone()
                 .ok_or_else(|| attached_client_required("choose-buffer"))?
         };
+        let _access = self.require_requester_origin_write(&mode.origin).await?;
         let had_tagged_items_before_rebuild = !mode.tagged.is_empty();
         let selected_id_before_rebuild = mode.selected_id.clone();
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
@@ -257,34 +259,24 @@ impl RequestHandler {
             .await
     }
 
-    pub(super) async fn perform_buffer_delete_actions(
-        &self,
-        attach_pid: u32,
-        actions: Vec<ModeTreeAction>,
-    ) -> Result<(), RmuxError> {
-        self.perform_buffer_delete_actions_inner(attach_pid, None, actions)
-            .await
-    }
-
-    async fn perform_buffer_delete_actions_for_identity(
+    pub(super) async fn perform_buffer_delete_actions_for_identity(
         &self,
         identity: ModeTreeActionIdentity,
         actions: Vec<ModeTreeAction>,
     ) -> Result<(), RmuxError> {
-        self.perform_buffer_delete_actions_inner(identity.attach_pid(), Some(identity), actions)
+        let origin = self.mode_tree_origin_for_action_identity(identity).await?;
+        let _access = self.require_requester_origin_write(&origin).await?;
+        self.perform_buffer_delete_actions_inner(identity, actions)
             .await
     }
 
     async fn perform_buffer_delete_actions_inner(
         &self,
-        attach_pid: u32,
-        expected_requester: Option<ModeTreeActionIdentity>,
+        expected_requester: ModeTreeActionIdentity,
         actions: Vec<ModeTreeAction>,
     ) -> Result<(), RmuxError> {
         #[cfg(test)]
-        if let Some(identity) = expected_requester {
-            pause_before_mode_tree_buffer_delete(identity).await;
-        }
+        pause_before_mode_tree_buffer_delete(expected_requester).await;
 
         let deleted = {
             let mut state = self.state.lock().await;
@@ -292,25 +284,19 @@ impl RequestHandler {
             // Holding both makes requester validation and the whole selected
             // buffer deletion batch one logical commit: a same-PID reconnect
             // cannot inherit any of the old key event's actions.
-            let _active_attach = match expected_requester {
-                Some(expected) => {
-                    let active_attach = self.active_attach.lock().await;
-                    let requester_is_current = active_attach
-                        .by_pid
-                        .get(&expected.attach_pid())
-                        .is_some_and(|active| {
-                            active.id == expected.attach_id()
-                                && active.mode_tree_state_id == expected.state_id()
-                                && active.mode_tree.is_some()
-                                && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
-                        });
-                    if !requester_is_current {
-                        return Err(attached_client_required("choose-buffer"));
-                    }
-                    Some(active_attach)
-                }
-                None => None,
-            };
+            let _active_attach = self.active_attach.lock().await;
+            let requester_is_current = _active_attach
+                .by_pid
+                .get(&expected_requester.attach_pid())
+                .is_some_and(|active| {
+                    active.id == expected_requester.attach_id()
+                        && active.mode_tree_state_id == expected_requester.state_id()
+                        && active.mode_tree.is_some()
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                });
+            if !requester_is_current {
+                return Err(attached_client_required("choose-buffer"));
+            }
             actions
                 .into_iter()
                 .filter_map(|action| {
@@ -328,12 +314,7 @@ impl RequestHandler {
             self.emit(LifecycleEvent::PasteBufferDeleted { buffer_name })
                 .await;
         }
-        match expected_requester {
-            Some(identity) => {
-                self.refresh_mode_tree_overlay_for_action_identity(identity)
-                    .await
-            }
-            None => self.refresh_mode_tree_overlay_if_active(attach_pid).await,
-        }
+        self.refresh_mode_tree_overlay_for_action_identity(expected_requester)
+            .await
     }
 }

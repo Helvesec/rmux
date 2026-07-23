@@ -4,6 +4,7 @@ mod common;
 
 use std::error::Error;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -87,7 +88,8 @@ fn source_file_background_if_shell_keeps_write_access_after_client_exit(
 }
 
 #[test]
-fn kill_server_terminates_direct_background_run_shell_tree() -> Result<(), Box<dyn Error>> {
+fn kill_server_terminates_direct_background_run_shell_tree_product_divergence(
+) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("bg-run-shell-kill-server")?;
     let mut daemon = harness.start_hidden_daemon()?;
     let probe = ShellShutdownProbe::new(&harness, "direct-run-shell");
@@ -104,7 +106,8 @@ fn kill_server_terminates_direct_background_run_shell_tree() -> Result<(), Box<d
 }
 
 #[test]
-fn kill_server_terminates_queued_background_run_shell_tree() -> Result<(), Box<dyn Error>> {
+fn kill_server_terminates_queued_background_run_shell_tree_product_divergence(
+) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("bg-queued-run-shell-kill-server")?;
     let mut daemon = harness.start_hidden_daemon()?;
     let probe = ShellShutdownProbe::new(&harness, "queued-run-shell");
@@ -151,7 +154,8 @@ fn kill_server_terminates_background_if_shell_condition_tree() -> Result<(), Box
 }
 
 #[test]
-fn kill_server_bounds_slow_session_closed_hook_tree() -> Result<(), Box<dyn Error>> {
+fn kill_server_bounds_slow_session_closed_hook_tree_product_divergence(
+) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("session-closed-hook-kill-server")?;
     let mut daemon = harness.start_hidden_daemon()?;
     let probe = ShellShutdownProbe::new(&harness, "session-closed-hook");
@@ -174,6 +178,44 @@ fn kill_server_bounds_slow_session_closed_hook_tree() -> Result<(), Box<dyn Erro
     wait_for_daemon_exit_with_timeout(&mut daemon, SLOW_HOOK_SHUTDOWN_TIMEOUT)?;
 
     probe.assert_terminated()?;
+    Ok(())
+}
+
+#[test]
+fn kill_server_joins_background_session_closed_hook_trees_product_divergence(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("session-closed-background-hook-kill-server")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let probe = HookShutdownBurst::new(&harness)?;
+    let accepted_path = harness.tmpdir().join("background-hooks-accepted.log");
+
+    for index in 0..32 {
+        assert_success(&harness.run(&[
+            "new-session",
+            "-d",
+            "-s",
+            &format!("closing-{index:02}"),
+        ])?);
+    }
+    assert_success(&harness.run(&["set-hook", "-g", "session-closed", &probe.hook_command(0)])?);
+    assert_success(&harness.run(&["set-hook", "-ag", "session-closed", &probe.hook_command(1)])?);
+    let accepted_command = format!("printf 'accepted\\n' >> {}", shell_quote(&accepted_path));
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-ag",
+        "session-closed",
+        &format!("run-shell {}", shell_quote_str(&accepted_command)),
+    ])?);
+
+    assert_success(&harness.run(&["kill-server"])?);
+    wait_for_daemon_exit(&mut daemon)?;
+
+    assert_eq!(
+        fs::read_to_string(&accepted_path)?.lines().count(),
+        32,
+        "every accepted session-closed hook must drain before shutdown"
+    );
+    probe.assert_started_and_terminated()?;
     Ok(())
 }
 
@@ -330,6 +372,106 @@ impl Drop for ShellShutdownProbe {
     fn drop(&mut self) {
         kill_pid_file(&self.child_pid_path);
         kill_pid_file(&self.parent_pid_path);
+    }
+}
+
+struct HookShutdownBurst {
+    scripts: Vec<PathBuf>,
+    state_dirs: Vec<PathBuf>,
+}
+
+impl HookShutdownBurst {
+    fn new(harness: &CliHarness) -> Result<Self, Box<dyn Error>> {
+        let mut scripts = Vec::new();
+        let mut state_dirs = Vec::new();
+        for (label, chatter) in [("silent", false), ("chatty", true)] {
+            let state_dir = harness.tmpdir().join(format!("hook-{label}-state"));
+            fs::create_dir_all(&state_dir)?;
+            let script = harness.tmpdir().join(format!("hook-{label}.sh"));
+            let child_loop = if chatter {
+                "while :; do printf 'hook-noise\\n'; sleep 0.05; done"
+            } else {
+                "while :; do sleep 1; done"
+            };
+            let child_redirect = if chatter {
+                ""
+            } else {
+                " </dev/null >/dev/null 2>&1"
+            };
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\n\
+                     set -eu\n\
+                     parent=$$\n\
+                     printf '%s\\n' \"$parent\" > {state}/$parent.parent\n\
+                     (trap '' HUP TERM PIPE; {child_loop}){child_redirect} &\n\
+                     child=$!\n\
+                     printf '%s\\n' \"$child\" > {state}/$parent.child\n\
+                     trap '' HUP TERM PIPE\n\
+                     wait \"$child\"\n",
+                    state = shell_quote(&state_dir),
+                ),
+            )?;
+            let mut permissions = fs::metadata(&script)?.permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&script, permissions)?;
+            scripts.push(script);
+            state_dirs.push(state_dir);
+        }
+        Ok(Self {
+            scripts,
+            state_dirs,
+        })
+    }
+
+    fn hook_command(&self, index: usize) -> String {
+        format!("run-shell -b {}", shell_quote(&self.scripts[index]))
+    }
+
+    fn assert_started_and_terminated(&self) -> Result<(), Box<dyn Error>> {
+        for state_dir in &self.state_dirs {
+            let pid_files = fs::read_dir(state_dir)?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    matches!(
+                        path.extension().and_then(|extension| extension.to_str()),
+                        Some("parent" | "child")
+                    )
+                })
+                .collect::<Vec<_>>();
+            let child_count = pid_files
+                .iter()
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "child")
+                })
+                .count();
+            assert!(
+                child_count > 0,
+                "no background hook descendant started for '{}'",
+                state_dir.display()
+            );
+            for pid_file in pid_files {
+                wait_for_pid_exit(read_pid(&pid_file)?)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HookShutdownBurst {
+    fn drop(&mut self) {
+        for state_dir in &self.state_dirs {
+            let Ok(entries) = fs::read_dir(state_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                kill_pid_file(&entry.path());
+            }
+        }
     }
 }
 

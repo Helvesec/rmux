@@ -217,9 +217,7 @@ fn active_pane_at(layout: &MouseLayout, x: u16, y: u16) -> Option<&PaneMouseTarg
         }
 
         match layout.pane_border_status {
-            PaneBorderStatus::Top => {
-                !(y <= yoff.saturating_sub(2) || y > yoff.saturating_add(sy).saturating_sub(1))
-            }
+            PaneBorderStatus::Top => y >= yoff.saturating_sub(1) && y <= yoff.saturating_add(sy),
             PaneBorderStatus::Off | PaneBorderStatus::Bottom => {
                 !(y < yoff || y > yoff.saturating_add(sy))
             }
@@ -239,15 +237,12 @@ fn check_mouse_in_pane(
         PaneBorderStatus::Off => None,
     };
 
-    let inside_vertical = match pane_status_line {
-        Some(line) => {
-            (py >= pane.geometry.y() && py < pane.geometry.y().saturating_add(pane.geometry.rows()))
-                || py == line
-        }
-        None => {
-            py >= pane.geometry.y() && py < pane.geometry.y().saturating_add(pane.geometry.rows())
-        }
-    };
+    if pane_status_line == Some(py) {
+        return (MouseLocation::Border, None);
+    }
+
+    let inside_vertical =
+        py >= pane.geometry.y() && py < pane.geometry.y().saturating_add(pane.geometry.rows());
 
     if inside_vertical {
         if let Some(scrollbar) = &pane.scrollbar {
@@ -279,6 +274,23 @@ fn check_mouse_in_pane(
                     );
                 }
                 return (MouseLocation::ScrollbarDown, None);
+            }
+
+            let content_left = pane.geometry.x();
+            let content_right = content_left.saturating_add(pane.geometry.cols());
+            let (padding_left, padding_right) = match scrollbar.position {
+                ScrollbarPosition::Left => {
+                    (content_left.saturating_sub(scrollbar.pad), content_left)
+                }
+                ScrollbarPosition::Right => {
+                    (content_right, content_right.saturating_add(scrollbar.pad))
+                }
+            };
+            if px >= padding_left && px < padding_right {
+                // tmux treats the gutter between content and track as a pane
+                // binding location, while application passthrough still
+                // rejects it against the content geometry.
+                return (MouseLocation::Pane, None);
             }
         }
         if px >= pane.geometry.x() && px < pane.geometry.x().saturating_add(pane.geometry.cols()) {

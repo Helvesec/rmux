@@ -2,6 +2,10 @@ use super::super::super::{
     attach_support::{DisplayPanesClientState, DisplayPanesLabel},
     prompt_support::PromptInputEvent,
 };
+#[cfg(test)]
+use super::super::super::{
+    scripting_support::QueueExecutionContext, DetachedRequesterAuthority, RequesterOrigin,
+};
 
 pub(super) enum DisplayPanesOutcome {
     Stay,
@@ -72,6 +76,7 @@ fn match_display_panes_label(state: &DisplayPanesClientState) -> DisplayPanesMat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::StableTargetIdentity;
     use rmux_proto::{PaneTarget, SessionName, WindowTarget};
 
     fn session_name(value: &str) -> SessionName {
@@ -81,13 +86,18 @@ mod tests {
     #[test]
     fn accepts_letter_alias_labels() {
         let alpha = session_name("alpha");
+        let target = PaneTarget::with_window(alpha.clone(), 0, 10);
+        let target_identity = StableTargetIdentity::pane_for_test(target.clone());
         let mut state = DisplayPanesClientState {
             id: 1,
+            origin: RequesterOrigin::new(1, DetachedRequesterAuthority::Denied),
+            command_context: QueueExecutionContext::without_caller_cwd(),
             window: WindowTarget::with_window(alpha.clone(), 0),
             labels: vec![DisplayPanesLabel {
                 label: "a".to_owned(),
-                target: PaneTarget::with_window(alpha, 0, 10),
+                target,
                 target_string: "=alpha:0.%10".to_owned(),
+                target_identity,
             }],
             input: String::new(),
             template: None,

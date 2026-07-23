@@ -1428,7 +1428,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         SCOPE_WINDOW | SCOPE_PANE,
         GlobalRoot::Window,
         OptionValueType::String,
-        DefaultValue::Scalar("#[align=right]#{t/p:top_line_time}#{?#{e|>:#{top_line_time},0}, ,}[#{scroll_position}/#{history_size}]#{?search_timed_out, (timed out),#{?search_count, (#{search_count}#{?search_count_partial,+,} results),}}"),
+        DefaultValue::Scalar("#[align=right]#{t/p:top_line_time}#{?#{e|>:#{top_line_time},0}, ,}[#{copy_position}/#{copy_position_limit}]#{?search_timed_out, (timed out),#{?search_count, (#{search_count}#{?search_count_partial,+,} results),}}"),
         "",
         false,
         EFFECT_RENDER,

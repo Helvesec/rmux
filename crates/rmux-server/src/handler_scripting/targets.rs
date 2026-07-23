@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use rmux_core::{
-    command_target_metadata, CommandTargetSpec, OptionStore, SessionStore, TargetFindContext,
-    TargetFindFlags, TargetFindType, UnresolvedTarget,
+    command_target_metadata, CommandTargetSpec, MissingCurrentTargetFallback, OptionStore,
+    SessionStore, TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget,
 };
 use rmux_proto::{
     MoveWindowTarget, PaneTarget, RmuxError, SelectLayoutTarget, SessionName, SplitWindowTarget,
@@ -512,6 +512,7 @@ pub(super) struct QueueTargetFindContextInput<'a> {
     pub(super) requester_pane_id: Option<u32>,
     pub(super) attached_session: Option<&'a SessionName>,
     pub(super) current_target: Option<&'a Target>,
+    pub(super) missing_current_target_fallback: MissingCurrentTargetFallback,
     pub(super) mouse_target: Option<&'a Target>,
     pub(super) marked_target: Option<&'a PaneTarget>,
 }
@@ -534,6 +535,12 @@ pub(super) fn queue_target_find_context(
         TargetFindContext::new(current)
     };
 
+    let context = match input.missing_current_target_fallback {
+        MissingCurrentTargetFallback::AllowDefaultSession => context,
+        MissingCurrentTargetFallback::ForbidDefaultSession => {
+            context.forbid_missing_current_target_fallback()
+        }
+    };
     let context = context
         .with_mouse_target(input.mouse_target.cloned())
         .with_marked_target(input.marked_target.cloned().map(Target::Pane));
@@ -797,11 +804,10 @@ pub(super) fn parse_new_window_target_argument(
     }
 
     match Target::parse(&value) {
-        Ok(Target::Session(session_name)) => Ok((session_name, None)),
         Ok(Target::Window(target)) => {
             Ok((target.session_name().clone(), Some(target.window_index())))
         }
-        Ok(Target::Pane(_)) | Err(_) => {
+        Ok(Target::Session(_)) | Ok(Target::Pane(_)) | Err(_) => {
             let resolved =
                 resolve_queue_target_argument("new-window", 't', value, sessions, find_context)?;
             parse_new_window_target(resolved)

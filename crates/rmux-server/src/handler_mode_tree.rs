@@ -17,12 +17,16 @@ mod mode_tree_customize_build;
 mod mode_tree_dismissal;
 #[path = "handler_mode_tree/filter.rs"]
 mod mode_tree_filter;
+#[path = "handler_mode_tree/geometry.rs"]
+mod mode_tree_geometry;
 #[path = "handler_mode_tree/input.rs"]
 mod mode_tree_input;
 #[path = "handler_mode_tree/model.rs"]
 mod mode_tree_model;
 #[path = "handler_mode_tree/order.rs"]
 mod mode_tree_order;
+#[path = "handler_mode_tree/origin.rs"]
+mod mode_tree_origin;
 #[path = "handler_mode_tree/parse.rs"]
 mod mode_tree_parse;
 #[path = "handler_mode_tree/preview.rs"]
@@ -33,10 +37,15 @@ mod mode_tree_prompt;
 mod mode_tree_render;
 #[path = "handler_mode_tree/runtime.rs"]
 mod mode_tree_runtime;
+#[path = "handler_mode_tree/runtime_identity.rs"]
+mod mode_tree_runtime_identity;
 #[path = "handler_mode_tree/selection.rs"]
 mod mode_tree_selection;
 #[path = "handler_mode_tree/sort.rs"]
 mod mode_tree_sort;
+#[cfg(test)]
+#[path = "handler_mode_tree/test_support.rs"]
+mod mode_tree_test_support;
 #[path = "handler_mode_tree/tree_build.rs"]
 mod mode_tree_tree_build;
 #[path = "handler_mode_tree/tree_kill.rs"]

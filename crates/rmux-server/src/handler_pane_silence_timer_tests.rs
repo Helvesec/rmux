@@ -1,6 +1,7 @@
+use super::lifecycle_producer_tasks::run_registered_lifecycle_producer;
 use super::RequestHandler;
 use crate::pane_io::PaneExitEvent;
-use rmux_core::{PaneId, WINLINK_SILENCE};
+use rmux_core::{LifecycleEvent, PaneId, WINLINK_SILENCE};
 use rmux_proto::{
     BreakPaneRequest, KillPaneRequest, LinkWindowRequest, NewSessionExtRequest, NewWindowRequest,
     OptionName, PaneKillRequest, PaneTarget, PaneTargetRef, Request, Response, ScopeSelector,
@@ -196,6 +197,234 @@ fn timer_snapshot(handler: &RequestHandler, target: &WindowTarget) -> (u64, toki
     handler
         .silence_timer_snapshot_for_test(target)
         .expect("monitored window has a silence timer")
+}
+
+fn spawn_registered_silence_expiry(
+    handler: &RequestHandler,
+    target: WindowTarget,
+) -> tokio::task::JoinHandle<Option<()>> {
+    let (session_id, window_id, generation) = handler
+        .silence_timer_identity_for_test(&target)
+        .expect("monitor-silence arms the timer before the expiry race");
+    let registration = handler
+        .reserve_lifecycle_producer_task("test-silence-expiry")
+        .expect("test expiry producer is admitted");
+    let handler = handler.clone();
+    tokio::spawn(async move {
+        run_registered_lifecycle_producer(registration, async move {
+            handler
+                .expire_silence_timer_for_test(target, session_id, window_id, generation)
+                .await;
+        })
+        .await
+    })
+}
+
+#[tokio::test]
+async fn normal_shutdown_waits_for_silence_timer_handoff_then_cancels_it() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "silence-shutdown-handoff").await;
+    let target = WindowTarget::with_window(session.clone(), 0);
+    let pause = handler.install_pre_admitted_producer_spawn_pause("rmux-silence-timer");
+    let (runtime_release_tx, runtime_release_rx) = tokio::sync::oneshot::channel();
+    let installer_handler = handler.clone();
+    let installer_target = target.clone();
+    let installer = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("silence timer installer runtime")
+            .block_on(async move {
+                set_monitor_silence(&installer_handler, ScopeSelector::Window(installer_target))
+                    .await;
+                let _ = runtime_release_rx.await;
+            });
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("timer installer reaches the pre-spawn handoff");
+    let close_handler = handler.clone();
+    let close = tokio::spawn(async move {
+        close_handler
+            .close_normal_and_drain_lifecycle_producers()
+            .await;
+    });
+    handler
+        .wait_until_normal_lifecycle_producers_closing_for_test()
+        .await;
+    assert!(
+        !close.is_finished(),
+        "shutdown must wait until the timer state is installed or rolled back"
+    );
+
+    pause.release();
+    tokio::time::timeout(std::time::Duration::from_secs(2), close)
+        .await
+        .expect("normal producer drain is bounded")
+        .expect("normal producer drain task joins");
+    assert_eq!(
+        handler.silence_timer_snapshot_for_test(&target),
+        None,
+        "cancellation cleanup removes the exact installed timer"
+    );
+    let state = handler.state.lock().await;
+    assert!(
+        !state
+            .sessions
+            .session(&session)
+            .expect("session remains present")
+            .winlink_alert_flags(0)
+            .contains(WINLINK_SILENCE),
+        "a cancelled timer cannot publish a late silence alert"
+    );
+    drop(state);
+
+    runtime_release_tx
+        .send(())
+        .expect("timer installer runtime remains alive");
+    installer.join().expect("timer installer thread joins");
+}
+
+#[tokio::test]
+async fn expired_silence_publication_outlives_its_mutation_guard() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "silence-publication-handoff").await;
+    let target = WindowTarget::with_window(session.clone(), 0);
+    set_monitor_silence(&handler, ScopeSelector::Window(target.clone())).await;
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(session.clone()),
+            option: OptionName::SilenceAction,
+            value: "none".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    let pause = handler.install_alert_plan_effect_pause();
+
+    let expiry = spawn_registered_silence_expiry(&handler, target.clone());
+    if tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .is_err()
+    {
+        let snapshot = handler.silence_timer_snapshot_for_test(&target);
+        let flags = handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&session)
+            .expect("session remains present")
+            .winlink_alert_flags(0);
+        panic!("expired timer did not reach alert effects: timer={snapshot:?}, flags={flags:?}");
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), expiry)
+        .await
+        .expect("expiry producer finishes after publication handoff")
+        .expect("expiry producer task joins");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        handler.close_normal_and_drain_lifecycle_producers(),
+    )
+    .await
+    .expect("timer releases its mutation guard after handing off publication");
+    let publication_handler = handler.clone();
+    let publication_drain = tokio::spawn(async move {
+        publication_handler
+            .close_and_wait_for_lifecycle_publications()
+            .await;
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !publication_drain.is_finished(),
+        "the alert batch remains owned after its timer mutation finishes"
+    );
+
+    pause.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(2), publication_drain)
+        .await
+        .expect("publication drain finishes after alert effects")
+        .expect("publication drain task joins");
+    assert_eq!(handler.silence_timer_snapshot_for_test(&target), None);
+    let state = handler.state.lock().await;
+    assert!(
+        state
+            .sessions
+            .session(&session)
+            .expect("session remains present")
+            .winlink_alert_flags(0)
+            .contains(WINLINK_SILENCE),
+        "the admitted expiry commits its silence flag before handoff"
+    );
+}
+
+#[tokio::test]
+async fn full_lifecycle_outbox_cannot_hold_a_silence_mutation_open() {
+    let handler = RequestHandler::with_lifecycle_dispatch_capacity_for_test(1);
+    let session = create_quiet_session(&handler, "silence-full-outbox").await;
+    let target = WindowTarget::with_window(session.clone(), 0);
+    set_monitor_silence(&handler, ScopeSelector::Window(target.clone())).await;
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(session.clone()),
+            option: OptionName::SilenceAction,
+            value: "any".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+    let lifecycle_receiver = handler
+        .take_lifecycle_dispatch_receiver()
+        .expect("test activates the lifecycle outbox receiver");
+    let filler = handler
+        .prepare_lifecycle_event_for_test(LifecycleEvent::ClientFocusIn {
+            session_name: session.clone(),
+            client_name: Some("fill-silence-outbox".to_owned()),
+        })
+        .await;
+    handler.emit_prepared_lifecycle_event_for_test(filler).await;
+
+    let mut observed = handler.subscribe_lifecycle_events();
+    let expiry = spawn_registered_silence_expiry(&handler, target.clone());
+    tokio::time::timeout(std::time::Duration::from_secs(2), expiry)
+        .await
+        .expect("expiry mutation hands publication to a separate task")
+        .expect("expiry producer task joins");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
+        .await
+        .expect("silence event reaches the saturated outbox")
+        .expect("lifecycle broadcast remains active");
+    assert!(matches!(
+        event.event,
+        LifecycleEvent::AlertSilence { target: event_target } if event_target == target
+    ));
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        handler.close_normal_and_drain_lifecycle_producers(),
+    )
+    .await
+    .expect("full outbox cannot retain the timer mutation guard");
+    let publication_handler = handler.clone();
+    let publication_drain = tokio::spawn(async move {
+        publication_handler
+            .close_and_wait_for_lifecycle_publications()
+            .await;
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !publication_drain.is_finished(),
+        "the saturated outbox still owns the handed-off publication"
+    );
+
+    handler.deactivate_lifecycle_dispatch_for_shutdown();
+    drop(lifecycle_receiver);
+    tokio::time::timeout(std::time::Duration::from_secs(2), publication_drain)
+        .await
+        .expect("receiver drop releases the handed-off silence publication")
+        .expect("publication drain task joins");
 }
 
 #[tokio::test]

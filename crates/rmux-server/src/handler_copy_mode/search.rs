@@ -77,8 +77,9 @@ impl RequestHandler {
         target: PaneTarget,
         direction: AttachedCopyModeSearchDirection,
     ) -> Result<(), RmuxError> {
+        let origin = self.capture_requester_origin(attach_pid).await;
         let plan = CommandPromptPlan {
-            requester_pid: attach_pid,
+            origin,
             target_client: None,
             context: QueueExecutionContext::without_caller_cwd(),
             fields: vec![PromptField {
@@ -124,6 +125,10 @@ impl RequestHandler {
         let Ok(result) = rx.await else {
             return;
         };
+        let _access = result
+            .origin
+            .as_ref()
+            .map(|origin| self.begin_requester_origin_access(origin));
         let Some(responses) = result.responses else {
             return;
         };

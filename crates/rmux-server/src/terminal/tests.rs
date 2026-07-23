@@ -8,6 +8,8 @@ use super::{
     parse_environment_assignments, spawn_hook_command, validate_process_command, TerminalProfile,
 };
 use rmux_core::{EnvironmentStore, OptionStore};
+#[cfg(windows)]
+use rmux_proto::RmuxError;
 use rmux_proto::{OptionName, ProcessCommand, ScopeSelector, SessionName, SetOptionMode};
 #[cfg(windows)]
 use rmux_pty::TerminalSize as PtyTerminalSize;
@@ -731,16 +733,119 @@ fn explicit_empty_process_commands_are_rejected() {
 
 #[cfg(windows)]
 #[test]
-fn windows_batch_tail_wraps_cmd_s_c_payload() {
-    let tail = super::windows_batch_cmd_tail(
-        Path::new(r"C:\Users\RMUX User\scripts\custom shell.bat"),
-        &["echo hi".to_owned()],
-    );
+fn windows_structured_argv_rejects_batch_programs_before_shell_interpretation() {
+    for extension in ["cmd", "CMD", "bat", "BAT"] {
+        let command = ProcessCommand::Argv(vec![
+            format!(r"C:\Users\RMUX User\scripts\probe.{extension}"),
+            "two words".to_owned(),
+            "quote\"value".to_owned(),
+            "%RMUX_SENTINEL%".to_owned(),
+            "bang!value".to_owned(),
+            "amp&value".to_owned(),
+            "pipe|value".to_owned(),
+            "less<value".to_owned(),
+            "greater>value".to_owned(),
+            "caret^value".to_owned(),
+            String::new(),
+        ]);
 
-    assert_eq!(
-        tail,
-        OsString::from("\"\"C:\\Users\\RMUX User\\scripts\\custom shell.bat\" \"echo hi\"\"")
-    );
+        let error = validate_process_command(Some(&command))
+            .expect_err("Windows batch argv must be rejected before cmd.exe can reinterpret it");
+        assert!(matches!(error, RmuxError::SpawnFailed { .. }));
+        assert_eq!(
+            error.to_string(),
+            super::WINDOWS_BATCH_ARGV_UNSUPPORTED_MESSAGE
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_structured_argv_keeps_native_executables_direct() {
+    for extension in ["exe", "EXE", "com", "COM"] {
+        validate_process_command(Some(&ProcessCommand::Argv(vec![format!(
+            r"C:\Tools\native.{extension}"
+        )])))
+        .expect("native Windows executables remain valid structured argv targets");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_structured_argv_rejects_pathext_resolved_batch_shims() -> Result<(), Box<dyn Error>> {
+    let root = unique_directory("batch-argv-shim")?;
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin)?;
+    fs::write(root.join("opencode.cmd"), "@echo off\r\nexit /b 0\r\n")?;
+    fs::write(root.join("absolute-shim.cmd"), "@echo off\r\nexit /b 0\r\n")?;
+    fs::write(bin.join("relative-shim.bat"), "@echo off\r\nexit /b 0\r\n")?;
+    fs::write(root.join("native.exe"), b"")?;
+    fs::write(bin.join("native.com"), b"")?;
+    let environment = EnvironmentStore::new();
+    let options = OptionStore::new();
+    let session_name = SessionName::new("batch-shim").expect("valid session name");
+    let profile = TerminalProfile::for_session(
+        &environment,
+        &options,
+        &session_name,
+        7,
+        Path::new(r"\\.\pipe\rmux-batch-argv-test"),
+        None,
+        true,
+        Some(&[
+            format!("PATH={}", root.display()),
+            "PATHEXT=.COM;.EXE;.BAT;.CMD".to_owned(),
+        ]),
+        None,
+        Some(&root),
+    )?;
+
+    for (program, shape) in [
+        (PathBuf::from("opencode"), "bare PATH shim"),
+        (root.join("absolute-shim"), "absolute extensionless shim"),
+        (
+            PathBuf::from("bin").join("relative-shim"),
+            "relative extensionless shim",
+        ),
+    ] {
+        let error = super::validate_windows_process_command_for_profile(
+            &profile,
+            Some(&ProcessCommand::Argv(vec![program
+                .to_string_lossy()
+                .into_owned()])),
+        )
+        .expect_err("PATHEXT-resolved batch shim must not cross into cmd.exe argv parsing");
+        assert!(matches!(error, RmuxError::SpawnFailed { .. }), "{shape}");
+        assert_eq!(
+            error.to_string(),
+            super::WINDOWS_BATCH_ARGV_UNSUPPORTED_MESSAGE,
+            "{shape}"
+        );
+    }
+
+    for program in [root.join("native"), PathBuf::from("bin").join("native")] {
+        super::validate_windows_process_command_for_profile(
+            &profile,
+            Some(&ProcessCommand::Argv(vec![program
+                .to_string_lossy()
+                .into_owned()])),
+        )
+        .expect("extensionless native .exe/.com target remains structured argv");
+    }
+
+    let _ = fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_structured_argv_does_not_treat_windows_batch_suffixes_specially() {
+    for extension in ["cmd", "bat"] {
+        validate_process_command(Some(&ProcessCommand::Argv(vec![format!(
+            "/tmp/native-name.{extension}"
+        )])))
+        .expect("Unix argv targets remain direct regardless of Windows-style suffixes");
+    }
 }
 
 #[test]

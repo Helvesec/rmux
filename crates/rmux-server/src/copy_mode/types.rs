@@ -20,6 +20,7 @@ impl ModeKeys {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CopyModeCommandContext {
     pub(crate) mode_keys: ModeKeys,
+    pub(crate) line_number_mode: super::CopyModeLineNumberMode,
     pub(crate) wrap_search: bool,
     pub(crate) word_separators: String,
     pub(crate) default_shell: String,
@@ -35,11 +36,35 @@ pub(crate) struct CopyModeMouseContext {
     pub(crate) selection_anchor: Option<(u32, u16)>,
     pub(crate) scroll_y: u16,
     pub(crate) slider_mpos: i32,
+    pub(crate) move_cursor_before_command: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyModePrefixBehavior {
+    Repeat,
+    Count,
+}
+
+impl super::CopyModeState {
+    pub(crate) fn summary_for_mouse(
+        backing: Screen,
+        context: &CopyModeCommandContext,
+    ) -> CopyModeSummary {
+        let mut state = Self::new(backing, None, false, context, false, false);
+        if let Some(mouse) = context.mouse {
+            state.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
+        }
+        state.summary()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CopyModeSummary {
     pub(crate) view_mode: bool,
+    pub(crate) line_numbers_enabled: bool,
+    pub(crate) show_position: bool,
+    pub(crate) history_size: usize,
+    pub(crate) backing_rows: u16,
     pub(crate) scroll_position: usize,
     pub(crate) rectangle_toggle: bool,
     pub(crate) cursor_x: u32,
@@ -65,6 +90,10 @@ pub(crate) struct CopyModeSummary {
 pub(crate) struct CopyModeRenderSnapshot {
     pub(crate) screen: Screen,
     pub(crate) overlays: CopyModeRenderOverlays,
+    pub(crate) history_size: usize,
+    pub(crate) scroll_position: usize,
+    pub(crate) alternate_on: bool,
+    pub(crate) line_numbers_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

@@ -456,6 +456,7 @@ async fn control_queue_new_session_rejects_same_name_replacement_before_attach()
         .await;
     assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
     crate::hook_runtime::with_hook_execution(
+        crate::hook_runtime::HookExecutionContext::lifecycle(HookName::SessionClosed),
         Vec::new(),
         create_session(&handler, session_name.clone()),
     )

@@ -235,7 +235,7 @@ fn status_layout_marks_left_window_and_right_ranges() {
         )
         .expect("right option set");
 
-    let layout = status_line_layout(&session, &options, 0, None).expect("layout exists");
+    let layout = status_line_layout(&session, &options, 0, None, None).expect("layout exists");
     assert!(layout
         .ranges
         .iter()
@@ -279,7 +279,7 @@ fn status_layout_tracks_inline_range_changes_inside_status_left() {
         )
         .expect("left length set");
 
-    let layout = status_line_layout(&session, &options, 0, None).expect("layout exists");
+    let layout = status_line_layout(&session, &options, 0, None, None).expect("layout exists");
 
     assert!(layout.ranges.iter().any(|range| matches!(
         range.kind,

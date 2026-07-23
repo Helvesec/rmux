@@ -171,6 +171,34 @@ pub(super) fn resolve_pane_target_spec(
     }
 }
 
+pub(super) fn resolve_canfail_pane_target_spec(
+    connection: &mut Connection,
+    target: &TargetSpec,
+) -> Result<Option<rmux_proto::PaneTarget>, ExitFailure> {
+    let response = connection
+        .resolve_target(
+            Some(target.raw().to_owned()),
+            ResolveTargetType::Pane,
+            false,
+            false,
+        )
+        .map_err(ExitFailure::from_client)?;
+    match response {
+        Response::ResolveTarget(response) => match response.target {
+            rmux_proto::Target::Pane(target) => Ok(Some(target)),
+            other => Err(ExitFailure::new(
+                1,
+                format!(
+                    "resolve-target produced {} where a pane target was required",
+                    response_name_for_target(&other)
+                ),
+            )),
+        },
+        Response::Error(_) => Ok(None),
+        other => Err(unexpected_response("resolve-target", &other)),
+    }
+}
+
 pub(super) fn listed_pane_index_matches_target(
     target: &rmux_proto::PaneTarget,
     visible_pane_index: &str,

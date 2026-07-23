@@ -5,7 +5,7 @@ use rmux_core::{
 use rmux_proto::{OptionName, SessionId, SessionName, WindowId, WindowTarget};
 use tokio::task::JoinHandle;
 
-use super::{QueuedLifecycleEvent, RequestHandler};
+use super::{RequestHandler, UnsequencedLifecycleEvent};
 use crate::pane_io::AttachControl;
 use crate::renderer;
 
@@ -77,7 +77,7 @@ pub(in crate::handler) struct AlertPlan {
     send_bell: bool,
     show_message: bool,
     message_text: String,
-    lifecycle_event: Option<QueuedLifecycleEvent>,
+    lifecycle_event: Option<UnsequencedLifecycleEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,14 +180,15 @@ impl RequestHandler {
             };
             let session_name = session.name().clone();
             let overlay_frame = {
-                let mut frame = renderer::render_display_panes_clear(session, &state.options);
+                let mut frame =
+                    renderer::render_display_panes_clear(session, &state.options, &state);
                 frame.extend_from_slice(
                     renderer::render_status_message(session, &state.options, &plan.message_text)
                         .as_slice(),
                 );
                 frame
             };
-            let clear_frame = renderer::render_display_panes_clear(session, &state.options);
+            let clear_frame = renderer::render_display_panes_clear(session, &state.options, &state);
             (
                 overlay_frame,
                 clear_frame,

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use crate::input::InputEndType;
+
 /// Maximum payload size retained for one terminal graphics passthrough event.
 pub(crate) const MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
@@ -10,6 +12,7 @@ pub struct TerminalPassthrough {
     cursor_x: u32,
     cursor_y: u32,
     palette_index: Option<TerminalPaletteIndex>,
+    clipboard_query: Option<TerminalClipboardQuery>,
     payload: Arc<[u8]>,
 }
 
@@ -35,6 +38,43 @@ pub enum TerminalPassthroughKind {
 /// terminal query path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TerminalPaletteIndex(u8);
+
+/// A bounded pane-originated OSC 52 clipboard query.
+///
+/// The selector is reduced to the first tmux-supported selector byte. Invalid
+/// selector bytes are discarded instead of being reflected to a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalClipboardQuery {
+    selection: Option<u8>,
+    terminator: InputEndType,
+}
+
+impl TerminalClipboardQuery {
+    const VALID_SELECTIONS: &'static [u8] = b"cpqs01234567";
+
+    /// Creates a typed query from an OSC 52 selection field and terminator.
+    #[must_use]
+    pub fn new(selection: &str, terminator: InputEndType) -> Self {
+        Self {
+            selection: selection
+                .bytes()
+                .find(|byte| Self::VALID_SELECTIONS.contains(byte)),
+            terminator,
+        }
+    }
+
+    /// Returns the first valid tmux clipboard selector, if any.
+    #[must_use]
+    pub const fn selection(self) -> Option<u8> {
+        self.selection
+    }
+
+    /// Returns the pane query's original OSC terminator.
+    #[must_use]
+    pub const fn terminator(self) -> InputEndType {
+        self.terminator
+    }
+}
 
 impl TerminalPaletteIndex {
     /// Parses one strict ASCII-decimal palette index in the inclusive 0..=255
@@ -69,6 +109,7 @@ impl TerminalPassthrough {
             cursor_x,
             cursor_y,
             palette_index: None,
+            clipboard_query: None,
             payload: Arc::from(payload.into()),
         }
     }
@@ -81,6 +122,25 @@ impl TerminalPassthrough {
             cursor_x: 0,
             cursor_y: 0,
             palette_index: None,
+            clipboard_query: None,
+            payload: Arc::from(payload.into()),
+        }
+    }
+
+    /// Creates a typed OSC 52 clipboard query event while retaining its
+    /// original framed payload for inspection.
+    #[must_use]
+    pub fn clipboard_query(query: TerminalClipboardQuery, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            // Preserve the public protocol-family classification: adding a
+            // new enum variant would break exhaustive downstream matches in
+            // a patch release. The additive typed metadata distinguishes a
+            // query from an OSC 52 write internally.
+            kind: TerminalPassthroughKind::Clipboard,
+            cursor_x: 0,
+            cursor_y: 0,
+            palette_index: None,
+            clipboard_query: Some(query),
             payload: Arc::from(payload.into()),
         }
     }
@@ -97,6 +157,7 @@ impl TerminalPassthrough {
             cursor_x: 0,
             cursor_y: 0,
             palette_index: Some(index),
+            clipboard_query: None,
             payload: Arc::from(payload),
         }
     }
@@ -109,6 +170,7 @@ impl TerminalPassthrough {
             cursor_x,
             cursor_y,
             palette_index: None,
+            clipboard_query: None,
             payload: Arc::from(payload.into()),
         }
     }
@@ -121,6 +183,7 @@ impl TerminalPassthrough {
             cursor_x,
             cursor_y,
             palette_index: None,
+            clipboard_query: None,
             payload: Arc::from(payload.into()),
         }
     }
@@ -155,9 +218,20 @@ impl TerminalPassthrough {
         self.palette_index
     }
 
+    /// Returns typed OSC 52 query metadata for clipboard-query events.
+    #[must_use]
+    pub const fn clipboard_query_metadata(&self) -> Option<TerminalClipboardQuery> {
+        self.clipboard_query
+    }
+
     /// Renders the passthrough as an outer-terminal escape sequence.
     #[must_use]
     pub fn render_sequence(&self) -> Vec<u8> {
+        // Clipboard queries are server-correlated and must never fall
+        // through the generic outer-terminal passthrough path.
+        if self.clipboard_query.is_some() {
+            return Vec::new();
+        }
         match self.kind {
             TerminalPassthroughKind::Raw => self.payload.to_vec(),
             TerminalPassthroughKind::Clipboard => self.payload.to_vec(),
@@ -182,7 +256,8 @@ impl TerminalPassthrough {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalPaletteIndex, TerminalPassthrough};
+    use super::{TerminalClipboardQuery, TerminalPaletteIndex, TerminalPassthrough};
+    use crate::input::InputEndType;
 
     #[test]
     fn renders_kitty_apc_sequence() {
@@ -203,6 +278,26 @@ mod tests {
         let passthrough = TerminalPassthrough::clipboard(b"\x1b]52;c;QQ==\x07".to_vec());
 
         assert_eq!(passthrough.render_sequence(), b"\x1b]52;c;QQ==\x07");
+    }
+
+    #[test]
+    fn clipboard_query_is_typed_bounded_and_never_generically_rendered() {
+        let query = TerminalClipboardQuery::new("zzpc", InputEndType::St);
+        assert_eq!(query.selection(), Some(b'p'));
+        assert_eq!(query.terminator(), InputEndType::St);
+
+        let passthrough =
+            TerminalPassthrough::clipboard_query(query, b"\x1b]52;zzpc;?\x1b\\".to_vec());
+        assert_eq!(
+            passthrough.kind(),
+            super::TerminalPassthroughKind::Clipboard
+        );
+        assert_eq!(passthrough.clipboard_query_metadata(), Some(query));
+        assert_eq!(passthrough.payload(), b"\x1b]52;zzpc;?\x1b\\");
+        assert!(passthrough.render_sequence().is_empty());
+
+        let invalid = TerminalClipboardQuery::new("xyz", InputEndType::Bel);
+        assert_eq!(invalid.selection(), None);
     }
 
     #[test]

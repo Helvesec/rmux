@@ -4,8 +4,8 @@ use rmux_proto::RmuxError;
 
 use super::args::{is_readonly_command, strip_leading_separator};
 use super::types::{
-    ClearPolicy, CopyModeCommandContext, CopyModeCommandOutcome, JumpKind, ModeKeys,
-    SearchDirection,
+    ClearPolicy, CopyModeCommandContext, CopyModeCommandOutcome, CopyModePrefixBehavior, JumpKind,
+    ModeKeys, SearchDirection,
 };
 use super::CopyModeState;
 
@@ -16,10 +16,26 @@ impl CopyModeState {
         args: &[String],
         context: &CopyModeCommandContext,
     ) -> Result<CopyModeCommandOutcome, RmuxError> {
+        self.execute_command_with_prefix(command, args, context, 1)
+    }
+
+    pub(crate) fn execute_command_with_prefix(
+        &mut self,
+        command: &str,
+        args: &[String],
+        context: &CopyModeCommandContext,
+        prefix: usize,
+    ) -> Result<CopyModeCommandOutcome, RmuxError> {
         let args = strip_leading_separator(args);
         self.mode_keys = context.mode_keys;
         self.wrap_search = context.wrap_search;
         self.word_separators = context.word_separators.clone();
+        if let Some(mouse) = context
+            .mouse
+            .filter(|mouse| mouse.move_cursor_before_command)
+        {
+            self.reposition_cursor_to_mouse(mouse.content_x, mouse.content_y);
+        }
         if self.view_mode && !is_readonly_command(command) {
             return Ok(CopyModeCommandOutcome::nothing());
         }
@@ -73,14 +89,16 @@ impl CopyModeState {
                 self.selection = None;
                 Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always))
             }
-            "copy-end-of-line" => self.transfer_end_of_line(args, false, false),
-            "copy-end-of-line-and-cancel" => self.transfer_end_of_line(args, false, true),
-            "copy-pipe-end-of-line" => self.transfer_end_of_line(args, true, false),
-            "copy-pipe-end-of-line-and-cancel" => self.transfer_end_of_line(args, true, true),
-            "copy-line" => self.transfer_line(args, false, false),
-            "copy-line-and-cancel" => self.transfer_line(args, false, true),
-            "copy-pipe-line" => self.transfer_line(args, true, false),
-            "copy-pipe-line-and-cancel" => self.transfer_line(args, true, true),
+            "copy-end-of-line" => self.transfer_end_of_line(args, false, false, prefix),
+            "copy-end-of-line-and-cancel" => self.transfer_end_of_line(args, false, true, prefix),
+            "copy-pipe-end-of-line" => self.transfer_end_of_line(args, true, false, prefix),
+            "copy-pipe-end-of-line-and-cancel" => {
+                self.transfer_end_of_line(args, true, true, prefix)
+            }
+            "copy-line" => self.transfer_line(args, false, false, prefix),
+            "copy-line-and-cancel" => self.transfer_line(args, false, true, prefix),
+            "copy-pipe-line" => self.transfer_line(args, true, false, prefix),
+            "copy-pipe-line-and-cancel" => self.transfer_line(args, true, true, prefix),
             "copy-pipe-no-clear" => self.transfer_copy_pipe(args, false, ClearPolicy::Never),
             "copy-pipe" => self.transfer_copy_pipe(args, false, ClearPolicy::Always),
             "copy-pipe-and-cancel" => self.transfer_copy_pipe(args, true, ClearPolicy::Always),
@@ -118,7 +136,11 @@ impl CopyModeState {
                 let line = args
                     .first()
                     .ok_or_else(|| RmuxError::Server("goto-line expects a line".to_owned()))?;
-                state.cmd_goto_line(line)
+                state.cmd_goto_line(
+                    line,
+                    state.line_numbers_enabled
+                        && context.line_number_mode.uses_absolute_positions(),
+                )
             }),
             "halfpage-down" => {
                 self.readonly_exit_on_scroll(Self::cmd_halfpage_down, ClearPolicy::EmacsOnly)
@@ -296,6 +318,20 @@ impl CopyModeState {
         }?;
 
         Ok(outcome)
+    }
+
+    pub(crate) fn prefix_behavior(command: &str) -> CopyModePrefixBehavior {
+        match command {
+            "copy-end-of-line"
+            | "copy-end-of-line-and-cancel"
+            | "copy-pipe-end-of-line"
+            | "copy-pipe-end-of-line-and-cancel"
+            | "copy-line"
+            | "copy-line-and-cancel"
+            | "copy-pipe-line"
+            | "copy-pipe-line-and-cancel" => CopyModePrefixBehavior::Count,
+            _ => CopyModePrefixBehavior::Repeat,
+        }
     }
 
     fn readonly(

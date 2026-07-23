@@ -5,6 +5,7 @@ use rmux_proto::{PaneTarget, TerminalSize};
 mod args;
 #[path = "copy_mode/commands.rs"]
 mod commands;
+mod line_numbers;
 #[path = "copy_mode/motion.rs"]
 mod motion;
 #[path = "copy_mode/render.rs"]
@@ -22,17 +23,16 @@ mod types;
 #[path = "copy_mode/word.rs"]
 mod word;
 
+pub(crate) use line_numbers::{CopyModeLineNumberLayout, CopyModeLineNumberMode};
 use text::{
     classify_word_char, is_owner_position, line_char, owner_positions, pattern_looks_like_regex,
     WordClass,
 };
 #[cfg_attr(windows, allow(unused_imports))]
-pub(crate) use transfer::run_pipe_command;
-#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
     CopyBufferTarget, CopyModeCommandContext, CopyModeCommandOutcome, CopyModeMouseContext,
-    CopyModeOverlayRange, CopyModePipeCommand, CopyModeRenderOverlays, CopyModeRenderSnapshot,
-    CopyModeSummary, CopyModeTransfer, CopyPosition, ModeKeys,
+    CopyModeOverlayRange, CopyModePipeCommand, CopyModePrefixBehavior, CopyModeRenderOverlays,
+    CopyModeRenderSnapshot, CopyModeSummary, CopyModeTransfer, CopyPosition, ModeKeys,
 };
 use types::{JumpState, SearchDirection, SearchMatch, SelectionState};
 
@@ -41,6 +41,7 @@ const BRACKET_SCAN_LIMIT: usize = 1500;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CopyModeState {
     view_mode: bool,
+    line_numbers_enabled: bool,
     source_target: Option<PaneTarget>,
     backing: Screen,
     top_line: usize,
@@ -103,6 +104,7 @@ impl CopyModeState {
         };
         let mut state = Self {
             view_mode,
+            line_numbers_enabled: !view_mode,
             source_target,
             top_line: 0,
             cursor,
@@ -139,6 +141,7 @@ impl CopyModeState {
             false,
             &CopyModeCommandContext {
                 mode_keys: ModeKeys::Emacs,
+                line_number_mode: CopyModeLineNumberMode::Off,
                 wrap_search: true,
                 word_separators: " -_@".to_owned(),
                 default_shell: "/bin/sh".to_owned(),
@@ -226,6 +229,10 @@ impl CopyModeState {
             .map(|result| result.text.clone());
         CopyModeSummary {
             view_mode: self.view_mode,
+            line_numbers_enabled: self.line_numbers_enabled,
+            show_position: self.show_position,
+            history_size: self.backing.history_size(),
+            backing_rows: self.backing.size().rows,
             scroll_position: self.bottom_top_line().saturating_sub(self.top_line),
             rectangle_toggle: self.rectangle,
             cursor_x: self.cursor.x,
@@ -253,17 +260,6 @@ impl CopyModeState {
                 0
             },
         }
-    }
-
-    pub(crate) fn summary_for_mouse(
-        backing: Screen,
-        context: &CopyModeCommandContext,
-    ) -> CopyModeSummary {
-        let mut state = Self::new(backing, None, false, context, false, false);
-        if let Some(mouse) = context.mouse {
-            state.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
-        }
-        state.summary()
     }
 
     fn current_word(&self) -> Option<String> {
@@ -396,12 +392,6 @@ impl CopyModeState {
     fn full_line_text(&self, y: usize, trim_spaces: bool) -> String {
         let line = self.line(y);
         self.extract_line_range(&line, 0, self.cols().saturating_sub(1), trim_spaces)
-    }
-
-    fn logical_line_text(&self, y: usize, trim_spaces: bool) -> String {
-        let start = self.logical_line_start_y(y);
-        let end = self.logical_line_end_y(y);
-        self.logical_line_text_range(start, end, trim_spaces)
     }
 
     fn logical_line_text_range(&self, start_y: usize, end_y: usize, trim_spaces: bool) -> String {

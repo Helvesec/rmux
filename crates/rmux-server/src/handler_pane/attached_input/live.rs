@@ -341,6 +341,9 @@ impl RequestHandler {
         windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
         active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<bool> {
+        if !bytes.is_empty() {
+            self.record_attached_input_activity(identity).await?;
+        }
         if bytes.len() <= ATTACHED_LIVE_REROUTE_CHUNK_BYTES {
             return match self
                 .handle_attached_live_input_chunk(
@@ -391,6 +394,25 @@ impl RequestHandler {
             active_emit_cache,
         )
         .await
+    }
+
+    async fn record_attached_input_activity(
+        &self,
+        identity: ActiveAttachIdentity,
+    ) -> io::Result<()> {
+        let mut active_attach = self.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&identity.attach_pid())
+            .filter(|active| {
+                identity.matches_active(active)
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .ok_or_else(|| io_other("attached client disappeared"))?;
+        if active.can_write && !active.flags.contains(ClientFlags::READONLY) {
+            let _ = active_attach.record_client_activity(identity.attach_pid());
+        }
+        Ok(())
     }
 
     async fn handle_attached_live_input_work_queue(
@@ -543,8 +565,8 @@ impl RequestHandler {
         {
             return Ok(step);
         }
-        let target = self
-            .attached_input_target_for_identity(identity)
+        let (target, target_session_id) = self
+            .attached_input_target_identity(identity)
             .await
             .map_err(io_other)?;
         self.emit_attached_client_active_if_changed(identity, &target, active_emit_cache)
@@ -558,7 +580,13 @@ impl RequestHandler {
             pending_input.extend_from_slice(bytes);
             match decode_bracketed_paste_after_append(pending_input, new_input_at) {
                 BracketedPasteDecode::Matched { .. } => {
-                    let _ = self.exit_clock_mode(&target).await.map_err(io_other)?;
+                    #[cfg(test)]
+                    self.pause_before_live_clock_mode_exit_for_test(identity)
+                        .await;
+                    let _ = self
+                        .exit_clock_mode_for_attached_identity(&target, identity, target_session_id)
+                        .await
+                        .map_err(io_other)?;
                     return Ok(AttachedLiveInputStep::Reroute {
                         bytes: std::mem::take(pending_input),
                         forwarded: false,
@@ -566,7 +594,17 @@ impl RequestHandler {
                 }
                 BracketedPasteDecode::Partial => {
                     if pending_input.len() > MAX_RETAINED_ATTACHED_CONTROL_INPUT {
-                        let _ = self.exit_clock_mode(&target).await.map_err(io_other)?;
+                        #[cfg(test)]
+                        self.pause_before_live_clock_mode_exit_for_test(identity)
+                            .await;
+                        let _ = self
+                            .exit_clock_mode_for_attached_identity(
+                                &target,
+                                identity,
+                                target_session_id,
+                            )
+                            .await
+                            .map_err(io_other)?;
                         return Ok(AttachedLiveInputStep::Reroute {
                             bytes: std::mem::take(pending_input),
                             forwarded: false,
@@ -595,7 +633,13 @@ impl RequestHandler {
                 };
                 if consumed > 0 {
                     pending_input.drain(..consumed);
-                    let _ = self.exit_clock_mode(&target).await.map_err(io_other)?;
+                    #[cfg(test)]
+                    self.pause_before_live_clock_mode_exit_for_test(identity)
+                        .await;
+                    let _ = self
+                        .exit_clock_mode_for_attached_identity(&target, identity, target_session_id)
+                        .await
+                        .map_err(io_other)?;
                     let remaining =
                         (!pending_input.is_empty()).then(|| std::mem::take(pending_input));
                     return Ok(attached_mode_input_step(remaining));
@@ -617,7 +661,13 @@ impl RequestHandler {
                 }
             };
             pending_input.drain(..consumed);
-            let _ = self.exit_clock_mode(&target).await.map_err(io_other)?;
+            #[cfg(test)]
+            self.pause_before_live_clock_mode_exit_for_test(identity)
+                .await;
+            let _ = self
+                .exit_clock_mode_for_attached_identity(&target, identity, target_session_id)
+                .await
+                .map_err(io_other)?;
             let remaining = (!pending_input.is_empty()).then(|| std::mem::take(pending_input));
             return Ok(attached_mode_input_step(remaining));
         }
@@ -870,6 +920,26 @@ impl RequestHandler {
                             index,
                             &pending_input[offset..offset + size],
                         )
+                        .await?;
+                    offset += size;
+                    raw_start = offset;
+                    continue;
+                }
+                TerminalResponseDecode::ClipboardResponse {
+                    size,
+                    selection,
+                    content,
+                } => {
+                    if raw_start < offset {
+                        self.write_attached_bytes_for_identity(
+                            identity,
+                            &pending_input[raw_start..offset],
+                        )
+                        .await?;
+                        forwarded_to_pane = true;
+                    }
+                    forwarded_to_pane |= self
+                        .handle_attached_clipboard_response(identity, selection, content)
                         .await?;
                     offset += size;
                     raw_start = offset;
@@ -1263,6 +1333,14 @@ impl RequestHandler {
                     // through a prompt or mode-tree would let its leading ESC
                     // close the surface after another attached client had
                     // already consumed the shared query slot.
+                    continue;
+                }
+                ModalPaletteInputSegment::ClipboardResponse {
+                    selection, content, ..
+                } => {
+                    forwarded |= self
+                        .handle_attached_clipboard_response(identity, selection, content)
+                        .await?;
                     continue;
                 }
             };

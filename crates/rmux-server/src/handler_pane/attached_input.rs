@@ -33,6 +33,8 @@ use crate::pane_terminals::HandlerState;
 
 #[path = "attached_input/bracketed_paste.rs"]
 pub(super) mod bracketed_paste;
+#[path = "attached_input/click_timer_lifecycle.rs"]
+mod click_timer_lifecycle;
 #[path = "attached_input/kitty_graphics.rs"]
 mod kitty_graphics;
 #[path = "attached_input/live.rs"]
@@ -86,7 +88,7 @@ enum AttachedPaneForward<'a> {
 }
 
 impl RequestHandler {
-    async fn with_live_input_session_state<T>(
+    pub(super) async fn with_live_input_session_state<T>(
         &self,
         identity: ActiveAttachIdentity,
         session_name: &rmux_proto::SessionName,
@@ -499,19 +501,34 @@ impl RequestHandler {
             return Ok(());
         };
         if !mouse_enabled {
-            let Some(event) = mouse_event_for_pane_passthrough(&layout, raw) else {
+            let Some(passthrough) = mouse_event_for_pane_passthrough(&layout, raw) else {
                 return Ok(());
             };
-            let Some(target) = event.pane_target.clone() else {
+            if let (Some(window_id), Some(pane_id)) =
+                (passthrough.event.window_id, passthrough.focus_target)
+            {
+                self.select_attached_mouse_focus(
+                    identity,
+                    &session_name,
+                    session_id,
+                    window_id,
+                    pane_id,
+                )
+                .await?;
+            }
+            let Some(target) = passthrough.event.pane_target.clone() else {
                 return Ok(());
             };
             self.forward_attached_mouse_event_to_pane_for_session_identity(
-                identity, session_id, &target, &event,
+                identity,
+                session_id,
+                &target,
+                &passthrough.event,
             )
             .await?;
             return Ok(());
         }
-        let (classified, click_deadline) = {
+        let (classified, click_timer) = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -522,78 +539,15 @@ impl RequestHandler {
                 })
                 .ok_or_else(|| io_other("attached client disappeared"))?;
             let classified = classify_mouse_events(&mut active.mouse, &layout, raw, Instant::now());
-            (classified, active.mouse.click_deadline())
+            (classified, active.mouse.click_timer_token())
         };
-        if let Some(deadline) = click_deadline {
-            self.schedule_attached_mouse_click_timer(
-                identity,
-                session_name.clone(),
-                session_id,
-                deadline,
-            );
+        if let Some(token) = click_timer {
+            self.schedule_attached_mouse_click_timer(identity, token);
         }
         if classified.is_empty() {
             return Ok(());
         }
         for classified in classified {
-            self.dispatch_attached_mouse_classified(
-                identity,
-                &session_name,
-                session_id,
-                classified,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    fn schedule_attached_mouse_click_timer(
-        &self,
-        identity: ActiveAttachIdentity,
-        session_name: rmux_proto::SessionName,
-        session_id: rmux_proto::SessionId,
-        deadline: Instant,
-    ) {
-        let handler = self.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-            let _ = handler
-                .dispatch_expired_attached_mouse_click(identity, session_name, session_id)
-                .await;
-        });
-    }
-
-    async fn dispatch_expired_attached_mouse_click(
-        &self,
-        identity: ActiveAttachIdentity,
-        session_name: rmux_proto::SessionName,
-        session_id: rmux_proto::SessionId,
-    ) -> io::Result<()> {
-        let attach_pid = identity.attach_pid();
-        let attached_count = self
-            .attached_count_for_session_identity(&session_name, session_id)
-            .await;
-        let layout = {
-            let state = self.state.lock().await;
-            ensure_session_identity(&state, &session_name, session_id).map_err(io_other)?;
-            layout_for_session(&state, &session_name, attached_count)
-        };
-        let Some(layout) = layout else {
-            return Ok(());
-        };
-        let classified = {
-            let mut active_attach = self.active_attach.lock().await;
-            let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
-                return Ok(());
-            };
-            if !identity.matches_active_session(active, &session_name, session_id)
-                || active.closing.load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return Ok(());
-            }
-            active.mouse.expire_click_timer(Instant::now(), &layout)
-        };
-        if let Some(classified) = classified {
             self.dispatch_attached_mouse_classified(
                 identity,
                 &session_name,
@@ -613,6 +567,18 @@ impl RequestHandler {
         classified: ClassifiedMouseEvent,
     ) -> io::Result<()> {
         let attach_pid = identity.attach_pid();
+        if let (Some(window_id), Some(pane_id)) =
+            (classified.event.window_id, classified.focus_target)
+        {
+            self.select_attached_mouse_focus(
+                identity,
+                session_name,
+                session_id,
+                window_id,
+                pane_id,
+            )
+            .await?;
+        }
         let target = if let Some(target) = classified.event.pane_target.clone() {
             target
         } else {
@@ -952,8 +918,8 @@ impl RequestHandler {
 
         let bytes = std::mem::take(pending_input);
         if bytes.first() == Some(&b'\x1b') {
-            let target = self
-                .attached_input_target_for_identity(identity)
+            let (target, target_session_id) = self
+                .attached_input_target_identity(identity)
                 .await
                 .map_err(io_other)?;
             let consumed_by_mode = if self
@@ -961,7 +927,12 @@ impl RequestHandler {
                 .await
                 .map_err(io_other)?
             {
-                self.exit_clock_mode(&target).await.map_err(io_other)?
+                #[cfg(test)]
+                self.pause_before_live_clock_mode_exit_for_test(identity)
+                    .await;
+                self.exit_clock_mode_for_attached_identity(&target, identity, target_session_id)
+                    .await
+                    .map_err(io_other)?
             } else {
                 self.handle_attached_copy_mode_key_event_for_identity(
                     identity,
@@ -1018,6 +989,7 @@ impl RequestHandler {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(in crate::handler) async fn attached_input_target(
         &self,
         attach_pid: u32,
@@ -1027,16 +999,7 @@ impl RequestHandler {
         resolve_input_target(&state, None, Some(&session_name))
     }
 
-    pub(in crate::handler) async fn attached_input_target_for_identity(
-        &self,
-        identity: ActiveAttachIdentity,
-    ) -> Result<PaneTarget, RmuxError> {
-        self.attached_input_target_identity(identity)
-            .await
-            .map(|(target, _)| target)
-    }
-
-    async fn attached_input_target_identity(
+    pub(in crate::handler) async fn attached_input_target_identity(
         &self,
         identity: ActiveAttachIdentity,
     ) -> Result<(PaneTarget, rmux_proto::SessionId), RmuxError> {

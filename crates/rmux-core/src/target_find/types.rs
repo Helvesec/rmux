@@ -80,10 +80,23 @@ impl UnresolvedTarget {
     }
 }
 
+/// Policy for an omitted target when the supplied current target disappeared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MissingCurrentTargetFallback {
+    /// Match ordinary tmux lookup by selecting the default live session when
+    /// the supplied current target is absent.
+    #[default]
+    AllowDefaultSession,
+    /// Preserve a retained target tombstone and fail target-dependent lookup
+    /// instead of selecting an unrelated live session.
+    ForbidDefaultSession,
+}
+
 /// Current target context used for omitted targets and relative lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetFindContext {
     current: Option<Target>,
+    missing_current_target_fallback: MissingCurrentTargetFallback,
     mouse_target: Option<Target>,
     marked_target: Option<Target>,
     pane_base_indices: HashMap<(SessionName, u32), u32>,
@@ -95,6 +108,7 @@ impl TargetFindContext {
     pub fn new(current: Option<Target>) -> Self {
         Self {
             current,
+            missing_current_target_fallback: MissingCurrentTargetFallback::AllowDefaultSession,
             mouse_target: None,
             marked_target: None,
             pane_base_indices: HashMap::new(),
@@ -106,6 +120,7 @@ impl TargetFindContext {
     pub fn from_target(target: Target) -> Self {
         Self {
             current: Some(target),
+            missing_current_target_fallback: MissingCurrentTargetFallback::AllowDefaultSession,
             mouse_target: None,
             marked_target: None,
             pane_base_indices: HashMap::new(),
@@ -116,6 +131,18 @@ impl TargetFindContext {
     #[must_use]
     pub const fn current(&self) -> Option<&Target> {
         self.current.as_ref()
+    }
+
+    /// Disables default-session fallback when a supplied current target no
+    /// longer exists.
+    #[must_use]
+    pub fn forbid_missing_current_target_fallback(mut self) -> Self {
+        self.missing_current_target_fallback = MissingCurrentTargetFallback::ForbidDefaultSession;
+        self
+    }
+
+    pub(super) const fn missing_current_target_fallback(&self) -> MissingCurrentTargetFallback {
+        self.missing_current_target_fallback
     }
 
     /// Returns a context extended with an active mouse target.

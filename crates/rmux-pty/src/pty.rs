@@ -5,6 +5,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::backend;
 #[cfg(all(not(unix), not(windows)))]
@@ -14,6 +15,9 @@ use crate::PtyError;
 use crate::{Result, TerminalGeometry, TerminalSize};
 #[cfg(unix)]
 use rustix::termios::{tcgetattr, LocalModes};
+
+#[cfg(any(unix, windows))]
+const DEFAULT_PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 /// The slave endpoint of a Unix pseudoterminal pair.
@@ -168,7 +172,7 @@ impl PtyIo {
         }
     }
 
-    /// Reads bytes from this PTY endpoint.
+    /// Reads bytes from this PTY endpoint, waiting for Unix readiness when needed.
     pub fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
         #[cfg(unix)]
         {
@@ -193,32 +197,47 @@ impl PtyIo {
         }
     }
 
-    /// Writes all bytes to this PTY endpoint.
+    /// Attempts one nonblocking read from this Unix PTY endpoint.
+    #[cfg(unix)]
+    pub fn try_read(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        backend::try_read(self.fd.as_ref().as_fd(), buffer)
+    }
+
+    /// Writes all bytes to this PTY endpoint with the default two-second timeout.
     pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            backend::write_all(self.fd.as_ref().as_fd(), bytes)
+            self.write_all_with_timeout(bytes, DEFAULT_PTY_WRITE_TIMEOUT)
         }
 
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
-            #[cfg(windows)]
-            {
-                self.pty.write_all(bytes)
-            }
-
-            #[cfg(not(windows))]
-            {
-                let _ = bytes;
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "pty I/O is unsupported on this platform",
-                ))
-            }
+            let _ = bytes;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "pty I/O is unsupported on this platform",
+            ))
         }
     }
 
-    /// Makes the PTY endpoint nonblocking.
+    /// Writes all bytes to this PTY endpoint while write progress continues.
+    /// The timeout measures consecutive inactivity, so a timeout may occur
+    /// after the PTY accepted a prefix of `bytes`.
+    #[cfg(any(unix, windows))]
+    pub fn write_all_with_timeout(&self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            backend::write_all_with_timeout(self.fd.as_ref().as_fd(), bytes, timeout)
+        }
+
+        #[cfg(windows)]
+        {
+            self.pty.write_all_with_timeout(bytes, timeout)
+        }
+    }
+
+    /// Ensures that the underlying PTY endpoint is nonblocking.
+    /// Unix PTY masters are configured this way before they are exposed.
     pub fn set_nonblocking(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -246,8 +265,8 @@ impl PtyIo {
         }
     }
 
-    /// Returns a borrowed Unix descriptor for integration points that still
-    /// require `AsyncFd`.
+    /// Returns the borrowed nonblocking Unix descriptor for readiness-driven
+    /// integration points such as `AsyncFd`.
     #[cfg(unix)]
     #[must_use]
     pub fn as_fd(&self) -> BorrowedFd<'_> {
@@ -367,7 +386,7 @@ impl PtyMaster {
         self.io
     }
 
-    /// Consumes this Unix PTY master and returns the owned file descriptor.
+    /// Consumes this Unix PTY master and returns its nonblocking owned file descriptor.
     #[cfg(unix)]
     pub fn into_owned_fd(self) -> io::Result<OwnedFd> {
         match Arc::try_unwrap(self.io.fd) {
@@ -382,9 +401,17 @@ impl PtyMaster {
         &self.io
     }
 
-    /// Writes all bytes to the PTY master.
+    /// Writes all bytes to the PTY master with the default two-second timeout.
     pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         self.io.write_all(bytes)
+    }
+
+    /// Writes all bytes to the PTY master while write progress continues.
+    /// The timeout measures consecutive inactivity, so a timeout may occur
+    /// after the PTY accepted a prefix of `bytes`.
+    #[cfg(any(unix, windows))]
+    pub fn write_all_with_timeout(&self, bytes: &[u8], timeout: Duration) -> io::Result<()> {
+        self.io.write_all_with_timeout(bytes, timeout)
     }
 
     /// Attempts to write bytes to a nonblocking Unix PTY master without waiting.
@@ -425,10 +452,12 @@ pub struct PtyPair {
 
 impl PtyPair {
     /// Allocates a PTY pair using the platform backend.
+    /// Unix master descriptors are made nonblocking before the pair is returned.
     pub fn open() -> Result<Self> {
         #[cfg(unix)]
         {
             let (master, slave) = backend::open_pty_pair()?;
+            backend::set_nonblocking(master.as_fd())?;
 
             Ok(Self {
                 master: PtyMaster::new(master),

@@ -5,7 +5,7 @@ mod common;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -141,10 +141,10 @@ fn spawn_wire_v3_kill_server_after_parse_probes(
 ) -> io::Result<JoinHandle<io::Result<()>>> {
     prepare_fake_server_socket_parent(socket_path)?;
     let _ = fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = UnlinkingUnixListener::bind(socket_path)?;
     let handle = thread::spawn(move || {
         for _ in 0..capability_probe_count {
-            let (mut stream, request) = accept_current_wire_request(&listener)?;
+            let (mut stream, request) = accept_current_wire_request(listener.listener())?;
             if !matches!(request, Request::Handshake(_)) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -154,7 +154,7 @@ fn spawn_wire_v3_kill_server_after_parse_probes(
             write_legacy_incompatible_wire_response(&mut stream, 3)?;
         }
 
-        let (mut stream, request) = accept_current_wire_request(&listener)?;
+        let (mut stream, request) = accept_current_wire_request(listener.listener())?;
         if !matches!(request, Request::KillServer(_)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -164,7 +164,7 @@ fn spawn_wire_v3_kill_server_after_parse_probes(
         write_legacy_incompatible_wire_response(&mut stream, 3)?;
         drop(stream);
 
-        let (mut stream, _) = listener.accept()?;
+        let (mut stream, _) = listener.listener().accept()?;
         let mut buffer = [0_u8; 1024];
         let bytes_read = stream.read(&mut buffer)?;
         if bytes_read < 10 {
@@ -197,6 +197,33 @@ fn spawn_wire_v3_kill_server_after_parse_probes(
         Ok(())
     });
     Ok(handle)
+}
+
+struct UnlinkingUnixListener {
+    listener: Option<UnixListener>,
+    socket_path: PathBuf,
+}
+
+impl UnlinkingUnixListener {
+    fn bind(socket_path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            listener: Some(UnixListener::bind(socket_path)?),
+            socket_path: socket_path.to_path_buf(),
+        })
+    }
+
+    fn listener(&self) -> &UnixListener {
+        self.listener
+            .as_ref()
+            .expect("fake server listener remains open until drop")
+    }
+}
+
+impl Drop for UnlinkingUnixListener {
+    fn drop(&mut self) {
+        drop(self.listener.take());
+        let _ = fs::remove_file(&self.socket_path);
+    }
 }
 
 fn accept_current_wire_request(listener: &UnixListener) -> io::Result<(UnixStream, Request)> {
@@ -1533,6 +1560,10 @@ fn kill_server_falls_back_to_wire_v3_shutdown_for_0_8_daemon() -> Result<(), Box
 
     assert_success(&output);
     server.join().expect("fake wire-v3 server should exit")?;
+    assert!(
+        !harness.socket_path().exists(),
+        "wire-v3 fake daemon left its socket pathname behind"
+    );
     Ok(())
 }
 
@@ -1552,6 +1583,10 @@ fn queued_kill_server_tolerates_parse_probe_against_wire_v3_daemon() -> Result<(
 
     assert_success(&output);
     server.join().expect("fake wire-v3 server should exit")?;
+    assert!(
+        !harness.socket_path().exists(),
+        "queued wire-v3 fake daemon left its socket pathname behind"
+    );
     assert!(!harness
         .run(&["has-session", "-t", "must-not-start"])?
         .status
@@ -1571,6 +1606,94 @@ fn server_access_list_succeeds_against_running_server() -> Result<(), Box<dyn Er
         assert!(stdout(&output).contains(" (W)"));
     }
     assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn server_access_updates_unix_transport_and_preserves_it_across_rebind(
+) -> Result<(), Box<dyn Error>> {
+    let Some(user) = delegated_unix_account() else {
+        return Ok(());
+    };
+    let harness = CliHarness::new("server-access-transport")?;
+    let daemon = harness.start_hidden_daemon()?;
+    let socket_path = harness.socket_path();
+    let socket_parent = socket_path.parent().expect("socket parent");
+    assert_unix_transport_modes(socket_parent, socket_path, 0o700, 0o600)?;
+
+    let read_only = harness.run(&["server-access", "-r", &user])?;
+    assert_success(&read_only);
+    assert_unix_transport_modes(socket_parent, socket_path, 0o711, 0o666)?;
+
+    let previous_inode = fs::symlink_metadata(socket_path)?.ino();
+    let pid = i32::try_from(daemon.pid())?;
+    let signal_result = unsafe {
+        // SAFETY: `pid` is the live child daemon owned by this test and SIGUSR1
+        // requests the server's documented socket recreation path.
+        libc::kill(pid, libc::SIGUSR1)
+    };
+    if signal_result != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs::symlink_metadata(socket_path) {
+            Ok(metadata) if metadata.ino() != previous_inode => break,
+            Ok(_) | Err(_) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(_) => return Err("SIGUSR1 did not replace the Unix socket inode".into()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert_unix_transport_modes(socket_parent, socket_path, 0o711, 0o666)?;
+
+    let write = harness.run(&["server-access", "-w", &user])?;
+    assert_success(&write);
+    assert_unix_transport_modes(socket_parent, socket_path, 0o711, 0o666)?;
+
+    let deny = harness.run(&["server-access", "-d", &user])?;
+    assert_success(&deny);
+    assert_unix_transport_modes(socket_parent, socket_path, 0o700, 0o600)?;
+    Ok(())
+}
+
+fn delegated_unix_account() -> Option<String> {
+    let owner_uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|uid| uid.trim().parse::<u32>().ok())?;
+    ["nobody", "daemon", "_daemon", "www-data", "_www"]
+        .into_iter()
+        .find(|candidate| {
+            Command::new("id")
+                .args(["-u", candidate])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|uid| uid.trim().parse::<u32>().ok())
+                .is_some_and(|uid| uid != 0 && uid != owner_uid)
+        })
+        .map(str::to_owned)
+}
+
+fn assert_unix_transport_modes(
+    socket_parent: &Path,
+    socket_path: &Path,
+    expected_directory: u32,
+    expected_socket: u32,
+) -> Result<(), Box<dyn Error>> {
+    assert_eq!(
+        fs::metadata(socket_parent)?.permissions().mode() & 0o777,
+        expected_directory
+    );
+    assert_eq!(
+        fs::symlink_metadata(socket_path)?.permissions().mode() & 0o777,
+        expected_socket
+    );
     Ok(())
 }
 
@@ -1712,6 +1835,113 @@ fn direct_cli_list_windows_and_panes_forward_sort_and_reverse() -> Result<(), Bo
         "alpha:a\nbeta:b\nbeta:c\nalpha:m\nalpha:z\n"
     );
 
+    Ok(())
+}
+
+#[test]
+fn direct_new_window_k_prints_pre_hook_target_after_atomic_replacement(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("direct-new-window-k-atomic-hook")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "base"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:5", "-n", "old"])?);
+    assert_success(&harness.run(&["set-hook", "-g", "after-new-window", "move-window -r"])?);
+
+    let replaced = harness.run(&[
+        "new-window",
+        "-d",
+        "-k",
+        "-P",
+        "-F",
+        "OUT=#{window_index}|#{window_name}",
+        "-t",
+        "alpha:5",
+        "-n",
+        "replacement",
+    ])?;
+    assert_eq!(replaced.status.code(), Some(0));
+    assert!(stderr(&replaced).is_empty());
+    assert_eq!(stdout(&replaced), "OUT=5|replacement\n");
+
+    let windows = harness.run(&[
+        "list-windows",
+        "-t",
+        "alpha",
+        "-F",
+        "#{window_index}:#{window_name}",
+    ])?;
+    assert_eq!(windows.status.code(), Some(0));
+    assert!(stderr(&windows).is_empty());
+    assert_eq!(stdout(&windows), "0:base\n1:replacement\n");
+    Ok(())
+}
+
+#[test]
+fn direct_new_window_k_preserves_payload_output_and_error_contract() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("direct-new-window-k-payload")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let start_dir = harness.tmpdir().join("cwd ; literal");
+    let output_path = harness.tmpdir().join("new-window-k-payload.txt");
+    fs::create_dir_all(&start_dir)?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "base"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:5", "-n", "old"])?);
+    let shell_command = format!(
+        "printf '%s|%s|%s|%s' \"$PWD\" \"$RMUX_K_VALUE\" \"$1\" \"$2\" > {}; sleep 30",
+        shell_quote(&output_path)
+    );
+    let start_dir_text = start_dir.to_string_lossy().to_string();
+    let replacement = harness.run(&[
+        "new-window",
+        "-dkP",
+        "-F",
+        "OUT=#{window_index}|#{window_name}",
+        "-t",
+        "alpha:5",
+        "-n",
+        "replacement ; literal",
+        "-c",
+        &start_dir_text,
+        "-e",
+        "RMUX_K_VALUE=value with spaces ; literal",
+        "--",
+        "sh",
+        "-c",
+        &shell_command,
+        "sh",
+        "argument with spaces",
+        "argument ; literal",
+    ])?;
+    assert_eq!(replacement.status.code(), Some(0));
+    assert!(stderr(&replacement).is_empty());
+    assert_eq!(stdout(&replacement), "OUT=5|replacement ; literal\n");
+
+    let expected_payload = format!(
+        "{start_dir_text}|value with spaces ; literal|argument with spaces|argument ; literal"
+    );
+    wait_for_file_contents(&output_path, &expected_payload, ATTACH_TIMEOUT)?;
+
+    let missing = harness.run(&[
+        "new-window",
+        "-dk",
+        "-t",
+        "missing:5",
+        "-n",
+        "must-not-exist",
+    ])?;
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stdout(&missing).is_empty());
+    assert!(
+        stderr(&missing).contains("missing"),
+        "stderr={:?}",
+        stderr(&missing)
+    );
+    assert!(
+        !stderr(&missing).starts_with("-:"),
+        "queued transport details must not leak into direct CLI errors: {:?}",
+        stderr(&missing)
+    );
     Ok(())
 }
 
@@ -2786,7 +3016,7 @@ fn queued_run_shell_children_inherit_calling_pane_target() -> Result<(), Box<dyn
     fs::write(
         &child_script,
         format!(
-            "{binary} split-window -d \"sh -c 'printf queued > {}; sleep 2'\"\n",
+            "{binary} split-window -d \"sh -c 'printf queued > {}; sleep 30'\"\n",
             shell_quote(&marker)
         ),
     )?;
@@ -2795,7 +3025,7 @@ fn queued_run_shell_children_inherit_calling_pane_target() -> Result<(), Box<dyn
         format!("run-shell \"sh {}\"\n", shell_quote(&child_script)),
     )?;
     let pane_command = format!(
-        "while [ ! -f {} ]; do sleep 0.05; done; {binary} source-file {}; sleep 2",
+        "while [ ! -f {} ]; do sleep 0.05; done; {binary} source-file {}; sleep 30",
         shell_quote(&gate),
         shell_quote(&command_file)
     );

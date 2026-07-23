@@ -122,6 +122,7 @@ impl RequestHandler {
             ) {
                 Ok(response) => {
                     self.record_pane_respawn_boundary(pane_id);
+                    state.retire_respawned_lifecycle_panes(&[pane_id]);
                     (Response::RespawnPane(response), Some(pane_id))
                 }
                 Err(error) => (Response::Error(ErrorResponse { error }), None),

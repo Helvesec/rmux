@@ -6,10 +6,12 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TAG_OBJECT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
     root: PathBuf,
@@ -39,8 +41,9 @@ fn temp_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_nanos();
+    let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "rmux-release-promotion-evidence-{}-{nonce}",
+        "rmux-release-promotion-evidence-{}-{nonce}-{sequence}",
         std::process::id()
     ));
     fs::create_dir_all(&path).expect("create fixture directory");

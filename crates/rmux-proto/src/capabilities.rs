@@ -60,6 +60,8 @@ pub const CAPABILITY_CLI_TARGET_ACTIONS: &str = "commands.cli_target_actions";
 pub const CAPABILITY_CLI_CAPTURE_TARGET_ACTION: &str = "commands.cli_capture_target_action";
 /// Stable feature id for non-executing server-side CLI alias canonicalization.
 pub const CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION: &str = "commands.cli_runtime_command_expansion";
+/// Stable feature id for daemon-owned `list-windows -a` queue execution.
+pub const CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE: &str = "commands.cli_list_windows_all_queue";
 /// Stable feature id for browser-visible pane sharing.
 ///
 /// This optional capability is advertised by daemons compiled with their web
@@ -94,6 +96,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_CLI_TARGET_ACTIONS,
     CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
     CAPABILITY_CLI_RUNTIME_COMMAND_EXPANSION,
+    CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE,
     CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
 ];
 
@@ -213,7 +216,7 @@ mod tests {
     use super::{
         capabilities_for_features, HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
         CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
-        CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_HANDSHAKE,
+        CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE, CAPABILITY_CLI_TARGET_ACTIONS, CAPABILITY_HANDSHAKE,
         CAPABILITY_SDK_OWNED_SESSION_STABLE_IDENTITY, CAPABILITY_SDK_PANE_SPLIT_IDENTITY,
         CAPABILITY_SDK_SESSION_LEASE_BY_ID, CAPABILITY_SDK_SESSION_LEASE_BY_ID_V2,
         CAPABILITY_SDK_WAITS_ARMED, CAPABILITY_WEB_SHARE,
@@ -241,6 +244,7 @@ mod tests {
         for expected in [
             CAPABILITY_CLI_TARGET_ACTIONS,
             CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
+            CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE,
             CAPABILITY_SDK_WAITS_ARMED,
         ] {
             assert!(

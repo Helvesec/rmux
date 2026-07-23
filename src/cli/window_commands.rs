@@ -5,12 +5,19 @@ use std::path::Path;
 use rmux_client::{connect, Connection};
 use rmux_core::formats::{is_truthy, DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT};
 use rmux_proto::{
-    CommandOutput, ErrorResponse, KillSessionRequest, KillWindowResponse, ListWindowsResponse,
-    MoveWindowTarget, OptionScopeSelector, ResolveTargetType, Response, WindowListEntry,
+    CommandOutput, ErrorResponse, ListWindowsResponse, MoveWindowTarget, OptionScopeSelector,
+    ResolveTargetType, Response, WindowListEntry, CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE,
 };
 
+use super::command_runner::{
+    capture_list_windows_all_server_command_with_connection,
+    run_list_windows_all_server_command_with_connection,
+    run_queued_server_command_at_target_with_connection,
+};
 use super::format_print::print_target_format;
-use super::json_output::write_list_windows_json;
+use super::json_output::{
+    list_windows_json_format, write_length_prefixed_list_windows_json, write_list_windows_json,
+};
 use super::{
     expect_command_output, expect_command_success, list_session_names, resolve_current_pane_target,
     resolve_current_session_target, resolve_existing_window_target_or_current,
@@ -645,6 +652,18 @@ fn resolve_current_session(
 }
 
 pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+    if args.kill_existing {
+        let mut connection = connect(socket_path)
+            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+        let target = resolve_current_pane_target(&mut connection, "new-window")?;
+        return run_queued_server_command_at_target_with_connection(
+            &mut connection,
+            "new-window",
+            args.queue_command,
+            target,
+        );
+    }
+
     let start_directory = args
         .start_directory
         .clone()
@@ -655,7 +674,6 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
         .clone()
         .unwrap_or_else(|| DEFAULT_NEW_WINDOW_PRINT_FORMAT.to_owned());
     let name = args.name.clone();
-    let kill_existing = args.kill_existing;
     let select_existing = args.select_existing;
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
@@ -684,28 +702,10 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
             return Ok(0);
         }
     }
-    let mut create_window_index = target_window_index;
-    let replace_after_create = if kill_existing {
-        match target_window_index {
-            Some(window_index) => {
-                match kill_existing_window_at(&mut connection, &target, window_index) {
-                    Ok(()) => None,
-                    Err(error) if only_window_kill_failure(&error) => {
-                        create_window_index = None;
-                        Some(window_index)
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
     let response = connection
         .new_window_at_with_environment(
             target.clone(),
-            create_window_index,
+            target_window_index,
             name,
             args.detached,
             (!args.environment.is_empty()).then_some(args.environment),
@@ -721,16 +721,6 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
             unreachable!("new-window error response should return from expect_command_success")
         }
         other => return Err(unexpected_response("new-window", &other)),
-    };
-    let target = if let Some(window_index) = replace_after_create {
-        move_created_window_to_replacement_index(
-            &mut connection,
-            target,
-            window_index,
-            args.detached,
-        )?
-    } else {
-        target
     };
 
     if print_target {
@@ -783,64 +773,6 @@ fn find_window_by_name(
         }
     }
     Ok(matched)
-}
-
-fn kill_existing_window_at(
-    connection: &mut Connection,
-    session_name: &rmux_proto::SessionName,
-    window_index: u32,
-) -> Result<(), ExitFailure> {
-    let target = rmux_proto::WindowTarget::with_window(session_name.clone(), window_index);
-    let response = connection
-        .kill_window(target, false)
-        .map_err(ExitFailure::from_client)?;
-    match response {
-        Response::KillWindow(_) => Ok(()),
-        Response::Error(ErrorResponse { error }) if missing_window_error(&error) => Ok(()),
-        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error.to_string())),
-        other => Err(unexpected_response("kill-window", &other)),
-    }
-}
-
-fn only_window_kill_failure(error: &ExitFailure) -> bool {
-    error
-        .message()
-        .contains("cannot kill the only window in session ")
-}
-
-fn move_created_window_to_replacement_index(
-    connection: &mut Connection,
-    created: rmux_proto::WindowTarget,
-    window_index: u32,
-    detached: bool,
-) -> Result<rmux_proto::WindowTarget, ExitFailure> {
-    let target =
-        rmux_proto::WindowTarget::with_window(created.session_name().clone(), window_index);
-    let response = connection
-        .move_window(
-            Some(created),
-            MoveWindowTarget::Window(target.clone()),
-            false,
-            true,
-            detached,
-        )
-        .map_err(ExitFailure::from_client)?;
-    match response {
-        Response::MoveWindow(response) => Ok(response.target.unwrap_or(target)),
-        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error.to_string())),
-        other => Err(unexpected_response("move-window", &other)),
-    }
-}
-
-fn missing_window_error(error: &rmux_proto::RmuxError) -> bool {
-    match error {
-        rmux_proto::RmuxError::InvalidTarget { reason, .. } => {
-            reason.contains("window index does not exist")
-                || reason.starts_with("can't find window:")
-        }
-        rmux_proto::RmuxError::Server(message) => message.starts_with("can't find window:"),
-        _ => false,
-    }
 }
 
 fn resolve_new_window_placement_target(
@@ -1033,31 +965,9 @@ pub(super) fn run_kill_window(
         let target =
             resolve_window_target_or_current(connection, args.target.as_ref(), "kill-window")?;
         let response = connection
-            .kill_window(target.clone(), args.kill_others)
+            .kill_window(target, args.kill_others)
             .map_err(ExitFailure::from_client)?;
-        match response {
-            Response::Error(ErrorResponse { error })
-                if error
-                    .to_string()
-                    .starts_with("server error: cannot kill the only window") =>
-            {
-                let session_name = target.session_name().clone();
-                let kill_session = connection
-                    .kill_session(KillSessionRequest {
-                        target: session_name,
-                        kill_all_except_target: false,
-                        clear_alerts: false,
-                        kill_group: false,
-                    })
-                    .map_err(ExitFailure::from_client)?;
-                if matches!(kill_session, Response::KillSession(_)) {
-                    Ok(Response::KillWindow(KillWindowResponse { target }))
-                } else {
-                    Ok(kill_session)
-                }
-            }
-            response => Ok(response),
-        }
+        Ok(response)
     })
 }
 
@@ -1176,6 +1086,25 @@ pub(super) fn run_list_windows(
     let json = args.json;
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let queued_all_sessions = args.all_sessions
+        && connection
+            .supports_capability(CAPABILITY_CLI_LIST_WINDOWS_ALL_QUEUE)
+            .map_err(ExitFailure::from_client)?;
+    if queued_all_sessions {
+        let json_format = json.then(list_windows_json_format);
+        let arguments = list_windows_all_queue_arguments(&args, json_format.as_deref());
+        if json {
+            let (exit_status, output) = capture_list_windows_all_server_command_with_connection(
+                &mut connection,
+                &arguments,
+            )?;
+            if exit_status != 0 {
+                return Ok(exit_status);
+            }
+            return write_length_prefixed_list_windows_json(&output);
+        }
+        return run_list_windows_all_server_command_with_connection(&mut connection, &arguments);
+    }
     let targets = if args.all_sessions {
         list_session_names(&mut connection)?
     } else {
@@ -1272,6 +1201,29 @@ pub(super) fn run_list_windows(
     write_lines_output(&lines)
 }
 
+fn list_windows_all_queue_arguments(
+    args: &ListWindowsArgs,
+    format_override: Option<&str>,
+) -> Vec<String> {
+    let mut command = vec!["list-windows".to_owned(), "-a".to_owned()];
+    if let Some(target) = args.target.as_ref() {
+        command.extend(["-t".to_owned(), target.raw().to_owned()]);
+    }
+    if let Some(format) = format_override.or(args.format.as_deref()) {
+        command.extend(["-F".to_owned(), format.to_owned()]);
+    }
+    if let Some(filter) = args.filter.as_deref() {
+        command.extend(["-f".to_owned(), filter.to_owned()]);
+    }
+    if let Some(sort_order) = args.sort_order.as_deref() {
+        command.extend(["-O".to_owned(), sort_order.to_owned()]);
+    }
+    if args.reversed {
+        command.push("-r".to_owned());
+    }
+    command
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CliWindowListSortOrder {
     Index,
@@ -1325,8 +1277,9 @@ fn sort_all_session_window_entries(
                 .window_index()
                 .cmp(&right.window.target.window_index()),
             CliWindowListSortOrder::Name => stable_window_entry_name_cmp(left, right),
-            CliWindowListSortOrder::Size => (left.window.size.cols, left.window.size.rows)
-                .cmp(&(right.window.size.cols, right.window.size.rows)),
+            CliWindowListSortOrder::Size => {
+                cli_terminal_area(left.window.size).cmp(&cli_terminal_area(right.window.size))
+            }
             CliWindowListSortOrder::Activity => right.activity_at.cmp(&left.activity_at),
             CliWindowListSortOrder::Creation => left.created_at.cmp(&right.created_at),
         };
@@ -1347,6 +1300,10 @@ fn sort_all_session_window_entries(
             })
             .then_with(|| stable_window_entry_name_cmp(left, right))
     });
+}
+
+fn cli_terminal_area(size: rmux_proto::TerminalSize) -> u64 {
+    u64::from(size.cols) * u64::from(size.rows)
 }
 
 fn stable_window_entry_name_cmp(left: &CliWindowListEntry, right: &CliWindowListEntry) -> Ordering {

@@ -566,24 +566,52 @@ async fn resize_event_keeps_its_exact_identity_across_post_apply_rename() {
     );
     let mut events = handler.subscribe_lifecycle_events();
     let pause = handler.install_window_lifecycle_emit_pause();
-    let resize = handler.handle(window_size_option_request(
-        OptionScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
-        "largest",
-    ));
+    let resize_handler = handler.clone();
+    let resize_session = session.clone();
+    let resize = tokio::spawn(async move {
+        resize_handler
+            .handle(window_size_option_request(
+                OptionScopeSelector::Window(WindowTarget::with_window(resize_session, 0)),
+                "largest",
+            ))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("resize reaches post-commit lifecycle pause");
     let renamed = rmux_proto::SessionName::new("resize-event-stable-renamed")
         .expect("valid renamed session name");
-    let rename_after_apply = async {
-        pause.reached.notified().await;
-        let response = handler
+    let rename_handler = handler.clone();
+    let rename_source = session.clone();
+    let rename_target = renamed.clone();
+    let rename_after_apply = tokio::spawn(async move {
+        rename_handler
             .handle(Request::RenameSession(RenameSessionRequest {
-                target: session.clone(),
-                new_name: renamed.clone(),
+                target: rename_source,
+                new_name: rename_target,
             }))
-            .await;
-        pause.release.notify_one();
-        response
-    };
-    let (resize_response, rename_response) = tokio::join!(resize, rename_after_apply);
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if handler
+                .state
+                .lock()
+                .await
+                .sessions
+                .session(&renamed)
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rename commits while the earlier resize publication is paused");
+    pause.release.notify_one();
+    let resize_response = resize.await.expect("resize task joins");
+    let rename_response = rename_after_apply.await.expect("rename task joins");
     assert!(
         matches!(resize_response, Response::SetOptionByName(_)),
         "{resize_response:?}"
@@ -651,14 +679,18 @@ async fn hooks_disabled_resize_preserves_the_one_shot_hook() {
     );
     let mut events = handler.subscribe_lifecycle_events();
 
-    let response = crate::hook_runtime::with_hook_execution(Vec::new(), async {
-        handler
-            .handle(window_size_option_request(
-                OptionScopeSelector::Window(target.clone()),
-                "largest",
-            ))
-            .await
-    })
+    let response = crate::hook_runtime::with_hook_execution(
+        crate::hook_runtime::HookExecutionContext::lifecycle(HookName::WindowResized),
+        Vec::new(),
+        async {
+            handler
+                .handle(window_size_option_request(
+                    OptionScopeSelector::Window(target.clone()),
+                    "largest",
+                ))
+                .await
+        },
+    )
     .await;
     assert!(
         matches!(response, Response::SetOptionByName(_)),

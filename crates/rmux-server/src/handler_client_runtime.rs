@@ -17,12 +17,13 @@ use crate::terminal::{base_process_environment, base_process_environment_display
 
 use super::{
     attach_support::{self, ClientFlags},
-    control_support::{self, current_control_queue_identity},
-    option_value_u32, prompt_support, RequestHandler,
+    control_support, option_value_u32, prompt_support, RequestHandler,
 };
 
 #[path = "handler_client_runtime/list_clients.rs"]
 mod list_clients;
+#[path = "handler_client_runtime/requester_access.rs"]
+mod requester_access;
 
 pub(in crate::handler) use list_clients::ListClientSnapshot;
 
@@ -46,37 +47,6 @@ impl RequestHandler {
         let state = self.state.lock().await;
         let millis = option_value_u32(&state.options, None, OptionName::EscapeTime);
         Duration::from_millis(u64::from(millis))
-    }
-
-    pub(in crate::handler) async fn requester_can_write(&self, requester_pid: u32) -> bool {
-        if let Some(identity) = current_control_queue_identity(requester_pid) {
-            return self.control_queue_can_write(identity).await;
-        }
-
-        {
-            let active_attach = self.active_attach.lock().await;
-            if let Some(active) = active_attach.by_pid.get(&requester_pid) {
-                return active.can_write && !active.flags.contains(ClientFlags::READONLY);
-            }
-        }
-
-        let active_control = self.active_control.lock().await;
-        if let Some(active) = active_control.by_pid.get(&requester_pid) {
-            return active.can_write;
-        }
-        drop(active_control);
-
-        {
-            let detached_access = self
-                .active_detached_requester_access
-                .lock()
-                .expect("active detached requester access mutex must not be poisoned");
-            if let Some(active) = detached_access.get(&requester_pid) {
-                return active.can_write();
-            }
-        }
-
-        requester_pid == std::process::id()
     }
 
     #[allow(dead_code)]

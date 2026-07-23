@@ -15,7 +15,8 @@ use common::{assert_clap_failure, assert_success, stderr, stdout, terminate_chil
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
-fn list_windows_sort_activity_creation_and_global_index_match_tmux() -> Result<(), Box<dyn Error>> {
+fn list_windows_sort_activity_creation_and_global_index_primary_order() -> Result<(), Box<dyn Error>>
+{
     let _guard = window_surface_guard();
     let harness = CliHarness::new("list-windows-sort-order")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -347,6 +348,163 @@ fn new_window_reuses_window_zero_after_killing_it() -> Result<(), Box<dyn Error>
     ])?);
 
     wait_for_file_contents(&output_path, "reused-zero", ATTACH_TIMEOUT)?;
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn kill_last_window_is_atomic_across_every_queued_entry_path() -> Result<(), Box<dyn Error>> {
+    // Oracle: tmux 3.7b destroys the session and runs window-unlinked before
+    // session-closed. It never runs command-error for this successful command.
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("kill-last-window-entry-paths")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let source_file = harness.tmpdir().join("kill-last-window.conf");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "window-unlinked",
+        "set-buffer -a -b trace W",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "session-closed",
+        "set-buffer -a -b trace S",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "command-error",
+        "set-buffer -a -b trace E",
+    ])?);
+
+    let reset = |marker: &str| -> Result<(), Box<dyn Error>> {
+        assert_success(&harness.run(&["set-buffer", "-b", "trace", marker])?);
+        assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+        Ok(())
+    };
+    let assert_trace = |expected: &str| -> Result<(), Box<dyn Error>> {
+        let trace = harness.run(&["show-buffer", "-b", "trace"])?;
+        assert_eq!(trace.status.code(), Some(0));
+        assert!(stderr(&trace).is_empty());
+        assert_eq!(stdout(&trace), expected);
+        let missing = harness.run(&["has-session", "-t", "alpha"])?;
+        assert_eq!(missing.status.code(), Some(1));
+        Ok(())
+    };
+
+    reset("direct:")?;
+    assert_success(&harness.run(&["kill-window", "-t", "alpha:0"])?);
+    assert_trace("direct:WS")?;
+
+    reset("queue:")?;
+    assert_success(&harness.run(&["run-shell", "-C", "kill-window -t alpha:0"])?);
+    assert_trace("queue:WS")?;
+
+    reset("source:")?;
+    fs::write(&source_file, "kill-window -t alpha:0\n")?;
+    assert_success(&harness.run(&[
+        "source-file",
+        source_file.to_str().expect("utf-8 source path"),
+    ])?);
+    assert_trace("source:WS")?;
+
+    reset("control:")?;
+    let control = harness.run(&["-C", "kill-window", "-t", "alpha:0"])?;
+    assert_eq!(control.status.code(), Some(0));
+    assert!(stderr(&control).is_empty());
+    assert_trace("control:WS")?;
+
+    reset("hook:")?;
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-new-window",
+        "kill-window -t alpha:0",
+    ])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "beta"])?);
+    let missing = harness.run(&["has-session", "-t", "alpha"])?;
+    assert_eq!(missing.status.code(), Some(1));
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn nested_lifecycle_hooks_match_tmux_across_command_entry_paths() -> Result<(), Box<dyn Error>> {
+    // Oracle: tmux 3.7b lets an after-new-window command enqueue the distinct
+    // window-unlinked and session-closed hooks in that order.
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("nested-lifecycle-entry-paths")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let source_file = harness.tmpdir().join("nested-lifecycle.conf");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "window-unlinked",
+        "set-buffer -a -b trace W",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "session-closed",
+        "set-buffer -a -b trace S",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "command-error",
+        "set-buffer -a -b trace E",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-new-window",
+        "kill-window -t alpha:0",
+    ])?);
+
+    let reset = |marker: &str| -> Result<(), Box<dyn Error>> {
+        assert_success(&harness.run(&["set-buffer", "-b", "trace", marker])?);
+        assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+        Ok(())
+    };
+    let assert_trace = |expected: &str| -> Result<(), Box<dyn Error>> {
+        let trace = harness.run(&["show-buffer", "-b", "trace"])?;
+        assert_eq!(trace.status.code(), Some(0));
+        assert!(stderr(&trace).is_empty());
+        assert_eq!(stdout(&trace), expected);
+        let missing = harness.run(&["has-session", "-t", "alpha"])?;
+        assert_eq!(missing.status.code(), Some(1));
+        Ok(())
+    };
+
+    reset("direct:")?;
+    assert_success(&harness.run(&["new-window", "-d", "-t", "beta"])?);
+    assert_trace("direct:WS")?;
+
+    reset("queue:")?;
+    assert_success(&harness.run(&["run-shell", "-C", "new-window -d -t beta"])?);
+    assert_trace("queue:WS")?;
+
+    reset("source:")?;
+    fs::write(&source_file, "new-window -d -t beta\n")?;
+    assert_success(&harness.run(&[
+        "source-file",
+        source_file.to_str().expect("utf-8 source path"),
+    ])?);
+    assert_trace("source:WS")?;
+
+    reset("control:")?;
+    let control = harness.run(&["-C", "new-window", "-d", "-t", "beta"])?;
+    assert_eq!(control.status.code(), Some(0));
+    assert!(stderr(&control).is_empty());
+    assert_trace("control:WS")?;
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -1575,6 +1733,193 @@ fn list_windows_all_uses_tmux_multi_session_default_format() -> Result<(), Box<d
     assert_eq!(scoped.status.code(), Some(0));
     assert_eq!(stdout(&scoped), stdout(&listed));
     assert!(stderr(&scoped).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn list_windows_all_size_sort_uses_terminal_area_like_tmux() -> Result<(), Box<dyn Error>> {
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("list-windows-all-size-area")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-x", "100", "-y", "20"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "-x", "80", "-y", "30"])?);
+
+    let listed = harness.run(&[
+        "list-windows",
+        "-a",
+        "-O",
+        "size",
+        "-F",
+        "#{session_name}:#{window_width}x#{window_height}",
+    ])?;
+    assert_eq!(listed.status.code(), Some(0));
+    assert_eq!(stdout(&listed), "alpha:100x20\nbeta:80x30\n");
+    assert!(stderr(&listed).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn list_windows_all_cli_emits_one_scoped_hook_boundary() -> Result<(), Box<dyn Error>> {
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("list-windows-all-hook-boundary")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "a"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "-n", "b"])?);
+    for buffer in [
+        "alpha-list-success",
+        "beta-list-success",
+        "alpha-list-error",
+        "beta-list-error",
+        "global-list-error",
+        "list-sessions-hook",
+    ] {
+        assert_success(&harness.run(&["set-buffer", "-b", buffer, "seed"])?);
+    }
+    for (target, hook, buffer) in [
+        ("alpha", "after-list-windows", "alpha-list-success"),
+        ("beta", "after-list-windows", "beta-list-success"),
+        ("alpha", "command-error", "alpha-list-error"),
+        ("beta", "command-error", "beta-list-error"),
+    ] {
+        assert_success(&harness.run(&[
+            "set-hook",
+            "-t",
+            target,
+            hook,
+            &format!("set-buffer -a -b {buffer} x"),
+        ])?);
+    }
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "command-error",
+        "set-buffer -a -b global-list-error x",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-list-sessions",
+        "set-buffer -a -b list-sessions-hook x",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-a",
+        "-t",
+        "alpha",
+        "after-list-windows",
+        "new-window -d -t alpha: -n hook-added",
+    ])?);
+    let listed = harness.run(&[
+        "list-windows",
+        "-a",
+        "-t",
+        "alpha",
+        "-F",
+        "-:1: #{session_name} '#{window_name}'",
+    ])?;
+    assert_eq!(listed.status.code(), Some(0));
+    assert_eq!(stdout(&listed), "-:1: alpha 'a'\n-:1: beta 'b'\n");
+    assert!(stderr(&listed).is_empty());
+    assert_eq!(show_buffer(&harness, "alpha-list-success")?, "seedx");
+    assert_eq!(show_buffer(&harness, "beta-list-success")?, "seed");
+
+    let json = harness.run(&[
+        "list-windows",
+        "-a",
+        "-t",
+        "alpha",
+        "-f",
+        "#{==:#{session_name},alpha}",
+        "-O",
+        "name",
+        "-r",
+        "--json",
+    ])?;
+    assert_eq!(json.status.code(), Some(0));
+    assert!(stdout(&json).contains("\"session_name\":\"alpha\""));
+    assert!(!stdout(&json).contains("\"session_name\":\"beta\""));
+    assert_eq!(
+        stdout(&json)
+            .matches("\"window_name\":\"hook-added\"")
+            .count(),
+        1,
+        "JSON must describe the snapshot taken before its after hook mutates state"
+    );
+    assert!(
+        stdout(&json).find("\"window_name\":\"hook-added\"")
+            < stdout(&json).find("\"window_name\":\"a\""),
+        "reverse name sort must be applied inside the server snapshot"
+    );
+    assert!(stderr(&json).is_empty());
+    assert_eq!(show_buffer(&harness, "alpha-list-success")?, "seedxx");
+    assert_eq!(show_buffer(&harness, "beta-list-success")?, "seed");
+    assert_eq!(show_buffer(&harness, "list-sessions-hook")?, "seed");
+
+    let invalid = harness.run(&["list-windows", "-a", "-t", "beta", "-O", "bogus"])?;
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(stderr(&invalid).contains(rmux_core::INVALID_SORT_ORDER));
+    assert_eq!(show_buffer(&harness, "alpha-list-error")?, "seed");
+    assert_eq!(show_buffer(&harness, "beta-list-error")?, "seedx");
+    assert_eq!(show_buffer(&harness, "global-list-error")?, "seed");
+
+    let missing = harness.run(&["list-windows", "-a", "-t", "missing"])?;
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("can't find session: missing"));
+    let error_hook_count = [
+        show_buffer(&harness, "alpha-list-error")?,
+        show_buffer(&harness, "beta-list-error")?,
+        show_buffer(&harness, "global-list-error")?,
+    ]
+    .into_iter()
+    .map(|value| value.bytes().filter(|byte| *byte == b'x').count())
+    .sum::<usize>();
+    assert_eq!(
+        error_hook_count, 2,
+        "each failed command must emit one hook"
+    );
+    assert_eq!(show_buffer(&harness, "alpha-list-success")?, "seedxx");
+    assert_eq!(show_buffer(&harness, "beta-list-success")?, "seed");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn list_windows_all_json_preserves_window_name_control_characters() -> Result<(), Box<dyn Error>> {
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("list-windows-all-json-controls")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let names = [
+        "unit\x1fseparator",
+        "record\x1eseparator",
+        "line\nseparator",
+    ];
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", names[0]])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:", "-n", names[1]])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:", "-n", names[2]])?);
+
+    let output = harness.run(&["list-windows", "-a", "--json"])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    let json: serde_json::Value = serde_json::from_str(&stdout(&output))?;
+    let rendered_names = json
+        .as_array()
+        .expect("list-windows JSON is an array")
+        .iter()
+        .map(|window| {
+            window["window_name"]
+                .as_str()
+                .expect("window name is a string")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rendered_names, names);
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -4338,6 +4683,13 @@ fn wait_for_file_contents(
     }
 
     Err(format!("timed out waiting for '{}'", path.display()).into())
+}
+
+fn show_buffer(harness: &CliHarness, name: &str) -> Result<String, Box<dyn Error>> {
+    let output = harness.run(&["show-buffer", "-b", name])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    Ok(stdout(&output))
 }
 
 fn shell_quote(path: &Path) -> String {

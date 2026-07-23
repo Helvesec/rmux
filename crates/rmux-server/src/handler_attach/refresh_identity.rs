@@ -12,6 +12,16 @@ impl RequestHandler {
         session_name: &rmux_proto::SessionName,
         session_id: rmux_proto::SessionId,
     ) {
+        self.refresh_attached_session_for_session_identity_except(session_name, session_id, None)
+            .await;
+    }
+
+    pub(in crate::handler) async fn refresh_attached_session_for_session_identity_except(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
+        excluded_identity: Option<ActiveAttachIdentity>,
+    ) {
         let identities = {
             let active_attach = self.active_attach.lock().await;
             active_attach
@@ -24,6 +34,7 @@ impl RequestHandler {
                         && !active.closing.load(Ordering::SeqCst)
                 })
                 .map(|(attach_pid, active)| active.identity(*attach_pid))
+                .filter(|identity| excluded_identity != Some(*identity))
                 .collect::<Vec<_>>()
         };
         for identity in identities {

@@ -2,7 +2,7 @@ use rmux_core::events::{
     OutputCursor, OutputCursorItem, OutputEvent, OutputRing, DEFAULT_OUTPUT_RING_CAPACITY,
     DEFAULT_RECENT_LIVE_BUFFER_CAPACITY,
 };
-use rmux_core::{PaneGeometry, PaneId, TerminalPassthrough};
+use rmux_core::{PaneGeometry, PaneId, TerminalClipboardQuery, TerminalPassthrough};
 use rmux_proto::TerminalSize;
 use rmux_pty::PtyMaster;
 use std::collections::VecDeque;
@@ -84,11 +84,18 @@ pub(crate) struct PaneAlertEvent {
     /// (tmux's `paste_add` in input_osc_52); empty for a query or for panes that
     /// emitted no clipboard write.
     pub(crate) clipboard_writes: Vec<Vec<u8>>,
+    /// Typed pane-originated OSC 52 queries in arrival order. The server
+    /// consumes these independently of generic terminal passthrough rendering.
+    pub(crate) clipboard_queries: Vec<TerminalClipboardQuery>,
     /// True when this batch toggled one of the pane's mouse-tracking modes
     /// (?1000/?1002/?1003). Attached clients must rebuild their outer
     /// terminal so pane-driven tracking reaches the outer terminal without
     /// waiting for an unrelated refresh (issue #93).
     pub(crate) mouse_mode_changed: bool,
+    /// True when this batch entered or left the alternate screen. Pane
+    /// scrollbars are suppressed there, so the pane PTY geometry must be
+    /// reconciled immediately rather than waiting for an outer resize.
+    pub(crate) alternate_mode_changed: bool,
     pub(crate) queue_activity_alert: bool,
     pub(crate) generation: Option<u64>,
 }

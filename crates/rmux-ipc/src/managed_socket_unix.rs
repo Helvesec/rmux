@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use crate::LocalEndpoint;
 
 const SOCKET_DIRECTORY_PREFIX: &str = "rmux";
-const UNSAFE_PERMISSION_MASK: u32 = 0o077;
+const OWNER_ONLY_DIRECTORY_MODE: u32 = 0o700;
+const ALLOWLISTED_DIRECTORY_MODE: u32 = 0o711;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirectoryIdentity {
@@ -90,12 +91,12 @@ fn validate_managed_socket_directory(path: &Path) -> io::Result<DirectoryIdentit
         ));
     }
 
-    let mode = metadata.permissions().mode();
-    if mode & UNSAFE_PERMISSION_MASK != 0 {
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != OWNER_ONLY_DIRECTORY_MODE && mode != ALLOWLISTED_DIRECTORY_MODE {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "managed socket directory '{}' must not be accessible by group or others",
+                "managed socket directory '{}' has unsafe permissions",
                 path.display()
             ),
         ));

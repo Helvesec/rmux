@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
@@ -118,12 +119,22 @@ fn collect_control_events(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<Co
 }
 
 #[tokio::test]
-async fn full_control_server_event_queue_closes_and_removes_client() {
+async fn full_control_server_event_queue_defers_removal_until_transport_finishes() {
     let handler = RequestHandler::new();
     let requester_pid = 4242;
-    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let attached_session = session_name("full-control-event-queue");
+    new_session(&handler, &attached_session).await;
+    let attached_session_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&attached_session)
+            .expect("attached session exists")
+            .id()
+    };
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
-    let _control_id = handler
+    let control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
@@ -135,6 +146,20 @@ async fn full_control_server_event_queue_closes_and_removes_client() {
             Arc::clone(&closing),
         )
         .await;
+    handler
+        .set_control_session(requester_pid, Some(attached_session.clone()))
+        .await
+        .expect("control session set succeeds");
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(ControlServerEvent::SessionChanged(Some(ref session_name)))
+            | Ok(ControlServerEvent::SessionChangedAt {
+                ref session_name,
+                ..
+            })
+            if session_name == &attached_session
+    ));
+    let mut lifecycle = handler.subscribe_lifecycle_events();
 
     for index in 0..CONTROL_SERVER_EVENT_CAPACITY {
         handler
@@ -152,9 +177,52 @@ async fn full_control_server_event_queue_closes_and_removes_client() {
         .await;
 
     assert_eq!(event_rx.len(), CONTROL_SERVER_EVENT_CAPACITY);
-    assert!(event_rx.is_closed());
+    assert!(!event_rx.is_closed());
     assert!(closing.load(Ordering::SeqCst));
     assert!(!handler.is_control_client(requester_pid).await);
+    {
+        let active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get(&requester_pid)
+            .expect("closing control stays registered until its transport finishes");
+        assert_eq!(active.id, control_id);
+        assert_eq!(active.session_id, Some(attached_session_id));
+    }
+    assert!(matches!(
+        event_rx.try_recv(),
+        Ok(ControlServerEvent::Notification(line)) if line == "%message queued-0"
+    ));
+    handler
+        .send_control_notification_to(requester_pid, "%message after-closing".to_owned())
+        .await;
+    assert_eq!(
+        event_rx.len(),
+        CONTROL_SERVER_EVENT_CAPACITY - 1,
+        "closing clients reject later server events even after capacity becomes available"
+    );
+
+    handler.finish_control(requester_pid, control_id).await;
+
+    assert!(event_rx.is_closed());
+    assert!(!handler
+        .active_control
+        .lock()
+        .await
+        .by_pid
+        .contains_key(&requester_pid));
+    let detached = tokio::time::timeout(Duration::from_secs(1), lifecycle.recv())
+        .await
+        .expect("transport finish publishes client-detached")
+        .expect("lifecycle channel remains open");
+    assert_eq!(detached.control_session_identity, Some(attached_session_id));
+    assert!(matches!(
+        detached.event,
+        LifecycleEvent::ClientDetached {
+            session_name,
+            client_name: Some(client_name),
+        } if session_name == attached_session && client_name == requester_pid.to_string()
+    ));
 }
 
 async fn session_id(handler: &RequestHandler, session_name: &SessionName) -> u32 {
@@ -365,22 +433,39 @@ async fn window_close_notifications_follow_each_clients_session_visibility() {
 }
 
 #[tokio::test]
-async fn killing_the_only_window_is_rejected_without_notifications() {
+async fn killing_the_only_window_notifies_surviving_control_in_tmux_order() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
+    let beta = session_name("beta");
     new_session(&handler, &alpha).await;
+    new_session(&handler, &beta).await;
 
-    let mut control_rx = register_control_client(&handler, 450, Some(alpha.clone())).await;
+    let alpha_window_id = window_id(&handler, &WindowTarget::new(alpha.clone())).await;
+
+    let mut control_rx = register_control_client(&handler, 450, Some(beta)).await;
     let _ = drain_control_notifications(&mut control_rx);
 
     let response = handler
         .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(alpha, 0),
+            target: WindowTarget::with_window(alpha.clone(), 0),
             kill_all_others: false,
         }))
         .await;
-    assert!(matches!(response, Response::Error(_)));
-    assert!(drain_control_notifications(&mut control_rx).is_empty());
+    assert!(matches!(response, Response::KillWindow(_)));
+    assert!(handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .is_none());
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec![
+            format!("%unlinked-window-close @{alpha_window_id}"),
+            "%sessions-changed".to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -660,7 +745,7 @@ async fn startup_config_errors_do_not_block_first_regular_command() {
 }
 
 #[tokio::test]
-async fn control_detach_notifies_the_same_control_client_before_exit() {
+async fn control_detach_exits_self_and_notifies_other_controls() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     new_session(&handler, &alpha).await;
@@ -677,13 +762,8 @@ async fn control_detach_notifies_the_same_control_client_before_exit() {
     );
 
     let self_events = collect_control_events(&mut self_rx);
-    assert!(self_events.iter().any(|event| matches!(
-        event,
-        ControlServerEvent::Notification(line) if line == "%client-detached 810"
-    )));
-    assert!(self_events
-        .iter()
-        .any(|event| matches!(event, ControlServerEvent::Exit(None))));
+    assert_eq!(self_events.len(), 1, "{self_events:?}");
+    assert!(matches!(self_events[0], ControlServerEvent::Exit(None)));
     assert_eq!(
         drain_control_notifications(&mut other_rx),
         vec!["%client-detached 810".to_owned()]
@@ -691,7 +771,7 @@ async fn control_detach_notifies_the_same_control_client_before_exit() {
 }
 
 #[tokio::test]
-async fn hook_commands_do_not_emit_nested_control_notifications() {
+async fn hook_commands_emit_distinct_lifecycle_control_notifications() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     new_session(&handler, &alpha).await;
@@ -720,7 +800,10 @@ async fn hook_commands_do_not_emit_nested_control_notifications() {
         }))
         .await;
     assert!(matches!(response, Response::ShowOptions(_)));
-    assert!(drain_control_notifications(&mut control_rx).is_empty());
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%sessions-changed".to_owned()]
+    );
 
     let has_beta = handler
         .handle(Request::HasSession(rmux_proto::HasSessionRequest {
@@ -791,8 +874,6 @@ async fn client_session_changed_notification_follows_rename_not_reused_name() {
             .expect("session exists")
             .id()
     };
-    let queued =
-        prepared_client_session_changed(&handler, original.clone(), original_id, "9902").await;
     let mut observer_rx = register_control_client(&handler, 9_903, Some(observer)).await;
     let _ = drain_control_notifications(&mut observer_rx);
 
@@ -809,7 +890,9 @@ async fn client_session_changed_notification_follows_rename_not_reused_name() {
     new_session(&handler, &original).await;
     let _ = drain_control_notifications(&mut observer_rx);
 
-    handler.dispatch_lifecycle_hook(queued).await;
+    handler
+        .emit_client_session_changed(9_902, original, original_id)
+        .await;
     assert_eq!(
         drain_control_notifications(&mut observer_rx),
         vec![format!(
@@ -817,6 +900,54 @@ async fn client_session_changed_notification_follows_rename_not_reused_name() {
             original_id.as_u32()
         )]
     );
+}
+
+#[tokio::test]
+async fn deactivated_lifecycle_dispatch_still_delivers_control_effects() {
+    let handler = RequestHandler::new();
+    let attached = session_name("notify-after-lifecycle-shutdown");
+    let observer = session_name("notify-after-lifecycle-shutdown-observer");
+    new_session(&handler, &attached).await;
+    new_session(&handler, &observer).await;
+    let attached_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&attached)
+            .expect("attached session exists")
+            .id()
+    };
+    let queued = {
+        let mut state = handler.state.lock().await;
+        let mut queued = super::prepare_lifecycle_event(
+            &mut state,
+            &LifecycleEvent::ClientSessionChanged {
+                session_name: attached.clone(),
+                client_name: Some("9910".to_owned()),
+            },
+        );
+        queued.control_session_identity = Some(attached_id);
+        queued
+    };
+
+    let lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .expect("test activates the lifecycle queue once");
+    handler.lifecycle_dispatch.deactivate();
+    drop(lifecycle_events);
+    let mut observer_rx = register_control_client(&handler, 9_911, Some(observer)).await;
+    let _ = drain_control_notifications(&mut observer_rx);
+
+    handler.emit_prepared(queued.clone()).await;
+
+    let expected = vec![format!(
+        "%client-session-changed 9910 ${} {attached}",
+        attached_id.as_u32()
+    )];
+    assert_eq!(drain_control_notifications(&mut observer_rx), expected);
+
+    handler.emit_prepared_and_wait(queued).await;
+    assert_eq!(drain_control_notifications(&mut observer_rx), expected);
 }
 
 #[tokio::test]
@@ -851,9 +982,15 @@ async fn hooks_disabled_client_session_changed_skips_deleted_reused_session() {
     new_session(&handler, &replaced).await;
     let _ = drain_control_notifications(&mut observer_rx);
 
-    crate::hook_runtime::with_hook_execution(Vec::new(), async {
-        handler.emit_prepared(queued).await;
-    })
+    crate::hook_runtime::with_hook_execution(
+        crate::hook_runtime::HookExecutionContext::lifecycle(
+            rmux_proto::HookName::ClientSessionChanged,
+        ),
+        Vec::new(),
+        async {
+            handler.emit_prepared(queued).await;
+        },
+    )
     .await;
     assert!(drain_control_notifications(&mut observer_rx).is_empty());
 }

@@ -10,7 +10,7 @@ async fn live_attach_large_bracketed_paste_survives_irregular_chunks() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -56,7 +56,7 @@ async fn live_attach_one_mebibyte_bracketed_paste_has_bounded_work() {
     let alpha = session_name("one-mebibyte-bracketed-paste");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
@@ -95,7 +95,7 @@ async fn live_attach_over_limit_bracketed_mode_uses_bounded_envelopes_product_di
     let alpha = session_name("over-limit-bracketed-mode");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
     {
         let mut state = handler.state.lock().await;
         state

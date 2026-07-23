@@ -3,12 +3,12 @@
 #[cfg(target_os = "linux")]
 use std::fs;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Write};
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::FileTypeExt;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmux_pty::{ChildCommand, ProcessId, PtyPair, Signal, TerminalSize};
 
@@ -26,9 +26,12 @@ fn read_exact_from_master(
     len: usize,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let io = master.try_clone_io()?;
-    let mut file = File::from(io.as_fd().try_clone_to_owned()?);
     let mut buffer = vec![0_u8; len];
-    file.read_exact(&mut buffer)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut offset = 0;
+    while offset < buffer.len() {
+        offset += read_master_with_deadline(&io, &mut buffer[offset..], deadline)?;
+    }
     Ok(buffer)
 }
 
@@ -36,11 +39,40 @@ fn read_line_from_master(
     master: &rmux_pty::PtyMaster,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let io = master.try_clone_io()?;
-    let file = File::from(io.as_fd().try_clone_to_owned()?);
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    Ok(line)
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        read_master_with_deadline(&io, &mut byte, deadline)?;
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            return Ok(String::from_utf8(line)?);
+        }
+    }
+}
+
+fn read_master_with_deadline(
+    io: &rmux_pty::PtyIo,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> io::Result<usize> {
+    loop {
+        match io.try_read(buffer) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Ok(bytes_read) => return Ok(bytes_read),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting for PTY output",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -132,6 +164,21 @@ fn allocated_pair_round_trips_resized_terminal_size() -> Result<(), Box<dyn std:
 }
 
 #[test]
+fn allocated_master_is_nonblocking_before_exposure() -> Result<(), Box<dyn std::error::Error>> {
+    let pair = PtyPair::open()?;
+    let mut byte = [0_u8; 1];
+
+    let error = pair
+        .master()
+        .io()
+        .try_read(&mut byte)
+        .expect_err("idle master read must not block");
+
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    Ok(())
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn spawned_child_is_session_and_foreground_group_leader() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -219,7 +266,6 @@ fn write_all_times_out_when_child_stops_draining_stdin() -> Result<(), Box<dyn s
 
     assert_eq!(read_exact_from_master(spawned.master(), 5)?, b"READY");
 
-    spawned.master().io().set_nonblocking()?;
     let payload = vec![b'x'; 16 * 1024 * 1024];
     let started = std::time::Instant::now();
 
@@ -235,6 +281,39 @@ fn write_all_times_out_when_child_stops_draining_stdin() -> Result<(), Box<dyn s
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "write timeout should be bounded, elapsed={:?}",
+        started.elapsed()
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn write_timeout_resets_while_child_drains_slowly() -> Result<(), Box<dyn std::error::Error>> {
+    let mut spawned = ChildCommand::new("/bin/sh")
+        .args([
+            "-c",
+            "stty raw -echo; printf READY; while :; do dd bs=1024 count=1 of=/dev/null 2>/dev/null; sleep 0.05; done",
+        ])
+        .size(TerminalSize::new(80, 24))
+        .spawn()?;
+
+    assert_eq!(read_exact_from_master(spawned.master(), 5)?, b"READY");
+
+    let payload = vec![b'x'; 64 * 1024];
+    let timeout = Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    spawned
+        .master()
+        .write_all_with_timeout(&payload, timeout)
+        .expect("continuous progress should keep the write alive");
+
+    let _ = spawned.child().kill(Signal::KILL);
+    let _ = spawned.child_mut().wait();
+
+    assert!(
+        started.elapsed() > timeout,
+        "test must outlive one inactivity timeout, elapsed={:?}",
         started.elapsed()
     );
 

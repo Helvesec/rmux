@@ -2,6 +2,7 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::ptr;
+use std::time::Duration;
 
 use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
 use rustix::process::{
@@ -121,8 +122,16 @@ pub(crate) fn read(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<usize> {
     unix_io::read(fd, buffer)
 }
 
-pub(crate) fn write_all(fd: BorrowedFd<'_>, buffer: &[u8]) -> io::Result<()> {
-    unix_io::write_all(fd, buffer)
+pub(crate) fn try_read(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<usize> {
+    unix_io::try_read(fd, buffer)
+}
+
+pub(crate) fn write_all_with_timeout(
+    fd: BorrowedFd<'_>,
+    buffer: &[u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    unix_io::write_all_with_timeout(fd, buffer, timeout)
 }
 
 pub(crate) fn try_write_immediate(fd: BorrowedFd<'_>, buffer: &[u8]) -> io::Result<usize> {

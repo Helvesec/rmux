@@ -6,6 +6,7 @@ use rmux_proto::{Target, TerminalSize};
 use super::super::scripting_support::rename_target_session;
 use crate::renderer::{render_popup_overlay, OverlayRect, PopupRenderSpec};
 
+use super::identity::OverlayIdentity;
 use super::menu::MenuOverlayState;
 use super::popup_job::{PopupDragMode, PopupJob, PopupSurface};
 use super::scrollable::ScrollablePopupText;
@@ -31,6 +32,20 @@ impl ClientOverlayState {
         }
     }
 
+    pub(super) fn identity(&self) -> &OverlayIdentity {
+        match self {
+            Self::Menu(menu) => &menu.identity,
+            Self::Popup(popup) => &popup.identity,
+        }
+    }
+
+    pub(super) fn current_target(&self) -> &Target {
+        match self {
+            Self::Menu(menu) => &menu.current_target,
+            Self::Popup(popup) => &popup.current_target,
+        }
+    }
+
     pub(in crate::handler) fn rename_session_targets(
         &mut self,
         old_name: &rmux_proto::SessionName,
@@ -38,12 +53,19 @@ impl ClientOverlayState {
     ) {
         match self {
             Self::Menu(menu) => {
+                menu.identity.rename_session(old_name, new_name);
                 rename_target_session(&mut menu.current_target, old_name, new_name);
+                menu.command_context
+                    .rename_session_targets(old_name, new_name);
             }
             Self::Popup(popup) => {
+                popup.identity.rename_session(old_name, new_name);
                 rename_target_session(&mut popup.current_target, old_name, new_name);
                 if let Some(menu) = popup.nested_menu.as_mut() {
+                    menu.identity.rename_session(old_name, new_name);
                     rename_target_session(&mut menu.current_target, old_name, new_name);
+                    menu.command_context
+                        .rename_session_targets(old_name, new_name);
                 }
             }
         }
@@ -53,7 +75,7 @@ impl ClientOverlayState {
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct PopupOverlayState {
     pub(in crate::handler) id: u64,
-    pub(in crate::handler) requester_pid: u32,
+    pub(in crate::handler) identity: OverlayIdentity,
     pub(in crate::handler) current_target: Target,
     pub(in crate::handler) rect: OverlayRect,
     pub(in crate::handler) preferred_width: u16,

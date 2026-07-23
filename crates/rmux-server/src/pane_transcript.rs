@@ -22,12 +22,30 @@ pub(crate) const PANE_INPUT_GROUND_TIMEOUT: Duration = Duration::from_secs(5);
 enum PaneModeState {
     Copy(Box<CopyModeState>),
     Clock(ClockModeState),
-    ModeTree(&'static str),
+    ModeTree {
+        name: &'static str,
+        previous: Option<Box<PaneModeState>>,
+    },
+}
+
+impl PaneModeState {
+    fn resize(&mut self, size: TerminalSize) {
+        match self {
+            Self::Copy(copy_mode) => copy_mode.resize(size),
+            Self::ModeTree { previous, .. } => {
+                if let Some(previous) = previous.as_mut() {
+                    previous.resize(size);
+                }
+            }
+            Self::Clock(_) => {}
+        }
+    }
 }
 
 pub(crate) struct PaneTranscript {
     terminal: TerminalScreen,
     mode: Option<PaneModeState>,
+    mode_revision: u64,
     output_sequence: u64,
     next_clock_generation: u64,
     ground_timer_started_at: Option<Instant>,
@@ -52,6 +70,7 @@ pub(crate) struct PaneAppendResult {
     pub(crate) dropped_passthrough_count: u64,
     pub(crate) replies: Vec<u8>,
     pub(crate) ground_timer: Option<PaneGroundTimer>,
+    pub(crate) alternate_mode_changed: bool,
 }
 
 pub(crate) struct PaneTranscriptRenderState {
@@ -83,6 +102,7 @@ impl PaneTranscript {
         Self {
             terminal: TerminalScreen::new(size, limit),
             mode: None,
+            mode_revision: 0,
             output_sequence: 0,
             next_clock_generation: 1,
             ground_timer_started_at: None,
@@ -117,6 +137,7 @@ impl PaneTranscript {
             self.output_sequence = self.output_sequence.saturating_add(1);
         }
         let title_before = self.terminal.screen().title().to_owned();
+        let alternate_before = self.terminal.screen().is_alternate();
         self.terminal.feed(bytes);
         let title_after = self.terminal.screen().title().to_owned();
         let title_changed = title_after != title_before;
@@ -133,6 +154,7 @@ impl PaneTranscript {
             dropped_passthrough_count,
             replies,
             ground_timer,
+            alternate_mode_changed: self.terminal.screen().is_alternate() != alternate_before,
         }
     }
 
@@ -336,7 +358,7 @@ impl PaneTranscript {
             Some(PaneModeState::Copy(mode)) => {
                 Some(mode.render_screen().capture_transcript(range, options))
             }
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree(_)) | None => None,
+            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => None,
         }
     }
 
@@ -348,7 +370,7 @@ impl PaneTranscript {
             Some(PaneModeState::Copy(mode)) => {
                 Some(mode.render_screen().capture_line_format_flags(range))
             }
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree(_)) | None => None,
+            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => None,
         }
     }
 
@@ -406,8 +428,8 @@ impl PaneTranscript {
 
     pub(crate) fn resize(&mut self, size: TerminalSize) {
         self.terminal.resize(size);
-        if let Some(PaneModeState::Copy(copy_mode)) = &mut self.mode {
-            copy_mode.resize(size);
+        if let Some(mode) = self.mode.as_mut() {
+            mode.resize(size);
         }
     }
 
@@ -422,19 +444,20 @@ impl PaneTranscript {
     pub(crate) fn copy_mode_state(&self) -> Option<&CopyModeState> {
         match &self.mode {
             Some(PaneModeState::Copy(mode)) => Some(mode.as_ref()),
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree(_)) | None => None,
+            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => None,
         }
     }
 
     pub(crate) fn copy_mode_state_mut(&mut self) -> Option<&mut CopyModeState> {
         match &mut self.mode {
             Some(PaneModeState::Copy(mode)) => Some(mode.as_mut()),
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree(_)) | None => None,
+            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => None,
         }
     }
 
     pub(crate) fn set_copy_mode_state(&mut self, state: Option<CopyModeState>) {
         self.mode = state.map(Box::new).map(PaneModeState::Copy);
+        self.bump_mode_revision();
     }
 
     pub(crate) fn copy_mode_summary(&self) -> Option<CopyModeSummary> {
@@ -446,16 +469,24 @@ impl PaneTranscript {
     }
 
     pub(crate) fn copy_mode_render_snapshot(&self) -> Option<CopyModeRenderSnapshot> {
-        self.copy_mode_state().map(CopyModeState::render_snapshot)
+        self.copy_mode_state().map(|mode| {
+            let mut snapshot = mode.render_snapshot();
+            // tmux suppresses pane scrollbars from the live base screen's
+            // alternate-screen state, even while copy-mode renders its own
+            // backing snapshot.
+            snapshot.alternate_on = self.terminal.screen().is_alternate();
+            snapshot
+        })
     }
 
     pub(crate) fn clear_copy_mode(&mut self) -> bool {
         match self.mode {
             Some(PaneModeState::Copy(_)) => {
                 self.mode = None;
+                self.bump_mode_revision();
                 true
             }
-            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree(_)) | None => false,
+            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree { .. }) | None => false,
         }
     }
 
@@ -463,13 +494,14 @@ impl PaneTranscript {
         let generation = self.next_clock_generation;
         self.next_clock_generation = self.next_clock_generation.saturating_add(1);
         self.mode = Some(PaneModeState::Clock(ClockModeState::new(generation)));
+        self.bump_mode_revision();
         generation
     }
 
     pub(crate) fn clock_mode_generation(&self) -> Option<u64> {
         match self.mode {
             Some(PaneModeState::Clock(mode)) => Some(mode.generation()),
-            Some(PaneModeState::Copy(_) | PaneModeState::ModeTree(_)) | None => None,
+            Some(PaneModeState::Copy(_) | PaneModeState::ModeTree { .. }) | None => None,
         }
     }
 
@@ -477,30 +509,56 @@ impl PaneTranscript {
         match self.mode {
             Some(PaneModeState::Clock(_)) => {
                 self.mode = None;
+                self.bump_mode_revision();
                 true
             }
-            Some(PaneModeState::Copy(_) | PaneModeState::ModeTree(_)) | None => false,
+            Some(PaneModeState::Copy(_) | PaneModeState::ModeTree { .. }) | None => false,
         }
     }
 
     pub(crate) fn enter_mode_tree(&mut self, mode_name: &'static str) -> bool {
-        let changed = self.pane_mode_name() != Some(mode_name);
-        self.mode = Some(PaneModeState::ModeTree(mode_name));
-        changed
+        if matches!(
+            self.mode.as_ref(),
+            Some(PaneModeState::ModeTree { name, .. }) if *name == mode_name
+        ) {
+            return false;
+        }
+        let previous = match self.mode.take() {
+            Some(PaneModeState::ModeTree { previous, .. }) => previous,
+            previous => previous.map(Box::new),
+        };
+        self.mode = Some(PaneModeState::ModeTree {
+            name: mode_name,
+            previous,
+        });
+        self.bump_mode_revision();
+        true
     }
 
     pub(crate) fn clear_mode_tree(&mut self) -> bool {
-        match self.mode {
-            Some(PaneModeState::ModeTree(_)) => {
-                self.mode = None;
+        match self.mode.take() {
+            Some(PaneModeState::ModeTree { previous, .. }) => {
+                self.mode = previous.map(|previous| *previous);
+                self.bump_mode_revision();
                 true
             }
-            Some(PaneModeState::Copy(_) | PaneModeState::Clock(_)) | None => false,
+            mode @ (Some(PaneModeState::Copy(_) | PaneModeState::Clock(_)) | None) => {
+                self.mode = mode;
+                false
+            }
         }
     }
 
     pub(crate) fn pane_in_mode(&self) -> bool {
         self.mode.is_some()
+    }
+
+    pub(crate) const fn pane_mode_revision(&self) -> u64 {
+        self.mode_revision
+    }
+
+    fn bump_mode_revision(&mut self) {
+        self.mode_revision = self.mode_revision.saturating_add(1);
     }
 
     pub(crate) fn pane_mode_name(&self) -> Option<&'static str> {
@@ -511,7 +569,7 @@ impl PaneTranscript {
                 "copy-mode"
             }),
             Some(PaneModeState::Clock(_)) => Some(CLOCK_MODE_NAME),
-            Some(PaneModeState::ModeTree(mode_name)) => Some(mode_name),
+            Some(PaneModeState::ModeTree { name, .. }) => Some(*name),
             None => None,
         }
     }
@@ -963,8 +1021,8 @@ mod tests {
     fn alternate_screen_keeps_saved_visible_grid() {
         let mut transcript = transcript(8, 2, 10);
         transcript.append_bytes(b"main\n");
-        transcript.append_bytes(b"\x1b[?1049h");
-        transcript.append_bytes(b"alt\n");
+        let entered = transcript.append_bytes_with_effects(b"\x1b[?1049h");
+        let unchanged = transcript.append_bytes_with_effects(b"alt\n");
 
         let capture = String::from_utf8(
             transcript
@@ -972,8 +1030,14 @@ mod tests {
                 .expect("alternate capture exists"),
         )
         .expect("utf8");
+        assert!(entered.alternate_mode_changed);
+        assert!(!unchanged.alternate_mode_changed);
         assert!(capture.contains("main"));
         assert!(!capture.contains("alt"));
+
+        let exited = transcript.append_bytes_with_effects(b"\x1b[?1049l");
+        assert!(exited.alternate_mode_changed);
+        assert!(!transcript.is_alternate());
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rmux_core::command_parser::CommandParser;
+use rmux_core::LifecycleEvent;
 use rmux_proto::request::SwitchClientExt3Request;
 use rmux_proto::{
     ControlMode, NewSessionRequest, NewWindowRequest, Request, Response, ScopeSelector,
@@ -738,10 +739,18 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
     create_session(&handler, alpha.clone()).await;
     create_session(&handler, beta.clone()).await;
     let target_window = create_runtime_window(&handler, &beta).await;
+    let alpha_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .expect("alpha exists")
+        .id();
     let requester = spawn_environment_child("switch-atomic-control-after").await;
     let control_pid = requester.0.id();
     let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
-    handler
+    let control_id = handler
         .register_control_with_closing(
             control_pid,
             ControlModeUpgrade {
@@ -754,7 +763,7 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
         )
         .await;
     handler
-        .set_control_session(control_pid, Some(alpha))
+        .set_control_session(control_pid, Some(alpha.clone()))
         .await
         .expect("initial control session set succeeds");
     assert!(matches!(
@@ -779,6 +788,7 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
                 .map(str::to_owned),
         )
     };
+    let mut lifecycle = handler.subscribe_lifecycle_events();
 
     let response = handler
         .handle_switch_client_ext3(
@@ -799,12 +809,40 @@ async fn closed_control_switch_preserves_environment_selection_and_touch() {
         before_display.as_deref()
     );
     drop(state);
+    {
+        let active_control = handler.active_control.lock().await;
+        let active = active_control
+            .by_pid
+            .get(&control_pid)
+            .expect("failed switch keeps the exact closing control registration");
+        assert_eq!(active.id, control_id);
+        assert!(active.closing.load(Ordering::SeqCst));
+        assert_eq!(active.session_name.as_ref(), Some(&alpha));
+        assert_eq!(active.session_id, Some(alpha_id));
+        assert_eq!(active.last_session, None);
+        assert_eq!(active.last_session_id, None);
+    }
+
+    handler.finish_control(control_pid, control_id).await;
+
     assert!(!handler
         .active_control
         .lock()
         .await
         .by_pid
         .contains_key(&control_pid));
+    let detached = tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle.recv())
+        .await
+        .expect("transport finish publishes client-detached")
+        .expect("lifecycle channel remains open");
+    assert_eq!(detached.control_session_identity, Some(alpha_id));
+    assert!(matches!(
+        detached.event,
+        LifecycleEvent::ClientDetached {
+            session_name,
+            client_name: Some(client_name),
+        } if session_name == alpha && client_name == control_pid.to_string()
+    ));
 }
 
 #[tokio::test]

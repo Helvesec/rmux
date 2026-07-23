@@ -5,14 +5,13 @@ use rmux_proto::{
 use tokio::task::AbortHandle;
 
 use crate::handler::overlay_support::AttachedHelpContext;
-use crate::hook_runtime::{current_hook_formats, hooks_disabled, with_hook_execution};
+use crate::hook_runtime::{current_hook_execution, current_hook_formats, with_hook_execution};
 use crate::mouse::AttachedMouseEvent;
 
 use super::super::super::{
-    attach_support::ActiveAttachIdentity,
-    attached_client_name,
-    scripting_support::{spawn_background_async, QueueExecutionContext},
-    with_expected_attach_and_session_identity, with_expected_session_identity, RequestHandler,
+    attach_support::ActiveAttachIdentity, attached_client_name,
+    scripting_support::QueueExecutionContext, with_expected_attach_and_session_identity,
+    with_expected_session_identity, RequestHandler,
 };
 
 pub(super) struct AttachedBindingCommandContext {
@@ -154,9 +153,9 @@ pub(super) async fn execute_attached_binding_commands(
             return Ok(());
         }
 
-        let handler = handler.clone();
-        let _ = spawn_background_async("rmux-attached-prompt", move || async move {
-            let execution = handler.execute_parsed_commands(requester_pid, commands, context);
+        let task_handler = handler.clone();
+        let _ = handler.spawn_background_task("rmux-attached-prompt", move || async move {
+            let execution = task_handler.execute_parsed_commands(requester_pid, commands, context);
             let _ = match live_identity {
                 Some(identity) => {
                     with_expected_attach_and_session_identity(
@@ -180,7 +179,10 @@ pub(super) async fn execute_attached_binding_commands(
     let task_handler = handler.clone();
     let task_commands = commands.clone();
     let task_session_name = session_name.clone();
-    let inherited_hook_formats = hooks_disabled().then(current_hook_formats);
+    let inherited_hook = current_hook_execution().map(|execution| {
+        let formats = current_hook_formats();
+        (execution, formats)
+    });
     let task = tokio::spawn(async move {
         let command_execution =
             task_handler.execute_parsed_commands(requester_pid, task_commands, context);
@@ -201,8 +203,10 @@ pub(super) async fn execute_attached_binding_commands(
                 }
             }
         };
-        match inherited_hook_formats {
-            Some(formats) => with_hook_execution(formats, execution).await,
+        match inherited_hook {
+            Some((hook_execution, formats)) => {
+                with_hook_execution(hook_execution, formats, execution).await
+            }
             None => execution.await,
         }
     });
@@ -224,7 +228,6 @@ pub(super) async fn execute_attached_binding_commands(
                     .show_attached_key_help_popup(
                         AttachedHelpContext {
                             attach_pid,
-                            requester_pid,
                             expected_identity: live_identity,
                             expected_session_name: &session_name,
                             expected_session_id: session_id,

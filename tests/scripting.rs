@@ -25,8 +25,8 @@ fn foreground_run_shell_prints_stdout_like_tmux() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
-fn explicitly_targeted_run_shell_does_not_print_to_caller_like_tmux() -> Result<(), Box<dyn Error>>
-{
+fn explicitly_targeted_run_shell_process_stdout_does_not_print_to_caller_like_tmux(
+) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-explicit-target-output")?;
     let _daemon = harness.start_hidden_daemon()?;
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
@@ -40,8 +40,119 @@ fn explicitly_targeted_run_shell_does_not_print_to_caller_like_tmux() -> Result<
 }
 
 #[test]
-fn source_file_explicitly_targeted_run_shell_does_not_print_to_caller() -> Result<(), Box<dyn Error>>
+fn explicitly_targeted_run_shell_commands_print_to_caller_like_tmux() -> Result<(), Box<dyn Error>>
 {
+    let harness = CliHarness::new("run-shell-command-explicit-target-output")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&[
+        "run-shell",
+        "-C",
+        "-t",
+        "alpha:0.0",
+        "display-message -p command-target-output",
+    ])?;
+
+    assert_eq!(output.status.code(), Some(0), "stderr={}", stderr(&output));
+    assert_eq!(stdout(&output), "command-target-output\n");
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn background_targeted_run_shell_commands_have_no_synchronous_output_like_tmux(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("run-shell-command-background-target-output")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&[
+        "run-shell",
+        "-bC",
+        "-t",
+        "alpha:0.0",
+        "display-message -p background-command-target-output",
+    ])?;
+
+    assert_eq!(output.status.code(), Some(0), "stderr={}", stderr(&output));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn control_mode_targeted_run_shell_commands_print_to_caller_like_tmux() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("control-run-shell-command-explicit-target-output")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut command = harness.base_command();
+    let mut control = command
+        .arg("-C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    writeln!(
+        control.stdin.as_mut().expect("control stdin"),
+        "run-shell -C -t alpha:0.0 'display-message -p control-command-target-output'"
+    )?;
+    drop(control.stdin.take());
+    let output = control.wait_with_output()?;
+
+    assert_eq!(output.status.code(), Some(0), "stderr={}", stderr(&output));
+    assert!(
+        stdout(&output).contains("control-command-target-output\n"),
+        "control output={:?}",
+        stdout(&output)
+    );
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn deeply_nested_run_shell_commands_complete_without_recursing_the_server_stack(
+) -> Result<(), Box<dyn Error>> {
+    const DEPTH: usize = 160;
+    let harness = CliHarness::new("run-shell-command-depth")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("nested-run-shell.conf");
+    let mut contents = String::new();
+    for depth in 0..DEPTH {
+        let value = if depth == 0 {
+            "set-buffer -b nested-run-shell-cli ok".to_owned()
+        } else {
+            format!("run-shell -C '#{{@nested-run-shell-{}}}'", depth - 1)
+        };
+        contents.push_str(&format!(
+            "set-option -g @nested-run-shell-{depth} {}\n",
+            shell_quote_str(&value)
+        ));
+    }
+    fs::write(&config, contents)?;
+    assert_success(&harness.run(&["source-file", config.to_str().expect("UTF-8 config path")])?);
+
+    let output = harness.run(&[
+        "run-shell",
+        "-C",
+        &format!("#{{@nested-run-shell-{}}}", DEPTH - 1),
+    ])?;
+
+    assert_eq!(output.status.code(), Some(0), "stderr={}", stderr(&output));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty());
+    let buffer = harness.run(&["show-buffer", "-b", "nested-run-shell-cli"])?;
+    assert_eq!(buffer.status.code(), Some(0), "stderr={}", stderr(&buffer));
+    assert!(stderr(&buffer).is_empty());
+    assert_eq!(stdout(&buffer), "ok");
+    Ok(())
+}
+
+#[test]
+fn source_file_targeted_run_shell_process_stdout_does_not_print_to_caller(
+) -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("source-run-shell-explicit-target-output")?;
     let _daemon = harness.start_hidden_daemon()?;
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
@@ -55,6 +166,26 @@ fn source_file_explicitly_targeted_run_shell_does_not_print_to_caller() -> Resul
 
     assert_eq!(output.status.code(), Some(6));
     assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_file_targeted_run_shell_commands_print_to_caller_like_tmux() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("source-run-shell-command-explicit-target-output")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let config = harness.tmpdir().join("targeted-run-shell-command.conf");
+    fs::write(
+        &config,
+        "run-shell -C -t alpha:0.0 'display-message -p source-command-target-output'\n",
+    )?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+
+    assert_eq!(output.status.code(), Some(0), "stderr={}", stderr(&output));
+    assert_eq!(stdout(&output), "source-command-target-output\n");
     assert!(stderr(&output).is_empty());
     Ok(())
 }
@@ -560,6 +691,222 @@ fn queued_run_shell_missing_canfail_target_preserves_entry_contexts() -> Result<
 }
 
 #[test]
+fn direct_source_file_missing_canfail_target_uses_implicit_active_pane(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("direct-source-file-missing-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["set-option", "-g", "base-index", "3"])?);
+    assert_success(&harness.run(&["set-option", "-g", "pane-base-index", "4"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep 30"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:5", "sleep 30"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:5"])?);
+    assert_success(&harness.run(&["select-window", "-t", "alpha:5"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "alpha:5.5"])?);
+
+    let output_path = harness.tmpdir().join("direct-source-file-missing.txt");
+    let config = harness.tmpdir().join("direct-source-file-missing.conf");
+    let marker = format_marker_command("direct", &output_path);
+    fs::write(&config, format!("run-shell {}\n", shell_quote_str(&marker)))?;
+
+    assert_success(&harness.run(&[
+        "source-file",
+        "-t",
+        "%9999",
+        config.to_str().expect("utf-8 source path"),
+    ])?);
+    wait_for_file_text(&output_path, "direct:alpha:5.5\n")?;
+    Ok(())
+}
+
+#[test]
+fn queued_source_file_target_finder_covers_runtime_entry_points() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("queued-source-file-target-finder")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["set-option", "-g", "base-index", "3"])?);
+    assert_success(&harness.run(&["set-option", "-g", "pane-base-index", "4"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep 30"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:5", "sleep 30"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:5"])?);
+    assert_success(&harness.run(&["select-window", "-t", "alpha:5"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "alpha:5.5"])?);
+
+    let output_path = harness.tmpdir().join("queued-source-file-targets.txt");
+    let write_probe = |name: &str, label: &str| -> Result<std::path::PathBuf, Box<dyn Error>> {
+        let path = harness.tmpdir().join(name);
+        let marker = format_marker_command(label, &output_path);
+        fs::write(&path, format!("run-shell {}\n", shell_quote_str(&marker)))?;
+        Ok(path)
+    };
+    let source_probe = write_probe("source-probe.conf", "source")?;
+    let source_outer = harness.tmpdir().join("source-outer.conf");
+    fs::write(
+        &source_outer,
+        format!("source-file -t alpha {}\n", shell_quote(&source_probe)),
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        source_outer.to_str().expect("utf-8 source path"),
+    ])?);
+    wait_for_file_text(&output_path, "source:alpha:5.5\n")?;
+
+    let missing_probe = write_probe("missing-probe.conf", "missing")?;
+    let missing_outer = harness.tmpdir().join("missing-outer.conf");
+    fs::write(
+        &missing_outer,
+        format!("source-file -t %9999 {}\n", shell_quote(&missing_probe)),
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        "-t",
+        "alpha:5.4",
+        missing_outer.to_str().expect("utf-8 missing source path"),
+    ])?);
+    wait_for_file_text(&output_path, "source:alpha:5.5\nmissing:alpha:5.5\n")?;
+
+    let run_shell_probe = write_probe("run-shell-probe.conf", "run-shell")?;
+    let run_shell_command = format!("source-file -t alpha {}", shell_quote(&run_shell_probe));
+    assert_success(&harness.run(&["run-shell", "-C", &run_shell_command])?);
+    wait_for_file_text(
+        &output_path,
+        "source:alpha:5.5\nmissing:alpha:5.5\nrun-shell:alpha:5.5\n",
+    )?;
+
+    let alias_probe = write_probe("alias-probe.conf", "alias")?;
+    let alias = format!(
+        "source091=source-file -t alpha {}",
+        shell_quote(&alias_probe)
+    );
+    assert_success(&harness.run(&["set-option", "-s", "command-alias[20]", &alias])?);
+    assert_success(&harness.run(&["source091"])?);
+    wait_for_file_text(
+        &output_path,
+        "source:alpha:5.5\nmissing:alpha:5.5\nrun-shell:alpha:5.5\nalias:alpha:5.5\n",
+    )?;
+
+    let control_probe = write_probe("control-probe.conf", "control")?;
+    let mut control = harness
+        .base_command()
+        .arg("-C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut control_stdin = control.stdin.take().expect("control stdin");
+    writeln!(control_stdin, "attach-session -t alpha")?;
+    writeln!(
+        control_stdin,
+        "source-file -t alpha {}",
+        shell_quote(&control_probe)
+    )?;
+    control_stdin.flush()?;
+    wait_for_file_text(
+        &output_path,
+        "source:alpha:5.5\nmissing:alpha:5.5\nrun-shell:alpha:5.5\nalias:alpha:5.5\ncontrol:alpha:5.5\n",
+    )?;
+    writeln!(control_stdin, "detach-client")?;
+    drop(control_stdin);
+    let control_output = control.wait_with_output()?;
+    assert_eq!(control_output.status.code(), Some(0));
+    assert!(stderr(&control_output).is_empty());
+
+    let mut attach =
+        AttachedSession::spawn(&harness, "alpha", TerminalSize { cols: 80, rows: 12 })?;
+    attach.wait_for_raw_mode(Duration::from_secs(5))?;
+    let _ = read_until_contains(attach.master_mut(), "[alpha]", Duration::from_secs(5))?;
+    let binding_probe = write_probe("binding-probe.conf", "binding")?;
+    assert_success(&harness.run(&[
+        "bind-key",
+        "-T",
+        "prefix",
+        "X",
+        "source-file",
+        "-t",
+        "alpha",
+        binding_probe.to_str().expect("utf-8 binding source path"),
+    ])?);
+    attach.send_bytes(b"\x02X")?;
+    wait_for_file_text(
+        &output_path,
+        "source:alpha:5.5\nmissing:alpha:5.5\nrun-shell:alpha:5.5\nalias:alpha:5.5\ncontrol:alpha:5.5\nbinding:alpha:5.5\n",
+    )?;
+
+    let hook_probe = write_probe("hook-probe.conf", "hook")?;
+    let hook_queue = format!("source-file -t alpha {}", shell_quote(&hook_probe));
+    assert_success(&harness.run(&["set-hook", "-g", "after-new-window", &hook_queue])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha"])?);
+    wait_for_file_text(
+        &output_path,
+        "source:alpha:5.5\nmissing:alpha:5.5\nrun-shell:alpha:5.5\nalias:alpha:5.5\ncontrol:alpha:5.5\nbinding:alpha:5.5\nhook:alpha:5.5\n",
+    )?;
+
+    attach.send_bytes(b"\x02d")?;
+    assert!(attach.wait_for_exit(Duration::from_secs(5))?.success());
+    Ok(())
+}
+
+#[test]
+fn nested_source_file_missing_target_keeps_live_fallback_across_queues(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("nested-source-file-missing-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["set-option", "-g", "base-index", "3"])?);
+    assert_success(&harness.run(&["set-option", "-g", "pane-base-index", "4"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep 30"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:5", "sleep 30"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:5"])?);
+    assert_success(&harness.run(&["select-window", "-t", "alpha:5"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "alpha:5.5"])?);
+
+    let output_path = harness.tmpdir().join("nested-source-file-missing.txt");
+    let child = harness.tmpdir().join("nested-source-file-child.conf");
+    let outer = harness.tmpdir().join("nested-source-file-outer.conf");
+    let marker = format_marker_command("nested", &output_path);
+    fs::write(&child, format!("run-shell {}\n", shell_quote_str(&marker)))?;
+    fs::write(
+        &outer,
+        format!("source-file -t %9999 {}\n", shell_quote(&child)),
+    )?;
+
+    assert_success(&harness.run(&[
+        "source-file",
+        "-t",
+        "alpha:5.4",
+        outer.to_str().expect("utf-8 outer source path"),
+    ])?);
+    wait_for_file_text(&output_path, "nested:alpha:5.5\n")?;
+
+    let run_shell_command = format!("source-file -t alpha:5.4 {}", shell_quote(&outer));
+    assert_success(&harness.run(&["run-shell", "-C", &run_shell_command])?);
+    wait_for_file_text(&output_path, "nested:alpha:5.5\nnested:alpha:5.5\n")?;
+
+    let mut control = harness
+        .base_command()
+        .arg("-C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut control_stdin = control.stdin.take().expect("control stdin");
+    writeln!(control_stdin, "attach-session -t alpha")?;
+    writeln!(
+        control_stdin,
+        "source-file -t alpha:5.4 {}",
+        shell_quote(&outer)
+    )?;
+    control_stdin.flush()?;
+    wait_for_file_text(
+        &output_path,
+        "nested:alpha:5.5\nnested:alpha:5.5\nnested:alpha:5.5\n",
+    )?;
+    writeln!(control_stdin, "detach-client")?;
+    drop(control_stdin);
+    let control_output = control.wait_with_output()?;
+    assert_eq!(control_output.status.code(), Some(0));
+    assert!(stderr(&control_output).is_empty());
+    Ok(())
+}
+
+#[test]
 fn run_shell_exports_tmux_env_matching_mux_socket() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-tmux-env")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -694,6 +1041,46 @@ fn source_file_commands_follow_implicit_selected_window_context() -> Result<(), 
         "initial shell window should remain inactive: {listed:?}"
     );
     assert_eq!(lines[1], "3:1:w1");
+    assert!(stderr(&windows).is_empty());
+    Ok(())
+}
+
+#[test]
+fn repeated_targets_use_the_last_value_in_queued_and_sourced_commands() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("repeated-target-queue-source")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+
+    let queued = harness.run(&[
+        "if-shell",
+        "-F",
+        "1",
+        "new-window -d -t bad:xyz.??? -t beta -n queued-recovered",
+    ])?;
+    assert_success(&queued);
+
+    let config = harness.tmpdir().join("repeated-target.conf");
+    fs::write(
+        &config,
+        "new-window -d -tbad:xyz.??? -tbeta -n sourced-recovered\n",
+    )?;
+    let sourced = harness.run(&[
+        "source-file",
+        "-t",
+        "bad:xyz.???",
+        "-t",
+        "alpha:0.0",
+        config.to_str().expect("utf-8 config path"),
+    ])?;
+    assert_success(&sourced);
+
+    let windows = harness.run(&["list-windows", "-t", "beta", "-F", "#{window_name}"])?;
+    assert_eq!(windows.status.code(), Some(0));
+    let listed = stdout(&windows);
+    assert!(listed.contains("queued-recovered\n"), "{listed:?}");
+    assert!(listed.contains("sourced-recovered\n"), "{listed:?}");
     assert!(stderr(&windows).is_empty());
     Ok(())
 }
@@ -1823,6 +2210,63 @@ fn startup_config_run_shell_can_call_back_into_daemon() -> Result<(), Box<dyn Er
         callback_output.contains("base-index"),
         "startup source callback must execute against the still-loading daemon: {callback_output:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn startup_nested_source_file_target_uses_active_indexed_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("startup-source-file-target-finder")?;
+    let valid = harness.tmpdir().join("startup-valid.conf");
+    let missing = harness.tmpdir().join("startup-missing.conf");
+    let outer = harness.tmpdir().join("startup-outer.conf");
+    let startup = harness.tmpdir().join("startup.conf");
+    fs::write(
+        &valid,
+        "set-option -gF @startup-valid '#{session_name}:#{window_index}.#{pane_index}'\n",
+    )?;
+    fs::write(
+        &missing,
+        "set-option -gF @startup-missing '#{session_name}:#{window_index}.#{pane_index}'\n",
+    )?;
+    fs::write(
+        &outer,
+        format!(
+            "source-file -t alpha:5 {}\nsource-file -t %9999 {}\n",
+            shell_quote(&valid),
+            shell_quote(&missing),
+        ),
+    )?;
+    fs::write(
+        &startup,
+        format!(
+            "set-option -g base-index 3\n\
+             set-option -g pane-base-index 4\n\
+             new-session -d -s alpha\n\
+             new-window -d -t alpha:5\n\
+             split-window -d -t alpha:5\n\
+             select-window -t alpha:5\n\
+             select-pane -t alpha:5.5\n\
+             source-file -t alpha:5.4 {}\n",
+            shell_quote(&outer),
+        ),
+    )?;
+
+    let output = harness.run(&[
+        "-f",
+        startup.to_str().expect("utf-8 startup path"),
+        "new-session",
+        "-d",
+        "-s",
+        "boot",
+    ])?;
+
+    assert_success(&output);
+    for option in ["@startup-valid", "@startup-missing"] {
+        let value = harness.run(&["show-options", "-gqv", option])?;
+        assert_eq!(value.status.code(), Some(0), "option {option}");
+        assert_eq!(stdout(&value), "alpha:5.5\n", "option {option}");
+        assert!(stderr(&value).is_empty());
+    }
     Ok(())
 }
 

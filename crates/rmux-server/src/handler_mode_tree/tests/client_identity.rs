@@ -184,6 +184,131 @@ async fn choose_client_stale_selection_does_not_detach_reconnected_pid() {
 }
 
 #[tokio::test]
+async fn choose_client_detach_revalidates_requester_at_target_send_lock() {
+    use super::super::mode_tree_test_support::{
+        install_mode_tree_identity_pause, ModeTreeIdentityPausePoint,
+    };
+
+    let handler = RequestHandler::new();
+    let fixture = client_identity_fixture(&handler, "choose-client-requester-aba", 615).await;
+    select_stale_client(&handler, &fixture).await;
+    let identity = handler
+        .current_mode_tree_action_identity(fixture.host_pid)
+        .await
+        .expect("original choose-client identity");
+    let pause =
+        install_mode_tree_identity_pause(ModeTreeIdentityPausePoint::Mutation(fixture.host_pid));
+    let action_handler = handler.clone();
+    let action = tokio::spawn(async move {
+        action_handler
+            .perform_client_detach_for_identity(identity)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("detach reaches its final identity check");
+
+    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+    let replacement_attach_id = handler
+        .register_attach(
+            fixture.host_pid,
+            fixture.session_name.clone(),
+            replacement_tx,
+        )
+        .await;
+    let parsed = CommandParser::new()
+        .parse_arguments(["choose-client"])
+        .expect("choose-client parses");
+    let command = RequestHandler::parse_mode_tree_queue_command(parsed.commands()[0].clone())
+        .expect("mode-tree command parses")
+        .expect("mode-tree command recognized");
+    handler
+        .execute_queued_mode_tree(
+            fixture.host_pid,
+            command,
+            &QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("replacement choose-client opens");
+    pause.release.notify_one();
+
+    assert!(
+        action.await.expect("detach task joins").is_err(),
+        "the stale requester must fail closed"
+    );
+    let active_attach = handler.active_attach.lock().await;
+    assert_eq!(
+        active_attach.by_pid[&fixture.host_pid].id,
+        replacement_attach_id
+    );
+    let victim = active_attach
+        .by_pid
+        .get(&fixture.victim_pid)
+        .expect("victim remains attached");
+    assert_eq!(victim.id, fixture.victim_attach_id);
+    assert!(
+        !victim.closing.load(Ordering::SeqCst),
+        "a stale requester must not detach a live target"
+    );
+}
+
+#[tokio::test]
+async fn choose_client_control_detach_revalidates_requester_at_control_lock() {
+    use std::sync::Arc;
+
+    use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+    use rmux_proto::{ClientTerminalContext, ControlMode};
+
+    let handler = RequestHandler::new();
+    let fixture = client_identity_fixture(&handler, "choose-control-requester-aba", 617).await;
+    let identity = handler
+        .current_mode_tree_action_identity(fixture.host_pid)
+        .await
+        .expect("original choose-client identity");
+    let control_pid = fixture.victim_pid.saturating_add(1);
+    let (event_tx, _event_rx) = mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let control_id = handler
+        .register_control_with_closing(
+            control_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default()
+                    .with_client_terminal(&ClientTerminalContext {
+                        terminal_features: Vec::new(),
+                        utf8: true,
+                    }),
+            },
+            event_tx,
+            Arc::clone(&closing),
+        )
+        .await;
+    handler
+        .set_control_session(control_pid, Some(fixture.session_name.clone()))
+        .await
+        .expect("control session set succeeds");
+
+    let (replacement_tx, _replacement_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(
+            fixture.host_pid,
+            fixture.session_name.clone(),
+            replacement_tx,
+        )
+        .await;
+
+    assert!(handler
+        .exit_control_client_for_identity_from_mode_tree(identity, control_pid, control_id, None,)
+        .await
+        .is_err());
+    assert!(
+        !closing.load(Ordering::SeqCst),
+        "a stale requester must not close a control client"
+    );
+}
+
+#[tokio::test]
 async fn choose_client_stale_tag_does_not_detach_reconnected_pid() {
     let handler = RequestHandler::new();
     let fixture = client_identity_fixture(&handler, "choose-client-stale-tag", 620).await;

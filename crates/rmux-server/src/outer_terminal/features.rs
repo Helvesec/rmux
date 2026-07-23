@@ -42,13 +42,13 @@ impl OuterTerminal {
                 options.resolve(None, OptionName::SetClipboard),
                 Some("on")
             ),
-            mouse_tracking_mode: if matches!(
+            mouse_tracking_mode: match (
                 options.resolve(session_name, OptionName::Mouse),
-                Some("on")
+                options.resolve(session_name, OptionName::FocusFollowsMouse),
             ) {
-                MouseTrackingMode::Button
-            } else {
-                MouseTrackingMode::Off
+                (Some("on"), Some("on")) => MouseTrackingMode::All,
+                (Some("on"), _) => MouseTrackingMode::Button,
+                _ => MouseTrackingMode::Off,
             },
             ..Self::default()
         };

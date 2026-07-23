@@ -619,26 +619,244 @@ async fn new_window_does_not_mutate_the_session_when_existing_terminals_are_miss
 }
 
 #[tokio::test]
-async fn killing_the_only_window_returns_an_explicit_error() {
+async fn killing_the_only_window_atomically_destroys_its_session_in_tmux_hook_order() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, "alpha").await;
+    let mut events = handler.subscribe_lifecycle_events();
 
     let response = handler
         .handle(Request::KillWindow(KillWindowRequest {
-            target: WindowTarget::with_window(alpha, 0),
+            target: WindowTarget::with_window(alpha.clone(), 0),
             kill_all_others: false,
         }))
         .await;
 
     assert_eq!(
         response,
-        Response::Error(rmux_proto::ErrorResponse {
-            error: rmux_proto::RmuxError::Server(
-                "cannot kill the only window in session alpha".to_owned(),
-            ),
+        Response::KillWindow(rmux_proto::KillWindowResponse {
+            target: WindowTarget::with_window(alpha.clone(), 0),
         })
     );
+    assert!(handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .is_none());
+
+    let first = timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("window-unlinked event should arrive")
+        .expect("lifecycle channel should stay open");
+    let second = timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("session-closed event should arrive")
+        .expect("lifecycle channel should stay open");
+    assert!(
+        matches!(
+            &first.event,
+            rmux_core::LifecycleEvent::WindowUnlinked {
+                session_name,
+                target: Some(target),
+                ..
+            } if session_name == &alpha && target == &WindowTarget::with_window(alpha.clone(), 0)
+        ),
+        "{first:?}"
+    );
+    assert!(
+        matches!(
+            &second.event,
+            rmux_core::LifecycleEvent::SessionClosed {
+                session_name,
+                ..
+            } if session_name == &alpha
+        ),
+        "{second:?}"
+    );
+}
+
+#[tokio::test]
+async fn kill_last_window_commit_excludes_a_concurrent_new_window() {
+    let handler = std::sync::Arc::new(RequestHandler::new());
+    let alpha = session_name("kill-last-window-race");
+    create_session(&handler, alpha.as_str()).await;
+    let target = WindowTarget::with_window(alpha.clone(), 0);
+    let pause = handler.install_kill_window_commit_pause(target.clone());
+
+    let killing_handler = std::sync::Arc::clone(&handler);
+    let killing_target = target.clone();
+    let killing = tokio::spawn(async move {
+        killing_handler
+            .handle(Request::KillWindow(KillWindowRequest {
+                target: killing_target,
+                kill_all_others: false,
+            }))
+            .await
+    });
+    timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("kill-window should reach the in-lock commit barrier");
+
+    let creating_handler = std::sync::Arc::clone(&handler);
+    let creating_target = alpha.clone();
+    let mut creating = tokio::spawn(async move {
+        creating_handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: creating_target,
+                name: None,
+                detached: true,
+                environment: None,
+                command: None,
+                start_directory: None,
+                target_window_index: None,
+                insert_at_target: false,
+                process_command: None,
+            })))
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(50), &mut creating)
+            .await
+            .is_err(),
+        "new-window must wait behind the kill-window state transaction"
+    );
+
+    pause.release.notify_one();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), killing)
+            .await
+            .expect("kill-window should leave the barrier")
+            .expect("kill-window task should join"),
+        Response::KillWindow(_)
+    ));
+    assert!(matches!(
+        timeout(Duration::from_secs(1), creating)
+            .await
+            .expect("new-window should resume after the committed kill")
+            .expect("new-window task should join"),
+        Response::Error(rmux_proto::ErrorResponse {
+            error: rmux_proto::RmuxError::SessionNotFound(_),
+        })
+    ));
+}
+
+#[tokio::test]
+async fn kill_last_linked_window_orders_target_session_before_surviving_alias() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-linked-last");
+    let beta = session_name("beta-linked-last");
+    create_session(&handler, alpha.as_str()).await;
+    create_session(&handler, beta.as_str()).await;
+    insert_window(&handler, &beta, 1).await;
+    assert!(matches!(
+        handler
+            .handle(Request::LinkWindow(LinkWindowRequest {
+                source: WindowTarget::with_window(alpha.clone(), 0),
+                target: WindowTarget::with_window(beta.clone(), 2),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: false,
+            }))
+            .await,
+        Response::LinkWindow(_)
+    ));
+    let mut events = handler.subscribe_lifecycle_events();
+
+    assert!(matches!(
+        handler
+            .handle(Request::KillWindow(KillWindowRequest {
+                target: WindowTarget::with_window(alpha.clone(), 0),
+                kill_all_others: false,
+            }))
+            .await,
+        Response::KillWindow(_)
+    ));
+
+    let mut observed = Vec::new();
+    for _ in 0..3 {
+        let queued = timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("linked kill lifecycle event should arrive")
+            .expect("lifecycle channel should stay open");
+        observed.push(match queued.event {
+            rmux_core::LifecycleEvent::WindowUnlinked { session_name, .. } => {
+                format!("window:{session_name}")
+            }
+            rmux_core::LifecycleEvent::SessionClosed { session_name, .. } => {
+                format!("session:{session_name}")
+            }
+            other => panic!("unexpected lifecycle event: {other:?}"),
+        });
+    }
+    assert_eq!(
+        observed,
+        [
+            "window:alpha-linked-last",
+            "session:alpha-linked-last",
+            "window:beta-linked-last",
+        ]
+    );
+
+    let state = handler.state.lock().await;
+    assert!(state.sessions.session(&alpha).is_none());
+    let beta_session = state.sessions.session(&beta).expect("beta should survive");
+    assert_eq!(
+        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[tokio::test]
+async fn kill_last_grouped_window_matches_tmux_peer_hook_order() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-grouped-last");
+    let beta = session_name("beta-grouped-last");
+    create_session(&handler, alpha.as_str()).await;
+    create_grouped_session(&handler, beta.as_str(), &alpha).await;
+    create_session(&handler, "survivor-grouped-last").await;
+    let mut events = handler.subscribe_lifecycle_events();
+
+    assert!(matches!(
+        handler
+            .handle(Request::KillWindow(KillWindowRequest {
+                target: WindowTarget::with_window(alpha.clone(), 0),
+                kill_all_others: false,
+            }))
+            .await,
+        Response::KillWindow(_)
+    ));
+
+    let mut observed = Vec::new();
+    for _ in 0..4 {
+        let queued = timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("grouped kill lifecycle event should arrive")
+            .expect("lifecycle channel should stay open");
+        observed.push(match queued.event {
+            rmux_core::LifecycleEvent::WindowUnlinked { session_name, .. } => {
+                format!("window:{session_name}")
+            }
+            rmux_core::LifecycleEvent::SessionClosed { session_name, .. } => {
+                format!("session:{session_name}")
+            }
+            other => panic!("unexpected lifecycle event: {other:?}"),
+        });
+    }
+    assert_eq!(
+        observed,
+        [
+            "window:alpha-grouped-last",
+            "session:alpha-grouped-last",
+            "session:beta-grouped-last",
+            "window:beta-grouped-last",
+        ]
+    );
+    let state = handler.state.lock().await;
+    assert!(state.sessions.session(&alpha).is_none());
+    assert!(state.sessions.session(&beta).is_none());
 }
 
 #[tokio::test]

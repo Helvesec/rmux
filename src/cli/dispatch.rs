@@ -44,8 +44,9 @@ use super::session_commands::{
     run_has_session, run_kill_session, run_list_sessions, run_new_session, run_rename_session,
 };
 use super::target_resolution::{
-    resolve_current_pane_target, resolve_current_session_target, resolve_pane_target_or_current,
-    resolve_pane_target_spec, resolve_select_layout_target_spec, resolve_window_target_or_current,
+    resolve_canfail_pane_target_spec, resolve_current_pane_target, resolve_current_session_target,
+    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_select_layout_target_spec,
+    resolve_window_target_or_current,
 };
 use super::web_commands::run_web_share;
 use super::window_commands::{
@@ -671,7 +672,7 @@ fn dispatch(
             let (command, arguments) =
                 run_shell_command_and_arguments(args.command, args.as_commands)?;
             run_command_resolved(socket_path, "run-shell", move |connection| {
-                let target = resolve_run_shell_target(connection, args.target.as_ref())?;
+                let target = resolve_canfail_pane_target(connection, args.target.as_ref())?;
                 connection
                     .run_shell(
                         command,
@@ -728,7 +729,7 @@ fn run_shell_foreground(
     let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands)?;
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let target = resolve_run_shell_target(&mut connection, args.target.as_ref())?;
+    let target = resolve_canfail_pane_target(&mut connection, args.target.as_ref())?;
     let response = connection
         .run_shell(
             command,
@@ -767,15 +768,12 @@ fn run_shell_command_and_arguments(
     Ok((shell_command, command.collect()))
 }
 
-fn resolve_run_shell_target(
+fn resolve_canfail_pane_target(
     connection: &mut rmux_client::Connection,
     target: Option<&crate::cli_args::TargetSpec>,
 ) -> Result<Option<rmux_proto::PaneTarget>, ExitFailure> {
     match target {
-        Some(target) => match resolve_pane_target_spec(connection, target) {
-            Ok(target) => Ok(Some(target)),
-            Err(_) => Ok(None),
-        },
+        Some(target) => resolve_canfail_pane_target_spec(connection, target),
         None => Ok(None),
     }
 }
@@ -878,7 +876,7 @@ fn run_source_file(
 
     let mut connection = connect_with_startserver(socket_path, startup)?;
     let target = match args.target.as_ref() {
-        Some(target) => Some(resolve_pane_target_spec(&mut connection, target)?),
+        Some(target) => resolve_canfail_pane_target_spec(&mut connection, target)?,
         None => inherited_pane_target(&mut connection, socket_path)?,
     };
     let response = connection

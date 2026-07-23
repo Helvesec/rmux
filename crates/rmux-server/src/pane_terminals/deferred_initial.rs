@@ -45,7 +45,10 @@ impl HandlerState {
                     session,
                     &self.options,
                     pane.window_index,
+                    pane.index,
                     pane.geometry,
+                    false,
+                    false,
                 ),
             )
         };
@@ -62,6 +65,7 @@ impl HandlerState {
             Some(pane.id),
             requested_cwd,
         )?;
+        crate::terminal::validate_windows_process_command_for_profile(&profile, spawn.command)?;
         let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
         let initial_title = profile.initial_pane_title();
@@ -163,7 +167,10 @@ impl HandlerState {
                     session,
                     &self.options,
                     target.window_index(),
+                    pane.index(),
                     pane.geometry(),
+                    false,
+                    false,
                 ),
                 window.size(),
                 self.attached_terminal_pixels

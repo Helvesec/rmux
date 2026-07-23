@@ -1,6 +1,7 @@
 use std::io;
 use std::process::{Child, ExitStatus};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 /// A process-group identity whose numeric ID remains usable only while its
 /// direct child still owns that ID.
@@ -31,6 +32,33 @@ impl UnixProcessGroup {
                 Err(io::Error::last_os_error())
             }
         })
+    }
+
+    pub(super) fn terminate_and_wait(&self, timeout: Duration) -> io::Result<bool> {
+        let active = self.lock_active();
+        if !*active {
+            return Ok(true);
+        }
+        let result = unsafe {
+            // SAFETY: The negative value targets the process group created
+            // before user code began executing. Keeping `active` locked also
+            // keeps the group leader unreaped, so its numeric ID cannot be
+            // recycled while liveness is observed.
+            libc::kill(-self.id, libc::SIGKILL)
+        };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(true);
+            }
+            if error.raw_os_error() == Some(libc::EPERM)
+                && super::unix_group_liveness::wait_for_no_live_members(self.id, Duration::ZERO)?
+            {
+                return Ok(true);
+            }
+            return Err(error);
+        }
+        super::unix_group_liveness::wait_for_no_live_members(self.id, timeout)
     }
 
     pub(super) fn try_reap(&self, child: &mut Child) -> io::Result<Option<ExitStatus>> {

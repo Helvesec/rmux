@@ -200,6 +200,7 @@ pub(crate) fn status_line_layout(
     options: &rmux_core::OptionStore,
     attached_count: usize,
     prompt: Option<&RenderedPrompt>,
+    state: Option<&crate::pane_terminals::HandlerState>,
 ) -> Option<StatusLineLayout> {
     let geometry = StatusGeometry::for_session(session, options);
     let _ = geometry.status_y?;
@@ -242,6 +243,7 @@ pub(crate) fn status_line_layout(
         u16::try_from(width).unwrap_or(u16::MAX),
         attached_count,
         geometry.status_lines,
+        state,
     )
     .into_iter()
     .enumerate()

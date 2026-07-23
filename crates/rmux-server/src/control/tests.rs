@@ -10,10 +10,11 @@ use super::subscriptions::{
     handle_pane_event, refresh_subscriptions, PaneEvent, PaneSubscriptionStart,
 };
 use super::{
-    append_control_input, arm_control_eof_transition, control_control_waits_for_attached_session,
-    drain_control_command_after_eof, drain_control_queue_after_eof, ensure_control_newline,
-    extract_complete_control_lines, forward_control as forward_control_identity,
-    install_control_eof_queue_lease_pause, wait_for_control_eof_transition, ActiveControlCommand,
+    append_control_input, arm_control_eof_transition, control_commands_require_drain,
+    control_control_waits_for_attached_session, drain_control_command_after_eof,
+    drain_control_queue_after_eof, ensure_control_newline, extract_complete_control_lines,
+    forward_control as forward_control_identity, install_control_eof_queue_lease_pause,
+    pause_after_control_eof_queue_lease, wait_for_control_eof_transition, ActiveControlCommand,
     ControlCommandResult, ControlLifecycle, ControlModeUpgrade, ControlOutputQueue,
     ControlQueueEofCancellation, ControlServerEvent, ControlUpgradeInput, EofDrainContext,
     CONTROL_EOF_GRACE, CONTROL_SERVER_EVENT_CAPACITY, MAX_CONTROL_LINE_BYTES,
@@ -25,7 +26,7 @@ use crate::handler::{
     RequestHandler,
 };
 use crate::outer_terminal::OuterTerminalContext;
-use crate::server_access::current_owner_uid;
+use crate::server_access::{current_owner_uid, AccessMode};
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
     ControlMode, KillSessionRequest, NewSessionRequest, Request, Response, RmuxError, SessionId,
@@ -33,6 +34,78 @@ use rmux_proto::{
 };
 
 const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn only_blocking_control_waits_are_cancel_safe_during_shutdown() {
+    let handler = RequestHandler::new();
+    for line in [
+        "wait-for channel",
+        "wait-for -- -channel",
+        "wait-for -L lock",
+    ] {
+        let commands = handler
+            .parse_control_commands(line)
+            .await
+            .expect("cancel-safe wait parses");
+        assert!(
+            !control_commands_require_drain(&commands),
+            "{line:?} must not hold the mutation drain barrier"
+        );
+    }
+    for line in [
+        "wait-for -S channel",
+        "wait-for -U lock",
+        "set-buffer changed",
+        "RMUX_TEST=value",
+    ] {
+        let commands = handler
+            .parse_control_commands(line)
+            .await
+            .expect("mutating command parses");
+        assert!(
+            control_commands_require_drain(&commands),
+            "{line:?} must hold the mutation drain barrier"
+        );
+    }
+}
+
+#[tokio::test]
+async fn eof_queue_lease_pauses_are_scoped_by_handler_and_cleaned_on_drop() {
+    let identity = ControlClientIdentity::new(81_001, 1);
+    let first_handler = Arc::new(RequestHandler::new());
+    let second_handler = Arc::new(RequestHandler::new());
+    let abandoned_pause = install_control_eof_queue_lease_pause(&first_handler, identity);
+    drop(abandoned_pause);
+    let second_pause = install_control_eof_queue_lease_pause(&second_handler, identity);
+    let first_pause = install_control_eof_queue_lease_pause(&first_handler, identity);
+
+    let first_handler_for_task = Arc::clone(&first_handler);
+    let first_task = tokio::spawn(async move {
+        pause_after_control_eof_queue_lease(&first_handler_for_task, identity).await;
+    });
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, first_pause.reached.notified())
+        .await
+        .expect("first handler reaches its EOF lease pause");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second_pause.reached.notified())
+            .await
+            .is_err(),
+        "the first handler must not consume the second handler's pause"
+    );
+    first_pause.release.notify_one();
+    first_task.await.expect("first EOF lease pause joins");
+
+    let second_handler_for_task = Arc::clone(&second_handler);
+    let second_task = tokio::spawn(async move {
+        pause_after_control_eof_queue_lease(&second_handler_for_task, identity).await;
+    });
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, second_pause.reached.notified())
+        .await
+        .expect("second handler reaches its EOF lease pause");
+
+    second_pause.release.notify_one();
+    second_task.await.expect("second EOF lease pause joins");
+}
 
 #[test]
 fn only_control_control_eof_waits_for_an_attached_session() {
@@ -126,6 +199,314 @@ async fn forward_control(
     .await;
     handler.finish_control(requester_pid, control_id).await;
     result
+}
+
+#[tokio::test]
+async fn shutdown_quiesce_finishes_the_active_control_mutation_and_rejects_later_frames() {
+    const REQUESTER_PID: u32 = 42_422;
+
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let (server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let control_id = handler
+        .register_control_with_closing(
+            REQUESTER_PID,
+            ControlModeUpgrade {
+                initial_command_count: 1,
+                mode: ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            server_event_tx,
+            Arc::clone(&closing),
+        )
+        .await;
+    let identity = ControlClientIdentity::new(REQUESTER_PID, control_id);
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(REQUESTER_PID, AccessMode::ReadWrite);
+    let marker = std::env::temp_dir().join(format!(
+        "rmux-control-quiesce-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
+    ));
+    let input = format!(
+        "run-shell 'printf started > {}; sleep 0.4' ; set-buffer -b shutdown-control-active committed\n\
+         set-buffer -b shutdown-control-later must-not-run\n",
+        marker.display()
+    );
+    let handler_for_control = Arc::clone(&handler);
+    let control_task = tokio::spawn(async move {
+        forward_control_identity(
+            server_stream,
+            handler_for_control,
+            identity,
+            ControlUpgradeInput::new(input.into_bytes(), 1),
+            shutdown_rx,
+            server_event_rx,
+            ControlLifecycle {
+                closing,
+                shutdown_handle,
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("active control frame reaches its foreground shell");
+    assert!(!handler.normal_drain_requests_quiesced());
+
+    handler.close_normal_request_admission();
+    shutdown_tx.send_replace(());
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("control task joins")
+        .expect("control forwarding succeeds");
+    assert!(handler.normal_drain_requests_quiesced());
+
+    let active = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("shutdown-control-active".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        active
+            .command_output()
+            .expect("the admitted active frame commits")
+            .stdout(),
+        b"committed"
+    );
+    let later = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("shutdown-control-later".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(later, Response::Error(_)),
+        "a later frame must not be admitted during quiesce: {later:?}"
+    );
+    let rendered = String::from_utf8(rendered).expect("control transcript is utf-8");
+    assert!(rendered.contains("%end "), "{rendered:?}");
+    assert!(
+        rendered.ends_with("%exit server shutting down\n"),
+        "{rendered:?}"
+    );
+
+    handler.finish_control(REQUESTER_PID, control_id).await;
+    let _ = std::fs::remove_file(marker);
+}
+
+#[tokio::test]
+async fn eof_queue_rechecks_normal_request_admission_before_spawning_each_frame() {
+    let handler = Arc::new(RequestHandler::new());
+    let requester_pid = 4252;
+    let (event_tx, mut event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    let identity = ControlClientIdentity::new(requester_pid, control_id);
+    assert_eq!(
+        handler.begin_control_queue_drain(identity).await,
+        ControlQueueDrainLease::Acquired
+    );
+
+    handler.close_normal_request_admission();
+    let mut queued_lines = std::collections::VecDeque::from([
+        "set-buffer -b eof-admission-after-close must-not-run".to_owned(),
+    ]);
+    let mut queued_bytes = queued_lines.iter().map(String::len).sum();
+    let (_shutdown_tx, mut shutdown_rx) = watch::channel(());
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let mut context = EofDrainContext {
+        server_events: &mut event_rx,
+        events_open: true,
+        handler: &handler,
+        control_identity: identity,
+        shutdown: &mut shutdown_rx,
+        shutdown_handle: &shutdown_handle,
+    };
+
+    drain_control_queue_after_eof(
+        None,
+        &mut queued_lines,
+        &mut queued_bytes,
+        false,
+        &mut context,
+    )
+    .await
+    .expect("closed EOF queue stops without spawning its next frame");
+
+    let response = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("eof-admission-after-close".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::Error(_)),
+        "a frame rejected by normal admission must not mutate: {response:?}"
+    );
+    handler.finish_control(requester_pid, control_id).await;
+}
+
+#[tokio::test]
+async fn live_kill_server_stops_buffered_frames_before_shutdown_watch_propagates() {
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let (shutdown_handle, shutdown_request_rx) = ShutdownHandle::new();
+
+    let control_task = tokio::spawn(forward_control(
+        server_stream,
+        Arc::clone(&handler),
+        4248,
+        ControlUpgradeInput::new(
+            b"kill-server\nset-buffer -b live-after-kill must-not-run\n".to_vec(),
+            2,
+        ),
+        shutdown_rx,
+        server_event_rx,
+        ControlLifecycle {
+            closing,
+            shutdown_handle,
+        },
+    ));
+
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, shutdown_request_rx)
+        .await
+        .expect("kill-server requests shutdown before timeout")
+        .expect("shutdown request channel stays open");
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, control_task)
+        .await
+        .expect("forward control exits before timeout")
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let response = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("live-after-kill".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::Error(_)),
+        "a live frame buffered behind kill-server must never be admitted: {response:?}"
+    );
+    let rendered = String::from_utf8(rendered).expect("control transcript is utf-8");
+    assert!(
+        rendered.ends_with("%exit server shutting down\n"),
+        "{rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_cancels_only_the_explicit_control_wait() {
+    const REQUESTER_PID: u32 = 42_421;
+    const WAIT_CHANNEL: &str = "control-shutdown-active";
+
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let (server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let control_id = handler
+        .register_control_with_closing(
+            REQUESTER_PID,
+            ControlModeUpgrade {
+                initial_command_count: 1,
+                mode: ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            server_event_tx,
+            Arc::clone(&closing),
+        )
+        .await;
+    let identity = ControlClientIdentity::new(REQUESTER_PID, control_id);
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(REQUESTER_PID, AccessMode::ReadWrite);
+    let input = format!(
+        "wait-for {WAIT_CHANNEL}\n\
+         set-buffer -b shutdown-active-later must-not-run\n"
+    );
+    let handler_for_control = Arc::clone(&handler);
+    let control_task = tokio::spawn(async move {
+        forward_control_identity(
+            server_stream,
+            handler_for_control,
+            identity,
+            ControlUpgradeInput::new(input.into_bytes(), 1),
+            shutdown_rx,
+            server_event_rx,
+            ControlLifecycle {
+                closing,
+                shutdown_handle,
+            },
+        )
+        .await
+    });
+
+    wait_for_waiter(&handler, WAIT_CHANNEL).await;
+    assert!(
+        handler.normal_drain_requests_quiesced(),
+        "a pure wait-for frame must not hold the mutation barrier"
+    );
+    assert!(!handler.normal_requests_quiesced());
+    handler.close_normal_request_admission();
+    shutdown_tx.send_replace(());
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, async {
+        while !handler.normal_requests_quiesced() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the selected wait cancels during shutdown");
+
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("control task joins")
+        .expect("control forwarding succeeds");
+    let rendered = String::from_utf8(rendered).expect("control transcript is utf-8");
+    assert!(rendered.contains("%end "), "{rendered:?}");
+    assert!(
+        rendered.ends_with("%exit server shutting down\n"),
+        "{rendered:?}"
+    );
+
+    let response = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("shutdown-active-later".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::Error(_)),
+        "shutdown must suppress the later frame: {response:?}"
+    );
+    handler.finish_control(REQUESTER_PID, control_id).await;
 }
 
 #[test]
@@ -344,7 +725,8 @@ async fn notifications_wait_until_after_the_active_command_block() {
     let (server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(4242, AccessMode::ReadWrite);
 
     let control_task = tokio::spawn(forward_control(
         server_stream,
@@ -523,7 +905,8 @@ async fn eof_closes_transport_while_finite_control_queue_continues_product_diver
     let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(4242, AccessMode::ReadWrite);
     let marker = std::env::temp_dir().join(format!(
         "rmux-control-eof-detached-{}-{}",
         std::process::id(),
@@ -597,7 +980,13 @@ async fn eof_closes_transport_while_finite_control_queue_continues_product_diver
     );
 
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !marker.is_file() {
+        loop {
+            match std::fs::read_to_string(&marker) {
+                Ok(contents) if contents == "done" => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read detached shell marker: {error}"),
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -635,7 +1024,8 @@ async fn eof_preserves_active_if_shell_when_wait_is_only_in_unselected_branch_pr
     let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let _requester_access_guard = handler.begin_detached_requester_access(4250, true);
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(4250, AccessMode::ReadWrite);
     let input = b"if-shell -F 1 { run-shell 'sleep 1' ; set-buffer -b eof-active-finite-branch done } { wait-for eof-active-unselected-wait }\n";
 
     let control_task = tokio::spawn(forward_control(
@@ -709,7 +1099,8 @@ async fn eof_queued_if_shell_cancels_only_a_selected_wait_frame_product_divergen
     let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let _requester_access_guard = handler.begin_detached_requester_access(4251, true);
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(4251, AccessMode::ReadWrite);
     let input = b"run-shell 'sleep 1'\nif-shell -F 1 { set-buffer -b eof-queued-finite-branch done } { wait-for eof-queued-unselected-wait }\nif-shell -F 1 { wait-for eof-queued-selected-wait ; set-buffer -b eof-queued-after-wait must-not-run } { set-buffer -b eof-queued-fallback must-not-run }\nset-buffer -b eof-queued-later-frame done\n";
 
     let control_task = tokio::spawn(forward_control(
@@ -1066,8 +1457,8 @@ async fn eof_queue_rechecks_registration_after_active_exit_delivery_fails() {
     assert!(closing.load(Ordering::SeqCst));
     assert_eq!(
         handler.begin_control_queue_drain(identity).await,
-        ControlQueueDrainLease::Unavailable,
-        "failed Exit delivery removes the exact registration"
+        ControlQueueDrainLease::Acquired,
+        "failed Exit delivery keeps the exact closing registration"
     );
 
     let (_shutdown_tx, mut shutdown_rx) = watch::channel(());
@@ -1084,7 +1475,13 @@ async fn eof_queue_rechecks_registration_after_active_exit_delivery_fails() {
         drain_control_command_after_eof(active_task, &mut drain_context)
             .await
             .expect("active EOF frame drains"),
-        "a removed or closing registration is terminal even when Exit was never delivered"
+        "a closing registration is terminal even when Exit was never delivered"
+    );
+    handler.finish_control(requester_pid, control_id).await;
+    assert_eq!(
+        handler.begin_control_queue_drain(identity).await,
+        ControlQueueDrainLease::Unavailable,
+        "transport finish removes the exact registration"
     );
 }
 
@@ -1115,7 +1512,8 @@ async fn eof_after_deferred_exit_with_removed_registration_finishes_only_active_
         .await;
     let identity = ControlClientIdentity::new(requester_pid, control_id);
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let _requester_access_guard = handler.begin_detached_requester_access(requester_pid, true);
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(requester_pid, AccessMode::ReadWrite);
     let marker = std::env::temp_dir().join(format!(
         "rmux-control-eof-deferred-exit-{}-{}",
         std::process::id(),
@@ -1248,19 +1646,31 @@ async fn eof_after_deferred_exit_with_removed_registration_finishes_only_active_
 }
 
 #[tokio::test]
-async fn external_shutdown_cancels_finite_eof_queue_drain_product_divergence() {
+async fn external_shutdown_drains_admitted_finite_eof_mutation_product_divergence() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let marker = std::env::temp_dir().join(format!(
+        "rmux-control-eof-shutdown-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos()
+    ));
+    let command = format!(
+        "run-shell 'sleep 0.4; printf done > {}'\n",
+        marker.display()
+    );
 
     let control_task = tokio::spawn(forward_control(
         server_stream,
         Arc::clone(&handler),
         4247,
-        ControlUpgradeInput::new(b"run-shell 'sleep 2'\n".to_vec(), 1),
+        ControlUpgradeInput::new(command.into_bytes(), 1),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -1283,13 +1693,21 @@ async fn external_shutdown_cancels_finite_eof_queue_drain_product_divergence() {
         !control_task.is_finished(),
         "finite frame is still draining before external shutdown"
     );
+    assert!(!handler.normal_drain_requests_quiesced());
 
+    handler.close_normal_request_admission();
     shutdown_tx.send_replace(());
-    tokio::time::timeout(Duration::from_millis(500), control_task)
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, control_task)
         .await
-        .expect("external shutdown cancels the detached queue promptly")
+        .expect("external shutdown drains the admitted detached mutation")
         .expect("control task joins")
-        .expect("shutdown cancellation is clean");
+        .expect("shutdown drain is clean");
+    assert!(handler.normal_drain_requests_quiesced());
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("admitted EOF mutation commits"),
+        "done"
+    );
+    let _ = std::fs::remove_file(marker);
 }
 
 #[tokio::test]
@@ -1380,7 +1798,7 @@ async fn eof_queue_lease_blocks_same_pid_registration_and_preserves_permissions_
         )
         .await;
     let old_identity = ControlClientIdentity::new(requester_pid, old_control_id);
-    let eof_lease_pause = install_control_eof_queue_lease_pause(old_identity);
+    let eof_lease_pause = install_control_eof_queue_lease_pause(&handler, old_identity);
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
     let handler_for_control = Arc::clone(&handler);
     let control_task = tokio::spawn(async move {
@@ -1760,9 +2178,10 @@ async fn control_control_eof_reconciles_ready_session_change_before_exit() {
         .await;
     let identity = ControlClientIdentity::new(requester_pid, control_id);
     let attach_pause = handler.install_created_session_control_attach_pause(session_name.clone());
-    let eof_pause = install_control_eof_queue_lease_pause(identity);
+    let eof_pause = install_control_eof_queue_lease_pause(&handler, identity);
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let _requester_access_guard = handler.begin_detached_requester_access(requester_pid, true);
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(requester_pid, AccessMode::ReadWrite);
     let handler_for_control = Arc::clone(&handler);
     let command =
         format!("new-session -A -s {session_name} ; set-buffer -b control-cc-race-ready done\n");
@@ -2040,7 +2459,8 @@ async fn pending_control_command_waits_for_completion_without_execution_timeout(
     let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(4242, AccessMode::ReadWrite);
 
     let control_task = tokio::spawn(forward_control(
         server_stream,
@@ -2114,7 +2534,8 @@ async fn eof_while_control_command_is_pending_closes_guard_and_exits() {
     let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(4242, AccessMode::ReadWrite);
 
     let control_task = tokio::spawn(forward_control(
         server_stream,
@@ -2214,7 +2635,8 @@ async fn eof_transition_is_not_starved_by_continuous_server_events() {
         .await;
     let identity = ControlClientIdentity::new(requester_pid, control_id);
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
-    let _requester_access_guard = handler.begin_detached_requester_access(requester_pid, true);
+    let _requester_access_guard =
+        handler.begin_test_detached_requester_access(requester_pid, AccessMode::ReadWrite);
     let handler_for_control = Arc::clone(&handler);
     let control_task = tokio::spawn(async move {
         let result = forward_control_identity(

@@ -214,6 +214,7 @@ pub struct PaneOutputStream {
     inner: PaneSubscription,
     pending: VecDeque<PaneOutputChunk>,
     poll_delay: Duration,
+    cursor_request: Option<tokio::task::JoinHandle<Result<Response>>>,
 }
 
 /// Opaque live stream of rendered pane output lines.
@@ -287,6 +288,7 @@ impl PaneOutputStream {
             },
             pending: VecDeque::new(),
             poll_delay: POLL_INITIAL_DELAY,
+            cursor_request: None,
         })
     }
 
@@ -331,32 +333,48 @@ impl PaneOutputStream {
     /// makes it the appropriate primitive for callers that want explicit
     /// control over their own backoff.
     pub async fn poll_once(&mut self) -> Result<Vec<PaneOutputChunk>> {
-        let mut buffered: Vec<PaneOutputChunk> = self.pending.drain(..).collect();
         if self.inner.closed {
-            return Ok(buffered);
+            return Ok(self.pending.drain(..).collect());
         }
 
         match self.refill_once().await? {
             RefillOutcome::Closed => {
                 self.inner.closed = true;
             }
-            RefillOutcome::Filled => {
-                buffered.extend(self.pending.drain(..));
-                if buffered.iter().any(output_chunk_is_eof) {
-                    self.inner.closed = true;
-                }
-            }
+            RefillOutcome::Filled => {}
+        }
+        let buffered: Vec<PaneOutputChunk> = self.pending.drain(..).collect();
+        if buffered.iter().any(output_chunk_is_eof) {
+            self.inner.closed = true;
         }
         Ok(buffered)
     }
 
     async fn refill_once(&mut self) -> Result<RefillOutcome> {
-        let request = Request::PaneOutputCursor(PaneOutputCursorRequest {
-            subscription_id: self.inner.subscription_id,
-            max_events: Some(PANE_OUTPUT_BATCH_SIZE),
-        });
+        if self.cursor_request.is_none() {
+            let transport = self.inner.transport.clone();
+            let request = Request::PaneOutputCursor(PaneOutputCursorRequest {
+                subscription_id: self.inner.subscription_id,
+                max_events: Some(PANE_OUTPUT_BATCH_SIZE),
+            });
+            self.cursor_request = Some(tokio::spawn(
+                async move { transport.request(request).await },
+            ));
+        }
+        let response = self
+            .cursor_request
+            .as_mut()
+            .expect("cursor request exists")
+            .await;
+        self.cursor_request = None;
+        let response = response.map_err(|error| {
+            RmuxError::transport(
+                "join pane-output cursor poll",
+                std::io::Error::other(error.to_string()),
+            )
+        })?;
 
-        match self.inner.transport.request(request).await {
+        match response {
             Ok(Response::PaneOutputCursor(cursor)) => {
                 self.inner
                     .validate_response_subscription("pane-output-cursor", cursor.subscription_id)?;

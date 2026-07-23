@@ -1,4 +1,5 @@
 mod application;
+mod bounded_write;
 mod command_line;
 mod dsr;
 mod flags;

@@ -49,19 +49,23 @@ pub(crate) async fn handle_server_signal(
             handler.continue_stopped_panes().await;
         }
         Some(ServerSignal::RecreateSocket) => {
-            recreate_listener_after_signal(socket_path, listener, cleanup);
+            recreate_listener_after_signal(handler, socket_path, listener, cleanup).await;
         }
         None => {}
     }
 }
 
 #[cfg(unix)]
-fn recreate_listener_after_signal(
+async fn recreate_listener_after_signal(
+    handler: &RequestHandler,
     socket_path: &Path,
     listener: &mut LocalListener,
     cleanup: &mut SocketCleanup,
 ) {
-    match crate::unix_socket::rebind_unix_listener_at(socket_path, cleanup.socket_identity()) {
+    match handler
+        .rebind_unix_socket(socket_path, cleanup.socket_identity())
+        .await
+    {
         Ok(rebound) => {
             *listener = rebound.listener;
             cleanup.update_socket_identity(rebound.identity);
@@ -74,7 +78,8 @@ fn recreate_listener_after_signal(
 }
 
 #[cfg(not(unix))]
-fn recreate_listener_after_signal(
+async fn recreate_listener_after_signal(
+    _handler: &RequestHandler,
     _socket_path: &Path,
     _listener: &mut LocalListener,
     _cleanup: &mut SocketCleanup,

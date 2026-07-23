@@ -1,5 +1,5 @@
 artifact: frozen_tmux_reference
-scope: "Pinned tmux 3.7b reference used by the RMUX 0.9.0 tmux compatibility harness."
+scope: "Pinned tmux 3.7b reference used by the RMUX 0.9 release-line compatibility harness."
 tmux_reference:
   source_tag: "3.7b"
   source_sha: "e802909de06012a4df6209d55e86487c56223163"

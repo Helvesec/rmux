@@ -84,7 +84,7 @@ impl<'a> PaneSpawnBuilder<'a> {
                 message: rmux_proto::PROCESS_COMMAND_EMPTY_MESSAGE.to_owned(),
             });
         }
-        let pane = self.pane.begin_operation_handle();
+        let (pane, _) = self.pane.begin_pinned_operation_handle().await?;
         let target = pane
             .respawn(PaneRespawnOptions {
                 kill: self.kill_existing,

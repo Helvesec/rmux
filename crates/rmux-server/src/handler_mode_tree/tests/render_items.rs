@@ -60,6 +60,7 @@ fn choose_tree_uses_window_local_visible_pane_indices_in_rows_and_previews() {
             window_occurrence_id: None,
             pane_index: None,
             pane_id: None,
+            pane_output_generation: None,
         },
     };
     let preview = mode_tree_preview_lines(&state, &mode, &item, 60, 7, &Utf8Config::default());
@@ -328,6 +329,82 @@ fn render_mode_tree_overlay_keeps_cursor_hidden_while_active() {
     let rendered = String::from_utf8_lossy(&frame);
     assert!(rendered.contains("\u{1b}[?25l"));
     assert!(!rendered.contains("\u{1b}[?25h"));
+}
+
+#[test]
+fn render_mode_tree_overlay_uses_scrollbar_content_geometry_on_both_sides() {
+    for (position, list_cursor, box_cursor) in [
+        ("right", b"\x1b[1;1H".as_slice(), b"\x1b[3;1H".as_slice()),
+        ("left", b"\x1b[1;4H".as_slice(), b"\x1b[3;4H".as_slice()),
+    ] {
+        let mut state = HandlerState::default();
+        let session_name = SessionName::new("test").expect("valid session");
+        state
+            .sessions
+            .create_session(
+                session_name.clone(),
+                rmux_proto::TerminalSize { cols: 20, rows: 8 },
+            )
+            .expect("session create succeeds");
+        state
+            .options
+            .set(
+                ScopeSelector::Session(session_name.clone()),
+                OptionName::Status,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option");
+        let target = rmux_proto::WindowTarget::with_window(session_name, 0);
+        for (option, value) in [
+            (OptionName::PaneScrollbars, "on"),
+            (OptionName::PaneScrollbarsPosition, position),
+            (OptionName::PaneScrollbarsStyle, "width=2,pad=1"),
+        ] {
+            state
+                .options
+                .set(
+                    ScopeSelector::Window(target.clone()),
+                    option,
+                    value.to_owned(),
+                    SetOptionMode::Replace,
+                )
+                .expect("scrollbar option");
+        }
+        let mut mode = test_mode(8);
+        mode.key_format.clear();
+        mode.preview_mode = PreviewMode::Big;
+        mode.selected_id = Some("12345678\tABCDEFGHjkl".to_owned());
+        let build = flat_build(&["12345678\tABCDEFGHjkl"]);
+
+        let frame = render_mode_tree_overlay(&state, &mode, &build);
+
+        assert!(
+            frame
+                .windows(list_cursor.len())
+                .any(|run| run == list_cursor),
+            "{position}: list must start at the content origin"
+        );
+        assert!(
+            frame.windows(box_cursor.len()).any(|run| run == box_cursor),
+            "{position}: preview box must use the same content origin"
+        );
+        assert!(
+            !frame.windows(b"jkl".len()).any(|run| run == b"jkl"),
+            "{position}: list text must be clipped to 17 content cells"
+        );
+        assert!(
+            !frame.contains(&b'\t'),
+            "{position}: a literal tab must not escape the content geometry"
+        );
+        assert!(
+            frame
+                .windows(b"12345678 ABCDEFGH".len())
+                .any(|run| run == b"12345678 ABCDEFGH"),
+            "{position}: tabs must be sanitized before width clipping"
+        );
+        assert!(frame.ends_with(b"\x1b[0m\x1b[u"));
+    }
 }
 
 #[test]

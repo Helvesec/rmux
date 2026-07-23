@@ -16,13 +16,30 @@ where
         return String::new();
     };
 
+    let float_precision = expression_float_precision(modifier);
     if is_comparison_operator(operator) {
-        return numeric_compare(operator, &left, &right)
-            .map(bool_string)
-            .unwrap_or_default();
+        return match float_precision {
+            ExpressionFloatPrecision::Valid(precision) => {
+                let Some(value) =
+                    numeric_compare(operator, &left, &right, ExpressionComparisonMode::Float)
+                else {
+                    return String::new();
+                };
+                format_float_value(if value { 1.0 } else { 0.0 }, precision)
+            }
+            ExpressionFloatPrecision::Invalid => String::new(),
+            ExpressionFloatPrecision::Disabled => {
+                let Some(value) =
+                    numeric_compare(operator, &left, &right, ExpressionComparisonMode::Integer)
+                else {
+                    return String::new();
+                };
+                bool_string(value)
+            }
+        };
     }
 
-    match expression_float_precision(modifier) {
+    match float_precision {
         ExpressionFloatPrecision::Valid(precision) => {
             let Some(value) = numeric_operation(operator, &left, &right) else {
                 return String::new();
@@ -80,10 +97,27 @@ fn integer_operation(operator: &str, left: &str, right: &str) -> Option<String> 
     Some(integer_result(value))
 }
 
-fn numeric_compare(operator: &str, left: &str, right: &str) -> Option<bool> {
-    let left = comparison_operand(left)?;
-    let right = comparison_operand(right)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpressionComparisonMode {
+    Integer,
+    Float,
+}
+
+fn numeric_compare(
+    operator: &str,
+    left: &str,
+    right: &str,
+    mode: ExpressionComparisonMode,
+) -> Option<bool> {
+    let parse_operand = match mode {
+        ExpressionComparisonMode::Integer => comparison_operand,
+        ExpressionComparisonMode::Float => parse_number,
+    };
+    let left = parse_operand(left)?;
+    let right = parse_operand(right)?;
     Some(match operator {
+        "==" if mode == ExpressionComparisonMode::Float => (left - right).abs() < 1e-9,
+        "!=" if mode == ExpressionComparisonMode::Float => (left - right).abs() > 1e-9,
         "==" => left == right,
         "!=" => left != right,
         ">" => left > right,

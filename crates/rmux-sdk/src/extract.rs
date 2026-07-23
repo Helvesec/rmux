@@ -117,10 +117,20 @@ pub(crate) async fn collect_output_until_exit_starting_at(
     max_bytes: usize,
 ) -> Result<CollectedPaneOutput> {
     let timeout = crate::wait::resolved_wait_timeout(pane.configured_default_timeout());
-    crate::wait::with_wait_timeout(
+    let deadline = crate::wait::wait_deadline(timeout);
+    let pane = pane.begin_operation_handle();
+    let (pane, _) = crate::wait::with_wait_deadline(
         COLLECT_OUTPUT_UNTIL_EXIT_OPERATION,
         timeout,
-        collect_output_until_exit_without_timeout(pane, start, max_bytes),
+        deadline,
+        pane.pin_to_current_identity(),
+    )
+    .await?;
+    crate::wait::with_wait_deadline(
+        COLLECT_OUTPUT_UNTIL_EXIT_OPERATION,
+        timeout,
+        deadline,
+        collect_output_until_exit_without_timeout(&pane, start, max_bytes),
     )
     .await
 }

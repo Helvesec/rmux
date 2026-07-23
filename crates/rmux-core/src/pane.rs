@@ -97,6 +97,10 @@ impl Pane {
         self.activity_at = current_unix_timestamp();
     }
 
+    pub(crate) fn set_activity_at(&mut self, activity_at: i64) {
+        self.activity_at = activity_at;
+    }
+
     /// Builds an exact pane target for this pane in the given session.
     #[must_use]
     pub fn target(&self, session_name: &SessionName) -> PaneTarget {

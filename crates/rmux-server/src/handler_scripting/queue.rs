@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use rmux_core::{
     command_parser::ParsedCommands,
     command_queue::{CommandGroup, CommandQueue},
+    MissingCurrentTargetFallback,
 };
 use rmux_proto::{
     CommandOutput, ErrorResponse, PaneTarget, Request, Response, RmuxError, SessionName, Target,
@@ -12,8 +14,10 @@ use rmux_proto::{
 
 use crate::mouse::AttachedMouseEvent;
 
+use super::super::lifecycle_support::{LeaseResolution, LifecycleTargetLease};
+use super::super::{StablePaneOutputIdentity, StableTargetIdentity};
 use super::list_commands_runtime::ParsedListCommandsCommand;
-use super::list_parse::ParsedListPanesAllCommand;
+use super::list_parse::{ParsedListPanesAllCommand, ParsedListWindowsAllCommand};
 use super::pane_parse::ParsedSplitWindowCommand;
 use super::prompt_parse::{
     ParsedCommandPromptCommand, ParsedConfirmBeforeCommand, ParsedPromptHistoryCommand,
@@ -22,18 +26,23 @@ use super::queue_parse::{ParsedIfShellCommand, ParsedNewWindowCommand};
 use super::shell_parse::ParsedRunShellCommand;
 use super::source_files::ParsedSourceFileCommand;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::handler) struct QueueExecutionContext {
     pub(super) caller_cwd: Option<PathBuf>,
     pub(super) source_file_depth: usize,
     pub(super) current_file: Option<String>,
     pub(super) current_target: Option<Target>,
     pub(super) current_target_allows_canfail_fallback: bool,
+    missing_current_target_fallback: MissingCurrentTargetFallback,
     run_shell_canfail_fallback_target: bool,
     pub(super) follows_attached_session: bool,
     pub(super) client_name: Option<String>,
     pub(super) mouse_target: Option<Target>,
     pub(super) mouse_event: Option<AttachedMouseEvent>,
+    retained_lifecycle_target: Option<Arc<LifecycleTargetLease>>,
+    pinned_current_target_identity: Option<Arc<StableTargetIdentity>>,
+    pinned_pane_output_identity: Option<Arc<StablePaneOutputIdentity>>,
+    run_shell_command_depth: usize,
 }
 
 impl QueueExecutionContext {
@@ -44,11 +53,16 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            missing_current_target_fallback: MissingCurrentTargetFallback::AllowDefaultSession,
             run_shell_canfail_fallback_target: false,
             follows_attached_session: false,
             client_name: None,
             mouse_target: None,
             mouse_event: None,
+            retained_lifecycle_target: None,
+            pinned_current_target_identity: None,
+            pinned_pane_output_identity: None,
+            run_shell_command_depth: 0,
         }
     }
 
@@ -59,11 +73,16 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            missing_current_target_fallback: MissingCurrentTargetFallback::AllowDefaultSession,
             run_shell_canfail_fallback_target: false,
             follows_attached_session: false,
             client_name: None,
             mouse_target: None,
             mouse_event: None,
+            retained_lifecycle_target: None,
+            pinned_current_target_identity: None,
+            pinned_pane_output_identity: None,
+            run_shell_command_depth: 0,
         }
     }
 
@@ -78,12 +97,41 @@ impl QueueExecutionContext {
             current_file,
             current_target: self.current_target.clone(),
             current_target_allows_canfail_fallback: self.current_target_allows_canfail_fallback,
+            missing_current_target_fallback: self.missing_current_target_fallback,
             run_shell_canfail_fallback_target: self.run_shell_canfail_fallback_target,
             follows_attached_session: self.follows_attached_session,
             client_name: self.client_name.clone(),
             mouse_target: self.mouse_target.clone(),
             mouse_event: self.mouse_event.clone(),
+            retained_lifecycle_target: self.retained_lifecycle_target.clone(),
+            pinned_current_target_identity: self.pinned_current_target_identity.clone(),
+            pinned_pane_output_identity: self.pinned_pane_output_identity.clone(),
+            run_shell_command_depth: self.run_shell_command_depth,
         }
+    }
+
+    pub(in crate::handler) fn with_caller_cwd(mut self, caller_cwd: Option<PathBuf>) -> Self {
+        self.caller_cwd = caller_cwd;
+        self
+    }
+
+    pub(in crate::handler) const fn run_shell_command_depth(&self) -> usize {
+        self.run_shell_command_depth
+    }
+
+    pub(in crate::handler) fn for_run_shell_commands(
+        mut self,
+        parent_depth: usize,
+    ) -> Result<Self, RmuxError> {
+        let depth = parent_depth.saturating_add(1);
+        if depth > super::RUN_SHELL_COMMAND_NESTING_LIMIT {
+            return Err(RmuxError::Server(format!(
+                "run-shell -C nesting exceeds safe runtime limit ({})",
+                super::RUN_SHELL_COMMAND_NESTING_LIMIT
+            )));
+        }
+        self.run_shell_command_depth = depth;
+        Ok(self)
     }
 
     pub(in crate::handler) fn with_current_target(
@@ -93,6 +141,8 @@ impl QueueExecutionContext {
         self.current_target_allows_canfail_fallback = current_target.is_some();
         self.follows_attached_session = false;
         self.current_target = current_target;
+        self.pinned_current_target_identity = None;
+        self.pinned_pane_output_identity = None;
         self
     }
 
@@ -102,7 +152,18 @@ impl QueueExecutionContext {
     ) -> Self {
         self.current_target = current_target;
         self.current_target_allows_canfail_fallback = false;
+        self.pinned_current_target_identity = None;
+        self.pinned_pane_output_identity = None;
         self
+    }
+
+    pub(in crate::handler) fn forbid_missing_current_target_fallback(mut self) -> Self {
+        self.missing_current_target_fallback = MissingCurrentTargetFallback::ForbidDefaultSession;
+        self
+    }
+
+    pub(super) const fn missing_current_target_fallback(&self) -> MissingCurrentTargetFallback {
+        self.missing_current_target_fallback
     }
 
     pub(in crate::handler) fn with_run_shell_canfail_fallback_target(mut self) -> Self {
@@ -126,6 +187,8 @@ impl QueueExecutionContext {
         current_target: Target,
     ) {
         self.current_target = Some(current_target);
+        self.pinned_current_target_identity = None;
+        self.pinned_pane_output_identity = None;
     }
 
     pub(in crate::handler) fn uses_explicit_current_target(&self) -> bool {
@@ -147,6 +210,98 @@ impl QueueExecutionContext {
         mouse_event: Option<AttachedMouseEvent>,
     ) -> Self {
         self.mouse_event = mouse_event;
+        self
+    }
+
+    pub(in crate::handler) fn with_retained_lifecycle_target(
+        mut self,
+        target: Option<Arc<LifecycleTargetLease>>,
+    ) -> Self {
+        if target.is_none() {
+            return self.without_retained_lifecycle_target();
+        }
+        self.retained_lifecycle_target = target;
+        self
+    }
+
+    pub(in crate::handler) fn without_retained_lifecycle_target(mut self) -> Self {
+        self.retained_lifecycle_target = None;
+        self
+    }
+
+    pub(in crate::handler) fn with_pinned_current_target_identity(
+        mut self,
+        identity: Option<StableTargetIdentity>,
+    ) -> Self {
+        if let Some(identity) = identity {
+            self.current_target = Some(identity.target().clone());
+            self.pinned_current_target_identity = Some(Arc::new(identity));
+        }
+        self
+    }
+
+    pub(in crate::handler) fn with_pinned_pane_output_identity(
+        mut self,
+        identity: Option<StablePaneOutputIdentity>,
+    ) -> Self {
+        self.pinned_pane_output_identity = identity.map(Arc::new);
+        self
+    }
+
+    pub(super) fn require_pinned_current_target(
+        &self,
+        state: &crate::pane_terminals::HandlerState,
+    ) -> Result<(), RmuxError> {
+        match (
+            self.pinned_current_target_identity.as_ref(),
+            self.current_target.as_ref(),
+        ) {
+            (Some(identity), Some(target)) => {
+                identity.require(state, target, "queued pinned")?;
+            }
+            (Some(_), None) => Err(RmuxError::Server(
+                "queued pinned target was unavailable".to_owned(),
+            ))?,
+            (None, _) => {}
+        }
+        if let Some(identity) = self.pinned_pane_output_identity.as_ref() {
+            identity.require(state, "queued pinned")?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::handler) fn require_live_retained_lifecycle_target(
+        &self,
+        state: &crate::pane_terminals::HandlerState,
+        operation: &str,
+    ) -> Result<(), RmuxError> {
+        match self
+            .retained_lifecycle_target
+            .as_deref()
+            .map(|target| target.resolve(state))
+        {
+            Some(LeaseResolution::Retired(_)) => Err(RmuxError::Server(format!(
+                "queued lifecycle target retired before {operation}"
+            ))),
+            Some(LeaseResolution::Replaced) => Err(RmuxError::Server(format!(
+                "queued lifecycle target was replaced before {operation}"
+            ))),
+            Some(LeaseResolution::Live(_)) | None => Ok(()),
+        }
+    }
+
+    pub(super) fn retained_lifecycle_target(&self) -> Option<&Arc<LifecycleTargetLease>> {
+        self.retained_lifecycle_target.as_ref()
+    }
+
+    pub(in crate::handler) fn without_mouse_event(mut self) -> Self {
+        self.mouse_event = None;
+        self
+    }
+
+    pub(in crate::handler) fn without_mouse_origin(mut self) -> Self {
+        self.mouse_target = None;
+        self.mouse_event = None;
         self
     }
 
@@ -181,6 +336,12 @@ impl QueueExecutionContext {
             if let Some(target) = event.pane_target.as_mut() {
                 rename_pane_target_session(target, old_name, new_name);
             }
+        }
+        if let Some(identity) = self.pinned_current_target_identity.as_mut() {
+            Arc::make_mut(identity).rename_session(old_name, new_name);
+        }
+        if let Some(identity) = self.pinned_pane_output_identity.as_mut() {
+            Arc::make_mut(identity).rename_session(old_name, new_name);
         }
     }
 }
@@ -287,6 +448,7 @@ pub(super) enum QueueInvocation {
     IfShell(ParsedIfShellCommand),
     SourceFile(ParsedSourceFileCommand),
     ListPanesAll(ParsedListPanesAllCommand),
+    ListWindowsAll(ParsedListWindowsAllCommand),
     SplitWindow(ParsedSplitWindowCommand),
     MouseResizePane(rmux_proto::PaneTarget),
     CommandPrompt(ParsedCommandPromptCommand),

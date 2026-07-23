@@ -231,7 +231,14 @@ async fn attached_last_pane_exit_honors_detach_on_destroy_off() {
     let switched = recv_matching_attach_control(
         &mut control_rx,
         "last-pane detach-on-destroy switch",
-        |control| matches!(control, AttachControl::Switch(_)),
+        |control| {
+            let AttachControl::Switch(target) = control else {
+                return false;
+            };
+            target
+                .with_target(|target| target.session_name == beta)
+                .unwrap_or(false)
+        },
     )
     .await;
     assert_eq!(take_switch_target(switched).session_name, beta);

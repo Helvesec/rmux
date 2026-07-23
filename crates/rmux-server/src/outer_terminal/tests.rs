@@ -314,6 +314,58 @@ fn active_pane_all_motion_tracking_preserves_decset_1003() {
 }
 
 #[test]
+fn focus_follows_mouse_option_upgrades_mouse_tracking_to_all_motion() {
+    let context = || {
+        OuterTerminalContext::default().with_client_terminal(&ClientTerminalContext {
+            terminal_features: vec!["mouse".to_owned()],
+            utf8: true,
+        })
+    };
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::FocusFollowsMouse,
+            "on".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("focus-follows-mouse set succeeds");
+
+    let mouse_off =
+        OuterTerminal::resolve_for_session(&options, Some(&session_name("alpha")), context());
+    let off_start = String::from_utf8(mouse_off.attach_start_sequence()).expect("utf8");
+    assert!(!off_start.contains("\u{1b}[?1003h"));
+
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::Mouse,
+            "on".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("mouse set succeeds");
+    let mouse_on =
+        OuterTerminal::resolve_for_session(&options, Some(&session_name("alpha")), context());
+    let on_start = String::from_utf8(mouse_on.attach_start_sequence()).expect("utf8");
+    assert!(on_start.contains("\u{1b}[?1003h"));
+    assert!(!on_start.contains("\u{1b}[?1002h"));
+
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::FocusFollowsMouse,
+            "off".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("focus-follows-mouse unset succeeds");
+    let button_tracking =
+        OuterTerminal::resolve_for_session(&options, Some(&session_name("alpha")), context());
+    let button_start = String::from_utf8(button_tracking.attach_start_sequence()).expect("utf8");
+    assert!(button_start.contains("\u{1b}[?1002h"));
+    assert!(!button_start.contains("\u{1b}[?1003h"));
+}
+
+#[test]
 fn render_prelude_emits_title_path_and_cursor_colour() {
     let mut options = OptionStore::new();
     options

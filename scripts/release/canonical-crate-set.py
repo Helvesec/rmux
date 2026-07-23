@@ -102,19 +102,23 @@ def run_cargo_package(names: list[str], target: Path) -> None:
     if target.exists() or target.is_symlink():
         raise ValueError("crate package target must start absent")
     env = {**os.environ, "CARGO_TARGET_DIR": str(target)}
+    command = ["cargo", "package"]
     for name in names:
-        completed = subprocess.run(
-            ["cargo", "package", "--package", name, "--locked", "--no-verify"],
-            cwd=ROOT,
-            env=env,
-            check=False,
-            capture_output=True,
-            text=True,
+        command.extend(("--package", name))
+    command.extend(("--locked", "--no-verify"))
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise ValueError(
+            "cargo package failed for canonical workspace set: "
+            f"{completed.stderr.strip()}"
         )
-        if completed.returncode != 0:
-            raise ValueError(
-                f"cargo package failed for {name}: {completed.stderr.strip()}"
-            )
 
 
 def tar_info(name: str, size: int) -> tarfile.TarInfo:

@@ -1,42 +1,55 @@
 use crate::handles::session::unexpected_response;
-use crate::{Pane, PaneCloseOutcome, PaneRef, PaneRespawnOptions, Result, RmuxError};
+use crate::{Pane, PaneCloseOutcome, PaneRef, PaneRespawnOptions, Result};
 use rmux_proto::{
     PaneKillRequest, PaneRespawnRequest, Request, Response, CAPABILITY_SDK_PANE_BY_ID,
 };
 
-use super::target::is_already_closed_pane_error;
+use super::target::{is_already_closed_pane_error, is_stale_pane_id_target_error};
 
 pub(super) async fn close_pane(pane: Pane) -> Result<PaneCloseOutcome> {
     let target = pane.target.clone();
-    let stable_id = pane.stable_id;
-    let response = async {
-        crate::capabilities::require(&pane.transport, &[CAPABILITY_SDK_PANE_BY_ID]).await?;
-        pane.transport
+    crate::capabilities::require(&pane.transport, &[CAPABILITY_SDK_PANE_BY_ID]).await?;
+    let Some(mut resolved_target) = pane.resolved_proto_target_ref().await? else {
+        return Ok(PaneCloseOutcome::AlreadyClosed { target });
+    };
+
+    for attempt in 0..2 {
+        let response = pane
+            .transport
             .request(Request::PaneKill(PaneKillRequest {
-                target: pane.required_resolved_proto_target_ref().await?,
+                target: resolved_target.clone(),
                 kill_all_except: false,
             }))
-            .await
-    }
-    .await;
+            .await;
 
-    match response {
-        Ok(Response::KillPane(response)) => Ok(PaneCloseOutcome::Closed {
-            target,
-            window_destroyed: response.window_destroyed,
-        }),
-        Ok(response) => Err(unexpected_response("kill-pane", response)),
-        Err(error) if is_already_closed_pane_error(&error, &target) => {
-            Ok(PaneCloseOutcome::AlreadyClosed { target })
+        match response {
+            Ok(Response::KillPane(response)) => {
+                return Ok(PaneCloseOutcome::Closed {
+                    target,
+                    window_destroyed: response.window_destroyed,
+                });
+            }
+            Ok(response) => return Err(unexpected_response("kill-pane", response)),
+            Err(error)
+                if pane.is_stable_id()
+                    && is_stale_pane_id_target_error(&error, &resolved_target) =>
+            {
+                let Some(live_target) = pane.resolved_proto_target_ref().await? else {
+                    return Ok(PaneCloseOutcome::AlreadyClosed { target });
+                };
+                if attempt == 0 {
+                    resolved_target = live_target;
+                    continue;
+                }
+                return Err(error);
+            }
+            Err(error) if is_already_closed_pane_error(&error, &target) => {
+                return Ok(PaneCloseOutcome::AlreadyClosed { target });
+            }
+            Err(error) => return Err(error),
         }
-        Err(RmuxError::PaneNotFound {
-            session_name,
-            pane_id,
-        }) if stable_id == Some(pane_id) && session_name == target.session_name => {
-            Ok(PaneCloseOutcome::AlreadyClosed { target })
-        }
-        Err(error) => Err(error),
     }
+    unreachable!("pane close retry loop always returns")
 }
 
 pub(super) async fn respawn_pane(pane: &Pane, options: PaneRespawnOptions) -> Result<PaneRef> {

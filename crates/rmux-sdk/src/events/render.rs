@@ -1,8 +1,11 @@
 //! Minimal snapshot render stream built from raw pane output.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::{Pane, PaneLagNotice, PaneOutputChunk, PaneOutputStream, PaneSnapshot, Result};
+use tokio::time::Instant;
 
 const DEFAULT_RENDER_DEBOUNCE: Duration = Duration::from_millis(16);
 
@@ -47,6 +50,14 @@ pub struct PaneRenderStream {
     debounce: Duration,
     last_revision: Option<u64>,
     pending_lag: Option<PaneLagNotice>,
+    pending_render: Option<PendingRender>,
+}
+
+type PendingSnapshot = Pin<Box<dyn Future<Output = Result<PaneSnapshot>> + Send + Sync + 'static>>;
+
+enum PendingRender {
+    Debouncing { deadline: Instant },
+    Snapshotting(PendingSnapshot),
 }
 
 impl PaneRenderStream {
@@ -60,6 +71,7 @@ impl PaneRenderStream {
             debounce: DEFAULT_RENDER_DEBOUNCE,
             last_revision: Some(baseline.revision),
             pending_lag: None,
+            pending_render: None,
         })
     }
 
@@ -74,26 +86,37 @@ impl PaneRenderStream {
     /// subscription closes.
     pub async fn next(&mut self) -> Result<Option<RenderUpdate>> {
         loop {
+            if let Some(PendingRender::Debouncing { deadline }) = self.pending_render.as_ref() {
+                tokio::time::sleep_until(*deadline).await;
+                let pane = self.pane.clone();
+                self.pending_render = Some(PendingRender::Snapshotting(Box::pin(async move {
+                    pane.snapshot().await
+                })));
+            }
+
+            if let Some(PendingRender::Snapshotting(snapshot)) = self.pending_render.as_mut() {
+                let snapshot = snapshot.as_mut().await;
+                self.pending_render = None;
+                let snapshot = snapshot?;
+                if self.last_revision == Some(snapshot.revision) {
+                    continue;
+                }
+                self.last_revision = Some(snapshot.revision);
+                return Ok(Some(RenderUpdate {
+                    snapshot,
+                    lag: self.pending_lag.take(),
+                }));
+            }
+
             let Some(chunk) = self.output.next().await? else {
                 return Ok(None);
             };
             if let PaneOutputChunk::Lag(lag) = chunk {
                 self.pending_lag = Some(lag);
             }
-
-            if !self.debounce.is_zero() {
-                tokio::time::sleep(self.debounce).await;
-            }
-
-            let snapshot = self.pane.snapshot().await?;
-            if self.last_revision == Some(snapshot.revision) {
-                continue;
-            }
-            self.last_revision = Some(snapshot.revision);
-            return Ok(Some(RenderUpdate {
-                snapshot,
-                lag: self.pending_lag.take(),
-            }));
+            self.pending_render = Some(PendingRender::Debouncing {
+                deadline: Instant::now() + self.debounce,
+            });
         }
     }
 }
@@ -106,6 +129,19 @@ impl std::fmt::Debug for PaneRenderStream {
             .field("debounce", &self.debounce)
             .field("last_revision", &self.last_revision)
             .field("pending_lag", &self.pending_lag)
+            .field(
+                "pending_render",
+                &self.pending_render.as_ref().map(PendingRender::phase),
+            )
             .finish_non_exhaustive()
+    }
+}
+
+impl PendingRender {
+    const fn phase(&self) -> &'static str {
+        match self {
+            Self::Debouncing { .. } => "debouncing",
+            Self::Snapshotting(_) => "snapshotting",
+        }
     }
 }

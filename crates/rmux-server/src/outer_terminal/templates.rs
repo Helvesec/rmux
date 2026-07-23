@@ -43,7 +43,7 @@ pub(super) fn render_sync_template(template: &str, mode: u32) -> String {
         .replace("%p1%d", &mode.to_string())
 }
 
-pub(super) fn encode_base64(bytes: &[u8]) -> String {
+pub(crate) fn encode_base64(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut index = 0;
 

@@ -57,11 +57,24 @@ done
   echo 'a regular, non-symlink dedicated signing key is required' >&2
   exit 2
 }
-for command in git python3 realpath ssh-keygen stat; do
+for command in git python3 realpath ssh-keygen; do
   command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 2; }
 done
 
-key_mode=$(stat -c '%a' "$signing_key")
+key_mode=$(python3 - "$signing_key" <<'PY'
+import os
+import stat
+import sys
+
+try:
+    metadata = os.stat(sys.argv[1], follow_symlinks=False)
+except OSError as error:
+    raise SystemExit(f"cannot inspect dedicated signing key: {error}") from error
+if not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("dedicated signing key is no longer a regular file")
+print(f"{stat.S_IMODE(metadata.st_mode):o}")
+PY
+)
 if (( (8#$key_mode & 8#077) != 0 )); then
   echo 'dedicated signing key must not be accessible by group or others' >&2
   exit 2

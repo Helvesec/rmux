@@ -370,27 +370,39 @@ pub(crate) struct Cli {
 #[derive(Debug, Parser)]
 #[command(disable_help_subcommand = true, version)]
 struct RawCli {
-    #[arg(short = '2', action = ArgAction::SetTrue)]
+    #[arg(
+        short = '2',
+        action = ArgAction::SetTrue,
+        overrides_with = "assume_256_colors"
+    )]
     assume_256_colors: bool,
     #[arg(short = 'C', action = ArgAction::Count)]
     control_mode: u8,
-    #[arg(short = 'D', action = ArgAction::SetTrue)]
+    #[arg(short = 'D', action = ArgAction::SetTrue, overrides_with = "no_fork")]
     no_fork: bool,
     #[arg(short = 'c', value_name = "shell-command")]
     shell_command: Option<String>,
     #[arg(short = 'f', value_name = "file")]
     config_files: Vec<PathBuf>,
-    #[arg(short = 'l', action = ArgAction::SetTrue)]
+    #[arg(
+        short = 'l',
+        action = ArgAction::SetTrue,
+        overrides_with = "login_shell"
+    )]
     login_shell: bool,
     #[arg(short = 'L', value_name = "socket-name", allow_hyphen_values = true)]
     socket_name: Option<OsString>,
-    #[arg(short = 'N', action = ArgAction::SetTrue)]
+    #[arg(
+        short = 'N',
+        action = ArgAction::SetTrue,
+        overrides_with = "no_start_server"
+    )]
     no_start_server: bool,
     #[arg(short = 'S', value_name = "socket-path", allow_hyphen_values = true)]
     socket_path: Option<OsString>,
     #[arg(short = 'T', value_name = "features", allow_hyphen_values = true)]
     terminal_features: Vec<String>,
-    #[arg(short = 'u', action = ArgAction::SetTrue)]
+    #[arg(short = 'u', action = ArgAction::SetTrue, overrides_with = "utf8")]
     utf8: bool,
     #[arg(short = 'v', action = ArgAction::Count)]
     verbose: u8,

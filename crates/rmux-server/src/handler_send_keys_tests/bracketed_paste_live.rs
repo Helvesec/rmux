@@ -6,7 +6,7 @@ async fn live_attach_bracketed_paste_strips_wrappers_when_pane_mode_is_off() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -46,7 +46,7 @@ async fn live_attach_bracketed_paste_preserves_wrappers_when_pane_mode_is_enable
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -83,7 +83,7 @@ async fn live_attach_bracketed_paste_is_consumed_without_pane_leak_in_copy_mode(
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
     let entered = handler
         .handle(Request::CopyMode(CopyModeRequest {
             target: Some(PaneTarget::new(alpha.clone(), 0)),
@@ -123,7 +123,7 @@ async fn live_attach_chunked_bracketed_paste_is_consumed_without_pane_leak_in_co
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
     let entered = handler
         .handle(Request::CopyMode(CopyModeRequest {
             target: Some(PaneTarget::new(alpha.clone(), 0)),
@@ -171,7 +171,7 @@ async fn live_attach_bracketed_paste_preserves_multiline_special_payload() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -213,7 +213,7 @@ async fn live_attach_bracketed_paste_forwards_embedded_control_sequences_as_payl
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
 
-    create_send_keys_test_session(&handler, &alpha).await;
+    create_quiet_input_session(&handler, &alpha).await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler

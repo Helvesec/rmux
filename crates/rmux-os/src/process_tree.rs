@@ -45,6 +45,7 @@ use crate::process::ProcessJob;
 mod terminal;
 #[cfg(unix)]
 pub use terminal::ForegroundTerminalGuard;
+mod termination;
 #[cfg(all(
     unix,
     not(any(
@@ -67,6 +68,17 @@ mod unix_controller;
     ))
 ))]
 use unix_controller::UnixProcessGroup;
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+mod unix_group_liveness;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

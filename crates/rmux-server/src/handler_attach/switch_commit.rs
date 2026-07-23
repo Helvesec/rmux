@@ -8,8 +8,8 @@ use rmux_proto::{
 use super::resize_policy::ATTACHED_SIZE_RECONCILE_ATTEMPTS;
 use super::{
     attach_target_for_session_switch, reset_interactive_attach_state_for_session_switch,
-    terminate_overlay_job, AttachSessionSwitchRenderOptions, ClientFlags, RequestHandler,
-    ATTACH_CONTROL_BACKLOG_LIMIT,
+    terminate_overlay_job, ActiveAttachIdentity, AttachSessionSwitchRenderOptions, ClientFlags,
+    RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
 };
 use crate::handler::client_support::SwitchTargetSelection;
 use crate::handler::update_environment_from_client;
@@ -330,6 +330,26 @@ impl RequestHandler {
                 window_id: committed_window.id(),
                 pane_id: committed_pane.id(),
             };
+            let mut refresh_sessions = state
+                .window_linked_session_family_list(
+                    &request.session_name,
+                    window_target.window_index(),
+                )
+                .into_iter()
+                .filter_map(|session_name| {
+                    state
+                        .sessions
+                        .session(&session_name)
+                        .map(|session| (session_name, session.id()))
+                })
+                .collect::<Vec<_>>();
+            refresh_sessions.sort_by(|left, right| {
+                left.0
+                    .as_str()
+                    .cmp(right.0.as_str())
+                    .then_with(|| left.1.cmp(&right.1))
+            });
+            refresh_sessions.dedup();
 
             let render_stream_refresh =
                 request.render_stream && target.is_coalescible_render_refresh();
@@ -379,6 +399,17 @@ impl RequestHandler {
             let previous_session_name = active.session_name.clone();
             let switches_session_identity = active.session_name != request.session_name
                 || active.session_id != request.session_id;
+            if switches_session_identity {
+                let previous_key_table = active.key_table_name.take();
+                active.key_table_set_at = None;
+                active.key_table_generation = active.key_table_generation.wrapping_add(1);
+                active.repeat_deadline = None;
+                active.repeat_active = false;
+                active.last_key = None;
+                if let Some(table_name) = previous_key_table {
+                    state.key_bindings.unref_table(&table_name);
+                }
+            }
             let overlay_to_terminate = switches_session_identity
                 .then(|| reset_interactive_attach_state_for_session_switch(active))
                 .flatten();
@@ -399,6 +430,16 @@ impl RequestHandler {
                 self.finish_committed_mode_tree_dismissal(effects).await;
             }
             terminate_overlay_job(overlay_to_terminate);
+            let switched_client =
+                ActiveAttachIdentity::new(attach_pid, expected_attach_id, request.session_id);
+            for (refresh_session_name, refresh_session_id) in refresh_sessions {
+                self.refresh_attached_session_for_session_identity_except(
+                    &refresh_session_name,
+                    refresh_session_id,
+                    Some(switched_client),
+                )
+                .await;
+            }
             return Ok(AttachedSwitchCommitOutcome {
                 previous_session_name,
                 committed_target,

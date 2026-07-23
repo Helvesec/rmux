@@ -34,6 +34,7 @@ use super::layout_parse::{
 use super::list_commands_runtime::parse_queued_list_commands;
 use super::list_parse::{
     parse_list_panes, parse_list_sessions, parse_list_windows, parse_queued_list_panes_all,
+    parse_queued_list_windows_all,
 };
 use super::mode_parse::{parse_clock_mode, parse_copy_mode};
 use super::pane_parse::{
@@ -54,7 +55,9 @@ use super::session_parse::{
 };
 use super::shell_parse::{parse_if_shell, parse_queued_run_shell, parse_run_shell, parse_wait_for};
 use super::targets::resolve_queue_target_arguments;
-use super::tokens::{normalize_compact_short_options, CommandTokens};
+use super::tokens::{
+    normalize_compact_short_options, normalize_repeated_target_options, CommandTokens,
+};
 use super::window_parse::{
     parse_kill_window, parse_link_window, parse_move_window, parse_new_window, parse_rename_window,
     parse_resize_window, parse_respawn_window, parse_rotate_window, parse_swap_window,
@@ -71,6 +74,7 @@ pub(super) fn parse_queue_invocation(
     queue_current_target: Option<&Target>,
     run_shell_canfail_fallback_target: Option<&Target>,
 ) -> Result<QueueInvocation, RmuxError> {
+    let command = normalize_repeated_target_options(command);
     if command.name() == "new-window" {
         return parse_queued_new_window(command, sessions, find_context)
             .map(QueueInvocation::NewWindow);
@@ -104,6 +108,15 @@ pub(super) fn parse_queue_invocation(
         let arguments = command_arguments_as_strings(command.name(), command.arguments())?;
         if let Some(command) = parse_queued_list_panes_all(CommandTokens::new(arguments))? {
             return Ok(QueueInvocation::ListPanesAll(command));
+        }
+    }
+    if command.name() == "list-windows" {
+        let arguments = command_arguments_as_strings(command.name(), command.arguments())?;
+        let arguments = normalize_compact_short_options(command.name(), arguments);
+        let arguments =
+            resolve_queue_target_arguments(command.name(), arguments, sessions, find_context)?;
+        if let Some(command) = parse_queued_list_windows_all(CommandTokens::new(arguments))? {
+            return Ok(QueueInvocation::ListWindowsAll(command));
         }
     }
     if command.name() == "command-prompt" {

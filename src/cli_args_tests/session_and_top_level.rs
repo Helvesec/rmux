@@ -156,6 +156,117 @@ fn top_level_flags_parse_before_the_command() {
 }
 
 #[test]
+fn repeated_idempotent_top_level_flags_match_tmux_3_7b() {
+    for (short, compact) in [
+        ('2', "-22"),
+        ('D', "-DD"),
+        ('l', "-ll"),
+        ('N', "-NN"),
+        ('u', "-uu"),
+    ] {
+        let separated = format!("-{short}");
+        for mut invocation in [vec![separated.as_str(), separated.as_str()], vec![compact]] {
+            if short != 'D' {
+                invocation.push("list-sessions");
+            }
+
+            let cli = parse_args(&invocation)
+                .unwrap_or_else(|error| panic!("{invocation:?} should parse: {error}"));
+            let cli_switch_is_set = match short {
+                '2' => cli.assume_256_colors,
+                'D' => cli.no_fork,
+                'l' => cli.login_shell,
+                'N' => cli.no_start_server,
+                'u' => cli.utf8,
+                _ => unreachable!("unmeasured top-level switch"),
+            };
+            assert!(cli_switch_is_set, "{invocation:?}");
+
+            let scan_arguments = invocation
+                .iter()
+                .map(|argument| OsString::from(*argument))
+                .collect::<Vec<_>>();
+            let scan = super::super::scan_top_level_command(&scan_arguments)
+                .unwrap_or_else(|error| panic!("scanner rejected {invocation:?}: {error}"));
+            let scan_switch_is_set = match short {
+                '2' => scan.assume_256_colors,
+                'D' => scan.no_fork,
+                'l' => scan.login_shell,
+                'N' => scan.no_start_server,
+                'u' => scan.utf8,
+                _ => unreachable!("unmeasured top-level switch"),
+            };
+            assert!(scan_switch_is_set, "scanner lost {invocation:?}");
+
+            if short == 'D' {
+                assert!(cli.command.is_none());
+                assert!(scan.command.is_empty());
+            } else {
+                assert!(matches!(
+                    cli.command.as_ref(),
+                    Some(super::super::Command::ListSessions(_))
+                ));
+                assert_eq!(scan.command, [OsString::from("list-sessions")]);
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_top_level_flags_preserve_mixed_clusters_and_terminator() {
+    let invocation = [
+        "-u2lN",
+        "-Nlu2",
+        "-L",
+        "named",
+        "-vv",
+        "--",
+        "list-sessions",
+    ];
+    let cli = parse_args(&invocation).expect("mixed repeated switches should parse");
+    assert!(cli.assume_256_colors);
+    assert!(cli.login_shell);
+    assert!(cli.no_start_server);
+    assert!(cli.utf8);
+    assert_eq!(cli.socket_name(), Some(std::ffi::OsStr::new("named")));
+    assert_eq!(cli.verbose, 2);
+    assert!(matches!(
+        cli.command.as_ref(),
+        Some(super::super::Command::ListSessions(_))
+    ));
+
+    let scan_arguments = invocation.iter().map(OsString::from).collect::<Vec<_>>();
+    let scan = super::super::scan_top_level_command(&scan_arguments)
+        .expect("scanner should preserve mixed repeated switches");
+    assert!(scan.assume_256_colors);
+    assert!(scan.login_shell);
+    assert!(scan.no_start_server);
+    assert!(scan.utf8);
+    assert_eq!(scan.socket_name, Some(OsString::from("named")));
+    assert_eq!(scan.verbose, 2);
+    assert_eq!(scan.command, [OsString::from("list-sessions")]);
+
+    let foreground = ["-DD", "-uu", "-22", "-ll", "-L", "named", "--"];
+    let cli = parse_args(&foreground).expect("repeated foreground switches should parse");
+    assert!(cli.no_fork);
+    assert!(cli.utf8);
+    assert!(cli.assume_256_colors);
+    assert!(cli.login_shell);
+    assert_eq!(cli.socket_name(), Some(std::ffi::OsStr::new("named")));
+    assert!(cli.command.is_none());
+
+    let scan_arguments = foreground.iter().map(OsString::from).collect::<Vec<_>>();
+    let scan = super::super::scan_top_level_command(&scan_arguments)
+        .expect("scanner should preserve repeated foreground switches");
+    assert!(scan.no_fork);
+    assert!(scan.utf8);
+    assert!(scan.assume_256_colors);
+    assert!(scan.login_shell);
+    assert_eq!(scan.socket_name, Some(OsString::from("named")));
+    assert!(scan.command.is_empty());
+}
+
+#[test]
 fn top_level_accepts_attached_socket_name_before_the_command() {
     let cli = parse_args(&["-Lnamed", "list-sessions"]).unwrap();
 

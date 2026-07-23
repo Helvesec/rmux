@@ -8,6 +8,8 @@ mod pane_attached_key_dispatch;
 mod pane_broadcast;
 #[path = "handler_pane/by_id.rs"]
 mod pane_by_id;
+#[path = "handler_pane/by_id_selection.rs"]
+mod pane_by_id_selection;
 #[cfg(windows)]
 #[path = "handler_pane/deferred_wait.rs"]
 mod pane_deferred_wait;
@@ -65,7 +67,8 @@ use pane_io_encoding::{
     write_bytes_to_target, write_bytes_to_targets, PaneInputWrite,
 };
 pub(super) use pane_io_encoding::{
-    prepare_pane_input_write, write_bytes_to_target_io, PaneInputLiveness,
+    prepare_pane_input_write, write_attached_bytes_to_target_io, write_bytes_to_target_io,
+    PaneInputLiveness,
 };
 pub(in crate::handler) use pane_management::{SplitWindowParts, SplitWindowResponseMode};
 pub(super) use pane_prompt_input::decode_prompt_input_event;

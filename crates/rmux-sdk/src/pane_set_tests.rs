@@ -328,6 +328,108 @@ async fn wait_any_keeps_the_observed_pane_after_slot_replacement() {
     assert_replacement_wait_keeps_observed_pane(true).await;
 }
 
+#[tokio::test]
+async fn wait_any_keeps_shared_transport_healthy_after_cancelling_loser() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(client_stream);
+    transport
+        .cache_capabilities(vec![
+            CAPABILITY_HANDSHAKE.to_owned(),
+            CAPABILITY_SDK_PANE_BY_ID.to_owned(),
+        ])
+        .await;
+    let first = Pane::new(
+        PaneRef::new(session_name(), 0, 0),
+        RmuxEndpoint::Default,
+        Some(Duration::from_secs(1)),
+        transport.clone(),
+    );
+    let probe = first.clone();
+    let second = Pane::new(
+        PaneRef::new(session_name(), 0, 1),
+        RmuxEndpoint::Default,
+        Some(Duration::from_secs(1)),
+        transport,
+    );
+    let panes = PaneSet::new([first, second]);
+
+    let server = tokio::spawn(async move {
+        let identity_requests = read_requests(&mut server_stream, 2).await;
+        assert!(identity_requests.iter().all(|request| matches!(
+            request,
+            Request::ListPanes(request)
+                if request.target == session_name() && request.target_window_index == Some(0)
+        )));
+        for _ in 0..2 {
+            write_response(
+                &mut server_stream,
+                Response::ListPanes(ListPanesResponse {
+                    output: CommandOutput::from_stdout("0:0:%1\n0:1:%2\n"),
+                }),
+            )
+            .await;
+        }
+
+        let stable_id_requests = read_requests(&mut server_stream, 2).await;
+        assert!(stable_id_requests.iter().all(|request| matches!(
+            request,
+            Request::ListPanes(request)
+                if request.target == session_name() && request.target_window_index.is_none()
+        )));
+        for _ in 0..2 {
+            write_response(
+                &mut server_stream,
+                Response::ListPanes(ListPanesResponse {
+                    output: CommandOutput::from_stdout("0:0:%1\n0:1:%2\n"),
+                }),
+            )
+            .await;
+        }
+
+        let snapshot_requests = read_requests(&mut server_stream, 2).await;
+        assert!(snapshot_requests
+            .iter()
+            .all(|request| matches!(request, Request::PaneSnapshotRef(_))));
+        write_response(
+            &mut server_stream,
+            Response::PaneSnapshot(snapshot_response("ready")),
+        )
+        .await;
+
+        let Request::ListPanes(request) = read_request(&mut server_stream).await else {
+            panic!("expected follow-up pane identity lookup");
+        };
+        assert_eq!(request.target, session_name());
+        assert_eq!(request.target_window_index, Some(0));
+
+        // The cancelled loser still owns the preceding FIFO response. Drain
+        // it before replying to the follow-up request.
+        write_response(
+            &mut server_stream,
+            Response::PaneSnapshot(snapshot_response("not ready")),
+        )
+        .await;
+        write_response(
+            &mut server_stream,
+            Response::ListPanes(ListPanesResponse {
+                output: CommandOutput::from_stdout("0:0:%1\n0:1:%2\n"),
+            }),
+        )
+        .await;
+    });
+
+    let outcome = panes.wait_any().visible_text_contains("ready").await;
+    assert!(
+        outcome.any().expect("wait_any outcome").success().is_some(),
+        "one pane must match"
+    );
+    assert_eq!(
+        probe.id().await.expect("follow-up identity lookup"),
+        Some(PaneId::new(1))
+    );
+    server.await.expect("server task");
+}
+
 #[tokio::test(start_paused = true)]
 async fn snapshot_all_shares_identity_and_snapshot_deadline_per_pane() {
     let (client_stream, mut server_stream) = tokio::io::duplex(4096);
@@ -679,6 +781,27 @@ async fn read_request(stream: &mut tokio::io::DuplexStream) -> Request {
         assert_ne!(read, 0, "client closed before request");
         decoder.push_bytes(&buffer[..read]);
     }
+}
+
+async fn read_requests(stream: &mut tokio::io::DuplexStream, count: usize) -> Vec<Request> {
+    let mut decoder = FrameDecoder::new();
+    let mut requests = Vec::with_capacity(count);
+    let mut buffer = [0_u8; 256];
+    while requests.len() < count {
+        while let Some(request) = decoder
+            .next_frame::<Request>()
+            .expect("request frame decodes")
+        {
+            requests.push(request);
+            if requests.len() == count {
+                return requests;
+            }
+        }
+        let read = stream.read(&mut buffer).await.expect("read requests");
+        assert_ne!(read, 0, "client closed before all requests arrived");
+        decoder.push_bytes(&buffer[..read]);
+    }
+    requests
 }
 
 async fn write_response(stream: &mut tokio::io::DuplexStream, response: Response) {

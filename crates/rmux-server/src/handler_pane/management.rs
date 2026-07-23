@@ -138,7 +138,7 @@ impl RequestHandler {
         let attached_count = self.attached_count(&session_name).await;
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
-        let (response, successful_pane) = {
+        let (response, successful_pane, refresh_sessions) = {
             let mut state = self.state.lock().await;
             if let Err(error) =
                 super::super::require_expected_session_identity(&state, &session_name)
@@ -217,14 +217,20 @@ impl RequestHandler {
                             }
                         }
                         let successful_pane = response.pane.clone();
+                        let refresh_sessions = state.window_linked_session_family_list(
+                            successful_pane.session_name(),
+                            successful_pane.window_index(),
+                        );
                         match split_window_response(&state, response, response_mode) {
-                            Ok(response) => (response, Some(successful_pane)),
-                            Err(error) => (Response::Error(ErrorResponse { error }), None),
+                            Ok(response) => (response, Some(successful_pane), refresh_sessions),
+                            Err(error) => {
+                                (Response::Error(ErrorResponse { error }), None, Vec::new())
+                            }
                         }
                     }
-                    Err(error) => (Response::Error(ErrorResponse { error }), None),
+                    Err(error) => (Response::Error(ErrorResponse { error }), None, Vec::new()),
                 },
-                Err(error) => (Response::Error(ErrorResponse { error }), None),
+                Err(error) => (Response::Error(ErrorResponse { error }), None, Vec::new()),
             }
         };
 
@@ -242,7 +248,7 @@ impl RequestHandler {
                 ),
             })
             .await;
-            self.refresh_attached_session(&session_name).await;
+            self.refresh_linked_window_sessions(refresh_sessions).await;
         }
 
         response
@@ -265,12 +271,8 @@ impl RequestHandler {
             after_hook_target,
         ) = {
             let mut state = self.state.lock().await;
-            let target_window = WindowTarget::with_window(
-                request.target.session_name().clone(),
-                request.target.window_index(),
-            );
             if let Err(error) =
-                super::super::require_expected_window_identity(&state, &target_window)
+                super::super::require_expected_pane_identity(&state, &request.target)
             {
                 return Response::Error(ErrorResponse { error });
             }
@@ -283,6 +285,7 @@ impl RequestHandler {
             let timer_mutation = self.plan_all_window_mutation_silence_timers_locked(&state);
             match state.kill_pane_with_options(request.target, request.kill_all_except) {
                 Ok(result) => {
+                    state.retire_removed_lifecycle_targets();
                     self.apply_window_mutation_silence_timers_and_arm_all_locked(
                         &state,
                         timer_mutation,
@@ -368,13 +371,20 @@ impl RequestHandler {
         if matches!(response, Response::KillPane(_)) {
             for (session_name, session_id, detach_on_destroy) in &destroyed_attached_sessions {
                 let prepared = self
-                    .rehome_control_session_identity(session_name, *session_id, *detach_on_destroy)
+                    .prepare_destroy_session_rehome(session_name, *session_id, *detach_on_destroy)
                     .await;
                 prepared_attached_switches.insert(*session_id, prepared);
             }
         }
         for event in lifecycle_events {
             self.emit_prepared(event).await;
+        }
+        for (_, session_id, _) in &destroyed_attached_sessions {
+            if let Some(prepared) = prepared_attached_switches.get_mut(session_id) {
+                for event in prepared.control_lifecycle_events.drain(..) {
+                    self.emit_prepared(event).await;
+                }
+            }
         }
         if matches!(response, Response::KillPane(_)) {
             self.cleanup_pane_output_subscriptions(&removed_subscription_keys)
@@ -390,17 +400,11 @@ impl RequestHandler {
                 })
                 .collect::<Vec<_>>();
             self.remove_session_leases(&destroyed_identities);
-            for (session_name, session_id, detach_on_destroy) in destroyed_attached_sessions {
-                if let Some(prepared) = prepared_attached_switches.remove(&session_id) {
-                    self.exit_prepared_attached_session_identity(prepared).await;
-                } else {
-                    self.exit_attached_session_identity(
-                        &session_name,
-                        session_id,
-                        detach_on_destroy,
-                    )
-                    .await;
-                }
+            for (session_name, session_id, _detach_on_destroy) in destroyed_attached_sessions {
+                let prepared = prepared_attached_switches
+                    .remove(&session_id)
+                    .expect("kill-pane destroy rehome must be prepared before publication");
+                self.exit_prepared_attached_session_identity(prepared).await;
                 self.cancel_session_silence_timers(&session_name).await;
                 self.refresh_control_session(&session_name).await;
             }

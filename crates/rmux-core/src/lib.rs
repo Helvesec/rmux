@@ -90,11 +90,12 @@ pub use style::{
     StyleAlign, StyleCell, StyleDefaultType, StyleList, StyleParseError, StyleRange, StyleWidth,
 };
 pub use target_find::{
-    command_target_metadata, CommandTargetMetadata, CommandTargetSpec, TargetFindContext,
-    TargetFindFlags, TargetFindType, UnresolvedTarget,
+    command_target_metadata, CommandTargetMetadata, CommandTargetSpec,
+    MissingCurrentTargetFallback, TargetFindContext, TargetFindFlags, TargetFindType,
+    UnresolvedTarget,
 };
 pub use terminal_passthrough::{
-    TerminalPaletteIndex, TerminalPassthrough, TerminalPassthroughKind,
+    TerminalClipboardQuery, TerminalPaletteIndex, TerminalPassthrough, TerminalPassthroughKind,
 };
 pub use terminal_screen::TerminalScreen;
 pub use terminal_sequences::{alternate_screen_enter_sequence, alternate_screen_exit_sequence};
@@ -102,8 +103,8 @@ pub use transcript::{ScreenCaptureRange, Transcript};
 pub use utf8::{text_width, truncate_right_to_width, truncate_to_width, Utf8Config};
 pub use vis::encode_paste_bytes;
 pub use window::{
-    AlertFlags, Window, WINDOW_ACTIVITY, WINDOW_ALERTFLAGS, WINDOW_BELL, WINDOW_SILENCE,
-    WINLINK_ACTIVITY, WINLINK_ALERTFLAGS, WINLINK_BELL, WINLINK_SILENCE,
+    AlertFlags, Window, WindowPaneActivity, WINDOW_ACTIVITY, WINDOW_ALERTFLAGS, WINDOW_BELL,
+    WINDOW_SILENCE, WINLINK_ACTIVITY, WINLINK_ALERTFLAGS, WINLINK_BELL, WINLINK_SILENCE,
 };
 
 /// Returns whether `text` matches the tmux-style glob `pattern`.

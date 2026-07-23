@@ -13,9 +13,10 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use rmux_core::{input::InputParser, Screen};
 use rmux_proto::{
-    CapturePaneRequest, CopyModeRequest, ListPanesRequest, NewSessionExtRequest,
-    OptionScopeSelector, PaneTarget, Request, Response, SendKeysExtRequest, SetOptionByNameRequest,
-    SetOptionMode, ShowBufferRequest, SwitchClientRequest, TerminalSize,
+    CapturePaneRequest, CopyModeRequest, ListPanesRequest, NewSessionExtRequest, OptionName,
+    OptionScopeSelector, PaneTarget, Request, Response, ScopeSelector, SendKeysExtRequest,
+    SetOptionByNameRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
+    SwitchClientRequest, TerminalSize, WindowTarget,
 };
 use tokio::time::sleep;
 
@@ -159,6 +160,57 @@ async fn enter_copy_mode(handler: &RequestHandler, target: &PaneTarget, page_up:
         .await
 }
 
+#[tokio::test]
+async fn direct_copy_mode_entry_enables_line_numbers() {
+    let handler = RequestHandler::new();
+    let target = create_session(
+        &handler,
+        "line-numbers-direct",
+        TerminalSize { cols: 20, rows: 5 },
+    )
+    .await;
+
+    assert!(matches!(
+        enter_copy_mode(&handler, &target, false).await,
+        Response::CopyMode(_)
+    ));
+    let transcript = {
+        let state = handler.state.lock().await;
+        state
+            .transcript_handle(&target)
+            .expect("session transcript must exist")
+    };
+    let enabled = transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned")
+        .copy_mode_render_snapshot()
+        .expect("copy-mode snapshot")
+        .line_numbers_enabled;
+
+    assert!(enabled, "ordinary copy-mode entry enables the gutter");
+}
+
+async fn pane_terminal_size(handler: &RequestHandler, target: &PaneTarget) -> TerminalSize {
+    handler
+        .wait_for_pane_startup_to_finish_for_test(target)
+        .await;
+    let master = {
+        let mut state = handler.state.lock().await;
+        state
+            .clone_pane_master_if_alive(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+            )
+            .expect("pane terminal is alive")
+    };
+    let size = master.size().expect("pane terminal size is available");
+    TerminalSize {
+        cols: size.cols,
+        rows: size.rows,
+    }
+}
+
 async fn send_copy_mode_command(
     handler: &RequestHandler,
     target: &PaneTarget,
@@ -235,6 +287,27 @@ fn unique_copy_pipe_output_path(label: &str) -> PathBuf {
         "rmux-copy-pipe-{label}-{}-{nanos}.txt",
         std::process::id()
     ))
+}
+
+async fn wait_for_file_contents(path: &Path, expected: &str) -> String {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match fs::read_to_string(path) {
+                Ok(contents) if contents.contains(expected) => return contents,
+                Ok(_) | Err(_) => sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let observation = fs::read_to_string(path)
+            .map(|contents| format!("contents were {contents:?}"))
+            .unwrap_or_else(|error| format!("read failed: {error}"));
+        panic!(
+            "file {} never contained {expected:?} within 5 seconds; {observation}",
+            path.display()
+        );
+    })
 }
 
 #[cfg(unix)]
@@ -363,6 +436,106 @@ async fn copy_mode_capture_uses_backing_screen_snapshot() {
 }
 
 #[tokio::test]
+async fn modal_scrollbar_resizes_pty_only_while_copy_mode_is_active() {
+    let handler = RequestHandler::new();
+    let size = TerminalSize { cols: 20, rows: 8 };
+    let target = create_session(&handler, "scrollbar-modal", size).await;
+    assert_eq!(pane_terminal_size(&handler, &target).await, size);
+
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Window(WindowTarget::with_window(
+                target.session_name().clone(),
+                target.window_index(),
+            )),
+            option: OptionName::PaneScrollbars,
+            value: "modal".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)));
+    assert_eq!(pane_terminal_size(&handler, &target).await, size);
+
+    assert!(matches!(
+        enter_copy_mode(&handler, &target, false).await,
+        Response::CopyMode(_)
+    ));
+    assert_eq!(
+        pane_terminal_size(&handler, &target).await,
+        TerminalSize { cols: 19, rows: 8 }
+    );
+
+    let response = handler
+        .handle(Request::CopyMode(CopyModeRequest {
+            target: Some(target.clone()),
+            page_down: false,
+            exit_on_scroll: false,
+            hide_position: false,
+            mouse_drag_start: false,
+            cancel_mode: true,
+            scrollbar_scroll: false,
+            source: None,
+            page_up: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::CopyMode(_)));
+    assert_eq!(pane_terminal_size(&handler, &target).await, size);
+
+    for (value, expected_cols) in [("on", 19), ("off", 20)] {
+        let response = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(
+                    target.session_name().clone(),
+                    target.window_index(),
+                )),
+                option: OptionName::PaneScrollbars,
+                value: value.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(matches!(response, Response::SetOption(_)));
+        assert_eq!(
+            pane_terminal_size(&handler, &target).await,
+            TerminalSize {
+                cols: expected_cols,
+                rows: 8,
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn copy_mode_line_number_gutter_never_resizes_the_pty() {
+    let handler = RequestHandler::new();
+    let size = TerminalSize { cols: 20, rows: 8 };
+    let target = create_session(&handler, "line-number-pty", size).await;
+    assert_eq!(pane_terminal_size(&handler, &target).await, size);
+
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Window(WindowTarget::with_window(
+                target.session_name().clone(),
+                target.window_index(),
+            )),
+            option: OptionName::CopyModeLineNumbers,
+            value: "absolute".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)));
+
+    assert!(matches!(
+        enter_copy_mode(&handler, &target, false).await,
+        Response::CopyMode(_)
+    ));
+    assert_eq!(
+        pane_terminal_size(&handler, &target).await,
+        size,
+        "the line-number gutter is an internal copy-mode overlay"
+    );
+}
+
+#[tokio::test]
 async fn copy_mode_formats_report_live_state() {
     let handler = RequestHandler::new();
     let size = TerminalSize { cols: 40, rows: 4 };
@@ -374,6 +547,17 @@ async fn copy_mode_formats_report_live_state() {
         b"alpha beta gamma\r\nneedle here\r\nomega\r\n",
     )
     .await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::CopyModeLineNumbers,
+                value: "absolute".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
 
     assert!(matches!(
         enter_copy_mode(&handler, &target, false).await,
@@ -392,7 +576,7 @@ async fn copy_mode_formats_report_live_state() {
         .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: target.session_name().clone(),
             format: Some(
-                "#{pane_in_mode} #{pane_mode} #{search_present} #{selection_present} #{copy_cursor_word}".to_owned(),
+                "#{pane_in_mode} #{pane_mode} #{search_present} #{selection_present} #{copy_cursor_word} #{copy_position}/#{copy_position_limit}".to_owned(),
             ),
             filter: None,
             sort_order: None,
@@ -404,7 +588,7 @@ async fn copy_mode_formats_report_live_state() {
         .command_output()
         .expect("list-panes returns command output");
     let text = String::from_utf8_lossy(output.stdout());
-    assert_eq!(text.as_ref(), "1 copy-mode 1 1 needle\n");
+    assert_eq!(text.as_ref(), "1 copy-mode 1 1 needle 1/4\n");
 }
 
 #[tokio::test]
@@ -703,7 +887,7 @@ async fn copy_pipe_without_command_uses_copy_command_option() {
         Response::SendKeys(_)
     ));
 
-    let output = fs::read_to_string(&output_path).expect("copy-command should write selection");
+    let output = wait_for_file_contents(&output_path, "needle fallback").await;
     let _ = fs::remove_file(&output_path);
     assert!(output.contains("needle fallback"));
 }
@@ -757,8 +941,7 @@ async fn copy_pipe_explicit_command_overrides_copy_command_option() {
         Response::SendKeys(_)
     ));
 
-    let explicit_output =
-        fs::read_to_string(&explicit_path).expect("explicit pipe command should write selection");
+    let explicit_output = wait_for_file_contents(&explicit_path, "needle explicit").await;
     let fallback_output = fs::read_to_string(&fallback_path).ok();
     let _ = fs::remove_file(&explicit_path);
     let _ = fs::remove_file(&fallback_path);
@@ -903,8 +1086,7 @@ async fn copy_pipe_uses_local_osc7_file_url_as_working_directory() {
         Response::SendKeys(_)
     ));
 
-    let output = fs::read_to_string(&output_path)
-        .expect("relative copy-pipe command should write inside OSC7 cwd");
+    let output = wait_for_file_contents(&output_path, "needle osc7 cwd").await;
     let _ = fs::remove_file(&output_path);
     let _ = fs::remove_dir(&temp_dir);
     assert!(output.contains("needle osc7 cwd"));
@@ -977,7 +1159,7 @@ async fn copy_pipe_uses_bin_sh_instead_of_default_shell_like_tmux() {
         Response::SendKeys(_)
     ));
 
-    let output = fs::read_to_string(&output_path).expect("copy-pipe output");
+    let output = wait_for_file_contents(&output_path, "needle bin sh").await;
     assert!(output.contains("needle bin sh"));
     assert!(
         !marker_path.exists(),

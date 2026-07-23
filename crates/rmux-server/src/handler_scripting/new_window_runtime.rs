@@ -1,25 +1,147 @@
 use rmux_core::{LifecycleEvent, SessionStore};
 use rmux_proto::request::Request;
 use rmux_proto::{
-    DisplayMessageRequest, ErrorResponse, HookName, KillWindowRequest, MoveWindowRequest,
-    MoveWindowTarget, NewWindowRequest, NewWindowResponse, PaneTarget, Response, RmuxError,
-    ScopeSelector, SelectWindowRequest, Target, WindowTarget,
+    DisplayMessageRequest, ErrorResponse, HookName, MoveWindowRequest, MoveWindowTarget,
+    NewWindowRequest, NewWindowResponse, PaneTarget, Response, RmuxError, ScopeSelector,
+    SelectWindowRequest, SessionName, Target, WindowTarget,
 };
 
 use super::format_context_for_target_with_server_values;
 use super::queue::{queue_action_from_response, QueueCommandAction, QueueExecutionContext};
-use super::queue_parse::ParsedNewWindowCommand;
+use super::queue_parse::{NewWindowPlacement, ParsedNewWindowCommand};
 use super::render_start_directory_template;
 use super::targets::NewWindowTargetIndex;
 use crate::format_runtime::render_runtime_template;
 use crate::handler::{
     client_environment_snapshot, client_spawn_environment, prepare_lifecycle_event_if_enabled,
-    RequestHandler,
+    RequestHandler, StableTargetIdentity,
 };
 use crate::hook_runtime::{capture_inline_hooks, PendingInlineHookFormat};
 use crate::pane_terminals::{
-    resolve_new_pane_process_command, NewWindowOptions, WindowSpawnOptions,
+    resolve_new_pane_process_command, HandlerState, NewWindowOptions, WindowSpawnOptions,
 };
+
+#[derive(Debug, Clone)]
+pub(in crate::handler) struct QueuedNewWindowTargetWitness {
+    session_name: SessionName,
+    session: StableTargetIdentity,
+    resolved_window_index: Option<u32>,
+    anchor: Option<StableTargetIdentity>,
+    destination: Option<WindowSlotWitness>,
+}
+
+#[derive(Debug, Clone)]
+enum WindowSlotWitness {
+    Vacant(u32),
+    Occupied(StableTargetIdentity),
+}
+
+impl QueuedNewWindowTargetWitness {
+    pub(super) fn capture(
+        state: &mut HandlerState,
+        command: &ParsedNewWindowCommand,
+    ) -> Result<Self, RmuxError> {
+        let active_window_index = state
+            .sessions
+            .session(&command.target)
+            .ok_or_else(|| RmuxError::SessionNotFound(command.target.to_string()))?
+            .active_window_index();
+        let session =
+            StableTargetIdentity::capture(state, Target::Session(command.target.clone()))?;
+        let resolved_window_index = resolve_queued_new_window_target_index(
+            &state.sessions,
+            &command.target,
+            command.target_window_index,
+        )?;
+        let anchor_index = match (command.placement, command.target_window_index) {
+            (Some(NewWindowPlacement::Before), _) => resolved_window_index,
+            (Some(NewWindowPlacement::After), _) => Some(
+                resolved_window_index
+                    .and_then(|index| index.checked_sub(1))
+                    .ok_or_else(|| {
+                        RmuxError::Server("new-window placement anchor underflowed".to_owned())
+                    })?,
+            ),
+            (None, Some(NewWindowTargetIndex::Relative(_))) => Some(active_window_index),
+            (None, _) => None,
+        };
+        let anchor = anchor_index
+            .map(|index| {
+                StableTargetIdentity::capture(
+                    state,
+                    Target::Window(WindowTarget::with_window(command.target.clone(), index)),
+                )
+            })
+            .transpose()?;
+        let destination = resolved_window_index
+            .map(|index| capture_window_slot(state, &command.target, index))
+            .transpose()?;
+        Ok(Self {
+            session_name: command.target.clone(),
+            session,
+            resolved_window_index,
+            anchor,
+            destination,
+        })
+    }
+
+    fn validate(&self, state: &HandlerState) -> Result<(), RmuxError> {
+        if !self.session.is_current(state)
+            || self
+                .anchor
+                .as_ref()
+                .is_some_and(|anchor| !anchor.is_current(state))
+            || self
+                .destination
+                .as_ref()
+                .is_some_and(|slot| !slot.matches(state, &self.session_name))
+        {
+            return Err(changed_new_window_target(&self.session_name));
+        }
+        Ok(())
+    }
+}
+
+impl WindowSlotWitness {
+    fn matches(&self, state: &HandlerState, session_name: &SessionName) -> bool {
+        match self {
+            Self::Occupied(identity) => identity.is_current(state),
+            Self::Vacant(index) => state
+                .sessions
+                .session(session_name)
+                .and_then(|session| session.window_at(*index))
+                .is_none(),
+        }
+    }
+}
+
+fn capture_window_slot(
+    state: &mut HandlerState,
+    session_name: &SessionName,
+    index: u32,
+) -> Result<WindowSlotWitness, RmuxError> {
+    let occupied = state
+        .sessions
+        .session(session_name)
+        .and_then(|session| session.window_at(index))
+        .is_some();
+    if occupied {
+        StableTargetIdentity::capture(
+            state,
+            Target::Window(WindowTarget::with_window(session_name.clone(), index)),
+        )
+        .map(WindowSlotWitness::Occupied)
+    } else {
+        Ok(WindowSlotWitness::Vacant(index))
+    }
+}
+
+fn changed_new_window_target(session_name: &SessionName) -> RmuxError {
+    RmuxError::invalid_target(
+        session_name.to_string(),
+        "queued new-window target changed before mutation",
+    )
+}
 
 impl RequestHandler {
     pub(super) async fn execute_queued_new_window(
@@ -30,8 +152,10 @@ impl RequestHandler {
     ) -> Result<QueueCommandAction, RmuxError> {
         let ParsedNewWindowCommand {
             target,
-            target_window_index,
+            target_window_index: _,
             insert_at_target,
+            placement: _,
+            target_witness,
             name,
             detached,
             print_target,
@@ -43,11 +167,10 @@ impl RequestHandler {
             command,
         } = command;
         let start_directory = start_directory.or_else(|| context.caller_cwd.clone());
-
-        let target_window_index = {
-            let state = self.state.lock().await;
-            resolve_queued_new_window_target_index(&state.sessions, &target, target_window_index)?
-        };
+        let target_witness = *target_witness.ok_or_else(|| {
+            RmuxError::Server("queued new-window target witness was not captured".to_owned())
+        })?;
+        let target_window_index = target_witness.resolved_window_index;
         let can_write = self.requester_can_write(requester_pid).await;
         let request_for_hooks = crate::server_access::apply_access_policy(
             Request::NewWindow(Box::new(NewWindowRequest {
@@ -112,8 +235,16 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let (response, inline_hooks) = capture_inline_hooks(async {
-            let (response, linked_event) = {
+            let (response, linked_event, committed_move) = {
                 let mut state = self.state.lock().await;
+                if let Err(error) = target_witness.validate(&state) {
+                    return Response::Error(ErrorResponse { error });
+                }
+                if let Err(error) =
+                    crate::handler::require_expected_session_identity(&state, &target)
+                {
+                    return Response::Error(ErrorResponse { error });
+                }
                 let process_command = resolve_new_pane_process_command(
                     &state.options,
                     &target,
@@ -151,39 +282,96 @@ impl RequestHandler {
                         },
                     },
                 ) {
-                    Ok(response) => {
-                        let mut timer_targets = Vec::new();
-                        for timer_session_name in state.sessions.session_group_members(&target) {
-                            let Some(session) = state.sessions.session(&timer_session_name) else {
-                                continue;
+                    Ok(created) => {
+                        let destination = replace_after_create.map(|window_index| {
+                            WindowTarget::with_window(target.clone(), window_index)
+                        });
+                        if let Some(destination) =
+                            destination.filter(|destination| destination != &created.target)
+                        {
+                            if let Err(error) = target_witness.validate(&state) {
+                                let error = self.rollback_unpublished_new_window_locked(
+                                    &mut state,
+                                    &created.target,
+                                    error,
+                                );
+                                return Response::Error(ErrorResponse { error });
+                            }
+                            let request = MoveWindowRequest {
+                                source: Some(created.target.clone()),
+                                target: MoveWindowTarget::Window(destination.clone()),
+                                renumber: false,
+                                kill_destination: true,
+                                detached,
+                                after: false,
+                                before: false,
                             };
-                            timer_targets.extend(session.windows().keys().copied().map(
-                                |window_index| {
-                                    WindowTarget::with_window(
-                                        timer_session_name.clone(),
-                                        window_index,
-                                    )
+                            let committed = match self
+                                .commit_prevalidated_move_window_locked(&mut state, &request)
+                            {
+                                Ok(committed) => committed,
+                                Err(error) => {
+                                    let error = self.rollback_unpublished_new_window_locked(
+                                        &mut state,
+                                        &created.target,
+                                        error,
+                                    );
+                                    return Response::Error(ErrorResponse { error });
+                                }
+                            };
+                            (
+                                Response::NewWindow(created),
+                                None,
+                                Some((committed, destination)),
+                            )
+                        } else {
+                            let mut timer_targets = Vec::new();
+                            for timer_session_name in state.sessions.session_group_members(&target)
+                            {
+                                let Some(session) = state.sessions.session(&timer_session_name)
+                                else {
+                                    continue;
+                                };
+                                timer_targets.extend(session.windows().keys().copied().map(
+                                    |window_index| {
+                                        WindowTarget::with_window(
+                                            timer_session_name.clone(),
+                                            window_index,
+                                        )
+                                    },
+                                ));
+                            }
+                            self.apply_window_mutation_silence_timers_locked(
+                                &state,
+                                timer_mutation,
+                                Vec::new(),
+                                &[],
+                                timer_targets,
+                            );
+                            let linked_event = prepare_lifecycle_event_if_enabled(
+                                &mut state,
+                                &LifecycleEvent::WindowLinked {
+                                    session_name: target.clone(),
+                                    target: Some(created.target.clone()),
                                 },
-                            ));
+                            );
+                            (Response::NewWindow(created), linked_event, None)
                         }
-                        self.apply_window_mutation_silence_timers_locked(
-                            &state,
-                            timer_mutation,
-                            Vec::new(),
-                            &[],
-                            timer_targets,
-                        );
-                        let linked_event = prepare_lifecycle_event_if_enabled(
-                            &mut state,
-                            &LifecycleEvent::WindowLinked {
-                                session_name: target.clone(),
-                                target: Some(response.target.clone()),
-                            },
-                        );
-                        (Response::NewWindow(response), linked_event)
                     }
-                    Err(error) => (Response::Error(ErrorResponse { error }), None),
+                    Err(error) => (Response::Error(ErrorResponse { error }), None, None),
                 }
+            };
+
+            let response = match committed_move {
+                Some((committed, destination)) => {
+                    match self.finish_committed_move_window(committed).await {
+                        Response::MoveWindow(moved) => Response::NewWindow(NewWindowResponse {
+                            target: moved.target.unwrap_or(destination),
+                        }),
+                        response => response,
+                    }
+                }
+                None => response,
             };
 
             if matches!(response, Response::NewWindow(_)) {
@@ -203,37 +391,40 @@ impl RequestHandler {
                         self.emit_prepared(linked_event).await;
                     }
                 }
-                self.refresh_attached_session(&target).await;
+                let refresh_target = match &response {
+                    Response::NewWindow(success) => success.target.session_name(),
+                    _ => &target,
+                };
+                self.refresh_attached_session(refresh_target).await;
             }
 
             response
         })
         .await;
-        let response = match replace_after_create {
-            Some(window_index) => {
-                self.move_queued_new_window_to_replacement_index(response, window_index, detached)
-                    .await
-            }
-            None => response,
-        };
 
-        let inline_hook_names = inline_hooks
-            .iter()
-            .map(|pending| pending.hook)
-            .collect::<Vec<_>>();
-        self.run_inline_hooks(requester_pid, inline_hooks, None)
+        super::super::without_expected_stable_target_identities(async {
+            // tmux renders -P/-F before after-new-window hooks may move the target.
+            let action = self
+                .queued_new_window_action(requester_pid, print_target, format, response.clone())
+                .await;
+            let inline_hook_names = inline_hooks
+                .iter()
+                .map(|pending| pending.hook)
+                .collect::<Vec<_>>();
+            self.run_inline_hooks(requester_pid, inline_hooks, None)
+                .await;
+            self.run_request_hooks(
+                requester_pid,
+                &request_for_hooks,
+                &response,
+                None,
+                &inline_hook_names,
+            )
             .await;
-        self.run_request_hooks(
-            requester_pid,
-            &request_for_hooks,
-            &response,
-            None,
-            &inline_hook_names,
-        )
-        .await;
 
-        self.queued_new_window_action(requester_pid, print_target, format, response)
-            .await
+            action
+        })
+        .await
     }
 
     async fn find_existing_new_window_by_name(
@@ -263,7 +454,7 @@ impl RequestHandler {
 
     async fn prepare_queued_new_window_kill_existing(
         &self,
-        session_name: &rmux_proto::SessionName,
+        _session_name: &rmux_proto::SessionName,
         target_window_index: Option<u32>,
         insert_at_target: bool,
         kill_existing: bool,
@@ -274,63 +465,24 @@ impl RequestHandler {
         if !kill_existing || insert_at_target {
             return Ok((Some(window_index), None));
         }
-
-        let existing_window_count = {
-            let state = self.state.lock().await;
-            let session = state
-                .sessions
-                .session(session_name)
-                .ok_or_else(|| RmuxError::SessionNotFound(session_name.to_string()))?;
-            session
-                .window_at(window_index)
-                .map(|_| session.windows().len())
-        };
-        match existing_window_count {
-            None => Ok((Some(window_index), None)),
-            Some(1) => Ok((None, Some(window_index))),
-            Some(_) => match self
-                .handle_kill_window(KillWindowRequest {
-                    target: WindowTarget::with_window(session_name.clone(), window_index),
-                    kill_all_others: false,
-                })
-                .await
-            {
-                Response::KillWindow(_) => Ok((Some(window_index), None)),
-                Response::Error(ErrorResponse { error }) => Err(error),
-                response => Err(RmuxError::Server(format!(
-                    "unexpected kill-window response while replacing new-window target: {response:?}"
-                ))),
-            },
-        }
+        Ok((None, Some(window_index)))
     }
 
-    async fn move_queued_new_window_to_replacement_index(
+    fn rollback_unpublished_new_window_locked(
         &self,
-        response: Response,
-        window_index: u32,
-        detached: bool,
-    ) -> Response {
-        let Response::NewWindow(created) = response else {
-            return response;
-        };
-        let destination =
-            WindowTarget::with_window(created.target.session_name().clone(), window_index);
-        match self
-            .handle_move_window(MoveWindowRequest {
-                source: Some(created.target),
-                target: MoveWindowTarget::Window(destination.clone()),
-                renumber: false,
-                kill_destination: true,
-                detached,
-                after: false,
-                before: false,
-            })
-            .await
-        {
-            Response::MoveWindow(moved) => Response::NewWindow(NewWindowResponse {
-                target: moved.target.unwrap_or(destination),
-            }),
-            response => response,
+        state: &mut HandlerState,
+        target: &WindowTarget,
+        source_error: RmuxError,
+    ) -> RmuxError {
+        match state.kill_window(target.clone(), false) {
+            Ok(removed) => {
+                state.retire_removed_lifecycle_targets();
+                self.record_panes_closed_as_killed(&removed.removed_pane_ids);
+                source_error
+            }
+            Err(rollback_error) => RmuxError::Server(format!(
+                "failed to roll back unpublished new-window {target} after {source_error}: {rollback_error}"
+            )),
         }
     }
 

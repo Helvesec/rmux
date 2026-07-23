@@ -47,15 +47,27 @@ fn release_workflows_and_composite_actions_are_valid_yaml() {
         }
     }
     files.sort();
-    let output = Command::new("ruby")
+    let ruby = Command::new("ruby")
         .args([
             "-e",
-            "require 'yaml'; ARGV.each { |path| YAML.load_file(path, aliases: true) }",
+            "require 'yaml'; loader = YAML.method(:load_file); supports_aliases = loader.parameters.any? { |kind, name| (kind == :key && name == :aliases) || kind == :keyrest }; ARGV.each { |path| supports_aliases ? YAML.load_file(path, aliases: true) : YAML.load_file(path) }",
         ])
         .args(&files)
-        .current_dir(root)
-        .output()
-        .expect("parse workflow YAML with Ruby stdlib");
+        .current_dir(&root)
+        .output();
+    let output = match ruby {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Command::new("python3")
+            .args([
+                "-c",
+                "import sys, yaml\nfor path in sys.argv[1:]:\n    with open(path, encoding='utf-8') as stream:\n        yaml.safe_load(stream)",
+            ])
+            .args(&files)
+            .current_dir(&root)
+            .output()
+            .expect("parse workflow YAML with PyYAML"),
+        Err(error) => panic!("start workflow YAML parser: {error}"),
+    };
     assert!(
         output.status.success(),
         "stdout={}\nstderr={}",

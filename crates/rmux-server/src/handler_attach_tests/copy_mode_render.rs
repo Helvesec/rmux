@@ -160,6 +160,124 @@ async fn attached_copy_mode_u_attach_render_matches_mode_capture_source() {
 }
 
 #[tokio::test]
+async fn attached_copy_mode_clipped_cursor_marker_wins_over_position_badge() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("copy-line-marker");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+    replace_transcript_contents(
+        &handler,
+        &target,
+        TerminalSize { cols: 80, rows: 24 },
+        b"\x1b[1;80H",
+    )
+    .await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                option: OptionName::CopyModeLineNumbers,
+                value: "absolute".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    drain_attach_controls(&mut control_rx);
+
+    assert!(matches!(
+        handler
+            .handle(Request::CopyMode(CopyModeRequest {
+                target: Some(target),
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: false,
+                mouse_drag_start: false,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }))
+            .await,
+        Response::CopyMode(_)
+    ));
+    let frame = recv_render_frame(&mut control_rx, "line-number marker refresh").await;
+    let rendered = {
+        let mut screen = Screen::new(TerminalSize { cols: 80, rows: 24 }, 0);
+        let mut parser = InputParser::new();
+        parser.parse(frame.as_bytes(), &mut screen);
+        String::from_utf8(screen.capture_transcript(Default::default(), Default::default()))
+            .expect("render frame replay is utf-8")
+    };
+    assert!(
+        rendered
+            .lines()
+            .next()
+            .is_some_and(|line| line.ends_with('$')),
+        "tmux paints '$' after the overlapping badge: frame={frame:?} replay={rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn attached_copy_mode_hide_and_toggle_position_control_the_badge() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("copy-position-hidden");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let target = PaneTarget::new(alpha.clone(), 0);
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                option: OptionName::CopyModePositionFormat,
+                value: "POSITION-VISIBLE".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    drain_attach_controls(&mut control_rx);
+
+    assert!(matches!(
+        handler
+            .handle(Request::CopyMode(CopyModeRequest {
+                target: Some(target.clone()),
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: true,
+                mouse_drag_start: false,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }))
+            .await,
+        Response::CopyMode(_)
+    ));
+    let hidden = recv_render_frame(&mut control_rx, "hidden position refresh").await;
+    assert!(
+        !hidden.contains("POSITION-VISIBLE"),
+        "hidden frame: {hidden:?}"
+    );
+
+    assert!(matches!(
+        super::copy_mode_keys::send_attached_copy_mode_command(
+            &handler,
+            &target,
+            &["toggle-position"],
+        )
+        .await,
+        Response::SendKeys(_)
+    ));
+    let visible = recv_render_frame(&mut control_rx, "toggled position refresh").await;
+    assert!(
+        visible.contains("POSITION-VISIBLE"),
+        "toggle-position should reveal the badge: {visible:?}"
+    );
+}
+
+#[tokio::test]
 async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();

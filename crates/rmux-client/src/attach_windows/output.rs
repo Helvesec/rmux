@@ -29,6 +29,19 @@ impl<W> AttachStdout<W> {
     }
 }
 
+impl<W> AttachStdout<W>
+where
+    W: Write,
+{
+    pub(super) fn flush_output_fence(&mut self) -> io::Result<()> {
+        if let Some(console) = &mut self.console {
+            console.flush_output_fence()
+        } else {
+            self.fallback.flush()
+        }
+    }
+}
+
 impl<W> Write for AttachStdout<W>
 where
     W: Write,
@@ -147,6 +160,21 @@ impl Utf16ConsoleWriter {
         Ok(())
     }
 
+    fn flush_output_fence(&mut self) -> io::Result<()> {
+        // An exclusive terminal action ends the current output epoch: no
+        // later frame may complete a split UTF-8 or VT sequence before the
+        // action takes ownership of the console.
+        self.flush_pending()?;
+        if !self.pending_utf8.is_empty() {
+            let incomplete_utf8 = std::mem::take(&mut self.pending_utf8);
+            self.write_scanned_bytes(&incomplete_utf8)?;
+        }
+        if let Some(pending) = self.vt_mode_scanner.finish() {
+            self.write_chunk(&pending)?;
+        }
+        Ok(())
+    }
+
     fn write_scanned_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         // Older Windows builds, redirected handles, and failed capability
         // probes retain the byte-for-byte writer path used before this fix.
@@ -190,9 +218,7 @@ fn select_output_console<T>(
 
 impl Drop for Utf16ConsoleWriter {
     fn drop(&mut self) {
-        if let Some(pending) = self.vt_mode_scanner.finish() {
-            let _ = self.write_chunk(&pending);
-        }
+        let _ = self.flush_output_fence();
         if let OutputModeOwnership::Restore(mode) = self.mode_ownership {
             let _ = restore_output_console(self.handle, mode);
         }
@@ -344,6 +370,28 @@ mod tests {
         writer.flush_pending().expect("split utf8 waits");
 
         assert_eq!(writer.pending_utf8, glyph[..1]);
+    }
+
+    #[test]
+    fn output_fence_releases_incomplete_vt_scanner_tail() {
+        let mut writer = Utf16ConsoleWriter {
+            handle: std::ptr::null_mut(),
+            _owned_handle: None,
+            mode_ownership: OutputModeOwnership::Borrowed,
+            pending_utf8: Vec::new(),
+            vt_mode_scanner: VtModeScanner::default(),
+            vt_input_passthrough: None,
+        };
+        assert!(writer.vt_mode_scanner.push(b"\x1b[?").is_empty());
+
+        assert!(
+            writer.flush_output_fence().is_err(),
+            "the null test console handle should reject the released tail"
+        );
+        assert!(
+            writer.vt_mode_scanner.finish().is_none(),
+            "the fence must consume the scanner tail before reporting the write failure"
+        );
     }
 
     #[test]

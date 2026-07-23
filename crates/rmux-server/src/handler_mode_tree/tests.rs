@@ -1,4 +1,5 @@
 use super::super::scripting_support::QueueExecutionContext;
+use super::super::{DetachedRequesterAuthority, RequesterOrigin};
 use super::mode_tree_build::tree_item_display_line;
 use super::mode_tree_model::{
     ModeTreeAction, ModeTreeBuild, ModeTreeItem, PreviewMode, SearchDirection, SearchState,
@@ -20,18 +21,27 @@ use super::*;
 use crate::pane_terminals::HandlerState;
 use rmux_core::{command_parser::CommandParser, input::InputParser, Screen, Style, Utf8Config};
 use rmux_proto::{
-    NewSessionRequest, OptionName, Request, Response, ScopeSelector, SessionName, SetOptionMode,
-    SetOptionRequest, TerminalSize,
+    NewSessionRequest, OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName,
+    SetOptionMode, SetOptionRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
+    TerminalSize,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::sync::mpsc;
 
+fn test_origin() -> RequesterOrigin {
+    RequesterOrigin::new(std::process::id(), DetachedRequesterAuthority::Denied)
+}
+
 fn test_mode(list_rows: usize) -> ModeTreeClientState {
     ModeTreeClientState {
+        origin: test_origin(),
         kind: ModeTreeKind::Tree,
         session_name: SessionName::new("test").expect("valid session"),
+        session_id: rmux_proto::SessionId::new(1),
         host_pane: None,
+        host_identity: None,
+        host_transcript: None,
         preview_mode: PreviewMode::Off,
         row_format: None,
         filter_format: None,

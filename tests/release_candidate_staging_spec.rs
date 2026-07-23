@@ -1,6 +1,8 @@
+#[path = "support/python3.rs"]
+mod python3;
+
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
@@ -154,7 +156,7 @@ assert "candidate asset bytes differ" in rejected.stderr
 #[test]
 fn staging_rebinds_live_archives_and_original_bytes() {
     let root = temp_dir();
-    let output = Command::new("python3")
+    let output = python3::command()
         .args(["-c", FIXTURE])
         .arg(repo_root())
         .arg(&root)

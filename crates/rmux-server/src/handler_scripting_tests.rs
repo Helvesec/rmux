@@ -12,6 +12,7 @@ use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVEN
 use crate::handler::scripting_support::QueueExecutionContext;
 use crate::hook_runtime::with_hook_execution;
 use crate::outer_terminal::OuterTerminalContext;
+use crate::server_access::AccessMode;
 use rmux_core::command_parser::CommandParser;
 use rmux_core::TargetFindContext;
 use rmux_proto::{
@@ -393,11 +394,17 @@ mod if_shell;
 #[path = "handler_scripting_tests/parsed_queue_core.rs"]
 mod parsed_queue_core;
 
+#[path = "handler_scripting_tests/detached_access.rs"]
+mod detached_access;
+
 #[path = "handler_scripting_tests/parsed_queue_cwd.rs"]
 mod parsed_queue_cwd;
 
 #[path = "handler_scripting_tests/queued_inventory.rs"]
 mod queued_inventory;
+
+#[path = "handler_scripting_tests/queue_exact_target.rs"]
+mod queue_exact_target;
 
 #[path = "handler_scripting_tests/parsed_queue_split.rs"]
 mod parsed_queue_split;
@@ -420,8 +427,17 @@ mod parsed_queue_select_zoom;
 #[path = "handler_scripting_tests/parsed_queue_resize_trim.rs"]
 mod parsed_queue_resize_trim;
 
+#[path = "handler_scripting_tests/mouse_origin_copy_mode.rs"]
+mod mouse_origin_copy_mode;
+
+#[path = "handler_scripting_tests/prompt_mouse_origin.rs"]
+mod prompt_mouse_origin;
+
 #[path = "handler_scripting_tests/control_hooks_wait.rs"]
 mod control_hooks_wait;
+
+#[path = "handler_scripting_tests/list_windows_all.rs"]
+mod list_windows_all;
 
 #[path = "handler_scripting_tests/command_alias.rs"]
 mod command_alias;

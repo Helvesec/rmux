@@ -289,6 +289,31 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn allowlisted_managed_socket_directory_is_accepted_before_and_after_connect() {
+        let root = unique_root("allowlisted");
+        let managed = root.join(format!("rmux-{}", rmux_os::identity::real_user_id()));
+        fs::create_dir_all(&managed).expect("create managed socket directory");
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o711))
+            .expect("open managed socket directory for allowlisted users");
+        let endpoint = LocalEndpoint::from_path(managed.join("default"));
+
+        let stream = super::connect_blocking_with(
+            &endpoint,
+            Duration::from_secs(1),
+            move |_endpoint, _timeout| {
+                let (client, server) = UnixStream::pair()?;
+                drop(server);
+                Ok(client)
+            },
+        )
+        .expect("0711 managed directory remains identity-safe during connect");
+
+        drop(stream);
+        let _ = fs::set_permissions(&managed, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn unique_root(label: &str) -> PathBuf {
         let unique = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(

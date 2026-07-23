@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant, MissedTickBehavior, Sleep};
 use tracing::{debug, info};
@@ -41,6 +41,7 @@ pub(super) async fn serve_pane_loop(
     outbound: WebSocketOutbound,
     share_id: String,
     mut pane: WebPaneStream,
+    mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     queue_or_close(
         &outbound,
@@ -67,6 +68,13 @@ pub(super) async fn serve_pane_loop(
 
     loop {
         tokio::select! {
+            biased;
+            () = wait_for_normal_shutdown(&mut shutdown) => {
+                // Dropping the outbound side aborts a blocked socket writer.
+                // Shutdown must not wait on an unresponsive browser before it
+                // can account for the stream and its attach cleanup.
+                return Ok(());
+            }
             item = pane.output.recv() => {
                 match item {
                     OutputCursorItem::Event(event) => {
@@ -264,6 +272,7 @@ pub(super) async fn serve_session_loop(
     share_id: String,
     mut session: WebSessionStream,
     supports_session_pane_frame: bool,
+    mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut scrolls = HashMap::new();
     queue_session_keyframe_or_close(&outbound, None, &session.snapshot, &share_id).await?;
@@ -288,6 +297,12 @@ pub(super) async fn serve_session_loop(
 
     loop {
         tokio::select! {
+            biased;
+            () = wait_for_normal_shutdown(&mut shutdown) => {
+                // See the pane loop: the transport is cancel-safe, while any
+                // already-started mutation retains its independent Drain guard.
+                return Ok(());
+            }
             output = attach_reader.read_event() => {
                 match output? {
                     Some(WebSessionAttachEvent::Data(frame)) => {
@@ -565,6 +580,14 @@ pub(super) async fn serve_session_loop(
                     }
                 }
             }
+        }
+    }
+}
+
+async fn wait_for_normal_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
         }
     }
 }

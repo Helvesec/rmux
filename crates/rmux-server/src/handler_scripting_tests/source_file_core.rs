@@ -1514,6 +1514,117 @@ async fn queued_source_file_accepts_compact_format_target_with_attached_value() 
 }
 
 #[tokio::test]
+async fn queued_source_file_target_finder_uses_active_indexed_pane() {
+    let handler = RequestHandler::new();
+    for (option, value) in [
+        (OptionName::BaseIndex, "3"),
+        (OptionName::PaneBaseIndex, "4"),
+    ] {
+        assert!(matches!(
+            handler
+                .handle(Request::SetOption(SetOptionRequest {
+                    scope: ScopeSelector::Global,
+                    option,
+                    value: value.to_owned(),
+                    mode: SetOptionMode::Replace,
+                }))
+                .await,
+            Response::SetOption(_)
+        ));
+    }
+
+    let beta = session_name("beta");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: beta.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: beta.clone(),
+                name: Some("active".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(5),
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(beta.clone(), 5, 0)),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SelectWindow(rmux_proto::SelectWindowRequest {
+                target: WindowTarget::with_window(beta.clone(), 5),
+            }))
+            .await,
+        Response::SelectWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                target: PaneTarget::with_window(beta.clone(), 5, 1),
+                title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
+            })))
+            .await,
+        Response::SelectPane(_)
+    ));
+
+    let root = temp_root("source-file-active-indexed-pane");
+    write_config(
+        &root.join("target.conf"),
+        "display-message -p '#{session_name}:#{window_index}.#{pane_index}'\n",
+    );
+    write_config(
+        &root.join("outer.conf"),
+        "source-file -t missing target.conf\n",
+    );
+    let parsed = CommandParser::new()
+        .parse(
+            "source-file -t beta target.conf; \
+             source-file -tbeta:5 target.conf; \
+             source-file -t beta:5.5 target.conf; \
+             source-file -t beta:5.4 outer.conf",
+        )
+        .expect("source-file target matrix parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::new(Some(root.clone()))
+                .with_current_target(Some(Target::Pane(PaneTarget::with_window(beta, 5, 0)))),
+        )
+        .await
+        .expect("source-file target matrix should execute");
+
+    assert_eq!(output.stdout(), b"beta:5.5\nbeta:5.5\nbeta:5.5\nbeta:5.5\n");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn queued_source_file_preserves_assignment_order_across_multi_paths() {
     let handler = RequestHandler::new();
     let root = temp_root("queued-multi-path-assignments-order");

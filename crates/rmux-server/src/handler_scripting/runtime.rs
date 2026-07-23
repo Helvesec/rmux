@@ -1,16 +1,14 @@
 use std::ffi::OsString;
-use std::future::Future;
 use std::path::PathBuf;
 use std::process::{Command as StdCommand, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use rmux_os::process_tree::{ConsoleWindowBehavior, ProcessTreeChild};
 use rmux_proto::{RmuxError, DEFAULT_MAX_FRAME_LENGTH};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{ChildStderr, ChildStdout};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::super::shell_processes::{
     ShellProcessGuard, ShellProcessRegistrationError, ShellProcessRegistry,
@@ -23,71 +21,6 @@ const RUN_SHELL_PIPE_FINISH_TIMEOUT: Duration = Duration::from_secs(2);
 const RUN_SHELL_TERMINATE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const RUN_SHELL_TRUNCATION_MARKER: &[u8] = b"\nrmux: run-shell output truncated\n";
 const RUN_SHELL_OUTPUT_LIMIT: usize = DEFAULT_MAX_FRAME_LENGTH - 64 * 1024;
-const MAX_BACKGROUND_TASKS: usize = 1024;
-// Queued scripting composes task-local and recursive command futures; keep headroom beyond the
-// 2 MiB default thread stack used by supported Windows targets.
-const BACKGROUND_TASK_STACK_SIZE: usize = 8 * 1024 * 1024;
-
-static BACKGROUND_TASK_LIMITER: OnceLock<BackgroundTaskLimiter> = OnceLock::new();
-
-pub(in super::super) fn spawn_background_async<Fut, Factory>(
-    thread_name: &'static str,
-    factory: Factory,
-) -> Result<(), RmuxError>
-where
-    Factory: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = ()> + 'static,
-{
-    let permit = background_task_limiter().try_acquire()?;
-    if std::thread::Builder::new()
-        .name(thread_name.to_owned())
-        .stack_size(BACKGROUND_TASK_STACK_SIZE)
-        .spawn(move || {
-            let _permit = permit;
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            runtime.block_on(factory());
-        })
-        .is_err()
-    {
-        return Err(RmuxError::Server(format!(
-            "failed to spawn background task '{thread_name}'"
-        )));
-    }
-    Ok(())
-}
-
-fn background_task_limiter() -> &'static BackgroundTaskLimiter {
-    BACKGROUND_TASK_LIMITER.get_or_init(|| BackgroundTaskLimiter::new(MAX_BACKGROUND_TASKS))
-}
-
-struct BackgroundTaskLimiter {
-    semaphore: Arc<Semaphore>,
-    max_tasks: usize,
-}
-
-impl BackgroundTaskLimiter {
-    fn new(max_tasks: usize) -> Self {
-        Self {
-            semaphore: Arc::new(Semaphore::new(max_tasks)),
-            max_tasks,
-        }
-    }
-
-    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, RmuxError> {
-        self.semaphore.clone().try_acquire_owned().map_err(|_| {
-            RmuxError::Server(format!(
-                "too many background tasks; limit is {}",
-                self.max_tasks
-            ))
-        })
-    }
-}
-
 pub(super) async fn run_shell_foreground(
     command: String,
     profile: &TerminalProfile,
@@ -512,7 +445,7 @@ async fn read_limited_pipe<R>(
 mod tests {
     use super::{
         finish_pipe_task, run_shell_foreground_with_timeout, spawn_pipe_reader,
-        wait_child_with_timeout, BackgroundTaskLimiter, RUN_SHELL_TRUNCATION_MARKER,
+        wait_child_with_timeout, RUN_SHELL_TRUNCATION_MARKER,
     };
     use crate::terminal::TerminalProfile;
     use rmux_core::{EnvironmentStore, OptionStore};
@@ -522,27 +455,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::AsyncWriteExt;
-
-    #[test]
-    fn background_task_limiter_releases_capacity_when_permits_drop() {
-        let limiter = BackgroundTaskLimiter::new(2);
-        let first = limiter.try_acquire().expect("first permit");
-        let second = limiter.try_acquire().expect("second permit");
-        let error = limiter
-            .try_acquire()
-            .expect_err("third permit should exceed capacity");
-        assert!(
-            error.to_string().contains("too many background tasks"),
-            "unexpected error: {error}"
-        );
-
-        drop(first);
-        let third = limiter
-            .try_acquire()
-            .expect("dropped permit should restore capacity");
-        drop(second);
-        drop(third);
-    }
 
     #[tokio::test]
     async fn pipe_drain_keeps_reading_active_output_after_finish_request() {

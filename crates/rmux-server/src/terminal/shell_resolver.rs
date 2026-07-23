@@ -120,11 +120,29 @@ fn resolve_program_path_with_base(
     environment: &HashMap<String, String>,
     current_dir: Option<&Path>,
 ) -> PathBuf {
-    if path.components().count() > 1 {
-        return path.to_path_buf();
+    if path.is_absolute() || has_path_component(path) {
+        let base = current_dir
+            .map(Path::to_path_buf)
+            .or_else(|| env::current_dir().ok());
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(base) = base {
+            base.join(path)
+        } else {
+            path.to_path_buf()
+        };
+        let pathext = environment_or_process_os_value(environment, "PATHEXT");
+        return resolve_program_candidate(&candidate, pathext.as_deref())
+            .unwrap_or_else(|| path.to_path_buf());
     }
 
     find_program_on_path(path, environment, current_dir).unwrap_or_else(|| path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn has_path_component(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
 }
 
 #[cfg(windows)]
@@ -187,7 +205,6 @@ fn search_path_in_from(
     pathext: Option<&OsStr>,
     current_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    let extensions = executable_extensions(path, pathext);
     for directory in env::split_paths(path_value) {
         let directory = if directory.is_absolute() {
             directory
@@ -196,33 +213,60 @@ fn search_path_in_from(
         } else {
             directory
         };
-        for extension in &extensions {
-            let candidate = directory.join(format!("{}{}", path.to_string_lossy(), extension));
-            if candidate.is_file() && is_usable_shell_candidate(&candidate) {
-                return Some(candidate);
-            }
+        if let Some(candidate) = resolve_program_candidate(&directory.join(path), pathext) {
+            return Some(candidate);
         }
     }
     None
 }
 
 #[cfg(windows)]
-fn executable_extensions(path: &Path, pathext: Option<&OsStr>) -> Vec<String> {
+fn resolve_program_candidate(path: &Path, pathext: Option<&OsStr>) -> Option<PathBuf> {
+    executable_extensions(path, pathext)
+        .into_iter()
+        .map(|extension| append_extension(path, &extension))
+        .find(|candidate| candidate.is_file() && is_usable_shell_candidate(candidate))
+}
+
+#[cfg(windows)]
+fn executable_extensions(path: &Path, pathext: Option<&OsStr>) -> Vec<OsString> {
     if path.extension().is_some() {
-        return vec![String::new()];
+        return vec![OsString::new()];
     }
 
-    pathext
-        .map(|value| {
-            value
-                .to_string_lossy()
-                .split(';')
-                .filter(|extension| !extension.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .filter(|extensions| !extensions.is_empty())
-        .unwrap_or_else(|| vec![".COM".to_owned(), ".EXE".to_owned(), ".BAT".to_owned()])
+    let mut extensions = vec![OsString::new()];
+    extensions.extend(
+        pathext
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|extension| !extension.is_empty())
+                    .map(|extension| {
+                        if extension.starts_with('.') {
+                            OsString::from(extension)
+                        } else {
+                            OsString::from(format!(".{extension}"))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|extensions| !extensions.is_empty())
+            .unwrap_or_else(|| {
+                [".COM", ".EXE", ".BAT", ".CMD"]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect()
+            }),
+    );
+    extensions
+}
+
+#[cfg(windows)]
+fn append_extension(path: &Path, extension: &OsStr) -> PathBuf {
+    let mut candidate = path.as_os_str().to_owned();
+    candidate.push(extension);
+    PathBuf::from(candidate)
 }
 
 #[cfg(unix)]
@@ -450,6 +494,33 @@ mod tests {
         let resolved = resolve_program_path_from(Path::new("rmux-probe"), &environment, &root);
 
         assert_eq!(resolved, bin.join("rmux-probe.EXE"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_program_path_completes_explicit_paths_from_child_cwd_and_pathext() {
+        let root = unique_test_dir("explicit-pathext");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("bin test directory");
+        let absolute = bin.join("absolute-shim.CMD");
+        let relative = bin.join("relative-shim.BAT");
+        fs::write(&absolute, b"").expect("absolute batch fixture");
+        fs::write(&relative, b"").expect("relative batch fixture");
+        let environment = HashMap::from([("PATHEXT".to_owned(), "CMD;.BAT".to_owned())]);
+
+        let resolved_absolute = resolve_program_path_from(
+            &bin.join("absolute-shim"),
+            &environment,
+            Path::new(r"C:\ignored-for-absolute-path"),
+        );
+        let resolved_relative = resolve_program_path_from(
+            &PathBuf::from("bin").join("relative-shim"),
+            &environment,
+            &root,
+        );
+
+        assert_eq!(resolved_absolute, absolute);
+        assert_eq!(resolved_relative, relative);
         let _ = fs::remove_dir_all(root);
     }
 

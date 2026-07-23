@@ -70,6 +70,163 @@ async fn non_websocket_http_paths_return_404() {
 }
 
 #[tokio::test]
+async fn shutdown_closes_the_web_listener() {
+    let port = {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind port probe");
+        probe.local_addr().expect("probe address").port()
+    };
+    let handler = Arc::new(RequestHandler::new());
+    handler.update_web_listener_port(port);
+    super::spawn(Arc::clone(&handler))
+        .await
+        .expect("web listener starts");
+
+    handler.close_normal_request_admission();
+    timeout(Duration::from_secs(1), async {
+        while !handler.normal_requests_quiesced() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("listener admission drains on shutdown");
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).await.is_err(),
+        "the Web listener must stop accepting once normal admission closes"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_closes_an_admitted_partial_http_connection() {
+    let handler = Arc::new(RequestHandler::new());
+    let (mut client, connection_task) =
+        raw_connection(Arc::clone(&handler), PreAuthQueue::new(1)).await;
+    client
+        .write_all(b"GET /share HTTP/1.1\r\nHost: local\r\n")
+        .await
+        .expect("partial request keeps the admitted connection open");
+
+    handler.close_normal_request_admission();
+    timeout(Duration::from_secs(1), connection_task)
+        .await
+        .expect("admitted connection observes shutdown")
+        .expect("connection task joins")
+        .expect("connection closes cleanly");
+    assert!(handler.normal_requests_quiesced());
+
+    let mut byte = [0u8; 1];
+    let closed = timeout(Duration::from_secs(1), client.read(&mut byte))
+        .await
+        .expect("server closes the admitted socket");
+    assert!(
+        match &closed {
+            Ok(0) => true,
+            Err(error) => error.kind() == io::ErrorKind::ConnectionReset,
+            Ok(_) => false,
+        },
+        "unexpected socket result after shutdown: {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_closes_established_pane_and_session_websockets_and_forwarder() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_session(&handler, "websocket-shutdown-drain").await;
+    let pane_share = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(
+            PaneTarget::new(session_name.clone(), 0).into(),
+        )),
+    )
+    .await;
+    let session_share = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name)),
+    )
+    .await;
+    let mut pane = TestWebSocket::connect(
+        Arc::clone(&handler),
+        &token_from_url(
+            pane_share
+                .spectator_url
+                .as_deref()
+                .expect("pane spectator URL"),
+        ),
+    )
+    .await;
+    let mut session = TestWebSocket::connect(
+        Arc::clone(&handler),
+        &token_from_url(
+            session_share
+                .spectator_url
+                .as_deref()
+                .expect("session spectator URL"),
+        ),
+    )
+    .await;
+    assert_eq!(pane.read_json().await["scope"], "pane");
+    pane.read_binary_with_prefix(0x10, "pane snapshot").await;
+    assert_eq!(session.read_json().await["scope"], "session");
+    session
+        .read_binary_with_prefix(0x10, "session snapshot")
+        .await;
+
+    handler.close_normal_request_admission();
+    let TestWebSocket {
+        stream: mut pane_stream,
+        task: pane_task,
+        ..
+    } = pane;
+    let TestWebSocket {
+        stream: mut session_stream,
+        task: session_task,
+        ..
+    } = session;
+    timeout(Duration::from_secs(2), async {
+        pane_task
+            .await
+            .expect("pane server task joins")
+            .expect("pane server task closes cleanly");
+        session_task
+            .await
+            .expect("session server task joins")
+            .expect("session server task closes cleanly");
+        while !handler.normal_requests_quiesced() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("WebSocket connections and session forwarder drain on shutdown");
+
+    assert_tcp_stream_closed(&mut pane_stream, "pane WebSocket").await;
+    assert_tcp_stream_closed(&mut session_stream, "session WebSocket").await;
+}
+
+async fn assert_tcp_stream_closed(stream: &mut TcpStream, label: &str) {
+    timeout(Duration::from_secs(1), async {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::NotConnected
+                    ) =>
+                {
+                    return;
+                }
+                Err(error) => panic!("unexpected {label} close error: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label} did not close after shutdown"));
+}
+
+#[tokio::test]
 async fn head_requests_return_headers_without_body() {
     let response = response_for("HEAD /missing HTTP/1.1\r\nHost: local\r\n\r\n").await;
 
@@ -1168,6 +1325,72 @@ async fn loopback_backoff_waiters_do_not_block_another_share_over_websocket() {
 }
 
 #[tokio::test]
+async fn shutdown_cancels_authentication_backoff_before_web_open_admission() {
+    let handler = Arc::new(RequestHandler::new_with_web_authentication_limits(
+        1, 8, 8, 4,
+    ));
+    let session_name = create_session(&handler, "websocket-shutdown-auth-wait").await;
+    let created = create_share(
+        &handler,
+        CreateWebShareRequest {
+            require_pin: true,
+            ..share_request(WebShareScope::Pane(PaneTarget::new(session_name, 0).into()))
+        },
+    )
+    .await;
+    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let pin = created
+        .spectator_pairing_code
+        .as_deref()
+        .expect("protected share has a PIN");
+    let wrong_pin = if pin == "000000" { "111111" } else { "000000" };
+    let token_id = SecretHashForCrypto::from_secret(&token).token_id();
+
+    // Four settled failures make the next valid attempt wait 800 ms.
+    for _ in 0..4 {
+        let HandshakeSession {
+            mut stream, task, ..
+        } = drive_handshake_through_auth(
+            Arc::clone(&handler),
+            &token,
+            &token_id,
+            &auth_text_with_pin(wrong_pin),
+        )
+        .await;
+        assert_close(&mut stream, 4000, "handshake_rejected").await;
+        drop(stream);
+        task.await
+            .expect("failed PIN task joins")
+            .expect("failed PIN task exits cleanly");
+    }
+
+    let HandshakeSession { stream, task, .. } = drive_handshake_through_auth(
+        Arc::clone(&handler),
+        &token,
+        &token_id,
+        &auth_text_with_pin(pin),
+    )
+    .await;
+    timeout(Duration::from_millis(100), async {
+        while handler.web_authentication_wait_count() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("valid connection enters authentication backoff");
+
+    handler.close_normal_request_admission();
+    timeout(Duration::from_millis(500), task)
+        .await
+        .expect("shutdown cancels authentication before the 800 ms backoff")
+        .expect("authentication task joins")
+        .expect("authentication task exits cleanly");
+    drop(stream);
+    assert_eq!(handler.web_authentication_wait_count(), 0);
+    assert!(handler.normal_requests_quiesced());
+}
+
+#[tokio::test]
 async fn handshake_rejects_capacity_reached_with_collapsed_close() {
     // The share caps spectators at 1. Once that slot is held by a live viewer,
     // a second spectator hits the capacity-reached path after token auth. Keep
@@ -1509,10 +1732,17 @@ async fn response_for(request: impl AsRef<[u8]>) -> String {
     let (server, _) = server.expect("server accepts");
     let pre_auth = PreAuthQueue::new(16);
     let pre_auth_admission = pre_auth.try_register().expect("pre-auth slot");
+    let handler = Arc::new(RequestHandler::new());
+    let shutdown = handler.normal_request_shutdown_receiver();
+    let connection_admission = handler
+        .try_begin_normal_request(false)
+        .expect("test connection is admitted");
     let task = tokio::spawn(serve_admitted_connection(
         server,
-        Arc::new(RequestHandler::new()),
+        handler,
         pre_auth_admission,
+        shutdown,
+        connection_admission,
     ));
 
     client
@@ -1850,10 +2080,16 @@ async fn raw_connection(
     let client = client.expect("client connects");
     let (server, _) = server.expect("server accepts");
     let pre_auth_admission = pre_auth.try_register().expect("pre-auth slot");
+    let shutdown = handler.normal_request_shutdown_receiver();
+    let connection_admission = handler
+        .try_begin_normal_request(false)
+        .expect("test connection is admitted");
     let task = tokio::spawn(serve_admitted_connection(
         server,
         handler,
         pre_auth_admission,
+        shutdown,
+        connection_admission,
     ));
     (client, task)
 }
@@ -1872,10 +2108,14 @@ async fn raw_peer_connection(
     let client = client.expect("client connects");
     let (server, peer_addr) = server.expect("server accepts");
     let pre_auth_admission = pre_auth.admit_peer(peer_addr.ip()).await?;
+    let shutdown = handler.normal_request_shutdown_receiver();
+    let connection_admission = handler.try_begin_normal_request(false)?;
     let task = tokio::spawn(serve_admitted_connection(
         server,
         handler,
         pre_auth_admission,
+        shutdown,
+        connection_admission,
     ));
     Some((client, task))
 }

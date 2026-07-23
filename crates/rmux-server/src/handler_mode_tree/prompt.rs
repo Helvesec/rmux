@@ -8,29 +8,40 @@ use super::super::prompt_support::{
     PromptQueueResult, PromptStartOutcome, PromptType,
 };
 use super::super::scripting_support::QueueExecutionContext;
-use super::super::RequestHandler;
+use super::super::{RequestHandler, RequesterOrigin};
 use super::mode_tree_model::{
-    ModeTreeDeferredAction, ModeTreePromptCallback, SearchDirection, SearchState,
+    ModeTreeActionIdentity, ModeTreeDeferredAction, ModeTreePromptCallback, SearchDirection,
+    SearchState,
 };
 use super::mode_tree_selection::{repeat_search, selected_items};
 use super::SAFE_PROMPT_TEMPLATE;
 
 impl RequestHandler {
-    pub(super) async fn start_mode_tree_prompt(
+    pub(super) async fn start_mode_tree_prompt_for_action_identity(
         &self,
-        attach_pid: u32,
+        action_identity: ModeTreeActionIdentity,
         callback: ModeTreePromptCallback,
     ) -> Result<(), RmuxError> {
-        let mode = {
+        let attach_pid = action_identity.attach_pid();
+        let _ = self.mode_tree_for_action_identity(action_identity).await?;
+        let (mode, identity) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
+                .filter(|active| {
+                    active.id == action_identity.attach_id()
+                        && active.mode_tree_state_id == action_identity.state_id()
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
                 .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            active
-                .mode_tree
-                .clone()
-                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
+            (
+                active
+                    .mode_tree
+                    .clone()
+                    .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?,
+                active.identity(attach_pid),
+            )
         };
         let (prompt, initial, prompt_type) = match &callback {
             ModeTreePromptCallback::Filter => (
@@ -58,7 +69,7 @@ impl RequestHandler {
             }
         };
         let plan = CommandPromptPlan {
-            requester_pid: attach_pid,
+            origin: mode.origin.clone(),
             target_client: None,
             context: QueueExecutionContext::without_caller_cwd(),
             fields: vec![PromptField {
@@ -71,12 +82,14 @@ impl RequestHandler {
             background: false,
             format_values: Vec::new(),
         };
-        let outcome = self.start_command_prompt(plan).await?;
+        let outcome = self
+            .start_command_prompt_for_identity(identity, plan)
+            .await?;
         if let PromptStartOutcome::Waiting(rx) = outcome {
             let handler = self.clone();
             tokio::spawn(async move {
                 handler
-                    .await_mode_tree_prompt(attach_pid, callback, rx)
+                    .await_mode_tree_prompt(action_identity, callback, rx)
                     .await;
             });
         }
@@ -85,13 +98,17 @@ impl RequestHandler {
 
     async fn await_mode_tree_prompt(
         &self,
-        attach_pid: u32,
+        identity: ModeTreeActionIdentity,
         callback: ModeTreePromptCallback,
         rx: oneshot::Receiver<PromptQueueResult>,
     ) {
         let Ok(result) = rx.await else {
             return;
         };
+        let Some(origin) = result.origin else {
+            return;
+        };
+        let _access = self.begin_requester_origin_access(&origin);
         let Some(value) = result
             .responses
             .as_ref()
@@ -103,51 +120,68 @@ impl RequestHandler {
         let output = value.trim().to_owned();
         match callback {
             ModeTreePromptCallback::Filter => {
-                let _ = self.apply_mode_tree_filter(attach_pid, output).await;
+                let _ = self.apply_mode_tree_filter(identity, output).await;
             }
             ModeTreePromptCallback::Search(direction) => {
                 let _ = self
-                    .apply_mode_tree_search(attach_pid, output, direction)
+                    .apply_mode_tree_search(identity, output, direction)
                     .await;
             }
             ModeTreePromptCallback::Command => {
-                let _ = self.apply_mode_tree_command(attach_pid, output).await;
+                let _ = self
+                    .apply_mode_tree_command(identity, &origin, output)
+                    .await;
             }
             ModeTreePromptCallback::CustomizeSetOption { scope, name } => {
                 let _ = self
-                    .apply_customize_option_value(attach_pid, scope, name, output)
+                    .apply_customize_option_value(identity, &origin, scope, name, output)
                     .await;
             }
             ModeTreePromptCallback::CustomizeSetKey { table_name, key } => {
                 let _ = self
-                    .apply_customize_key_value(attach_pid, table_name, key, output)
+                    .apply_customize_key_value(identity, &origin, table_name, key, output)
                     .await;
             }
         }
     }
 
-    pub(super) async fn confirm_mode_tree_action(
+    pub(super) async fn confirm_mode_tree_action_for_identity(
         &self,
-        attach_pid: u32,
+        action_identity: ModeTreeActionIdentity,
         prompt: String,
         action: ModeTreeDeferredAction,
     ) -> Result<(), RmuxError> {
-        let auto_accept = {
+        let attach_pid = action_identity.attach_pid();
+        let _ = self.mode_tree_for_action_identity(action_identity).await?;
+        let (auto_accept, origin, identity) = {
             let active_attach = self.active_attach.lock().await;
-            active_attach
+            let active = active_attach
                 .by_pid
                 .get(&attach_pid)
-                .and_then(|active| active.mode_tree.as_ref())
-                .is_some_and(|mode| mode.auto_accept)
+                .filter(|active| {
+                    active.id == action_identity.attach_id()
+                        && active.mode_tree_state_id == action_identity.state_id()
+                        && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+                })
+                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
+            let mode = active
+                .mode_tree
+                .as_ref()
+                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?;
+            (
+                mode.auto_accept,
+                mode.origin.clone(),
+                active.identity(attach_pid),
+            )
         };
         if auto_accept {
             return self
-                .execute_mode_tree_deferred_action(attach_pid, action)
+                .execute_mode_tree_deferred_action(action_identity, &origin, action)
                 .await;
         }
 
         let plan = ConfirmBeforePlan {
-            requester_pid: attach_pid,
+            origin: origin.clone(),
             target_client: None,
             context: QueueExecutionContext::without_caller_cwd(),
             prompt,
@@ -157,16 +191,21 @@ impl RequestHandler {
             background: false,
             format_values: Vec::new(),
         };
-        let outcome = self.start_confirm_before(plan).await?;
+        let outcome = self
+            .start_confirm_before_for_identity(identity, plan)
+            .await?;
         if let PromptStartOutcome::Waiting(rx) = outcome {
             let handler = self.clone();
             tokio::spawn(async move {
                 let Ok(result) = rx.await else {
                     return;
                 };
+                let Some(origin) = result.origin else {
+                    return;
+                };
                 if result.inserted.is_some() {
                     let _ = handler
-                        .execute_mode_tree_deferred_action(attach_pid, action)
+                        .execute_mode_tree_deferred_action(action_identity, &origin, action)
                         .await;
                 }
             });
@@ -174,39 +213,59 @@ impl RequestHandler {
         Ok(())
     }
 
-    async fn execute_mode_tree_deferred_action(
+    pub(super) async fn execute_mode_tree_deferred_action(
         &self,
-        attach_pid: u32,
+        identity: ModeTreeActionIdentity,
+        origin: &RequesterOrigin,
         action: ModeTreeDeferredAction,
     ) -> Result<(), RmuxError> {
+        #[cfg(test)]
+        super::mode_tree_test_support::pause_mode_tree_identity(
+            super::mode_tree_test_support::ModeTreeIdentityPausePoint::DeferredAction(
+                identity.attach_pid(),
+            ),
+        )
+        .await;
+        let _ = self.mode_tree_for_action_identity(identity).await?;
+        let _access = self.require_requester_origin_write(origin).await?;
         match action {
             ModeTreeDeferredAction::DeleteBuffers { targets } => {
-                self.perform_buffer_delete_actions(attach_pid, targets)
+                self.perform_buffer_delete_actions_for_identity(identity, targets)
                     .await
             }
             ModeTreeDeferredAction::DetachClients { targets } => {
-                self.perform_client_detach_actions(attach_pid, targets)
+                self.perform_client_detach_actions_for_identity(identity, targets)
                     .await
             }
             ModeTreeDeferredAction::KillCurrentTreeSelection { targets } => {
-                self.perform_tree_kill_actions(attach_pid, targets).await
+                self.perform_tree_kill_actions_for_identity(identity, targets)
+                    .await
             }
             ModeTreeDeferredAction::KillTaggedTreeSelections { targets } => {
-                self.perform_tree_kill_tagged_actions(attach_pid, targets)
+                self.perform_tree_kill_tagged_actions_for_identity(identity, targets)
                     .await
             }
         }
     }
 
-    async fn apply_mode_tree_filter(
+    pub(super) async fn apply_mode_tree_filter(
         &self,
-        attach_pid: u32,
+        identity: ModeTreeActionIdentity,
         value: String,
     ) -> Result<(), RmuxError> {
+        let state = self.state.lock().await;
         let mut active_attach = self.active_attach.lock().await;
         let active = active_attach
             .by_pid
-            .get_mut(&attach_pid)
+            .get_mut(&identity.attach_pid())
+            .filter(|active| {
+                active.id == identity.attach_id()
+                    && active.mode_tree_state_id == identity.state_id()
+                    && active.mode_tree.as_ref().is_some_and(|mode| {
+                        super::mode_tree_runtime_identity::mode_tree_host_is_current(&state, mode)
+                    })
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
             .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
         let Some(mode) = active.mode_tree.as_mut() else {
             return Ok(());
@@ -215,65 +274,54 @@ impl RequestHandler {
         mode.scroll = 0;
         mode.preview_scroll = 0;
         drop(active_attach);
-        self.refresh_mode_tree_overlay_if_active(attach_pid).await
+        drop(state);
+        self.refresh_mode_tree_overlay_for_action_identity(identity)
+            .await
     }
 
     async fn apply_mode_tree_search(
         &self,
-        attach_pid: u32,
+        identity: ModeTreeActionIdentity,
         value: String,
         direction: SearchDirection,
     ) -> Result<(), RmuxError> {
-        let mut mode = {
-            let active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get(&attach_pid)
-                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            active
-                .mode_tree
-                .clone()
-                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
-        };
+        let attach_pid = identity.attach_pid();
+        let mut mode = self.mode_tree_for_action_identity(identity).await?;
         mode.search = (!value.is_empty()).then_some(SearchState { value, direction });
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
         repeat_search(&mut mode, &build, false);
-        self.store_mode_tree_state(attach_pid, mode).await?;
-        self.refresh_mode_tree_overlay_if_active(attach_pid).await
+        let identity = self
+            .store_mode_tree_state_for_action_identity(identity, mode)
+            .await?;
+        self.refresh_mode_tree_overlay_for_action_identity(identity)
+            .await
     }
 
-    async fn apply_mode_tree_command(
+    pub(super) async fn apply_mode_tree_command(
         &self,
-        attach_pid: u32,
+        identity: ModeTreeActionIdentity,
+        origin: &RequesterOrigin,
         command: String,
     ) -> Result<(), RmuxError> {
         if command.trim().is_empty() {
             return Ok(());
         }
-        let mut mode = {
-            let active_attach = self.active_attach.lock().await;
-            let active = active_attach
-                .by_pid
-                .get(&attach_pid)
-                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-            active
-                .mode_tree
-                .clone()
-                .ok_or_else(|| RmuxError::Server("mode-tree is not active".to_owned()))?
-        };
+        let attach_pid = identity.attach_pid();
+        let mut mode = self.mode_tree_for_action_identity(identity).await?;
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
         let targets = selected_items(&mode, &build)
             .into_iter()
             .filter_map(|item| item.action.target_string())
             .collect::<Vec<_>>();
-        let refresh_sessions = self.dismiss_mode_tree(attach_pid).await?;
+        let refresh_sessions = self.dismiss_mode_tree_for_action_identity(identity).await?;
+        let requester_pid = origin.requester_pid();
         if targets.is_empty() {
             let parsed = CommandParser::new()
                 .parse_one_group(&command)
                 .map_err(|error| RmuxError::Server(error.message().to_owned()))?;
             let context = QueueExecutionContext::without_caller_cwd();
             let _ = self
-                .execute_parsed_commands(attach_pid, parsed, context)
+                .execute_parsed_commands(requester_pid, parsed, context)
                 .await?;
         } else {
             for target in targets {
@@ -283,7 +331,7 @@ impl RequestHandler {
                     .map_err(|error| RmuxError::Server(error.message().to_owned()))?;
                 let context = QueueExecutionContext::without_caller_cwd();
                 let _ = self
-                    .execute_parsed_commands(attach_pid, parsed, context)
+                    .execute_parsed_commands(requester_pid, parsed, context)
                     .await?;
             }
         }
@@ -295,52 +343,80 @@ impl RequestHandler {
 
     async fn apply_customize_option_value(
         &self,
-        attach_pid: u32,
+        identity: ModeTreeActionIdentity,
+        origin: &RequesterOrigin,
         scope: OptionScopeSelector,
         name: String,
         value: String,
     ) -> Result<(), RmuxError> {
+        let _ = self.mode_tree_for_action_identity(identity).await?;
+        let _access = self.require_requester_origin_write(origin).await?;
+        #[cfg(test)]
+        super::mode_tree_test_support::pause_mode_tree_identity(
+            super::mode_tree_test_support::ModeTreeIdentityPausePoint::Mutation(
+                identity.attach_pid(),
+            ),
+        )
+        .await;
         let response = self
-            .handle_set_option_by_name(SetOptionByNameRequest {
-                scope,
-                name,
-                value: Some(value),
-                mode: SetOptionMode::Replace,
-                only_if_unset: false,
-                unset: false,
-                unset_pane_overrides: false,
-                format: false,
-                format_target: None,
-            })
+            .handle_set_option_by_name_for_mode_tree(
+                SetOptionByNameRequest {
+                    scope,
+                    name,
+                    value: Some(value),
+                    mode: SetOptionMode::Replace,
+                    only_if_unset: false,
+                    unset: false,
+                    unset_pane_overrides: false,
+                    format: false,
+                    format_target: None,
+                },
+                identity,
+            )
             .await;
         if let Response::Error(error) = response {
             return Err(error.error);
         }
-        self.refresh_mode_tree_overlay_if_active(attach_pid).await
+        self.refresh_mode_tree_overlay_for_action_identity(identity)
+            .await
     }
 
     async fn apply_customize_key_value(
         &self,
-        attach_pid: u32,
+        identity: ModeTreeActionIdentity,
+        origin: &RequesterOrigin,
         table_name: String,
         key: KeyCode,
         value: String,
     ) -> Result<(), RmuxError> {
+        let _ = self.mode_tree_for_action_identity(identity).await?;
+        let _access = self.require_requester_origin_write(origin).await?;
         let parsed = CommandParser::new()
             .parse_one_group(&value)
             .map_err(|error| RmuxError::Server(error.message().to_owned()))?;
+        #[cfg(test)]
+        super::mode_tree_test_support::pause_mode_tree_identity(
+            super::mode_tree_test_support::ModeTreeIdentityPausePoint::Mutation(
+                identity.attach_pid(),
+            ),
+        )
+        .await;
         let response = self
-            .handle_bind_key(BindKeyRequest {
-                table_name,
-                key: rmux_core::key_string_lookup_key(key, false),
-                note: None,
-                repeat: false,
-                command: Some(vec![parsed.to_tmux_reparse_string()]),
-            })
+            .handle_bind_key_for_mode_tree(
+                BindKeyRequest {
+                    table_name,
+                    key: rmux_core::key_string_lookup_key(key, false),
+                    note: None,
+                    repeat: false,
+                    command: Some(vec![parsed.to_tmux_reparse_string()]),
+                },
+                identity,
+            )
             .await;
         if let Response::Error(error) = response {
             return Err(error.error);
         }
-        self.refresh_mode_tree_overlay_if_active(attach_pid).await
+        self.refresh_mode_tree_overlay_for_action_identity(identity)
+            .await
     }
 }

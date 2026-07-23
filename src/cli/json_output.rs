@@ -46,6 +46,19 @@ const LIST_SESSIONS_FIELDS: &[JsonField] = &[
     JsonField::number("session_created"),
 ];
 
+const LIST_WINDOWS_JSON_FIELDS: &[JsonField] = &[
+    JsonField::string("session_name"),
+    JsonField::number("window_index"),
+    JsonField::string("window_id"),
+    JsonField::string("window_name"),
+    JsonField::number("window_panes"),
+    JsonField::number("window_width"),
+    JsonField::number("window_height"),
+    JsonField::string("window_layout"),
+    JsonField::bool("window_active"),
+    JsonField::bool("window_last_flag"),
+];
+
 pub(super) fn list_clients_json_format() -> String {
     json_format(LIST_CLIENTS_FIELDS)
 }
@@ -56,6 +69,14 @@ pub(super) fn list_panes_json_format() -> String {
 
 pub(super) fn list_sessions_json_format() -> String {
     json_format(LIST_SESSIONS_FIELDS)
+}
+
+pub(super) fn list_windows_json_format() -> String {
+    LIST_WINDOWS_JSON_FIELDS
+        .iter()
+        .map(|field| format!("#{{n:{0}}}:#{{{0}}}", field.name))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn json_format(fields: &[JsonField]) -> String {
@@ -118,6 +139,14 @@ pub(super) fn write_list_panes_json(output: &CommandOutput) -> Result<i32, ExitF
 
 pub(super) fn write_list_sessions_json(output: &CommandOutput) -> Result<i32, ExitFailure> {
     write_delimited_output_as_json(output, LIST_SESSIONS_FIELDS, "list-sessions")
+}
+
+pub(super) fn write_length_prefixed_list_windows_json(
+    output: &CommandOutput,
+) -> Result<i32, ExitFailure> {
+    let rows =
+        parse_length_prefixed_rows(output.stdout(), LIST_WINDOWS_JSON_FIELDS, "list-windows")?;
+    write_json_value(&Value::Array(rows), "list-windows")
 }
 
 pub(super) fn filter_delimited_json_output(
@@ -234,6 +263,73 @@ fn parse_delimited_row(
     Ok(Value::Object(object))
 }
 
+fn parse_length_prefixed_rows(
+    bytes: &[u8],
+    fields: &[JsonField],
+    command_name: &'static str,
+) -> Result<Vec<Value>, ExitFailure> {
+    let mut rows = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let mut object = Map::with_capacity(fields.len());
+        for field in fields {
+            let relative_colon = bytes[cursor..]
+                .iter()
+                .position(|byte| *byte == b':')
+                .ok_or_else(|| length_prefix_error(command_name, field.name))?;
+            let colon = cursor + relative_colon;
+            let length = std::str::from_utf8(&bytes[cursor..colon])
+                .ok()
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| length_prefix_error(command_name, field.name))?;
+            let value_start = colon + 1;
+            let value_end = value_start.checked_add(length).ok_or_else(|| {
+                ExitFailure::new(1, format!("{command_name} --json field length overflow"))
+            })?;
+            let value = bytes.get(value_start..value_end).ok_or_else(|| {
+                ExitFailure::new(
+                    1,
+                    format!(
+                        "{command_name} --json field '{}' exceeds the captured row",
+                        field.name
+                    ),
+                )
+            })?;
+            let value = std::str::from_utf8(value).map_err(|error| {
+                ExitFailure::new(
+                    1,
+                    format!(
+                        "{command_name} --json field '{}' is not UTF-8: {error}",
+                        field.name
+                    ),
+                )
+            })?;
+            object.insert(
+                field.name.to_owned(),
+                typed_field_value(field, value, command_name)?,
+            );
+            cursor = value_end;
+        }
+        if bytes.get(cursor) != Some(&b'\n') {
+            return Err(ExitFailure::new(
+                1,
+                format!("{command_name} --json row is missing its terminator"),
+            ));
+        }
+        cursor += 1;
+        rows.push(Value::Object(object));
+    }
+    Ok(rows)
+}
+
+fn length_prefix_error(command_name: &'static str, field_name: &'static str) -> ExitFailure {
+    ExitFailure::new(
+        1,
+        format!("{command_name} --json field '{field_name}' has an invalid length prefix"),
+    )
+}
+
 fn field_value(
     field: &JsonField,
     value: &str,
@@ -249,6 +345,14 @@ fn field_value(
         ));
     }
 
+    typed_field_value(field, value, command_name)
+}
+
+fn typed_field_value(
+    field: &JsonField,
+    value: &str,
+    command_name: &'static str,
+) -> Result<Value, ExitFailure> {
     match field.kind {
         JsonFieldKind::String => Ok(Value::String(value.to_owned())),
         JsonFieldKind::Bool => parse_bool(value, field.name, command_name).map(Value::Bool),
@@ -332,7 +436,9 @@ fn write_json_value(value: &Value, command_name: &'static str) -> Result<i32, Ex
 #[cfg(test)]
 mod tests {
     use super::{
-        list_sessions_json_format, parse_delimited_rows, LIST_PANES_FIELDS, LIST_SESSIONS_FIELDS,
+        list_sessions_json_format, list_windows_json_format, parse_delimited_rows,
+        parse_length_prefixed_rows, LIST_PANES_FIELDS, LIST_SESSIONS_FIELDS,
+        LIST_WINDOWS_JSON_FIELDS,
     };
 
     #[test]
@@ -376,5 +482,35 @@ mod tests {
             .expect_err("field count mismatch should fail");
 
         assert!(error.message().contains("expected 10 fields"));
+    }
+
+    #[test]
+    fn list_windows_length_prefix_preserves_all_user_control_characters() {
+        assert!(list_windows_json_format()
+            .starts_with("#{n:session_name}:#{session_name}#{n:window_index}:#{window_index}"));
+        let values = [
+            "alpha",
+            "0",
+            "@1",
+            "unit\x1frow\x1e\n雪",
+            "1",
+            "80",
+            "24",
+            "tiled",
+            "1",
+            "0",
+        ];
+        let mut payload = Vec::new();
+        for value in values {
+            payload.extend_from_slice(format!("{}:", value.len()).as_bytes());
+            payload.extend_from_slice(value.as_bytes());
+        }
+        payload.push(b'\n');
+
+        let rows = parse_length_prefixed_rows(&payload, LIST_WINDOWS_JSON_FIELDS, "list-windows")
+            .expect("length-prefixed row parses");
+        assert_eq!(rows[0]["window_name"], "unit\x1frow\x1e\n雪");
+        assert_eq!(rows[0]["window_index"], 0);
+        assert_eq!(rows[0]["window_active"], true);
     }
 }

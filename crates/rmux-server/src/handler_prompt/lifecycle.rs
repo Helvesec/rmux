@@ -5,8 +5,7 @@ use tracing::warn;
 use super::super::attach_support::ActiveAttachIdentity;
 use super::super::control_support::ManagedClient;
 use super::super::scripting_support::{
-    command_parser_from_state, spawn_background_async, ParsedPromptHistoryCommand,
-    PromptHistoryAction, QueueCommandAction,
+    command_parser_from_state, ParsedPromptHistoryCommand, PromptHistoryAction, QueueCommandAction,
 };
 use super::super::{with_expected_attach_and_session_identity, RequestHandler};
 use super::events::process_prompt_event;
@@ -50,7 +49,7 @@ impl RequestHandler {
     ) -> Result<PromptStartOutcome, RmuxError> {
         let managed = match self
             .resolve_target_managed_client(
-                plan.requester_pid,
+                plan.origin.requester_pid(),
                 plan.target_client.as_deref(),
                 "command-prompt",
             )
@@ -130,7 +129,7 @@ impl RequestHandler {
     ) -> Result<PromptStartOutcome, RmuxError> {
         let managed = match self
             .resolve_target_managed_client(
-                plan.requester_pid,
+                plan.origin.requester_pid(),
                 plan.target_client.as_deref(),
                 "confirm-before",
             )
@@ -156,6 +155,19 @@ impl RequestHandler {
 
         self.start_confirm_before_for_attach_identity(plan, attach_pid, attach_id)
             .await
+    }
+
+    pub(in crate::handler) async fn start_confirm_before_for_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        plan: ConfirmBeforePlan,
+    ) -> Result<PromptStartOutcome, RmuxError> {
+        self.start_confirm_before_for_attach_identity(
+            plan,
+            identity.attach_pid(),
+            identity.attach_id(),
+        )
+        .await
     }
 
     async fn start_confirm_before_for_attach_identity(
@@ -492,7 +504,7 @@ impl RequestHandler {
         match finished.kind {
             FinishedPromptKind::Cancel => {
                 if let PromptCompletion::Foreground(sender) = finished.completion {
-                    let _ = sender.send(PromptQueueResult::noop());
+                    let _ = sender.send(PromptQueueResult::cancelled(finished.origin));
                 }
             }
             FinishedPromptKind::Command {
@@ -510,23 +522,28 @@ impl RequestHandler {
                                 inserted: Some((parsed, finished.context)),
                                 error: None,
                                 responses: Some(responses),
+                                origin: Some(finished.origin),
                             },
                             Err(error) => PromptQueueResult {
                                 inserted: None,
                                 error: Some(error),
                                 responses: Some(responses),
+                                origin: Some(finished.origin),
                             },
                         });
                     }
                     PromptCompletion::Background => match parsed {
                         Ok(parsed) => {
                             let handler = self.clone();
-                            let requester_pid = finished.requester_pid;
+                            let origin = finished.origin;
+                            let requester_pid = origin.requester_pid();
                             let context = finished.context;
                             let execution_snapshot = snapshot
                                 .filter(|(identity, _, _)| identity.attach_pid() == requester_pid);
-                            let _ =
-                                spawn_background_async("rmux-prompt-finish", move || async move {
+                            let _ = self.spawn_background_task(
+                                "rmux-prompt-finish",
+                                move || async move {
+                                    let _access = handler.begin_requester_origin_access(&origin);
                                     let execution = handler.execute_parsed_commands(
                                         requester_pid,
                                         parsed,
@@ -544,7 +561,8 @@ impl RequestHandler {
                                         }
                                         None => execution.await,
                                     };
-                                });
+                                },
+                            );
                         }
                         Err(error) => {
                             warn!("background prompt command failed to parse: {error}");
@@ -657,14 +675,13 @@ impl RequestHandler {
         match parsed {
             Ok(parsed) => {
                 let handler = self.clone();
-                let execution_snapshot = snapshot
-                    .filter(|(identity, _, _)| identity.attach_pid() == dispatch.requester_pid);
-                let _ = spawn_background_async("rmux-prompt-dispatch", move || async move {
-                    let execution = handler.execute_parsed_commands(
-                        dispatch.requester_pid,
-                        parsed,
-                        dispatch.context,
-                    );
+                let requester_pid = dispatch.origin.requester_pid();
+                let execution_snapshot =
+                    snapshot.filter(|(identity, _, _)| identity.attach_pid() == requester_pid);
+                let _ = self.spawn_background_task("rmux-prompt-dispatch", move || async move {
+                    let _access = handler.begin_requester_origin_access(&dispatch.origin);
+                    let execution =
+                        handler.execute_parsed_commands(requester_pid, parsed, dispatch.context);
                     let _ = match execution_snapshot {
                         Some((identity, session_name, session_id)) => {
                             with_expected_attach_and_session_identity(

@@ -8,6 +8,8 @@ Usage: scripts/check-release-versions.sh [--binary PATH]
 Verify that release-facing versions agree:
   - workspace.package.version in Cargo.toml
   - every RMUX workspace crate version from cargo metadata
+  - every internal workspace path-dependency requirement
+  - RMUX package versions in scripts/fuzz/Cargo.lock
   - snap/snapcraft.yaml, when present
   - rmux.1 release-facing version
   - Windows application manifest assembly version
@@ -96,20 +98,68 @@ metadata_path, expected = sys.argv[1], sys.argv[2]
 metadata = json.load(open(metadata_path, encoding="utf-8"))
 checked = []
 bad = []
+workspace_names = {package["name"] for package in metadata["packages"]}
+dependency_bad = []
 for package in metadata["packages"]:
     name = package["name"]
     if name.startswith("rmux") or name in {"ratatui-rmux", "xtask"}:
         checked.append(name)
         if package["version"] != expected:
             bad.append(f"{name}={package['version']}")
+    for dependency in package["dependencies"]:
+        if dependency.get("path") is None or dependency["name"] not in workspace_names:
+            continue
+        expected_requirement = f"^{expected}"
+        if dependency["req"] != expected_requirement:
+            dependency_bad.append(
+                f"{name}->{dependency['name']}={dependency['req']}"
+            )
 if bad:
     print("version mismatch: " + ", ".join(sorted(bad)), file=sys.stderr)
+    sys.exit(1)
+if dependency_bad:
+    print(
+        "workspace path dependency version mismatch: "
+        + ", ".join(sorted(set(dependency_bad))),
+        file=sys.stderr,
+    )
     sys.exit(1)
 if not checked:
     print("no RMUX workspace packages found in metadata", file=sys.stderr)
     sys.exit(1)
 for name in sorted(checked):
     print(f"{name} {expected}")
+print(f"workspace-path-dependencies ^{expected}")
+PY
+
+[ -f scripts/fuzz/Cargo.lock ] || die "scripts/fuzz/Cargo.lock is missing"
+python3 - "$version" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+expected = sys.argv[1]
+path = Path("scripts/fuzz/Cargo.lock")
+with path.open("rb") as handle:
+    lockfile = tomllib.load(handle)
+
+checked = []
+bad = []
+for package in lockfile.get("package", []):
+    name = package.get("name", "")
+    if package.get("source") is not None or not name.startswith("rmux") or name == "rmux-fuzz":
+        continue
+    version = package.get("version")
+    checked.append(name)
+    if version != expected:
+        bad.append(f"{name}={version}")
+if bad:
+    print("fuzz lock version mismatch: " + ", ".join(sorted(bad)), file=sys.stderr)
+    sys.exit(1)
+if not checked:
+    print("scripts/fuzz/Cargo.lock has no RMUX packages", file=sys.stderr)
+    sys.exit(1)
+print(f"fuzz-lock {expected}")
 PY
 
 if [ -f snap/snapcraft.yaml ]; then

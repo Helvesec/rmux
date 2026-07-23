@@ -89,6 +89,141 @@ async fn link_window_refreshes_attached_non_syntactic_group_peer_output_receiver
 }
 
 #[tokio::test]
+async fn scrollbar_options_resize_shared_runtime_and_refresh_linked_alias() {
+    for kind in ["typed", "named", "sdk"] {
+        let handler = RequestHandler::new();
+        let suffix = kind;
+        let owner = session_name(&format!("scrollbar-option-owner-{suffix}"));
+        let alias = session_name(&format!("scrollbar-option-alias-{suffix}"));
+        create_session(&handler, owner.as_str()).await;
+        create_session(&handler, alias.as_str()).await;
+
+        let linked = handler
+            .handle(Request::LinkWindow(LinkWindowRequest {
+                source: WindowTarget::with_window(owner.clone(), 0),
+                target: WindowTarget::with_window(alias.clone(), 0),
+                after: false,
+                before: false,
+                kill_destination: true,
+                detached: true,
+            }))
+            .await;
+        assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+        handler.wait_for_initial_panes_for_test().await;
+        if kind == "sdk" {
+            assert!(matches!(
+                handler
+                    .handle(Request::SetOption(SetOptionRequest {
+                        scope: ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
+                        option: OptionName::PaneScrollbars,
+                        value: "on".to_owned(),
+                        mode: SetOptionMode::Replace,
+                    }))
+                    .await,
+                Response::SetOption(_)
+            ));
+        }
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        handler
+            .register_attach(
+                match kind {
+                    "typed" => 44,
+                    "named" => 45,
+                    "sdk" => 46,
+                    _ => unreachable!(),
+                },
+                alias.clone(),
+                control_tx,
+            )
+            .await;
+        drain_attach_controls(&mut control_rx).await;
+
+        let request = match kind {
+            "named" => Request::SetOptionByName(Box::new(rmux_proto::SetOptionByNameRequest {
+                scope: rmux_proto::OptionScopeSelector::Window(WindowTarget::with_window(
+                    owner.clone(),
+                    0,
+                )),
+                name: "pane-scrollbars".to_owned(),
+                value: Some("on".to_owned()),
+                mode: SetOptionMode::Replace,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                format: false,
+                format_target: None,
+            })),
+            "sdk" => Request::PaneOptionSet(rmux_proto::PaneOptionSetRequest {
+                target: PaneTargetRef::slot(PaneTarget::with_window(owner.clone(), 0, 0)),
+                name: "pane-scrollbars-style".to_owned(),
+                value: Some("width=2,pad=1".to_owned()),
+                mode: SetOptionMode::Replace,
+                unset: false,
+            }),
+            "typed" => Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(owner.clone(), 0)),
+                option: OptionName::PaneScrollbars,
+                value: "on".to_owned(),
+                mode: SetOptionMode::Replace,
+            }),
+            _ => unreachable!(),
+        };
+        let response = handler.handle(request).await;
+
+        assert!(
+            matches!(
+                response,
+                Response::SetOption(_) | Response::SetOptionByName(_) | Response::PaneOptionSet(_)
+            ),
+            "{suffix}: {response:?}"
+        );
+        let control = timeout(Duration::from_secs(2), control_rx.recv())
+            .await
+            .expect("linked alias must be refreshed after scrollbar geometry changes")
+            .expect("linked alias control channel remains open");
+        assert!(
+            matches!(control, AttachControl::Refresh | AttachControl::Switch(_)),
+            "{suffix}: unexpected linked alias control: {control:?}"
+        );
+        let mut state = handler.state.lock().await;
+        let resolved = if kind == "sdk" {
+            state
+                .options
+                .resolve_for_pane(&alias, 0, 0, OptionName::PaneScrollbarsStyle)
+        } else {
+            state
+                .options
+                .resolve_for_window(&alias, 0, OptionName::PaneScrollbars)
+        };
+        assert_eq!(
+            resolved,
+            Some(if kind == "sdk" { "width=2,pad=1" } else { "on" }),
+            "{suffix}"
+        );
+        let owner_size = state
+            .clone_pane_master_if_alive(&owner, 0, 0)
+            .expect("owner pane runtime")
+            .size()
+            .expect("owner pane size");
+        let alias_size = state
+            .clone_pane_master_if_alive(&alias, 0, 0)
+            .expect("alias pane runtime")
+            .size()
+            .expect("alias pane size");
+        assert_eq!(
+            (owner_size.cols, alias_size.cols),
+            if kind == "sdk" {
+                (117, 117)
+            } else {
+                (119, 119)
+            },
+            "{suffix}: both aliases expose the resized shared PTY"
+        );
+    }
+}
+
+#[tokio::test]
 async fn link_window_k_rejects_same_window_identity_through_group_peer_atomically() {
     let handler = RequestHandler::new();
     let owner = session_name("link-self-owner");

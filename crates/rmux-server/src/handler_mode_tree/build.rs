@@ -1,6 +1,6 @@
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone};
 use rmux_core::{formats::FormatContext, Utf8Config};
-use rmux_proto::{OptionName, PaneTarget, RmuxError};
+use rmux_proto::{PaneTarget, RmuxError};
 use std::collections::BTreeMap;
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
@@ -33,6 +33,11 @@ impl RequestHandler {
     ) -> Result<ModeTreeBuild, RmuxError> {
         let client_snapshot = self.mode_tree_clients_snapshot().await;
         let mut state = self.state.lock().await;
+        if !super::mode_tree_runtime_identity::mode_tree_host_is_current(&state, mode) {
+            return Err(RmuxError::Server(
+                "mode-tree host identity changed before rebuild".to_owned(),
+            ));
+        }
         if matches!(mode.kind, super::mode_tree_model::ModeTreeKind::Tree) {
             state.ensure_live_window_link_occurrences();
         }
@@ -125,14 +130,9 @@ impl RequestHandler {
                 .or_else(|| build.visible.first().cloned());
             mode.scroll = 0;
         }
-        if let Some(session) = state.sessions.session(&mode.session_name) {
-            let rows = session.window().size().rows;
-            let status = state
-                .options
-                .resolve(Some(session.name()), OptionName::Status);
-            let usable = crate::status_lines::content_rows_for_status(status, rows);
+        if let Ok(geometry) = super::mode_tree_geometry::content_geometry(&state, mode) {
             mode.last_list_rows = usize::from(mode_tree_list_rows(
-                usable,
+                geometry.rows(),
                 build.visible.len(),
                 mode.preview_mode,
             ));

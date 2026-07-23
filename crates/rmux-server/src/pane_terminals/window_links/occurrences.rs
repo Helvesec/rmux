@@ -45,6 +45,18 @@ impl HandlerState {
         self.window_link_occurrences.get(&slot).copied()
     }
 
+    pub(crate) fn ensure_live_window_link_occurrence_id(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Option<WindowLinkOccurrenceId> {
+        self.sessions
+            .session(session_name)
+            .and_then(|session| session.window_at(window_index))?;
+        let slot = self.canonical_window_link_slot_by_index(session_name, window_index);
+        Some(self.ensure_window_link_occurrence(&slot))
+    }
+
     pub(crate) fn window_link_occurrence_target(
         &self,
         occurrence_id: WindowLinkOccurrenceId,

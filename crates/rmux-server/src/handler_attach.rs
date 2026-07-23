@@ -29,6 +29,7 @@ struct AttachControlIdentityExpectation {
     current_session_id: Option<SessionId>,
     next_session: Option<(SessionName, SessionId)>,
     target_selection: Option<SwitchTargetSelection>,
+    mode_tree_requester: Option<super::mode_tree_support::ModeTreeActionIdentity>,
 }
 
 #[cfg(test)]
@@ -40,17 +41,25 @@ pub(in crate::handler) struct AttachControlIdentityPause {
 
 #[cfg(test)]
 static ATTACH_CONTROL_IDENTITY_PAUSE: std::sync::Mutex<
-    Option<(u32, std::sync::Arc<AttachControlIdentityPause>)>,
-> = std::sync::Mutex::new(None);
+    Vec<(u32, std::sync::Arc<AttachControlIdentityPause>)>,
+> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 pub(in crate::handler) fn install_attach_control_identity_pause(
     attach_pid: u32,
 ) -> std::sync::Arc<AttachControlIdentityPause> {
     let pause = std::sync::Arc::new(AttachControlIdentityPause::default());
-    *ATTACH_CONTROL_IDENTITY_PAUSE
+    let mut installed = ATTACH_CONTROL_IDENTITY_PAUSE
         .lock()
-        .expect("attach control identity pause lock") = Some((attach_pid, pause.clone()));
+        .expect("attach control identity pause lock");
+    if let Some((_, current)) = installed
+        .iter_mut()
+        .find(|(paused_pid, _)| *paused_pid == attach_pid)
+    {
+        *current = pause.clone();
+    } else {
+        installed.push((attach_pid, pause.clone()));
+    }
     pause
 }
 
@@ -60,15 +69,10 @@ async fn pause_after_attach_control_identity_capture(attach_pid: u32) {
         let mut installed = ATTACH_CONTROL_IDENTITY_PAUSE
             .lock()
             .expect("attach control identity pause lock");
-        let matches_pid = installed
-            .as_ref()
-            .is_some_and(|(paused_pid, _)| *paused_pid == attach_pid);
-        matches_pid.then(|| {
-            installed
-                .take()
-                .expect("matching pause remains installed")
-                .1
-        })
+        installed
+            .iter()
+            .position(|(paused_pid, _)| *paused_pid == attach_pid)
+            .map(|index| installed.swap_remove(index).1)
     };
     let Some(pause) = pause else {
         return;
@@ -95,10 +99,13 @@ mod state;
 mod switch_commit;
 
 pub(crate) use crate::client_flags::ClientFlags;
+pub(in crate::handler) use key_table::AttachedKeyTableCommit;
 pub(in crate::handler) use resize_policy::{
     surviving_attached_resize_targets, AttachedWindowSizePolicy,
 };
-pub(in crate::handler) use session_destroy::SessionDetachOnDestroy;
+pub(in crate::handler) use session_destroy::{
+    PreparedAttachedDestroySwitches, SessionDetachOnDestroy,
+};
 pub(super) use state::{
     ActiveAttach, ActiveAttachState, DisplayPanesClientState, DisplayPanesLabel,
 };
@@ -343,6 +350,32 @@ impl RequestHandler {
         .await
     }
 
+    pub(in crate::handler) async fn send_attach_control_for_client_identity_from_mode_tree(
+        &self,
+        requester: super::mode_tree_support::ModeTreeActionIdentity,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        command: AttachControl,
+        command_name: &str,
+    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+        if matches!(command, AttachControl::Switch(_)) {
+            return Err(rmux_proto::RmuxError::Server(
+                "session switch requires a stable session identity".to_owned(),
+            ));
+        }
+        self.send_attach_control_with_expected_identity(
+            attach_pid,
+            command,
+            command_name,
+            AttachControlIdentityExpectation {
+                attach_id: Some(expected_attach_id),
+                mode_tree_requester: Some(requester),
+                ..AttachControlIdentityExpectation::default()
+            },
+        )
+        .await
+    }
+
     pub(super) async fn send_attach_control_for_client_current_session_identity(
         &self,
         attach_pid: u32,
@@ -379,6 +412,7 @@ impl RequestHandler {
         let expected_attach_id = identity.attach_id;
         let expected_current_session_id = identity.current_session_id;
         let target_selection = identity.target_selection;
+        let mode_tree_requester = identity.mode_tree_requester;
         let (next_session_name, expected_next_session_id) = identity
             .next_session
             .map_or((None, None), |(name, session_id)| {
@@ -453,6 +487,11 @@ impl RequestHandler {
             }
         }
         let mut active_attach = self.active_attach.lock().await;
+        if mode_tree_requester
+            .is_some_and(|requester| !requester.matches_active(&state, &active_attach))
+        {
+            return Err(attached_client_required(command_name));
+        }
         let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
             return Err(attached_client_required(command_name));
         };
@@ -745,12 +784,54 @@ impl RequestHandler {
         clear_frame: Vec<u8>,
         duration: Duration,
     ) -> bool {
+        self.send_attached_overlay_to_client_guarded(
+            attach_pid,
+            None,
+            None,
+            overlay_frame,
+            clear_frame,
+            duration,
+        )
+        .await
+    }
+
+    pub(super) async fn send_attached_overlay_to_client_identity(
+        &self,
+        identity: ActiveAttachIdentity,
+        expected_session_id: Option<SessionId>,
+        overlay_frame: Vec<u8>,
+        clear_frame: Vec<u8>,
+        duration: Duration,
+    ) -> bool {
+        self.send_attached_overlay_to_client_guarded(
+            identity.attach_pid(),
+            Some(identity),
+            expected_session_id,
+            overlay_frame,
+            clear_frame,
+            duration,
+        )
+        .await
+    }
+
+    async fn send_attached_overlay_to_client_guarded(
+        &self,
+        attach_pid: u32,
+        expected_identity: Option<ActiveAttachIdentity>,
+        expected_session_id: Option<SessionId>,
+        overlay_frame: Vec<u8>,
+        clear_frame: Vec<u8>,
+        duration: Duration,
+    ) -> bool {
         let handler = self.clone();
         let mut active_attach = self.active_attach.lock().await;
         let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
             return false;
         };
-        if active.suspended {
+        if active.suspended
+            || expected_identity.is_some_and(|identity| !identity.matches_active(active))
+            || expected_session_id.is_some_and(|session_id| active.session_id != session_id)
+        {
             return false;
         }
 
@@ -791,6 +872,7 @@ impl RequestHandler {
 fn reset_interactive_attach_state_for_session_switch(
     active: &mut ActiveAttach,
 ) -> Option<super::overlay_support::ClientOverlayState> {
+    active.mouse.reset_for_session_switch();
     active.prompt = None;
     active.display_panes = None;
     active.display_panes_state_id = active.display_panes_state_id.saturating_add(1);
@@ -1086,6 +1168,9 @@ fn attach_target_for_session_with_prompt(
                         pane,
                         &summary,
                         stats.size,
+                        copy_snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.alternate_on),
                     )
                     .as_slice(),
                 );
@@ -1099,11 +1184,17 @@ fn attach_target_for_session_with_prompt(
         live_pane_render_for_target(state, session, &state.options, session_name, options.prompt);
     if options.prompt.is_none() {
         if let Some(active_pane) = active_pane.clone() {
-            if let Some(screen) = state.pane_copy_mode_render_screen(session_name, active_pane.id())
+            if let Some(snapshot) =
+                state.pane_copy_mode_render_snapshot(session_name, active_pane.id())
             {
                 render_frame.extend_from_slice(
-                    renderer::render_pane_cursor(session, &state.options, &active_pane, &screen)
-                        .as_slice(),
+                    renderer::render_copy_mode_pane_cursor(
+                        session,
+                        &state.options,
+                        &active_pane,
+                        &snapshot,
+                    )
+                    .as_slice(),
                 );
             } else if let Some(screen) = state.pane_screen(session_name, active_pane.id()) {
                 render_frame.extend_from_slice(
@@ -1117,8 +1208,16 @@ fn attach_target_for_session_with_prompt(
     let active_pane_geometry = active_pane.as_ref().map_or_else(
         || rmux_core::PaneGeometry::new(0, 0, 0, 0),
         |pane| {
-            renderer::visible_pane_terminal_geometry(session, &state.options, pane)
-                .unwrap_or_else(|| rmux_core::PaneGeometry::new(0, 0, 0, 0))
+            renderer::visible_pane_terminal_geometry(
+                session,
+                &state.options,
+                pane,
+                pane_state.as_ref().is_some_and(|state| state.alternate_on),
+                state
+                    .pane_copy_mode_summary(session_name, pane.id())
+                    .is_some(),
+            )
+            .unwrap_or_else(|| rmux_core::PaneGeometry::new(0, 0, 0, 0))
         },
     );
     let active_pane_is_starting = {
@@ -1271,6 +1370,7 @@ pub(super) fn option_affects_attached_rendering(option: rmux_proto::OptionName) 
         rmux_proto::OptionName::ExtendedKeys
             | rmux_proto::OptionName::AllowPassthrough
             | rmux_proto::OptionName::FocusEvents
+            | rmux_proto::OptionName::FocusFollowsMouse
             | rmux_proto::OptionName::Mouse
             | rmux_proto::OptionName::SetClipboard
             | rmux_proto::OptionName::TerminalFeatures
@@ -1303,6 +1403,13 @@ mod tests {
     use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
     use crate::pane_io::{pane_output_channel, AttachControl, AttachTarget};
     use crate::server_access::current_owner_uid;
+
+    #[test]
+    fn focus_follows_mouse_changes_refresh_attached_terminals() {
+        assert!(super::option_affects_attached_rendering(
+            OptionName::FocusFollowsMouse
+        ));
+    }
 
     #[tokio::test]
     async fn attach_control_backlog_limit_removes_slow_client() {
@@ -1797,6 +1904,7 @@ mod tests {
             uid,
             user: UserIdentity::Uid(uid),
             can_write: true,
+            clipboard_queries_desynchronized: false,
             suspended: false,
             closing,
             emit_detached_on_finish: false,
@@ -1804,6 +1912,7 @@ mod tests {
             client_size: TerminalSize { cols: 80, rows: 24 },
             client_pixels: None,
             size_sequence: 0,
+            last_activity_sequence: 0,
             persistent_overlay_epoch: persistent_overlay_epoch.clone(),
             render_generation: 5,
             overlay_generation: 11,
@@ -1811,6 +1920,7 @@ mod tests {
             display_panes_state_id: 17,
             key_table_name: None,
             key_table_set_at: None,
+            key_table_generation: 0,
             repeat_deadline: None,
             repeat_active: false,
             last_key: None,

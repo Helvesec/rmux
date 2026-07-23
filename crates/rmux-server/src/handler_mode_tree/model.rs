@@ -1,11 +1,159 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use rmux_core::KeyCode;
+use rmux_core::{KeyCode, Session};
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{PaneId, PaneTarget, SessionId, SessionName, Target, WindowId, WindowTarget};
 
 use super::super::scripting_support::rename_pane_target_session;
+use super::super::RequesterOrigin;
 use crate::pane_terminals::WindowLinkOccurrenceId;
+use crate::pane_transcript::SharedPaneTranscript;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::handler) struct ModeTreePaneIdentity {
+    target: PaneTarget,
+    session_id: SessionId,
+    window_id: WindowId,
+    window_occurrence_id: WindowLinkOccurrenceId,
+    pane_id: PaneId,
+    output_generation: u64,
+}
+
+impl ModeTreePaneIdentity {
+    pub(super) fn capture(
+        state: &mut crate::pane_terminals::HandlerState,
+        target: &PaneTarget,
+    ) -> Result<Self, rmux_proto::RmuxError> {
+        state.ensure_live_window_link_occurrences();
+        let session = state
+            .sessions
+            .session(target.session_name())
+            .ok_or_else(|| crate::pane_terminals::session_not_found(target.session_name()))?;
+        let window = session.window_at(target.window_index()).ok_or_else(|| {
+            rmux_proto::RmuxError::Server("mode-tree host window disappeared".to_owned())
+        })?;
+        let pane = window.pane(target.pane_index()).ok_or_else(|| {
+            rmux_proto::RmuxError::Server("mode-tree host pane disappeared".to_owned())
+        })?;
+        let window_id = window.id();
+        let pane_id = pane.id();
+        let window_occurrence_id = state
+            .window_link_occurrence_id(target.session_name(), target.window_index())
+            .ok_or_else(|| {
+                rmux_proto::RmuxError::Server(
+                    "mode-tree host window occurrence disappeared".to_owned(),
+                )
+            })?;
+        Ok(Self {
+            target: target.clone(),
+            session_id: session.id(),
+            window_id,
+            window_occurrence_id,
+            pane_id,
+            output_generation: state.pane_output_generation_for_target(target, pane_id),
+        })
+    }
+
+    pub(super) fn target(&self) -> &PaneTarget {
+        &self.target
+    }
+
+    pub(super) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(super) fn matches(&self, state: &crate::pane_terminals::HandlerState) -> bool {
+        state
+            .sessions
+            .session(self.target.session_name())
+            .filter(|session| session.id() == self.session_id)
+            .and_then(|session| session.window_at(self.target.window_index()))
+            .filter(|window| window.id() == self.window_id)
+            .and_then(|window| window.pane(self.target.pane_index()))
+            .is_some_and(|pane| pane.id() == self.pane_id)
+            && state
+                .window_link_occurrence_id(self.target.session_name(), self.target.window_index())
+                == Some(self.window_occurrence_id)
+            && state.pane_output_generation_for_target(&self.target, self.pane_id)
+                == self.output_generation
+    }
+
+    pub(super) fn current_target(
+        &self,
+        state: &crate::pane_terminals::HandlerState,
+    ) -> Option<PaneTarget> {
+        let original_session_target = state
+            .sessions
+            .iter()
+            .find(|(_, session)| session.id() == self.session_id)
+            .and_then(|(session_name, session)| {
+                self.exact_target_in_session(session_name, session)
+            });
+        original_session_target.or_else(|| {
+            state
+                .sessions
+                .iter()
+                .filter_map(|(session_name, session)| {
+                    self.exact_target_in_session(session_name, session)
+                })
+                .min_by(|left, right| {
+                    left.session_name()
+                        .as_str()
+                        .cmp(right.session_name().as_str())
+                        .then_with(|| left.window_index().cmp(&right.window_index()))
+                        .then_with(|| left.pane_index().cmp(&right.pane_index()))
+                })
+        })
+    }
+
+    fn exact_target_in_session(
+        &self,
+        session_name: &SessionName,
+        session: &Session,
+    ) -> Option<PaneTarget> {
+        let preferred = session
+            .window_at(self.target.window_index())
+            .filter(|window| window.id() == self.window_id)
+            .and_then(|window| {
+                window
+                    .panes()
+                    .iter()
+                    .find(|pane| pane.id() == self.pane_id)
+                    .map(|pane| (self.target.window_index(), pane.index()))
+            });
+        let (window_index, pane_index) = preferred.or_else(|| {
+            session
+                .windows()
+                .iter()
+                .find_map(|(&window_index, window)| {
+                    (window.id() == self.window_id).then(|| {
+                        window
+                            .panes()
+                            .iter()
+                            .find(|pane| pane.id() == self.pane_id)
+                            .map(|pane| (window_index, pane.index()))
+                    })?
+                })
+        })?;
+        Some(PaneTarget::with_window(
+            session_name.clone(),
+            window_index,
+            pane_index,
+        ))
+    }
+
+    pub(super) fn output_generation_matches(
+        &self,
+        state: &crate::pane_terminals::HandlerState,
+        target: &PaneTarget,
+    ) -> bool {
+        state.pane_output_generation_for_target(target, self.pane_id) == self.output_generation
+    }
+
+    fn rename_session(&mut self, old_name: &SessionName, new_name: &SessionName) {
+        rename_pane_target_session(&mut self.target, old_name, new_name);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::handler) struct ModeTreeActionIdentity {
@@ -33,6 +181,31 @@ impl ModeTreeActionIdentity {
 
     pub(in crate::handler) const fn state_id(self) -> u64 {
         self.state_id
+    }
+
+    pub(in crate::handler) fn matches_active(
+        self,
+        state: &crate::pane_terminals::HandlerState,
+        active_attach: &crate::handler::attach_support::ActiveAttachState,
+    ) -> bool {
+        active_attach
+            .by_pid
+            .get(&self.attach_pid)
+            .is_some_and(|active| {
+                active.id == self.attach_id
+                    && active.mode_tree_state_id == self.state_id
+                    && active.mode_tree.as_ref().is_some_and(|mode| {
+                        state
+                            .sessions
+                            .session(&mode.session_name)
+                            .is_some_and(|session| session.id() == mode.session_id)
+                            && mode
+                                .host_identity
+                                .as_ref()
+                                .is_none_or(|identity| identity.matches(state))
+                    })
+                    && !active.closing.load(std::sync::atomic::Ordering::SeqCst)
+            })
     }
 }
 
@@ -91,9 +264,13 @@ pub(super) struct SearchState {
 
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct ModeTreeClientState {
+    pub(super) origin: RequesterOrigin,
     pub(super) kind: ModeTreeKind,
     pub(super) session_name: SessionName,
+    pub(super) session_id: SessionId,
     pub(super) host_pane: Option<PaneTarget>,
+    pub(super) host_identity: Option<ModeTreePaneIdentity>,
+    pub(super) host_transcript: Option<SharedPaneTranscript>,
     pub(super) preview_mode: PreviewMode,
     pub(super) row_format: Option<String>,
     pub(super) filter_format: Option<String>,
@@ -112,7 +289,7 @@ pub(in crate::handler) struct ModeTreeClientState {
     pub(super) tree_depth: TreeDepth,
     pub(super) show_all_group_members: bool,
     pub(super) auto_accept: bool,
-    pub(in crate::handler) zoom_restore: Option<PaneTarget>,
+    pub(in crate::handler) zoom_restore: Option<ModeTreePaneIdentity>,
     pub(super) last_list_rows: usize,
 }
 
@@ -128,8 +305,11 @@ impl ModeTreeClientState {
         if let Some(target) = self.host_pane.as_mut() {
             rename_pane_target_session(target, old_name, new_name);
         }
-        if let Some(target) = self.zoom_restore.as_mut() {
-            rename_pane_target_session(target, old_name, new_name);
+        if let Some(identity) = self.host_identity.as_mut() {
+            identity.rename_session(old_name, new_name);
+        }
+        if let Some(identity) = self.zoom_restore.as_mut() {
+            identity.rename_session(old_name, new_name);
         }
     }
 }
@@ -184,6 +364,7 @@ pub(super) enum ModeTreeAction {
         window_occurrence_id: Option<WindowLinkOccurrenceId>,
         pane_index: Option<u32>,
         pane_id: Option<PaneId>,
+        pane_output_generation: Option<u64>,
     },
     Buffer {
         name: String,
@@ -213,6 +394,7 @@ pub(super) struct ChooseTreeTarget {
     pub(super) window_occurrence_id: Option<WindowLinkOccurrenceId>,
     pub(super) pane_index: Option<u32>,
     pub(super) pane_id: Option<PaneId>,
+    pub(super) pane_output_generation: Option<u64>,
 }
 
 impl ModeTreeKind {
@@ -245,6 +427,7 @@ impl ModeTreeAction {
             window_occurrence_id: None,
             pane_index: None,
             pane_id: None,
+            pane_output_generation: None,
         }
     }
 
@@ -263,26 +446,27 @@ impl ModeTreeAction {
             window_occurrence_id: Some(window_occurrence_id),
             pane_index: None,
             pane_id: None,
+            pane_output_generation: None,
         }
     }
 
     pub(super) fn pane_tree_target(
-        session_name: SessionName,
+        target: PaneTarget,
         session_id: SessionId,
-        window_index: u32,
         window_id: WindowId,
         window_occurrence_id: WindowLinkOccurrenceId,
-        pane_index: u32,
         pane_id: PaneId,
+        pane_output_generation: u64,
     ) -> Self {
         Self::TreeTarget {
-            session_name,
+            session_name: target.session_name().clone(),
             session_id,
-            window_index: Some(window_index),
+            window_index: Some(target.window_index()),
             window_id: Some(window_id),
             window_occurrence_id: Some(window_occurrence_id),
-            pane_index: Some(pane_index),
+            pane_index: Some(target.pane_index()),
             pane_id: Some(pane_id),
+            pane_output_generation: Some(pane_output_generation),
         }
     }
 

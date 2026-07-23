@@ -816,6 +816,8 @@ mod prefix_navigation;
 
 #[path = "handler_attach_tests/display_panes.rs"]
 mod display_panes;
+#[path = "handler_attach_tests/display_panes_identity.rs"]
+mod display_panes_identity;
 
 #[path = "handler_attach_tests/copy_mode_keys.rs"]
 mod copy_mode_keys;
@@ -844,6 +846,12 @@ mod attach_render;
 #[path = "handler_attach_tests/attached_prefix_lifecycle.rs"]
 mod attached_prefix_lifecycle;
 
+#[path = "handler_attach_tests/key_table_timer_shutdown.rs"]
+mod key_table_timer_shutdown;
+
+#[path = "handler_attach_tests/key_table_identity_regressions.rs"]
+mod key_table_identity_regressions;
+
 #[path = "handler_attach_tests/cleanup_identity.rs"]
 mod cleanup_identity;
 #[path = "handler_attach_tests/multi_client.rs"]
@@ -853,6 +861,9 @@ mod resize_selection_race;
 
 #[path = "handler_attach_tests/server_lifecycle.rs"]
 mod server_lifecycle;
+
+#[path = "handler_attach_tests/lock_identity_regressions.rs"]
+mod lock_identity_regressions;
 
 #[path = "handler_attach_tests/client_security.rs"]
 mod client_security;

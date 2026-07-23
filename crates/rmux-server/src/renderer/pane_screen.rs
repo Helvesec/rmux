@@ -12,6 +12,8 @@ use rmux_proto::OptionName;
 use crate::copy_mode::{CopyModeOverlayRange, CopyModeRenderOverlays, CopyModeRenderSnapshot};
 use crate::format_runtime::RuntimeFormatContext;
 
+use super::copy_mode_line_numbers::CopyModeLineNumberRenderer;
+use super::pane_scrollbar::{resolve_pane_scrollbar, PaneScrollbarRenderContext};
 use super::{cursor_position_bytes, visible_pane_geometry, StatusGeometry};
 
 const OSC8_CLOSE: &[u8] = b"\x1b]8;;\x1b\\";
@@ -60,7 +62,7 @@ pub(crate) fn render_copy_mode_pane_screen(
         pane,
         &snapshot.screen,
         PaneScreenCursorRestore::Pane,
-        Some(&snapshot.overlays),
+        Some(snapshot),
     )
 }
 
@@ -76,7 +78,7 @@ pub(crate) fn render_copy_mode_pane_screen_preserving_prompt_cursor(
         pane,
         &snapshot.screen,
         PaneScreenCursorRestore::Prompt,
-        Some(&snapshot.overlays),
+        Some(snapshot),
     )
 }
 
@@ -92,20 +94,54 @@ fn render_pane_screen_with_cursor_restore(
     pane: &Pane,
     screen: &Screen,
     cursor_restore: PaneScreenCursorRestore,
-    copy_mode_overlays: Option<&CopyModeRenderOverlays>,
+    copy_mode_snapshot: Option<&CopyModeRenderSnapshot>,
 ) -> Vec<u8> {
     let _render_span = crate::perf_instrument::span("render_compose")
         .with_str("site", "pane_screen")
         .with_u64("pane_id", u64::from(pane.id().as_u32()))
         .with_usize("history_size", screen.history_size());
     let geometry = StatusGeometry::for_session(session, options);
-    let Some(pane_geometry) = visible_pane_geometry(session, options, pane, geometry.content_rows)
+    let Some(raw_pane_geometry) =
+        visible_pane_geometry(session, options, pane, geometry.content_rows)
     else {
         return Vec::new();
     };
+    let copy_mode_overlays = copy_mode_snapshot.map(|snapshot| &snapshot.overlays);
+    let (history_size, alternate_on, copy_mode_scroll_position) = copy_mode_snapshot.map_or(
+        (screen.history_size(), screen.is_alternate(), None),
+        |snapshot| {
+            (
+                snapshot.history_size,
+                snapshot.alternate_on,
+                Some(snapshot.scroll_position),
+            )
+        },
+    );
+    let (pane_geometry, scrollbar) = resolve_pane_scrollbar(
+        session,
+        options,
+        pane,
+        PaneScrollbarRenderContext {
+            geometry: raw_pane_geometry,
+            history_size,
+            alternate_on,
+            copy_mode_scroll_position,
+            content_y_offset: geometry.content_y_offset,
+        },
+    );
     if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
         return Vec::new();
     }
+    let line_numbers = copy_mode_snapshot
+        .and_then(|snapshot| CopyModeLineNumberRenderer::resolve(session, options, pane, snapshot));
+    let line_number_layout = line_numbers
+        .as_ref()
+        .map(CopyModeLineNumberRenderer::layout);
+    let physical_line_number_width =
+        line_number_layout.map_or(0, |layout| layout.physical_width(pane_geometry.cols()));
+    let rendered_content_width = pane_geometry
+        .cols()
+        .saturating_sub(physical_line_number_width);
 
     let sparse_full_width_clear = pane_geometry.x() == 0
         && pane_geometry.cols() == session.terminal_size().cols
@@ -139,7 +175,7 @@ fn render_pane_screen_with_cursor_restore(
     frame.extend_from_slice(b"\x1b[s\x1b[?25l\x1b[0m");
     for row in 0..usize::from(pane_geometry.rows()) {
         let line = rendered_lines.get(row).copied().unwrap_or_default();
-        let line = truncate_rendered_pane_line(line, usize::from(pane_geometry.cols()), &utf8);
+        let line = truncate_rendered_pane_line(line, usize::from(rendered_content_width), &utf8);
         frame.extend_from_slice(
             cursor_position_bytes(
                 pane_geometry
@@ -151,7 +187,29 @@ fn render_pane_screen_with_cursor_restore(
             .as_slice(),
         );
         frame.extend_from_slice(b"\x1b[0m");
+        if let Some(line_numbers) = line_numbers.as_ref() {
+            line_numbers.append_prefix(&mut frame, row, pane_geometry.cols());
+        }
         frame.extend_from_slice(&line);
+        if line_number_layout.is_some_and(|layout| {
+            row == usize::try_from(screen.cursor_position().1).unwrap_or(usize::MAX)
+                && screen.cursor_position().0
+                    >= u32::from(layout.content_width(pane_geometry.cols()))
+        }) {
+            frame.extend_from_slice(
+                cursor_position_bytes(
+                    pane_geometry
+                        .y()
+                        .saturating_add(geometry.content_y_offset)
+                        .saturating_add(row as u16),
+                    pane_geometry
+                        .x()
+                        .saturating_add(pane_geometry.cols().saturating_sub(1)),
+                )
+                .as_slice(),
+            );
+            frame.extend_from_slice(b"\x1b[0m$\x1b[0m");
+        }
         if sparse_full_width_clear {
             if !line.is_empty() {
                 frame.extend_from_slice(b"\x1b[0m");
@@ -159,10 +217,19 @@ fn render_pane_screen_with_cursor_restore(
             frame.extend_from_slice(b"\x1b[K");
         }
     }
+    if let Some(scrollbar) = scrollbar {
+        frame.extend_from_slice(scrollbar.frame().as_slice());
+    }
     frame.extend_from_slice(b"\x1b[0m\x1b[u");
     match cursor_restore {
         PaneScreenCursorRestore::Pane => frame.extend_from_slice(
-            final_pane_cursor_state(screen, pane_geometry, geometry.content_y_offset).as_slice(),
+            final_pane_cursor_state(
+                screen,
+                pane_geometry,
+                geometry.content_y_offset,
+                line_number_layout,
+            )
+            .as_slice(),
         ),
         PaneScreenCursorRestore::Prompt => frame.extend_from_slice(b"\x1b[?25h"),
     }
@@ -173,11 +240,14 @@ fn final_pane_cursor_state(
     screen: &Screen,
     pane_geometry: rmux_core::PaneGeometry,
     content_y_offset: u16,
+    line_numbers: Option<crate::copy_mode::CopyModeLineNumberLayout>,
 ) -> Vec<u8> {
     let (cursor_x, cursor_y) = screen.cursor_position();
-    let x = pane_geometry
-        .x()
-        .saturating_add(cursor_x.min(u32::from(pane_geometry.cols().saturating_sub(1))) as u16);
+    let cursor_x = line_numbers.map_or_else(
+        || cursor_x.min(u32::from(pane_geometry.cols().saturating_sub(1))) as u16,
+        |layout| layout.cursor_x(pane_geometry.cols(), cursor_x),
+    );
+    let x = pane_geometry.x().saturating_add(cursor_x);
     let y = pane_geometry
         .y()
         .saturating_add(content_y_offset)
@@ -205,7 +275,7 @@ pub(crate) fn pane_selection_overlay_style(
         .map(|style| rmux_core::style_tostring(&style))
 }
 
-fn pane_cell_overlay_style(
+pub(super) fn pane_cell_overlay_style(
     session: &Session,
     options: &OptionStore,
     pane: &Pane,

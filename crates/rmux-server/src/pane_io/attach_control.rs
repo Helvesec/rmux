@@ -41,6 +41,13 @@ impl AttachControl {
         matches!(self, Self::Switch(target) if target.is_coalescible_render_refresh())
     }
 
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Detach | Self::Exited | Self::DetachKill | Self::DetachExecShellCommand(_)
+        )
+    }
+
     pub(crate) fn backlog_units(&self) -> usize {
         let retained_bytes = std::mem::size_of::<Self>().saturating_add(match self {
             Self::Detach

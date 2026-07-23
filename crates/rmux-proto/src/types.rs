@@ -33,8 +33,9 @@ pub use options::{OptionName, SetOptionMode};
 pub enum ProcessCommand {
     /// Execute the program directly with the supplied argv vector.
     ///
-    /// On Windows, `.bat` and `.cmd` targets run through `cmd.exe`, so its
-    /// percent-variable expansion still applies.
+    /// On Windows, `.bat` and `.cmd` targets are rejected because `cmd.exe`
+    /// cannot preserve arbitrary argv boundaries. Use [`Self::Shell`] when
+    /// shell interpretation is intentional, or target a native executable.
     Argv(Vec<String>),
     /// Execute command text through the configured shell.
     Shell(String),

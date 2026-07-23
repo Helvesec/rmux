@@ -87,8 +87,7 @@ impl CaptureBuilder {
                 Ok(capture_from_snapshot(&snapshot, rect, self.preserve_style))
             }
             CaptureSource::Locator(locator) => {
-                let locator = locator.begin_operation_handle();
-                let (snapshot, item) = locator.resolve_strict_with_wait().await?;
+                let (_locator, snapshot, item) = locator.resolve_strict_with_wait().await?;
                 let rect = Rect::new(
                     item.text_match.start_row,
                     item.text_match.start_col,
@@ -130,8 +129,7 @@ impl Pane {
 impl Locator {
     /// Returns the strict visible text match bounding box.
     pub async fn bounding_box(self) -> Result<Rect> {
-        let locator = self.begin_operation_handle();
-        let (_snapshot, item) = locator.resolve_strict_with_wait().await?;
+        let (_locator, _snapshot, item) = self.resolve_strict_with_wait().await?;
         Ok(Rect::new(
             item.text_match.start_row,
             item.text_match.start_col,

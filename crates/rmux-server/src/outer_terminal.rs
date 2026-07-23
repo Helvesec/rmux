@@ -21,11 +21,12 @@ use capabilities::{decode_capability_string, parse_capability_override, split_ov
 #[cfg(test)]
 use colours::colour_to_rgb;
 use colours::colour_to_rgb_string;
+pub(crate) use templates::encode_base64;
 #[cfg(test)]
 use templates::sanitize_osc_payload;
 use templates::{
-    encode_base64, render_int_template, render_open_close, render_string_string_template,
-    render_string_template, render_sync_template, sync_toggle,
+    render_int_template, render_open_close, render_string_string_template, render_string_template,
+    render_sync_template, sync_toggle,
 };
 
 const ATTACH_SCREEN_RESET_SEQUENCE: &[u8] = b"\x1b[0m\x1b[?25l\x1b[H\x1b[2J";

@@ -19,8 +19,8 @@ The crate currently emits detached RPC wire version 5. It also ships the
 tags. Breaking wire changes bump the envelope varint; compatible DTO
 additions append ledger entries rather than mutating existing frame IDs.
 
-RMUX 0.9.0 uses an exact envelope hard-cut: a decoder accepts only
-`RMUX_WIRE_VERSION` and rejects older or newer detached frames before any
+The RMUX 0.9 release line uses an exact envelope hard-cut: a decoder accepts
+only `RMUX_WIRE_VERSION` and rejects older or newer detached frames before any
 DTO-level handshake is decoded. `HandshakeRequest` min/max wire fields are
 therefore advisory after the current envelope has decoded, while
 `required_capabilities` are mandatory feature gates.

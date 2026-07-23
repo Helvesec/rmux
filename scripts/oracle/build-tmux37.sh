@@ -11,9 +11,10 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/oracle/build-tmux37.sh [options]
 
-Build the pinned RMUX 0.9.0 tmux oracle (tmux 3.7b) from the upstream release
-tarball and install it as <prefix>/tmux. The script writes <prefix>/tmux.reference
-so the Rust harness can verify source SHA, tarball SHA, version, and binary hash.
+Build the pinned RMUX 0.9 release-line tmux oracle (tmux 3.7b) from the upstream
+release tarball and install it as <prefix>/tmux. The script writes
+<prefix>/tmux.reference so the Rust harness can verify source SHA, tarball SHA,
+version, and binary hash.
 
 Options:
   --prefix DIR       Install oracle files under DIR. Defaults to /opt/rmux/reference/tmux-frozen/<source-sha>.

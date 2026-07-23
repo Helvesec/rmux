@@ -18,6 +18,13 @@ use rmux_server::{ConfigFileSelection, DaemonConfig, ServerDaemon};
 const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";
 
 fn main() {
+    #[cfg(unix)]
+    if let Some(exit_code) =
+        rmux_server::run_internal_fifo_reader_helper(std::env::args_os().skip(1))
+    {
+        std::process::exit(exit_code);
+    }
+
     match try_main(env::args_os().skip(1)) {
         Ok(()) => {}
         Err(error) => {

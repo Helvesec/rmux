@@ -18,6 +18,8 @@ use rmux_pty::TerminalSize;
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const NONBLOCKING_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
+const ATTACH_INPUT_COMMAND: &[u8] = b"printf '%s%s\\n' attach- stream-ready\r";
+const ATTACH_INPUT_READY: &str = "attach-stream-ready";
 const CHURN_ITERATIONS: usize = 8;
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const LAST_SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(7);
@@ -89,12 +91,16 @@ fn canonical_session_workflow_runs_end_to_end() -> Result<(), Box<dyn Error>> {
                     ATTACH_TIMEOUT,
                 )?;
 
-                attach.master_mut().write_all(b"attach-stream\r")?;
+                // Keep the completion marker out of the echoed command so this
+                // wait proves the shell executed the line. An unknown command
+                // can enter a host-specific command-not-found handler after its
+                // input has already been echoed by the terminal.
+                attach.master_mut().write_all(ATTACH_INPUT_COMMAND)?;
                 let echoed =
-                    read_until_contains(attach.master_mut(), "attach-stream", ATTACH_TIMEOUT)?;
+                    read_until_contains(attach.master_mut(), ATTACH_INPUT_READY, ATTACH_TIMEOUT)?;
                 assert!(
-                    echoed.contains("attach-stream"),
-                    "attach should surface client keystrokes through the pane tty echo"
+                    echoed.contains(ATTACH_INPUT_READY),
+                    "attach should deliver client keystrokes through the pane shell"
                 );
 
                 attached_session = Some(attach);

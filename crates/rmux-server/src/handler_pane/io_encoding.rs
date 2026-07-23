@@ -1,4 +1,6 @@
 use std::io;
+#[cfg(any(unix, windows))]
+use std::time::Duration;
 
 use rmux_core::{
     key_code_lookup_bits, key_code_to_bytes, key_string_lookup_key, key_string_lookup_string,
@@ -20,6 +22,8 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 
 #[cfg(unix)]
 const IMMEDIATE_PANE_INPUT_MAX_BYTES: usize = 256;
+#[cfg(any(unix, windows))]
+const PANE_INPUT_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(in crate::handler) struct PaneInputWrite {
     session_name: SessionName,
@@ -931,6 +935,7 @@ pub(super) fn pane_id_for_input_target(
     state: &HandlerState,
     target: &PaneTarget,
 ) -> Result<rmux_core::PaneId, RmuxError> {
+    super::super::require_expected_pane_identity(state, target)?;
     let session_name = target.session_name();
     let window_index = target.window_index();
     let pane_index = target.pane_index();
@@ -968,9 +973,11 @@ async fn write_pane_bytes(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<
 
 #[cfg(any(unix, windows))]
 async fn write_pane_bytes_blocking(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<()> {
-    tokio::task::spawn_blocking(move || master.write_all(&bytes))
-        .await
-        .map_err(|error| std::io::Error::other(format!("pane write task failed: {error}")))?
+    tokio::task::spawn_blocking(move || {
+        master.write_all_with_timeout(&bytes, PANE_INPUT_WRITE_TIMEOUT)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("pane write task failed: {error}")))?
 }
 
 #[cfg(unix)]
@@ -1072,16 +1079,28 @@ pub(super) fn encode_mouse_for_target(
         Some(0) if event.raw.y >= event.status_lines => event.raw.y - event.status_lines,
         _ => event.raw.y,
     };
-    if event.raw.x < pane.geometry().x()
-        || event.raw.x >= pane.geometry().x().saturating_add(pane.geometry().cols())
-        || adjusted_y < pane.geometry().y()
-        || adjusted_y >= pane.geometry().y().saturating_add(pane.geometry().rows())
-    {
+    let Some(geometry) = crate::mouse::pane_content_geometry_for_target(state, target) else {
         return Ok(Vec::new());
-    }
-    let x = event.raw.x - pane.geometry().x();
-    let y = adjusted_y - pane.geometry().y();
+    };
+    let Some((x, y)) = relative_mouse_position(event.raw.x, adjusted_y, geometry) else {
+        return Ok(Vec::new());
+    };
     Ok(encode_mouse_event(pane_mode, &event.raw, x, y).unwrap_or_default())
+}
+
+fn relative_mouse_position(
+    x: u16,
+    y: u16,
+    geometry: rmux_core::PaneGeometry,
+) -> Option<(u16, u16)> {
+    if x < geometry.x()
+        || x >= geometry.x().saturating_add(geometry.cols())
+        || y < geometry.y()
+        || y >= geometry.y().saturating_add(geometry.rows())
+    {
+        return None;
+    }
+    Some((x - geometry.x(), y - geometry.y()))
 }
 
 pub(super) fn expand_send_key_tokens(
@@ -1091,6 +1110,49 @@ pub(super) fn expand_send_key_tokens(
     _expand_formats: bool,
 ) -> Result<Vec<String>, RmuxError> {
     Ok(tokens.to_vec())
+}
+
+#[cfg(test)]
+mod mouse_geometry_tests {
+    use rmux_core::PaneGeometry;
+    use rmux_proto::{OptionName, ScopeSelector, SetOptionMode, TerminalSize, WindowTarget};
+
+    use super::*;
+
+    #[test]
+    fn left_scrollbar_application_mouse_coordinates_start_at_content_zero() {
+        let mut state = HandlerState::default();
+        let session_name = SessionName::new("mouse-left-scrollbar").expect("valid session");
+        state
+            .sessions
+            .create_session(session_name.clone(), TerminalSize { cols: 20, rows: 8 })
+            .expect("session creation");
+        let window = WindowTarget::with_window(session_name.clone(), 0);
+        for (option, value) in [
+            (OptionName::PaneScrollbars, "on"),
+            (OptionName::PaneScrollbarsPosition, "left"),
+            (OptionName::PaneScrollbarsStyle, "width=2,pad=1"),
+        ] {
+            state
+                .options
+                .set(
+                    ScopeSelector::Window(window.clone()),
+                    option,
+                    value.to_owned(),
+                    SetOptionMode::Replace,
+                )
+                .expect("scrollbar option");
+        }
+        let target = PaneTarget::with_window(session_name, 0, 0);
+
+        let geometry = crate::mouse::pane_content_geometry_for_target(&state, &target)
+            .expect("pane content geometry");
+
+        assert_eq!(geometry, PaneGeometry::new(3, 0, 17, 7));
+        assert_eq!(relative_mouse_position(3, 0, geometry), Some((0, 0)));
+        assert_eq!(relative_mouse_position(19, 0, geometry), Some((16, 0)));
+        assert_eq!(relative_mouse_position(2, 0, geometry), None);
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -21,6 +21,25 @@ pub(super) async fn send_attached_copy_mode_command(
         .await
 }
 
+async fn wait_for_pane_mode_status(
+    handler: &RequestHandler,
+    session: &SessionName,
+    expected: &str,
+) {
+    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
+    loop {
+        let actual = pane_mode_status(handler, session).await;
+        if actual == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for pane mode status {expected:?}, got {actual:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn attached_copy_mode_emacs_slash_is_unbound_and_not_forwarded() {
     let handler = RequestHandler::new();
@@ -111,12 +130,7 @@ async fn attached_copy_mode_emacs_ctrl_s_opens_search_prompt() {
         .handle_attached_live_input_for_test(requester_pid, b"\x13P0-LINE-12\r")
         .await
         .expect("copy-mode C-s search");
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
-    assert_eq!(
-        pane_mode_status(&handler, &alpha).await,
-        "1:copy-mode:1:0\n"
-    );
+    wait_for_pane_mode_status(&handler, &alpha, "1:copy-mode:1:0\n").await;
 }
 
 #[tokio::test]
@@ -170,12 +184,7 @@ async fn attached_copy_mode_gets_first_refusal_for_search_and_selection_keys() {
         .handle_attached_live_input_for_test(requester_pid, b"/P0-LINE-12\r ")
         .await
         .expect("copy-mode attached keys");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    assert_eq!(
-        pane_mode_status(&handler, &alpha).await,
-        "1:copy-mode:1:1\n"
-    );
+    wait_for_pane_mode_status(&handler, &alpha, "1:copy-mode:1:1\n").await;
 }
 
 #[tokio::test]
@@ -227,20 +236,14 @@ async fn attached_copy_mode_q_exits_and_refreshes_normal_surface() {
         .handle_attached_live_input_for_test(requester_pid, b"/P0-LINE-12\r ")
         .await
         .expect("copy-mode search/select attached keys");
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    assert_eq!(
-        pane_mode_status(&handler, &alpha).await,
-        "1:copy-mode:1:1\n"
-    );
+    wait_for_pane_mode_status(&handler, &alpha, "1:copy-mode:1:1\n").await;
     drain_attach_controls(&mut control_rx);
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"q\x1b")
         .await
         .expect("q exits copy-mode");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    assert_eq!(pane_mode_status(&handler, &alpha).await, "0:::\n");
+    wait_for_pane_mode_status(&handler, &alpha, "0:::\n").await;
     let frame = recv_render_frame(&mut control_rx, "exit refresh").await;
     assert!(
         !frame.is_empty(),

@@ -4,6 +4,9 @@ use rmux_core::{PaneGeometry, PaneId};
 use rmux_proto::PaneTarget;
 
 use crate::input_keys::MouseForwardEvent;
+#[cfg(test)]
+pub(crate) use crate::pane_scrollbar::PaneScrollbarsMode;
+pub(crate) use crate::pane_scrollbar::{PaneScrollbar, ScrollbarPosition};
 pub(crate) use crate::status_ranges::{StatusLineLayout, StatusRange, StatusRangeType};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,84 +41,10 @@ pub(crate) enum MouseEventKind {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScrollbarPosition {
-    Left,
-    Right,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PaneScrollbarsMode {
-    Off,
-    Modal,
-    On,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaneBorderStatus {
     Off,
     Top,
     Bottom,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PaneScrollbar {
-    pub(crate) position: ScrollbarPosition,
-    pub(crate) width: u16,
-    pub(crate) pad: u16,
-    pub(crate) slider_y: u16,
-    pub(crate) slider_h: u16,
-}
-
-impl PaneScrollbar {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_view(
-        rows: u16,
-        history_size: usize,
-        alternate_on: bool,
-        mode: PaneScrollbarsMode,
-        position: ScrollbarPosition,
-        width: u16,
-        pad: u16,
-        copy_mode_offset: Option<usize>,
-    ) -> Option<Self> {
-        if alternate_on || width == 0 || rows == 0 {
-            return None;
-        }
-        if matches!(mode, PaneScrollbarsMode::Off) {
-            return None;
-        }
-        if matches!(mode, PaneScrollbarsMode::Modal) && copy_mode_offset.is_none() {
-            return None;
-        }
-
-        let sb_h = usize::from(rows);
-        let (slider_y, slider_h) = if let Some(offset) = copy_mode_offset {
-            let total_height = history_size.saturating_add(sb_h).max(1);
-            let slider_h =
-                ((sb_h as f64) * ((sb_h as f64) / (total_height as f64))).floor() as usize;
-            let slider_y =
-                (((sb_h + 1) as f64) * ((offset as f64) / (total_height as f64))).floor() as usize;
-            (slider_y, slider_h)
-        } else {
-            let total_height = history_size.saturating_add(sb_h).max(1);
-            let percent_view = (sb_h as f64) / (total_height as f64);
-            let slider_h = ((sb_h as f64) * percent_view).floor() as usize;
-            let slider_y = sb_h.saturating_sub(slider_h.max(1));
-            (slider_y, slider_h)
-        };
-
-        let slider_h = slider_h.max(1).min(sb_h);
-        let slider_y = slider_y.min(sb_h.saturating_sub(slider_h));
-        Some(Self {
-            position,
-            width,
-            pad,
-            slider_y: slider_y as u16,
-            slider_h: slider_h as u16,
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,9 +102,28 @@ pub(crate) struct ClassifiedMouseEvent {
     pub(crate) focus_target: Option<PaneId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PanePassthroughMouseEvent {
+    pub(crate) event: AttachedMouseEvent,
+    pub(crate) focus_target: Option<PaneId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MouseClickTimerToken {
+    deadline: Instant,
+    generation: u64,
+}
+
+impl MouseClickTimerToken {
+    pub(crate) const fn deadline(self) -> Instant {
+        self.deadline
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ClientMouseState {
     pub(crate) click_deadline: Option<Instant>,
+    pub(crate) click_timer_generation: u64,
     pub(crate) double_click_pending: bool,
     pub(crate) triple_click_pending: bool,
     pub(crate) click_button: u16,
@@ -188,4 +136,50 @@ pub(crate) struct ClientMouseState {
     pub(crate) current_event: Option<AttachedMouseEvent>,
     pub(crate) drag_start_event: Option<AttachedMouseEvent>,
     pub(crate) drag_handler: Option<MouseDragHandler>,
+}
+
+impl ClientMouseState {
+    pub(crate) const fn click_deadline(&self) -> Option<Instant> {
+        self.click_deadline
+    }
+
+    pub(crate) fn click_timer_token(&self) -> Option<MouseClickTimerToken> {
+        self.click_deadline.map(|deadline| MouseClickTimerToken {
+            deadline,
+            generation: self.click_timer_generation,
+        })
+    }
+
+    pub(crate) fn click_timer_matches(&self, token: MouseClickTimerToken) -> bool {
+        self.click_timer_token() == Some(token)
+    }
+
+    pub(crate) fn arm_click_timer(&mut self, deadline: Instant) {
+        self.click_timer_generation = self.click_timer_generation.saturating_add(1);
+        self.click_deadline = Some(deadline);
+    }
+
+    pub(crate) fn clear_click_timer_if_current(&mut self, token: MouseClickTimerToken) -> bool {
+        if !self.click_timer_matches(token) {
+            return false;
+        }
+        self.clear_click_timer_state();
+        true
+    }
+
+    pub(crate) fn reset_for_session_switch(&mut self) {
+        let next_generation = self.click_timer_generation.saturating_add(1);
+        *self = Self {
+            click_timer_generation: next_generation,
+            slider_mpos: -1,
+            ..Self::default()
+        };
+    }
+
+    pub(crate) fn clear_click_timer_state(&mut self) {
+        self.click_deadline = None;
+        self.double_click_pending = false;
+        self.triple_click_pending = false;
+        self.click_event = None;
+    }
 }

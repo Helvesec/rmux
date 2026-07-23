@@ -25,10 +25,13 @@ use rustix::termios::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::Instant;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 static IN_PROCESS_PTY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 pub(crate) static PTY_TEST_LOCK: PtyTestLock = PtyTestLock;
+const SOCKET_REMOVAL_TIMEOUT: Duration = Duration::from_secs(2);
+const SOCKET_REMOVAL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub(crate) struct PtyTestLock;
 
@@ -102,12 +105,20 @@ pub(crate) fn create_stale_socket(socket_path: &Path) -> Result<StdUnixListener,
 }
 
 pub(crate) async fn wait_for_socket_removal(socket_path: &Path) -> Result<(), Box<dyn Error>> {
-    for _ in 0..200 {
-        if !socket_path.exists() {
-            return Ok(());
+    let deadline = Instant::now() + SOCKET_REMOVAL_TIMEOUT;
+    loop {
+        match std::fs::symlink_metadata(socket_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        if Instant::now() >= deadline {
+            break;
         }
 
-        tokio::task::yield_now().await;
+        // A timer-backed yield lets the daemon shutdown task make progress even
+        // when the executor immediately re-polls a task after `yield_now()`.
+        tokio::time::sleep(SOCKET_REMOVAL_POLL_INTERVAL).await;
     }
 
     Err(io::Error::other(format!(

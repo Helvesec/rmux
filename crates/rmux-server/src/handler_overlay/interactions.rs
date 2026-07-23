@@ -43,6 +43,10 @@ impl RequestHandler {
         identity: Option<ActiveAttachIdentity>,
         event: PromptInputEvent,
     ) -> Result<bool, RmuxError> {
+        let status = self.overlay_action_is_current(attach_pid, identity).await?;
+        if !status.is_current() {
+            return Ok(status.was_retired());
+        }
         let outcome = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
@@ -91,6 +95,13 @@ impl RequestHandler {
         identity: Option<ActiveAttachIdentity>,
         raw: MouseForwardEvent,
     ) -> Result<(), RmuxError> {
+        if !self
+            .overlay_action_is_current(attach_pid, identity)
+            .await?
+            .is_current()
+        {
+            return Ok(());
+        }
         let outcome = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
@@ -119,6 +130,13 @@ impl RequestHandler {
         identity: Option<ActiveAttachIdentity>,
         outcome: MenuOutcome,
     ) -> Result<(), RmuxError> {
+        if !self
+            .overlay_action_is_current(attach_pid, identity)
+            .await?
+            .is_current()
+        {
+            return Ok(());
+        }
         match outcome {
             MenuOutcome::Stay => {}
             MenuOutcome::Redraw => {
@@ -155,7 +173,7 @@ impl RequestHandler {
                 }
             }
             MenuOutcome::Execute(action) => {
-                let (requester_pid, target) = {
+                let (origin, target, command_context) = {
                     let mut active_attach = self.active_attach.lock().await;
                     let active = active_attach
                         .by_pid
@@ -169,19 +187,22 @@ impl RequestHandler {
                     match active.overlay.as_mut() {
                         Some(ClientOverlayState::Menu(menu)) => {
                             let target = menu.current_target.clone();
-                            let requester_pid = menu.requester_pid;
+                            let origin = menu.origin.clone();
+                            let command_context = menu.command_context.clone();
                             active.overlay = None;
-                            (requester_pid, target)
+                            (origin, target, command_context)
                         }
                         Some(ClientOverlayState::Popup(popup)) => {
-                            let requester_pid = popup.requester_pid;
-                            let target = popup.current_target.clone();
-                            popup.nested_menu = None;
-                            (requester_pid, target)
+                            let Some(menu) = popup.nested_menu.take() else {
+                                return Ok(());
+                            };
+                            (menu.origin, menu.current_target, menu.command_context)
                         }
                         None => return Ok(()),
                     }
                 };
+                let requester_pid = origin.requester_pid();
+                let _access = self.begin_requester_origin_access(&origin);
                 match action {
                     OverlayMenuAction::Command(command) => {
                         self.refresh_interactive_overlay_for_optional_identity(
@@ -194,8 +215,7 @@ impl RequestHandler {
                             .execute_parsed_commands(
                                 requester_pid,
                                 parsed,
-                                QueueExecutionContext::without_caller_cwd()
-                                    .with_current_target(Some(target)),
+                                command_context.with_current_target(Some(target)),
                             )
                             .await?;
                     }
@@ -236,6 +256,13 @@ impl RequestHandler {
         key: KeyCode,
         bytes: &[u8],
     ) -> io::Result<bool> {
+        let status = self
+            .overlay_action_is_current(attach_pid, identity)
+            .await
+            .map_err(io::Error::other)?;
+        if !status.is_current() {
+            return Ok(status.was_retired());
+        }
         let popup = {
             let active_attach = self.active_attach.lock().await;
             active_attach
@@ -351,6 +378,14 @@ impl RequestHandler {
         identity: Option<ActiveAttachIdentity>,
         raw: MouseForwardEvent,
     ) -> io::Result<()> {
+        if !self
+            .overlay_action_is_current(attach_pid, identity)
+            .await
+            .map_err(io::Error::other)?
+            .is_current()
+        {
+            return Ok(());
+        }
         let nested_menu_active = {
             let active_attach = self.active_attach.lock().await;
             active_attach
@@ -437,7 +472,14 @@ impl RequestHandler {
         x: u16,
         y: u16,
     ) -> Result<(), RmuxError> {
-        let (client_size, popup_target, popup_requester_pid) = {
+        if !self
+            .overlay_action_is_current(attach_pid, identity)
+            .await?
+            .is_current()
+        {
+            return Ok(());
+        }
+        let (client_size, popup_id, menu_client_identity) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -447,11 +489,19 @@ impl RequestHandler {
             let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_ref() else {
                 return Ok(());
             };
-            (
-                active.client_size,
-                popup.current_target.clone(),
-                popup.requester_pid,
-            )
+            (active.client_size, popup.id, active.identity(attach_pid))
+        };
+        let origin = self.capture_requester_origin(attach_pid).await;
+        let menu_target = self
+            .resolve_overlay_target_for_identity(menu_client_identity, None, None)
+            .await?;
+        let menu_identity = {
+            let mut state = self.state.lock().await;
+            super::identity::OverlayIdentity::capture(
+                &mut state,
+                menu_client_identity,
+                menu_target.clone(),
+            )?
         };
         let state = self.state.lock().await;
         let items = popup_menu_items(&state);
@@ -473,23 +523,43 @@ impl RequestHandler {
         };
         let options = menu_option_styles(
             &state,
-            popup_target.session_name(),
-            target_window_index(&popup_target).unwrap_or(0),
+            menu_target.session_name(),
+            target_window_index(&menu_target).unwrap_or(0),
             None,
         );
+        drop(state);
 
         {
+            let state = self.state.lock().await;
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
                 .filter(|active| identity.is_none_or(|identity| identity.matches_active(active)))
                 .ok_or_else(|| attached_client_required("display-menu"))?;
-            if let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_mut() {
+            let popup_is_current = active.overlay.as_ref().is_some_and(|overlay| {
+                overlay.id() == popup_id
+                    && overlay
+                        .identity()
+                        .matches(&state, active, overlay.current_target())
+            });
+            if !popup_is_current || !menu_identity.matches(&state, active, &menu_target) {
+                return Ok(());
+            }
+            if let Some(ClientOverlayState::Popup(popup)) = active
+                .overlay
+                .as_mut()
+                .filter(|overlay| overlay.id() == popup_id)
+            {
                 popup.nested_menu = Some(MenuOverlayState {
-                    id: popup.id,
-                    requester_pid: popup_requester_pid,
-                    current_target: popup_target,
+                    id: popup_id,
+                    identity: menu_identity.clone(),
+                    origin,
+                    command_context: menu_identity.command_context(
+                        QueueExecutionContext::without_caller_cwd(),
+                        menu_target.clone(),
+                    ),
+                    current_target: menu_target,
                     rect,
                     title,
                     style: options.style,

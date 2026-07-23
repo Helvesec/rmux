@@ -48,11 +48,11 @@ static LIVE_ATTACH_INPUT_APPLY_PAUSE: std::sync::Mutex<
 
 #[cfg(test)]
 static LIVE_ATTACH_INPUT_VALIDATION_PAUSE: std::sync::Mutex<
-    Option<(
+    Vec<(
         crate::handler::attach_support::ActiveAttachIdentity,
         Arc<LiveAttachInputApplyPause>,
     )>,
-> = std::sync::Mutex::new(None);
+> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn install_live_attach_input_apply_pause(
@@ -70,9 +70,10 @@ fn install_live_attach_input_validation_pause(
     identity: crate::handler::attach_support::ActiveAttachIdentity,
 ) -> Arc<LiveAttachInputApplyPause> {
     let pause = Arc::new(LiveAttachInputApplyPause::default());
-    *LIVE_ATTACH_INPUT_VALIDATION_PAUSE
+    LIVE_ATTACH_INPUT_VALIDATION_PAUSE
         .lock()
-        .expect("live attach input validation pause lock") = Some((identity, Arc::clone(&pause)));
+        .expect("live attach input validation pause lock")
+        .push((identity, Arc::clone(&pause)));
     pause
 }
 
@@ -85,14 +86,9 @@ async fn pause_before_live_attach_input_validation(
             .lock()
             .expect("live attach input validation pause lock");
         installed
-            .as_ref()
-            .is_some_and(|(expected, _)| *expected == identity)
-            .then(|| {
-                installed
-                    .take()
-                    .expect("matching validation pause remains installed")
-                    .1
-            })
+            .iter()
+            .position(|(expected, _)| *expected == identity)
+            .map(|position| installed.remove(position).1)
     };
     let Some(pause) = pause else {
         return;
@@ -157,8 +153,8 @@ use attach_transport::{AttachTransport, TryAttachRead};
 use control::{
     apply_pending_attach_controls, coalesce_render_switches, preserves_live_output,
     recv_attach_control, redraw_after_persistent_overlay_state_advance, should_emit_overlay,
-    switch_attach_target, take_pending_live_passthroughs, PendingAttachAction, PendingAttachExit,
-    PendingAttachInputState,
+    switch_attach_target, take_pending_live_passthroughs, try_recv_attach_control,
+    PendingAttachAction, PendingAttachExit, PendingAttachInputState,
 };
 #[cfg(any(unix, windows))]
 use deferred_passthrough::{
@@ -261,6 +257,9 @@ pub(crate) async fn forward_attach(
             .await,
     );
     let mut locked = false;
+    let mut pending_shutdown_requested = false;
+    let mut shutdown_draining = false;
+    let mut shutdown_pending_output_batch = None;
     decoder.push_bytes(&initial_socket_bytes);
     emit_attach_bytes(
         &stream,
@@ -283,10 +282,48 @@ pub(crate) async fn forward_attach(
 
     let result = async {
         loop {
+            if shutdown_draining || attach_shutdown_observable(&shutdown) {
+                if closing.load(Ordering::SeqCst) {
+                    if let Some(control) = take_pending_terminal_attach_control(
+                        &mut deferred_controls,
+                        attach_controls.as_mut(),
+                        &control_backlog,
+                    ) {
+                        // Terminal controls only finish the already-committed pane-output and
+                        // transport sequence. They never enter RequestHandler mutation paths, so
+                        // honoring one here preserves the finite exit banner without admitting a
+                        // post-shutdown attach mutation.
+                        let reason = finish_terminal_attach_control(
+                            control,
+                            &stream,
+                            &mut current_target,
+                            &mut deferred_passthroughs,
+                            shutdown_pending_output_batch.take(),
+                        )
+                        .await?;
+                        log_attach_exit(&live_input, &current_target, reason);
+                        return Ok(());
+                    }
+                }
+                let reason = if pending_shutdown_requested {
+                    AttachExitReason::PendingServerShutdown
+                } else {
+                    AttachExitReason::ServerShutdown
+                };
+                log_attach_exit(&live_input, &current_target, reason);
+                let _ = emit_attach_stop(&stream, &current_target).await;
+                return Ok(());
+            }
             // Socket reads and attach-control refreshes can both remain
             // continuously ready. Service an expired input ambiguity before
             // either queue so its deadline is a real upper bound rather than
             // merely another selectable wakeup.
+            let Some(pending_escape_batch) =
+                begin_attach_mutation_batch(&live_input, &shutdown)
+            else {
+                shutdown_draining = true;
+                continue;
+            };
             flush_due_pending_escape_input(
                 &mut pending_escape_flush,
                 &live_input,
@@ -294,6 +331,14 @@ pub(crate) async fn forward_attach(
                 locked,
             )
             .await?;
+            drop(pending_escape_batch);
+            if attach_shutdown_observable(&shutdown) {
+                continue;
+            }
+            let Some(control_batch) = begin_attach_mutation_batch(&live_input, &shutdown) else {
+                shutdown_draining = true;
+                continue;
+            };
             synchronize_persistent_overlay_epoch(
                 &persistent_overlay_epoch,
                 &stream,
@@ -393,6 +438,10 @@ pub(crate) async fn forward_attach(
                 }
                 PendingAttachAction::Write => {}
             }
+            drop(control_batch);
+            if attach_shutdown_observable(&shutdown) {
+                continue;
+            }
             // A pending repaint must not stop input from reaching the pane.
             // The repaint is rendered from the current transcript when its
             // deadline fires, so fresh input can safely pull the deadline in.
@@ -411,6 +460,13 @@ pub(crate) async fn forward_attach(
                     TryAttachRead::WouldBlock => break,
                 }
             }
+            if attach_shutdown_observable(&shutdown) {
+                continue;
+            }
+            let Some(socket_batch) = begin_attach_mutation_batch(&live_input, &shutdown) else {
+                shutdown_draining = true;
+                continue;
+            };
             process_attach_socket_messages(
                 &mut decoder,
                 &stream,
@@ -425,6 +481,14 @@ pub(crate) async fn forward_attach(
                 &mut last_client_input_at,
             )
             .await?;
+            drop(socket_batch);
+            if attach_shutdown_observable(&shutdown) {
+                continue;
+            }
+            let Some(control_batch) = begin_attach_mutation_batch(&live_input, &shutdown) else {
+                shutdown_draining = true;
+                continue;
+            };
             prime_persistent_overlay_barriers(
                 &mut persistent_overlay_state_id,
                 attach_controls.as_mut(),
@@ -518,62 +582,15 @@ pub(crate) async fn forward_attach(
                 }
                 PendingAttachAction::Write => {}
             }
-            let pending_shutdown_requested = live_input.handler.request_shutdown_if_pending();
+            drop(control_batch);
+            pending_shutdown_requested |= live_input.handler.request_shutdown_if_pending();
 
             tokio::select! {
+                biased;
                 result = shutdown.changed() => {
                     let _ = result;
-                    if closing.load(Ordering::SeqCst) {
-                        loop {
-                            match apply_pending_attach_controls(
-                                &mut deferred_controls,
-                                attach_controls.as_mut(),
-                                &control_backlog,
-                                &mut current_target,
-                                &stream,
-                                &mut render_generation,
-                                &mut overlay_generation,
-                                &mut persistent_overlay,
-                                &mut persistent_overlay_visible,
-                                &mut persistent_overlay_state_id,
-                                &mut locked,
-                                Some(PendingAttachInputState::new(
-                                    &mut pending_input,
-                                    &mut pending_escape_flush,
-                                )),
-                            )
-                            .await?
-                            {
-                                PendingAttachAction::Exit(PendingAttachExit { reason, .. }) => {
-                                    finish_pending_attach_exit(
-                                        reason,
-                                        &stream,
-                                        &mut current_target,
-                                        &mut deferred_passthroughs,
-                                    )
-                                    .await?;
-                                    log_attach_exit(&live_input, &current_target, reason);
-                                    return Ok(());
-                                }
-                                PendingAttachAction::Continue { .. }
-                                | PendingAttachAction::InteractiveInput
-                                | PendingAttachAction::Refresh { .. } => continue,
-                                PendingAttachAction::Write => break,
-                            }
-                        }
-                    }
-                    let reason = if pending_shutdown_requested {
-                        AttachExitReason::PendingServerShutdown
-                    } else {
-                        AttachExitReason::ServerShutdown
-                    };
-                    log_attach_exit(
-                        &live_input,
-                        &current_target,
-                        reason,
-                    );
-                    let _ = emit_attach_stop(&stream, &current_target).await;
-                    return Ok(());
+                    shutdown_draining = true;
+                    continue;
                 }
                 result = read_socket_bytes(&stream, &mut decoder) => {
                     if !result? {
@@ -585,6 +602,13 @@ pub(crate) async fn forward_attach(
                         let _ = emit_attach_stop(&stream, &current_target).await;
                         return Ok(());
                     }
+                    if attach_shutdown_observable(&shutdown) {
+                        continue;
+                    }
+                    let Some(socket_batch) = begin_attach_mutation_batch(&live_input, &shutdown) else {
+                        shutdown_draining = true;
+                        continue;
+                    };
                     process_attach_socket_messages(
                         &mut decoder,
                         &stream,
@@ -599,8 +623,16 @@ pub(crate) async fn forward_attach(
                         &mut last_client_input_at,
                     )
                     .await?;
+                    drop(socket_batch);
                 }
                 _ = wait_for_refresh_deadline(pane_refresh.deadline()) => {
+                    if attach_shutdown_observable(&shutdown) {
+                        continue;
+                    }
+                    let Some(_control_batch) = begin_attach_mutation_batch(&live_input, &shutdown) else {
+                        shutdown_draining = true;
+                        continue;
+                    };
                     pane_refresh.clear();
                     match apply_pending_attach_controls(
                         &mut deferred_controls,
@@ -779,6 +811,13 @@ pub(crate) async fn forward_attach(
                     }
                 }
                 _ = wait_for_refresh_deadline(status_refresh.deadline()) => {
+                    if attach_shutdown_observable(&shutdown) {
+                        continue;
+                    }
+                    let Some(_control_batch) = begin_attach_mutation_batch(&live_input, &shutdown) else {
+                        shutdown_draining = true;
+                        continue;
+                    };
                     match apply_pending_attach_controls(
                         &mut deferred_controls,
                         attach_controls.as_mut(),
@@ -899,6 +938,13 @@ pub(crate) async fn forward_attach(
                         .await;
                 }
                 _ = wait_for_refresh_deadline(pending_escape_flush.deadline()) => {
+                    if attach_shutdown_observable(&shutdown) {
+                        continue;
+                    }
+                    let Some(_pending_escape_batch) = begin_attach_mutation_batch(&live_input, &shutdown) else {
+                        shutdown_draining = true;
+                        continue;
+                    };
                     flush_due_pending_escape_input(
                         &mut pending_escape_flush,
                         &live_input,
@@ -908,6 +954,19 @@ pub(crate) async fn forward_attach(
                     .await?;
                 }
                 control = recv_attach_control(&mut deferred_controls, attach_controls.as_mut(), &control_backlog) => {
+                    if attach_shutdown_observable(&shutdown) {
+                        if let Some(control) = control {
+                            deferred_controls.push_front(control);
+                        }
+                        continue;
+                    }
+                    let Some(_control_batch) = begin_attach_mutation_batch(&live_input, &shutdown) else {
+                        if let Some(control) = control {
+                            deferred_controls.push_front(control);
+                        }
+                        shutdown_draining = true;
+                        continue;
+                    };
                     // Dismissal publishes its persistent-overlay epoch before
                     // the fresh base frame is ready. This select arm may have
                     // already received a stale tree control while that epoch
@@ -1199,6 +1258,14 @@ pub(crate) async fn forward_attach(
                 result = recv_pane_output_optional(current_target.pane_output.as_mut()), if !pane_refresh.is_pending() => {
                     let Some(item) = result? else {
                         current_target.pane_output = None;
+                        continue;
+                    };
+                    let Some(_output_batch) = begin_attach_mutation_batch(&live_input, &shutdown) else {
+                        shutdown_pending_output_batch = Some(collect_attach_output_batch(
+                            item,
+                            current_target.pane_output.as_mut(),
+                        ));
+                        shutdown_draining = true;
                         continue;
                     };
                     #[cfg(unix)]
@@ -1539,6 +1606,109 @@ async fn synchronize_persistent_overlay_epoch(
         persistent_overlay_replacement_pending(deferred_controls, *persistent_overlay_state_id),
     )
     .await
+}
+
+#[cfg(any(unix, windows))]
+fn attach_shutdown_observable(shutdown: &watch::Receiver<()>) -> bool {
+    shutdown.has_changed().unwrap_or(true)
+}
+
+#[cfg(any(unix, windows))]
+/// Linearize one attach mutation batch against shutdown.
+///
+/// Callers keep the returned Drain guard through the batch's last handler mutation and any
+/// lifecycle publication it awaits. Transport reads may happen before this point, but decoded
+/// input or attach controls must not be applied until admission succeeds.
+fn begin_attach_mutation_batch(
+    live_input: &LiveAttachInputContext,
+    shutdown: &watch::Receiver<()>,
+) -> Option<crate::handler::NormalRequestGuard> {
+    if attach_shutdown_observable(shutdown) {
+        return None;
+    }
+    let guard = live_input.handler.try_begin_normal_request(true)?;
+    if attach_shutdown_observable(shutdown) {
+        // The listener closes normal admission before publishing transport shutdown. If the
+        // watch raced the optimistic admission, reject the batch before its first mutation.
+        return None;
+    }
+    Some(guard)
+}
+
+#[cfg(any(unix, windows))]
+fn take_pending_terminal_attach_control(
+    deferred_controls: &mut VecDeque<AttachControl>,
+    mut attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
+    control_backlog: &AtomicUsize,
+) -> Option<AttachControl> {
+    loop {
+        let control = match deferred_controls.pop_front() {
+            Some(control) => control,
+            None => {
+                let control_rx = attach_controls.as_mut()?;
+                match try_recv_attach_control(control_rx, control_backlog) {
+                    Ok(control) => control,
+                    Err(
+                        mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected,
+                    ) => return None,
+                }
+            }
+        };
+        if control.is_terminal() {
+            return Some(control);
+        }
+        // Shutdown has already been observed. Dropping a queued refresh, switch, overlay,
+        // write, lock, or suspend releases its memory reservation without starting the
+        // attach-control batch that could otherwise mutate the live forwarder state.
+    }
+}
+
+#[cfg(any(unix, windows))]
+async fn finish_terminal_attach_control(
+    control: AttachControl,
+    stream: &AttachTransport,
+    current_target: &mut types::OpenAttachTarget,
+    deferred_passthroughs: &mut Vec<TerminalPassthrough>,
+    pending_output_batch: Option<AttachOutputBatch>,
+) -> io::Result<AttachExitReason> {
+    match control {
+        AttachControl::Detach => {
+            emit_detached_attach_stop(stream, current_target).await?;
+            Ok(AttachExitReason::AttachControlDetach)
+        }
+        AttachControl::Exited => {
+            finish_pending_attach_exit_with_batch(
+                AttachExitReason::AttachControlExited,
+                stream,
+                current_target,
+                deferred_passthroughs,
+                pending_output_batch,
+            )
+            .await?;
+            Ok(AttachExitReason::AttachControlExited)
+        }
+        AttachControl::DetachKill => {
+            emit_attach_stop(stream, current_target).await?;
+            emit_attach_message(stream, &AttachMessage::DetachKill).await?;
+            Ok(AttachExitReason::AttachControlDetachKill)
+        }
+        AttachControl::DetachExecShellCommand(command) => {
+            emit_attach_stop(stream, current_target).await?;
+            emit_attach_message(stream, &AttachMessage::DetachExecShellCommand(command)).await?;
+            Ok(AttachExitReason::AttachControlDetachExec)
+        }
+        AttachControl::InteractiveInput
+        | AttachControl::Refresh
+        | AttachControl::Switch(_)
+        | AttachControl::AdvancePersistentOverlayState(_)
+        | AttachControl::Overlay(_)
+        | AttachControl::Write(_)
+        | AttachControl::ClipboardWrite { .. }
+        | AttachControl::LockShellCommand(_)
+        | AttachControl::Suspend => {
+            unreachable!("only terminal attach controls reach shutdown finalization")
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]

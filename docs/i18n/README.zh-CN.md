@@ -34,7 +34,7 @@
   <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
   <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.9.0"><img src="https://img.shields.io/badge/rmux-0.9.0-informational.svg" alt="rmux 0.9.0"></a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.9.1"><img src="https://img.shields.io/badge/rmux-0.9.1-informational.svg" alt="rmux 0.9.1"></a>
 </p>
 
 </div>
@@ -125,7 +125,7 @@ rmux web-share --help
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/rust.svg"><img src="../install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
 
-直接下载（`.tar.gz`、`.deb`、`.rpm`、`.zip`）可在 [v0.9.0 GitHub Release](https://github.com/Helvesec/rmux/releases/tag/v0.9.0) 获取。
+直接下载（`.tar.gz`、`.deb`、`.rpm`、`.zip`）可在 [v0.9.1 GitHub Release](https://github.com/Helvesec/rmux/releases/tag/v0.9.1) 获取。
 
 包管理器在注册表审核新版本时可能会滞后；在管理器更新前，请使用固定版本的 GitHub Release 下载。
 
@@ -282,9 +282,9 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.9.0-web-share">
-  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.9.0-web-share">
-  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.9.0-web-share" alt="RMUX 运行时架构" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.9.1-web-share">
+  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.9.1-web-share">
+  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.9.1-web-share" alt="RMUX 运行时架构" width="800">
 </picture>
 
 </div>

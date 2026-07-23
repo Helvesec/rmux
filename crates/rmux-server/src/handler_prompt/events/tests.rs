@@ -1,13 +1,18 @@
 use super::super::super::scripting_support::QueueExecutionContext;
+use super::super::super::{DetachedRequesterAuthority, RequesterOrigin};
 use super::super::{
     CommandPromptPlan, ConfirmBeforePlan, PromptCompletion, PromptField, PromptType,
 };
 use super::*;
 
+fn test_origin(requester_pid: u32) -> RequesterOrigin {
+    RequesterOrigin::new(requester_pid, DetachedRequesterAuthority::Denied)
+}
+
 #[test]
 fn command_prompt_initial_render_starts_in_entry_mode() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -31,7 +36,7 @@ fn command_prompt_initial_render_starts_in_entry_mode() {
 #[test]
 fn buffer_operations_with_multibyte_chars() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -72,7 +77,7 @@ fn buffer_operations_with_multibyte_chars() {
 #[test]
 fn batched_text_inserts_once_at_the_unicode_cursor() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -102,7 +107,7 @@ fn per_event_prompt_types_reject_batched_text() {
         PROMPT_FLAG_INCREMENTAL,
     ] {
         let plan = CommandPromptPlan {
-            requester_pid: 1,
+            origin: test_origin(1),
             target_client: None,
             context: QueueExecutionContext::without_caller_cwd(),
             fields: vec![PromptField {
@@ -125,7 +130,7 @@ fn per_event_prompt_types_reject_batched_text() {
 #[test]
 fn confirm_key_mode_accepts_correct_key() {
     let plan = ConfirmBeforePlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         prompt: "sure? ".to_owned(),
@@ -155,7 +160,7 @@ fn confirm_key_mode_accepts_correct_key() {
 #[test]
 fn confirm_enter_without_default_yes_declines() {
     let plan = ConfirmBeforePlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         prompt: "sure? ".to_owned(),
@@ -179,7 +184,7 @@ fn confirm_enter_without_default_yes_declines() {
 #[test]
 fn confirm_enter_with_default_yes_accepts() {
     let plan = ConfirmBeforePlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         prompt: "sure? ".to_owned(),
@@ -203,7 +208,7 @@ fn confirm_enter_with_default_yes_accepts() {
 #[test]
 fn key_mode_captures_any_key() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -226,7 +231,7 @@ fn key_mode_captures_any_key() {
 #[test]
 fn numeric_mode_rejects_non_digits() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -265,7 +270,7 @@ fn numeric_mode_rejects_non_digits() {
 #[test]
 fn incremental_mode_dispatches_on_each_char() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -301,7 +306,7 @@ fn incremental_mode_dispatches_on_each_char() {
 #[test]
 fn bspace_exit_cancels_on_empty_buffer_backspace() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -330,7 +335,7 @@ fn bspace_exit_cancels_on_empty_buffer_backspace() {
 #[test]
 fn delete_word_left_and_paste() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -359,7 +364,7 @@ fn delete_word_left_and_paste() {
 #[test]
 fn confirm_key_y_accepts_y_char() {
     let plan = ConfirmBeforePlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         prompt: "kill? ".to_owned(),
@@ -388,7 +393,7 @@ fn confirm_key_y_accepts_y_char() {
 #[test]
 fn confirm_escape_cancels() {
     let plan = ConfirmBeforePlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         prompt: "kill? ".to_owned(),
@@ -411,7 +416,7 @@ fn confirm_escape_cancels() {
 #[test]
 fn confirm_ctrl_c_cancels() {
     let plan = ConfirmBeforePlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         prompt: "kill? ".to_owned(),
@@ -440,7 +445,7 @@ fn confirm_ctrl_c_cancels() {
 #[test]
 fn numeric_mode_escape_cancels() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -464,7 +469,7 @@ fn numeric_mode_escape_cancels() {
 #[test]
 fn numeric_mode_backspace_on_empty_submits_empty() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
@@ -493,7 +498,7 @@ fn numeric_mode_backspace_on_empty_submits_empty() {
 #[test]
 fn multi_prompt_advances_through_fields() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![
@@ -529,7 +534,7 @@ fn multi_prompt_advances_through_fields() {
 #[test]
 fn incremental_ctrl_r_with_empty_buffer_restores_last_input() {
     let plan = CommandPromptPlan {
-        requester_pid: 1,
+        origin: test_origin(1),
         target_client: None,
         context: QueueExecutionContext::without_caller_cwd(),
         fields: vec![PromptField {
