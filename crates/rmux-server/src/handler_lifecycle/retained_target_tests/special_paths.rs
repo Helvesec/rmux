@@ -165,6 +165,11 @@ async fn source_file_missing_explicit_target_cuts_the_outer_lifecycle_lease() {
     let handler = RequestHandler::new();
     let alpha = session_with_spare_window(&handler, "special-source-missing-alpha").await;
     let beta = create_handler_session(&handler, "special-source-missing-beta").await;
+    let requester_pid = std::process::id();
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, beta.clone(), control_tx)
+        .await;
     let (current_target, lease) = retained_window_binding(&handler, &alpha).await;
     let path = unique_temp_path("source-missing-target.conf");
     std::fs::write(&path, "rename-window fallback-beta\n").expect("write source fixture");
@@ -173,7 +178,7 @@ async fn source_file_missing_explicit_target_cuts_the_outer_lifecycle_lease() {
     let queued = tokio::spawn(async move {
         queued_handler
             .execute_hook_command_with_target_binding(
-                std::process::id(),
+                requester_pid,
                 &format!(
                     "source-file -t %9999 {}",
                     crate::test_shell::command_quote(&path.display().to_string())
