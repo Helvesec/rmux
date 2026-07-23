@@ -313,6 +313,11 @@ fn write_github_tag_fixture(fixture: &Fixture, message: &Path) -> (PathBuf, Path
         String::from_utf8(raw.stdout[..marker_index].to_vec()).expect("signature payload UTF-8");
     let signature =
         String::from_utf8(raw.stdout[marker_index..].to_vec()).expect("signature envelope UTF-8");
+    let github_message = format!(
+        "{}{}",
+        fs::read_to_string(message).expect("read canonical message"),
+        signature
+    );
     let ref_json = fixture.root.join("ref.json");
     let tag_json = fixture.root.join("tag.json");
     fs::write(
@@ -329,7 +334,7 @@ fn write_github_tag_fixture(fixture: &Fixture, message: &Path) -> (PathBuf, Path
         serde_json::to_vec(&serde_json::json!({
             "sha": tag_sha,
             "tag": "v0.9.1",
-            "message": fs::read_to_string(message).expect("read canonical message"),
+            "message": github_message,
             "object": {
                 "type": "commit",
                 "sha": fixture.source_sha,
@@ -643,7 +648,7 @@ headers, message = payload.split("\n\n", 1)
 header = dict(line.split(" ", 1) for line in headers.splitlines()[:3])
 ref = {"ref": "refs/tags/v0.9.1", "object": {"type": "tag", "sha": sys.argv[2]}}
 tag = {
-    "sha": sys.argv[2], "tag": "v0.9.1", "message": message,
+    "sha": sys.argv[2], "tag": "v0.9.1", "message": message + signature,
     "object": {"type": "commit", "sha": header["object"]},
     "verification": {
         "verified": sys.argv[5] == "true", "reason": "valid" if sys.argv[5] == "true" else "unknown_key",
