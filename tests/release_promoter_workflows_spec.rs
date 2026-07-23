@@ -185,6 +185,16 @@ fn signed_tag_gate_preserves_dedicated_ssh_signature_and_app_boundary() {
 }
 
 #[test]
+fn signed_tag_gate_accepts_rfc3339_fractional_seconds() {
+    for variable in ["RMUX_MANIFEST_CREATED_AT", "RMUX_MANIFEST_EXPIRES_AT"] {
+        let check = format!(
+            r#"[[ "${variable}" =~ ^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T[0-9]{{2}}:[0-9]{{2}}:[0-9]{{2}}(\.[0-9]{{1,9}})?Z$ ]]"#
+        );
+        assert!(TAG.contains(&check), "missing fractional timestamp gate");
+    }
+}
+
+#[test]
 fn promotion_splits_oidc_from_contents_write_and_keeps_exact_dag() {
     let verify = job(PROMOTE, "verify-candidate", Some("prepare-policy-audit"));
     let prepare = job(PROMOTE, "prepare-policy-audit", Some("policy-audit"));
