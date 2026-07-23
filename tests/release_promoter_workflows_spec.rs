@@ -17,6 +17,7 @@ const CI: &str = include_str!("../.github/workflows/ci.yml");
 const LEGACY_RELEASE: &str = include_str!("../.github/workflows/release.yml");
 const LEGACY_CHOCOLATEY: &str = include_str!("../.github/workflows/publish-chocolatey.yml");
 const SECURITY: &str = include_str!("../SECURITY.md");
+const CHECK_RELEASE_VERSIONS: &str = include_str!("../scripts/check-release-versions.sh");
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -329,6 +330,8 @@ fn release_verification_docs_match_current_and_legacy_bundle_types() {
     assert!(SECURITY.contains("For releases from `v0.6.5` through `v0.9.0`"));
     assert!(SECURITY.contains("cosign verify-blob \\"));
     assert!(SECURITY.contains("release\\.yml@refs/tags/"));
+    assert!(CHECK_RELEASE_VERSIONS.contains("f\"release-promote.yml@refs/tags/v{version}\""));
+    assert!(!CHECK_RELEASE_VERSIONS.contains("f\"release.yml@refs/tags/v{version}\""));
 }
 
 #[test]
