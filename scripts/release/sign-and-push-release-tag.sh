@@ -200,8 +200,8 @@ fi
 
 clone=$temporary/repository
 git clone --quiet --no-checkout --no-hardlinks --local "$repository_root" "$clone"
-git -C "$clone" config user.name 'RMUX Release'
-git -C "$clone" config user.email 'release@rmux.io'
+git -C "$clone" config user.name 'Sidney Sissaoui'
+git -C "$clone" config user.email 'shideneyu@gmail.com'
 git -C "$clone" config gpg.format ssh
 git -C "$clone" config user.signingkey "$(realpath "$signing_key")"
 git -C "$clone" tag --annotate --sign --file "$message_file" "$release_ref" "$source_sha"
