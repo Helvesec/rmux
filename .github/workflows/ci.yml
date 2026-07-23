@@ -250,9 +250,6 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
-      - name: Install audit tooling
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep
-
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
