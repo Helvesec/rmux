@@ -217,9 +217,10 @@ def verify_github_json(
     signature_text = require_string(verification.get("signature"), "signature envelope")
     raw = payload_text.encode("utf-8") + signature_text.encode("utf-8")
     result = verify_raw_tag(raw, tag_sha, identity)
-    if tag.get("message") != identity.message():
+    github_message = require_string(tag.get("message"), "GitHub tag message")
+    if github_message != identity.message() + signature_text:
         raise PolicyError(
-            "GitHub tag message differs from the canonical signed message"
+            "GitHub tag message differs from the canonical message and signature"
         )
     result["mode"] = "github-json-verified"
     return result
