@@ -44,6 +44,9 @@ fn release_tag_surface_has_a_dedicated_signer_and_is_create_only() {
     assert!(driver.contains("refs/tags/$release_ref:refs/tags/$release_ref"));
     assert!(driver.contains("https://github.com/Helvesec/rmux.git"));
     assert!(driver.contains("GIT_ASKPASS=$askpass"));
+    assert!(driver.contains("config user.name 'Sidney Sissaoui'"));
+    assert!(driver.contains("config user.email 'shideneyu@gmail.com'"));
+    assert!(!driver.contains("config user.email 'release@rmux.io'"));
     assert!(driver.contains("github_verification=$(verify_existing_ref \"$created_ref\")"));
     assert_eq!(driver.matches("verify_existing_ref").count(), 3);
     for forbidden in [
