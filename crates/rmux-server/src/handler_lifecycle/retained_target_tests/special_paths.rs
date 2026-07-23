@@ -418,13 +418,26 @@ fn unique_temp_path(label: &str) -> PathBuf {
 }
 
 async fn wait_for_file(path: &std::path::Path) {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(background_shell_marker_timeout(), async {
         while !path.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("background shell writes its marker");
+    .unwrap_or_else(|_| panic!("background shell did not write marker {}", path.display()));
+}
+
+fn background_shell_marker_timeout() -> Duration {
+    #[cfg(windows)]
+    {
+        // Hosted Windows can heavily delay a cold PowerShell process. This
+        // test checks eventual completion, not process-start latency.
+        Duration::from_secs(30)
+    }
+    #[cfg(not(windows))]
+    {
+        Duration::from_secs(10)
+    }
 }
 
 fn delayed_file_command(started: &std::path::Path, finished: &std::path::Path) -> String {

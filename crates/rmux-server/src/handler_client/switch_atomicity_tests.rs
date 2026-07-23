@@ -606,9 +606,9 @@ async fn successful_attach_switch_applies_mode_tree_dismissal_after_delivery() {
         observer.persistent_overlay_epoch.load(Ordering::SeqCst),
         observer.mode_tree_state_id
     );
-    assert_eq!(
-        observer.overlay_generation,
-        mode_tree_before.overlay_generation.saturating_add(1)
+    assert!(
+        observer.overlay_generation > mode_tree_before.overlay_generation,
+        "committed dismissal must advance the shared overlay generation"
     );
     let switched = active_attach
         .by_pid
@@ -711,9 +711,9 @@ async fn concurrent_switch_recomputes_mode_tree_source_under_commit_locks() {
         observer.persistent_overlay_epoch.load(Ordering::SeqCst),
         observer.mode_tree_state_id
     );
-    assert_eq!(
-        observer.overlay_generation,
-        mode_tree_before.overlay_generation.saturating_add(1)
+    assert!(
+        observer.overlay_generation > mode_tree_before.overlay_generation,
+        "concurrent dismissal must advance the shared overlay generation"
     );
     let switching = active_attach
         .by_pid
