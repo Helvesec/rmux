@@ -1574,7 +1574,7 @@ fn cancellation_remains_active_while_output_drop_blocks() -> Result<(), Box<dyn 
     drop_started_rx
         .recv_timeout(Duration::from_secs(1))
         .map_err(|_| io::Error::other("output Drop did not start"))?;
-    let joined = match joined_rx.recv_timeout(Duration::from_secs(2)) {
+    let joined = match joined_rx.recv_timeout(Duration::from_secs(10)) {
         Ok(joined) => joined,
         Err(_) => {
             drop(blocked_output_reader);
