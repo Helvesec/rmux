@@ -185,6 +185,30 @@ fn signed_tag_gate_preserves_dedicated_ssh_signature_and_app_boundary() {
 }
 
 #[test]
+fn signed_tag_artifact_stages_all_evidence_at_its_root() {
+    let create = job(TAG, "create-signed-tag", Some("dispatch-promoter"));
+    assert!(create.contains("bundle=\"$RUNNER_TEMP/rmux-signed-tag\""));
+    assert!(create.contains(
+        "\"$RUNNER_TEMP/rmux-tag-input/candidate-reference.json\" \\\n            \"$bundle/candidate-reference.json\""
+    ));
+    for filename in [
+        "candidate-reference.json",
+        "signed-tag-proof.json",
+        "tag-verification.json",
+    ] {
+        assert!(
+            create.contains(&format!(
+                "${{{{ runner.temp }}}}/rmux-signed-tag/{filename}"
+            )),
+            "signed-tag artifact does not stage {filename} at its root"
+        );
+    }
+    assert!(!create.contains(
+        "${{ runner.temp }}/rmux-tag-input/candidate-reference.json\n            ${{ runner.temp }}/signed-tag-proof.json"
+    ));
+}
+
+#[test]
 fn signed_tag_gate_accepts_rfc3339_fractional_seconds() {
     for variable in ["RMUX_MANIFEST_CREATED_AT", "RMUX_MANIFEST_EXPIRES_AT"] {
         let check = format!(

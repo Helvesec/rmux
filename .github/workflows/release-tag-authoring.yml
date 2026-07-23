@@ -325,15 +325,27 @@ jobs:
             --verified-at "$verified_at" \
             --document "$RUNNER_TEMP/signed-tag-proof.json"
 
+      - name: Stage the exact signed-tag evidence bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/rmux-signed-tag"
+          install -d -m 0700 "$bundle"
+          install -m 0600 \
+            "$RUNNER_TEMP/rmux-tag-input/candidate-reference.json" \
+            "$bundle/candidate-reference.json"
+          install -m 0600 "$RUNNER_TEMP/signed-tag-proof.json" "$bundle/signed-tag-proof.json"
+          install -m 0600 "$RUNNER_TEMP/tag-verification.json" "$bundle/tag-verification.json"
+
       - id: tag-proof
         name: Upload only exact signed-tag evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: rmux-signed-tag-${{ inputs.expected_source_sha }}
           path: |
-            ${{ runner.temp }}/rmux-tag-input/candidate-reference.json
-            ${{ runner.temp }}/signed-tag-proof.json
-            ${{ runner.temp }}/tag-verification.json
+            ${{ runner.temp }}/rmux-signed-tag/candidate-reference.json
+            ${{ runner.temp }}/rmux-signed-tag/signed-tag-proof.json
+            ${{ runner.temp }}/rmux-signed-tag/tag-verification.json
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
