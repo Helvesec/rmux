@@ -154,8 +154,36 @@ class ApiClient:
     def get_release(self, release_ref: str) -> dict[str, Any] | None:
         path = f"/repos/{REPOSITORY}/releases/tags/{quote(release_ref, safe='')}"
         status, _, value = self.request("GET", path, statuses={200, 404})
-        if status == 404:
-            return None
+        if status == 200:
+            if not isinstance(value, dict):
+                raise ValueError("GitHub release response is not an object")
+            return value
+
+        # The tag endpoint returns published releases only. Authenticated release
+        # listings include drafts, so scan a bounded number of pages to support
+        # exact draft resumption without weakening public-release detection.
+        for page in range(1, 11):
+            _, headers, releases = self.request(
+                "GET",
+                f"/repos/{REPOSITORY}/releases?per_page=100&page={page}",
+            )
+            if not isinstance(releases, list) or not all(
+                isinstance(item, dict) for item in releases
+            ):
+                raise ValueError("GitHub release listing is invalid")
+            matches = [item for item in releases if item.get("tag_name") == release_ref]
+            if len(matches) > 1:
+                raise ValueError("GitHub release listing contains duplicate tags")
+            if matches:
+                return matches[0]
+            if 'rel="next"' not in headers.get("link", ""):
+                return None
+        raise ValueError("GitHub release listing exceeded the bounded scan")
+
+    def get_release_by_id(self, release_id: int) -> dict[str, Any]:
+        _, _, value = self.request(
+            "GET", f"/repos/{REPOSITORY}/releases/{positive(release_id, 'release ID')}"
+        )
         if not isinstance(value, dict):
             raise ValueError("GitHub release response is not an object")
         return value
@@ -338,7 +366,7 @@ def verify_live_inputs(
     client: ApiClient, evidence: Any, now: datetime, release_id: int
 ) -> None:
     verify_live_evidence(client, evidence, now)
-    current = client.get_release(evidence.release_ref)
-    if current is None or release_identity(current, evidence, draft=True) != release_id:
+    current = client.get_release_by_id(release_id)
+    if release_identity(current, evidence, draft=True) != release_id:
         raise ValueError("GitHub draft changed immediately before publication")
     inspect_assets(client.list_assets(release_id), evidence, complete=True)

@@ -547,12 +547,27 @@ fn handle_request(mut stream: TcpStream, shared: &Arc<Mutex<ServerState>>) {
     let mut state = shared.lock().expect("fake API state");
     state.requests.push(request.clone());
     let release_path = "/repos/Helvesec/rmux/releases/tags/v1.2.3";
+    let release_list_path = "/repos/Helvesec/rmux/releases?per_page=100&page=1";
+    let release_id_path = "/repos/Helvesec/rmux/releases/42";
     let assets_path = "/repos/Helvesec/rmux/releases/42/assets?per_page=100";
     let (status, value) = match (request.method.as_str(), request.path.as_str()) {
         ("GET", path) if path == release_path => match state.draft {
-            Some(draft) => (200, release_json(draft)),
-            None => (404, json!({"message": "Not Found"})),
+            Some(false) => (200, release_json(false)),
+            Some(true) | None => (404, json!({"message": "Not Found"})),
         },
+        ("GET", path) if path == release_list_path => (
+            200,
+            Value::Array(
+                state
+                    .draft
+                    .map(release_json)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        ("GET", path) if path == release_id_path && state.draft.is_some() => {
+            (200, release_json(state.draft.expect("release state")))
+        }
         ("POST", "/repos/Helvesec/rmux/releases") if state.draft.is_none() => {
             let body: Value = serde_json::from_slice(&request.body).expect("create draft body");
             assert_eq!(body["tag_name"], "v1.2.3");
@@ -666,7 +681,7 @@ fn default_mode_is_a_read_only_plan() {
     assert_eq!(result["action"], "create-draft");
     assert_eq!(result["mutations"], false);
     let requests = server.requests();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 2);
     assert!(requests.iter().all(|request| request.method == "GET"));
 }
 
@@ -815,6 +830,12 @@ fn resumes_only_the_exact_draft_without_clobbering_existing_asset() {
             .count(),
         1
     );
+    assert!(requests.iter().any(|item| {
+        item.method == "GET" && item.path == "/repos/Helvesec/rmux/releases?per_page=100&page=1"
+    }));
+    assert!(requests
+        .iter()
+        .any(|item| { item.method == "GET" && item.path == "/repos/Helvesec/rmux/releases/42" }));
 }
 
 #[test]
