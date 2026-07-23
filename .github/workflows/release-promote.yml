@@ -1,4 +1,4 @@
-name: Disarmed exact-tag GitHub Release promoter
+name: Exact-tag GitHub Release promoter
 
 on:
   workflow_dispatch:
@@ -307,9 +307,8 @@ jobs:
           retention-days: 1
           compression-level: 0
   prepare-policy-audit:
-    name: Disabled exact policy audit preparation
+    name: Prepare exact policy audit inputs
     needs: verify-candidate
-    if: ${{ false }}
     uses: ./.github/workflows/release-policy-audit.yml
     with:
       candidate_run_id: ${{ inputs.candidate_run_id }}
@@ -326,9 +325,8 @@ jobs:
       release_policy_sha256: ${{ inputs.release_policy_sha256 }}
       release_policy_contract_blob_oid: ${{ inputs.release_policy_contract_blob_oid }}
   policy-audit:
-    name: Disabled exact live policy audit
+    name: Audit exact live release policy
     needs: prepare-policy-audit
-    if: ${{ false }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     environment: release-policy-audit
@@ -367,9 +365,8 @@ jobs:
           audit-app-private-key: ${{ secrets.RMUX_POLICY_AUDIT_APP_PRIVATE_KEY }}
           github-token: ${{ github.token }}
   authorize-promotion:
-    name: Disabled short-lived promotion authorization
+    name: Create short-lived promotion authorization
     needs: [verify-candidate, policy-audit]
-    if: ${{ false }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
@@ -544,9 +541,8 @@ jobs:
           compression-level: 0
 
   publish:
-    name: Disabled atomic GitHub Release publication
+    name: Publish atomic GitHub Release
     needs: [verify-candidate, policy-audit, authorize-promotion]
-    if: ${{ false }}
     uses: ./.github/workflows/release-github-publish.yml
     permissions:
       actions: read
@@ -568,9 +564,8 @@ jobs:
       authorization_envelope_artifact_digest: ${{ needs.authorize-promotion.outputs.envelope_artifact_digest }}
 
   dispatch-receipt:
-    name: Disabled exact receipt-only dispatch
+    name: Dispatch exact receipt verification
     needs: [authorize-promotion, publish]
-    if: ${{ false }}
     uses: ./.github/workflows/release-receipt-dispatch.yml
     permissions:
       actions: write

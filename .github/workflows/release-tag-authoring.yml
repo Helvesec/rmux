@@ -1,4 +1,4 @@
-name: Disarmed candidate-first signed release tag authoring
+name: Candidate-first signed release tag authoring
 
 on:
   workflow_dispatch:
@@ -196,9 +196,8 @@ jobs:
           compression-level: 0
 
   create-signed-tag:
-    name: Disabled exact signed annotated tag creation
+    name: Create exact signed annotated tag
     needs: verify-tag-inputs
-    if: ${{ false }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     environment: release-tagging

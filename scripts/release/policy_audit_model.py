@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Typed, fail-closed model for the disarmed live release-policy audit."""
+"""Typed, fail-closed model for the live release-policy audit."""
 
 from __future__ import annotations
 

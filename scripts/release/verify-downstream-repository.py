@@ -56,8 +56,11 @@ def load_contract() -> dict[str, Any]:
         },
         "downstream repository contract",
     )
-    if contract["schema_version"] != 1 or contract["status"] != "review-only-disarmed":
-        raise ValueError("downstream repository contract must remain disarmed")
+    if (
+        contract["schema_version"] != 1
+        or contract["status"] != "active-authority-gated"
+    ):
+        raise ValueError("downstream repository contract must remain authority-gated")
     app = contract["writer_app"]
     if app != WRITER_APP:
         raise ValueError("downstream writer App identity or permissions changed")
@@ -205,7 +208,7 @@ def main() -> int:
     args = parse_args()
     contract = load_contract()
     if args.command == "contract":
-        print("downstream-repository-contract=disarmed")
+        print("downstream-repository-contract=authority-gated")
         return 0
     expected = repository_by_key(contract, args.repository_key)
     metadata = read_object(args.metadata, "repository metadata")

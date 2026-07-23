@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create or verify disarmed downstream result predicates and envelopes."""
+"""Create or verify downstream result predicates and envelopes."""
 
 from __future__ import annotations
 

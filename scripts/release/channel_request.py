@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create or verify byte-bound, disarmed downstream channel requests."""
+"""Create or verify byte-bound downstream channel requests."""
 
 from __future__ import annotations
 

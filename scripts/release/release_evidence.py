@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared fail-closed primitives for disarmed release evidence records."""
+"""Shared fail-closed primitives for release evidence records."""
 
 from __future__ import annotations
 

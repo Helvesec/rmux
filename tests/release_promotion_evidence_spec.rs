@@ -540,8 +540,8 @@ fn promotion_authorization_round_trip_rejects_forged_evidence() {
         &auth_verify_args(&fixture, &fixture.authorization),
     ));
     let predicate = read_json(&fixture.authorization);
-    assert_eq!(predicate["status"], "disarmed-non-authoritative");
-    assert_eq!(predicate["publication_authority"], false);
+    assert_eq!(predicate["status"], "promotion-authorized");
+    assert_eq!(predicate["publication_authority"], true);
     assert!(predicate.get("attestation_id").is_none());
     let envelope_duplicate = fixture.root.join("authorization-envelope-2.json");
     assert_success(invoke(
@@ -726,7 +726,7 @@ fn publication_receipt_round_trip_rejects_asset_and_authorization_drift() {
         &receipt_envelope,
     );
     let receipt = read_json(&fixture.receipt);
-    assert_eq!(receipt["downstream_authority"], false);
+    assert_eq!(receipt["downstream_authority"], true);
     assert!(receipt.get("attestation_id").is_none());
     let original_state = read_json(&fixture.release_state);
     let mut missing = original_state.clone();

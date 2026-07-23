@@ -71,8 +71,8 @@ def fixture(root):
     predicate = {
         'schema_version': 1,
         'predicate_type': 'https://rmux.io/attestations/release-publication-receipt/v1',
-        'status': 'disarmed-non-authoritative',
-        'downstream_authority': False,
+        'status': 'downstream-authorized',
+        'downstream_authority': True,
         'repository_id': 1239918790,
         'source_git_sha': SOURCE,
         'release': {
@@ -117,8 +117,8 @@ def fixture(root):
     reference_path = root / 'receipt-reference.json'
     reference = {
         'schema_version': 1,
-        'status': 'disarmed-non-authoritative',
-        'downstream_authority': False,
+        'status': 'downstream-authorized',
+        'downstream_authority': True,
         'repository_id': 1239918790,
         'source_git_sha': SOURCE,
         'release': RELEASE,

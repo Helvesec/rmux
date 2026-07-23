@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect or verify one exact, short-lived, disarmed policy-audit proof."""
+"""Collect or verify one exact, short-lived policy-audit proof."""
 
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ def collect(args: argparse.Namespace) -> None:
     if SHA40.fullmatch(args.source_sha) is None:
         raise ValueError("source SHA must be 40 lowercase hex characters")
     contract = read_object(args.contract, "policy audit contract")
-    validate_contract(contract, require_disarmed=False)
+    validate_contract(contract, require_configured=False)
     if not contract["audit_app"]["configured"]:
         raise ValueError(
             "policy audit App is unconfigured; live audit remains disarmed"
@@ -161,7 +161,7 @@ def collect(args: argparse.Namespace) -> None:
 def verify(args: argparse.Namespace) -> None:
     value = read_object(args.predicate, "policy audit predicate")
     contract = read_object(args.contract, "policy audit contract")
-    validate_contract(contract, require_disarmed=False)
+    validate_contract(contract, require_configured=False)
     validate_predicate_against_contract(value, contract)
     fixture_marker = Path("offline-verification") if args.now is not None else None
     now = parse_now(args.now, fixture_marker)
@@ -181,7 +181,7 @@ def create_reference(args: argparse.Namespace) -> None:
 def verify_reference(args: argparse.Namespace) -> None:
     predicate = read_object(args.predicate, "policy audit predicate")
     contract = read_object(args.contract, "policy audit contract")
-    validate_contract(contract, require_disarmed=False)
+    validate_contract(contract, require_configured=False)
     validate_predicate_against_contract(predicate, contract)
     reference = read_object(args.reference, "policy audit reference")
     validate_reference(reference, predicate)
