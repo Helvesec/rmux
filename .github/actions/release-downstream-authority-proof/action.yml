@@ -1,0 +1,101 @@
+name: Verify downstream repository authority proof
+description: Verify and consume one exact non-secret downstream authority audit artifact
+
+inputs:
+  audit-run-id:
+    description: Workflow run that produced the audit artifact
+    required: true
+  audit-workflow-id:
+    description: Exact receipt workflow ID
+    required: true
+  audit-artifact-id:
+    description: Exact downstream authority audit artifact ID
+    required: true
+  audit-artifact-digest:
+    description: Exact downstream authority audit artifact digest
+    required: true
+  expected-source-sha:
+    description: Exact trusted RMUX source commit
+    required: true
+  release-ref:
+    description: Exact signed release tag
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Reject malformed downstream audit evidence
+      shell: bash
+      env:
+        RMUX_DOWNSTREAM_AUDIT_RUN_ID: ${{ inputs.audit-run-id }}
+        RMUX_DOWNSTREAM_AUDIT_WORKFLOW_ID: ${{ inputs.audit-workflow-id }}
+        RMUX_DOWNSTREAM_AUDIT_ARTIFACT_ID: ${{ inputs.audit-artifact-id }}
+        RMUX_DOWNSTREAM_AUDIT_ARTIFACT_DIGEST: ${{ inputs.audit-artifact-digest }}
+        RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
+        RMUX_RELEASE_REF: ${{ inputs.release-ref }}
+      run: |
+        set -euo pipefail
+        test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
+        test "$GITHUB_REPOSITORY_ID" = "1239918790"
+        test "$GITHUB_RUN_ATTEMPT" = 1
+        test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+        for value in "$RMUX_DOWNSTREAM_AUDIT_RUN_ID" "$RMUX_DOWNSTREAM_AUDIT_WORKFLOW_ID" "$RMUX_DOWNSTREAM_AUDIT_ARTIFACT_ID"; do
+          [[ "$value" =~ ^[1-9][0-9]*$ ]]
+        done
+        test "$RMUX_DOWNSTREAM_AUDIT_WORKFLOW_ID" = 316435347
+        [[ "$RMUX_DOWNSTREAM_AUDIT_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+        [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+        [[ "$RMUX_RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+        test "$GITHUB_REF" = "refs/tags/$RMUX_RELEASE_REF"
+
+    - name: Verify exact downstream authority artifact identity
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        python3 scripts/release/actions-artifact.py verify \
+          --repository "$GITHUB_REPOSITORY" \
+          --run-id "${{ inputs.audit-run-id }}" \
+          --artifact-id "${{ inputs.audit-artifact-id }}" \
+          --name "rmux-downstream-authority-${{ inputs.expected-source-sha }}-${{ inputs.audit-run-id }}" \
+          --expected-source-sha "${{ inputs.expected-source-sha }}" \
+          --expected-digest "${{ inputs.audit-artifact-digest }}" \
+          --expected-workflow-id "${{ inputs.audit-workflow-id }}" \
+          --expected-workflow-path .github/workflows/release-receipt.yml \
+          --expected-event workflow_dispatch \
+          --expected-head-branch "${{ inputs.release-ref }}" \
+          --allow-running-current-run --max-attempts 1
+
+    - name: Download only the exact downstream authority artifact ID
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        artifact-ids: ${{ inputs.audit-artifact-id }}
+        merge-multiple: true
+        path: ${{ runner.temp }}/rmux-downstream-authority
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ inputs.audit-run-id }}
+
+    - name: Verify exact downstream authority fixtures
+      shell: bash
+      run: |
+        set -euo pipefail
+        root="$RUNNER_TEMP/rmux-downstream-authority"
+        files=(--file installation.json)
+        for key in homebrew-rmux rmux-packages rmux-web-share scoop-rmux; do
+          for name in metadata.json protection.json rulesets.json environments.json runners.json; do
+            files+=(--file "$key/$name")
+          done
+        done
+        scripts/release/verify-exact-file-set.py --root "$root" "${files[@]}"
+        for key in homebrew-rmux rmux-packages rmux-web-share scoop-rmux; do
+          scripts/release/verify-downstream-repository.py fixtures \
+            --repository-key "$key" \
+            --metadata "$root/$key/metadata.json" \
+            --protection "$root/$key/protection.json" \
+            --rulesets "$root/$key/rulesets.json" \
+            --environments "$root/$key/environments.json" \
+            --runners "$root/$key/runners.json" \
+            --installation "$root/installation.json"
+        done

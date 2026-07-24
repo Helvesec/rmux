@@ -8,6 +8,8 @@ const DOWNSTREAM: &str = include_str!("../.github/workflows/release-downstream.y
 const DOWNSTREAM_AUDIT: &str = include_str!("../.github/workflows/release-downstream-audit.yml");
 const DOWNSTREAM_AUDIT_ACTION: &str =
     include_str!("../.github/actions/release-downstream-audit/action.yml");
+const DOWNSTREAM_AUTHORITY_PROOF: &str =
+    include_str!("../.github/actions/release-downstream-authority-proof/action.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
 const CI: &str = include_str!("../.github/workflows/ci.yml");
 const RECEIPT_REFERENCE_BUILDER: &str =
@@ -97,9 +99,9 @@ fn downstream_workflow_is_receipt_gated_read_only_and_active() {
         DOWNSTREAM
             .matches("environment: release-publication")
             .count(),
-        1
+        0
     );
-    assert_eq!(DOWNSTREAM.matches("environment:").count(), 1);
+    assert_eq!(DOWNSTREAM.matches("environment:").count(), 0);
     assert!(!DOWNSTREAM.contains("self-hosted"));
     assert!(!DOWNSTREAM.contains("larger-runner"));
 
@@ -202,26 +204,45 @@ fn downstream_authority_is_rechecked_live_before_payload_staging() {
             .count(),
         1
     );
+    assert!(DOWNSTREAM_AUDIT_ACTION.contains("artifact-id:"));
+    assert!(DOWNSTREAM_AUDIT_ACTION.contains("artifact-digest:"));
     assert!(!DOWNSTREAM.contains("uses: ./.github/workflows/release-downstream-audit.yml"));
-    assert_eq!(
-        DOWNSTREAM
-            .matches("uses: ./.github/actions/release-downstream-audit")
-            .count(),
-        1
-    );
-    let audit = job(
-        DOWNSTREAM,
-        "audit-downstream-authority",
-        Some("prepare-payloads"),
-    );
+    assert!(!DOWNSTREAM.contains("uses: ./.github/actions/release-downstream-audit"));
+    assert!(!DOWNSTREAM.contains("RMUX_DOWNSTREAM_APP_PRIVATE_KEY"));
+    assert!(!DOWNSTREAM.contains("environment: release-publication"));
+    let audit = job(RECEIPT, "audit-downstream-authority", Some("downstream"));
     assert!(audit.contains("environment: release-publication"));
     assert!(audit.contains("app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}"));
+    assert!(audit.contains("uses: ./.github/actions/release-downstream-audit"));
+    assert!(audit.contains("artifact_id: ${{ steps.audit.outputs.artifact-id }}"));
+    assert!(audit.contains("artifact_digest: ${{ steps.audit.outputs.artifact-digest }}"));
+    let downstream = job(RECEIPT, "downstream", None);
+    assert!(downstream.contains("needs: [receipt-only, audit-downstream-authority]"));
+    assert!(downstream.contains("downstream_audit_artifact_id:"));
+    assert!(downstream.contains("downstream_audit_artifact_digest:"));
+    let verification = job(
+        DOWNSTREAM,
+        "verify-downstream-authority",
+        Some("prepare-payloads"),
+    );
+    assert!(verification.contains("uses: ./.github/actions/release-downstream-authority-proof"));
+    assert!(verification.contains(
+        "test \"${{ inputs.downstream_audit_run_id }}\" = \"${{ inputs.receipt_run_id }}\""
+    ));
+    assert!(DOWNSTREAM_AUTHORITY_PROOF.contains("actions-artifact.py verify"));
+    assert!(DOWNSTREAM_AUTHORITY_PROOF
+        .contains("--expected-workflow-path .github/workflows/release-receipt.yml"));
+    assert!(DOWNSTREAM_AUTHORITY_PROOF
+        .contains("test \"$RMUX_DOWNSTREAM_AUDIT_WORKFLOW_ID\" = 316435347"));
+    assert!(DOWNSTREAM_AUTHORITY_PROOF.contains("verify-exact-file-set.py"));
+    assert!(DOWNSTREAM_AUTHORITY_PROOF.contains("verify-downstream-repository.py fixtures"));
+    assert!(DOWNSTREAM_AUTHORITY_PROOF.contains("--allow-running-current-run"));
     let payloads = job(
         DOWNSTREAM,
         "prepare-payloads",
         Some("build-linux-repository"),
     );
-    assert!(payloads.contains("needs: [prepare-plan, audit-downstream-authority]"));
+    assert!(payloads.contains("needs: [prepare-plan, verify-downstream-authority]"));
 }
 
 #[test]
@@ -266,6 +287,10 @@ fn exact_receipt_ids_digests_origin_and_documents_are_bound() {
         "receipt_envelope_artifact_digest:",
         "receipt_predicate_sha256:",
         "receipt_envelope_sha256:",
+        "downstream_audit_run_id:",
+        "downstream_audit_workflow_id:",
+        "downstream_audit_artifact_id:",
+        "downstream_audit_artifact_digest:",
         "expected_source_sha:",
         "release_id:",
         "release_ref:",

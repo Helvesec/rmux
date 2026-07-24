@@ -407,9 +407,47 @@ jobs:
               )
           PY
 
+  audit-downstream-authority:
+    name: Audit live downstream repository authority
+    needs: receipt-only
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    environment: release-publication
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.audit.outputs.artifact-id }}
+      artifact_digest: ${{ steps.audit.outputs.artifact-digest }}
+    env:
+      RMUX_EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+    steps:
+      - name: Reject malformed or stale audit identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "Helvesec/rmux"
+          test "$GITHUB_REPOSITORY_ID" = "1239918790"
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$GITHUB_SHA" = "$RMUX_EXPECTED_SOURCE_SHA"
+          [[ "$RMUX_EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ inputs.expected_source_sha }}
+          persist-credentials: false
+
+      - id: audit
+        name: Audit exact downstream repository authority
+        uses: ./.github/actions/release-downstream-audit
+        with:
+          app-id: ${{ vars.RMUX_DOWNSTREAM_APP_ID }}
+          app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
+          expected-source-sha: ${{ inputs.expected_source_sha }}
+
   downstream:
     name: Receipt-gated downstream publication
-    needs: receipt-only
+    needs: [receipt-only, audit-downstream-authority]
     uses: ./.github/workflows/release-downstream.yml
     permissions:
       actions: read
@@ -426,6 +464,10 @@ jobs:
       receipt_envelope_artifact_digest: ${{ needs.receipt-only.outputs.envelope_artifact_digest }}
       receipt_predicate_sha256: ${{ needs.receipt-only.outputs.receipt_predicate_sha256 }}
       receipt_envelope_sha256: ${{ needs.receipt-only.outputs.receipt_envelope_sha256 }}
+      downstream_audit_run_id: ${{ github.run_id }}
+      downstream_audit_workflow_id: ${{ inputs.receipt_workflow_id }}
+      downstream_audit_artifact_id: ${{ needs.audit-downstream-authority.outputs.artifact_id }}
+      downstream_audit_artifact_digest: ${{ needs.audit-downstream-authority.outputs.artifact_digest }}
       expected_source_sha: ${{ inputs.expected_source_sha }}
       release_id: ${{ inputs.release_id }}
       release_ref: ${{ inputs.release_ref }}
