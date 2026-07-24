@@ -971,9 +971,11 @@ dependencies = [
 name = "rmux-ipc"
 version = "0.10.0"
 dependencies = [
+ "getrandom 0.3.4",
  "libc",
  "rmux-os",
  "rustix",
+ "sha2",
  "tokio",
  "tracing",
  "windows-sys",
@@ -1004,6 +1006,7 @@ dependencies = [
 name = "rmux-pty"
 version = "0.10.0"
 dependencies = [
+ "getrandom 0.3.4",
  "libc",
  "rmux-os",
  "rmux-types",
