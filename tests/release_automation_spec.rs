@@ -208,13 +208,13 @@ fn release_line_changelog_records_the_exact_detached_wire_version() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    assert_eq!(rmux_proto::RMUX_WIRE_VERSION, 6);
+    assert_eq!(rmux_proto::RMUX_WIRE_VERSION, 7);
     assert!(
-        current_release.contains("wire version 5 to wire version 6"),
+        current_release.contains("wire version 5 to wire version 7"),
         "{current_version} changelog must record the current detached wire cut"
     );
     assert!(
-        current_release.contains("wire-v5 daemon must be restarted"),
+        current_release.contains("pre-0.10 daemon must be restarted"),
         "{current_version} changelog must document the required daemon restart"
     );
 }

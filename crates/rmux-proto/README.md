@@ -14,12 +14,12 @@ payload length  little-endian u32
 payload         bincode v1 DTO
 ```
 
-The crate currently emits detached RPC wire version 6. It also ships the
+The crate currently emits detached RPC wire version 7. It also ships the
 `V1_FRAME_LEDGER`, the first stable ledger of frame-kind IDs and bincode
 tags. Breaking wire changes bump the envelope varint; compatible DTO
 additions append ledger entries rather than mutating existing frame IDs.
 
-The RMUX 0.9 release line uses an exact envelope hard-cut: a decoder accepts
+The RMUX 0.10 release line uses an exact envelope hard-cut: a decoder accepts
 only `RMUX_WIRE_VERSION` and rejects older or newer detached frames before any
 DTO-level handshake is decoded. `HandshakeRequest` min/max wire fields are
 therefore advisory after the current envelope has decoded, while
@@ -27,7 +27,7 @@ therefore advisory after the current envelope has decoded, while
 
 ## Surface
 
-- `RMUX_FRAME_MAGIC = 0x52`, `RMUX_WIRE_VERSION = 6`, `V1_FRAME_LEDGER`.
+- `RMUX_FRAME_MAGIC = 0x52`, `RMUX_WIRE_VERSION = 7`, `V1_FRAME_LEDGER`.
 - `encode_frame`, `decode_frame`, `FrameDecoder`.
 - Request, response, attach, control, capability DTOs.
 - `PaneId`, `SessionId`, `SessionName`, `WindowId` identity types.

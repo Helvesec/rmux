@@ -27,9 +27,9 @@
 ### Protocol
 
 - Begin the 0.10 release line by moving detached RPC from wire version 5 to wire
-  version 6 for the pane stream requests, responses, lifecycle events, and
-  capabilities. An already-running wire-v5 daemon must be restarted before a
-  0.10.0 client can connect.
+  version 7 for pane streams and display-message client controls. Wire version
+  6 was an unreleased candidate and is rejected. An already-running pre-0.10
+  daemon must be restarted before a 0.10.0 client can connect.
 - Make the public `Request` and `Response` envelopes non-exhaustive. Downstream
   matches now require a fallback arm, so future capability-gated additions
   cannot silently become source-breaking patch updates.

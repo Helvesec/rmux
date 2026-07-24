@@ -1336,9 +1336,10 @@ fn frame_decoder_rejects_corrupt_fixture_magic() {
 fn frame_decoder_rejects_unsupported_wire_version() {
     let bytes = read_fixture("has_session_request");
     let payload = &bytes[6..];
+    let unsupported = RMUX_WIRE_VERSION.saturating_add(1);
     let mut synthetic = Vec::with_capacity(bytes.len());
     synthetic.push(RMUX_FRAME_MAGIC);
-    synthetic.push(0x07); // claim wire version 7
+    synthetic.push(u8::try_from(unsupported).expect("test wire version fits one byte"));
     let length = u32::try_from(payload.len()).expect("fits");
     synthetic.extend_from_slice(&length.to_le_bytes());
     synthetic.extend_from_slice(payload);
@@ -1347,10 +1348,10 @@ fn frame_decoder_rejects_unsupported_wire_version() {
     assert!(matches!(
         err,
         RmuxError::UnsupportedWireVersion {
-            got: 7,
+            got,
             minimum: RMUX_WIRE_VERSION,
             maximum: RMUX_WIRE_VERSION,
-        }
+        } if got == unsupported
     ));
 }
 

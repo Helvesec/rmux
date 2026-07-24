@@ -345,7 +345,7 @@ fn ensure_legacy_namespace_available(
     if windows_endpoint_legacy::namespace_exists(&endpoint)? {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
-            "an older RMUX daemon still owns this label; stop it before starting wire v6",
+            "an older RMUX daemon still owns this label; stop it before starting the current daemon",
         ));
     }
     Ok(())
