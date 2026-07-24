@@ -554,12 +554,15 @@ fn source_file_uses_current_targets_for_windows_safe_tmux_commands_without_t(
 #[cfg(windows)]
 fn source_file_expands_tilde_from_userprofile_when_home_is_absent() -> Result<(), Box<dyn Error>> {
     let harness = CrossPlatformHarness::new("source-config-win-userprofile")?;
-    let user_profile = harness.tmpdir().join("windows-profile");
-    fs::create_dir_all(&user_profile)?;
+    let user_profile = std::env::var_os("USERPROFILE").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "USERPROFILE is not set on Windows",
+        )
+    })?;
 
     let mut start = harness.command(["new-session", "-d", "-s", "cfg"]);
     start.env_remove("HOME");
-    start.env("USERPROFILE", &user_profile);
     let output = start.output()?;
     assert_success(&output)?;
 
@@ -572,7 +575,7 @@ fn source_file_expands_tilde_from_userprofile_when_home_is_absent() -> Result<()
 
     let expected = format!(
         "RMUX_WINDOWS_TILDE={}/config-marker",
-        user_profile.display()
+        std::path::Path::new(&user_profile).display()
     );
     assert_environment(&harness, &expected)
 }
