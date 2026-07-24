@@ -192,11 +192,11 @@ def validate_candidate() -> None:
     if candidate.get("allowed_jobs") != {}:
         raise ValueError("candidate run cannot have variable job conclusions")
     if (
-        len(candidate_success) != 24
+        len(candidate_success) != 25
         or len(candidate_skipped) != 26
         or set(candidate_success) & set(candidate_skipped)
     ):
-        raise ValueError("candidate contract must contain 24 successes and 26 skips")
+        raise ValueError("candidate contract must contain 25 successes and 26 skips")
     runner_policy = contract.get("runner_policy")
     if not isinstance(runner_policy, dict) or runner_policy.get("provider") != (
         "github_standard_hosted"

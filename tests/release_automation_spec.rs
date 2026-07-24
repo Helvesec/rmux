@@ -922,6 +922,15 @@ fn release_qualification_replaces_replayed_runtime_with_release_delta() {
     assert!(delta.contains("name: Candidate delta Windows Ctrl policy"));
     assert!(delta.contains("windows_ctrl_matrix.ps1 -StaticMatrixSpec"));
     assert!(!delta.contains("cargo test -p rmux --locked --test windows_ctrl_matrix_spec"));
+    assert!(delta.contains("name: Candidate delta Windows channel-result digest"));
+    assert!(delta.contains("shell: pwsh"));
+    assert!(delta.contains("[IO.File]::WriteAllText("));
+    assert!(delta.contains("digest=\"$(sha256sum < \"$RMUX_TARGET_EVIDENCE\" | cut -d' ' -f1)\""));
+    assert!(delta.contains(
+        "WINDOWS_CHANNEL_DIGEST_RESULT: ${{ needs.windows-channel-result-digest.result }}"
+    ));
+    assert!(delta.contains("test \"$WINDOWS_CHANNEL_DIGEST_RESULT\" = success"));
+    assert!(!delta.contains("actions/attest@"));
 
     for (job, next_job) in [
         ("release-review-perf", "release-review-sections"),
