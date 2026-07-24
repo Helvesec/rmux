@@ -18,6 +18,9 @@ DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 SHA = re.compile(r"[0-9a-f]{40}")
 REPOSITORY = "Helvesec/rmux"
 REPOSITORY_ID = 1239918790
+ACTIVE_RUN_STATUSES = frozenset(
+    {"queued", "in_progress", "requested", "waiting", "pending"}
+)
 
 
 def artifact_timestamp(value: Any, label: str) -> str:
@@ -120,7 +123,7 @@ def verify_run_identity(args: argparse.Namespace) -> None:
                 "running artifact verification differs from the current context"
             )
         if (
-            run.get("status") not in {"in_progress", "waiting"}
+            run.get("status") not in ACTIVE_RUN_STATUSES
             or run.get("conclusion") is not None
         ):
             raise ValueError("current workflow run is not actively in progress")

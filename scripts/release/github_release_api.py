@@ -16,6 +16,9 @@ API_ROOT = "https://api.github.com"
 UPLOAD_ROOT = "https://uploads.github.com"
 API_VERSION = "2026-03-10"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+ACTIVE_RUN_STATUSES = frozenset(
+    {"queued", "in_progress", "requested", "waiting", "pending"}
+)
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -343,7 +346,7 @@ def verify_live_evidence(client: ApiClient, evidence: Any, now: datetime) -> Non
         or run.get("workflow_id") != authorization["workflow_id"]
         or run.get("path") != authorization["workflow_path"]
         or run.get("head_sha") != evidence.source_sha
-        or run.get("status") != "in_progress"
+        or run.get("status") not in ACTIVE_RUN_STATUSES
         or run.get("conclusion") is not None
         or run.get("repository", {}).get("id") != REPOSITORY_ID
     ):
