@@ -8,9 +8,9 @@ use rmux_proto::PaneOutputSubscriptionId;
 use rmux_proto::{
     ErrorResponse, PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse,
     PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionStart,
-    PaneRecentOutput, PaneTarget, PaneTargetRef, Response, RmuxError,
-    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
-    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
+    PaneRecentOutput, PaneStreamEndReason, PaneStreamMode, PaneTarget, PaneTargetRef, Response,
+    RmuxError, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
+    SubscribePaneOutputResponse, UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
 };
 
 use crate::pane_io::PaneOutputSender;
@@ -348,6 +348,10 @@ impl RequestHandler {
                 .subscriptions
                 .lock()
                 .expect("subscription registry mutex must not be poisoned");
+            let now = std::time::Instant::now();
+            for mode in [PaneStreamMode::Raw, PaneStreamMode::Surface] {
+                subscriptions.end_pane_streams(&pane, mode, PaneStreamEndReason::PaneRemoved, now);
+            }
             subscriptions.begin_pane_drain(pane.clone())
         };
         if should_watch {

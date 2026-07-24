@@ -484,6 +484,34 @@ async fn pane_removal_finishes_stream_with_typed_end() {
 }
 
 #[tokio::test]
+async fn natural_pane_exit_finishes_raw_and_surface_streams() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let raw = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let surface = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let key = handler
+        .pane_output_subscription_key_for_test(raw.subscription_id)
+        .expect("subscription key");
+
+    handler.drain_exited_pane_output_subscriptions(key).await;
+
+    for subscription_id in [raw.subscription_id, surface.subscription_id] {
+        assert_eq!(
+            cursor(&handler, subscription_id).await,
+            vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
+        );
+    }
+    assert!(
+        handler
+            .subscriptions
+            .lock()
+            .expect("subscription lock")
+            .is_empty(),
+        "ended pane streams must not keep exit-empty shutdown busy"
+    );
+}
+
+#[tokio::test]
 async fn stale_stream_finishes_with_subscription_expired() {
     let handler = RequestHandler::with_owner_uid_and_subscription_limits(
         crate::server_access::current_owner_uid(),
