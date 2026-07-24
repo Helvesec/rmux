@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rmux_core::events::SubscriptionLimits;
 use rmux_proto::{
-    NewSessionRequest, PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage,
+    NewSessionExtRequest, PaneRawRebase, PaneRawRebaseReason, PaneRecoveryCoverage,
     PaneStreamCursorRequest, PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent,
     PaneStreamMode, PaneSurfaceFrame, PaneTarget, PaneTargetRef, Request, Response, SessionName,
     SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
@@ -17,21 +17,57 @@ use super::{validate_raw_rebase_size, RequestHandler};
 
 const CONNECTION_ID: u64 = 41;
 
+#[cfg(unix)]
+fn quiet_command() -> Vec<String> {
+    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
+}
+
+#[cfg(windows)]
+fn quiet_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
+}
+
 async fn test_pane(
     handler: &RequestHandler,
 ) -> (PaneTarget, PaneOutputSender, SharedPaneTranscript) {
     let session = SessionName::new("pane-stream").expect("valid session name");
     let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session.clone(),
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
             detached: true,
             size: Some(TerminalSize { cols: 12, rows: 4 }),
             environment: None,
-        }))
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
         .await;
     assert!(matches!(response, Response::NewSession(_)), "{response:?}");
-    handler.wait_for_initial_panes_for_test().await;
     let target = PaneTarget::with_window(session, 0, 0);
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
     let (output, transcript) = {
         let state = handler.state.lock().await;
         (
