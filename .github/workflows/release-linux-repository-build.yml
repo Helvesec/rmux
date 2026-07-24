@@ -192,6 +192,7 @@ jobs:
             --signing-key "$RMUX_APT_GPG_KEY"
           scripts/generate-rpm-repository.sh \
             --input-dir "$root/packages" --output-dir "$root/output/rpm" \
+            --previous-repository-dir "$root/history/rpm" \
             --baseurl https://packages.rmux.io/rpm \
             --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
             --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \

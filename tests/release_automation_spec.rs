@@ -1413,6 +1413,9 @@ fn release_publication_waits_for_native_and_package_validations() {
         assert!(repository_step.contains(generated_architecture));
     }
     assert!(repository_step.contains("--rpm-signing-version \"$PACKAGE_VERSION\""));
+    assert!(
+        repository_step.contains("--previous-repository-dir target/package-repository-history/rpm")
+    );
     for public_mutation in ["--draft=false", "git push", "choco push", "action-publish"] {
         assert!(
             !prepare.contains(public_mutation),

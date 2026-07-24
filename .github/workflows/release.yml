@@ -949,6 +949,7 @@ jobs:
           scripts/generate-rpm-repository.sh \
             --input-dir target/package-repository-inputs \
             --output-dir target/package-repositories/rpm \
+            --previous-repository-dir target/package-repository-history/rpm \
             --baseurl https://packages.rmux.io/rpm \
             --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
             --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \

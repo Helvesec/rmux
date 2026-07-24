@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -76,6 +78,141 @@ fn generate_repository(
         .current_dir(repo_root())
         .output()
         .expect("generate APT repository")
+}
+
+fn install_rpm_metadata_tools(tools: &Path) {
+    fs::create_dir_all(tools).expect("create RPM metadata tool directory");
+    let createrepo = tools.join("createrepo_c");
+    fs::write(
+        &createrepo,
+        r#"#!/bin/sh
+set -eu
+python3 - "$1" "${RPM_METADATA_ID:?}" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]) / "repodata"
+identity = sys.argv[2]
+root.mkdir(parents=True, exist_ok=True)
+payload = f"{identity}-metadata".encode()
+digest = hashlib.sha256(payload).hexdigest()
+name = f"{digest}-primary.xml.gz"
+(root / name).write_bytes(payload)
+(root / "repomd.xml").write_text(
+    '<?xml version="1.0" encoding="UTF-8"?>\n'
+    '<repomd xmlns="http://linux.duke.edu/metadata/repo">\n'
+    '  <data type="primary">\n'
+    f'    <checksum type="sha256">{digest}</checksum>\n'
+    f'    <location href="repodata/{name}"/>\n'
+    f'    <size>{len(payload)}</size>\n'
+    '  </data>\n'
+    '</repomd>\n',
+    encoding="utf-8",
+)
+PY
+"#,
+    )
+    .expect("write fake createrepo_c");
+    make_executable(&createrepo);
+
+    let gpg = tools.join("gpg");
+    fs::write(
+        &gpg,
+        r#"#!/bin/sh
+set -eu
+case " $* " in
+  *" --with-colons --fingerprint "*)
+    printf 'pub:::::::::\n'
+    printf 'fpr:::::::::0123456789ABCDEF0123456789ABCDEF01234567:\n'
+    exit 0
+    ;;
+  *" --export "*)
+    printf 'authorized-rpm-repository-key'
+    exit 0
+    ;;
+esac
+output=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --output ]; then
+    output=$2
+    shift 2
+  else
+    shift
+  fi
+done
+test -n "$output"
+printf 'trusted-signature' > "$output"
+"#,
+    )
+    .expect("write fake gpg");
+    make_executable(&gpg);
+
+    let gpgv = tools.join("gpgv");
+    fs::write(
+        &gpgv,
+        r#"#!/bin/sh
+set -eu
+keyring=
+signature=
+document=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --homedir) shift 2 ;;
+    --keyring) keyring=$2; shift 2 ;;
+    *)
+      if [ -z "$signature" ]; then signature=$1; else document=$1; fi
+      shift
+      ;;
+  esac
+done
+test -n "$keyring" && test -n "$signature" && test -n "$document"
+grep -q '^authorized-rpm-repository-key$' "$keyring"
+grep -q '^trusted-signature$' "$signature"
+grep -q '<repomd ' "$document"
+"#,
+    )
+    .expect("write fake gpgv");
+    make_executable(&gpgv);
+}
+
+fn generate_rpm_repository(
+    input: &Path,
+    output: &Path,
+    previous: Option<&Path>,
+    identity: &str,
+    path: &OsStr,
+) -> Output {
+    let mut command = Command::new(repo_root().join("scripts/generate-rpm-repository.sh"));
+    command
+        .args(["--input-dir"])
+        .arg(input)
+        .args(["--output-dir"])
+        .arg(output)
+        .args(["--repo-signing-key", "repository-key"]);
+    if let Some(previous) = previous {
+        command.args(["--previous-repository-dir"]).arg(previous);
+    }
+    command
+        .env("PATH", path)
+        .env("RPM_METADATA_ID", identity)
+        .current_dir(repo_root())
+        .output()
+        .expect("generate signed RPM repository")
+}
+
+fn retained_metadata(repository: &Path) -> BTreeSet<Vec<u8>> {
+    fs::read_dir(repository.join("repodata"))
+        .expect("list RPM repodata")
+        .map(|entry| entry.expect("read RPM repodata entry").path())
+        .filter(|path| {
+            !matches!(
+                path.file_name().and_then(OsStr::to_str),
+                Some("repomd.xml" | "repomd.xml.asc")
+            )
+        })
+        .map(|path| fs::read(path).expect("read retained RPM metadata"))
+        .collect()
 }
 
 #[test]
@@ -213,4 +350,144 @@ printf 'Package: rmux\nVersion: 0.9.1\nArchitecture: %s\n' "$architecture"
     );
 
     fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[test]
+fn rpm_repository_retains_exactly_one_authenticated_metadata_generation() {
+    let root = temp_dir("rpm-metadata-retention");
+    let input = root.join("input");
+    let tools = root.join("tools");
+    fs::create_dir_all(&input).expect("create RPM input");
+    fs::write(input.join("rmux-0.10.0-1.x86_64.rpm"), b"rpm").expect("write RPM input");
+    install_rpm_metadata_tools(&tools);
+    let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH is defined"),
+    )))
+    .expect("compose PATH");
+
+    let first = root.join("first");
+    let result = generate_rpm_repository(&input, &first, None, "old", &path);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    fs::write(
+        first.join("repodata/unreferenced.xml.gz"),
+        b"untrusted-extra",
+    )
+    .expect("write unreferenced metadata");
+
+    let second = root.join("second");
+    let result = generate_rpm_repository(&input, &second, Some(&first), "current", &path);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        retained_metadata(&second),
+        BTreeSet::from([b"current-metadata".to_vec(), b"old-metadata".to_vec()]),
+        "H_old and H_new must be available without retaining arbitrary files"
+    );
+
+    let third = root.join("third");
+    let result = generate_rpm_repository(&input, &third, Some(&second), "next", &path);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        retained_metadata(&third),
+        BTreeSet::from([b"current-metadata".to_vec(), b"next-metadata".to_vec()]),
+        "N-2 metadata must be pruned while the immediate previous generation remains"
+    );
+
+    fs::remove_dir_all(root).expect("remove RPM metadata fixture");
+}
+
+#[test]
+fn rpm_repository_rejects_unauthenticated_or_unsafe_metadata_history() {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_dir("rpm-metadata-rejection");
+    let input = root.join("input");
+    let tools = root.join("tools");
+    fs::create_dir_all(&input).expect("create RPM input");
+    fs::write(input.join("rmux-0.10.0-1.x86_64.rpm"), b"rpm").expect("write RPM input");
+    install_rpm_metadata_tools(&tools);
+    let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH is defined"),
+    )))
+    .expect("compose PATH");
+
+    let previous = root.join("previous");
+    let result = generate_rpm_repository(&input, &previous, None, "old", &path);
+    assert!(result.status.success());
+    let signature = previous.join("repodata/repomd.xml.asc");
+    let repomd = previous.join("repodata/repomd.xml");
+    let signed_repomd = fs::read_to_string(&repomd).expect("read signed repomd fixture");
+    fs::write(&signature, b"untrusted-signature").expect("tamper signature");
+    let rejected = generate_rpm_repository(
+        &input,
+        &root.join("bad-signature"),
+        Some(&previous),
+        "new",
+        &path,
+    );
+    assert!(!rejected.status.success(), "untrusted history was accepted");
+
+    fs::write(&signature, b"trusted-signature").expect("restore signature fixture");
+    fs::write(&repomd, signed_repomd.replace("repodata/", "repodata/../"))
+        .expect("write traversal repomd fixture");
+    let rejected = generate_rpm_repository(
+        &input,
+        &root.join("traversal"),
+        Some(&previous),
+        "new",
+        &path,
+    );
+    assert!(
+        !rejected.status.success(),
+        "traversal metadata was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("unsafe or duplicate"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    fs::write(&repomd, signed_repomd).expect("restore signed repomd fixture");
+    let metadata = fs::read_dir(previous.join("repodata"))
+        .expect("list previous repodata")
+        .map(|entry| entry.expect("read repodata entry").path())
+        .find(|path| path.extension().and_then(OsStr::to_str) == Some("gz"))
+        .expect("find referenced metadata");
+    let payload = fs::read(&metadata).expect("read referenced metadata");
+    fs::remove_file(&metadata).expect("remove referenced metadata");
+    let outside = root.join("outside-metadata");
+    fs::write(&outside, payload).expect("write outside metadata");
+    symlink(&outside, &metadata).expect("replace referenced metadata with symlink");
+    let rejected =
+        generate_rpm_repository(&input, &root.join("symlink"), Some(&previous), "new", &path);
+    assert!(
+        !rejected.status.success(),
+        "symlinked metadata was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("symbolic link"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+
+    fs::remove_dir_all(root).expect("remove RPM rejection fixture");
+}
+
+#[test]
+fn release_workflows_supply_the_authenticated_previous_rpm_repository() {
+    let release = include_str!("../.github/workflows/release.yml");
+    let downstream = include_str!("../.github/workflows/release-linux-repository-build.yml");
+    assert!(release.contains("--previous-repository-dir target/package-repository-history/rpm"));
+    assert!(downstream.contains("--previous-repository-dir \"$root/history/rpm\""));
 }
