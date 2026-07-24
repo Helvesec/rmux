@@ -134,18 +134,36 @@ PY
 
 [ -f scripts/fuzz/Cargo.lock ] || die "scripts/fuzz/Cargo.lock is missing"
 python3 - "$version" <<'PY'
+import json
+import re
 import sys
-import tomllib
 from pathlib import Path
 
 expected = sys.argv[1]
 path = Path("scripts/fuzz/Cargo.lock")
-with path.open("rb") as handle:
-    lockfile = tomllib.load(handle)
+
+packages = []
+for block in path.read_text(encoding="utf-8").split("[[package]]")[1:]:
+    package = {}
+    for field in ("name", "version", "source"):
+        matches = re.findall(rf"(?m)^{field}\s*=\s*(.*?)\s*$", block)
+        if len(matches) > 1:
+            print(f"{path}: duplicate {field} in package entry", file=sys.stderr)
+            sys.exit(1)
+        if matches:
+            try:
+                package[field] = json.loads(matches[0])
+            except json.JSONDecodeError as error:
+                print(f"{path}: invalid {field}: {error}", file=sys.stderr)
+                sys.exit(1)
+            if not isinstance(package[field], str):
+                print(f"{path}: {field} must be a string", file=sys.stderr)
+                sys.exit(1)
+    packages.append(package)
 
 checked = []
 bad = []
-for package in lockfile.get("package", []):
+for package in packages:
     name = package.get("name", "")
     if package.get("source") is not None or not name.startswith("rmux") or name == "rmux-fuzz":
         continue
