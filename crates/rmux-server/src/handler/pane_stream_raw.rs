@@ -13,8 +13,8 @@ use super::super::subscription_support::cursor_event_limit;
 use super::{
     capture_source, materialize_raw_rebase, owned_stream_record, raw_reason,
     reserved_stream_key_if_owned, slow_consumer_response, stream_cursor_response,
-    validate_raw_rebase_size, wrong_stream_mode, CachedRawRebase, PaneStreamSource,
-    PaneStreamSubscription, RawRebaseGuard, RequestHandler,
+    validate_detached_response, validate_raw_rebase_size, wrong_stream_mode, CachedRawRebase,
+    PaneStreamSource, PaneStreamSubscription, RawRebaseGuard, RequestHandler,
 };
 
 impl RequestHandler {
@@ -108,7 +108,17 @@ impl RequestHandler {
         let Some((key, token, reason, epoch, include_snapshot, observed_process_exit_revision)) =
             rebase
         else {
-            return stream_cursor_response(request.subscription_id, events, reached_limit);
+            let response = stream_cursor_response(request.subscription_id, events, reached_limit);
+            if let Err(error) = validate_detached_response(&response) {
+                self.finish_stream_after_end(request.subscription_id);
+                return match error {
+                    RmuxError::FrameTooLarge { .. } => {
+                        slow_consumer_response(request.subscription_id)
+                    }
+                    error => Response::Error(ErrorResponse { error }),
+                };
+            }
+            return response;
         };
 
         let mut rebase_guard =
@@ -145,6 +155,15 @@ impl RequestHandler {
             };
         }
         let rebase_event = PaneStreamEvent::RawRebase(Box::new(rebase.clone()));
+        events.push(rebase_event);
+        let response = stream_cursor_response(request.subscription_id, events, false);
+        if let Err(error) = validate_detached_response(&response) {
+            self.finish_stream_after_end(request.subscription_id);
+            return match error {
+                RmuxError::FrameTooLarge { .. } => slow_consumer_response(request.subscription_id),
+                error => Response::Error(ErrorResponse { error }),
+            };
+        }
 
         let mut subscriptions = self
             .subscriptions
@@ -156,7 +175,7 @@ impl RequestHandler {
             request.subscription_id,
             key.pane_id(),
         ) else {
-            return stream_cursor_response(request.subscription_id, events, false);
+            return stream_cursor_response(request.subscription_id, Vec::new(), false);
         };
         let finished = match subscriptions.streams.get_mut(&request.subscription_id) {
             Some(PaneStreamSubscription::Raw(stream)) => {
@@ -165,10 +184,12 @@ impl RequestHandler {
             Some(PaneStreamSubscription::Reserved(_) | PaneStreamSubscription::Surface(_)) => {
                 return wrong_stream_mode()
             }
-            None => return stream_cursor_response(request.subscription_id, events, false),
+            None => {
+                return stream_cursor_response(request.subscription_id, Vec::new(), false);
+            }
         };
         if !finished {
-            return stream_cursor_response(request.subscription_id, events, false);
+            return stream_cursor_response(request.subscription_id, Vec::new(), false);
         }
         subscriptions.raw_rebases.insert(
             current_key,
@@ -178,8 +199,7 @@ impl RequestHandler {
             }),
         );
         rebase_guard.disarm();
-        events.push(rebase_event);
-        stream_cursor_response(request.subscription_id, events, false)
+        response
     }
 
     fn cached_or_captured_raw_rebase(

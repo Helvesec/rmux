@@ -7,7 +7,7 @@ use rmux_proto::{
     PaneStreamEndReason, PaneStreamEvent, PaneStreamLifecycleEvent, PaneStreamMode,
     PaneSurfaceFrame, PaneTarget, PaneTargetRef, Request, Response, SessionName,
     SubscribePaneStreamRequest, SubscribePaneStreamResponse, TerminalSize,
-    UnsubscribePaneStreamRequest,
+    UnsubscribePaneStreamRequest, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
 use crate::pane_io::{PaneInvalidationReason, PaneOutputSender};
@@ -164,6 +164,26 @@ async fn raw_stream_reports_the_clamped_batch_boundary() {
     assert!(cursor(&handler, subscribed.subscription_id)
         .await
         .is_empty());
+}
+
+#[tokio::test]
+async fn oversized_raw_batch_ends_the_stream_before_transport_encoding() {
+    let handler = RequestHandler::new();
+    let (target, output, _) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+
+    output.send(vec![b'x'; DEFAULT_MAX_DETACHED_FRAME_LENGTH]);
+
+    assert_eq!(
+        cursor(&handler, subscribed.subscription_id).await,
+        vec![PaneStreamEvent::End(PaneStreamEndReason::SlowConsumer)]
+    );
+    assert!(
+        handler
+            .pane_output_subscription_key_for_test(subscribed.subscription_id)
+            .is_none(),
+        "an undeliverable batch must release its subscription immediately"
+    );
 }
 
 #[tokio::test]
