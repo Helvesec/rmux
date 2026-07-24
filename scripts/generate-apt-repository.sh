@@ -168,6 +168,12 @@ for architecture in "${architectures[@]}"; do
       } >> "$packages"
     done
   gzip -n -c "$packages" > "$packages.gz"
+  by_hash_dir="$binary_dir/by-hash/SHA256"
+  mkdir -p "$by_hash_dir"
+  for index in "$packages" "$packages.gz"; do
+    index_hash="$(hash_file sha256 "$index")"
+    cp "$index" "$by_hash_dir/$index_hash"
+  done
   release_files+=("$packages" "$packages.gz")
 done
 
@@ -182,6 +188,7 @@ Date: $date_utc
 Architectures: ${architectures[*]}
 Components: $component
 Description: RMUX APT repository
+Acquire-By-Hash: yes
 MD5Sum:
 $(release_hash_block md5 "$output_dir/dists/$suite" "${release_files[@]}")
 SHA256:
