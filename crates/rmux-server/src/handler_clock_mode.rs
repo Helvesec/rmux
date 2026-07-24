@@ -393,19 +393,13 @@ impl RequestHandler {
                 return true;
             }
 
+            let mut frame = frame.clone();
+            crate::handler::attach_support::append_transient_message_frame(active, &mut frame);
             active.overlay_generation = active.overlay_generation.saturating_add(1);
             let overlay = if persistent {
-                OverlayFrame::persistent(
-                    frame.clone(),
-                    active.render_generation,
-                    active.overlay_generation,
-                )
+                OverlayFrame::persistent(frame, active.render_generation, active.overlay_generation)
             } else {
-                OverlayFrame::new(
-                    frame.clone(),
-                    active.render_generation,
-                    active.overlay_generation,
-                )
+                OverlayFrame::new(frame, active.render_generation, active.overlay_generation)
             };
             active
                 .control_tx

@@ -10,9 +10,10 @@ use rmux_core::{
 };
 use rmux_proto::request::NewSessionExtRequest;
 use rmux_proto::{
-    ClockModeRequest, ControlMode, HookLifecycle, HookName, ListPanesRequest, OptionName,
-    PaneTarget, Request, Response, ScopeSelector, SessionName, SetHookRequest, SetOptionMode,
-    SetOptionRequest, ShowBufferRequest, TerminalSize, WindowTarget,
+    ClockModeRequest, ControlMode, DisplayMessageRequest, HookLifecycle, HookName,
+    ListPanesRequest, OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName,
+    SetHookRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest, Target, TerminalSize,
+    WindowTarget,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration};
@@ -361,6 +362,56 @@ async fn clock_mode_overlay_uses_window_options_for_fallback_rendering() {
     assert!(frame.contains("\u{1b}[?25l"));
     assert!(frame.contains("\u{1b}[31m"));
     assert!(frame.contains("AM") || frame.contains("PM"));
+}
+
+#[tokio::test]
+async fn clock_tick_keeps_an_active_transient_message_visible() {
+    let handler = RequestHandler::new();
+    let target = create_session(
+        &handler,
+        "clock-transient-message",
+        TerminalSize { cols: 24, rows: 8 },
+    )
+    .await;
+    let session_name = target.session_name().clone();
+    let requester_pid = std::process::id();
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, session_name.clone(), control_tx)
+        .await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::ClockMode(ClockModeRequest {
+                target: Some(target),
+            }))
+            .await,
+        Response::ClockMode(_)
+    ));
+    let _ = next_overlay(&mut control_rx).await;
+    while control_rx.try_recv().is_ok() {}
+
+    let response = handler
+        .handle(Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Session(session_name.clone())),
+            print: false,
+            message: Some("still-visible".to_owned()),
+            empty_target_context: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    let message = next_transient_overlay(&mut control_rx).await;
+    assert!(String::from_utf8_lossy(&message.frame).contains("still-visible"));
+
+    handler
+        .refresh_clock_overlays_for_session(&session_name)
+        .await;
+    let refreshed = next_overlay(&mut control_rx).await;
+    assert!(refreshed.persistent);
+    assert!(
+        String::from_utf8_lossy(&refreshed.frame).contains("still-visible"),
+        "clock refresh must compose the still-active status message"
+    );
 }
 
 #[tokio::test]
