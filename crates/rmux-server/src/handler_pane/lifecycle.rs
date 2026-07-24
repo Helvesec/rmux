@@ -89,15 +89,12 @@ impl ExitedPaneOutput {
         }
     }
 
-    async fn ensure_eof(&mut self, generation: Option<u64>, output_eof_published: bool) -> bool {
+    async fn ensure_eof(&mut self, output_eof_published: bool) -> bool {
         if output_eof_published {
             return true;
         }
         if wait_for_pane_output_eof(self.receiver.take()).await {
             return true;
-        }
-        if let Some(sender) = self.sender.as_ref() {
-            let _ = sender.send_for_generation(generation, Vec::new());
         }
         false
     }
@@ -151,9 +148,7 @@ impl RequestHandler {
         if !event.output_eof_published() {
             self.notify_pane_exit_output_drain_started();
         }
-        let output_eof_observed = output
-            .ensure_eof(event.generation, event.output_eof_published())
-            .await;
+        let output_eof_observed = output.ensure_eof(event.output_eof_published()).await;
         self.flush_pending_pane_alert_for_exit(event.pane_id, event.generation)
             .await;
         let mut output = Some(output);
@@ -961,11 +956,38 @@ mod tests {
             stream_source: None,
         };
 
-        tokio::time::timeout(
-            Duration::from_millis(25),
-            output.ensure_eof(generation, true),
-        )
-        .await
-        .expect("published EOF should not wait for the drain timeout");
+        tokio::time::timeout(Duration::from_millis(25), output.ensure_eof(true))
+            .await
+            .expect("published EOF should not wait for the drain timeout");
+    }
+
+    #[tokio::test]
+    async fn ensure_eof_timeout_does_not_precede_late_reader_output() {
+        let sender = crate::pane_io::pane_output_channel();
+        let generation = None;
+        let receiver = sender.subscribe();
+        let mut stream_receiver = sender.subscribe();
+        let mut output = ExitedPaneOutput {
+            receiver: Some(receiver),
+            sender: Some(sender.clone()),
+            stream_source: None,
+        };
+
+        assert!(!output.ensure_eof(false).await);
+        sender
+            .send_for_generation(generation, b"late-conpty-tail".to_vec())
+            .expect("late output must remain publishable");
+        sender
+            .send_for_generation(generation, Vec::new())
+            .expect("reader EOF must remain publishable");
+
+        let OutputCursorItem::Event(tail) = stream_receiver.recv().await else {
+            panic!("late output must not be preceded by a synthetic EOF");
+        };
+        assert_eq!(tail.bytes(), b"late-conpty-tail");
+        let OutputCursorItem::Event(eof) = stream_receiver.recv().await else {
+            panic!("reader EOF must follow late output");
+        };
+        assert!(eof.bytes().is_empty());
     }
 }
