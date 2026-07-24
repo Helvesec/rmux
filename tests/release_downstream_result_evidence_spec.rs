@@ -26,6 +26,15 @@ fn assert_fixture(source: &str) {
     );
 }
 
+const RESULT_ACTION: &str = include_str!("../.github/actions/release-channel-result/action.yml");
+
+#[test]
+fn result_attestation_uses_algorithm_qualified_subject_digest() {
+    assert!(RESULT_ACTION.contains("echo \"subject_digest=sha256:$digest\" >> \"$GITHUB_OUTPUT\""));
+    assert!(!RESULT_ACTION.contains("echo \"subject_digest=$digest\" >> \"$GITHUB_OUTPUT\""));
+    assert!(RESULT_ACTION.contains("subject-digest: ${{ steps.predicate.outputs.subject_digest }}"));
+}
+
 const FIXTURE: &str = r#"
 import argparse
 import copy

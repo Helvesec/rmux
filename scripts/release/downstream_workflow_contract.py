@@ -52,6 +52,10 @@ def _audit_proof_action_path(root: Path) -> Path:
     return root / ".github/actions/release-downstream-authority-proof/action.yml"
 
 
+def _channel_result_action_path(root: Path) -> Path:
+    return root / ".github/actions/release-channel-result/action.yml"
+
+
 def _receipt_path(root: Path) -> Path:
     return root / ".github/workflows/release-receipt.yml"
 
@@ -158,6 +162,17 @@ def _validate_payload_prepare(path: Path) -> None:
         raise ValueError(
             "downstream payload preparer lost the exact shadow run identity"
         )
+
+
+def _validate_channel_result_action(path: Path) -> None:
+    text = path.read_text(encoding="utf-8")
+    qualified = 'echo "subject_digest=sha256:$digest" >> "$GITHUB_OUTPUT"'
+    unqualified = 'echo "subject_digest=$digest" >> "$GITHUB_OUTPUT"'
+    consumer = "subject-digest: ${{ steps.predicate.outputs.subject_digest }}"
+    if text.count(qualified) != 1 or text.count(consumer) != 1:
+        raise ValueError("channel result attestation lost its qualified subject digest")
+    if unqualified in text:
+        raise ValueError("channel result attestation regained an unqualified digest")
 
 
 def _validate_retry(path: Path) -> None:
@@ -404,6 +419,7 @@ def validate_downstream_workflows(root: Path) -> None:
     _validate_payload_prepare(
         root / ".github/workflows/release-downstream-prepare.yml"
     )
+    _validate_channel_result_action(_channel_result_action_path(root))
     for path in paths[1:]:
         _validate_retry(path)
     _validate_retry_dispatch(_retry_dispatch_path(root))

@@ -91,7 +91,7 @@ runs:
         scripts/release/channel-result.py verify-predicate "${common[@]}" \
           --document "$root/downstream-channel-result-predicate.json"
         digest="$(sha256sum "$RMUX_TARGET_EVIDENCE" | cut -d' ' -f1)"
-        echo "subject_digest=$digest" >> "$GITHUB_OUTPUT"
+        echo "subject_digest=sha256:$digest" >> "$GITHUB_OUTPUT"
         echo "observed_at=$observed_at" >> "$GITHUB_OUTPUT"
 
     - id: attestation
