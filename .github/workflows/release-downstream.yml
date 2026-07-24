@@ -160,20 +160,24 @@ jobs:
 
       - name: Bind exact authorized receipt evidence
         shell: bash
-        run: >-
-          scripts/release/build-downstream-receipt-reference.py
-          --predicate "$RUNNER_TEMP/rmux-downstream/receipt/publication-receipt-predicate.json"
-          --bundle "$RUNNER_TEMP/rmux-downstream/receipt/publication-receipt.sigstore.json"
-          --envelope "$RUNNER_TEMP/rmux-downstream/envelope/publication-receipt-envelope.json"
-          --predicate-artifact "$RUNNER_TEMP/rmux-downstream/receipt-artifact.json"
-          --envelope-artifact "$RUNNER_TEMP/rmux-downstream/envelope-artifact.json"
-          --source-sha "$RMUX_EXPECTED_SOURCE_SHA" --release-id "$RMUX_RELEASE_ID"
-          --release-ref "$RMUX_RELEASE_REF" --release-kind "$RMUX_RELEASE_KIND"
-          --receipt-run-id "$RMUX_RECEIPT_RUN_ID"
-          --receipt-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID"
-          --predicate-sha256 "$RMUX_RECEIPT_PREDICATE_SHA256"
-          --envelope-sha256 "$RMUX_RECEIPT_ENVELOPE_SHA256"
-          --output "$RUNNER_TEMP/rmux-downstream/receipt-reference.json"
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/rmux-downstream"
+          scripts/release/build-downstream-receipt-reference.py \
+            --predicate "$root/receipt/publication-receipt-predicate.json" \
+            --bundle "$root/receipt/publication-receipt.sigstore.json" \
+            --envelope "$root/envelope/publication-receipt-envelope.json" \
+            --predicate-artifact "$root/receipt-artifact.json" \
+            --envelope-artifact "$root/envelope-artifact.json" \
+            --source-sha "$RMUX_EXPECTED_SOURCE_SHA" --release-id "$RMUX_RELEASE_ID" \
+            --release-ref "$RMUX_RELEASE_REF" --release-kind "$RMUX_RELEASE_KIND" \
+            --receipt-run-id "$RMUX_RECEIPT_RUN_ID" \
+            --receipt-workflow-id "$RMUX_RECEIPT_WORKFLOW_ID" \
+            --predicate-sha256 "$RMUX_RECEIPT_PREDICATE_SHA256" \
+            --envelope-sha256 "$RMUX_RECEIPT_ENVELOPE_SHA256" \
+            --output "$root/receipt-reference.json"
+          cp -- "$root/receipt/publication-receipt-predicate.json" \
+            "$root/publication-receipt-predicate.json"
 
       - name: Create and verify the default-deny channel plan
         shell: bash
@@ -201,7 +205,7 @@ jobs:
           name: rmux-downstream-plan-${{ inputs.expected_source_sha }}-${{ inputs.release_id }}
           path: |
             ${{ runner.temp }}/rmux-downstream/downstream-channel-plan.json
-            ${{ runner.temp }}/rmux-downstream/receipt/publication-receipt-predicate.json
+            ${{ runner.temp }}/rmux-downstream/publication-receipt-predicate.json
             ${{ runner.temp }}/rmux-downstream/receipt-reference.json
           if-no-files-found: error
           retention-days: 7

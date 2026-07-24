@@ -130,6 +130,15 @@ def _validate_receipt_origin(main: str) -> None:
         raise ValueError("downstream receipt artifacts must come from release-receipt")
     if main.count("verify-receipt-attestation.py") != 1:
         raise ValueError("downstream plan must verify one exact signed receipt")
+    flat_predicate = (
+        "${{ runner.temp }}/rmux-downstream/publication-receipt-predicate.json"
+    )
+    nested_predicate = (
+        "${{ runner.temp }}/rmux-downstream/receipt/"
+        "publication-receipt-predicate.json"
+    )
+    if main.count(flat_predicate) != 1 or nested_predicate in main:
+        raise ValueError("downstream plan artifact must flatten its receipt predicate")
 
 
 def _validate_retry(path: Path) -> None:
