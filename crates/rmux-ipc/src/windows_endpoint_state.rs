@@ -75,31 +75,24 @@ pub(crate) fn endpoint_for_label(
     integrity: &'static str,
 ) -> io::Result<LocalEndpoint> {
     let key = endpoint_key(label, sid_component, integrity);
-    let state = StateStore::open(&key, integrity)?;
-    let _lock = state.lock()?;
-
-    if let Some(record) = state.read_record()? {
-        if record.key == key
-            && record.phase != EndpointPhase::Stopped
-            && process_is_live(record.process)
-        {
-            return Ok(LocalEndpoint::from_path(pipe_path(
-                sid_component,
-                integrity,
-                &record.key,
-                &record.nonce,
-            )));
+    if let Some(state) = StateStore::open_existing(&key, integrity)? {
+        let _lock = state.lock()?;
+        if let Some(record) = state.read_record()? {
+            if record.key == key
+                && record.phase != EndpointPhase::Stopped
+                && process_is_live(record.process)
+            {
+                return Ok(LocalEndpoint::from_path(pipe_path(
+                    sid_component,
+                    integrity,
+                    &record.key,
+                    &record.nonce,
+                )));
+            }
         }
     }
 
     let nonce = random_nonce()?;
-    let record = EndpointRecord {
-        phase: EndpointPhase::Starting,
-        key: key.clone(),
-        nonce: nonce.clone(),
-        process: current_process_stamp()?,
-    };
-    state.write_record(&record)?;
     Ok(LocalEndpoint::from_path(pipe_path(
         sid_component,
         integrity,
@@ -123,13 +116,19 @@ pub fn reserve_managed_endpoint_start(
             _claim: None,
         });
     };
-    let state = StateStore::open_existing(&components.key, components.integrity)?
-        .ok_or_else(|| invalid_state("managed endpoint discovery state is missing"))?;
+    let state = StateStore::open(&components.key, components.integrity)?;
     let _lock = state.lock()?;
-    let mut record = state
-        .read_record()?
-        .ok_or_else(|| invalid_state("managed endpoint discovery record is missing"))?;
     let requester = current_process_stamp()?;
+    let Some(mut record) = state.read_record()? else {
+        let record = EndpointRecord {
+            phase: EndpointPhase::Starting,
+            key: components.key.clone(),
+            nonce: components.nonce.clone(),
+            process: requester,
+        };
+        state.write_record(&record)?;
+        return Ok(owner_reservation(&components, record, requester));
+    };
     let decision = decide_reservation(
         &record,
         &components.nonce,
@@ -147,22 +146,16 @@ pub fn reserve_managed_endpoint_start(
     }
 
     if decision == ReservationDecision::Rotate {
-        record.nonce = random_nonce()?;
+        record.nonce = if record.nonce == components.nonce {
+            random_nonce()?
+        } else {
+            components.nonce.clone()
+        };
     }
     record.phase = EndpointPhase::Starting;
     record.process = requester;
     state.write_record(&record)?;
-    let endpoint = managed_endpoint(&components, &record.nonce);
-    Ok(ManagedEndpointStartReservation {
-        endpoint,
-        owner: true,
-        _claim: Some(ManagedStartClaim {
-            key: components.key,
-            nonce: record.nonce,
-            process: requester,
-            integrity: components.integrity,
-        }),
-    })
+    Ok(owner_reservation(&components, record, requester))
 }
 
 pub(crate) fn register_running(
@@ -290,6 +283,23 @@ fn managed_endpoint(components: &ManagedComponents, nonce: &str) -> LocalEndpoin
         &components.key,
         nonce,
     ))
+}
+
+fn owner_reservation(
+    components: &ManagedComponents,
+    record: EndpointRecord,
+    requester: ProcessStamp,
+) -> ManagedEndpointStartReservation {
+    ManagedEndpointStartReservation {
+        endpoint: managed_endpoint(components, &record.nonce),
+        owner: true,
+        _claim: Some(ManagedStartClaim {
+            key: components.key.clone(),
+            nonce: record.nonce,
+            process: requester,
+            integrity: components.integrity,
+        }),
+    }
 }
 
 fn endpoint_key(label: &OsStr, sid: &str, integrity: &str) -> String {

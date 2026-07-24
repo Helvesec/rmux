@@ -23,6 +23,9 @@ const STALE_GENERATION_HELPER_ENV: &str = "RMUX_TEST_STALE_GENERATION_LABEL";
 const STALE_GENERATION_OUTPUT_ENV: &str = "RMUX_TEST_STALE_GENERATION_OUTPUT";
 const DEAD_RUNNING_HELPER_ENV: &str = "RMUX_TEST_DEAD_RUNNING_GENERATION_LABEL";
 const DEAD_RUNNING_OUTPUT_ENV: &str = "RMUX_TEST_DEAD_RUNNING_GENERATION_OUTPUT";
+const RESOLVE_ONLY_HELPER_ENV: &str = "RMUX_TEST_RESOLVE_ONLY_LABEL";
+const RESOLVE_ONLY_READY_ENV: &str = "RMUX_TEST_RESOLVE_ONLY_READY";
+const RESOLVE_ONLY_RELEASE_ENV: &str = "RMUX_TEST_RESOLVE_ONLY_RELEASE";
 
 #[test]
 fn blocking_connect_to_missing_pipe_reports_not_found() -> std::io::Result<()> {
@@ -340,7 +343,7 @@ async fn first_pipe_instance_rejects_preexisting_raw_server() -> std::io::Result
 }
 
 #[test]
-fn concurrent_label_resolution_shares_one_private_generation() -> std::io::Result<()> {
+fn concurrent_label_resolution_defers_ownership_until_reservation() -> std::io::Result<()> {
     let label = format!("generation-concurrency-{}", std::process::id());
     let barrier = Arc::new(Barrier::new(12));
     let threads = (0..12)
@@ -358,10 +361,46 @@ fn concurrent_label_resolution_shares_one_private_generation() -> std::io::Resul
         .into_iter()
         .map(|thread| thread.join().expect("resolver thread"))
         .collect::<std::io::Result<Vec<_>>>()?;
+    let winner = reserve_managed_endpoint_start(&paths[0])?;
+    assert!(winner.is_owner());
+    for candidate in paths.iter().skip(1) {
+        let follower = reserve_managed_endpoint_start(candidate)?;
+        assert!(!follower.is_owner());
+        assert_eq!(follower.endpoint(), winner.endpoint());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn resolve_only_process_cannot_publish_a_starting_owner() -> std::io::Result<()> {
+    let label = format!("generation-resolve-only-{}", std::process::id());
+    let ready = std::env::temp_dir().join(format!("{label}-ready.txt"));
+    let release = std::env::temp_dir().join(format!("{label}-release.txt"));
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("resolve_only_helper")
+        .arg("--nocapture")
+        .env(RESOLVE_ONLY_HELPER_ENV, &label)
+        .env(RESOLVE_ONLY_READY_ENV, &ready)
+        .env(RESOLVE_ONLY_RELEASE_ENV, &release)
+        .spawn()?;
+
+    wait_for_file(&ready)?;
+    let candidate = endpoint_for_label(&label)?;
+    let reservation = reserve_managed_endpoint_start(candidate.as_path());
+    std::fs::write(&release, b"continue")?;
+    let status = child.wait()?;
+    let _ = std::fs::remove_file(&ready);
+    let _ = std::fs::remove_file(&release);
+    assert!(status.success(), "resolve-only helper failed");
+
+    let reservation = reservation?;
     assert!(
-        paths.windows(2).all(|pair| pair[0] == pair[1]),
-        "concurrent same-label callers must share one startup generation"
+        reservation.is_owner(),
+        "a resolver that never starts a daemon must not own discovery state"
     );
+    let listener = LocalListener::bind(reservation.endpoint())?;
+    drop(listener);
     Ok(())
 }
 
@@ -494,6 +533,33 @@ async fn dead_running_generation_helper() -> std::io::Result<()> {
     std::fs::write(output, endpoint.as_path().to_string_lossy().as_bytes())?;
     std::mem::forget(listener);
     std::process::exit(0);
+}
+
+#[test]
+fn resolve_only_helper() -> std::io::Result<()> {
+    let Some(label) = std::env::var_os(RESOLVE_ONLY_HELPER_ENV) else {
+        return Ok(());
+    };
+    let ready = std::env::var_os(RESOLVE_ONLY_READY_ENV)
+        .ok_or_else(|| std::io::Error::other("missing resolve-only ready path"))?;
+    let release = std::env::var_os(RESOLVE_ONLY_RELEASE_ENV)
+        .ok_or_else(|| std::io::Error::other("missing resolve-only release path"))?;
+    let endpoint = endpoint_for_label(label)?;
+    std::fs::write(ready, endpoint.as_path().to_string_lossy().as_bytes())?;
+    wait_for_file(Path::new(&release))
+}
+
+fn wait_for_file(path: &Path) -> std::io::Result<()> {
+    for _ in 0..200 {
+        if path.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err(std::io::Error::new(
+        ErrorKind::TimedOut,
+        format!("timed out waiting for {}", path.display()),
+    ))
 }
 
 fn assert_bind_conflict(error: std::io::Error) {
