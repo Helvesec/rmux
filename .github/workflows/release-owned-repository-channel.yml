@@ -12,6 +12,9 @@ on:
       expected_source_sha: {required: true, type: string}
       release_id: {required: true, type: string}
       release_ref: {required: true, type: string}
+    secrets:
+      RMUX_DOWNSTREAM_APP_PRIVATE_KEY:
+        required: false
 
 permissions: {}
 

@@ -64,13 +64,29 @@ def _validate_reusable_workflow(path: Path, *, require_repository_guard: bool) -
     text = path.read_text(encoding="utf-8")
     if "on:\n  workflow_call:" not in text or "permissions: {}" not in text:
         raise ValueError(f"{path.name} must remain reusable and default-deny")
+    allows_signing_recovery = path.name == "release-linux-repository-build.yml"
     for forbidden in (
         "\n  push:",
-        "\n  workflow_dispatch:",
         "larger-runner",
     ):
         if forbidden in text:
             raise ValueError(f"{path.name} contains forbidden value {forbidden}")
+    if allows_signing_recovery:
+        dispatch = text.split("\n  workflow_dispatch:\n", 1)
+        if len(dispatch) != 2 or "\npermissions: {}\n" not in dispatch[1]:
+            raise ValueError("Linux repository signer lost its recovery trigger")
+        for name in (
+            "expected_source_sha",
+            "payload_artifact_digest",
+            "payload_artifact_id",
+            "receipt_run_id",
+            "release_id",
+            "release_ref",
+        ):
+            if f"      {name}:" not in dispatch[1]:
+                raise ValueError(f"Linux repository recovery lost input {name}")
+    elif "\n  workflow_dispatch:" in text:
+        raise ValueError(f"{path.name} gained a mutation-capable dispatch trigger")
     if "runs-on: self-hosted" in text or "\n      - self-hosted" in text:
         raise ValueError(f"{path.name} gained a self-hosted runner label")
     if require_repository_guard and (
@@ -78,6 +94,35 @@ def _validate_reusable_workflow(path: Path, *, require_repository_guard: bool) -
         or 'test "$GITHUB_REPOSITORY_ID" = "1239918790"' not in text
     ):
         raise ValueError(f"{path.name} does not reject external callers")
+
+
+def _validate_worker_secret_declarations(root: Path) -> None:
+    workflows = root / ".github/workflows"
+    expected = {
+        "release-chocolatey-channel.yml": ("CHOCOLATEY_API_KEY",),
+        "release-linux-repository-build.yml": (
+            "RMUX_APT_GPG_PRIVATE_KEY",
+            "RMUX_APT_GPG_KEY",
+            "RMUX_RPM_GPG_PRIVATE_KEY",
+            "RMUX_RPM_GPG_KEY",
+            "RMUX_RPM_REPO_GPG_PRIVATE_KEY",
+            "RMUX_RPM_REPO_GPG_KEY",
+        ),
+        "release-linux-repository-publish.yml": ("RMUX_DOWNSTREAM_APP_PRIVATE_KEY",),
+        "release-owned-repository-channel.yml": ("RMUX_DOWNSTREAM_APP_PRIVATE_KEY",),
+        "release-snap-channel.yml": ("SNAPCRAFT_STORE_CREDENTIALS",),
+    }
+    for name, secret_names in expected.items():
+        text = (workflows / name).read_text(encoding="utf-8")
+        call = text.split("\n  workflow_dispatch:", 1)[0]
+        if "\n    secrets:\n" not in call:
+            raise ValueError(f"{name} does not declare protected environment secrets")
+        for secret_name in secret_names:
+            declaration = f"      {secret_name}:\n        required: false"
+            if call.count(declaration) != 1:
+                raise ValueError(f"{name} lost secret declaration {secret_name}")
+            if text.count(f"secrets.{secret_name}") < 1:
+                raise ValueError(f"{name} no longer consumes secret {secret_name}")
 
 
 def _calls_workflow(line: str, workflow: str) -> bool:
@@ -138,8 +183,7 @@ def _validate_receipt_origin(main: str) -> None:
         "${{ runner.temp }}/rmux-downstream/publication-receipt-predicate.json"
     )
     nested_predicate = (
-        "${{ runner.temp }}/rmux-downstream/receipt/"
-        "publication-receipt-predicate.json"
+        "${{ runner.temp }}/rmux-downstream/receipt/publication-receipt-predicate.json"
     )
     if main.count(flat_predicate) != 1 or nested_predicate in main:
         raise ValueError("downstream plan artifact must flatten its receipt predicate")
@@ -419,13 +463,12 @@ def validate_downstream_workflows(root: Path) -> None:
         )
     for path in _worker_paths(root):
         _validate_reusable_workflow(path, require_repository_guard=False)
+    _validate_worker_secret_declarations(root)
     _validate_callers(root, paths)
     main = paths[0].read_text(encoding="utf-8")
     _validate_receipt_origin(main)
     _validate_channel_orchestration(main)
-    _validate_payload_prepare(
-        root / ".github/workflows/release-downstream-prepare.yml"
-    )
+    _validate_payload_prepare(root / ".github/workflows/release-downstream-prepare.yml")
     _validate_channel_result_action(_channel_result_action_path(root))
     for path in paths[1:]:
         _validate_retry(path)

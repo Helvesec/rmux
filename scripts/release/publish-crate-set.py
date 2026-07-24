@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -50,7 +51,38 @@ def registry_url(name: str, version: str, *, download: bool = False) -> str:
     return f"https://crates.io/api/v1/crates/{name}/{version}{suffix}"
 
 
+def registry_version_exists(name: str, version: str) -> bool:
+    request = urllib.request.Request(
+        registry_url(name, version),
+        headers={"User-Agent": "rmux-release-writer/1 (security@rmux.io)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = response.read(2 * 1024 * 1024 + 1)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return False
+        raise ValueError(f"crates.io lookup failed with HTTP {error.code}") from error
+    if len(data) > 2 * 1024 * 1024:
+        raise ValueError("crates.io metadata exceeds the release size limit")
+    try:
+        metadata = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("crates.io metadata is invalid") from error
+    observed = metadata.get("version") if isinstance(metadata, dict) else None
+    if (
+        not isinstance(observed, dict)
+        or observed.get("crate") != name
+        or observed.get("num") != version
+        or observed.get("dl_path") != f"/api/v1/crates/{name}/{version}/download"
+    ):
+        raise ValueError("crates.io metadata identity differs")
+    return True
+
+
 def registry_bytes(name: str, version: str) -> bytes | None:
+    if not registry_version_exists(name, version):
+        return None
     request = urllib.request.Request(
         registry_url(name, version, download=True),
         headers={"User-Agent": "rmux-release-writer/1 (security@rmux.io)"},
@@ -59,9 +91,7 @@ def registry_bytes(name: str, version: str) -> bytes | None:
         with urllib.request.urlopen(request, timeout=30) as response:
             data = response.read(16 * 1024 * 1024 + 1)
     except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return None
-        raise ValueError(f"crates.io lookup failed with HTTP {error.code}") from error
+        raise ValueError(f"crates.io download failed with HTTP {error.code}") from error
     if len(data) > 16 * 1024 * 1024:
         raise ValueError("crates.io package exceeds the release size limit")
     return data
@@ -84,6 +114,27 @@ def run_cargo(args: list[str], *, token: str, target_dir: Path) -> None:
     if completed.returncode != 0:
         detail = completed.stderr.strip()[-4000:]
         raise ValueError(f"cargo {' '.join(args[:2])} failed: {detail}")
+
+
+def generated_package_paths(target_dir: Path, filename: str) -> tuple[Path, Path]:
+    package_dir = target_dir / "package"
+    return package_dir / filename, package_dir / "tmp-crate" / filename
+
+
+def remove_generated_package(target_dir: Path, filename: str) -> None:
+    for path in generated_package_paths(target_dir, filename):
+        path.unlink(missing_ok=True)
+
+
+def generated_package(target_dir: Path, filename: str) -> Path:
+    files = [
+        path
+        for path in generated_package_paths(target_dir, filename)
+        if path.is_file() and not path.is_symlink()
+    ]
+    if len(files) != 1:
+        raise ValueError(f"Cargo generated an unexpected package set: {filename}")
+    return files[0]
 
 
 def wait_for_exact(name: str, version: str, expected: Path) -> None:
@@ -125,21 +176,25 @@ def execute(args: argparse.Namespace) -> None:
             if hashlib.sha256(existing).hexdigest() != package["sha256"]:
                 raise ValueError(f"existing crates.io bytes differ: {name}")
             continue
-        generated = cargo_target / "package" / package["file"]
-        generated.unlink(missing_ok=True)
+        remove_generated_package(cargo_target, package["file"])
         run_cargo(
             ["publish", "--dry-run", "--locked", "--package", name],
             token=token,
             target_dir=cargo_target,
         )
-        if not generated.is_file() or file_hash(generated) != file_hash(canonical):
+        if file_hash(generated_package(cargo_target, package["file"])) != file_hash(
+            canonical
+        ):
             raise ValueError(f"Cargo package bytes differ from the candidate: {name}")
+        remove_generated_package(cargo_target, package["file"])
         run_cargo(
             ["publish", "--locked", "--package", name],
             token=token,
             target_dir=cargo_target,
         )
-        if not generated.is_file() or file_hash(generated) != file_hash(canonical):
+        if file_hash(generated_package(cargo_target, package["file"])) != file_hash(
+            canonical
+        ):
             raise ValueError(f"published Cargo package bytes changed: {name}")
         mutated = True
         wait_for_exact(name, version, canonical)
