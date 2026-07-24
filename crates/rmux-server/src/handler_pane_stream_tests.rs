@@ -380,6 +380,83 @@ async fn raw_batch_defers_a_deliverable_event_that_would_overflow_the_response()
 }
 
 #[tokio::test]
+async fn raw_batch_defers_a_rebase_that_only_overflows_the_current_response() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let PaneStreamEvent::RawRebase(initial) = subscribed.event else {
+        panic!("raw subscription must start with a rebase");
+    };
+    let key = handler
+        .pane_output_subscription_key_for_test(subscribed.subscription_id)
+        .expect("subscription key");
+    let payload_len = 192 * 1024;
+    let rebase_len = DEFAULT_MAX_DETACHED_FRAME_LENGTH - 128 * 1024;
+    output.send(vec![b'x'; payload_len]);
+    {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let Some(super::PaneStreamSubscription::Raw(stream)) =
+            subscriptions.streams.get_mut(&subscribed.subscription_id)
+        else {
+            panic!("raw stream state");
+        };
+        let output = stream
+            .receiver
+            .try_recv_observed()
+            .expect("queued raw output");
+        stream.defer_observation(output);
+    }
+    output.mutate_transcript(&transcript, PaneInvalidationReason::Resize, |transcript| {
+        transcript.resize(TerminalSize { cols: 13, rows: 4 });
+        ((), true)
+    });
+    let (boundary, (), _) = output.capture_with_observer(|| ());
+    let mut large_rebase = *initial;
+    large_rebase.epoch = 2;
+    large_rebase.reason = PaneRawRebaseReason::Resize;
+    large_rebase.cols = 13;
+    large_rebase.rows = 4;
+    large_rebase.invalidation_revision = boundary.invalidation_revision;
+    large_rebase.next_sequence = boundary.next_output_sequence;
+    large_rebase.keyframe = vec![b' '; rebase_len];
+    handler
+        .subscriptions
+        .lock()
+        .expect("subscription lock")
+        .raw_rebases
+        .insert(
+            key,
+            std::sync::Arc::new(super::CachedRawRebase {
+                boundary,
+                rebase: large_rebase,
+            }),
+        );
+
+    let first = cursor_with_limit(&handler, subscribed.subscription_id, 2).await;
+    assert!(first.limited);
+    assert!(matches!(
+        first.events.as_slice(),
+        [PaneStreamEvent::RawBytes(bytes)]
+            if bytes.bytes.len() == payload_len
+    ));
+    assert!(
+        handler
+            .pane_output_subscription_key_for_test(subscribed.subscription_id)
+            .is_some(),
+        "a response-local size conflict must not end a healthy stream"
+    );
+
+    let second = cursor_with_limit(&handler, subscribed.subscription_id, 2).await;
+    assert!(!second.limited);
+    assert!(matches!(
+        second.events.as_slice(),
+        [PaneStreamEvent::RawRebase(rebase)]
+            if rebase.reason == PaneRawRebaseReason::Resize
+                && rebase.keyframe.len() == rebase_len
+    ));
+}
+
+#[tokio::test]
 async fn raw_batch_defers_lifecycle_that_would_overflow_the_response() {
     let handler = RequestHandler::new();
     let (target, _, _) = test_pane(&handler).await;

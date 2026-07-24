@@ -512,6 +512,25 @@ impl RequestHandler {
             };
         }
         let rebase_event = PaneStreamEvent::RawRebase(Box::new(rebase.clone()));
+        let rebase_event_size = match encoded_stream_event_size(&rebase_event) {
+            Ok(size) => size,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
+        if !events.is_empty()
+            && response_size.saturating_add(rebase_event_size) > DEFAULT_MAX_DETACHED_FRAME_LENGTH
+        {
+            let response = stream_cursor_response(request.subscription_id, events, true);
+            if let Err(error) = validate_detached_response(&response) {
+                self.finish_stream_after_end(request.subscription_id);
+                return match error {
+                    RmuxError::FrameTooLarge { .. } => {
+                        slow_consumer_response(request.subscription_id)
+                    }
+                    error => Response::Error(ErrorResponse { error }),
+                };
+            }
+            return response;
+        }
         events.push(rebase_event);
         let response = stream_cursor_response(request.subscription_id, events, false);
         if let Err(error) = validate_detached_response(&response) {
