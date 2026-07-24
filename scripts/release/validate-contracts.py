@@ -160,9 +160,9 @@ def validate_candidate() -> None:
         for right in range(left + 1, len(qualification_sets))
     ):
         raise ValueError("qualification job conclusion sets overlap")
-    if len(set.union(*qualification_sets)) != 53 or len(qualification_success) != 52:
+    if len(set.union(*qualification_sets)) != 54 or len(qualification_success) != 53:
         raise ValueError(
-            "qualification contract must contain 52 successes and one variable cache job"
+            "qualification contract must contain 53 successes and one variable cache job"
         )
     qualification_shards = {
         name
@@ -192,11 +192,11 @@ def validate_candidate() -> None:
     if candidate.get("allowed_jobs") != {}:
         raise ValueError("candidate run cannot have variable job conclusions")
     if (
-        len(candidate_success) != 25
+        len(candidate_success) != 26
         or len(candidate_skipped) != 26
         or set(candidate_success) & set(candidate_skipped)
     ):
-        raise ValueError("candidate contract must contain 25 successes and 26 skips")
+        raise ValueError("candidate contract must contain 26 successes and 26 skips")
     runner_policy = contract.get("runner_policy")
     if not isinstance(runner_policy, dict) or runner_policy.get("provider") != (
         "github_standard_hosted"
@@ -371,7 +371,7 @@ def validate_candidate_workflow() -> None:
         scheduler.get("concurrency_group") != "rmux-release-candidate"
         or scheduler.get("cancel_in_progress") is not False
         or scheduler.get("dispatch_after_fast_success") is not True
-        or scheduler.get("maximum_parallel_jobs") != 14
+        or scheduler.get("maximum_parallel_jobs") != 15
         or scheduler.get("maximum_parallel_macos_jobs") != 2
     ):
         raise ValueError("candidate scheduler invariants drifted")
@@ -381,8 +381,24 @@ def validate_candidate_workflow() -> None:
     sections = require_unique_strings(
         delta.get("review_sections"), "candidate delta review_sections"
     )
-    if sections != sorted(sections) or sections != ["cli", "perf", "static", "tmux"]:
+    if sections != sorted(sections) or sections != [
+        "cli",
+        "perf",
+        "static",
+        "tmux",
+        "xterm",
+    ]:
         raise ValueError("candidate delta contains a fast-covered review section")
+    proof_jobs = require_unique_strings(
+        delta.get("proof_jobs"), "candidate delta proof_jobs"
+    )
+    proof_sections = [
+        job.removeprefix("release-review-")
+        for job in proof_jobs
+        if job.startswith("release-review-")
+    ]
+    if proof_jobs != sorted(proof_jobs) or proof_sections != sections:
+        raise ValueError("candidate delta review proof inventory drifted")
     if delta.get("tmux_oracle_builds") != 1:
         raise ValueError("the fast and candidate path must build tmux exactly once")
     validate_canonical_candidate_policy(contract.get("canonical_builds"))

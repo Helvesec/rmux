@@ -13,7 +13,7 @@
   "scheduler": {
     "concurrency_group": "rmux-release-candidate",
     "cancel_in_progress": false,
-    "maximum_parallel_jobs": 14,
+    "maximum_parallel_jobs": 15,
     "maximum_parallel_macos_jobs": 2,
     "dispatch_after_fast_success": true
   },
@@ -26,13 +26,14 @@
   "delta": {
     "replays_fast_jobs": false,
     "tmux_oracle_builds": 1,
-    "review_sections": ["cli", "perf", "static", "tmux"],
+    "review_sections": ["cli", "perf", "static", "tmux", "xterm"],
     "proof_jobs": [
       "nix",
       "release-review-cli",
       "release-review-perf",
       "release-review-static",
       "release-review-tmux",
+      "release-review-xterm",
       "snap",
       "windows-ctrl-matrix"
     ]

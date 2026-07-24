@@ -1,6 +1,7 @@
 #[path = "support/python3.rs"]
 mod python3;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 #[cfg(unix)]
@@ -23,6 +24,70 @@ fn job_block<'a>(workflow: &'a str, job: &str, next_job: &str) -> &'a str {
         .split(&format!("\n  {next_job}:\n"))
         .next()
         .unwrap_or_else(|| panic!("unbounded job {job}"))
+}
+
+fn matrix_sections(workflow: &str, job: &str, next_job: &str) -> BTreeSet<String> {
+    let block = job_block(workflow, job, next_job);
+    let values = block
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            line.strip_prefix("section: [")
+                .and_then(|value| value.strip_suffix(']'))
+        })
+        .unwrap_or_else(|| panic!("missing section matrix for {job}"));
+    let sections = values
+        .split(',')
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let maximum = block
+        .lines()
+        .map(str::trim)
+        .find_map(|line| line.strip_prefix("max-parallel: "))
+        .unwrap_or_else(|| panic!("missing max-parallel for {job}"))
+        .parse::<usize>()
+        .unwrap_or_else(|_| panic!("invalid max-parallel for {job}"));
+    assert_eq!(
+        maximum,
+        sections.len(),
+        "{job} does not run every section concurrently"
+    );
+    sections
+}
+
+fn named_review_section(workflow: &str, job: &str, next_job: &str, prefix: &str) -> String {
+    job_block(workflow, job, next_job)
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            line.strip_prefix(prefix)
+                .and_then(|value| value.strip_suffix(')'))
+        })
+        .unwrap_or_else(|| panic!("missing review name for {job}"))
+        .to_owned()
+}
+
+fn json_strings(value: &serde_json::Value) -> BTreeSet<String> {
+    value
+        .as_array()
+        .expect("string array")
+        .iter()
+        .map(|value| value.as_str().expect("string array entry").to_owned())
+        .collect()
+}
+
+fn review_sections_from_names(value: &serde_json::Value, prefix: &str) -> BTreeSet<String> {
+    value
+        .as_array()
+        .expect("job name array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|name| name.strip_prefix(prefix))
+        .filter_map(|section| section.strip_suffix(')'))
+        .filter(|section| !section.contains("${{"))
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]
@@ -204,6 +269,68 @@ fn release_review_candidate_mode_only_runs_true_deltas() {
     assert!(!delta.contains("matrix.section == 'runtime-sdk'"));
     assert!(gate.contains("static|perf|xterm|cli|tmux"));
     assert!(include_str!("../.github/workflows/ci.yml").contains("--retries 0"));
+}
+
+#[test]
+fn release_review_matrices_match_contracts_and_runner_policy_exactly() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let mut full_sections = matrix_sections(ci, "release-review-sections", "release-review-gate");
+    full_sections.insert(named_review_section(
+        ci,
+        "release-review-perf",
+        "release-review-sections",
+        "name: Release review (",
+    ));
+
+    let delta_workflow = include_str!("../.github/workflows/release-candidate-delta.yml");
+    let mut delta_sections = matrix_sections(delta_workflow, "release-review-sections", "snap");
+    delta_sections.insert(named_review_section(
+        delta_workflow,
+        "release-review-perf",
+        "release-review-sections",
+        "name: Candidate delta release review (",
+    ));
+
+    let workflow_contract: serde_json::Value = serde_json::from_str(include_str!(
+        "../.github/release/candidate-workflow-contract.json"
+    ))
+    .expect("candidate workflow contract");
+    assert_eq!(
+        delta_sections,
+        json_strings(&workflow_contract["delta"]["review_sections"])
+    );
+    let contracted_proof_sections = workflow_contract["delta"]["proof_jobs"]
+        .as_array()
+        .expect("proof job array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|job| job.strip_prefix("release-review-"))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(delta_sections, contracted_proof_sections);
+
+    let candidate_contract: serde_json::Value =
+        serde_json::from_str(include_str!("../.github/release/candidate-contract.json"))
+            .expect("candidate contract");
+    let qualification_sections = review_sections_from_names(
+        &candidate_contract["qualification_run"]["success_jobs"],
+        "Release review (",
+    );
+    assert_eq!(full_sections, qualification_sections);
+    let candidate_sections = review_sections_from_names(
+        &candidate_contract["candidate_run"]["success_jobs"],
+        "Run release-only candidate delta / Candidate delta release review (",
+    );
+    assert_eq!(delta_sections, candidate_sections);
+
+    let ubuntu_jobs = &candidate_contract["runner_policy"]["jobs_by_label"]["ubuntu-latest"];
+    let runner_full_sections = review_sections_from_names(ubuntu_jobs, "Release review (");
+    assert_eq!(full_sections, runner_full_sections);
+    let runner_delta_sections = review_sections_from_names(
+        ubuntu_jobs,
+        "Run release-only candidate delta / Candidate delta release review (",
+    );
+    assert_eq!(delta_sections, runner_delta_sections);
 }
 
 #[test]
