@@ -349,6 +349,7 @@ impl RequestHandler {
                     source.key.pane_id(),
                     1,
                     1,
+                    1,
                     captured.boundary.next_output_sequence,
                     &captured.seed,
                 ) {

@@ -129,6 +129,7 @@ impl RequestHandler {
                 pending,
                 epoch,
                 driver.revision.saturating_add(1),
+                driver.latest.snapshot.revision.saturating_add(1),
                 reset,
                 driver.fingerprint.clone(),
                 driver.receiver.observed_process_exit_revision(),
@@ -148,6 +149,7 @@ impl RequestHandler {
             pending,
             epoch,
             revision,
+            minimum_snapshot_revision,
             reset,
             previous_fingerprint,
             observed_process_exit_revision,
@@ -232,6 +234,7 @@ impl RequestHandler {
             key.pane_id(),
             epoch,
             revision,
+            minimum_snapshot_revision,
             captured.boundary.next_output_sequence,
             seed,
         ) {

@@ -1026,6 +1026,10 @@ async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
     let (target, output, transcript) = test_pane(&handler).await;
     let raw = subscribe(&handler, &target, PaneStreamMode::Raw).await;
     let surface = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+    let initial_surface_revision = surface_frame(&surface.event)
+        .expect("surface subscription starts with a frame")
+        .snapshot
+        .revision;
     let key = handler
         .pane_output_subscription_key_for_test(raw.subscription_id)
         .expect("subscription key");
@@ -1067,13 +1071,14 @@ async fn natural_pane_exit_drains_raw_and_surface_streams_before_end() {
             PaneStreamEvent::SurfacePatch(frame),
             PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }),
             PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
-        ] if frame
-            .snapshot
-            .cells
-            .iter()
-            .map(|cell| cell.text.as_str())
-            .collect::<String>()
-            .contains("natural-tail")
+        ] if frame.snapshot.revision > initial_surface_revision
+            && frame
+                .snapshot
+                .cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("natural-tail")
     ));
     assert!(
         handler

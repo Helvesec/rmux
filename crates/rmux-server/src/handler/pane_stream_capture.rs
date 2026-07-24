@@ -121,6 +121,7 @@ pub(in crate::handler) fn materialize_surface_frame(
     pane_id: PaneId,
     epoch: u64,
     surface_revision: u64,
+    minimum_snapshot_revision: u64,
     next_output_sequence: u64,
     seed: &PaneRecoverySeed,
 ) -> Result<Arc<PaneSurfaceFrame>, RmuxError> {
@@ -149,7 +150,9 @@ pub(in crate::handler) fn materialize_surface_frame(
         history_bytes,
         pane_id.as_u32(),
     );
-    let grid_revision = handler.assign_pane_snapshot_revision(pane_id, fingerprint);
+    let grid_revision = handler
+        .assign_pane_snapshot_revision(pane_id, fingerprint)
+        .max(minimum_snapshot_revision);
     Ok(Arc::new(PaneSurfaceFrame {
         epoch,
         revision: surface_revision,
