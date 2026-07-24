@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use rmux_ipc::{
     connect_blocking, connect_windows_pipe, endpoint_for_label, reserve_managed_endpoint_start,
-    wait_for_peer_close, LocalListener,
+    wait_for_peer_close, LocalEndpoint, LocalListener,
 };
 use rmux_os::identity::{IdentityResolver, UserIdentity};
 use rmux_os::path::socket_paths_match;
@@ -363,7 +363,7 @@ fn concurrent_label_resolution_defers_ownership_until_reservation() -> std::io::
         .collect::<std::io::Result<Vec<_>>>()?;
     assert!(
         paths.iter().all(|candidate| candidate == &paths[0]),
-        "pure resolution should reuse one process-local candidate"
+        "resolution should reuse one passive candidate without claiming startup"
     );
     let winner = reserve_managed_endpoint_start(&paths[0])?;
     assert!(winner.is_owner());
@@ -390,7 +390,8 @@ async fn resolve_only_process_cannot_publish_a_starting_owner() -> std::io::Resu
         .spawn()?;
 
     wait_for_file(&ready)?;
-    let candidate = endpoint_for_label(&label)?;
+    let candidate =
+        LocalEndpoint::from_path(std::path::PathBuf::from(std::fs::read_to_string(&ready)?));
     let reservation = reserve_managed_endpoint_start(candidate.as_path());
     std::fs::write(&release, b"continue")?;
     let status = child.wait()?;
@@ -405,6 +406,40 @@ async fn resolve_only_process_cannot_publish_a_starting_owner() -> std::io::Resu
     );
     let listener = LocalListener::bind(reservation.endpoint())?;
     drop(listener);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cross_process_resolution_preserves_the_legacy_upgrade_guard() -> std::io::Result<()> {
+    let label = format!("legacy-cross-process-{}", std::process::id());
+    let ready = std::env::temp_dir().join(format!("{label}-ready.txt"));
+    let release = std::env::temp_dir().join(format!("{label}-release.txt"));
+    let mut child = Command::new(std::env::current_exe()?)
+        .arg("--exact")
+        .arg("resolve_only_helper")
+        .arg("--nocapture")
+        .env(RESOLVE_ONLY_HELPER_ENV, &label)
+        .env(RESOLVE_ONLY_READY_ENV, &ready)
+        .env(RESOLVE_ONLY_RELEASE_ENV, &release)
+        .spawn()?;
+
+    wait_for_file(&ready)?;
+    let candidate =
+        LocalEndpoint::from_path(std::path::PathBuf::from(std::fs::read_to_string(&ready)?));
+    let legacy_path = legacy_path_for(&label, &candidate);
+    let _legacy_daemon = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&legacy_path)?;
+    let reservation = reserve_managed_endpoint_start(candidate.as_path());
+
+    std::fs::write(&release, b"continue")?;
+    let status = child.wait()?;
+    let _ = std::fs::remove_file(&ready);
+    let _ = std::fs::remove_file(&release);
+    assert!(status.success(), "resolve-only helper failed");
+
+    let error = reservation.expect_err("cross-process v6 startup must detect the v5 namespace");
+    assert_eq!(error.kind(), ErrorKind::AddrInUse);
     Ok(())
 }
 

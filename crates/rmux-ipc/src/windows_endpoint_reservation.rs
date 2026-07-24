@@ -93,6 +93,7 @@ impl Drop for ManagedStartClaim {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReservationDecision {
+    OwnResolved,
     JoinCurrent,
     Rotate,
 }
@@ -102,6 +103,9 @@ pub(crate) fn decide(
     requested_nonce: &str,
     recorded_process_is_live: bool,
 ) -> ReservationDecision {
+    if record.phase == EndpointPhase::Resolved {
+        return ReservationDecision::OwnResolved;
+    }
     if record.nonce != requested_nonce {
         return if record.phase != EndpointPhase::Stopped && recorded_process_is_live {
             ReservationDecision::JoinCurrent
@@ -117,6 +121,7 @@ pub(crate) fn decide(
         EndpointPhase::Starting | EndpointPhase::Running | EndpointPhase::Stopped => {
             ReservationDecision::Rotate
         }
+        EndpointPhase::Resolved => unreachable!("resolved records return above"),
     }
 }
 
@@ -151,6 +156,19 @@ mod tests {
                 true,
             ),
             ReservationDecision::JoinCurrent
+        );
+    }
+
+    #[test]
+    fn resolved_generation_is_claimed_without_rotation() {
+        let requester = stamp(10);
+        assert_eq!(
+            decide(
+                &record(EndpointPhase::Resolved, "candidate", requester),
+                "candidate",
+                false,
+            ),
+            ReservationDecision::OwnResolved
         );
     }
 

@@ -6,12 +6,10 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::zeroed;
-use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 
-use sha2::{Digest, Sha256};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
@@ -24,8 +22,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::endpoint::{current_integrity_label, pipe_component, LocalEndpoint, PIPE_PREFIX};
-use crate::windows_endpoint_candidate;
 use crate::windows_endpoint_legacy;
+use crate::windows_endpoint_naming::{
+    endpoint_key, pipe_path, random_nonce, random_nonce_away_from,
+};
 use crate::windows_endpoint_record::{
     is_lower_hex, parse as parse_record, serialize as serialize_record, EndpointPhase,
     EndpointRecord, ProcessStamp, KEY_HEX_LEN, NONCE_HEX_LEN,
@@ -74,33 +74,59 @@ pub(crate) fn endpoint_for_label(
     integrity: &'static str,
 ) -> io::Result<LocalEndpoint> {
     let key = endpoint_key(label, sid_component, integrity);
-    windows_endpoint_legacy::remember_component(&key, sid_component, integrity, label);
-    let mut rejected_nonce = None;
-    if let Some(state) = StateStore::open_existing(&key, integrity)? {
-        let _lock = state.lock()?;
-        if let Some(record) = state.read_record()? {
-            if record.key == key
-                && record.phase != EndpointPhase::Stopped
-                && process_is_live(record.process)
-            {
-                return Ok(LocalEndpoint::from_path(pipe_path(
-                    sid_component,
-                    integrity,
-                    &record.key,
-                    &record.nonce,
-                )));
-            }
-            rejected_nonce = Some(record.nonce);
+    let legacy_component =
+        windows_endpoint_legacy::supported_component(sid_component, integrity, label);
+    let state = StateStore::open(&key, integrity)?;
+    let _lock = state.lock()?;
+    let process = current_process_stamp()?;
+    let mut record = match state.read_record()? {
+        Some(record)
+            if matches!(
+                record.phase,
+                EndpointPhase::Starting | EndpointPhase::Running
+            ) && process_is_live(record.process) =>
+        {
+            return Ok(managed_endpoint_from_parts(
+                sid_component,
+                integrity,
+                &record,
+            ));
         }
-    }
-
-    let nonce = windows_endpoint_candidate::for_key(&key, rejected_nonce.as_deref())?;
-    Ok(LocalEndpoint::from_path(pipe_path(
+        Some(mut record)
+            if record.phase == EndpointPhase::Resolved && process_is_live(record.process) =>
+        {
+            if record.legacy_component != legacy_component {
+                record.legacy_component = legacy_component;
+                record.process = process;
+                state.write_record(&record)?;
+            }
+            return Ok(managed_endpoint_from_parts(
+                sid_component,
+                integrity,
+                &record,
+            ));
+        }
+        Some(mut record) => {
+            record.nonce = random_nonce_away_from(Some(&record.nonce))?;
+            record
+        }
+        None => EndpointRecord {
+            phase: EndpointPhase::Resolved,
+            key: key.clone(),
+            nonce: random_nonce()?,
+            legacy_component: None,
+            process,
+        },
+    };
+    record.phase = EndpointPhase::Resolved;
+    record.legacy_component = legacy_component;
+    record.process = process;
+    state.write_record(&record)?;
+    Ok(managed_endpoint_from_parts(
         sid_component,
         integrity,
-        &key,
-        &nonce,
-    )))
+        &record,
+    ))
 }
 
 /// Atomically reserves a private Windows label endpoint for daemon startup.
@@ -119,13 +145,12 @@ pub fn reserve_managed_endpoint_start(
     let state = StateStore::open(&components.key, components.integrity)?;
     let _lock = state.lock()?;
     let requester = current_process_stamp()?;
-    let remembered_legacy = windows_endpoint_legacy::remembered_component(&components.key);
     let Some(mut record) = state.read_record()? else {
         let record = EndpointRecord {
             phase: EndpointPhase::Starting,
             key: components.key.clone(),
             nonce: components.nonce.clone(),
-            legacy_component: remembered_legacy,
+            legacy_component: None,
             process: requester,
         };
         ensure_legacy_namespace_available(&components, &record)?;
@@ -151,9 +176,6 @@ pub fn reserve_managed_endpoint_start(
         ));
     }
 
-    if remembered_legacy.is_some() {
-        record.legacy_component = remembered_legacy;
-    }
     if decision == ReservationDecision::Rotate {
         record.nonce = if record.nonce == components.nonce {
             random_nonce()?
@@ -303,6 +325,14 @@ fn managed_endpoint(components: &ManagedComponents, nonce: &str) -> LocalEndpoin
     ))
 }
 
+fn managed_endpoint_from_parts(
+    sid: &str,
+    integrity: &str,
+    record: &EndpointRecord,
+) -> LocalEndpoint {
+    LocalEndpoint::from_path(pipe_path(sid, integrity, &record.key, &record.nonce))
+}
+
 fn ensure_legacy_namespace_available(
     components: &ManagedComponents,
     record: &EndpointRecord,
@@ -328,44 +358,6 @@ fn legacy_endpoint(
     component.map(|component| {
         windows_endpoint_legacy::endpoint(&components.sid, components.integrity, component)
     })
-}
-
-fn endpoint_key(label: &OsStr, sid: &str, integrity: &str) -> String {
-    let mut hash = Sha256::new();
-    hash.update(b"rmux windows endpoint label v1\0");
-    hash.update((sid.len() as u64).to_le_bytes());
-    hash.update(sid.as_bytes());
-    hash.update((integrity.len() as u64).to_le_bytes());
-    hash.update(integrity.as_bytes());
-    let label_units = label.encode_wide().collect::<Vec<_>>();
-    hash.update((label_units.len() as u64).to_le_bytes());
-    for unit in label_units {
-        hash.update(unit.to_le_bytes());
-    }
-    hex(hash.finalize().as_slice())
-}
-
-fn pipe_path(sid: &str, integrity: &str, key: &str, nonce: &str) -> PathBuf {
-    PathBuf::from(format!(
-        "{PIPE_PREFIX}rmux-{sid}-il-{integrity}{MANAGED_PIPE_MARKER}{key}-{nonce}"
-    ))
-}
-
-fn random_nonce() -> io::Result<String> {
-    let mut nonce = [0_u8; NONCE_HEX_LEN / 2];
-    getrandom::fill(&mut nonce)
-        .map_err(|error| io::Error::other(format!("Windows endpoint RNG failed: {error}")))?;
-    Ok(hex(&nonce))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
 }
 
 struct StateStore {

@@ -12,6 +12,7 @@ const STATE_FORMAT_V2: &str = "rmux-endpoint-state-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EndpointPhase {
+    Resolved,
     Starting,
     Running,
     Stopped,
@@ -34,6 +35,7 @@ pub(crate) struct ProcessStamp {
 
 pub(crate) fn serialize(record: &EndpointRecord) -> String {
     let phase = match record.phase {
+        EndpointPhase::Resolved => "resolved",
         EndpointPhase::Starting => "starting",
         EndpointPhase::Running => "running",
         EndpointPhase::Stopped => "stopped",
@@ -57,6 +59,7 @@ pub(crate) fn parse(text: &str, expected_key: &str) -> io::Result<EndpointRecord
         return Err(invalid_state("managed endpoint state version is invalid"));
     };
     let phase = match field(&mut lines, "phase")? {
+        "resolved" => EndpointPhase::Resolved,
         "starting" => EndpointPhase::Starting,
         "running" => EndpointPhase::Running,
         "stopped" => EndpointPhase::Stopped,
