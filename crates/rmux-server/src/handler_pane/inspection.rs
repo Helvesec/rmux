@@ -321,7 +321,17 @@ impl RequestHandler {
                     .find_display_message_client(requester_pid, target_client)
                     .await
                 {
-                    Ok(Some(client)) => self.display_message_client_from_managed(client).await,
+                    Ok(Some(client)) => {
+                        match self.display_message_client_from_managed(client).await {
+                            Some(client) => Some(client),
+                            None if print => None,
+                            None => {
+                                return Response::DisplayMessage(
+                                    DisplayMessageResponse::no_output(),
+                                );
+                            }
+                        }
+                    }
                     Ok(None) if print => None,
                     Ok(None) => {
                         return Response::DisplayMessage(DisplayMessageResponse::no_output());

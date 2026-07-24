@@ -1057,6 +1057,72 @@ async fn display_message_target_client_delivers_only_to_that_client() {
 }
 
 #[tokio::test]
+async fn display_message_stale_explicit_client_does_not_fall_back_to_a_peer() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("display-stale-alpha");
+    let beta = session_name("display-stale-beta");
+    for session_name in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session_name.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 20, rows: 4 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let requester_pid = 43_101;
+    let (requester_tx, _requester_rx) = mpsc::unbounded_channel();
+    let requester_attach_id = handler
+        .register_attach(requester_pid, alpha, requester_tx)
+        .await;
+    let (peer_tx, mut peer_rx) = mpsc::unbounded_channel();
+    handler.register_attach(43_102, beta, peer_tx).await;
+    while peer_rx.try_recv().is_ok() {}
+
+    let pause = super::client_support::install_managed_client_resolution_pause(requester_pid);
+    let display_handler = handler.clone();
+    let display = tokio::spawn(async move {
+        display_handler
+            .dispatch(
+                requester_pid,
+                Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
+                    target: None,
+                    print: false,
+                    message: Some("must not reach peer".to_owned()),
+                    target_client: Some("=".to_owned()),
+                    empty_target_context: false,
+                    duration_ms: None,
+                    ignore_input: false,
+                })),
+            )
+            .await
+            .response
+    });
+
+    timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("display-message resolves the original attached client");
+    handler
+        .finish_attach(requester_pid, requester_attach_id)
+        .await;
+    pause.release.notify_one();
+
+    assert_eq!(
+        display.await.expect("display-message task joins"),
+        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+    );
+    assert!(
+        peer_rx.try_recv().is_err(),
+        "a stale explicit client must not fall back to another attached client"
+    );
+}
+
+#[tokio::test]
 async fn queued_display_message_ignore_input_is_scoped_to_its_attached_initiator() {
     // Oracle: tmux 3.7b with two clients attached to one session arms
     // `display-message -d2000 -N` only on the client that invoked the binding;
