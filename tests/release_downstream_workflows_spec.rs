@@ -269,6 +269,85 @@ fn downstream_writers_keep_the_python_310_runtime_contract() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn crates_writer_distinguishes_missing_versions_from_download_denials() {
+    let fixture = r#"
+import importlib.util
+import pathlib
+import sys
+import tempfile
+import urllib.error
+
+root = pathlib.Path.cwd()
+scripts = root / "scripts" / "release"
+sys.path.insert(0, str(scripts))
+spec = importlib.util.spec_from_file_location(
+    "publish_crate_set", scripts / "publish-crate-set.py"
+)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+calls = []
+class Response:
+    def __init__(self, body):
+        self.body = body
+    def __enter__(self):
+        return self
+    def __exit__(self, *_args):
+        return False
+    def read(self, _limit):
+        return self.body
+
+def missing(request, timeout):
+    calls.append((request.full_url, timeout))
+    raise urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
+
+module.urllib.request.urlopen = missing
+assert module.registry_bytes("rmux", "0.9.1") is None
+assert calls == [("https://crates.io/api/v1/crates/rmux/0.9.1", 30)]
+
+def forbidden(request, timeout):
+    raise urllib.error.HTTPError(request.full_url, 403, "forbidden", {}, None)
+
+module.urllib.request.urlopen = forbidden
+try:
+    module.registry_bytes("rmux", "0.9.1")
+except ValueError as error:
+    assert "lookup failed with HTTP 403" in str(error)
+else:
+    raise AssertionError("metadata access denial was treated as a missing version")
+
+with tempfile.TemporaryDirectory() as directory:
+    target = pathlib.Path(directory)
+    filename = "rmux-types-0.9.1.crate"
+    direct, temporary = module.generated_package_paths(target, filename)
+    temporary.parent.mkdir(parents=True)
+    temporary.write_bytes(b"canonical")
+    assert module.generated_package(target, filename) == temporary
+    direct.write_bytes(b"duplicate")
+    try:
+        module.generated_package(target, filename)
+    except ValueError as error:
+        assert "unexpected package set" in str(error)
+    else:
+        raise AssertionError("ambiguous Cargo package output was accepted")
+    module.remove_generated_package(target, filename)
+    assert not direct.exists() and not temporary.exists()
+"#;
+    let output = Command::new("python3")
+        .args(["-c", fixture])
+        .current_dir(repo_root())
+        .output()
+        .expect("run crates.io metadata regression fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn downstream_json_writer_uses_canonical_lf_bytes_on_every_platform() {
     let nonce = SystemTime::now()
