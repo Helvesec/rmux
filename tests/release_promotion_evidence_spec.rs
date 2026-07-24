@@ -487,7 +487,7 @@ fn complete_release_state(fixture: &Fixture) {
             "repository_id": 1239918790, "release_id": 1234,
             "release_ref": "v1.0.0", "source_git_sha": SOURCE,
             "tag_object_sha": TAG_OBJECT, "draft": false, "prerelease": false,
-            "immutable": true, "created_at": "2026-07-19T00:32:00Z",
+            "immutable": true, "created_at": "2026-07-19T00:29:00Z",
             "published_at": "2026-07-19T00:33:00Z", "assets": assets
         }),
     );
@@ -749,6 +749,18 @@ fn publication_receipt_round_trip_rejects_asset_and_authorization_drift() {
         ),
         "authorized immutable release",
     );
+    for published_at in ["2026-07-19T00:30:00Z", "2026-07-19T00:41:00Z"] {
+        let mut outside_ttl = original_state.clone();
+        outside_ttl["published_at"] = json!(published_at);
+        write_json(&fixture.release_state, &outside_ttl);
+        assert_rejected(
+            invoke(
+                "publication-receipt.py",
+                &receipt_predicate_args(&fixture, "--output", &duplicate),
+            ),
+            "outside the authorization TTL",
+        );
+    }
     write_json(&fixture.release_state, &original_state);
     let original_envelope = read_json(&fixture.authorization_envelope);
     let mut forged_envelope = original_envelope.clone();

@@ -82,7 +82,13 @@ def validate_release_state(
     audit_expires = timestamp(
         predicate["policy_audit"]["expires_at"], "policy audit expires_at"
     )
-    if not issued <= created <= published <= expires or published > audit_expires:
+    # GitHub derives a Release's created_at from the tagged commit. Only the
+    # immutable publication transition must occur inside the authorization TTL.
+    if (
+        created > published
+        or not issued <= published <= expires
+        or published > audit_expires
+    ):
         raise ValueError("GitHub Release changed state outside the authorization TTL")
     expected = _expected_release_assets(predicate, envelope)
     actual = state["assets"]
