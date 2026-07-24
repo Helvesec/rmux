@@ -80,10 +80,8 @@ impl RequestHandler {
                     }
                     PaneObservationItem::ProcessExited { .. } => {
                         lifecycle_events = lifecycle_events.saturating_add(1);
-                        if !dirty {
-                            frame_lifecycle_revision =
-                                driver.lifecycle_revision.saturating_add(lifecycle_events);
-                        }
+                        frame_lifecycle_revision =
+                            driver.lifecycle_revision.saturating_add(lifecycle_events);
                     }
                     PaneObservationItem::Output(OutputCursorItem::Gap(_)) => {
                         dirty = true;

@@ -399,6 +399,30 @@ async fn surface_delivers_exit_before_a_following_generation_reset() {
 }
 
 #[tokio::test]
+async fn surface_delivers_exit_before_reset_when_visual_output_precedes_eof() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Surface).await;
+
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(b"visual");
+    output.send(b"visual".to_vec());
+    output.send(Vec::new());
+    output.set_generation(output.current_generation().saturating_add(1));
+
+    let events = cursor(&handler, subscribed.subscription_id).await;
+    assert!(matches!(
+        events.as_slice(),
+        [
+            PaneStreamEvent::Lifecycle(PaneStreamLifecycleEvent::ProcessExited { .. }),
+            PaneStreamEvent::SurfaceReset(_)
+        ]
+    ));
+}
+
+#[tokio::test]
 async fn surface_delivers_each_process_exit_without_collapsing_revisions() {
     let handler = RequestHandler::new();
     let (target, output, _) = test_pane(&handler).await;
