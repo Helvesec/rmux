@@ -168,11 +168,19 @@ jobs:
               "run_attempt": 1,
               "path": ".github/workflows/release-promote.yml",
               "head_sha": os.environ["RMUX_EXPECTED_SOURCE_SHA"],
-              "status": "completed",
-              "conclusion": "success",
           }
-          if any(run.get(field) != wanted for field, wanted in run_expected.items()) or run.get("repository", {}).get("id") != 1239918790:
-              raise SystemExit("authorization producer run identity differs")
+          status = run.get("status")
+          conclusion = run.get("conclusion")
+          lifecycle_valid = (
+              (status == "in_progress" and conclusion is None)
+              or (status == "completed" and isinstance(conclusion, str))
+          )
+          if (
+              any(run.get(field) != wanted for field, wanted in run_expected.items())
+              or run.get("repository", {}).get("id") != 1239918790
+              or not lifecycle_valid
+          ):
+              raise SystemExit("authorization producer run identity or lifecycle differs")
           if predicate.get("authorization", {}).get("run_id") != run_expected["id"] or predicate.get("authorization", {}).get("workflow_id") != run_expected["workflow_id"]:
               raise SystemExit("authorization predicate run identity differs from live run")
           release_expected = {

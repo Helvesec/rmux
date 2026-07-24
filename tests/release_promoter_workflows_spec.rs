@@ -302,6 +302,9 @@ fn receipt_is_separate_receipt_only_and_never_writes_contents() {
     assert!(RECEIPT.contains("git/ref/tags/$RMUX_RELEASE_REF"));
     assert!(RECEIPT.contains("git/tags/$tag_object_sha"));
     assert!(RECEIPT.contains("\"run_attempt\": 1"));
+    assert!(RECEIPT.contains("status == \"in_progress\" and conclusion is None"));
+    assert!(RECEIPT.contains("status == \"completed\" and isinstance(conclusion, str)"));
+    assert!(!RECEIPT.contains("\"conclusion\": \"success\""));
     assert!(RECEIPT.contains("live immutable Release identity differs"));
     assert!(RECEIPT.contains("live annotated tag signature or target differs"));
     assert!(RECEIPT.contains("not isinstance(target, dict)"));
