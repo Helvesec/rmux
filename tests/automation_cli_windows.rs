@@ -13,6 +13,63 @@ use serde_json::Value;
 mod windows_cli_serial;
 
 #[test]
+fn windows_socket_label_is_ascii_case_insensitive_end_to_end() -> Result<(), Box<dyn Error>> {
+    let _serial_guard = windows_cli_serial::acquire("windows-socket-label-case")?;
+    let base_label = unique_label("windows-socket-label-case")?;
+    let start_label = base_label.to_ascii_uppercase();
+    let lower_label = base_label.to_ascii_lowercase();
+    let mixed_label = alternating_ascii_case(&base_label, true);
+    let kill_label = alternating_ascii_case(&base_label, false);
+    let _server = ForegroundServerGuard::start(start_label.clone())?;
+    let session = "label-case";
+
+    assert_success(
+        rmux_command(&start_label)
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "cmd.exe",
+                "/D",
+                "/Q",
+                "/K",
+            ])
+            .stdin(Stdio::null())
+            .output()?,
+        "start daemon under uppercase socket label",
+    )?;
+    assert_success(
+        rmux_command(&lower_label)
+            .args(["has-session", "-t", session])
+            .stdin(Stdio::null())
+            .output()?,
+        "find session under lowercase socket label",
+    )?;
+    let sessions = assert_success(
+        rmux_command(&mixed_label)
+            .arg("list-sessions")
+            .stdin(Stdio::null())
+            .output()?,
+        "list sessions under mixed-case socket label",
+    )?;
+    assert!(
+        String::from_utf8(sessions.stdout)?
+            .lines()
+            .any(|line| line.starts_with(&format!("{session}:"))),
+        "list-sessions did not report {session}"
+    );
+    assert_success(
+        rmux_command(&kill_label)
+            .arg("kill-server")
+            .stdin(Stdio::null())
+            .output()?,
+        "kill server under another socket-label case",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn windows_automation_wait_snapshot_and_locator_work_end_to_end() -> Result<(), Box<dyn Error>> {
     let _serial_guard = windows_cli_serial::acquire("automation-cli-windows")?;
     let label = unique_label("automation-cli-windows")?;
@@ -416,6 +473,20 @@ fn rmux_binary() -> &'static str {
 fn unique_label(prefix: &str) -> Result<String, Box<dyn Error>> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     Ok(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
+fn alternating_ascii_case(value: &str, starts_uppercase: bool) -> String {
+    value
+        .chars()
+        .enumerate()
+        .map(|(index, character)| {
+            if (index % 2 == 0) == starts_uppercase {
+                character.to_ascii_uppercase()
+            } else {
+                character.to_ascii_lowercase()
+            }
+        })
+        .collect()
 }
 
 fn assert_success(output: Output, context: impl AsRef<str>) -> Result<Output, Box<dyn Error>> {

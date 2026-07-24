@@ -41,6 +41,16 @@ fn blocking_connect_to_missing_pipe_reports_not_found() -> std::io::Result<()> {
     Ok(())
 }
 
+#[test]
+fn label_endpoint_is_ascii_case_insensitive() -> std::io::Result<()> {
+    let suffix = format!("case-endpoint-{}", std::process::id());
+    let upper = endpoint_for_label(suffix.to_ascii_uppercase())?;
+    let lower = endpoint_for_label(suffix.to_ascii_lowercase())?;
+
+    assert_eq!(upper, lower);
+    Ok(())
+}
+
 #[tokio::test]
 async fn named_pipe_roundtrip_uses_bound_endpoint() -> std::io::Result<()> {
     let endpoint = endpoint_for_label(format!("integration-{}", std::process::id()))?;

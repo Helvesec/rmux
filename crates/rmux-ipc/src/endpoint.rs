@@ -170,7 +170,7 @@ fn endpoint_for_label_impl(label: &OsStr) -> io::Result<LocalEndpoint> {
             "Windows identity resolver returned a non-SID identity",
         ));
     };
-    let label = pipe_component(label);
+    let label = canonical_pipe_label_component(label);
     let sid = pipe_component(OsStr::new(sid.as_ref()));
     let integrity = current_integrity_label()?;
     crate::windows_endpoint_state::endpoint_for_label(OsStr::new(&label), &sid, integrity)
@@ -476,6 +476,13 @@ pub(crate) fn pipe_component(value: &OsStr) -> String {
 }
 
 #[cfg(windows)]
+fn canonical_pipe_label_component(value: &OsStr) -> String {
+    let mut component = pipe_component(value);
+    component.make_ascii_lowercase();
+    component
+}
+
+#[cfg(windows)]
 pub(crate) fn current_integrity_label() -> io::Result<&'static str> {
     let token = current_process_token()?;
     let mut needed = 0_u32;
@@ -723,6 +730,32 @@ mod tests {
         assert_eq!(
             pipe_component(OsStr::new("alpha/beta:gamma")),
             "alpha~002Fbeta~003Agamma"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_label_components_are_ascii_case_insensitive() {
+        assert_eq!(
+            canonical_pipe_label_component(OsStr::new("Alpha/BETA")),
+            canonical_pipe_label_component(OsStr::new("aLPHA/beta"))
+        );
+        assert_eq!(
+            canonical_pipe_label_component(OsStr::new("Alpha/BETA")),
+            "alpha~002fbeta"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_label_components_keep_escaped_units_injective() {
+        assert_ne!(
+            canonical_pipe_label_component(OsStr::new("alpha/beta")),
+            canonical_pipe_label_component(OsStr::new("alpha~002Fbeta"))
+        );
+        assert_ne!(
+            canonical_pipe_label_component(OsStr::new("É")),
+            canonical_pipe_label_component(OsStr::new("é"))
         );
     }
 
