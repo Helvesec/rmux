@@ -11,6 +11,7 @@ pub(in crate::handler) struct ListClientSnapshot {
     pub(in crate::handler) order: u64,
     pub(in crate::handler) width: u16,
     pub(in crate::handler) height: Option<u16>,
+    pub(in crate::handler) sort_height: u16,
     pub(in crate::handler) termname: String,
     pub(in crate::handler) termtype: String,
     pub(in crate::handler) termfeatures: String,
@@ -48,6 +49,6 @@ impl ListClientSnapshot {
     }
 
     pub(in crate::handler) fn sort_size(&self) -> (u16, u16) {
-        (self.width, self.height.unwrap_or_default())
+        (self.width, self.sort_height)
     }
 }

@@ -125,6 +125,7 @@ impl RequestHandler {
                         order: active.id,
                         width: active.client_size.cols,
                         height: Some(active.client_size.rows),
+                        sort_height: active.client_size.rows,
                         termname: active.terminal_context.term_name().to_owned(),
                         termtype: String::new(),
                         termfeatures: outer_terminal.features_string(),
@@ -154,6 +155,7 @@ impl RequestHandler {
                     order: active.id,
                     width: active.client_width,
                     height: None,
+                    sort_height: active.client_height,
                     termname: active.terminal_context.term_name().to_owned(),
                     termtype: String::new(),
                     termfeatures: active.terminal_context.explicit_features_string(),
@@ -652,6 +654,7 @@ mod tests {
             order,
             width: 80,
             height: Some(24),
+            sort_height: 24,
             termname: String::new(),
             termtype: String::new(),
             termfeatures: String::new(),
@@ -680,6 +683,37 @@ mod tests {
             .map(|client| client.name.as_str())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["beta", "alpha"]);
+    }
+
+    #[test]
+    fn list_clients_size_sort_uses_the_hidden_control_height() {
+        let mut tall = client_snapshot("tall", 1);
+        tall.control = true;
+        tall.width = 100;
+        tall.height = None;
+        tall.sort_height = 30;
+        let mut short = client_snapshot("short", 2);
+        short.control = true;
+        short.width = 100;
+        short.height = None;
+        short.sort_height = 20;
+        let mut clients = vec![tall, short];
+
+        sort_list_clients(&mut clients, Some("size"), false);
+
+        assert_eq!(
+            clients
+                .iter()
+                .map(|client| client.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["short", "tall"]
+        );
+        assert!(
+            clients
+                .iter()
+                .all(|client| client.height_value().is_empty()),
+            "the control height remains hidden from formatting"
+        );
     }
 
     #[test]

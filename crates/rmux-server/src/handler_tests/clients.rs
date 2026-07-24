@@ -157,6 +157,10 @@ async fn refresh_client_control_size_resizes_real_control_session() {
         control_client_geometry(&handler, requester_pid).await,
         (80, None)
     );
+    assert_eq!(
+        control_client_sort_height(&handler, requester_pid).await,
+        24
+    );
 
     let mut lifecycle_events = handler.subscribe_lifecycle_events();
     let response = handler
@@ -213,6 +217,10 @@ async fn refresh_client_control_size_resizes_real_control_session() {
     assert_eq!(
         control_client_geometry(&handler, requester_pid).await,
         (101, None)
+    );
+    assert_eq!(
+        control_client_sort_height(&handler, requester_pid).await,
+        31
     );
     assert_eq!(
         list_client_geometry(&handler).await,
@@ -312,6 +320,10 @@ async fn list_clients_hides_a_control_client_without_a_session() {
         control_client_geometry(&handler, requester_pid).await,
         (80, None)
     );
+    assert_eq!(
+        control_client_sort_height(&handler, requester_pid).await,
+        24
+    );
     assert!(
         list_client_geometry(&handler).await.is_empty(),
         "tmux 3.7b omits clients that have no session"
@@ -326,6 +338,10 @@ async fn list_clients_hides_a_control_client_without_a_session() {
     assert_eq!(
         control_client_geometry(&handler, requester_pid).await,
         (91, None)
+    );
+    assert_eq!(
+        control_client_sort_height(&handler, requester_pid).await,
+        20
     );
     assert!(
         list_client_geometry(&handler).await.is_empty(),
@@ -1048,6 +1064,17 @@ async fn control_client_geometry(handler: &RequestHandler, control_pid: u32) -> 
         .find(|client| client.control && client.pid == control_pid)
         .expect("control client snapshot");
     (client.width, client.height)
+}
+
+async fn control_client_sort_height(handler: &RequestHandler, control_pid: u32) -> u16 {
+    handler
+        .active_control
+        .lock()
+        .await
+        .by_pid
+        .get(&control_pid)
+        .expect("control client")
+        .client_height
 }
 
 async fn list_client_geometry(handler: &RequestHandler) -> String {

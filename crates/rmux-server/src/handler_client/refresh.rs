@@ -247,6 +247,7 @@ impl RequestHandler {
                 ) {
                     Ok(target) => {
                         active.client_width = size.cols;
+                        active.client_height = size.rows;
                         target
                     }
                     Err(error) => return Response::Error(ErrorResponse { error }),
@@ -271,6 +272,7 @@ impl RequestHandler {
                 });
             };
             active.client_width = size.cols;
+            active.client_height = size.rows;
         } else if control_size.is_none() {
             if let Err(error) = self.refresh_control_client_for_identity(identity).await {
                 return Response::Error(ErrorResponse { error });
