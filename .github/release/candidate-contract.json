@@ -316,6 +316,7 @@
     ".github/actions/release-channel-prepare/action.yml",
     ".github/actions/release-channel-result/action.yml",
     ".github/actions/release-channel-retry-prepare/action.yml",
+    ".github/actions/release-downstream-audit/action.yml",
     ".github/actions/release-policy-audit/action.yml",
     ".github/actions/release-publication-inputs/action.yml",
     ".github/actions/release-snap-candidate-write/action.yml",

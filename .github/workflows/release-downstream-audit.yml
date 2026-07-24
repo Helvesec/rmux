@@ -40,55 +40,9 @@ jobs:
           ref: ${{ inputs.expected_source_sha }}
           persist-credentials: false
 
-      - id: app
-        name: Mint a read-only downstream audit token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+      - name: Audit exact downstream repository authority
+        uses: ./.github/actions/release-downstream-audit
         with:
           app-id: ${{ vars.RMUX_DOWNSTREAM_APP_ID }}
-          private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
-          owner: Helvesec
-          repositories: |
-            homebrew-rmux
-            rmux-packages
-            rmux-web-share
-            scoop-rmux
-          permission-actions: read
-          # GitHub only returns ruleset bypass_actors with write access.
-          # The collector remains GET-only and receives no contents write token.
-          permission-administration: write
-          permission-contents: read
-
-      - name: Collect and verify live downstream authority
-        shell: bash
-        env:
-          RMUX_DOWNSTREAM_TOKEN: ${{ steps.app.outputs.token }}
-          RMUX_DOWNSTREAM_APP_ID: ${{ vars.RMUX_DOWNSTREAM_APP_ID }}
-          RMUX_DOWNSTREAM_APP_SLUG: ${{ steps.app.outputs.app-slug }}
-          RMUX_DOWNSTREAM_INSTALLATION_ID: ${{ steps.app.outputs.installation-id }}
-        run: |
-          set -euo pipefail
-          root="$RUNNER_TEMP/rmux-downstream-authority"
-          scripts/release/collect-downstream-repository.py \
-            --app-id "$RMUX_DOWNSTREAM_APP_ID" \
-            --app-slug "$RMUX_DOWNSTREAM_APP_SLUG" \
-            --installation-id "$RMUX_DOWNSTREAM_INSTALLATION_ID" \
-            --output-dir "$root"
-          for key in homebrew-rmux rmux-packages rmux-web-share scoop-rmux; do
-            scripts/release/verify-downstream-repository.py fixtures \
-              --repository-key "$key" \
-              --metadata "$root/$key/metadata.json" \
-              --protection "$root/$key/protection.json" \
-              --rulesets "$root/$key/rulesets.json" \
-              --environments "$root/$key/environments.json" \
-              --runners "$root/$key/runners.json" \
-              --installation "$root/installation.json"
-          done
-
-      - name: Upload exact downstream audit fixtures
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: rmux-downstream-authority-${{ inputs.expected_source_sha }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/rmux-downstream-authority
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
+          app-private-key: ${{ secrets.RMUX_DOWNSTREAM_APP_PRIVATE_KEY }}
+          expected-source-sha: ${{ inputs.expected_source_sha }}
