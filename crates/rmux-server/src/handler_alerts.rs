@@ -8,6 +8,29 @@ use tokio::task::JoinHandle;
 use super::{RequestHandler, UnsequencedLifecycleEvent};
 use crate::pane_io::AttachControl;
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct AlertOverlayIdentityPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AlertOverlayIdentityPause {
+    pub(in crate::handler) async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(in crate::handler) fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+static ALERT_OVERLAY_IDENTITY_PAUSES: std::sync::Mutex<
+    Vec<(usize, std::sync::Arc<AlertOverlayIdentityPause>)>,
+> = std::sync::Mutex::new(Vec::new());
+
 #[path = "handler_alerts/automatic_names.rs"]
 mod automatic_names;
 #[path = "handler_alerts/clipboard_relay.rs"]
@@ -152,6 +175,37 @@ impl AlertKind {
 }
 
 impl RequestHandler {
+    #[cfg(test)]
+    pub(in crate::handler) fn install_alert_overlay_identity_pause(
+        &self,
+    ) -> std::sync::Arc<AlertOverlayIdentityPause> {
+        let handler_key = std::sync::Arc::as_ptr(&self.state).addr();
+        let pause = std::sync::Arc::new(AlertOverlayIdentityPause::default());
+        ALERT_OVERLAY_IDENTITY_PAUSES
+            .lock()
+            .expect("alert overlay identity pause lock")
+            .push((handler_key, pause.clone()));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_after_alert_overlay_identity_capture(&self) {
+        let handler_key = std::sync::Arc::as_ptr(&self.state).addr();
+        let pause = {
+            let mut pauses = ALERT_OVERLAY_IDENTITY_PAUSES
+                .lock()
+                .expect("alert overlay identity pause lock");
+            pauses
+                .iter()
+                .position(|(key, _)| *key == handler_key)
+                .map(|position| pauses.swap_remove(position).1)
+        };
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
     pub(super) async fn clear_session_alerts_on_focus(
         &self,
         session_name: &SessionName,
@@ -211,9 +265,12 @@ impl RequestHandler {
             };
             session_name
         };
+        #[cfg(test)]
+        self.pause_after_alert_overlay_identity_capture().await;
         let _ = self
-            .send_attached_overlay(
+            .send_attached_overlay_to_session_identity(
                 &session_name,
+                session_id,
                 message,
                 (!duration.is_zero()).then_some(duration),
                 crate::handler::attach_support::TransientMessageInputPolicy::DismissAndForward,
