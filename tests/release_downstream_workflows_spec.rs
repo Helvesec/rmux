@@ -261,8 +261,11 @@ fn exact_receipt_ids_digests_origin_and_documents_are_bound() {
         "rmux-publication-receipt-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID",
         "rmux-publication-receipt-envelope-$RMUX_EXPECTED_SOURCE_SHA-$RMUX_RELEASE_ID",
     ] {
-        assert!(artifact_verification(prepare, artifact_name)
-            .contains("--expected-workflow-path .github/workflows/release-receipt.yml"));
+        let verification = artifact_verification(prepare, artifact_name);
+        assert!(
+            verification.contains("--expected-workflow-path .github/workflows/release-receipt.yml")
+        );
+        assert!(verification.contains("--allow-running-current-run"));
     }
     assert_eq!(
         prepare
