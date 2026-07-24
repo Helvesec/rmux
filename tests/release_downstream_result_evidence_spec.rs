@@ -30,6 +30,9 @@ const RESULT_ACTION: &str = include_str!("../.github/actions/release-channel-res
 
 #[test]
 fn result_attestation_uses_algorithm_qualified_subject_digest() {
+    assert!(RESULT_ACTION
+        .contains("digest=\"$(sha256sum < \"$RMUX_TARGET_EVIDENCE\" | cut -d' ' -f1)\""));
+    assert!(!RESULT_ACTION.contains("sha256sum \"$RMUX_TARGET_EVIDENCE\""));
     assert!(RESULT_ACTION.contains("echo \"subject_digest=sha256:$digest\" >> \"$GITHUB_OUTPUT\""));
     assert!(!RESULT_ACTION.contains("echo \"subject_digest=$digest\" >> \"$GITHUB_OUTPUT\""));
     assert!(RESULT_ACTION.contains("subject-digest: ${{ steps.predicate.outputs.subject_digest }}"));
