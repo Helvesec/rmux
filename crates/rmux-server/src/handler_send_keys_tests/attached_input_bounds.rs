@@ -5,29 +5,7 @@ async fn create_attached_live_session(
     name: &rmux_proto::SessionName,
     requester_pid: u32,
 ) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
-    #[cfg(unix)]
-    {
-        let mut state = handler.state.lock().await;
-        state
-            .options
-            .set(
-                ScopeSelector::Global,
-                OptionName::DefaultShell,
-                "/bin/bash".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .expect("test default-shell is valid");
-    }
-
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: name.clone(),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    create_quiet_input_session(handler, name).await;
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
