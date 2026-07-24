@@ -1037,6 +1037,61 @@ async fn register_control_test_client(
     (control_id, event_rx)
 }
 
+#[tokio::test]
+async fn list_clients_control_name_round_trips_through_client_targeting() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("control-client-name");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)), "{created:?}");
+    let control_pid = 91_401;
+    let (control_id, _events) = register_control_test_client(&handler, control_pid, &alpha).await;
+    let name = format!("client-{control_pid}");
+
+    let response = handler
+        .handle(Request::ListClients(Box::new(
+            rmux_proto::ListClientsRequest {
+                format: Some("#{client_name}|#{client_pid}".to_owned()),
+                target_session: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            },
+        )))
+        .await;
+    let Response::ListClients(response) = response else {
+        panic!("expected list-clients response");
+    };
+    assert_eq!(
+        String::from_utf8(response.output.stdout().to_vec()).expect("utf-8"),
+        format!("{name}|{control_pid}\n")
+    );
+
+    let resolved = handler
+        .resolve_target_managed_client(0, Some(&name), "test")
+        .await
+        .expect("canonical control client name resolves");
+    assert_eq!(
+        resolved,
+        super::super::control_support::ManagedClient::Control(
+            super::super::control_support::ControlClientIdentity::new(control_pid, control_id)
+        )
+    );
+    assert_eq!(
+        handler
+            .find_display_message_client(0, &name)
+            .await
+            .expect("display-message target resolves"),
+        Some(resolved)
+    );
+}
+
 fn refresh_client_request(target_pid: u32) -> rmux_proto::request::RefreshClientRequest {
     rmux_proto::request::RefreshClientRequest {
         target_client: Some(target_pid.to_string()),

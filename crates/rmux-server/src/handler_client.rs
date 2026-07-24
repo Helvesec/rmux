@@ -15,7 +15,7 @@ use crate::pane_terminals::session_not_found;
 
 use super::{
     attach_support::{ActiveAttachIdentity, ClientFlags},
-    attached_client_matches_target, command_output_from_lines,
+    attached_client_matches_target, command_output_from_lines, control_client_target_pid,
     control_support::{current_control_queue_identity, ManagedClient},
     format_client_uid, format_client_user, format_requester_uid, normalize_target_client,
     session_selection_prefers_live_process, sort_list_clients, validate_expected_attach_identity,
@@ -217,7 +217,7 @@ impl RequestHandler {
             return Ok(client);
         }
 
-        let control_client = if let Ok(pid) = target_client.parse::<u32>() {
+        let control_client = if let Some(pid) = control_client_target_pid(target_client) {
             let active_control = self.active_control.lock().await;
             active_control
                 .by_pid
@@ -271,7 +271,7 @@ impl RequestHandler {
         }
 
         let active_control = self.active_control.lock().await;
-        if let Ok(pid) = target_client.parse::<u32>() {
+        if let Some(pid) = control_client_target_pid(target_client) {
             if active_control.by_pid.contains_key(&pid) {
                 return Err(RmuxError::Server(format!(
                     "{command_name} requires an attached client"
@@ -325,9 +325,7 @@ impl RequestHandler {
         }
 
         let active_control = self.active_control.lock().await;
-        // list-clients exposes a control client under its decimal PID, which
-        // is also the canonical typed target accepted by the shared resolver.
-        Ok(target_client.parse::<u32>().ok().and_then(|pid| {
+        Ok(control_client_target_pid(target_client).and_then(|pid| {
             active_control.by_pid.get(&pid).and_then(|active| {
                 (!active.closing.load(Ordering::SeqCst)).then_some(ManagedClient::Control(
                     super::control_support::ControlClientIdentity::new(pid, active.id),

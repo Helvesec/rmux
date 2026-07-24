@@ -147,7 +147,7 @@ impl RequestHandler {
                 .by_pid
                 .iter()
                 .map(|(&pid, active)| ListClientSnapshot {
-                    name: pid.to_string(),
+                    name: control_client_name(pid),
                     pid,
                     tty: String::new(),
                     control: true,
@@ -485,6 +485,18 @@ pub(in crate::handler) fn attached_client_name(attach_pid: u32) -> String {
     attached_client_tty_path(attach_pid)
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| attach_pid.to_string())
+}
+
+pub(in crate::handler) fn control_client_name(control_pid: u32) -> String {
+    format!("client-{control_pid}")
+}
+
+pub(in crate::handler) fn control_client_target_pid(target: &str) -> Option<u32> {
+    target
+        .strip_prefix("client-")
+        .unwrap_or(target)
+        .parse()
+        .ok()
 }
 
 pub(in crate::handler) fn session_selection_prefers_live_process(pid: u32) -> bool {

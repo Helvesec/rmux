@@ -139,11 +139,11 @@ pub(in crate::handler) use client_environment_support::{
 };
 pub(in crate::handler) use client_runtime_support::{
     attached_client_matches_target, attached_client_name, client_environment_snapshot,
-    command_output_from_lines, effective_client_terminal_context, format_client_uid,
-    format_client_user, format_requester_uid, normalize_target_client, parse_client_flags,
-    parse_session_sort_order, session_selection_prefers_live_process, sort_list_clients,
-    switch_target_selector_count, update_environment_from_client, ListClientSnapshot,
-    SessionSortOrder, LIST_CLIENTS_TEMPLATE,
+    command_output_from_lines, control_client_target_pid, effective_client_terminal_context,
+    format_client_uid, format_client_user, format_requester_uid, normalize_target_client,
+    parse_client_flags, parse_session_sort_order, session_selection_prefers_live_process,
+    sort_list_clients, switch_target_selector_count, update_environment_from_client,
+    ListClientSnapshot, SessionSortOrder, LIST_CLIENTS_TEMPLATE,
 };
 use client_runtime_support::{
     current_process_environment_display_snapshot, current_process_environment_snapshot,
