@@ -603,11 +603,29 @@ impl PaneOutputSender {
         self.push_for_generation(generation, bytes, passthroughs)
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_for_generation<R>(
         &self,
         generation: Option<u64>,
         bytes: Vec<u8>,
         build_side_effects: impl FnOnce(&[u8]) -> (R, Vec<TerminalPassthrough>),
+    ) -> Option<(u64, R)> {
+        self.publish_for_generation_with_invalidation(generation, bytes, |bytes| {
+            let (result, passthroughs) = build_side_effects(bytes);
+            (result, passthroughs, None)
+        })
+    }
+
+    /// Publishes exact legacy bytes and, when requested, advances recoverable
+    /// observers past them to an authoritative state under the same lock.
+    pub(crate) fn publish_for_generation_with_invalidation<R>(
+        &self,
+        generation: Option<u64>,
+        bytes: Vec<u8>,
+        build_side_effects: impl FnOnce(
+            &[u8],
+        )
+            -> (R, Vec<TerminalPassthrough>, Option<PaneInvalidationReason>),
     ) -> Option<(u64, R)> {
         let fast_receiver_count = self.inner.fast_receiver_count.load(Ordering::Acquire);
         let (sequence, result, fast_bytes, fast_epoch) = {
@@ -619,11 +637,18 @@ impl PaneOutputSender {
             if !generation_matches(self.current_generation(), generation) {
                 return None;
             }
-            let (result, passthroughs) = build_side_effects(&bytes);
+            let (result, passthroughs, invalidation) = build_side_effects(&bytes);
             let retain_passthroughs = self.inner.receiver_count.load(Ordering::Acquire) > 0;
             let bytes: Arc<[u8]> = bytes.into();
-            let fast_bytes = fast_output_candidate(fast_receiver_count, &bytes, &passthroughs);
+            let fast_bytes = invalidation
+                .is_none()
+                .then(|| fast_output_candidate(fast_receiver_count, &bytes, &passthroughs))
+                .flatten();
             let sequence = state.push(bytes, passthroughs, true, retain_passthroughs);
+            if let Some(reason) = invalidation {
+                state.invalidate(reason);
+                self.inner.fast_epoch.fetch_add(1, Ordering::AcqRel);
+            }
             let fast_epoch = self.inner.fast_epoch.load(Ordering::Acquire);
             (sequence, result, fast_bytes, fast_epoch)
         };

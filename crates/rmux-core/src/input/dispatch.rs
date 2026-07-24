@@ -270,6 +270,12 @@ pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
                 return; // No prior character to repeat, or invalid param.
             }
             if let Some(ch) = parser.last_char {
+                // INPUT_LAST is parser-only state: no ANSI keyframe can seed
+                // it in another emulator. A character printed earlier in this
+                // same feed is replayable from the same raw event; a REP that
+                // reaches across feed boundaries requires an authoritative
+                // post-dispatch recovery rebase.
+                parser.note_effective_rep();
                 let set = if parser.cell.set == 0 {
                     parser.cell.g0set
                 } else {

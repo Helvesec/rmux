@@ -167,6 +167,75 @@ async fn raw_stream_emits_bytes_and_rebases_in_band_after_resize() {
 }
 
 #[tokio::test]
+async fn raw_stream_rebases_after_rep_instead_of_replaying_parser_only_state() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"X\x1b[".to_vec());
+    let prefix = cursor(&handler, subscribed.subscription_id).await;
+    assert!(matches!(
+        prefix.as_slice(),
+        [PaneStreamEvent::RawBytes(bytes)] if bytes.bytes == b"X\x1b["
+    ));
+
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"2b".to_vec());
+    let events = cursor(&handler, subscribed.subscription_id).await;
+    let rebase = events
+        .iter()
+        .find_map(raw_rebase)
+        .expect("effective fragmented REP must rebase");
+    assert_eq!(rebase.epoch, 2);
+    assert_eq!(rebase.reason, PaneRawRebaseReason::TranscriptMutation);
+    assert!(
+        events.iter().all(
+            |event| !matches!(event, PaneStreamEvent::RawBytes(bytes) if bytes.bytes == b"2b")
+        ),
+        "the final REP fragment must not be replayed after a keyframe"
+    );
+
+    let mut recovered = rmux_core::TerminalScreen::new(
+        TerminalSize {
+            cols: rebase.cols,
+            rows: rebase.rows,
+        },
+        100,
+    );
+    recovered.feed(&rebase.keyframe);
+    assert_eq!(
+        recovered.screen().capture_transcript(
+            rmux_core::ScreenCaptureRange::default(),
+            rmux_core::GridRenderOptions::default()
+        ),
+        b"XXX\n\n\n\n"
+    );
+
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"Z".to_vec());
+    assert!(matches!(
+        cursor(&handler, subscribed.subscription_id).await.as_slice(),
+        [PaneStreamEvent::RawBytes(bytes)]
+            if bytes.epoch == 2
+                && bytes.sequence == rebase.next_sequence
+                && bytes.bytes == b"Z"
+    ));
+}
+
+#[tokio::test]
+async fn raw_stream_keeps_same_event_rep_as_exact_raw_bytes() {
+    let handler = RequestHandler::new();
+    let (target, output, transcript) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let event = b"Q\x1b[2b".to_vec();
+
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, event.clone());
+
+    assert!(matches!(
+        cursor(&handler, subscribed.subscription_id).await.as_slice(),
+        [PaneStreamEvent::RawBytes(bytes)] if bytes.bytes == event
+    ));
+}
+
+#[tokio::test]
 async fn raw_stream_reports_the_clamped_batch_boundary() {
     let handler = RequestHandler::new();
     let (target, output, _) = test_pane(&handler).await;

@@ -292,6 +292,61 @@ async fn in_band_rebase_and_typed_end_are_delivered_before_stream_closes() {
 }
 
 #[tokio::test]
+async fn transcript_mutation_rebase_replaces_a_non_replayable_rep_event() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        serve_subscribe(&mut server).await;
+        let _ = read_request(&mut server).await;
+        let mut post_rep = rebase(2, ProtoReason::TranscriptMutation);
+        post_rep.next_sequence = 7;
+        post_rep.keyframe = b"\x1b[2J\x1b[HXXX".to_vec();
+        write_response(
+            &mut server,
+            Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+                subscription_id: subscription_id(),
+                events: vec![PaneStreamEvent::RawRebase(Box::new(post_rep))],
+                limited: false,
+            })),
+        )
+        .await;
+        let _ = read_request(&mut server).await;
+        write_response(
+            &mut server,
+            Response::PaneStreamCursor(Box::new(PaneStreamCursorResponse {
+                subscription_id: subscription_id(),
+                events: vec![PaneStreamEvent::RawBytes(PaneRawBytes {
+                    epoch: 2,
+                    sequence: 7,
+                    bytes: b"tail".to_vec(),
+                })],
+                limited: false,
+            })),
+        )
+        .await;
+        let _ = read_request(&mut server).await;
+    });
+
+    let mut stream = open_stream(client).await;
+    let _ = stream.next().await.expect("initial");
+    assert!(matches!(
+        stream.next().await.expect("post-REP rebase"),
+        Some(PaneRecoveryEvent::Rebase(rebase))
+            if rebase.reason == super::PaneRecoveryRebaseReason::TranscriptMutation
+                && rebase.next_sequence == 7
+    ));
+    assert_eq!(
+        stream.next().await.expect("post-rebase tail"),
+        Some(PaneRecoveryEvent::Bytes {
+            epoch: 2,
+            sequence: 7,
+            bytes: b"tail".to_vec(),
+        })
+    );
+    drop(stream);
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
 async fn events_after_typed_end_are_rejected_as_protocol_drift() {
     let (client, mut server) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {

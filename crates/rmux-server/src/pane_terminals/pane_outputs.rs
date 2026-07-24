@@ -230,12 +230,15 @@ impl HandlerState {
                 ))
             })?;
         Ok(output
-            .publish_for_generation(generation, bytes, |bytes| {
-                transcript
+            .publish_for_generation_with_invalidation(generation, bytes, |bytes| {
+                let append = transcript
                     .lock()
                     .expect("pane transcript mutex must not be poisoned")
-                    .append_bytes(bytes);
-                ((), Vec::new())
+                    .append_bytes_with_effects(bytes);
+                let invalidation = append
+                    .recovery_rebase_required
+                    .then_some(crate::pane_io::PaneInvalidationReason::TranscriptMutation);
+                ((), Vec::new(), invalidation)
             })
             .is_some())
     }

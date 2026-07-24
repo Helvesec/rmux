@@ -421,6 +421,126 @@ async fn web_session_share_drains_initial_attach_output() {
 }
 
 #[tokio::test]
+async fn web_pane_stream_resnapshots_instead_of_forwarding_cross_boundary_rep() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-pane-rep").await;
+    let target = PaneTarget::new(session_name.clone(), 0);
+    let (output, transcript) = {
+        let state = handler.state.lock().await;
+        (
+            state
+                .pane_output_for_target(&session_name, 0, 0)
+                .expect("pane output"),
+            state.transcript_handle(&target).expect("pane transcript"),
+        )
+    };
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"X".to_vec());
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(target.clone().into())),
+    )
+    .await;
+    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let stream = handler
+        .open_web_share(&token, None)
+        .await
+        .expect("pane web share opens");
+    let WebShareStream::Pane(mut pane) = stream else {
+        panic!("expected pane web share stream");
+    };
+
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"\x1b[2b".to_vec());
+
+    assert!(matches!(
+        pane.output.try_recv_observed(),
+        Some(crate::pane_io::PaneObservationItem::Invalidated(invalidation))
+            if invalidation.reason
+                == crate::pane_io::PaneInvalidationReason::TranscriptMutation
+    ));
+    assert!(
+        pane.output.try_recv_observed().is_none(),
+        "the browser must not receive REP without parser INPUT_LAST"
+    );
+    let (snapshot, _) = handler
+        .web_resnapshot(&pane.target)
+        .await
+        .expect("post-REP browser snapshot");
+    let mut recovered = rmux_core::TerminalScreen::new(
+        TerminalSize {
+            cols: snapshot.cols,
+            rows: snapshot.rows,
+        },
+        2_000,
+    );
+    recovered.feed(
+        snapshot
+            .recovery_keyframe
+            .as_deref()
+            .expect("pane resnapshot includes recovery keyframe"),
+    );
+    assert_eq!(
+        recovered.screen().capture_transcript(
+            rmux_core::ScreenCaptureRange::default(),
+            rmux_core::GridRenderOptions::default(),
+        ),
+        transcript.lock().expect("transcript lock").capture_main(
+            rmux_core::ScreenCaptureRange::default(),
+            rmux_core::GridRenderOptions::default(),
+        )
+    );
+}
+
+#[tokio::test]
+async fn web_session_attach_renders_rep_from_authoritative_screen_state() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-session-rep").await;
+    let target = PaneTarget::new(session_name.clone(), 0);
+    let (output, transcript) = {
+        let state = handler.state.lock().await;
+        (
+            state
+                .pane_output_for_target(&session_name, 0, 0)
+                .expect("pane output"),
+            state.transcript_handle(&target).expect("pane transcript"),
+        )
+    };
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"X".to_vec());
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name)),
+    )
+    .await;
+    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let stream = handler
+        .open_web_share(&token, None)
+        .await
+        .expect("session web share opens");
+    let WebShareStream::Session(mut session) = stream else {
+        panic!("expected session web share stream");
+    };
+    let mut reader = session.take_attach_reader();
+    let _ = timeout(Duration::from_secs(2), reader.read_event())
+        .await
+        .expect("initial attach frame")
+        .expect("attach read")
+        .expect("initial data");
+
+    crate::pane_io::publish_pane_bytes_for_test(&transcript, &output, b"\x1b[2b".to_vec());
+    let event = timeout(Duration::from_secs(2), reader.read_event())
+        .await
+        .expect("post-REP attach render")
+        .expect("attach read")
+        .expect("post-REP data");
+    let WebSessionAttachEvent::Data(frame) = event else {
+        panic!("REP changes the rendered session surface");
+    };
+    assert!(
+        !frame.windows(b"\x1b[2b".len()).any(|window| window == b"\x1b[2b"),
+        "session Web clients start from a rendered keyframe, so REP must be rendered from the authoritative screen instead of forwarded raw"
+    );
+}
+
+#[tokio::test]
 async fn web_session_last_exit_drains_before_daemon_shutdown() {
     let handler = RequestHandler::new();
     let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();

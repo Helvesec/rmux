@@ -174,6 +174,8 @@ use persistent_overlay::{
     replacement_persistent_overlay_frame, switch_requires_screen_clear,
     take_pending_persistent_overlay_for_state, update_persistent_overlay_cache,
 };
+#[cfg(test)]
+pub(crate) use reader::publish_pane_bytes_for_test;
 #[cfg(windows)]
 pub(crate) use reader::spawn_pane_exit_watcher;
 pub(crate) use reader::spawn_pane_output_reader;

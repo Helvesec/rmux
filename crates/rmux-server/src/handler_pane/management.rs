@@ -546,12 +546,15 @@ fn inject_split_window_stdin_output(
         target.window_index(),
         target.pane_index(),
     )?;
-    let _ = pane_output.publish_for_generation(None, payload, |bytes| {
-        transcript
+    let _ = pane_output.publish_for_generation_with_invalidation(None, payload, |bytes| {
+        let append = transcript
             .lock()
             .expect("pane transcript mutex must not be poisoned")
-            .append_bytes(bytes);
-        ((), Vec::new())
+            .append_bytes_with_effects(bytes);
+        let invalidation = append
+            .recovery_rebase_required
+            .then_some(crate::pane_io::PaneInvalidationReason::TranscriptMutation);
+        ((), Vec::new(), invalidation)
     });
     Ok(())
 }

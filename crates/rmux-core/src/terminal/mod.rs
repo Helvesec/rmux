@@ -141,6 +141,10 @@ impl TerminalParser {
         self.parser.parse(bytes, &mut self.screen);
     }
 
+    pub(crate) fn take_recovery_rebase_required(&mut self) -> bool {
+        self.parser.take_recovery_rebase_required()
+    }
+
     /// Returns the current parser progress state for diagnostics.
     #[must_use]
     pub(crate) fn parser_state(&self) -> TerminalParserState {

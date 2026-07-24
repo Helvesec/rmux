@@ -71,6 +71,7 @@ pub(crate) struct PaneAppendResult {
     pub(crate) replies: Vec<u8>,
     pub(crate) ground_timer: Option<PaneGroundTimer>,
     pub(crate) alternate_mode_changed: bool,
+    pub(crate) recovery_rebase_required: bool,
 }
 
 pub(crate) struct PaneTranscriptRenderState {
@@ -139,6 +140,7 @@ impl PaneTranscript {
         let title_before = self.terminal.screen().title().to_owned();
         let alternate_before = self.terminal.screen().is_alternate();
         self.terminal.feed(bytes);
+        let recovery_rebase_required = self.terminal.take_recovery_rebase_required();
         let title_after = self.terminal.screen().title().to_owned();
         let title_changed = title_after != title_before;
         let passthroughs = self.terminal.take_terminal_passthrough();
@@ -155,6 +157,7 @@ impl PaneTranscript {
             replies,
             ground_timer,
             alternate_mode_changed: self.terminal.screen().is_alternate() != alternate_before,
+            recovery_rebase_required,
         }
     }
 
@@ -760,6 +763,33 @@ mod tests {
         )
         .expect("capture is utf8");
         assert!(!capture.contains("Gf=100"));
+    }
+
+    #[test]
+    fn append_reports_rep_that_crosses_an_output_boundary() {
+        let mut transcript = transcript(8, 2, 10);
+        assert!(
+            !transcript
+                .append_bytes_with_effects("界".as_bytes())
+                .recovery_rebase_required
+        );
+
+        let result = transcript.append_bytes_with_effects(b"\x1b[2b");
+
+        assert!(result.recovery_rebase_required);
+        assert_eq!(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+            "界界界\n\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn append_keeps_same_boundary_rep_raw_replayable() {
+        let mut transcript = transcript(8, 2, 10);
+
+        let result = transcript.append_bytes_with_effects(b"X\x1b[2b");
+
+        assert!(!result.recovery_rebase_required);
     }
 
     #[test]

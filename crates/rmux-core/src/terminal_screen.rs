@@ -78,6 +78,16 @@ impl TerminalScreen {
         self.parser.feed(bytes);
     }
 
+    /// Returns and clears whether the latest feeds used terminal-parser state
+    /// that an ANSI recovery keyframe cannot reconstruct.
+    ///
+    /// Callers publishing raw continuation bytes must replace that
+    /// continuation with an authoritative post-dispatch keyframe.
+    #[must_use]
+    pub fn take_recovery_rebase_required(&mut self) -> bool {
+        self.parser.take_recovery_rebase_required()
+    }
+
     /// Returns and drains terminal replies generated while parsing PTY output.
     pub fn take_replies(&mut self) -> Vec<u8> {
         self.parser.take_replies()

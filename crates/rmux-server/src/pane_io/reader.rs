@@ -547,7 +547,7 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
         return Vec::new();
     }
     let Some((_sequence, append_result)) =
-        pane_output.publish_for_generation(generation, bytes, |bytes| {
+        pane_output.publish_for_generation_with_invalidation(generation, bytes, |bytes| {
             let mut transcript = transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned");
@@ -581,7 +581,10 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
                     generation,
                 });
             }
-            (append_result, passthroughs)
+            let invalidation = append_result
+                .recovery_rebase_required
+                .then_some(super::PaneInvalidationReason::TranscriptMutation);
+            (append_result, passthroughs, invalidation)
         })
     else {
         return Vec::new();
@@ -606,6 +609,28 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
         );
     }
     replies
+}
+
+#[cfg(test)]
+pub(crate) fn publish_pane_bytes_for_test(
+    transcript: &SharedPaneTranscript,
+    pane_output: &PaneOutputSender,
+    bytes: Vec<u8>,
+) {
+    let session_name =
+        rmux_proto::SessionName::new("pane-output-test").expect("test session name must be valid");
+    let _ = publish_pane_bytes(
+        PanePublishContext {
+            session_name: &session_name,
+            pane_id: PaneId::new(1),
+            transcript,
+            pane_output,
+            generation: None,
+            pane_alert_callback: None,
+            emit_no_bell_alert: false,
+        },
+        bytes,
+    );
 }
 
 fn passthrough_is_clipboard_set(passthrough: &TerminalPassthrough) -> bool {
@@ -1103,6 +1128,57 @@ mod tests {
         );
 
         assert!(callback_observed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn production_publication_invalidates_recovery_at_the_post_rep_boundary() {
+        let transcript = PaneTranscript::shared(2_000, TerminalSize { cols: 8, rows: 2 });
+        let output = pane_output_channel();
+        let mut recovery = output.subscribe();
+        let mut legacy = output.subscribe();
+        let session_name = SessionName::new("rep-recovery").expect("valid session name");
+        let context = || PanePublishContext {
+            session_name: &session_name,
+            pane_id: PaneId::new(1),
+            transcript: &transcript,
+            pane_output: &output,
+            generation: None,
+            pane_alert_callback: None,
+            emit_no_bell_alert: false,
+        };
+
+        let _ = publish_pane_bytes(context(), b"X".to_vec());
+        assert!(matches!(
+            recovery.try_recv_observed(),
+            Some(crate::pane_io::PaneObservationItem::Output(
+                rmux_core::events::OutputCursorItem::Event(event)
+            )) if event.bytes() == b"X"
+        ));
+        let _ = legacy.try_recv().expect("legacy subscriber receives X");
+
+        let _ = publish_pane_bytes(context(), b"\x1b[2b".to_vec());
+
+        let Some(crate::pane_io::PaneObservationItem::Invalidated(invalidation)) =
+            recovery.try_recv_observed()
+        else {
+            panic!("recoverable subscriber must skip REP and rebase");
+        };
+        assert_eq!(
+            invalidation.reason,
+            crate::pane_io::PaneInvalidationReason::TranscriptMutation
+        );
+        assert_eq!(invalidation.boundary.next_output_sequence, 2);
+        assert!(
+            recovery.try_recv_observed().is_none(),
+            "the non-replayable REP event must not follow its invalidation"
+        );
+
+        let rmux_core::events::OutputCursorItem::Event(event) =
+            legacy.try_recv().expect("legacy attach still receives REP")
+        else {
+            panic!("legacy REP must remain an output event");
+        };
+        assert_eq!(event.bytes(), b"\x1b[2b");
     }
 
     #[test]

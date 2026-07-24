@@ -124,6 +124,51 @@ fn rep_does_nothing_without_prior_print() {
 }
 
 #[test]
+fn rep_reports_recovery_rebase_when_it_uses_a_prior_feed_character() {
+    let mut parser = InputParser::new();
+    let mut writer = RecordingWriter::new(80, 24);
+    parser.parse(b"X", &mut writer);
+    assert!(!parser.take_recovery_rebase_required());
+
+    parser.parse(b"\x1b[3b", &mut writer);
+
+    assert!(parser.take_recovery_rebase_required());
+    assert!(!parser.take_recovery_rebase_required());
+}
+
+#[test]
+fn rep_after_a_character_in_the_same_feed_is_self_contained() {
+    let mut parser = InputParser::new();
+    let mut writer = RecordingWriter::new(80, 24);
+
+    parser.parse(b"X\x1b[3b", &mut writer);
+
+    assert!(!parser.take_recovery_rebase_required());
+}
+
+#[test]
+fn fragmented_rep_reports_recovery_only_when_the_final_byte_dispatches() {
+    let mut parser = InputParser::new();
+    let mut writer = RecordingWriter::new(80, 24);
+    parser.parse(b"\xe7\x95\x8c\x1b[", &mut writer);
+    assert!(!parser.take_recovery_rebase_required());
+
+    parser.parse(b"2", &mut writer);
+    assert!(!parser.take_recovery_rebase_required());
+    parser.parse(b"b", &mut writer);
+
+    assert!(parser.take_recovery_rebase_required());
+    assert_eq!(
+        writer
+            .chars
+            .iter()
+            .filter(|&&character| character == '界')
+            .count(),
+        3
+    );
+}
+
+#[test]
 fn c0_clears_input_last_so_rep_fails() {
     let mut parser = InputParser::new();
     let mut writer = RecordingWriter::new(80, 24);

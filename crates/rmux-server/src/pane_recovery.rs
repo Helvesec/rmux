@@ -579,6 +579,12 @@ mod tests {
                     .as_slice(),
                 b"\x1b8X".as_slice(),
             ),
+            (
+                "post-rep-wide-wrap-rebase",
+                TerminalSize { cols: 6, rows: 3 },
+                "a界\u{1b}[1b".as_bytes(),
+                b"ZW".as_slice(),
+            ),
         ];
         let vectors = vectors
             .into_iter()
