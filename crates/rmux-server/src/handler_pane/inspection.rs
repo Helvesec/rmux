@@ -512,7 +512,7 @@ impl RequestHandler {
                 Some(identity) => {
                     self.send_attached_overlay_to_client_identity(
                         identity,
-                        Some(identity.session_id()),
+                        Some(display_session_id),
                         expanded.clone(),
                         duration,
                         input_policy,

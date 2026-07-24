@@ -1,4 +1,5 @@
 use super::*;
+use crate::handler::scripting_support::install_queue_exact_target_capture_pause;
 use crate::pane_io::AttachControl;
 
 #[tokio::test]
@@ -208,6 +209,83 @@ async fn source_file_preserves_target_client_and_show_hooks_flags() {
             expected
         );
     }
+}
+
+#[tokio::test]
+async fn source_file_target_client_follows_the_same_registration_after_switch() {
+    let handler = RequestHandler::new();
+    let before_switch = session_name("source-display-client-before-switch");
+    let after_switch = session_name("source-display-client-after-switch");
+    for name in [before_switch.clone(), after_switch.clone()] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: name,
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let attach_pid = 91_943;
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach(attach_pid, before_switch, control_tx)
+        .await;
+    while control_rx.try_recv().is_ok() {}
+
+    let root = temp_root("target-client-switch");
+    write_config(
+        &root.join("display.conf"),
+        &format!("display-message -c {attach_pid} 'format #{{session_name}}'\n"),
+    );
+    let pause = install_queue_exact_target_capture_pause(&handler, "display-message");
+    let source_handler = handler.clone();
+    let source_root = root.clone();
+    let source = tokio::spawn(async move {
+        source_handler
+            .handle(source_file_request(
+                vec!["display.conf".to_owned()],
+                Some(source_root),
+            ))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), pause.reached.notified())
+        .await
+        .expect("source-file display reaches the post-capture pause");
+
+    let response = handler
+        .dispatch(
+            attach_pid,
+            Request::SwitchClient(rmux_proto::SwitchClientRequest {
+                target: after_switch.clone(),
+            }),
+        )
+        .await
+        .response;
+    assert!(
+        matches!(response, Response::SwitchClient(_)),
+        "{response:?}"
+    );
+    while control_rx.try_recv().is_ok() {}
+    pause.release.notify_one();
+
+    let response = source.await.expect("source-file task joins");
+    assert!(matches!(response, Response::SourceFile(_)), "{response:?}");
+    let frame = std::iter::from_fn(|| control_rx.try_recv().ok())
+        .find_map(|control| match control {
+            AttachControl::Overlay(overlay) => String::from_utf8(overlay.frame).ok(),
+            _ => None,
+        })
+        .expect("target client receives the source-file display overlay");
+    assert!(
+        frame.contains("format source-display-client-after-switch"),
+        "{frame:?}"
+    );
+    fs::remove_dir_all(root).expect("remove target client switch root");
 }
 
 #[tokio::test]
