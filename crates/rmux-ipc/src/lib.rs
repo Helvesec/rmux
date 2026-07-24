@@ -12,6 +12,8 @@ mod listener;
 mod managed_socket_unix;
 mod stream;
 #[cfg(windows)]
+mod windows_endpoint_candidate;
+#[cfg(windows)]
 mod windows_endpoint_legacy;
 #[cfg(windows)]
 mod windows_endpoint_record;

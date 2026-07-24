@@ -24,6 +24,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::endpoint::{current_integrity_label, pipe_component, LocalEndpoint, PIPE_PREFIX};
+use crate::windows_endpoint_candidate;
 use crate::windows_endpoint_legacy;
 use crate::windows_endpoint_record::{
     is_lower_hex, parse as parse_record, serialize as serialize_record, EndpointPhase,
@@ -74,6 +75,7 @@ pub(crate) fn endpoint_for_label(
 ) -> io::Result<LocalEndpoint> {
     let key = endpoint_key(label, sid_component, integrity);
     windows_endpoint_legacy::remember_component(&key, sid_component, integrity, label);
+    let mut rejected_nonce = None;
     if let Some(state) = StateStore::open_existing(&key, integrity)? {
         let _lock = state.lock()?;
         if let Some(record) = state.read_record()? {
@@ -88,10 +90,11 @@ pub(crate) fn endpoint_for_label(
                     &record.nonce,
                 )));
             }
+            rejected_nonce = Some(record.nonce);
         }
     }
 
-    let nonce = random_nonce()?;
+    let nonce = windows_endpoint_candidate::for_key(&key, rejected_nonce.as_deref())?;
     Ok(LocalEndpoint::from_path(pipe_path(
         sid_component,
         integrity,
@@ -137,12 +140,7 @@ pub fn reserve_managed_endpoint_start(
             legacy_endpoint,
         ));
     };
-    let decision = decide_reservation(
-        &record,
-        &components.nonce,
-        requester,
-        process_is_live(record.process),
-    );
+    let decision = decide_reservation(&record, &components.nonce, process_is_live(record.process));
 
     if decision == ReservationDecision::JoinCurrent {
         let endpoint = managed_endpoint(&components, &record.nonce);

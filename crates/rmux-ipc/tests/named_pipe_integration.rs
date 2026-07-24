@@ -361,6 +361,10 @@ fn concurrent_label_resolution_defers_ownership_until_reservation() -> std::io::
         .into_iter()
         .map(|thread| thread.join().expect("resolver thread"))
         .collect::<std::io::Result<Vec<_>>>()?;
+    assert!(
+        paths.iter().all(|candidate| candidate == &paths[0]),
+        "pure resolution should reuse one process-local candidate"
+    );
     let winner = reserve_managed_endpoint_start(&paths[0])?;
     assert!(winner.is_owner());
     for candidate in paths.iter().skip(1) {
@@ -404,8 +408,8 @@ async fn resolve_only_process_cannot_publish_a_starting_owner() -> std::io::Resu
     Ok(())
 }
 
-#[test]
-fn live_legacy_namespace_blocks_v6_reservation_before_startup() -> std::io::Result<()> {
+#[tokio::test]
+async fn live_legacy_namespace_blocks_v6_reservation_before_startup() -> std::io::Result<()> {
     let label = format!("legacy-upgrade-{}", std::process::id());
     let candidate = endpoint_for_label(&label)?;
     let legacy_path = legacy_path_for(&label, &candidate);

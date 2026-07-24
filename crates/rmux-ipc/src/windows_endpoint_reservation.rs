@@ -93,7 +93,6 @@ impl Drop for ManagedStartClaim {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReservationDecision {
-    OwnCurrent,
     JoinCurrent,
     Rotate,
 }
@@ -101,7 +100,6 @@ pub(crate) enum ReservationDecision {
 pub(crate) fn decide(
     record: &EndpointRecord,
     requested_nonce: &str,
-    requester: ProcessStamp,
     recorded_process_is_live: bool,
 ) -> ReservationDecision {
     if record.nonce != requested_nonce {
@@ -113,7 +111,6 @@ pub(crate) fn decide(
     }
 
     match record.phase {
-        EndpointPhase::Starting if record.process == requester => ReservationDecision::OwnCurrent,
         EndpointPhase::Starting | EndpointPhase::Running if recorded_process_is_live => {
             ReservationDecision::JoinCurrent
         }
@@ -145,16 +142,15 @@ mod tests {
     }
 
     #[test]
-    fn resolver_owned_starting_generation_is_claimed_without_rotation() {
+    fn repeated_same_process_reservation_joins_the_current_generation() {
         let requester = stamp(10);
         assert_eq!(
             decide(
                 &record(EndpointPhase::Starting, "old", requester),
                 "old",
-                requester,
                 true,
             ),
-            ReservationDecision::OwnCurrent
+            ReservationDecision::JoinCurrent
         );
     }
 
@@ -164,7 +160,6 @@ mod tests {
             decide(
                 &record(EndpointPhase::Running, "exposed", stamp(10)),
                 "exposed",
-                stamp(20),
                 false,
             ),
             ReservationDecision::Rotate
@@ -174,15 +169,14 @@ mod tests {
     #[test]
     fn concurrent_restart_joins_the_generation_reserved_by_the_winner() {
         let winner = stamp(10);
-        let loser = stamp(20);
         let reserved = record(EndpointPhase::Starting, "replacement", winner);
 
         assert_eq!(
-            decide(&reserved, "stopped-old", loser, true),
+            decide(&reserved, "stopped-old", true),
             ReservationDecision::JoinCurrent
         );
         assert_eq!(
-            decide(&reserved, "replacement", loser, true),
+            decide(&reserved, "replacement", true),
             ReservationDecision::JoinCurrent
         );
     }
@@ -193,7 +187,6 @@ mod tests {
             decide(
                 &record(EndpointPhase::Starting, "abandoned", stamp(10)),
                 "older",
-                stamp(20),
                 false,
             ),
             ReservationDecision::Rotate
