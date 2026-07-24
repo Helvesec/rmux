@@ -57,6 +57,28 @@ async fn pause_after_web_share_rollback_is_armed(handler: &RequestHandler) {
 }
 
 impl RequestHandler {
+    pub(crate) async fn handle_revoked_cleanup_request(
+        &self,
+        connection_id: u64,
+        request: Request,
+    ) -> Option<Response> {
+        match request {
+            Request::UnsubscribePaneOutput(request) => Some(
+                self.handle_unsubscribe_pane_output(connection_id, request)
+                    .await,
+            ),
+            Request::UnsubscribePaneStream(request) => Some(
+                self.handle_unsubscribe_pane_stream(connection_id, request)
+                    .await,
+            ),
+            Request::UnsubscribePaneState(request) => Some(
+                self.handle_unsubscribe_pane_state(connection_id, request)
+                    .await,
+            ),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn handle(&self, request: Request) -> Response {
         let mut lifecycle_events = self.subscribe_lifecycle_events();

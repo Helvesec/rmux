@@ -295,11 +295,16 @@ async fn serve_connection(
                     let response = match request {
                         Request::PaneStreamCursor(request) => handler
                             .handle_revoked_pane_stream_cursor(connection_id, request),
-                        _ => Response::Error(ErrorResponse {
-                            error: rmux_proto::RmuxError::Server(
-                                "access not allowed".to_owned(),
-                            ),
-                        }),
+                        request => handler
+                            .handle_revoked_cleanup_request(connection_id, request)
+                            .await
+                            .unwrap_or_else(|| {
+                                Response::Error(ErrorResponse {
+                                    error: rmux_proto::RmuxError::Server(
+                                        "access not allowed".to_owned(),
+                                    ),
+                                })
+                            }),
                     };
                     conn.write_response(&response).await?;
                     continue;
@@ -977,10 +982,11 @@ mod tests {
         CancelSdkWaitResponse, ClientTerminalContext, ControlMode, ControlModeRequest,
         CreateSessionLeaseRequest, DaemonStatusRequest, ErrorResponse, HandshakeRequest,
         HasSessionRequest, ListSessionsRequest, NewSessionRequest, OptionName,
-        PaneOutputSubscriptionStart, PaneTarget, RenameSessionRequest, RmuxError, RunShellRequest,
-        ScopeSelector, SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId,
-        SdkWaitOutcome, SdkWaitOwnerId, SessionName, SetOptionMode, SetOptionRequest,
-        ShutdownIfIdleRequest, ShutdownIfIdleResponse, SourceFileRequest, TerminalSize,
+        PaneOutputSubscriptionStart, PaneStreamMode, PaneTarget, PaneTargetRef,
+        RenameSessionRequest, RmuxError, RunShellRequest, ScopeSelector, SdkWaitForOutputRequest,
+        SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SessionName,
+        SetOptionMode, SetOptionRequest, ShutdownIfIdleRequest, ShutdownIfIdleResponse,
+        SourceFileRequest, SubscribePaneStreamRequest, TerminalSize, UnsubscribePaneStreamRequest,
         WaitForMode, WaitForRequest, WaitForResponse, INTERNAL_LIST_WINDOWS_ALL_EXECUTION_PATH,
         RMUX_WIRE_VERSION,
     };
@@ -1422,6 +1428,68 @@ mod tests {
             })
         );
 
+        drop(client);
+        connection_task.await.expect("connection task")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoked_connection_can_release_its_owned_pane_stream() -> io::Result<()> {
+        let peer_uid = rmux_os::identity::real_user_id().saturating_add(11_000);
+        let peer = PeerIdentity {
+            pid: std::process::id(),
+            uid: peer_uid,
+            user: rmux_os::identity::UserIdentity::Uid(peer_uid),
+        };
+        let handler = Arc::new(RequestHandler::new());
+        let session = SessionName::new("revoked-stream-cleanup").expect("valid session");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        handler
+            .set_test_access_mode_for_uid(peer_uid, AccessMode::ReadWrite)
+            .expect("test peer starts read-write");
+        let (mut client, _shutdown_tx, connection_task) =
+            spawn_test_connection_with_peer(&handler, peer)?;
+
+        write_test_request(
+            &mut client,
+            Request::SubscribePaneStream(SubscribePaneStreamRequest {
+                target: PaneTargetRef::slot(PaneTarget::new(session, 0)),
+                mode: PaneStreamMode::Raw,
+                include_snapshot: false,
+            }),
+        )
+        .await?;
+        let Response::SubscribePaneStream(subscribed) = read_test_response(&mut client).await?
+        else {
+            panic!("pane stream subscription must succeed before access revocation");
+        };
+        let subscription_id = subscribed.subscription_id;
+
+        handler
+            .remove_test_access_for_uid(peer_uid)
+            .expect("test peer access can be revoked");
+        write_test_request(
+            &mut client,
+            Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest { subscription_id }),
+        )
+        .await?;
+        assert_eq!(
+            read_test_response(&mut client).await?,
+            Response::UnsubscribePaneStream(rmux_proto::UnsubscribePaneStreamResponse {
+                subscription_id,
+                removed: true,
+            })
+        );
         drop(client);
         connection_task.await.expect("connection task")?;
         Ok(())
