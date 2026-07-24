@@ -397,14 +397,14 @@ fn verifier_requires_exact_allowlisted_ssh_signature_and_identity() {
     verify_args[run_index + 1] = original;
 
     let lightweight = run(Command::new("git")
-        .args(["tag", "v0.9.2", &fixture.source_sha])
+        .args(["tag", "v0.10.0", &fixture.source_sha])
         .current_dir(&fixture.repository));
     assert!(lightweight.status.success());
     let ref_index = verify_args
         .iter()
         .position(|value| value == "--release-ref")
         .expect("release ref argument");
-    verify_args[ref_index + 1] = "v0.9.2".to_owned();
+    verify_args[ref_index + 1] = "v0.10.0".to_owned();
     let not_annotated = run(Command::new(&verifier).args(&verify_args));
     assert!(!not_annotated.status.success());
     assert!(stderr(&not_annotated).contains("annotated tag object"));

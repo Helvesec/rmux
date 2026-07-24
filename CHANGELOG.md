@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.9.2
+## 0.10.0
 
 ### SDK
 
@@ -23,10 +23,13 @@
 
 ### Protocol
 
-- Move detached RPC from wire version 5 to wire version 6 for the additive pane
-  stream requests, responses, lifecycle events, and capabilities. An
-  already-running wire-v5 daemon must be restarted before a 0.9.2 client can
-  connect.
+- Begin the 0.10 release line by moving detached RPC from wire version 5 to wire
+  version 6 for the pane stream requests, responses, lifecycle events, and
+  capabilities. An already-running wire-v5 daemon must be restarted before a
+  0.10.0 client can connect.
+- Make the public `Request` and `Response` envelopes non-exhaustive. Downstream
+  matches now require a fallback arm, so future capability-gated additions
+  cannot silently become source-breaking patch updates.
 
 ### Reliability and performance
 

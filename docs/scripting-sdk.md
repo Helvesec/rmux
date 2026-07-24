@@ -1,6 +1,6 @@
 # RMUX SDK
 
-RMUX 0.9.2 ships a daemon-backed Rust SDK for terminal automation. The SDK talks
+RMUX 0.10.0 ships a daemon-backed Rust SDK for terminal automation. The SDK talks
 to the local RMUX daemon through the typed IPC contract; it is not a CLI parser
 or a tmux control-mode wrapper.
 
@@ -13,7 +13,7 @@ start browser shares.
 
 ```toml
 [dependencies]
-rmux-sdk = "0.9.2"
+rmux-sdk = "0.10.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
