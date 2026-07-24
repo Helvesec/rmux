@@ -97,7 +97,7 @@ jobs:
             --expected-workflow-id "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
             --expected-workflow-path .github/workflows/release-receipt.yml \
             --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
-            --max-attempts 1 > "$root/receipt-artifact.json"
+            --allow-running-current-run --max-attempts 1 > "$root/receipt-artifact.json"
           python3 scripts/release/actions-artifact.py verify \
             --repository "$GITHUB_REPOSITORY" --run-id "$RMUX_RECEIPT_RUN_ID" \
             --artifact-id "$RMUX_RECEIPT_ENVELOPE_ARTIFACT_ID" \
@@ -107,7 +107,7 @@ jobs:
             --expected-workflow-id "$RMUX_RECEIPT_RUN_WORKFLOW_ID" \
             --expected-workflow-path .github/workflows/release-receipt.yml \
             --expected-event workflow_dispatch --expected-head-branch "$RMUX_RELEASE_REF" \
-            --max-attempts 1 > "$root/envelope-artifact.json"
+            --allow-running-current-run --max-attempts 1 > "$root/envelope-artifact.json"
 
       - name: Download only the exact receipt predicate bundle ID
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
