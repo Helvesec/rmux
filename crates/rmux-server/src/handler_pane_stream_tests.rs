@@ -1005,19 +1005,46 @@ async fn cancelled_surface_refresh_is_retried_after_a_pane_rekey() {
 }
 
 #[tokio::test]
-async fn pane_removal_finishes_stream_with_typed_end() {
+async fn pane_removal_drains_buffered_stream_events_before_typed_end() {
     let handler = RequestHandler::new();
-    let (target, _, _) = test_pane(&handler).await;
-    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let (target, output, transcript) = test_pane(&handler).await;
+    let raw = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let surface = subscribe(&handler, &target, PaneStreamMode::Surface).await;
     let key = handler
-        .pane_output_subscription_key_for_test(subscribed.subscription_id)
+        .pane_output_subscription_key_for_test(raw.subscription_id)
         .expect("subscription key");
 
-    handler.cleanup_pane_output_subscriptions(&[key]).await;
-    assert_eq!(
-        cursor(&handler, subscribed.subscription_id).await,
-        vec![PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved)]
-    );
+    transcript
+        .lock()
+        .expect("transcript lock")
+        .append_bytes(b"killed-tail");
+    output.send(b"killed-tail".to_vec());
+
+    handler
+        .drain_removed_pane_output_subscriptions(&[key])
+        .await;
+    let raw_events = cursor_until_unlimited(&handler, raw.subscription_id, 1).await;
+    assert!(matches!(
+        raw_events.as_slice(),
+        [
+            PaneStreamEvent::RawBytes(bytes),
+            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+        ] if bytes.bytes == b"killed-tail"
+    ));
+    let surface_events = cursor_until_unlimited(&handler, surface.subscription_id, 1).await;
+    assert!(matches!(
+        surface_events.as_slice(),
+        [
+            PaneStreamEvent::SurfacePatch(frame),
+            PaneStreamEvent::End(PaneStreamEndReason::PaneRemoved),
+        ] if frame
+            .snapshot
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>()
+            .contains("killed-tail")
+    ));
 }
 
 #[tokio::test]

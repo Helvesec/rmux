@@ -291,18 +291,13 @@ impl RequestHandler {
         let _ = self.request_shutdown_if_pending();
     }
 
-    pub(crate) async fn cleanup_pane_output_subscriptions(
+    pub(crate) async fn drain_removed_pane_output_subscriptions(
         &self,
         panes: &[PaneOutputSubscriptionKey],
     ) {
-        {
-            let mut subscriptions = self
-                .subscriptions
-                .lock()
-                .expect("subscription registry mutex must not be poisoned");
-            for pane in panes {
-                let _ = subscriptions.remove_pane(pane);
-            }
+        for pane in panes {
+            self.drain_exited_pane_output_subscriptions(pane.clone(), None)
+                .await;
         }
         let _ = self.request_shutdown_if_pending();
     }

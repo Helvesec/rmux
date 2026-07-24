@@ -387,7 +387,7 @@ impl RequestHandler {
             }
         }
         if matches!(response, Response::KillPane(_)) {
-            self.cleanup_pane_output_subscriptions(&removed_subscription_keys)
+            self.drain_removed_pane_output_subscriptions(&removed_subscription_keys)
                 .await;
             let destroyed_names = destroyed_sessions
                 .iter()
