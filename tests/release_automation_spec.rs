@@ -1398,6 +1398,8 @@ fn release_publication_waits_for_native_and_package_validations() {
         assert!(retention_step.contains(required_architecture));
     }
     let repository_step = &prepare[repository_generation..];
+    assert!(repository_step
+        .contains("--previous-repository-dir target/package-repository-history/debian"));
     assert_eq!(
         repository_step
             .matches("--input-dir target/package-repository-inputs")

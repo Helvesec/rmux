@@ -940,6 +940,7 @@ jobs:
           scripts/generate-apt-repository.sh \
             --input-dir target/package-repository-inputs \
             --output-dir target/package-repositories/debian \
+            --previous-repository-dir target/package-repository-history/debian \
             --suite stable \
             --component main \
             --architecture amd64 \

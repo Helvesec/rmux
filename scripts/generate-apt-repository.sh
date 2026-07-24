@@ -10,6 +10,8 @@ Generate a static APT repository for RMUX Debian/Ubuntu packages.
 Options:
   --input-dir <dir>          Directory containing rmux_<version>_<arch>.deb
   --output-dir <dir>         Repository output directory
+  --previous-repository-dir <dir>
+                             Previously authenticated APT repository root
   --suite <name>             APT suite/codename (default: stable)
   --component <name>         APT component (default: main)
   --architecture <arch>      Debian architecture; repeat for multiple arches (default: amd64)
@@ -53,8 +55,102 @@ release_hash_block() {
   done
 }
 
+release_sha256_entry() {
+  local release relative
+  release="$1"
+  relative="$2"
+  awk -v target="$relative" '
+    BEGIN { in_sha256 = 0; found = 0; malformed = 0 }
+    $0 == "SHA256:" { in_sha256 = 1; next }
+    in_sha256 && $0 !~ /^ / { in_sha256 = 0 }
+    in_sha256 && NF {
+      if (NF != 3) {
+        malformed = 1
+        next
+      }
+      if ($3 == target) {
+        if (found) {
+          malformed = 1
+        } else {
+          digest = $1
+          size = $2
+          found = 1
+        }
+      }
+    }
+    END {
+      if (malformed || found != 1) {
+        exit 1
+      }
+      print digest, size
+    }
+  ' "$release"
+}
+
+verify_index_file() {
+  local file expected_hash expected_size label allowed_root resolved actual_size actual_hash
+  file="$1"
+  expected_hash="$2"
+  expected_size="$3"
+  label="$4"
+  allowed_root="$5"
+  [ -f "$file" ] && [ ! -L "$file" ] ||
+    die "APT $label is missing or unsafe"
+  resolved="$(cd "$(dirname "$file")" && pwd -P)/$(basename "$file")"
+  case "$resolved" in
+    "$allowed_root"/*) ;;
+    *) die "APT $label escaped its repository" ;;
+  esac
+  actual_size="$(wc -c < "$file" | tr -d ' ')"
+  actual_hash="$(hash_file sha256 "$file")"
+  [ "$actual_size" = "$expected_size" ] && [ "$actual_hash" = "$expected_hash" ] ||
+    die "APT $label does not match its SHA-256 name"
+}
+
+retain_previous_by_hash() {
+  local release release_resolved architecture name relative entry digest size canonical by_hash destination
+  release="$previous_repository_dir/dists/$suite/Release"
+  [ -f "$release" ] && [ ! -L "$release" ] ||
+    die "authenticated previous APT Release is missing or unsafe"
+  release_resolved="$(cd "$(dirname "$release")" && pwd -P)/$(basename "$release")"
+  case "$release_resolved" in
+    "$previous_repository_dir"/*) ;;
+    *) die "authenticated previous APT Release escaped its repository" ;;
+  esac
+  for architecture in "${architectures[@]}"; do
+    for name in Packages Packages.gz; do
+      relative="$component/binary-$architecture/$name"
+      entry="$(release_sha256_entry "$release" "$relative")" ||
+        die "authenticated previous APT Release lacks one SHA-256 entry for $relative"
+      read -r digest size <<< "$entry"
+      [ "${#digest}" -eq 64 ] || die "invalid previous APT SHA-256 for $relative"
+      case "$digest" in *[!0-9a-f]*) die "invalid previous APT SHA-256 for $relative" ;; esac
+      case "$size" in *[!0-9]*|"") die "invalid previous APT size for $relative" ;; esac
+
+      canonical="$previous_repository_dir/dists/$suite/$relative"
+      by_hash="$previous_repository_dir/dists/$suite/$component/binary-$architecture/by-hash/SHA256/$digest"
+      verify_index_file \
+        "$canonical" "$digest" "$size" "authenticated previous index $relative" \
+        "$previous_repository_dir"
+      verify_index_file \
+        "$by_hash" "$digest" "$size" "authenticated previous by-hash index $relative" \
+        "$previous_repository_dir"
+
+      destination="$output_dir/dists/$suite/$component/binary-$architecture/by-hash/SHA256/$digest"
+      if [ -e "$destination" ]; then
+        verify_index_file \
+          "$destination" "$digest" "$size" "retained by-hash index $relative" \
+          "$output_dir"
+      else
+        cp "$by_hash" "$destination"
+      fi
+    done
+  done
+}
+
 input_dir=""
 output_dir=""
+previous_repository_dir=""
 suite="stable"
 component="main"
 architectures=()
@@ -72,6 +168,11 @@ while [ "$#" -gt 0 ]; do
     --output-dir)
       [ "$#" -ge 2 ] || die "--output-dir requires a value"
       output_dir="$2"
+      shift 2
+      ;;
+    --previous-repository-dir)
+      [ "$#" -ge 2 ] || die "--previous-repository-dir requires a value"
+      previous_repository_dir="$2"
       shift 2
       ;;
     --suite)
@@ -134,6 +235,21 @@ need sha256sum
 
 input_dir="$(cd "$input_dir" && pwd)"
 output_dir="$(mkdir -p "$output_dir" && cd "$output_dir" && pwd)"
+if [ -n "$previous_repository_dir" ]; then
+  [ -d "$previous_repository_dir" ] ||
+    die "previous repository directory not found: $previous_repository_dir"
+  previous_repository_dir="$(cd "$previous_repository_dir" && pwd -P)"
+  case "$previous_repository_dir" in
+    "$output_dir"|"$output_dir"/*)
+      die "--previous-repository-dir and --output-dir cannot overlap"
+      ;;
+  esac
+  case "$output_dir" in
+    "$previous_repository_dir"|"$previous_repository_dir"/*)
+      die "--previous-repository-dir and --output-dir cannot overlap"
+      ;;
+  esac
+fi
 pool_dir="$output_dir/pool/$component/r/rmux"
 rm -rf "$output_dir/dists/$suite" "$pool_dir"
 mkdir -p "$pool_dir"
@@ -176,6 +292,10 @@ for architecture in "${architectures[@]}"; do
   done
   release_files+=("$packages" "$packages.gz")
 done
+
+if [ -n "$previous_repository_dir" ]; then
+  retain_previous_by_hash
+fi
 
 release="$output_dir/dists/$suite/Release"
 date_utc="$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')"

@@ -18,6 +18,8 @@ const DOWNSTREAM_PREPARE: &str =
     include_str!("../.github/workflows/release-downstream-prepare.yml");
 const RECEIPT: &str = include_str!("../.github/workflows/release-receipt.yml");
 const CI: &str = include_str!("../.github/workflows/ci.yml");
+const LINUX_REPOSITORY_BUILD: &str =
+    include_str!("../.github/workflows/release-linux-repository-build.yml");
 const CHANNEL_RESULT_ACTION: &str =
     include_str!("../.github/actions/release-channel-result/action.yml");
 const RECEIPT_REFERENCE_BUILDER: &str =
@@ -271,6 +273,18 @@ fn downstream_writers_keep_the_python_310_runtime_contract() {
         assert!(!source.contains("from datetime import UTC"));
         assert!(!source.contains("datetime.now(UTC)"));
     }
+}
+
+#[test]
+fn linux_repository_build_retains_authenticated_previous_by_hash_indexes() {
+    let authenticated = LINUX_REPOSITORY_BUILD
+        .find("scripts/retain-linux-package-history.py")
+        .expect("authenticated package history");
+    let generated = LINUX_REPOSITORY_BUILD
+        .find("\"$apt_generator\"")
+        .expect("APT repository generator");
+    assert!(authenticated < generated);
+    assert!(LINUX_REPOSITORY_BUILD.contains("--previous-repository-dir \"$root/history/debian\""));
 }
 
 #[cfg(unix)]

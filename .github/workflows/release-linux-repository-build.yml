@@ -187,6 +187,7 @@ jobs:
             --rpm-architecture x86_64 --rpm-architecture aarch64
           "$apt_generator" \
             --input-dir "$root/packages" --output-dir "$root/output/debian" \
+            --previous-repository-dir "$root/history/debian" \
             --suite stable --component main --architecture amd64 --architecture arm64 \
             --signing-key "$RMUX_APT_GPG_KEY"
           scripts/generate-rpm-repository.sh \
