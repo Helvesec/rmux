@@ -277,10 +277,11 @@ impl RequestHandler {
                 .map(|(pid, active)| ControlClientIdentity::new(*pid, active.id))
                 .collect::<Vec<_>>()
         };
-        let delivered = !identities.is_empty();
         let line = format_control_message_line(message);
+        let mut delivered = false;
         for identity in identities {
-            self.send_control_notification_to_queue(identity, line.clone())
+            delivered |= self
+                .send_control_notification_to_queue(identity, line.clone())
                 .await;
         }
         delivered
@@ -699,8 +700,7 @@ impl RequestHandler {
                         identity,
                         format_control_message_line(&expanded),
                     )
-                    .await;
-                    true
+                    .await
                 }
                 None => false,
             }

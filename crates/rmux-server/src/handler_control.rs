@@ -1535,7 +1535,7 @@ impl RequestHandler {
         &self,
         identity: ControlClientIdentity,
         line: String,
-    ) {
+    ) -> bool {
         let mut active_control = self.active_control.lock().await;
         if active_control
             .by_pid
@@ -1544,8 +1544,13 @@ impl RequestHandler {
                 active.id == identity.control_id() && !active.closing.load(Ordering::SeqCst)
             })
         {
-            deliver_control_notification(&mut active_control, identity.requester_pid(), line);
+            return deliver_control_notification(
+                &mut active_control,
+                identity.requester_pid(),
+                line,
+            );
         }
+        false
     }
 
     pub(super) async fn dispatch_control_notifications(&self, event: &QueuedLifecycleEvent) {
@@ -1868,11 +1873,11 @@ fn deliver_control_notification(
     active_control: &mut ActiveControlState,
     requester_pid: u32,
     line: String,
-) {
+) -> bool {
     let Some(active) = active_control.by_pid.get_mut(&requester_pid) else {
-        return;
+        return false;
     };
-    let _ = try_send_control_event(active, ControlServerEvent::Notification(line));
+    try_send_control_event(active, ControlServerEvent::Notification(line))
 }
 
 fn try_send_control_event(active: &ActiveControl, event: ControlServerEvent) -> bool {

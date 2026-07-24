@@ -812,6 +812,83 @@ async fn display_message_for_control_client_uses_message_notification() {
 }
 
 #[tokio::test]
+async fn rejected_control_display_message_is_not_added_to_show_messages() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("full-display-message-queue");
+    new_session(&handler, &alpha).await;
+
+    let requester_pid = 620;
+    let mut control_rx =
+        register_control_client(&handler, requester_pid, Some(alpha.clone())).await;
+    let _ = drain_control_notifications(&mut control_rx);
+    for index in 0..CONTROL_SERVER_EVENT_CAPACITY {
+        handler
+            .send_control_notification_to(requester_pid, format!("%message queued-{index}"))
+            .await;
+    }
+    assert_eq!(control_rx.len(), CONTROL_SERVER_EVENT_CAPACITY);
+
+    let response = dispatch_as(
+        &handler,
+        99_620,
+        Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
+            target: Some(Target::Session(alpha)),
+            print: false,
+            message: Some("must-not-be-logged".to_owned()),
+            target_client: Some(requester_pid.to_string()),
+            empty_target_context: false,
+            duration_ms: None,
+            ignore_input: false,
+        })),
+    )
+    .await;
+
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert!(handler.state.lock().await.message_log.is_empty());
+}
+
+#[tokio::test]
+async fn rejected_session_control_message_is_not_added_to_show_messages() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("full-session-display-queue");
+    new_session(&handler, &alpha).await;
+
+    let requester_pid = 621;
+    let mut control_rx =
+        register_control_client(&handler, requester_pid, Some(alpha.clone())).await;
+    let _ = drain_control_notifications(&mut control_rx);
+    for index in 0..CONTROL_SERVER_EVENT_CAPACITY {
+        handler
+            .send_control_notification_to(requester_pid, format!("%message queued-{index}"))
+            .await;
+    }
+    let pane_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .and_then(rmux_core::Session::active_pane_id)
+        .expect("active pane");
+
+    let response = handler
+        .handle_display_message_for_stable_pane(
+            99_621,
+            pane_id,
+            DisplayMessageRequest {
+                target: Some(Target::Session(alpha)),
+                print: false,
+                message: Some("must-not-be-logged".to_owned()),
+                empty_target_context: false,
+            },
+        )
+        .await;
+
+    assert!(matches!(response, Response::DisplayMessage(_)));
+    assert!(handler.state.lock().await.message_log.is_empty());
+}
+
+#[tokio::test]
 async fn display_message_orders_attached_and_control_clients_by_shared_activity() {
     // tmux 3.7b chooses the most recently active client across both client
     // types. Registration is initial activity; later accepted attached input
