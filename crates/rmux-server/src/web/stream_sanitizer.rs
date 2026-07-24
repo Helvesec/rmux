@@ -10,6 +10,7 @@ const MAX_BUFFERED_OSC_BYTES: usize = 1024 * 1024;
 pub(crate) struct WebTerminalSanitizer {
     state: State,
     utf8_continuations: u8,
+    pending_c2: bool,
 }
 
 #[derive(Debug, Default)]
@@ -23,6 +24,7 @@ enum State {
     },
     DiscardString {
         escaped: bool,
+        bell_terminates: bool,
     },
 }
 
@@ -36,9 +38,25 @@ impl WebTerminalSanitizer {
     pub(crate) fn reset(&mut self) {
         self.state = State::Ground;
         self.utf8_continuations = 0;
+        self.pending_c2 = false;
     }
 
     fn push_byte(&mut self, byte: u8, output: &mut Vec<u8>) {
+        if self.pending_c2 {
+            self.pending_c2 = false;
+            if (0x80..=0x9f).contains(&byte) {
+                self.utf8_continuations = 0;
+                self.process_byte(InputByte::encoded_c1(byte), output);
+                return;
+            }
+            self.process_byte(InputByte::plain(0xc2, false), output);
+            self.utf8_continuations = 0;
+        }
+        if byte == 0xc2 {
+            self.pending_c2 = true;
+            return;
+        }
+
         let standalone_control = if self.utf8_continuations > 0 {
             if byte & 0xc0 == 0x80 {
                 self.utf8_continuations -= 1;
@@ -51,35 +69,56 @@ impl WebTerminalSanitizer {
             self.utf8_continuations = utf8_continuations(byte);
             self.utf8_continuations == 0
         };
+        self.process_byte(InputByte::plain(byte, standalone_control), output);
+    }
+
+    fn process_byte(&mut self, input: InputByte, output: &mut Vec<u8>) {
         let state = std::mem::take(&mut self.state);
         self.state = match state {
-            State::Ground => ground(byte, output, standalone_control),
-            State::Escape => escaped(byte, output),
+            State::Ground => ground(input, output),
+            State::Escape => escape_sequence(input, output),
             State::Osc { mut bytes, escaped } => {
-                if string_ended(byte, escaped, true, standalone_control) {
-                    bytes.push(byte);
+                if cancelled(input) {
+                    State::Ground
+                } else if escaped && input.byte != b'\\' {
+                    escape_sequence(input, output)
+                } else if string_ended(input, escaped, true) {
+                    input.append_to(&mut bytes);
                     if allowed_osc(&bytes) {
                         output.extend_from_slice(&bytes);
                     }
                     State::Ground
+                } else if let Some(state) = string_introducer(input) {
+                    state
                 } else if bytes.len() >= MAX_BUFFERED_OSC_BYTES {
                     State::DiscardString {
-                        escaped: byte == 0x1b,
+                        escaped: input.byte == 0x1b,
+                        bell_terminates: true,
                     }
                 } else {
-                    bytes.push(byte);
+                    input.append_to(&mut bytes);
                     State::Osc {
                         bytes,
-                        escaped: byte == 0x1b,
+                        escaped: input.byte == 0x1b,
                     }
                 }
             }
-            State::DiscardString { escaped } => {
-                if string_ended(byte, escaped, false, standalone_control) {
+            State::DiscardString {
+                escaped,
+                bell_terminates,
+            } => {
+                if cancelled(input) {
                     State::Ground
+                } else if escaped && input.byte != b'\\' {
+                    escape_sequence(input, output)
+                } else if string_ended(input, escaped, bell_terminates) {
+                    State::Ground
+                } else if let Some(state) = string_introducer(input) {
+                    state
                 } else {
                     State::DiscardString {
-                        escaped: byte == 0x1b,
+                        escaped: input.byte == 0x1b,
+                        bell_terminates,
                     }
                 }
             }
@@ -87,43 +126,109 @@ impl WebTerminalSanitizer {
     }
 }
 
-fn ground(byte: u8, output: &mut Vec<u8>, standalone_control: bool) -> State {
-    match byte {
+#[derive(Clone, Copy)]
+struct InputByte {
+    byte: u8,
+    encoded_c1: bool,
+    standalone_control: bool,
+}
+
+impl InputByte {
+    const fn plain(byte: u8, standalone_control: bool) -> Self {
+        Self {
+            byte,
+            encoded_c1: false,
+            standalone_control,
+        }
+    }
+
+    const fn encoded_c1(byte: u8) -> Self {
+        Self {
+            byte,
+            encoded_c1: true,
+            standalone_control: true,
+        }
+    }
+
+    fn append_to(self, output: &mut Vec<u8>) {
+        if self.encoded_c1 {
+            output.extend_from_slice(&[0xc2, self.byte]);
+        } else {
+            output.push(self.byte);
+        }
+    }
+}
+
+fn ground(input: InputByte, output: &mut Vec<u8>) -> State {
+    if let Some(state) = string_introducer(input) {
+        return state;
+    }
+    match input.byte {
         0x1b => State::Escape,
-        0x9d if standalone_control => State::Osc {
-            bytes: vec![byte],
-            escaped: false,
-        },
-        0x90 | 0x98 | 0x9e | 0x9f if standalone_control => State::DiscardString { escaped: false },
+        0x18 | 0x1a if input.standalone_control => State::Ground,
         _ => {
-            output.push(byte);
+            input.append_to(output);
             State::Ground
         }
     }
 }
 
-fn escaped(byte: u8, output: &mut Vec<u8>) -> State {
-    match byte {
+fn escape_sequence(input: InputByte, output: &mut Vec<u8>) -> State {
+    if cancelled(input) {
+        return State::Ground;
+    }
+    if input.standalone_control && input.byte != 0x1b {
+        if let Some(state) = string_introducer(input) {
+            return state;
+        }
+    }
+    match input.byte {
         b']' => State::Osc {
             bytes: vec![0x1b, b']'],
             escaped: false,
         },
-        b'P' | b'X' | b'^' | b'_' => State::DiscardString { escaped: false },
-        0x1b => {
-            output.push(0x1b);
-            State::Escape
-        }
+        b'P' | b'X' | b'^' | b'_' => State::DiscardString {
+            escaped: false,
+            bell_terminates: false,
+        },
+        0x1b => State::Escape,
         _ => {
-            output.extend_from_slice(&[0x1b, byte]);
+            output.push(0x1b);
+            input.append_to(output);
             State::Ground
         }
     }
 }
 
-fn string_ended(byte: u8, escaped: bool, bell_terminates: bool, standalone_control: bool) -> bool {
-    (standalone_control && byte == 0x9c)
-        || (escaped && byte == b'\\')
-        || (bell_terminates && byte == 0x07)
+fn string_introducer(input: InputByte) -> Option<State> {
+    if !input.standalone_control {
+        return None;
+    }
+    match input.byte {
+        0x9d => {
+            let mut bytes = Vec::with_capacity(2);
+            input.append_to(&mut bytes);
+            Some(State::Osc {
+                bytes,
+                escaped: false,
+            })
+        }
+        0x90 | 0x98 | 0x9e | 0x9f => Some(State::DiscardString {
+            escaped: false,
+            bell_terminates: false,
+        }),
+        _ => None,
+    }
+}
+
+fn cancelled(input: InputByte) -> bool {
+    input.standalone_control && matches!(input.byte, 0x18 | 0x1a)
+}
+
+fn string_ended(input: InputByte, escaped: bool, bell_terminates: bool) -> bool {
+    (input.standalone_control && input.byte == 0x9c)
+        || (escaped && input.byte == b'\\')
+        || (bell_terminates && input.byte == 0x07)
 }
 
 const fn utf8_continuations(byte: u8) -> u8 {
@@ -140,12 +245,21 @@ fn allowed_osc(sequence: &[u8]) -> bool {
         &sequence[2..]
     } else if sequence.first() == Some(&0x9d) {
         &sequence[1..]
+    } else if sequence.starts_with(&[0xc2, 0x9d]) {
+        &sequence[2..]
     } else {
         return false;
     };
     let code_end = payload
         .iter()
-        .position(|byte| *byte == b';' || *byte == 0x07 || *byte == 0x9c || *byte == 0x1b)
+        .enumerate()
+        .position(|(index, byte)| {
+            *byte == b';'
+                || *byte == 0x07
+                || *byte == 0x9c
+                || *byte == 0x1b
+                || (*byte == 0xc2 && payload.get(index + 1) == Some(&0x9c))
+        })
         .unwrap_or(payload.len());
     let Ok(code) = std::str::from_utf8(&payload[..code_end]) else {
         return false;
@@ -182,7 +296,7 @@ fn allowed_hyperlink(payload: &[u8]) -> bool {
 }
 
 fn strip_osc_terminator(mut payload: &[u8]) -> &[u8] {
-    if payload.ends_with(b"\x1b\\") {
+    if payload.ends_with(b"\x1b\\") || payload.ends_with(&[0xc2, 0x9c]) {
         payload = &payload[..payload.len() - 2];
     } else if payload
         .last()
@@ -282,8 +396,29 @@ mod tests {
     }
 
     #[test]
+    fn utf8_encoded_c1_strings_follow_the_same_policy() {
+        let blocked = b"a\xc2\x9d52;c;Zm9v\xc2\x9cb\xc2\x9fGkitty\xc2\x9cc";
+        for split in 0..=blocked.len() {
+            assert_eq!(
+                sanitize(&[&blocked[..split], &blocked[split..]]),
+                b"abc",
+                "blocked split {split}"
+            );
+        }
+
+        let allowed = b"a\xc2\x9d2;title\xc2\x9cb";
+        for split in 0..=allowed.len() {
+            assert_eq!(
+                sanitize(&[&allowed[..split], &allowed[split..]]),
+                allowed,
+                "allowed split {split}"
+            );
+        }
+    }
+
+    #[test]
     fn utf8_continuations_that_overlap_c1_controls_are_never_reinterpreted() {
-        let input = "aНÜ\u{259c}b".as_bytes();
+        let input = "a\u{a0}НÜ\u{259c}b".as_bytes();
         for split in 0..=input.len() {
             assert_eq!(
                 sanitize(&[&input[..split], &input[split..]]),
@@ -303,6 +438,49 @@ mod tests {
                 "split {split}"
             );
         }
+    }
+
+    #[test]
+    fn escape_reentry_never_emits_a_forbidden_string_prefix() {
+        for input in [
+            b"a\x1b\x1b]52;c;WA==\x07b".as_slice(),
+            b"a\x1b]2;safe\x1b]52;c;WA==\x07b".as_slice(),
+            b"a\x1bPignored\x1b]52;c;WA==\x07b".as_slice(),
+        ] {
+            for first in 0..=input.len() {
+                for second in first..=input.len() {
+                    assert_eq!(
+                        sanitize(&[&input[..first], &input[first..second], &input[second..]]),
+                        b"ab",
+                        "splits {first}/{second}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn can_and_sub_cancel_strings_before_following_input_is_reparsed() {
+        for cancel in [0x18, 0x1a] {
+            let mut input = b"a\x1b]2;safe".to_vec();
+            input.push(cancel);
+            input.extend_from_slice(b"\x1b]52;c;WA==\x07b");
+            for split in 0..=input.len() {
+                assert_eq!(
+                    sanitize(&[&input[..split], &input[split..]]),
+                    b"ab",
+                    "cancel {cancel:#x}, split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_osc_discard_ends_at_bell() {
+        let mut input = b"before\x1b]2;".to_vec();
+        input.resize(input.len() + MAX_BUFFERED_OSC_BYTES + 1, b'x');
+        input.extend_from_slice(b"\x07after");
+        assert_eq!(sanitize(&[&input]), b"beforeafter");
     }
 
     #[test]
