@@ -66,6 +66,7 @@ fn run_attached_probe(
     let path = prepend_to_path(&bin)?;
     let fake_claude_log = root.join("fake-claude.log");
     let local_app_data = root.join("localappdata");
+    fs::create_dir_all(&local_app_data)?;
     let mut command = ChildCommand::new(rmux)
         .arg("claude")
         .arg("windows-probe")
