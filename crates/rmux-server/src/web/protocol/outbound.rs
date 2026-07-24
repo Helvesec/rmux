@@ -9,8 +9,8 @@ use serde::Serialize;
 use rmux_proto::{TerminalSize, WebTerminalPalette};
 
 use super::{
-    SERVER_CAPABILITIES, WEB_SHARE_PROTOCOL_VERSION, WS_OUTPUT_RAW, WS_RESIZE_NOTIFY,
-    WS_SESSION_PANE_FRAME, WS_SESSION_VIEW, WS_SNAPSHOT_FULL,
+    SERVER_CAPABILITIES, WEB_SHARE_PROTOCOL_VERSION, WS_OUTPUT_RAW, WS_PANE_RECOVERY_SNAPSHOT,
+    WS_RESIZE_NOTIFY, WS_SESSION_PANE_FRAME, WS_SESSION_VIEW, WS_SNAPSHOT_FULL,
 };
 use crate::handler::{WebPaneSnapshot, WebSessionPaneFrame, WebSessionSnapshot, WebShareStream};
 use crate::web::outbound::{OutboundQueueResult, WebSocketOutbound, WEB_OUTBOUND_BYTES_MAX};
@@ -66,8 +66,9 @@ pub(crate) fn queue_snapshot(
     socket: &WebSocketOutbound,
     snapshot: &WebPaneSnapshot,
     sanitizer: &mut WebTerminalSanitizer,
+    include_recovery_coverage: bool,
 ) -> OutboundQueueResult {
-    let Some(frame) = pane_snapshot_payload(snapshot, sanitizer) else {
+    let Some(frame) = pane_snapshot_payload(snapshot, sanitizer, include_recovery_coverage) else {
         return OutboundQueueResult::Closed;
     };
     socket.queue_snapshot(frame)
@@ -193,9 +194,17 @@ fn resize_payload(size: TerminalSize) -> Vec<u8> {
 fn pane_snapshot_payload(
     snapshot: &WebPaneSnapshot,
     sanitizer: &mut WebTerminalSanitizer,
+    include_recovery_coverage: bool,
 ) -> Option<Vec<u8>> {
-    let mut frame = Vec::with_capacity(1);
-    frame.push(WS_SNAPSHOT_FULL);
+    let mut frame = Vec::with_capacity(if include_recovery_coverage { 18 } else { 1 });
+    if include_recovery_coverage {
+        frame.push(WS_PANE_RECOVERY_SNAPSHOT);
+        frame.extend_from_slice(&snapshot.history_rows_total.to_be_bytes());
+        frame.extend_from_slice(&snapshot.history_rows_included.to_be_bytes());
+        frame.push(u8::from(snapshot.metadata_complete));
+    } else {
+        frame.push(WS_SNAPSHOT_FULL);
+    }
     let mut raw = Vec::new();
     snapshot.append_ansi_bytes(&mut raw);
     sanitizer.reset();
@@ -280,11 +289,11 @@ mod tests {
     use super::{
         pane_snapshot_payload, session_keyframe_payloads, session_pane_frame_payload, PaneSize,
         ServerMessage, WebSessionPaneFrame, WebSessionSnapshot, SERVER_CAPABILITIES,
-        WEB_OUTBOUND_BYTES_MAX, WEB_SHARE_PROTOCOL_VERSION, WS_RESIZE_NOTIFY,
-        WS_SESSION_PANE_FRAME, WS_SESSION_VIEW, WS_SNAPSHOT_FULL,
+        WEB_OUTBOUND_BYTES_MAX, WEB_SHARE_PROTOCOL_VERSION, WS_PANE_RECOVERY_SNAPSHOT,
+        WS_RESIZE_NOTIFY, WS_SESSION_PANE_FRAME, WS_SESSION_VIEW, WS_SNAPSHOT_FULL,
     };
     use crate::handler::{TestWebSessionView, WebPaneSnapshot, WebSessionPaneView};
-    use crate::web::protocol::PANE_FRAME_CAPABILITY;
+    use crate::web::protocol::{PANE_FRAME_CAPABILITY, PANE_RECOVERY_COVERAGE_CAPABILITY};
     use crate::web::stream_sanitizer::WebTerminalSanitizer;
     use crate::web::{WebShareConnectionCounts, WebShareRevokeReason};
 
@@ -317,7 +326,12 @@ mod tests {
             json!({
                 "type": "ready",
                 "protocol_version": 1,
-                "capabilities": ["e2ee-token-auth", "terminal-palette-v1", PANE_FRAME_CAPABILITY],
+                "capabilities": [
+                    "e2ee-token-auth",
+                    "terminal-palette-v1",
+                    PANE_FRAME_CAPABILITY,
+                    PANE_RECOVERY_COVERAGE_CAPABILITY
+                ],
                 "pane_size": { "cols": 80, "rows": 24 },
                 "scope": "session",
                 "share_id": "share-1",
@@ -495,10 +509,14 @@ mod tests {
             alternate: false,
             scroll_top: 0,
             scroll_bottom: 1,
+            history_rows_total: 7,
+            history_rows_included: 3,
+            metadata_complete: false,
             recovery_keyframe: Some(b"safe\x1b]52;c;partial".to_vec()),
         };
         let mut sanitizer = WebTerminalSanitizer::default();
-        let payload = pane_snapshot_payload(&snapshot, &mut sanitizer).expect("snapshot fits");
+        let payload =
+            pane_snapshot_payload(&snapshot, &mut sanitizer, false).expect("snapshot fits");
         assert_eq!(&payload[1..], b"safe");
 
         let mut live = Vec::new();
@@ -507,6 +525,46 @@ mod tests {
             live, b"after",
             "an OSC 52 fragmented across snapshot/live boundaries must stay removed"
         );
+    }
+
+    #[test]
+    fn pane_recovery_coverage_is_negotiated_and_atomic_with_the_snapshot() {
+        let snapshot = WebPaneSnapshot {
+            cols: 8,
+            rows: 2,
+            output_sequence: 4,
+            ansi_lines: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_visible: true,
+            mode_bits: 0,
+            cursor_style: 0,
+            alternate: false,
+            scroll_top: 0,
+            scroll_bottom: 1,
+            history_rows_total: 50,
+            history_rows_included: 12,
+            metadata_complete: false,
+            recovery_keyframe: Some(b"screen".to_vec()),
+        };
+        let mut sanitizer = WebTerminalSanitizer::default();
+        let legacy =
+            pane_snapshot_payload(&snapshot, &mut sanitizer, false).expect("snapshot fits");
+        assert_eq!(legacy, b"\x10screen");
+
+        let covered =
+            pane_snapshot_payload(&snapshot, &mut sanitizer, true).expect("snapshot fits");
+        assert_eq!(covered[0], WS_PANE_RECOVERY_SNAPSHOT);
+        assert_eq!(
+            u64::from_be_bytes(covered[1..9].try_into().expect("total row bytes")),
+            50
+        );
+        assert_eq!(
+            u64::from_be_bytes(covered[9..17].try_into().expect("included row bytes")),
+            12
+        );
+        assert_eq!(covered[17], 0);
+        assert_eq!(&covered[18..], b"screen");
     }
 
     #[test]
@@ -524,10 +582,13 @@ mod tests {
             alternate: false,
             scroll_top: 0,
             scroll_bottom: 1,
+            history_rows_total: 0,
+            history_rows_included: 0,
+            metadata_complete: true,
             recovery_keyframe: Some(vec![b'x'; WEB_OUTBOUND_BYTES_MAX]),
         };
         let mut sanitizer = WebTerminalSanitizer::default();
-        assert!(pane_snapshot_payload(&pane_snapshot, &mut sanitizer).is_none());
+        assert!(pane_snapshot_payload(&pane_snapshot, &mut sanitizer, false).is_none());
 
         let size = TerminalSize { cols: 80, rows: 24 };
         let pane = WebSessionPaneView {

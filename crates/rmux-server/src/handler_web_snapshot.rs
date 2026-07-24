@@ -33,6 +33,9 @@ pub(crate) struct WebPaneSnapshot {
     /// DECSTBM scroll region (top, bottom), 0-based inclusive.
     pub(crate) scroll_top: u32,
     pub(crate) scroll_bottom: u32,
+    pub(crate) history_rows_total: u64,
+    pub(crate) history_rows_included: u64,
+    pub(crate) metadata_complete: bool,
     #[serde(skip)]
     pub(crate) recovery_keyframe: Option<Vec<u8>>,
 }
@@ -373,6 +376,9 @@ mod tests {
             alternate: false,
             scroll_top: 0,
             scroll_bottom: 23,
+            history_rows_total: 0,
+            history_rows_included: 0,
+            metadata_complete: true,
             recovery_keyframe: None,
         }
     }

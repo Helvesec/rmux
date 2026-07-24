@@ -2,7 +2,9 @@ use super::http::{path_from_target, HttpRequest};
 use super::pre_auth::PreAuthQueue;
 use super::{is_fd_exhaustion, serve_admitted_connection, should_continue_accept_loop};
 use crate::handler::RequestHandler;
-use crate::web::protocol::{AUTH_FRAME_TIMEOUT, WEB_SHARE_PROTOCOL_VERSION};
+use crate::web::protocol::{
+    AUTH_FRAME_TIMEOUT, PANE_RECOVERY_COVERAGE_CAPABILITY, WEB_SHARE_PROTOCOL_VERSION,
+};
 use crate::web::SecretHashForCrypto;
 use base64::Engine;
 use rmux_proto::{
@@ -421,9 +423,11 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
         },
     )
     .await;
-    let mut client = TestWebSocket::connect(
+    let auth = auth_text_with_pane_recovery_coverage();
+    let mut client = TestWebSocket::connect_with_auth(
         Arc::clone(&handler),
         &token_from_url(created.operator_url.as_deref().expect("operator URL")),
+        &auth,
     )
     .await;
     let ready = client.read_json().await;
@@ -446,7 +450,19 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
         .iter()
         .any(|capability| capability == "e2ee-token-auth"));
 
-    client.read_binary_with_prefix(0x10, "snapshot").await;
+    let snapshot = client
+        .read_binary_with_prefix_payload(0x13, "bounded pane recovery snapshot")
+        .await;
+    assert!(snapshot.len() > 18);
+    assert_eq!(
+        u64::from_be_bytes(snapshot[1..9].try_into().expect("total row bytes")),
+        0
+    );
+    assert_eq!(
+        u64::from_be_bytes(snapshot[9..17].try_into().expect("included row bytes")),
+        0
+    );
+    assert_eq!(snapshot[17], 1);
 
     client.send_binary(&[0x80, b'p', b'w', b'd', b'\n']).await;
     let stopped = handler
@@ -2037,6 +2053,13 @@ fn auth_text() -> String {
     format!(
         r#"{{"type":"auth","protocol_version":{},"capabilities":["e2ee-token-auth","terminal-palette-v1"]}}"#,
         WEB_SHARE_PROTOCOL_VERSION
+    )
+}
+
+fn auth_text_with_pane_recovery_coverage() -> String {
+    format!(
+        r#"{{"type":"auth","protocol_version":{},"capabilities":["e2ee-token-auth","terminal-palette-v1","{}"]}}"#,
+        WEB_SHARE_PROTOCOL_VERSION, PANE_RECOVERY_COVERAGE_CAPABILITY
     )
 }
 

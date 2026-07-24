@@ -617,6 +617,9 @@ impl RequestHandler {
             alternate: seed.alternate(),
             scroll_top,
             scroll_bottom,
+            history_rows_total: keyframe.history_rows_total,
+            history_rows_included: keyframe.history_rows_included,
+            metadata_complete: keyframe.metadata_complete,
             recovery_keyframe: Some(keyframe.bytes),
         };
         Ok((snapshot, output))

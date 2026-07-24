@@ -42,10 +42,16 @@ pub(super) async fn serve_pane_loop(
     outbound: WebSocketOutbound,
     share_id: String,
     mut pane: WebPaneStream,
+    supports_pane_recovery_coverage: bool,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut sanitizer = WebTerminalSanitizer::default();
-    let initial_snapshot = queue_snapshot(&outbound, &pane.snapshot, &mut sanitizer);
+    let initial_snapshot = queue_snapshot(
+        &outbound,
+        &pane.snapshot,
+        &mut sanitizer,
+        supports_pane_recovery_coverage,
+    );
     queue_or_close(&outbound, initial_snapshot, &share_id).await?;
     let mut rate_limiter = OperatorRateLimiter::new();
     let mut last_connection_counts = pane.connection_counts();
@@ -182,6 +188,7 @@ pub(super) async fn serve_pane_loop(
                     &outbound,
                     &mut pane,
                     &mut sanitizer,
+                    supports_pane_recovery_coverage,
                 ).await? {
                     OutboundQueueResult::Queued => {
                         snapshot_pending = false;
@@ -280,6 +287,7 @@ async fn queue_fresh_pane_snapshot(
     outbound: &WebSocketOutbound,
     pane: &mut WebPaneStream,
     sanitizer: &mut WebTerminalSanitizer,
+    supports_pane_recovery_coverage: bool,
 ) -> io::Result<OutboundQueueResult> {
     let target = handler
         .current_web_pane_target(pane.session_id(), pane.target())
@@ -292,7 +300,12 @@ async fn queue_fresh_pane_snapshot(
         .map_err(|error| io::Error::other(error.to_string()))?;
     pane.snapshot = snapshot;
     pane.output = output;
-    Ok(queue_snapshot(outbound, &pane.snapshot, sanitizer))
+    Ok(queue_snapshot(
+        outbound,
+        &pane.snapshot,
+        sanitizer,
+        supports_pane_recovery_coverage,
+    ))
 }
 
 pub(super) async fn serve_session_loop(

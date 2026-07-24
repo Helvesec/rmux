@@ -55,10 +55,12 @@ pub(crate) const WEB_SHARE_PROTOCOL_VERSION: u16 = 1;
 /// precise reason is logged server-side, never sent.
 pub(crate) const HANDSHAKE_REJECTED: (u16, &str) = (4000, "handshake_rejected");
 pub(crate) const PANE_FRAME_CAPABILITY: &str = "pane-frame-v1";
+pub(crate) const PANE_RECOVERY_COVERAGE_CAPABILITY: &str = "pane-recovery-coverage-v1";
 const SERVER_CAPABILITIES: &[&str] = &[
     E2EE_CAPABILITY,
     "terminal-palette-v1",
     PANE_FRAME_CAPABILITY,
+    PANE_RECOVERY_COVERAGE_CAPABILITY,
 ];
 const OPERATOR_INPUT_FRAME_MAX: usize = 4 * 1024;
 const MAX_SESSION_RESIZE_DIMENSION: u16 = 4096;
@@ -69,6 +71,7 @@ const WS_RESIZE_NOTIFY: u8 = 0x02;
 const WS_SNAPSHOT_FULL: u8 = 0x10;
 const WS_SESSION_VIEW: u8 = 0x11;
 const WS_SESSION_PANE_FRAME: u8 = 0x12;
+const WS_PANE_RECOVERY_SNAPSHOT: u8 = 0x13;
 const WS_INPUT_TEXT: u8 = 0x80;
 const WS_INPUT_KEY: u8 = 0x81;
 const WS_RESIZE_REQUEST: u8 = 0x82;
@@ -99,6 +102,7 @@ pub(crate) enum SessionOperatorBinaryOutcome {
 pub(crate) struct AuthMessage {
     pub(crate) pin: Option<String>,
     pub(crate) supports_session_pane_frame: bool,
+    pub(crate) supports_pane_recovery_coverage: bool,
 }
 
 #[derive(Debug, Deserialize)]

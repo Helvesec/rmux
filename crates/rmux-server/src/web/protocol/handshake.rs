@@ -9,7 +9,8 @@ use tokio::time::timeout;
 
 use super::{
     AuthMessage, AuthWireMessage, AUTH_FRAME_TIMEOUT, HANDSHAKE_REJECTED, PANE_FRAME_CAPABILITY,
-    PRE_AUTH_TIMEOUT, SERVER_CAPABILITIES, WEB_SHARE_PROTOCOL_VERSION,
+    PANE_RECOVERY_COVERAGE_CAPABILITY, PRE_AUTH_TIMEOUT, SERVER_CAPABILITIES,
+    WEB_SHARE_PROTOCOL_VERSION,
 };
 use crate::web::crypto::{parse_client_hello, ClientHello, FrameOpener, E2EE_CAPABILITY};
 use crate::web::record::{OPERATOR_LIMIT_ERROR, SPECTATOR_LIMIT_ERROR};
@@ -106,9 +107,14 @@ pub(crate) async fn read_auth_message(
         .capabilities
         .iter()
         .any(|capability| capability == PANE_FRAME_CAPABILITY);
+    let supports_pane_recovery_coverage = wire
+        .capabilities
+        .iter()
+        .any(|capability| capability == PANE_RECOVERY_COVERAGE_CAPABILITY);
     Ok(AuthMessage {
         pin: wire.pin,
         supports_session_pane_frame,
+        supports_pane_recovery_coverage,
     })
 }
 
@@ -161,7 +167,7 @@ mod tests {
 
         assert_eq!(
             challenge,
-            r#"{"type":"challenge","protocol_version":1,"capabilities":["e2ee-token-auth","terminal-palette-v1","pane-frame-v1"],"server_nonce":"nonce","server_public":"server-public","server_ml_kem_ct":"ml-kem-ct"}"#
+            r#"{"type":"challenge","protocol_version":1,"capabilities":["e2ee-token-auth","terminal-palette-v1","pane-frame-v1","pane-recovery-coverage-v1"],"server_nonce":"nonce","server_public":"server-public","server_ml_kem_ct":"ml-kem-ct"}"#
         );
     }
 

@@ -20,7 +20,11 @@ fn web_share_protocol_version_and_capabilities_stay_v1_compatible() {
         crypto.contains("pub(super) const E2EE_CAPABILITY: &str = \"e2ee-token-auth\";"),
         "E2EE capability must stay stable"
     );
-    for capability in ["terminal-palette-v1", "pane-frame-v1"] {
+    for capability in [
+        "terminal-palette-v1",
+        "pane-frame-v1",
+        "pane-recovery-coverage-v1",
+    ] {
         assert!(
             protocol.contains(capability),
             "server capability {capability:?} must remain advertised"
@@ -28,7 +32,7 @@ fn web_share_protocol_version_and_capabilities_stay_v1_compatible() {
     }
     assert!(
         handshake.contains(
-            "\"capabilities\":[\"e2ee-token-auth\",\"terminal-palette-v1\",\"pane-frame-v1\"]"
+            "\"capabilities\":[\"e2ee-token-auth\",\"terminal-palette-v1\",\"pane-frame-v1\",\"pane-recovery-coverage-v1\"]"
         ),
         "challenge fixture must keep the full v1 capability list"
     );
@@ -44,6 +48,7 @@ fn web_share_binary_opcodes_stay_stable() {
         "const WS_SNAPSHOT_FULL: u8 = 0x10;",
         "const WS_SESSION_VIEW: u8 = 0x11;",
         "const WS_SESSION_PANE_FRAME: u8 = 0x12;",
+        "const WS_PANE_RECOVERY_SNAPSHOT: u8 = 0x13;",
         "const WS_INPUT_TEXT: u8 = 0x80;",
         "const WS_INPUT_KEY: u8 = 0x81;",
         "const WS_RESIZE_REQUEST: u8 = 0x82;",
@@ -74,7 +79,7 @@ fn web_share_resource_caps_are_enforced_in_protocol_and_accept_path() {
         );
     }
     assert!(
-        outbound.contains("const BACKLOG_BYTES_MAX: usize = 2 * 1024 * 1024;"),
+        outbound.contains("const WEB_OUTBOUND_BYTES_MAX: usize = 2 * 1024 * 1024;"),
         "web outbound backlog budget must stay explicit"
     );
     assert!(

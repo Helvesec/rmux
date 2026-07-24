@@ -38,6 +38,7 @@ struct EstablishedWebShare {
     share_id: String,
     share: WebShareStream,
     supports_session_pane_frame: bool,
+    supports_pane_recovery_coverage: bool,
 }
 
 struct PreReadyWebShare {
@@ -46,6 +47,7 @@ struct PreReadyWebShare {
     token_id: String,
     auth_pin: Option<String>,
     supports_session_pane_frame: bool,
+    supports_pane_recovery_coverage: bool,
     opener: crypto::FrameOpener,
     pre_auth_guard: PreAuthGuard,
     sealer: crypto::FrameSealer,
@@ -300,6 +302,7 @@ async fn serve_websocket(
                 established.outbound,
                 established.share_id,
                 *pane,
+                established.supports_pane_recovery_coverage,
                 shutdown,
             )
             .await
@@ -351,6 +354,7 @@ async fn establish_web_share(
         token_id,
         auth_pin,
         supports_session_pane_frame,
+        supports_pane_recovery_coverage,
         opener,
         pre_auth_guard,
         sealer,
@@ -443,6 +447,7 @@ async fn establish_web_share(
         share_id,
         share,
         supports_session_pane_frame,
+        supports_pane_recovery_coverage,
     }))
 }
 
@@ -541,6 +546,7 @@ async fn complete_pre_ready_handshake(
         token_id: hello.token_id,
         auth_pin: auth.pin,
         supports_session_pane_frame: auth.supports_session_pane_frame,
+        supports_pane_recovery_coverage: auth.supports_pane_recovery_coverage,
         opener,
         pre_auth_guard,
         sealer,
