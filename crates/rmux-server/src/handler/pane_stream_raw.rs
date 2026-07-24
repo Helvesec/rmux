@@ -5,6 +5,7 @@ use rmux_core::events::{OutputCursorItem, DEFAULT_SUBSCRIPTION_BATCH_EVENTS};
 use rmux_proto::{
     ErrorResponse, PaneRawBytes, PaneRawRebaseReason, PaneStreamCursorRequest, PaneStreamEndReason,
     PaneStreamEvent, PaneStreamLifecycleEvent, Response, RmuxError,
+    DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
 use crate::pane_io::{PaneBoundary, PaneObservationItem, PaneOutputReceiver};
@@ -12,6 +13,7 @@ use crate::pane_io::{PaneBoundary, PaneObservationItem, PaneOutputReceiver};
 use super::super::subscription_support::{
     cursor_event_limit, OutputSubscriptionState, RawInitializationRoute,
 };
+use super::protocol::detached_response_size;
 use super::types::RawPaneStream;
 use super::{
     capture_source, materialize_raw_rebase, owned_stream_record, raw_reason,
@@ -20,6 +22,21 @@ use super::{
     CachedRawRebase, CapturedPaneBoundary, PaneStreamSource, PaneStreamSubscription,
     RawRebaseGuard, RequestHandler,
 };
+
+fn encoded_stream_event_size(event: &PaneStreamEvent) -> Result<usize, RmuxError> {
+    let encoded =
+        bincode::serialized_size(event).map_err(|error| RmuxError::Encode(error.to_string()))?;
+    Ok(usize::try_from(encoded).unwrap_or(usize::MAX))
+}
+
+fn encoded_raw_bytes_size(epoch: u64, sequence: u64, byte_len: usize) -> Result<usize, RmuxError> {
+    let empty = PaneStreamEvent::RawBytes(PaneRawBytes {
+        epoch,
+        sequence,
+        bytes: Vec::new(),
+    });
+    Ok(encoded_stream_event_size(&empty)?.saturating_add(byte_len))
+}
 
 pub(super) enum RawInitializationOutcome {
     Complete(Response),
@@ -244,6 +261,14 @@ impl RequestHandler {
     ) -> Response {
         let now = Instant::now();
         let mut events = Vec::new();
+        let mut response_size = match detached_response_size(&stream_cursor_response(
+            request.subscription_id,
+            Vec::new(),
+            false,
+        )) {
+            Ok(size) => size,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
         let (rebase, reached_limit) = {
             let mut subscriptions = self
                 .subscriptions
@@ -276,9 +301,13 @@ impl RequestHandler {
             }
             let mut reason = stream.pending_rebase();
             let mut observed = 0_usize;
+            let mut reached_frame_limit = false;
             if reason.is_none() {
                 for _ in 0..limit {
-                    let Some(item) = stream.receiver.try_recv_observed() else {
+                    let item = stream
+                        .take_pending_observation()
+                        .or_else(|| stream.receiver.try_recv_observed());
+                    let Some(item) = item else {
                         break;
                     };
                     observed = observed.saturating_add(1);
@@ -288,15 +317,50 @@ impl RequestHandler {
                             break;
                         }
                         PaneObservationItem::ProcessExited { output_sequence } => {
-                            events.push(PaneStreamEvent::Lifecycle(
+                            let event = PaneStreamEvent::Lifecycle(
                                 PaneStreamLifecycleEvent::ProcessExited { output_sequence },
-                            ));
+                            );
+                            let event_size = match encoded_stream_event_size(&event) {
+                                Ok(size) => size,
+                                Err(error) => return Response::Error(ErrorResponse { error }),
+                            };
+                            let next_response_size = response_size.saturating_add(event_size);
+                            if !events.is_empty()
+                                && next_response_size > DEFAULT_MAX_DETACHED_FRAME_LENGTH
+                            {
+                                stream.defer_observation(PaneObservationItem::ProcessExited {
+                                    output_sequence,
+                                });
+                                reached_frame_limit = true;
+                                break;
+                            }
+                            response_size = next_response_size;
+                            events.push(event);
                         }
                         PaneObservationItem::Output(OutputCursorItem::Gap(_)) => {
                             reason = Some(PaneRawRebaseReason::Lag);
                             break;
                         }
                         PaneObservationItem::Output(OutputCursorItem::Event(event)) => {
+                            let event_size = match encoded_raw_bytes_size(
+                                stream.epoch,
+                                event.sequence(),
+                                event.byte_len(),
+                            ) {
+                                Ok(size) => size,
+                                Err(error) => return Response::Error(ErrorResponse { error }),
+                            };
+                            let next_response_size = response_size.saturating_add(event_size);
+                            if !events.is_empty()
+                                && next_response_size > DEFAULT_MAX_DETACHED_FRAME_LENGTH
+                            {
+                                stream.defer_observation(PaneObservationItem::Output(
+                                    OutputCursorItem::Event(event),
+                                ));
+                                reached_frame_limit = true;
+                                break;
+                            }
+                            response_size = next_response_size;
                             events.push(PaneStreamEvent::RawBytes(PaneRawBytes {
                                 epoch: stream.epoch,
                                 sequence: event.sequence(),
@@ -320,7 +384,7 @@ impl RequestHandler {
                         stream.receiver.observed_process_exit_revision(),
                     )
                 }),
-                reason.is_none() && observed == limit,
+                reason.is_none() && (observed == limit || reached_frame_limit),
             )
         };
 

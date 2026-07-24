@@ -312,6 +312,87 @@ async fn oversized_raw_batch_ends_the_stream_before_transport_encoding() {
 }
 
 #[tokio::test]
+async fn raw_batch_defers_a_deliverable_event_that_would_overflow_the_response() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let event_len = DEFAULT_MAX_DETACHED_FRAME_LENGTH / 2;
+    let output = crate::pane_io::pane_output_channel_with_limits(4, 2 * event_len + 1);
+    {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let Some(super::PaneStreamSubscription::Raw(stream)) =
+            subscriptions.streams.get_mut(&subscribed.subscription_id)
+        else {
+            panic!("raw stream state");
+        };
+        stream.receiver = output.subscribe();
+    }
+
+    output.send(vec![b'a'; event_len]);
+    output.send(vec![b'b'; event_len]);
+
+    let first = cursor_with_limit(&handler, subscribed.subscription_id, 2).await;
+    assert!(first.limited);
+    assert!(matches!(
+        first.events.as_slice(),
+        [PaneStreamEvent::RawBytes(bytes)]
+            if bytes.bytes.len() == event_len && bytes.bytes.iter().all(|byte| *byte == b'a')
+    ));
+    assert!(
+        handler
+            .pane_output_subscription_key_for_test(subscribed.subscription_id)
+            .is_some(),
+        "a deliverable event must remain subscribed when only its batch is full"
+    );
+
+    let second = cursor_with_limit(&handler, subscribed.subscription_id, 2).await;
+    assert!(!second.limited);
+    assert!(matches!(
+        second.events.as_slice(),
+        [PaneStreamEvent::RawBytes(bytes)]
+            if bytes.bytes.len() == event_len && bytes.bytes.iter().all(|byte| *byte == b'b')
+    ));
+}
+
+#[tokio::test]
+async fn raw_batch_defers_lifecycle_that_would_overflow_the_response() {
+    let handler = RequestHandler::new();
+    let (target, _, _) = test_pane(&handler).await;
+    let subscribed = subscribe(&handler, &target, PaneStreamMode::Raw).await;
+    let event_len = DEFAULT_MAX_DETACHED_FRAME_LENGTH - 64;
+    let output = crate::pane_io::pane_output_channel_with_limits(4, event_len + 1);
+    {
+        let mut subscriptions = handler.subscriptions.lock().expect("subscription lock");
+        let Some(super::PaneStreamSubscription::Raw(stream)) =
+            subscriptions.streams.get_mut(&subscribed.subscription_id)
+        else {
+            panic!("raw stream state");
+        };
+        stream.receiver = output.subscribe();
+    }
+
+    output.send(vec![b'x'; event_len]);
+    output.send(Vec::new());
+
+    let first = cursor_with_limit(&handler, subscribed.subscription_id, 2).await;
+    assert!(first.limited);
+    assert!(matches!(
+        first.events.as_slice(),
+        [PaneStreamEvent::RawBytes(bytes)] if bytes.bytes.len() == event_len
+    ));
+    let second = cursor_with_limit(&handler, subscribed.subscription_id, 2).await;
+    assert!(!second.limited);
+    assert!(matches!(
+        second.events.as_slice(),
+        [PaneStreamEvent::Lifecycle(
+            PaneStreamLifecycleEvent::ProcessExited {
+                output_sequence: Some(_)
+            }
+        )]
+    ));
+}
+
+#[tokio::test]
 async fn process_exit_is_delivered_before_generation_rebase() {
     let handler = RequestHandler::new();
     let (target, output, _) = test_pane(&handler).await;

@@ -44,9 +44,7 @@ pub(super) fn stream_cursor_response(
 }
 
 pub(super) fn validate_detached_response(response: &Response) -> Result<(), RmuxError> {
-    let encoded =
-        bincode::serialized_size(response).map_err(|error| RmuxError::Encode(error.to_string()))?;
-    let length = usize::try_from(encoded).unwrap_or(usize::MAX);
+    let length = detached_response_size(response)?;
     if length > DEFAULT_MAX_DETACHED_FRAME_LENGTH {
         return Err(RmuxError::FrameTooLarge {
             length,
@@ -54,6 +52,12 @@ pub(super) fn validate_detached_response(response: &Response) -> Result<(), Rmux
         });
     }
     Ok(())
+}
+
+pub(super) fn detached_response_size(response: &Response) -> Result<usize, RmuxError> {
+    let encoded =
+        bincode::serialized_size(response).map_err(|error| RmuxError::Encode(error.to_string()))?;
+    Ok(usize::try_from(encoded).unwrap_or(usize::MAX))
 }
 
 pub(super) fn validate_raw_rebase_size(

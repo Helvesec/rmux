@@ -6,7 +6,7 @@ use rmux_proto::{
     PaneRawRebase, PaneRawRebaseReason, PaneStreamEndReason, PaneStreamMode, PaneSurfaceFrame,
 };
 
-use crate::pane_io::{PaneBoundary, PaneOutputReceiver};
+use crate::pane_io::{PaneBoundary, PaneObservationItem, PaneOutputReceiver};
 
 #[derive(Debug)]
 pub(in crate::handler) struct RawPaneStream {
@@ -16,6 +16,7 @@ pub(in crate::handler) struct RawPaneStream {
     rebasing: bool,
     rebase_token: u64,
     pending_rebase: Option<PaneRawRebaseReason>,
+    pending_observation: Option<PaneObservationItem>,
 }
 
 impl RawPaneStream {
@@ -31,6 +32,7 @@ impl RawPaneStream {
             rebasing: false,
             rebase_token: 0,
             pending_rebase: None,
+            pending_observation: None,
         }
     }
 
@@ -40,6 +42,15 @@ impl RawPaneStream {
 
     pub(in crate::handler) const fn pending_rebase(&self) -> Option<PaneRawRebaseReason> {
         self.pending_rebase
+    }
+
+    pub(in crate::handler) fn take_pending_observation(&mut self) -> Option<PaneObservationItem> {
+        self.pending_observation.take()
+    }
+
+    pub(in crate::handler) fn defer_observation(&mut self, item: PaneObservationItem) {
+        debug_assert!(self.pending_observation.is_none());
+        self.pending_observation = Some(item);
     }
 
     pub(in crate::handler) fn begin_rebase(&mut self) -> Option<u64> {
