@@ -305,7 +305,15 @@ pub(super) async fn serve_session_loop(
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut scrolls = HashMap::new();
-    queue_session_keyframe_or_close(&outbound, None, &session.snapshot, &share_id).await?;
+    let mut sanitizer = WebTerminalSanitizer::default();
+    queue_session_keyframe_or_close(
+        &outbound,
+        None,
+        &session.snapshot,
+        &share_id,
+        &mut sanitizer,
+    )
+    .await?;
     let mut attach_reader = session.take_attach_reader();
     let mut rate_limiter = OperatorRateLimiter::new();
     let mut last_connection_counts = session.connection_counts();
@@ -324,8 +332,6 @@ pub(super) async fn serve_session_loop(
     let mut view_pending = false;
     let mut pending_started_at = None;
     let mut inbound = WebSocketReadPump::new(socket);
-    let mut sanitizer = WebTerminalSanitizer::default();
-
     loop {
         tokio::select! {
             biased;
@@ -409,6 +415,7 @@ pub(super) async fn serve_session_loop(
                                         &share_id,
                                         &mut scrolls,
                                         supports_session_pane_frame,
+                                        &mut sanitizer,
                                     ).await? {
                                         Some(OutboundQueueResult::Queued) => {
                                             pending_started_at = None;
@@ -473,6 +480,7 @@ pub(super) async fn serve_session_loop(
                                 &mut session,
                                 &share_id,
                                 &mut scrolls,
+                                &mut sanitizer,
                             ).await? {
                                 OutboundQueueResult::Queued => sanitizer.reset(),
                                 result if is_recoverable_session_queue_pressure(result) => {
@@ -542,6 +550,7 @@ pub(super) async fn serve_session_loop(
                         &mut session,
                         &share_id,
                         &mut scrolls,
+                        &mut sanitizer,
                     ).await? {
                         OutboundQueueResult::Queued => {
                             sanitizer.reset();
@@ -571,6 +580,7 @@ pub(super) async fn serve_session_loop(
                         &mut session,
                         &share_id,
                         &mut scrolls,
+                        &mut sanitizer,
                     ).await? {
                         OutboundQueueResult::Queued => {
                             view_pending = false;
@@ -638,6 +648,7 @@ async fn queue_fresh_session_snapshot(
     session: &mut WebSessionStream,
     share_id: &str,
     scrolls: &mut HashMap<PaneId, usize>,
+    sanitizer: &mut WebTerminalSanitizer,
 ) -> io::Result<OutboundQueueResult> {
     let next = handler
         .web_session_snapshot_with_scrolls(
@@ -650,7 +661,7 @@ async fn queue_fresh_session_snapshot(
     normalize_session_scrolls(scrolls, &next);
     let resize = (next.size != session.size()).then_some(next.size);
     session.snapshot = next;
-    let result = queue_session_keyframe(outbound, resize, &session.snapshot);
+    let result = queue_session_keyframe(outbound, resize, &session.snapshot, sanitizer);
     log_recoverable_session_queue_result(share_id, result);
     Ok(result)
 }
@@ -662,6 +673,7 @@ async fn queue_session_scroll_patch(
     share_id: &str,
     scrolls: &mut HashMap<PaneId, usize>,
     supports_session_pane_frame: bool,
+    sanitizer: &mut WebTerminalSanitizer,
 ) -> io::Result<Option<OutboundQueueResult>> {
     if !supports_session_pane_frame {
         return Ok(None);
@@ -687,7 +699,7 @@ async fn queue_session_scroll_patch(
     if !pane_frame_matches_snapshot(&session.snapshot, &frame) {
         return Ok(None);
     }
-    let result = queue_session_pane_frame(outbound, &frame);
+    let result = queue_session_pane_frame(outbound, &frame, sanitizer);
     log_recoverable_session_queue_result(share_id, result);
     if result == OutboundQueueResult::Queued {
         update_session_snapshot_pane(&mut session.snapshot, &frame);
@@ -746,6 +758,7 @@ async fn queue_fresh_session_view(
     session: &mut WebSessionStream,
     share_id: &str,
     scrolls: &mut HashMap<PaneId, usize>,
+    sanitizer: &mut WebTerminalSanitizer,
 ) -> io::Result<OutboundQueueResult> {
     let next = handler
         .web_session_snapshot_with_scrolls(
@@ -759,7 +772,7 @@ async fn queue_fresh_session_view(
     if next.size != session.size() {
         let resize = next.size;
         session.snapshot = next;
-        let result = queue_session_keyframe(outbound, Some(resize), &session.snapshot);
+        let result = queue_session_keyframe(outbound, Some(resize), &session.snapshot, sanitizer);
         log_recoverable_session_queue_result(share_id, result);
         return Ok(result);
     }
@@ -774,10 +787,11 @@ async fn queue_session_keyframe_or_close(
     resize: Option<rmux_proto::TerminalSize>,
     snapshot: &WebSessionSnapshot,
     share_id: &str,
+    sanitizer: &mut WebTerminalSanitizer,
 ) -> io::Result<()> {
     queue_or_close(
         outbound,
-        queue_session_keyframe(outbound, resize, snapshot),
+        queue_session_keyframe(outbound, resize, snapshot, sanitizer),
         share_id,
     )
     .await

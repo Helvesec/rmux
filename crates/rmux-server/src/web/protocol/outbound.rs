@@ -84,8 +84,9 @@ pub(crate) fn queue_session_keyframe(
     socket: &WebSocketOutbound,
     resize: Option<TerminalSize>,
     snapshot: &WebSessionSnapshot,
+    sanitizer: &mut WebTerminalSanitizer,
 ) -> OutboundQueueResult {
-    let Ok(frames) = session_keyframe_payloads(resize, snapshot) else {
+    let Ok(frames) = session_keyframe_payloads(resize, snapshot, sanitizer) else {
         return OutboundQueueResult::Closed;
     };
     socket.queue_keyframe(frames)
@@ -94,8 +95,9 @@ pub(crate) fn queue_session_keyframe(
 pub(crate) fn queue_session_pane_frame(
     socket: &WebSocketOutbound,
     frame: &WebSessionPaneFrame,
+    sanitizer: &mut WebTerminalSanitizer,
 ) -> OutboundQueueResult {
-    socket.queue_frame(session_pane_frame_payload(frame))
+    socket.queue_frame(session_pane_frame_payload(frame, sanitizer))
 }
 
 pub(crate) async fn send_ready(
@@ -195,10 +197,16 @@ fn pane_snapshot_payload(
     frame
 }
 
-fn session_snapshot_payload(snapshot: &WebSessionSnapshot) -> Vec<u8> {
+fn session_snapshot_payload(
+    snapshot: &WebSessionSnapshot,
+    sanitizer: &mut WebTerminalSanitizer,
+) -> Vec<u8> {
     let mut frame = Vec::with_capacity(1);
     frame.push(WS_SNAPSHOT_FULL);
-    snapshot.append_ansi_bytes(&mut frame);
+    let mut raw = Vec::new();
+    snapshot.append_ansi_bytes(&mut raw);
+    sanitizer.reset();
+    sanitizer.push(&raw, &mut frame);
     frame
 }
 
@@ -209,7 +217,10 @@ fn session_view_payload(snapshot: &WebSessionSnapshot) -> serde_json::Result<Vec
     Ok(frame)
 }
 
-fn session_pane_frame_payload(frame: &WebSessionPaneFrame) -> Vec<u8> {
+fn session_pane_frame_payload(
+    frame: &WebSessionPaneFrame,
+    sanitizer: &mut WebTerminalSanitizer,
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(25 + frame.frame.len());
     body.push(WS_SESSION_PANE_FRAME);
     body.extend_from_slice(&frame.pane.id.to_be_bytes());
@@ -221,19 +232,21 @@ fn session_pane_frame_payload(frame: &WebSessionPaneFrame) -> Vec<u8> {
     body.extend_from_slice(&frame.pane.rows.to_be_bytes());
     body.extend_from_slice(&saturating_u32(frame.pane.scroll_offset).to_be_bytes());
     body.extend_from_slice(&saturating_u32(frame.pane.history_size).to_be_bytes());
-    body.extend_from_slice(&frame.frame);
+    sanitizer.reset();
+    sanitizer.push(&frame.frame, &mut body);
     body
 }
 
 fn session_keyframe_payloads(
     resize: Option<TerminalSize>,
     snapshot: &WebSessionSnapshot,
+    sanitizer: &mut WebTerminalSanitizer,
 ) -> serde_json::Result<Vec<Vec<u8>>> {
     let mut frames = Vec::with_capacity(if resize.is_some() { 3 } else { 2 });
     if let Some(size) = resize {
         frames.push(resize_payload(size));
     }
-    frames.push(session_snapshot_payload(snapshot));
+    frames.push(session_snapshot_payload(snapshot, sanitizer));
     frames.push(session_view_payload(snapshot)?);
     Ok(frames)
 }
@@ -356,8 +369,10 @@ mod tests {
         let size = TerminalSize { cols: 80, rows: 24 };
         let snapshot =
             WebSessionSnapshot::new(size, b"paint".to_vec(), TestWebSessionView::new(size), 0, 0);
+        let mut sanitizer = WebTerminalSanitizer::default();
 
-        let frames = session_keyframe_payloads(Some(size), &snapshot).expect("view serializes");
+        let frames = session_keyframe_payloads(Some(size), &snapshot, &mut sanitizer)
+            .expect("view serializes");
 
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0][0], WS_RESIZE_NOTIFY);
@@ -388,7 +403,8 @@ mod tests {
             b"\x1b[3;42Hrow".to_vec(),
         );
 
-        let payload = session_pane_frame_payload(&frame);
+        let mut sanitizer = WebTerminalSanitizer::default();
+        let payload = session_pane_frame_payload(&frame, &mut sanitizer);
 
         assert_eq!(payload[0], WS_SESSION_PANE_FRAME);
         assert_eq!(u32::from_be_bytes(payload[1..5].try_into().unwrap()), 7);
@@ -404,6 +420,48 @@ mod tests {
             50_000
         );
         assert_eq!(&payload[25..], b"\x1b[3;42Hrow");
+    }
+
+    #[test]
+    fn session_keyframes_and_pane_frames_apply_the_web_terminal_policy() {
+        let size = TerminalSize { cols: 80, rows: 24 };
+        let unsafe_link = b"before\x1b]8;;javascript:alert(1)\x1b\\link\x1b]8;;\x1b\\after";
+        let snapshot = WebSessionSnapshot::new(
+            size,
+            unsafe_link.to_vec(),
+            TestWebSessionView::new(size),
+            0,
+            0,
+        );
+        let mut sanitizer = WebTerminalSanitizer::default();
+        let frames =
+            session_keyframe_payloads(None, &snapshot, &mut sanitizer).expect("view serializes");
+        assert!(
+            !frames[0]
+                .windows(b"javascript:".len())
+                .any(|window| window == b"javascript:"),
+            "session recovery frame must not retain an active-content URI"
+        );
+        assert!(frames[0].ends_with(b"beforelink\x1b]8;;\x1b\\after"));
+
+        let pane_frame = WebSessionPaneFrame::new(
+            size,
+            WebSessionPaneView {
+                id: 7,
+                x: 0,
+                y: 0,
+                cols: 80,
+                rows: 24,
+                active: true,
+                history_size: 0,
+                scroll_offset: 0,
+                alternate_on: false,
+                mouse_on: false,
+            },
+            unsafe_link.to_vec(),
+        );
+        let payload = session_pane_frame_payload(&pane_frame, &mut sanitizer);
+        assert_eq!(&payload[25..], b"beforelink\x1b]8;;\x1b\\after");
     }
 
     #[test]
