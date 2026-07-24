@@ -41,11 +41,12 @@ use super::{
 use crate::transport::{OperationDeadline, TransportClient};
 use crate::{PaneId, PaneRef, Result};
 use rmux_proto::{
-    encode_frame, ErrorResponse, FrameDecoder, PaneOutputCursor, PaneOutputCursorRequest,
-    PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse,
-    PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneRecentOutput, PaneTarget, Request,
-    Response, SessionName, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
-    UnsubscribePaneOutputRequest,
+    encode_frame, ErrorResponse, FrameDecoder, HasSessionRequest, HasSessionResponse,
+    PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent,
+    PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
+    PaneOutputSubscriptionStart, PaneRecentOutput, PaneTarget, Request, Response, SessionName,
+    SubscribePaneOutputRequest, SubscribePaneOutputResponse, UnsubscribePaneOutputRequest,
+    UnsubscribePaneOutputResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -440,6 +441,97 @@ async fn output_stream_drives_subscribe_then_cursor_then_unsubscribe() {
         }) => assert_eq!(id, subscription_id()),
         other => panic!("expected unsubscribe-pane-output on drop, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn cancelled_output_open_unsubscribes_once_and_preserves_shared_transport() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(8192);
+    let target = alpha_target();
+    let proto_target = target.to_proto();
+    let transport = TransportClient::spawn(client_stream);
+    let shared_transport = transport.clone();
+    let open = tokio::spawn(async move {
+        PaneOutputStream::open(
+            transport,
+            rmux_proto::PaneTargetRef::slot(target.into()),
+            PaneOutputStart::Now,
+        )
+        .await
+    });
+
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        Request::SubscribePaneOutput(SubscribePaneOutputRequest {
+            target: proto_target.clone(),
+            start: PaneOutputSubscriptionStart::Now,
+        })
+    );
+    open.abort();
+    assert!(
+        matches!(open.await, Err(error) if error.is_cancelled()),
+        "open task must report external cancellation"
+    );
+
+    let session = SessionName::new("still-aligned").expect("valid session");
+    let follow_up_request = Request::HasSession(HasSessionRequest {
+        target: session.clone(),
+    });
+    let follow_up = tokio::spawn({
+        let shared_transport = shared_transport.clone();
+        let follow_up_request = follow_up_request.clone();
+        async move { shared_transport.request(follow_up_request).await }
+    });
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        follow_up_request,
+        "the shared transport must keep accepting requests while the open is cancelled"
+    );
+
+    write_response(
+        &mut server_stream,
+        &Response::SubscribePaneOutput(SubscribePaneOutputResponse {
+            subscription_id: subscription_id(),
+            target: proto_target,
+            pane_id: PaneId::new(1),
+            cursor: cursor_zero(),
+        }),
+    )
+    .await;
+    let cleanup = tokio::time::timeout(Duration::from_secs(1), read_request(&mut server_stream))
+        .await
+        .expect("cancelled output open must schedule cleanup");
+    assert_eq!(
+        cleanup,
+        Request::UnsubscribePaneOutput(UnsubscribePaneOutputRequest {
+            subscription_id: subscription_id(),
+        })
+    );
+    write_response(
+        &mut server_stream,
+        &Response::HasSession(HasSessionResponse { exists: false }),
+    )
+    .await;
+    assert_eq!(
+        follow_up
+            .await
+            .expect("follow-up task")
+            .expect("shared transport remains usable"),
+        Response::HasSession(HasSessionResponse { exists: false })
+    );
+    write_response(
+        &mut server_stream,
+        &Response::UnsubscribePaneOutput(UnsubscribePaneOutputResponse {
+            subscription_id: subscription_id(),
+            removed: true,
+        }),
+    )
+    .await;
+    assert!(
+        try_read_request(&mut server_stream, Duration::from_millis(30))
+            .await
+            .is_none(),
+        "cancelled open must emit exactly one unsubscribe"
+    );
 }
 
 #[tokio::test]

@@ -1,7 +1,9 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use rmux_proto::{Response, SdkWaitId};
+use rmux_proto::{
+    Request, Response, SdkWaitId, UnsubscribePaneOutputRequest, UnsubscribePaneStreamRequest,
+};
 use tokio::sync::oneshot;
 
 use super::cancellation::OrderedResponseGuard;
@@ -133,10 +135,12 @@ impl PendingCall {
         Ok(PendingResponseAction::Complete)
     }
 
-    pub(super) fn complete(mut self, response: Response) {
+    pub(super) fn complete(mut self, response: Response) -> Option<Request> {
         self.send_armed_success_if_pending();
-        if let Some(reply) = self.reply {
-            let _ = reply.send(response_to_result(response));
+        let reply = self.reply?;
+        match reply.send(response_to_result(response)) {
+            Ok(()) | Err(Err(_)) => None,
+            Err(Ok(response)) => orphaned_subscription_cleanup(&response),
         }
     }
 
@@ -195,5 +199,21 @@ fn response_to_result(response: Response) -> Result<Response> {
     match response {
         Response::Error(error) => Err(error.into()),
         response => Ok(response),
+    }
+}
+
+fn orphaned_subscription_cleanup(response: &Response) -> Option<Request> {
+    match response {
+        Response::SubscribePaneOutput(response) => Some(Request::UnsubscribePaneOutput(
+            UnsubscribePaneOutputRequest {
+                subscription_id: response.subscription_id,
+            },
+        )),
+        Response::SubscribePaneStream(response) => Some(Request::UnsubscribePaneStream(
+            UnsubscribePaneStreamRequest {
+                subscription_id: response.subscription_id,
+            },
+        )),
+        _ => None,
     }
 }

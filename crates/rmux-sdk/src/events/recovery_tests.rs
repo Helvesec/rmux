@@ -3,11 +3,12 @@
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_frame, FrameDecoder, PaneOutputSubscriptionId, PaneRawBytes,
-    PaneRawRebase as ProtoRebase, PaneRawRebaseReason as ProtoReason, PaneStreamCursorRequest,
-    PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent, PaneStreamMode, PaneTarget,
-    PaneTargetRef, Request, Response, SessionName, SubscribePaneStreamRequest,
-    SubscribePaneStreamResponse, UnsubscribePaneStreamRequest,
+    encode_frame, FrameDecoder, HasSessionRequest, HasSessionResponse, PaneOutputSubscriptionId,
+    PaneRawBytes, PaneRawRebase as ProtoRebase, PaneRawRebaseReason as ProtoReason,
+    PaneStreamCursorRequest, PaneStreamCursorResponse, PaneStreamEndReason, PaneStreamEvent,
+    PaneStreamMode, PaneTarget, PaneTargetRef, Request, Response, SessionName,
+    SubscribePaneStreamRequest, SubscribePaneStreamResponse, UnsubscribePaneStreamRequest,
+    UnsubscribePaneStreamResponse,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -95,6 +96,94 @@ async fn serve_subscribe(server: &mut DuplexStream) {
         })),
     )
     .await;
+}
+
+#[tokio::test]
+async fn cancelled_recoverable_open_unsubscribes_once_and_preserves_shared_transport() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let transport = TransportClient::spawn(client);
+    let shared_transport = transport.clone();
+    let open = tokio::spawn(async move {
+        PaneRecoveryStream::open(
+            transport,
+            PaneTargetRef::slot(target()),
+            PaneRecoveryOptions::default(),
+        )
+        .await
+    });
+
+    assert_eq!(
+        read_request(&mut server).await,
+        Request::SubscribePaneStream(SubscribePaneStreamRequest {
+            target: PaneTargetRef::slot(target()),
+            mode: PaneStreamMode::Raw,
+            include_snapshot: false,
+        })
+    );
+    open.abort();
+    assert!(
+        matches!(open.await, Err(error) if error.is_cancelled()),
+        "open task must report external cancellation"
+    );
+
+    let session = SessionName::new("still-aligned").expect("valid session");
+    let follow_up_request = Request::HasSession(HasSessionRequest { target: session });
+    let follow_up = tokio::spawn({
+        let shared_transport = shared_transport.clone();
+        let follow_up_request = follow_up_request.clone();
+        async move { shared_transport.request(follow_up_request).await }
+    });
+    assert_eq!(
+        read_request(&mut server).await,
+        follow_up_request,
+        "the shared transport must keep accepting requests while the open is cancelled"
+    );
+
+    write_response(
+        &mut server,
+        Response::SubscribePaneStream(Box::new(SubscribePaneStreamResponse {
+            subscription_id: subscription_id(),
+            target: target(),
+            pane_id: PaneId::new(1),
+            event: PaneStreamEvent::RawRebase(Box::new(rebase(1, ProtoReason::Initial))),
+        })),
+    )
+    .await;
+    let cleanup = tokio::time::timeout(Duration::from_secs(1), read_request(&mut server))
+        .await
+        .expect("cancelled recoverable open must schedule cleanup");
+    assert_eq!(
+        cleanup,
+        Request::UnsubscribePaneStream(UnsubscribePaneStreamRequest {
+            subscription_id: subscription_id(),
+        })
+    );
+    write_response(
+        &mut server,
+        Response::HasSession(HasSessionResponse { exists: false }),
+    )
+    .await;
+    assert_eq!(
+        follow_up
+            .await
+            .expect("follow-up task")
+            .expect("shared transport remains usable"),
+        Response::HasSession(HasSessionResponse { exists: false })
+    );
+    write_response(
+        &mut server,
+        Response::UnsubscribePaneStream(UnsubscribePaneStreamResponse {
+            subscription_id: subscription_id(),
+            removed: true,
+        }),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), read_request(&mut server))
+            .await
+            .is_err(),
+        "cancelled open must emit exactly one unsubscribe"
+    );
 }
 
 #[tokio::test]

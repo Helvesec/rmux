@@ -156,7 +156,26 @@ pub(super) async fn run_actor<S>(
                     };
                     match pending_call.accept_response(&response) {
                         Ok(PendingResponseAction::Complete) => {
-                            pending_call.complete(response);
+                            if let Some(cleanup) = pending_call.complete(response) {
+                                let command_name = cleanup.command_name();
+                                let frame = match encode_request(&cleanup) {
+                                    Ok(frame) => frame,
+                                    Err(failure) => {
+                                        fail_shutdown(&mut shutdown_reply, &failure);
+                                        fail_transport(&mut pending, &state, failure);
+                                        break;
+                                    }
+                                };
+                                pending.push_back(PendingCall::discard(
+                                    command_name,
+                                    request_operation(&cleanup),
+                                ));
+                                if let Err(failure) = write_frame(&mut writer, &frame).await {
+                                    fail_shutdown(&mut shutdown_reply, &failure);
+                                    fail_transport(&mut pending, &state, failure);
+                                    break;
+                                }
+                            }
                         }
                         Ok(PendingResponseAction::KeepPending) => {
                             pending.push_front(pending_call);
