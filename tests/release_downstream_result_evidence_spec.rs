@@ -340,6 +340,40 @@ with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
 }
 
 #[test]
+fn result_envelope_normalizes_exact_github_artifact_metadata() {
+    assert_fixture(&format!(
+        "{FIXTURE}\n{}",
+        r#"
+with tempfile.TemporaryDirectory(dir=pathlib.Path.cwd()) as root:
+    root = pathlib.Path(root)
+    paths = write_fixture(root)
+    bundle = root / 'downstream-channel-result.sigstore.json'
+    bundle.write_text('{}\n', encoding='utf-8')
+    spec = importlib.util.spec_from_file_location(
+        'channel_result',
+        'scripts/release/channel-result.py',
+    )
+    channel_result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(channel_result)
+    envelope = channel_result.expected_envelope(argparse.Namespace(
+        request=paths['request'],
+        predicate=paths['predicate'],
+        attestation_id='result-attestation-7',
+        attestation_bundle=bundle,
+        bundle_artifact=paths['predicate_meta'],
+        created_at='2026-07-20T00:00:30Z',
+    ))
+    expected = artifact(
+        53,
+        f'rmux-downstream-homebrew_tap-result-{SOURCE}-7',
+    )
+    if envelope['result_bundle'] != expected:
+        raise SystemExit('GitHub artifact metadata was not normalized exactly')
+"#
+    ));
+}
+
+#[test]
 fn exact_reference_rejects_changed_envelope_and_symlinked_request() {
     assert_fixture(&format!(
         "{FIXTURE}\n{}",

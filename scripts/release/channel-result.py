@@ -16,7 +16,6 @@ from downstream_channels import (
     file_hash,
     read_object,
     timestamp,
-    validate_artifact,
     validate_request,
     write_object,
 )
@@ -27,6 +26,7 @@ from downstream_result import (
     validate_producer,
     validate_target_evidence,
 )
+from downstream_result_reference import artifact_reference
 
 
 def expected_predicate(args: argparse.Namespace) -> dict[str, Any]:
@@ -95,14 +95,16 @@ def expected_envelope(args: argparse.Namespace) -> dict[str, Any]:
     bundle_path = args.attestation_bundle.resolve(strict=True)
     if bundle_path.name != "downstream-channel-result.sigstore.json":
         raise ValueError("result attestation bundle name changed")
-    result_bundle = read_object(args.bundle_artifact, "result bundle artifact")
-    validate_artifact(result_bundle, "result bundle")
     expected_name = (
         f"rmux-downstream-{predicate['channel']}-result-"
         f"{predicate['source_git_sha']}-{predicate['release']['id']}"
     )
-    if result_bundle["name"] != expected_name:
-        raise ValueError("result bundle name differs from its exact release")
+    result_bundle = artifact_reference(
+        read_object(args.bundle_artifact, "result bundle artifact"),
+        expected_name=expected_name,
+        source_sha=predicate["source_git_sha"],
+        run_id=predicate["producer"]["run_id"],
+    )
     created = timestamp(args.created_at, "result envelope created_at")
     if created < timestamp(predicate["observed_at"], "result observed_at"):
         raise ValueError("result envelope predates its predicate")

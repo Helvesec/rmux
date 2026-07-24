@@ -63,7 +63,7 @@ REFERENCE_KEYS = {
 }
 
 
-def _artifact_reference(
+def artifact_reference(
     value: dict[str, Any], *, expected_name: str, source_sha: str, run_id: int
 ) -> dict[str, Any]:
     exact_keys(
@@ -207,13 +207,13 @@ def create_reference(
     channel = predicate["channel"]
     release = predicate["release"]
     run_id = predicate["producer"]["run_id"]
-    predicate_artifact = _artifact_reference(
+    predicate_artifact = artifact_reference(
         read_object(predicate_artifact_path, "predicate artifact metadata"),
         expected_name=f"rmux-downstream-{channel}-result-{source_sha}-{release['id']}",
         source_sha=source_sha,
         run_id=run_id,
     )
-    envelope_artifact = _artifact_reference(
+    envelope_artifact = artifact_reference(
         read_object(envelope_artifact_path, "envelope artifact metadata"),
         expected_name=(
             f"rmux-downstream-{channel}-result-envelope-{source_sha}-{release['id']}"
